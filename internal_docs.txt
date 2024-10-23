@@ -1,0 +1,26 @@
+These are just super lazy docs to document what i did to get fiber running. docs arent awesome...
+
+Install requirements.txt , I dont have versioning in yet
+
+Register two wallets on the netuid 237 of test network. This next step is required for both validators and miners
+
+Post IP to chain- fiber-post-ip --netuid <NETUID> --external_ip <YOUR_IP> --external_port <YOUR_PORT> --wallet.name NAME --wallet.hotkey HOTKEY
+
+For miner, need to create a .env file with these details in the home directory:
+wallet_name = os.getenv("WALLET_NAME", "default")
+    hotkey_name = os.getenv("HOTKEY_NAME", "default")
+    netuid = os.getenv("NETUID")
+    subtensor_network = os.getenv("SUBTENSOR_NETWORK")
+    subtensor_address = os.getenv("SUBTENSOR_ADDRESS")
+    load_old_nodes = bool(os.getenv("LOAD_OLD_NODES", True))
+    min_stake_threshold = int(os.getenv("MIN_STAKE_THRESHOLD", 1_000))
+
+
+For validator, need a file called dev.env with the following:
+WALLET_NAME=gaiatest
+WALLET_HOTKEY=default
+
+
+Run the miner in a pm2 instance or tmux session
+
+Run the validator. I created the handshake method (with GPT) and would love for one of you to look over it. The miner and validator properly transmit data. The validator is not in a loop.
