@@ -4,6 +4,8 @@ from tasks.base.components.inputs import Inputs
 from tasks.base.components.outputs import Outputs
 from tasks.base.components.scoring_mechanism import ScoringMechanism
 from tasks.base.components.preprocessing import Preprocessing
+from tasks.base.decorators import task_timer
+
 
 class Subtask:
     def __init__(self,
@@ -46,3 +48,10 @@ class Subtask:
         self.outputs = outputs
         self.scoring_mechanism = scoring_mechanism
         self.preprocessing = preprocessing
+
+    @task_timer
+    def execute(self):
+        '''
+        Execute the subtask based on the schema.
+        '''
+        pass
