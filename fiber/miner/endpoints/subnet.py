@@ -1,37 +1,41 @@
-"""
-THIS IS AN EXAMPLE FILE OF A SUBNET ENDPOINT!
-
-PLEASE IMPLEMENT YOUR OWN :)
-"""
-
-from functools import partial
-
+from functools import partial  # Add this line at the top of your file
 from fastapi import Depends
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRouter
 from pydantic import BaseModel
-
 from fiber.miner.dependencies import blacklist_low_stake, verify_request
 from fiber.miner.security.encryption import decrypt_general_payload
+from fiber.logging_utils import get_logger
 
+logger = get_logger(__name__)
 
-class ExampleSubnetRequest(BaseModel):
-    pass
+class DataModel(BaseModel):
+    name: str
+    value: int
 
+class GeomagneticRequest(BaseModel):
+    nonce: str | None = None  # Make nonce optional
+    data: DataModel | None = None   # Add data field as optional
 
-async def example_subnet_request(
-    decrypted_payload: ExampleSubnetRequest = Depends(
-        partial(decrypt_general_payload, ExampleSubnetRequest),
+async def geomagnetic_require(
+    decrypted_payload: GeomagneticRequest = Depends(
+        partial(decrypt_general_payload, GeomagneticRequest),
     ),
 ):
-    return {"status": "Example request received"}
-
+    logger.info(f"Received decrypted payload: {decrypted_payload}")
+    if decrypted_payload.data:
+        logger.info(f"Received data: {decrypted_payload.data}")
+    
+    # Process the data here; return it as response_data to be sent to the Validator
+    response_data = decrypted_payload.dict()
+    return JSONResponse(content=response_data)
 
 def factory_router() -> APIRouter:
     router = APIRouter()
     router.add_api_route(
-        "/example-subnet-request",
-        example_subnet_request,
-        tags=["Example"],
+        "/geomagnetic-request",
+        geomagnetic_require,
+        tags=["Geomagnetic"],
         dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
         methods=["POST"],
     )
