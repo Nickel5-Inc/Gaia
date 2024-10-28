@@ -2,7 +2,7 @@ import os
 
 from dotenv import load_dotenv
 
-load_dotenv("dev.env")
+load_dotenv(".env")
 import asyncio
 
 import httpx
@@ -38,6 +38,15 @@ async def main():
         raise ValueError("Symmetric key or UUID is None :-(")
     else:
         logger.info("Wohoo - handshake worked! :)")
+    
+    # Gabriel - this payload will need to be filled in with the proper data dynamically
+    payload = {
+        "nonce": "12345",
+        "data": {
+            "name": "Geomagnetic data",
+            "value": 42
+        }
+}
 
     fernet = Fernet(symmetric_key_str)
 
@@ -49,11 +58,11 @@ async def main():
         symmetric_key_uuid=symmetric_key_uuid,
         validator_ss58_address=keypair.ss58_address,
         miner_ss58_address=miner_hotkey_ss58_address,
-        payload={},
-        endpoint="/example-subnet-request",
+        payload=payload,
+        endpoint="/geomagnetic-request",
     )
     resp.raise_for_status()
-    logger.info(f"Example request sent! Response: {resp.text}")
+    logger.info(f"Geomagnetic request sent! Response: {resp.text}")
 
 
 if __name__ == "__main__":
