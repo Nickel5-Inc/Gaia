@@ -1,6 +1,7 @@
 import os
 
 from dotenv import load_dotenv
+from dev_utils.data.process_geomag_data import get_latest_geomag_data
 
 load_dotenv(".env")
 import asyncio
@@ -40,11 +41,15 @@ async def main():
         logger.info("Wohoo - handshake worked! :)")
     
     # Gabriel - this payload will need to be filled in with the proper data dynamically
+    # Is this what we are looking for?
+    timestamp, dst_value = get_latest_geomag_data()  # Fetch latest data
+
     payload = {
         "nonce": "12345",
         "data": {
             "name": "Geomagnetic data",
-            "value": 42
+            "timestamp": str(timestamp),  # Convert timestamp to string for JSON compatibility
+            "value": dst_value
         }
 }
 
