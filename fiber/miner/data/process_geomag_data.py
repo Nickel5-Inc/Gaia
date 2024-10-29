@@ -1,6 +1,6 @@
 import pandas as pd
 from datetime import datetime, timedelta
-from dev_utils.data.pull_geomag_data import fetch_data
+from fiber.miner.data.pull_geomag_data import fetch_data
 
 # Constants
 PLACEHOLDER_VALUE = '9999999999999999'

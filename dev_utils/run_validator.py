@@ -1,7 +1,7 @@
 import os
 
 from dotenv import load_dotenv
-from dev_utils.data.process_geomag_data import get_latest_geomag_data
+from fiber.miner.data.process_geomag_data import get_latest_geomag_data
 
 load_dotenv(".env")
 import asyncio
