@@ -39,19 +39,17 @@ async def main():
         raise ValueError("Symmetric key or UUID is None :-(")
     else:
         logger.info("Wohoo - handshake worked! :)")
-    
-    # Gabriel - this payload will need to be filled in with the proper data dynamically
-    # Is this what we are looking for?
+
     timestamp, dst_value = get_latest_geomag_data()  # Fetch latest data
 
     payload = {
         "nonce": "12345",
         "data": {
             "name": "Geomagnetic data",
-            "timestamp": str(timestamp),  # Convert timestamp to string for JSON compatibility
-            "value": dst_value
+            "timestamp": str(timestamp),  # Convert timestamp to string
+            "value": int(dst_value) if isinstance(dst_value, (int, float, np.integer)) else dst_value
         }
-}
+    }
 
     fernet = Fernet(symmetric_key_str)
 
