@@ -44,7 +44,7 @@ pre-commit install
 #### Create dev.env file for miner
 ```bash
 WALLET_NAME=<YOUR_WALLET.NAME>
-WALLET_HOTKEY=<YOUR_WALLET_HOTKEY>
+HOTKEY_NAME=<YOUR_WALLET_HOTKEY>
 ```
 
 #### Run dev miner
@@ -56,7 +56,7 @@ python start_miner.py
 #### Create .env file for validator
 ```bash
 WALLET_NAME=<YOUR_WALLET.NAME>
-WALLET_HOTKEY=<YOUR_WALLET_HOTKEY>
+HOTKEY_NAME=<YOUR_WALLET_HOTKEY>
 NETUID=<NETUID>
 SUBTENSOR_NETWORK=<NETWORK>
 MIN_STAKE_THRESHOLD=<INT>
