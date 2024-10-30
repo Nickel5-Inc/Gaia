@@ -41,15 +41,6 @@ pip install -e .
 pre-commit install
 ```
 
-#### Create dev.env file for miner
-```bash
-WALLET_NAME=<YOUR_WALLET.NAME>
-HOTKEY_NAME=<YOUR_WALLET_HOTKEY>
-NETUID=<NETUID>
-SUBTENSOR_NETWORK=<NETWORK>
-MIN_STAKE_THRESHOLD=<INT>
-```
-
 #### Register miner and/or validator on subnet
 ```bash
 btcli subnets register --subtensor.network <NETWORK> --netuid <NETUID> --wallet.name <COLDKEY> --wallet.hotkey <HOTKEY>
@@ -60,8 +51,14 @@ btcli subnets register --subtensor.network <NETWORK> --netuid <NETUID> --wallet.
 fiber-post-ip --netuid <NETUID> --external_ip <YOUR_IP> --external_port <YOUR_PORT> --subtensor.network <NETWORK> --wallet.name <COLDKEY> --wallet.hotkey <HOTKEY> 
 ```
 
-#### Post IP to Chain
-
+#### Create dev.env file for miner with the following components:
+```bash
+WALLET_NAME=<YOUR_WALLET.NAME>
+HOTKEY_NAME=<YOUR_WALLET_HOTKEY>
+NETUID=<NETUID>
+SUBTENSOR_NETWORK=<NETWORK>
+MIN_STAKE_THRESHOLD=<INT>
+```
 
 #### Run dev miner
 ```bash
@@ -69,7 +66,7 @@ cd dev_utils
 python start_miner.py
 ```
 
-#### Create .env file for validator
+#### Create .env file for validator with the following components:
 ```bash
 WALLET_NAME=<YOUR_WALLET.NAME>
 HOTKEY_NAME=<YOUR_WALLET_HOTKEY>
