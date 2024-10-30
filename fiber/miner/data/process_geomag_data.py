@@ -8,7 +8,6 @@ DEFAULT_YEAR = datetime.now().year
 DEFAULT_MONTH = datetime.now().month
 
 def parse_data(data, current_year=DEFAULT_YEAR, current_month=DEFAULT_MONTH):
-    # Your existing parse_data code
     dates = []
     hourly_values = []
 
@@ -36,11 +35,9 @@ def parse_data(data, current_year=DEFAULT_YEAR, current_month=DEFAULT_MONTH):
     return pd.DataFrame({'timestamp': dates, 'Dst': hourly_values})
 
 def clean_data(df):
-    # Your existing clean_data code
-    df.drop_duplicates(subset='timestamp', inplace=True)
+    df = df.drop_duplicates(subset='timestamp')
     df = df[df['Dst'].between(-500, 500)]
-    df.dropna(inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    df = df.dropna().reset_index(drop=True)
     return df
 
 def get_latest_geomag_data():
@@ -56,9 +53,9 @@ def get_latest_geomag_data():
 
     # Get the latest data point
     if not cleaned_df.empty:
-        latest_data_point = cleaned_df.iloc[-1]  # Get the most recent entry
+        latest_data_point = cleaned_df.iloc[-1]
         timestamp = latest_data_point['timestamp']
-        dst_value = latest_data_point['Dst']
+        dst_value = int(latest_data_point['Dst'])  # Convert to native int for JSON compatibility
         return timestamp, dst_value
     else:
         # If no data available, return placeholders
