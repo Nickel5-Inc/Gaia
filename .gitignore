@@ -1,10 +1,11 @@
 # Virtual Environment
 venv/
 env/
-.env/
+.env
 .venv/
 dev.env
 # Python cache files
 __pycache__/
 *.py[cod]
 *$py.class
+*.encrypted
