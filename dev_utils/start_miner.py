@@ -2,7 +2,9 @@ import os
 
 from dotenv import load_dotenv
 
-load_dotenv("dev.env")  # Important to load this before importing anything else!
+load_dotenv("dev.env")  
+
+import argparse
 
 from fiber.logging_utils import get_logger
 from fiber.miner import server
@@ -14,6 +16,17 @@ logger = get_logger(__name__)
 app = server.factory_app(debug=True)
 
 app.include_router(get_subnet_router())
+
+# Set up argparse to handle the flag
+parser = argparse.ArgumentParser(description="Start the miner with optional flags.")
+parser.add_argument('--use_base_model', action='store_true', help='Enable base model usage')
+
+# Parse the arguments
+args = parser.parse_args()
+
+# Check if the flag is set and execute the function
+if args.use_base_model:
+    # Gabriel, call out to a function to pull the basemodel
 
 
 if os.getenv("ENV", "dev").lower() == "dev":
