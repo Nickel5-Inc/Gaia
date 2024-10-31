@@ -7,7 +7,7 @@ class GeoMagBaseModel:
     A wrapper class for downloading and initializing the GeoMagModel from Hugging Face.
     """
 
-    def __init__(self, repo_id="vValentine7/geomagindex", filename="BaseModel.py"):
+    def __init__(self, repo_id="Nickel5HF/geomagmodel", filename="BaseModel.py"):
         """
         Initialize by downloading and loading the GeoMagModel class from Hugging Face.
 

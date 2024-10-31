@@ -7,3 +7,4 @@ netaddr
 #miner
 fastapi
 uvicorn
+huggingface_hub
