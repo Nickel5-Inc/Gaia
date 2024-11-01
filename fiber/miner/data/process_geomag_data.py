@@ -29,7 +29,7 @@ def parse_data(data, current_year=DEFAULT_YEAR, current_month=DEFAULT_MONTH):
                     continue
 
     for line in data.splitlines():
-        if line.startswith("DST2410"):
+        if line.startswith("DST2411"):
             parse_line(line)
 
     return pd.DataFrame({'timestamp': dates, 'Dst': hourly_values})
