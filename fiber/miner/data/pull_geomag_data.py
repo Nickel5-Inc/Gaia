@@ -1,7 +1,7 @@
 import requests
 
 # URL and any constants needed
-DEFAULT_URL = 'https://wdc.kugi.kyoto-u.ac.jp/dst_realtime/presentmonth/dst2410.for.request'
+DEFAULT_URL = 'https://wdc.kugi.kyoto-u.ac.jp/dst_realtime/202411/dst2411.for.request'
 
 def fetch_data(url=DEFAULT_URL):
     """
