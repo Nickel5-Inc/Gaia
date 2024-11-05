@@ -2,4 +2,4 @@ The proxy server still needs work. I need to document the packages it requires, 
 
 But it works by running 
 
-./setup_proxy_server.sh <IP>
+./setup_proxy_server.sh --server_name yourdomain.com --ip 192.168.1.100 --port 33333
