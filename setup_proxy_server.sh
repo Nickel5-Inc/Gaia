@@ -39,7 +39,9 @@ if [[ -z "$SERVER_IP" ]]; then
 fi
 
 # Install NGINX if not already installed
-sudo apt update && sudo apt install -y nginx || { echo "Failed to install NGINX"; exit 1; }
+if ! command -v nginx &> /dev/null; then
+    sudo apt update && sudo apt install -y nginx || { echo "Failed to install NGINX"; exit 1; }
+fi
 
 # Create SSL directory
 sudo mkdir -p /etc/nginx/ssl
@@ -52,37 +54,15 @@ if [ ! -f /etc/nginx/ssl/nginx.crt ]; then
         -subj "/C=US/ST=State/L=City/O=Organization/CN=$SERVER_NAME"
 fi
 
-# Create NGINX config with fixed variable escaping
-sudo bash -c "cat > /etc/nginx/sites-available/validator-miner << 'EOF'
-server {
-    listen 80;
-    server_name ${SERVER_NAME};
-    return 301 https://\$server_name\$request_uri;
-}
+# Create or update the NGINX config file for this port
+CONFIG_FILE="/etc/nginx/sites-available/validator-miner-${PORT}"
 
-server {
-    listen 443 ssl;
-    server_name ${SERVER_NAME};
-
-    ssl_certificate /etc/nginx/ssl/nginx.crt;
-    ssl_certificate_key /etc/nginx/ssl/nginx.key;
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
-    ssl_prefer_server_ciphers off;
-
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-
+# Create NGINX config for this specific port
+sudo bash -c "cat > ${CONFIG_FILE} << 'EOF'
+# Server block for port ${PORT}
 server {
     listen ${PORT} ssl;
+    listen [::]:${PORT} ssl;
     server_name ${SERVER_NAME};
 
     ssl_certificate /etc/nginx/ssl/nginx.crt;
@@ -103,17 +83,27 @@ server {
 }
 EOF"
 
-# Enable the configuration
-sudo ln -sf /etc/nginx/sites-available/validator-miner /etc/nginx/sites-enabled/
+# Enable the configuration for this port
+sudo ln -sf ${CONFIG_FILE} /etc/nginx/sites-enabled/
+
+# Remove any conflicting configurations
 sudo rm -f /etc/nginx/sites-enabled/default
 
-# Kill any process using the specified ports
-sudo fuser -k 80/tcp 2>/dev/null || true
-sudo fuser -k 443/tcp 2>/dev/null || true
-sudo fuser -k "$PORT"/tcp 2>/dev/null || true
+# Kill any process using the specified port
+sudo fuser -k "${PORT}"/tcp 2>/dev/null || true
 
-# Stop and restart NGINX to apply changes
-sudo systemctl stop nginx
-sudo nginx -t && sudo systemctl restart nginx
+# Make sure NGINX is running and then reload configuration
+echo "Starting NGINX service..."
+sudo systemctl start nginx || { echo "Failed to start NGINX"; exit 1; }
 
-echo "NGINX setup complete! Service available on $SERVER_NAME with IP $SERVER_IP at ports 443 and $PORT."
+echo "Testing NGINX configuration..."
+if sudo nginx -t; then
+    echo "NGINX configuration test passed. Reloading NGINX..."
+    sudo systemctl reload nginx || sudo systemctl restart nginx
+else
+    echo "NGINX configuration test failed!"
+    exit 1
+fi
+
+echo "NGINX setup complete! Server available on $SERVER_NAME with IP $SERVER_IP at port $PORT"
+echo "Forwarding to port $((PORT + 1))"
