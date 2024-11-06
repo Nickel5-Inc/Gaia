@@ -52,23 +52,23 @@ if [ ! -f /etc/nginx/ssl/nginx.crt ]; then
         -subj "/C=US/ST=State/L=City/O=Organization/CN=$SERVER_NAME"
 fi
 
-# Create NGINX config with properly escaped variables
-sudo bash -c "cat > /etc/nginx/sites-available/validator-miner << EOF
+# Create NGINX config with fixed variable escaping
+sudo bash -c "cat > /etc/nginx/sites-available/validator-miner << 'EOF'
 server {
     listen 80;
-    server_name $SERVER_NAME;
+    server_name ${SERVER_NAME};
     return 301 https://\$server_name\$request_uri;
 }
 
 server {
     listen 443 ssl;
-    server_name $SERVER_NAME;
+    server_name ${SERVER_NAME};
 
     ssl_certificate /etc/nginx/ssl/nginx.crt;
     ssl_certificate_key /etc/nginx/ssl/nginx.key;
 
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
     ssl_prefer_server_ciphers off;
 
     location / {
@@ -82,18 +82,18 @@ server {
 }
 
 server {
-    listen $PORT ssl;
-    server_name $SERVER_NAME;
+    listen ${PORT} ssl;
+    server_name ${SERVER_NAME};
 
     ssl_certificate /etc/nginx/ssl/nginx.crt;
     ssl_certificate_key /etc/nginx/ssl/nginx.key;
 
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
     ssl_prefer_server_ciphers off;
 
     location / {
-        proxy_pass http://127.0.0.1:$((PORT + 1));
+        proxy_pass http://127.0.0.1:$((${PORT} + 1));
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
