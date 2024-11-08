@@ -1,13 +1,33 @@
-# Fiber
+# GAIA
+
+### Welcome to the subnet 
+GAIA is a one-of-a-kind subnet where the world is our oyster. The purpose of this 
+subnet is to inspire the world with the help of the Bittensor community. 
+We base all of our models off of 'ground-truth' and believe that tasks will
+generate SoTA scientific results. 
+
+![Project Logo](logo.png) THIS COULD BE A NICE ADDITION
+
+
+### *Quicklinks*
+
+[Miner](docs/README.md) NEED TO UPDATE PATH!
+
+[Validator](docs/README.md) NEED TO UPDATE PATH!
+
+
+
+## Fiber
 
 Fiber is a lightweight, developer-friendly package for running Bittensor subnets.
 
 Fiber is designed to be a highly secure networking framework that utilizes Multi-Layer Transport Security (MLTS) for enhanced data protection, offers DDoS resistance, and is designed to be easily extendable across multiple programming languages.
 
 
-## Installation
+### Installation
 
-### Install Full fiber - with all networking + chain stuff
+#### Install Full fiber - with all networking + chain stuff
+
 ----
 ```bash
 pip install "git+https://github.com/rayonlabs/fiber.git@x.y.z#egg=fiber[full]"
@@ -16,6 +36,7 @@ pip install "git+https://github.com/rayonlabs/fiber.git@x.y.z#egg=fiber[full]"
 Replace x.y.z with the desired version (or remove it to install the latest version)
 
 ### Install Fiber with only Chain interactions
+
 ----
 
 
