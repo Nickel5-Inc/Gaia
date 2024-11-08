@@ -1,4 +1,4 @@
-# GAIA
+![Project Logo](logo-full.png)
 
 ### Welcome to the subnet 
 GAIA is a one-of-a-kind subnet where the world is our oyster. The purpose of this 
@@ -6,7 +6,11 @@ subnet is to inspire the world with the help of the Bittensor community.
 We base all of our models off of 'ground-truth' and believe that tasks will
 generate SoTA scientific results. 
 
-![Project Logo](logo.png) THIS COULD BE A NICE ADDITION
+[Website](https://www.gaiaresearch.ai/)
+
+
+
+
 
 
 ### *Quicklinks*
