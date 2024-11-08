@@ -32,7 +32,7 @@ parser.add_argument('--use_base_model', action='store_true', help='Enable base m
 args = parser.parse_args()
 
 # Automatically fetch the cleaned DataFrame
-from fiber.miner.data.process_geomag_data import get_latest_geomag_data
+from tasks.defined_tasks.geomagnetic.utils.process_geomag_data import get_latest_geomag_data
 
 def fetch_miner_cleaned_df():
     # Fetch the cleaned DataFrame
