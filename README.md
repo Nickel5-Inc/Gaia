@@ -1,6 +1,18 @@
 # Gaia
 
-Lets get a good introduction for this. Pushing research forward, targets these markets, built on fiber, blah blah blah
+Gaia is the intersection of geospatial data analysis and machine learning. Most current models, whether in academia/research or industry, are purpose built for a single task. They’re often quite small and tuned on incredibly specific and well-prepared datasets. There is hardly any advancement towards a “foundational” type mega-model. There have been attempts, sure - like LLMs trained on openstreetmap data, attempts to train in spatial understanding , etc. 
+
+Gaia will begin at the cutting-edge of several different applications (beginning with two) and will expand toward a Grand Foundational Model. Geospatial data is diverse and expansive but all intertwined. Read more in our whitepaper [here] *DONT FORGET TO ATTACH LINK*
+
+## Miners
+
+Miners develop models to understand future events. These events currently include soil moisture and geomagnetic readings at the equator. Miners will receive data from validators for the models that we have in place. They are also free to gather their own data from other resources. The tasks are consistent in design and in timing; this predictability allows miners the flexibility to retrieve any data that their model requires. 
+
+Miners can choose between these two tasks or perform both. Incentive is split 50:50 between the tasks.
+
+## Validators
+
+Validators will connect to a few API's to provide miners with the data they need to run models.
 
 ## Installation
 

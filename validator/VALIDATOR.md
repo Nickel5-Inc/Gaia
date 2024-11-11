@@ -1,3 +1,6 @@
+# API's required
+
+
 #### Create .env file for validator with the following components:
 ```bash
 WALLET_NAME=<YOUR_WALLET.NAME>
