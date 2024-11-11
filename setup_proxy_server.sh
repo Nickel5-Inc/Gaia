@@ -1,71 +1,111 @@
 #!/bin/bash
 
-# Check if IP address is provided
-if [ $# -ne 1 ]; then
-    echo "Usage: $0 <ip-address>"
-    echo "Example: $0 192.168.1.100"
+# Default values for flags
+SERVER_NAME="example.com"
+SERVER_IP="127.0.0.1"
+PORT="33333"
+
+# Function to display usage
+usage() {
+    echo "Usage: $0 --server_name <server_name> --ip <ip_address> --port <port>"
+    echo "Example: $0 --server_name example.com --ip 192.168.1.100 --port 33333"
     exit 1
+}
+
+# Parse flags using getopt
+OPTS=$(getopt -o '' -l server_name:,ip:,port: -- "$@")
+if [ $? != 0 ]; then usage; fi
+
+eval set -- "$OPTS"
+while true; do
+    case "$1" in
+        --server_name)
+            SERVER_NAME="$2"; shift 2 ;;
+        --ip)
+            SERVER_IP="$2"; shift 2 ;;
+        --port)
+            PORT="$2"; shift 2 ;;
+        --)
+            shift; break ;;
+        *)
+            usage ;;
+    esac
+done
+
+# Check if IP address is provided
+if [[ -z "$SERVER_IP" ]]; then
+    echo "Error: IP address is required."
+    usage
 fi
 
-SERVER_IP="$1"
-
 # Install NGINX if not already installed
-sudo apt update
-sudo apt install -y nginx
+if ! command -v nginx &> /dev/null; then
+    sudo apt update && sudo apt install -y nginx || { echo "Failed to install NGINX"; exit 1; }
+fi
 
 # Create SSL directory
 sudo mkdir -p /etc/nginx/ssl
 
-# Generate self-signed certificate if it doesn't exist
-if [ ! -f /etc/nginx/ssl/nginx.crt ]; then
-    sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout /etc/nginx/ssl/nginx.key \
-        -out /etc/nginx/ssl/nginx.crt \
-        -subj "/C=US/ST=State/L=City/O=Organization/CN=$SERVER_IP"
-fi
+# Create OpenSSL config file with IP SANs
+cat > /tmp/openssl.cnf << EOF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+req_extensions = req_ext
+distinguished_name = dn
 
-# Create NGINX config with properly escaped variables
-sudo bash -c "cat > /etc/nginx/sites-available/validator-miner << 'EOF'
-server {
-    listen 80;
-    server_name $SERVER_IP;
-    return 301 https://\$server_name\$request_uri;
-}
+[dn]
+C=US
+ST=State
+L=City
+O=Organization
+CN=${SERVER_NAME}
 
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = ${SERVER_NAME}
+DNS.2 = localhost
+IP.1 = ${SERVER_IP}
+IP.2 = 127.0.0.1
+EOF
+
+# Generate self-signed certificate with IP SANs
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout /etc/nginx/ssl/nginx.key \
+    -out /etc/nginx/ssl/nginx.crt \
+    -config /tmp/openssl.cnf \
+    -extensions req_ext
+
+# Remove temporary OpenSSL config
+rm /tmp/openssl.cnf
+
+# Set proper permissions for the certificate files
+sudo chmod 644 /etc/nginx/ssl/nginx.crt
+sudo chmod 600 /etc/nginx/ssl/nginx.key
+
+# Create NGINX config file for this port
+CONFIG_FILE="/etc/nginx/sites-available/validator-miner-${PORT}"
+
+# Create NGINX config for this specific port
+sudo bash -c "cat > ${CONFIG_FILE} << 'EOF'
+# Server block for port ${PORT}
 server {
-    listen 443 ssl;
-    server_name $SERVER_IP;
+    listen ${PORT} ssl;
+    listen [::]:${PORT} ssl;
+    server_name ${SERVER_NAME} ${SERVER_IP};
 
     ssl_certificate /etc/nginx/ssl/nginx.crt;
     ssl_certificate_key /etc/nginx/ssl/nginx.key;
 
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
     ssl_prefer_server_ciphers off;
 
     location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-
-server {
-    listen 33333 ssl;
-    server_name $SERVER_IP;
-
-    ssl_certificate /etc/nginx/ssl/nginx.crt;
-    ssl_certificate_key /etc/nginx/ssl/nginx.key;
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
-    ssl_prefer_server_ciphers off;
-
-    location / {
-        proxy_pass http://127.0.0.1:33334;
+        proxy_pass http://127.0.0.1:$((${PORT} + 1));
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -75,19 +115,27 @@ server {
 }
 EOF"
 
-# Enable the configuration
-sudo ln -sf /etc/nginx/sites-available/validator-miner /etc/nginx/sites-enabled/
+# Enable the configuration for this port
+sudo ln -sf ${CONFIG_FILE} /etc/nginx/sites-enabled/
+
+# Remove any conflicting configurations
 sudo rm -f /etc/nginx/sites-enabled/default
 
-# Kill any process using our ports
-sudo fuser -k 80/tcp 2>/dev/null || true
-sudo fuser -k 443/tcp 2>/dev/null || true
-sudo fuser -k 33333/tcp 2>/dev/null || true
+# Kill any process using the specified port
+sudo fuser -k "${PORT}"/tcp 2>/dev/null || true
 
-# Stop NGINX if it's running
-sudo systemctl stop nginx
+# Make sure NGINX is running and then reload configuration
+echo "Starting NGINX service..."
+sudo systemctl start nginx || { echo "Failed to start NGINX"; exit 1; }
 
-# Test and restart NGINX
-sudo nginx -t && sudo systemctl restart nginx
+echo "Testing NGINX configuration..."
+if sudo nginx -t; then
+    echo "NGINX configuration test passed. Reloading NGINX..."
+    sudo systemctl reload nginx || sudo systemctl restart nginx
+else
+    echo "NGINX configuration test failed!"
+    exit 1
+fi
 
-echo "NGINX setup complete! Both services are now accessible via HTTPS."
+echo "NGINX setup complete! Server available on $SERVER_NAME with IP $SERVER_IP at port $PORT"
+echo "Forwarding to port $((PORT + 1))"
