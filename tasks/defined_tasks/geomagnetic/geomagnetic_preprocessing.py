@@ -2,6 +2,7 @@ from tasks.base.components.preprocessing import Preprocessing
 import pandas as pd
 from models.geomag_basemodel import GeoMagBaseModel
 
+
 class GeomagneticPreprocessing(Preprocessing):
     def preprocess(self, data: pd.DataFrame):
         """
@@ -27,16 +28,24 @@ class GeomagneticPreprocessing(Preprocessing):
             model (object, optional): A custom model object with a `predict` method.
 
         Returns:
-            int or None: Predicted DST value for the next hour, or None if an error occurs.
+            dict: Predicted DST value and timestamp in UTC.
         """
         # Use the provided model, or fall back to the base model if none is provided
         if model is None:
             model = GeoMagBaseModel()  # Initialize the base model
 
+        # Ensure the timestamp is in UTC format
+        last_timestamp = processed_data['timestamp'].iloc[-1]
+        last_timestamp_utc = last_timestamp.tz_convert('UTC') if last_timestamp.tzinfo else last_timestamp
+
         try:
             # Assume the model has a `predict` method that takes the processed data
             prediction = model.predict(processed_data)
-            return int(prediction)
         except Exception as e:
             print(f"Error in model prediction: {e}")
             return None
+
+        return {
+            "predicted_value": int(prediction),
+            "timestamp": last_timestamp_utc
+        }

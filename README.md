@@ -19,6 +19,7 @@ Validators will connect to a few API's to provide miners with the data they need
 Gaia is built on Fiber, the package developed by Namoray to simplify Subnets. 
 
 ### Install fiber
+
 ----
 ```bash
 pip install "git+https://github.com/rayonlabs/fiber.git@1.0.0#egg=fiber[full]"
