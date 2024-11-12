@@ -4,31 +4,22 @@ from tasks.defined_tasks.geomagnetic.geomagnetic_inputs import GeomagneticInputs
 from tasks.defined_tasks.geomagnetic.geomagnetic_preprocessing import GeomagneticPreprocessing
 from tasks.defined_tasks.geomagnetic.geomagnetic_scoring_mechanism import GeomagneticScoringMechanism
 from tasks.defined_tasks.geomagnetic.geomagnetic_outputs import GeomagneticOutputs
+import datetime
+import numpy as np
 import pandas as pd
+
 
 class GeomagneticTask(Task):
     """
-    A task class for processing and analyzing geomagnetic data.
+    A task class for processing and analyzing geomagnetic data, with
+    execution methods for both miner and validator workflows.
 
-    The task workflow includes:
-        1. Metadata Configuration: Initializes task-specific metadata
-           for data source tracking, date range configuration, and other
-           relevant parameters through the GeomagneticMetadata class.
-
-        2. Input Handling: Uses GeomagneticInputs to load and validate raw
-           geomagnetic data from specified sources or file paths.
-
-        3. Preprocessing: Applies geomagnetic-specific preprocessing steps
-           on validated data via GeomagneticPreprocessing, utilizing utilities
-           for data transformation, filtering, and structuring.
-
-        4. Scoring Mechanism: Calculates scores or performance metrics
-           based on the preprocessed data using GeomagneticScoringMechanism,
-           which supports custom scoring logic tailored for geomagnetic data.
-
-        5. Output Management: Formats and saves the task’s output, ensuring
-           results are stored in the desired format and location, managed
-           by the GeomagneticOutputs component.
+    This task involves:
+        - Querying miners for predictions
+        - Adding predictions to a queue for scoring
+        - Fetching ground truth data
+        - Scoring predictions
+        - Moving scored tasks to history
 
     Attributes:
         name (str): The name of the task, set as "GeomagneticTask".
@@ -42,11 +33,10 @@ class GeomagneticTask(Task):
 
     Example:
         task = GeomagneticTask()
-        formatted_results = task.validator_execute(data, actual_value)
-
-    This example initializes a GeomagneticTask instance and executes
-    the task, performing each stage of data processing and scoring.
+        task.miner_execute()
+        task.validator_execute()
     """
+
     def __init__(self):
         super().__init__(
             name="GeomagneticTask",
@@ -59,68 +49,118 @@ class GeomagneticTask(Task):
             outputs=GeomagneticOutputs()
         )
 
-    def validator_prepare_subtasks(self):
-        """
-        Atomic task, so no subtasks to prepare.
-        """
-        pass
+    ############################################################
+    # Validator execution method
+    ############################################################
 
-    def validator_execute(self, data: pd.DataFrame, actual_value: int):
+    def validator_execute(self):
         """
-        Executes the validation workflow, processing and scoring the data.
+        Executes the validator workflow: checks tasks ready for scoring,
+        fetches ground truth, scores predictions, and moves completed
+        tasks to the history table.
+        """
+        # Step 1: Check the task queue for tasks older than 1 hour
+        tasks = self.get_pending_tasks()
+        current_time = datetime.datetime.utcnow()
 
-        Args:
-            data (pd.DataFrame): The recent cleaned geomagnetic data.
-            actual_value (int): The real DST value for scoring the prediction.
+        for task in tasks:
+            task_age = (current_time - task['query_time']).total_seconds() / 3600
+            if task_age >= 1:
+                # Step 2: Fetch ground truth data
+                ground_truth_value = self.fetch_ground_truth()
+                if ground_truth_value is not None:
+                    # Step 3: Score predictions
+                    scores = self.score_predictions(task['predicted_values'], ground_truth_value)
+
+                    # Step 4: Move scored task to history and remove from queue
+                    self.move_task_to_history(task, ground_truth_value, scores, current_time)
+                    print(f"Task scored and moved to history at {current_time}")
+
+    def get_pending_tasks(self):
+        """
+        Fetches pending tasks from the task queue that are ready for scoring.
 
         Returns:
-            np.ndarray or None: The formatted results if successful, None otherwise.
+            list: List of tasks with `predicted_values` and `query_time`.
         """
-        try:
-            # Step 1: Load and validate the data
-            validated_data = self.inputs.load_data(data)
-            if not self.inputs.validate_data(validated_data):
-                print("Data validation failed.")
-                return None
+        # Fetch from database where status is "pending"
+        return []  # Replace with actual database fetch
 
-            # Step 2: Preprocess the data and make a prediction
-            preprocessed_data = self.preprocessing.preprocess(validated_data)
-            predicted_value = self.preprocessing.predict_next_hour(preprocessed_data)
-
-            # Step 3: Calculate the score based on predicted vs. actual value
-            score = self.scoring_mechanism.calculate_score(predicted_value, actual_value)
-
-            # Step 4: Format and return the results
-            formatted_results = self.outputs.format_results([score])
-            return formatted_results
-        except Exception as e:
-            print(f"Error executing validation task: {e}")
-            return None
-
-    def validator_preprocess(self):
+    def fetch_ground_truth(self):
         """
-        Atomic task, so no preprocessing to perform.
-        """
-        pass
+        Fetches the current ground truth DST value.
 
-    def validator_score(self):
+        Returns:
+            int: The real-time DST value.
         """
-        Atomic task, so no scoring to perform.
+        # Fetch real-time data from an API or other source
+        # Example: ground_truth_value = api.get_latest_dst_value()
+        ground_truth_value = np.random.randint(-100, 100)  # Simulated for example
+        return ground_truth_value
+
+    def score_predictions(self, predicted_values, ground_truth_value):
         """
-        pass
+        Scores the predictions using a distance function against the ground truth value.
+
+        Args:
+            predicted_values (np.ndarray): Array of predicted DST values.
+            ground_truth_value (int): Actual DST value.
+
+        Returns:
+            np.ndarray: Array of scores for each prediction.
+        """
+        return np.abs(predicted_values - ground_truth_value)  # Example: absolute error
+
+    def move_task_to_history(self, task, ground_truth_value, scores, score_time):
+        """
+        Moves a completed task from the queue to the history table.
+
+        Args:
+            task (dict): Task details including `predicted_values` and `query_time`.
+            ground_truth_value (int): Actual DST value.
+            scores (np.ndarray): Array of scores.
+            score_time (datetime): The time the scoring was completed.
+        """
+        # Insert into history table and delete from queue table
+        # Example: db.insert("history", {...}); db.delete("task_queue", task_id=task["id"])
+        pass  # Replace with actual database code
 
     ############################################################
-    # Miner methods
+    # Miner execution method
     ############################################################
-
-    def miner_preprocess(self):
-        """
-        Placeholder for miner-specific preprocessing logic, if required.
-        """
-        pass
 
     def miner_execute(self):
         """
-        Placeholder for miner-specific execution logic, if required.
+        Executes the miner workflow: queries miners, collects responses,
+        and adds predictions to task queue.
         """
-        pass
+        # Step 1: Query miners and collect predictions
+        predictions = self.query_miners()  # This would call miners to get their predictions
+
+        # Step 2: Add predictions to task queue
+        query_time = datetime.datetime.utcnow()
+        self.add_task_to_queue(predictions, query_time)
+        print(f"Added task to queue at {query_time} with {len(predictions)} predictions.")
+
+    def query_miners(self):
+        """
+        Simulates querying miners and collecting predictions. Replace with actual miner querying logic.
+
+        Returns:
+            np.ndarray: Array of 256 predictions from miners.
+        """
+        # Simulate getting predictions from miners
+        predictions = np.random.randint(-100, 100, size=256)  # Example of simulated predictions
+        return predictions
+
+    def add_task_to_queue(self, predictions, query_time):
+        """
+        Adds a new task to the task queue (database or other storage).
+
+        Args:
+            predictions (np.ndarray): Array of predictions from miners.
+            query_time (datetime): The time the task was added.
+        """
+        # Database insertion logic here
+        # Example: db.insert("task_queue", {"predicted_values": predictions, "query_time": query_time, "status": "pending"})
+        pass  # Replace with actual database code
