@@ -43,8 +43,8 @@ def parse_data(data):
             parse_line(line)
 
     # Debugging output to check if any dates and values are parsed
-    print(f"Parsed dates: {dates[:5]}")  # Display first 5 dates for inspection
-    print(f"Parsed hourly_values: {hourly_values[:5]}")  # Display first 5 values for inspection
+    #print(f"Parsed dates: {dates[:5]}")  # Display first 5 dates for inspection
+    print(f"Parsed hourly_values: {hourly_values[:1]}")  # Display first 5 values for inspection
 
     return pd.DataFrame({'timestamp': dates, 'Dst': hourly_values})
 
