@@ -46,6 +46,7 @@ fi
 # Create SSL directory
 sudo mkdir -p /etc/nginx/ssl
 
+<<<<<<< HEAD
 # Generate self-signed certificate if it doesn't exist
 if [ ! -f /etc/nginx/ssl/nginx.crt ]; then
     sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
@@ -57,13 +58,62 @@ fi
 # Create or update the NGINX config file for this port
 CONFIG_FILE="/etc/nginx/sites-available/validator-miner-${PORT}"
 
+=======
+# Create OpenSSL config file with IP SANs
+cat > /tmp/openssl.cnf << EOF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+req_extensions = req_ext
+distinguished_name = dn
+
+[dn]
+C=US
+ST=State
+L=City
+O=Organization
+CN=${SERVER_NAME}
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = ${SERVER_NAME}
+DNS.2 = localhost
+IP.1 = ${SERVER_IP}
+IP.2 = 127.0.0.1
+EOF
+
+# Generate self-signed certificate with IP SANs
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout /etc/nginx/ssl/nginx.key \
+    -out /etc/nginx/ssl/nginx.crt \
+    -config /tmp/openssl.cnf \
+    -extensions req_ext
+
+# Remove temporary OpenSSL config
+rm /tmp/openssl.cnf
+
+# Set proper permissions for the certificate files
+sudo chmod 644 /etc/nginx/ssl/nginx.crt
+sudo chmod 600 /etc/nginx/ssl/nginx.key
+
+# Create NGINX config file for this port
+CONFIG_FILE="/etc/nginx/sites-available/validator-miner-${PORT}"
+
+>>>>>>> integration
 # Create NGINX config for this specific port
 sudo bash -c "cat > ${CONFIG_FILE} << 'EOF'
 # Server block for port ${PORT}
 server {
     listen ${PORT} ssl;
     listen [::]:${PORT} ssl;
+<<<<<<< HEAD
     server_name ${SERVER_NAME};
+=======
+    server_name ${SERVER_NAME} ${SERVER_IP};
+>>>>>>> integration
 
     ssl_certificate /etc/nginx/ssl/nginx.crt;
     ssl_certificate_key /etc/nginx/ssl/nginx.key;
