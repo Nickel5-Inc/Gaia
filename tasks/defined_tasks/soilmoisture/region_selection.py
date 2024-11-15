@@ -67,7 +67,7 @@ def select_1x1_degree_box_in_square(square, hex_polygon):
     else:
         return None
 
-def select_random_1x1_box(base_cells, urban_cells_set, lakes_cells_set, min_lat=-56, max_lat=60):
+def select_random_region(base_cells, urban_cells_set, lakes_cells_set, min_lat=-56, max_lat=60):
     """Randomly select a 1x1 degree box that does not overlap urban or lake cells within given lat/lon bounds."""
     base_cell = select_random_base_cell(base_cells, resolution=2, min_lat=min_lat, max_lat=max_lat)
     
@@ -96,7 +96,7 @@ base_cells = [{"index": cell["index"], "resolution": cell["resolution"]} for cel
 urban_cells_set = set(cell["index"] for cell in data["urban_overlay_cells"])
 lakes_cells_set = set(cell["index"] for cell in data["lakes_overlay_cells"])
 try:
-    random_1x1_box = select_random_1x1_box(base_cells, urban_cells_set, lakes_cells_set, min_lat=-56, max_lat=60)
-    print("Selected 1x1 degree box (min_lon, min_lat, max_lon, max_lat):", random_1x1_box)
+    random_region = select_random_region(base_cells, urban_cells_set, lakes_cells_set, min_lat=-56, max_lat=60)
+    print("Selected 1x1 degree region (min_lon, min_lat, max_lon, max_lat):", random_region)
 except ValueError as e:
     print(e)

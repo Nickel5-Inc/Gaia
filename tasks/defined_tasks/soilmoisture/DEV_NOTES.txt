@@ -29,3 +29,12 @@ region_selection.py - Randomly selects 1x1 degree boxes from the H3 map,
                     - hexagon is selected from the base cells, and then a 1x1 degree box is selected from that hexagon
                     - urban and lake/large river overlay cells checked to avoid selecting over cities or water
                     - min_lat/max_lat to avoid selecting over the poles
+
+
+Task workflow: 
+
+Validator:
+Region Selection → Data Collection → Package Data, bounds, crs → Send to Miners → wait 3 days → Get Ground Truth → Score
+
+Miner:
+Receive Data → Preprocess → Run Model → Return Predictions, bounds, crs to every validator
