@@ -15,3 +15,25 @@ MIN_STAKE_THRESHOLD=<INT>
 cd validator
 python validator.py
 ```
+
+
+
+
+## General Notes and Structure
+
+
+The validator neuron is responsible for gathering & processing data for tasks, constructing queries, sending requests to miners, and scoring results from those requests.
+
+It runs similar to an Operating System.
+
+
+## Main Loop
+
+
+
+
+
+
+
+
+

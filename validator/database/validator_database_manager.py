@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 import os
 import json
 from pathlib import Path
+from datetime import datetime
 
 class ValidatorDatabaseManager(BaseDatabaseManager):
     """
@@ -29,36 +30,128 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         super().__init__('validator', host, port, user, password, min_size, max_size)
 
     async def initialize_database(self):
-        """
-        Initialize the validator database schema.
-        Creates all necessary tables for validator operations.
-
-
-        Process Queue:
-            The process queue is a table that stores the status of processes related to tasks. 
-            The validator will loop through the queue and execute tasks based on their status/priority.
-            For example - tasks will have preprocessing, querying, and postprocessing steps.
-
-        """
-        # Get Task-Specific Table Schemas
-        await self.load_task_schemas()
+        """Initialize the queue tables"""
         async with self.get_connection() as conn:
-            # Create core validator tables
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS process_queue (
-                    name TEXT,
-                    uuid TEXT PRIMARY KEY,
-                    status TEXT NOT NULL,
+                    id SERIAL PRIMARY KEY,
+                    process_type VARCHAR(50) NOT NULL,  -- 'network' or 'compute'
+                    process_name VARCHAR(100) NOT NULL,
+                    task_id INTEGER, -- id of the calling task
+                    task_name VARCHAR(100), -- name of the calling task
+                    priority INTEGER DEFAULT 0, 
+                    status VARCHAR(50) DEFAULT 'pending',
+                    payload BYTEA,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                    priority INTEGER DEFAULT 0
-                      
+                    started_at TIMESTAMP WITH TIME ZONE,
+                    completed_at TIMESTAMP WITH TIME ZONE,
+                    complete_by TIMESTAMP WITH TIME ZONE, -- Some tasks may have a deadline - we should increase priority as deadline approaches.
+                    expected_execution_time INTEGER, -- Expected time taken to complete the task on the minimum hardware. 
+                    execution_time INTEGER, -- Time taken to complete the task
+                    error TEXT,
+                    retries INTEGER DEFAULT 0,
+                    max_retries INTEGER DEFAULT 3
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_process_queue_status ON process_queue(status);
+                CREATE INDEX IF NOT EXISTS idx_process_queue_priority ON process_queue(priority);
             """)
-    
 
 
 
+
+
+
+    ##### QUEUE TABLE FUNCTIONS #####
+    async def add_to_queue(self, 
+                          process_type: str, 
+                          process_name: str, 
+                          payload: bytes,
+                          task_id: Optional[int] = None,
+                          task_name: Optional[str] = None,
+                          priority: int = 0,
+                          complete_by: Optional[datetime] = None,
+                          expected_execution_time: Optional[int] = None):
+        """
+        Add a process to the queue.
+        
+        Args:
+            process_type (str): Type of process ('network' or 'compute')
+            process_name (str): Name of the process
+            payload (bytes): Binary data payload for the process
+            task_id (Optional[int]): ID of the calling task if applicable
+            task_name (Optional[str]): Name of the calling task
+            priority (int): Priority level (higher = more priority)
+            complete_by (Optional[datetime]): Deadline for task completion
+            expected_execution_time (Optional[int]): Expected execution time in seconds
+        """
+        async with self.get_connection() as conn:
+            await conn.execute("""
+                INSERT INTO process_queue (
+                    process_type,
+                    process_name,
+                    payload,
+                    task_id,
+                    task_name,
+                    priority,
+                    complete_by,
+                    expected_execution_time
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """, 
+            process_type,
+            process_name,
+            payload,
+            task_id,
+            task_name,
+            priority,
+            complete_by,
+            expected_execution_time
+            )
+
+    async def get_next_task(self, task_type: str = None):
+        """Get the next task from the queue"""
+        async with self.get_connection() as conn:
+            query = """
+                UPDATE process_queue 
+                SET status = 'processing', started_at = CURRENT_TIMESTAMP
+                WHERE id = (
+                    SELECT id FROM process_queue
+                    WHERE status = 'pending'
+                    AND retries < max_retries
+                    {}
+                    ORDER BY priority DESC, created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                RETURNING *
+            """.format("AND task_type = $1" if task_type else "")
+            
+            return await conn.fetchrow(query, task_type if task_type else None)
+
+    async def complete_task(self, task_id: int, error: str = None):
+        """Mark a task as completed or failed"""
+        async with self.get_connection() as conn:
+            if error:
+                await conn.execute("""
+                    UPDATE process_queue 
+                    SET status = 'failed',
+                        completed_at = CURRENT_TIMESTAMP,
+                        error = $2,
+                        retries = retries + 1
+                    WHERE id = $1
+                """, task_id, error)
+            else:
+                await conn.execute("""
+                    UPDATE process_queue 
+                    SET status = 'completed',
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE id = $1
+                """, task_id)
+
+
+
+    ##### LOAD TASK SPECIFIC TABLES #####
     async def load_task_schemas(self) -> Dict[str, Dict[str, Any]]:
         """
         Load database schemas for all tasks from their respective schema.json files.

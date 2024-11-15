@@ -30,6 +30,8 @@ class GaiaValidator:
         self.metagraph = None
         self.config = None
         self.database_manager = ValidatorDatabaseManager()
+        self.weights = None # TODO: Implement weights
+
     
     def setup_neuron(self) -> bool:
         """
@@ -127,71 +129,115 @@ class GaiaValidator:
             logger.error("Metagraph not initialized, exiting...")
             return
 
-        while True:  # Main loop
+        # Initialize database tables
+        await self.database_manager.initialize_database()
+
+        async def network_worker():
+            """Handle network operations (miner queries, API calls)"""
+            while True:
+                try:
+                    task = await self.database_manager.get_next_task('network')
+                    if task:
+                        try:
+                            ssl_context = ssl.create_default_context()
+                            ssl_context.check_hostname = False
+                            ssl_context.verify_mode = ssl.CERT_NONE
+                            
+                            async with httpx.AsyncClient(
+                                timeout=30.0,
+                                follow_redirects=True,
+                                verify=ssl_context,
+                            ) as client:
+                                if task['process_name'] == 'query_miners':
+                                    await self.query_miners(client, task['payload'])
+                                elif task['process_name'] == 'sync_metagraph':
+                                    await self.metagraph.sync_nodes()
+                                elif task['process_name'] == 'fetch_ground_truth':
+                                    await self._fetch_ground_truth(client, task)
+                                
+                                await self.database_manager.complete_task(task['id'])
+                        except Exception as e:
+                            await self.database_manager.complete_task(task['id'], str(e))
+                except Exception as e:
+                    logger.error(f"Network worker error: {e}")
+                await asyncio.sleep(1)
+
+        async def compute_worker():
+            """Handle compute-intensive processes"""
+            while True:
+                try:
+                    task = await self.database_manager.get_next_task('compute')
+                    if task:
+                        try:
+                            if task['process_name'] == 'score_predictions':
+                                await self._score_predictions(task)
+                            elif task['process_name'] == 'process_region_data':
+                                await self._process_region_data(task)
+                            
+                            await self.database_manager.complete_task(task['id'])
+                        except Exception as e:
+                            await self.database_manager.complete_task(task['id'], str(e))
+                except Exception as e:
+                    logger.error(f"Compute worker error: {e}")
+                await asyncio.sleep(1)
+
+        # Start workers
+        workers = [
+            asyncio.create_task(network_worker()),
+            asyncio.create_task(compute_worker())
+        ]
+
+        # Main scheduling loop
+        while True:
             try:
+                current_time = datetime.datetime.now(datetime.timezone.utc)
 
-                #START SERVER
+                # Schedule metagraph sync
+                await self.database_manager.add_to_queue(
+                    process_type='network',
+                    process_name='sync_metagraph',
+                    payload=None,
+                    priority=1
+                )
 
+                # Check for tasks ready for scoring
+                for task_type in ['geomagnetic', 'soil_moisture']:
+                    pending_tasks = await self.database_manager.get_tasks_ready_for_scoring(
+                        task_type=task_type,
+                        current_time=current_time
+                    )
+                    
+                    for task in pending_tasks:
+                        # Schedule ground truth fetching
+                        await self.database_manager.add_to_queue(
+                            process_type='network',
+                            process_name='fetch_ground_truth',
+                            payload={'task_id': task['id']},
+                            priority=2
+                        )
 
-                #PROCESS HANDLING
-
-
-                # Check process queue for processes to execute
-
-
-
-                # Execute processes
-                
-
-
-
-                # Schedule new processes, if necessary
-
-
-
-
-
-
+                # Schedule new task creation if needed
+                tasks_count = await self.database_manager.get_active_tasks_count()
+                if tasks_count < self.max_concurrent_tasks:
+                    await self._schedule_new_task()
 
                 await self.status_logger()
-
-                logger.info("Starting new iteration of miner queries...")
-                
-                # Create a custom SSL context that ignores hostname mismatches
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE  # This is necessary for self-signed certs
-                
-                async with httpx.AsyncClient(
-                    timeout=30.0,
-                    follow_redirects=True,
-                    verify=ssl_context,
-                ) as httpx_client:
-                    await self.query_miners(httpx_client)
-                
-                logger.info("Completed iteration. Waiting 5 minutes before next round...")
-                await asyncio.sleep(300)  # 5 minutes = 300 seconds
-                
-            except Exception as e:
-                logger.error(f"Error in main loop: {e}")
-                logger.info("Will retry in 5 minutes...")
                 await asyncio.sleep(300)
 
-    async def status_logger(self):
-        """
-        Log the status of the validator.
+            except Exception as e:
+                logger.error(f"Main loop error: {e}")
+                await asyncio.sleep(300)
 
-        
-        """
+        # Wait for workers to complete
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+
+    async def status_logger(self):
+        """Log the status of the validator."""
         current_time_utc = datetime.datetime.now(datetime.timezone.utc)
         formatted_time = current_time_utc.strftime("%Y-%m-%d %H:%M:%S")
-
-
-
-        # 
         logger.info(f"Current time (UTC): {formatted_time}")
-
-        pass
 
 if __name__ == "__main__":
     parser = ArgumentParser()
