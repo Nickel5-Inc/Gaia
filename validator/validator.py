@@ -1,6 +1,8 @@
+import datetime
 import os
 import asyncio
 import ssl
+from typing import Any, Optional
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import httpx
@@ -10,6 +12,9 @@ from fiber.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
 from substrateinterface import SubstrateInterface
 from tasks.defined_tasks.geomagnetic.utils.process_geomag_data import get_latest_geomag_data
+from validator.database.validator_database_manager import ValidatorDatabaseManager
+from tasks.base.components.inputs import Inputs
+from tasks.base.components.outputs import Outputs
 from argparse import ArgumentParser
 
 logger = get_logger(__name__)
@@ -19,12 +24,13 @@ class GaiaValidator:
     def __init__(self, args):
         """
         Initialize the GaiaValidator with provided arguments.
-        
+
         """
         self.args = args
         self.metagraph = None
+        self.config = None
+        self.database_manager = ValidatorDatabaseManager()
     
-
     def setup_neuron(self) -> bool:
         """
         Set up the neuron with necessary configurations and connections.
@@ -61,7 +67,7 @@ class GaiaValidator:
             logger.error(f"Error setting up neuron: {e}")
             return False
 
-    async def query_miners(self, httpx_client):
+    async def query_miners(self, httpx_client, payload: Optional[Inputs] = None) -> Outputs:
         """Handle the miner querying logic"""
         self.metagraph.sync_nodes()
 
@@ -110,6 +116,8 @@ class GaiaValidator:
             except Exception as e:
                 logger.error(f"Error with miner {miner_hotkey}: {e}")
 
+
+
     async def main(self):
         if not self.setup_neuron():
             logger.error("Failed to setup neuron, exiting...")
@@ -121,6 +129,32 @@ class GaiaValidator:
 
         while True:  # Main loop
             try:
+
+                #START SERVER
+
+
+                #PROCESS HANDLING
+
+
+                # Check process queue for processes to execute
+
+
+
+                # Execute processes
+                
+
+
+
+                # Schedule new processes, if necessary
+
+
+
+
+
+
+
+                await self.status_logger()
+
                 logger.info("Starting new iteration of miner queries...")
                 
                 # Create a custom SSL context that ignores hostname mismatches
@@ -143,6 +177,21 @@ class GaiaValidator:
                 logger.info("Will retry in 5 minutes...")
                 await asyncio.sleep(300)
 
+    async def status_logger(self):
+        """
+        Log the status of the validator.
+
+        
+        """
+        current_time_utc = datetime.datetime.now(datetime.timezone.utc)
+        formatted_time = current_time_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+
+
+        # 
+        logger.info(f"Current time (UTC): {formatted_time}")
+
+        pass
 
 if __name__ == "__main__":
     parser = ArgumentParser()

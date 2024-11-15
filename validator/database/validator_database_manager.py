@@ -55,6 +55,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                       
                 );
             """)
+    
+
+
 
     async def load_task_schemas(self) -> Dict[str, Dict[str, Any]]:
         """
