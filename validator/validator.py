@@ -17,10 +17,23 @@ logger = get_logger(__name__)
 
 class GaiaValidator:
     def __init__(self, args):
+        """
+        Initialize the GaiaValidator with provided arguments.
+        
+        """
         self.args = args
         self.metagraph = None
+    
 
     def setup_neuron(self) -> bool:
+        """
+        Set up the neuron with necessary configurations and connections.
+        This method is responsible for:
+        - Loading environment variables
+        - Setting up the netuid and chain endpoint
+        - Loading the wallet and keypair
+        - Initializing the substrate interface and metagraph
+        """
         try:
             load_dotenv(".env")
 
