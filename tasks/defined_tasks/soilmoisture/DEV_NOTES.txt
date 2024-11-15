@@ -1,0 +1,31 @@
+TODO:
+    H3 MAP is too large to host on github, will need to pull from huggingface
+    currently IFS data, and smap are stored locally in the directory
+    Need to add packages to requirements.txt and fix imports
+    Tweaks to daily dataset checks
+    .env for api auth
+
+Inference_classes.py - miner side: takes in the combined .tif and prepares to feed into model
+                     - probs needs some reworking
+
+Training_classes.py -  Dataset classes I used for training/val/test 
+                    - will move to HG before launch, here for reference
+
+smap_api.py - functions to get SMAP data for scoring, downloads once for each timestep, and parses for each region
+            - need to pass datetime of prediction, sentinel2 bounds, and sentinel2 crs for correct alignment
+
+soil_model.py - model architecture
+              - will change to use ifs weather
+
+soil_apis.py - apis + methods for pulling sentinel2, IFS forcasting, SRTM, NDVI, parsing into region
+             - Evaporation bands are computed using the IFS forcasting data
+             - mosaics srtm data since srtm is tiled in 1 degree steps,
+             - aligns all regions based on sentinel2 bounds NOT bbox given. 
+             - IFS is downloaded once a day with 4 6hr timesteps, and cropped for each region 
+             - .tiff is returned with all data with band ordering [sentinel2 bands, IFS bands, SRTM, NDVI]
+             - sentinel2 region bounds and crs are returned, need to store these for scoring
+
+region_selection.py - Randomly selects 1x1 degree boxes from the H3 map, 
+                    - hexagon is selected from the base cells, and then a 1x1 degree box is selected from that hexagon
+                    - urban and lake/large river overlay cells checked to avoid selecting over cities or water
+                    - min_lat/max_lat to avoid selecting over the poles
