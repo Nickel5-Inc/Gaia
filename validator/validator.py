@@ -17,6 +17,7 @@ from tasks.base.components.inputs import Inputs
 from tasks.base.components.outputs import Outputs
 from argparse import ArgumentParser
 
+
 logger = get_logger(__name__)
 
 
@@ -216,7 +217,7 @@ class GaiaValidator:
                             priority=2
                         )
 
-                # Schedule new task creation if needed
+                # Schedule new process creation if needed
                 tasks_count = await self.database_manager.get_active_tasks_count()
                 if tasks_count < self.max_concurrent_tasks:
                     await self._schedule_new_task()

@@ -40,8 +40,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     task_id INTEGER, -- id of the calling task
                     task_name VARCHAR(100), -- name of the calling task
                     priority INTEGER DEFAULT 0, 
-                    status VARCHAR(50) DEFAULT 'pending',
+                    status VARCHAR(50) DEFAULT 'pending', -- pending, processing, completed, failed 
                     payload BYTEA,
+                    start_processing_time TIMESTAMP WITH TIME ZONE, -- move task from pending to processing (for scheduled tasks that can't execute immediately)
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     started_at TIMESTAMP WITH TIME ZONE,
                     completed_at TIMESTAMP WITH TIME ZONE,
@@ -56,7 +57,19 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 CREATE INDEX IF NOT EXISTS idx_process_queue_status ON process_queue(status);
                 CREATE INDEX IF NOT EXISTS idx_process_queue_priority ON process_queue(priority);
             """)
-
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS task_queue (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    task_type VARCHAR(50) NOT NULL,
+                    task_name VARCHAR(100) NOT NULL,
+                    process_ids (INTEGER,TEXT), -- list of processes ids that are spawned for this task
+                    
+                    complete_by TIMESTAMP WITH TIME ZONE, -- deadline for task completion
+                    payload BYTEA,
+                    
+                );
+            """)
 
 
 
