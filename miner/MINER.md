@@ -1,4 +1,4 @@
-## GEOMAGNETIC Task By *vValentine*  
+## GeoMagnetic Task 
 The Geomagnetic Task is designed to predict geomagnetic disturbances, specifically through the DST (Disturbance Storm 
 Time) index, an essential measure in space weather monitoring. Geomagnetic disturbances, driven by solar activity, can
 have significant impacts on Earth's technology systems, including GPS, communications, power grids, and satellites. 
@@ -12,14 +12,14 @@ disturbances.
 - The cleaned DataFrame will ONLY have data of the current month. 
 - Miners can ALWAYS retrieve more historical data to make prediction more accurate.
 
-## Steps for Running the Geomagnetic Task as a Miner
+### Steps for Running the Geomagnetic Task as a Miner
 
-### Step 1: Obtain and Prepare Data
+#### Step 1: Obtain and Prepare Data
 - **Retrieve Recent DST Data**:
   - Obtain a cleaned DataFrame (`data`) containing recent DST values, with required columns like `timestamp` and `value`.
   - This is from the Validator
 
-### Step 2: Choose the Model
+#### Step 2: Choose the Model
 - **Decide on the Model Source**:
   - You can choose between:
     - **Base Model from HuggingFace**: To use the model hosted on HuggingFace, set the `--use_base_model` flag when running the task.
@@ -35,7 +35,7 @@ disturbances.
     python start_miner.py
     ```
 
-### Step 3: Run `start_miner.py` to Initialize the Model
+#### Step 3: Run `start_miner.py` to Initialize the Model
 - **Run `start_miner.py`**:
   - Based on the flag, `start_miner.py` will initialize either the HuggingFace model or the local model.
   - The following code in `start_miner.py` will load the model accordingly:
@@ -51,7 +51,7 @@ disturbances.
     ```
   - This loads the model into the `geomag_model` variable, which will be used for predictions.
 
-### Step 4: Preprocess the Data (Optional)
+#### Step 4: Preprocess the Data (Optional)
 - **Prepare Data for Prediction**:
   - If further data transformation is needed, call the `preprocess` method from `GeomagneticPreprocessing`.
 
@@ -61,7 +61,7 @@ disturbances.
     processed_data = preprocessing.preprocess(data)
     ```
 
-### Step 5: Make the Prediction
+#### Step 5: Make the Prediction
 - **Predict the Next Hour’s DST Value**:
   - Use the initialized model to make a prediction by calling the `predict_next_hour` method in `GeomagneticPreprocessing`. This method will return both the predicted DST value and the timestamp in UTC.
 
@@ -73,7 +73,7 @@ disturbances.
 
   - Now, `predicted_value` contains the DST prediction, and `timestamp_utc` contains the timestamp in UTC format.
 
-### Step 6: Return the Prediction to the Validator
+#### Step 6: Return the Prediction to the Validator
 - **Package the Prediction Result**:
   - The miner should package the prediction result with the following data:
     - **Predicted DST Value**: The DST index predicted for the next hour.
@@ -86,7 +86,7 @@ disturbances.
     }
     ```
 
-### Step 7: Send the Prediction Results to the Validator
+#### Step 7: Send the Prediction Results to the Validator
 - **Submit the Results for Validation**:
   - The validator will use the real-time DST value to calculate the score based on the miner’s prediction.
   - If integrated within the `GeomagneticTask`, call the `validator_execute` method with the `data` and `actual_value` arguments.
@@ -106,9 +106,59 @@ The miner must return the following to the Validator for evaluation:
 - **Predicted DST Value**: The miner’s predicted DST index for the next hour.
 - **Timestamp (UTC)**: The UTC timestamp of the last observation used in the prediction, ensuring it’s standardized.
 
+---
+
+## Soil Moisture Task
+
+### Why It Matters
+Soil moisture is a critical factor in understanding environmental processes, agriculture, and weather forecasting. 
+Accurate soil moisture data helps: 
+- Optimize agricultural water use.
+- Predict droughts and floods.
+- Enhance weather and climate models.
+- Support ecological research.
+
+### What Data It Uses
+The soil moisture model integrates various datasets to provide comprehensive insights:
+1. **Sentinel-2 Imagery**:
+   - High-resolution satellite data for monitoring vegetation and land cover.
+2. **IFS Forecasting Data**:
+   - Supplies weather forecasts, including precipitation and temperature, relevant for soil moisture modeling.
+3. **SMAP Data**:
+   - Global soil moisture data for scoring and analysis.
+4. **SRTM Data**:
+   - Elevation data from the Shuttle Radar Topography Mission to incorporate terrain information.
+5. **NDVI (Normalized Difference Vegetation Index)**:
+   - Tracks vegetation health and coverage, crucial for understanding land surface conditions.
+
+**These datasets are aligned based on the Sentinel-2 region boundaries to ensure spatial consistency and precision.**
+
+### How to Run the Model
+
+#### Step 1: Prepare Data
+- Use **`region_selection.py`** to select random regions for analysis, avoiding urban areas and large water bodies.
+- Retrieve necessary datasets using **`soil_apis.py`**:
+  - Sentinel-2 imagery.
+  - IFS weather forecasts.
+  - SRTM elevation tiles.
+  - NDVI vegetation data.
+
+#### Step 2: Generate Model Input
+- Compile the data into a `.tiff` file with the following band order:
+  - `[Sentinel-2, IFS, SRTM, NDVI]`.
+- Store the corresponding bounds and CRS (Coordinate Reference System) for later validation.
+
+#### Step 3: Run the Soil Moisture Model
+- Use **`soil_model.py`** to process the `.tiff` file and generate soil moisture predictions.
+
+#### Step 4: Post-Processing
+- Run **`Inference_classes.py`** to format predictions and prepare them for validation.
+
+#### Step 5: Validation
+- Submit the predictions, along with region bounds and CRS, to the validator for comparison with ground truth data.
 
 
-## DESCRIPTION OF SOIL MOISTURE BY STEVEN - why it matters, what data it uses, how to run the model
+---
 
 #### Create dev.env file for miner with the following components:
 ```bash
