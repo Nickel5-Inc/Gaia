@@ -1,0 +1,18 @@
+{
+    "table_name": "soil_moisture_regions",
+    "database_type": "validator",
+    "columns": {
+        "id": "SERIAL PRIMARY KEY",
+        "region_date": "DATE NOT NULL",
+        "target_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+        "bbox": "JSONB NOT NULL",
+        "combined_data": "BYTEA NOT NULL",
+        "sentinel_bounds": "FLOAT[] NOT NULL",
+        "sentinel_crs": "INTEGER NOT NULL",
+        "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+    },
+    "indexes": [
+        {"column": "region_date", "unique": false},
+        {"column": "target_time", "unique": false}
+    ]
+}

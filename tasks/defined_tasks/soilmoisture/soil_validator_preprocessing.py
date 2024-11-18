@@ -52,6 +52,20 @@ class SoilValidatorPreprocessing(Preprocessing):
         count = self._daily_regions.get(today, 0)
         return count < self.max_daily_regions
 
+    def get_soil_data(self, bbox: Dict, current_time: datetime) -> Optional[Dict]:
+        """Collect and prepare data for a given region."""
+        try:
+            soil_data = get_soil_data(bbox=bbox, datetime_obj=current_time)
+            if soil_data is None:
+                print(f"Failed to get soil data for region {bbox}")
+                return None
+            
+            return soil_data
+            
+        except Exception as e:
+            print(f"Error collecting soil data: {str(e)}")
+            return None
+
     def get_daily_regions(self) -> List[Dict]:
         """Get all available regions and their data for today."""
         regions = []
@@ -76,17 +90,12 @@ class SoilValidatorPreprocessing(Preprocessing):
                     max_lat=60
                 )
                 
-                tiff_path, sentinel_bounds, sentinel_crs = get_soil_data(
-                    bbox=bbox,
-                    datetime_obj=current_time
-                )
-                
-                if all([tiff_path, sentinel_bounds, sentinel_crs]):
+                soil_data = self.get_soil_data(bbox, current_time)
+                if soil_data is not None:
                     regions.append({
                         'datetime': target_time,
-                        'combined_data': tiff_path,
-                        'sentinel_bounds': sentinel_bounds,
-                        'sentinel_crs': sentinel_crs,
+                        'bbox': bbox,
+                        **soil_data
                     })
                     
             except Exception as e:

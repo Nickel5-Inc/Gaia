@@ -50,7 +50,12 @@ class Task(BaseModel, ABC):
         # Composite task properties
         self.subtasks = subtasks
 
+        self.db = None  # Will be set by validator/miner on initialization
 
+    async def initialize_database(self):
+        """Initialize task-specific database tables"""
+        if not self.db:
+            raise RuntimeError("Database not initialized")
 
     ############################################################
     # Validator methods

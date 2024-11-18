@@ -57,22 +57,17 @@ class SoilMoistureTask(Task):
         regions = self.inputs.get_daily_regions()
         
         for region in regions:
-            soil_data = self.preprocessing.get_soil_data(region['bbox'], current_time)
-            if soil_data is None:
-                print(f"Failed to get soil data for region {region['bbox']}")
-                continue
-            
             metadata = {
                 'query_time': current_time,
                 'target_time': target_time,
-                'sentinel_bounds': soil_data['sentinel_bounds'],
-                'sentinel_crs': soil_data['sentinel_crs'],
+                'sentinel_bounds': region['sentinel_bounds'],
+                'sentinel_crs': region['sentinel_crs'],
             }
             
             predictions = self.query_miners({
-                'combined_data': soil_data['combined_data'],
-                'sentinel_bounds': soil_data['sentinel_bounds'],
-                'sentinel_crs': soil_data['sentinel_crs'],
+                'combined_data': region['combined_data'],
+                'sentinel_bounds': region['sentinel_bounds'],
+                'sentinel_crs': region['sentinel_crs'],
                 'target_time': target_time
             })
             

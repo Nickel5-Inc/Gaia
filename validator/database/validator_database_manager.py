@@ -30,7 +30,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         super().__init__('validator', host, port, user, password, min_size, max_size)
 
     async def initialize_database(self):
-        """Initialize the queue tables"""
+        """Initialize the queue tables and task-specific tables"""
+
         async with self.get_connection() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS process_queue (
@@ -70,10 +71,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     
                 );
             """)
-
-
-
-
+        
+        task_schemas = await self.load_task_schemas()
+        await self.initialize_task_tables(task_schemas)
 
     ##### QUEUE TABLE FUNCTIONS #####
     async def add_to_queue(self, 
@@ -277,3 +277,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                             unique=index.get('unique', False)
                         )
 
+    async def initialize_task_tables(self, task_schemas: Dict[str, Dict[str, Any]]):
+        """Initialize validator-specific task tables."""
+        for schema in task_schemas.values():
+            if schema.get('database_type') in ['validator', 'both']:
+                await self._create_task_table(schema)

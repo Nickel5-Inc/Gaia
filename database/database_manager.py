@@ -270,6 +270,36 @@ class BaseDatabaseManager(ABC):
             ON {table_name} ({column_name})
         """)
 
+    async def store_task_data(self, table_name: str, data: Dict[str, Any]) -> int:
+        """Store task-specific data in database."""
+        columns = ", ".join(data.keys())
+        placeholders = ", ".join(f"${i+1}" for i in range(len(data)))
+        
+        async with self.get_connection() as conn:
+            return await conn.fetchval(f"""
+                INSERT INTO {table_name} ({columns})
+                VALUES ({placeholders})
+                RETURNING id
+            """, *data.values())
+    
+    async def get_task_data(self, table_name: str, conditions: Dict[str, Any]) -> List[Dict]:
+        """Retrieve task-specific data from database."""
+        where_clause = " AND ".join(f"{k} = ${i+1}" for i, k in enumerate(conditions))
+        
+        async with self.get_connection() as conn:
+            rows = await conn.fetch(f"""
+                SELECT *
+                FROM {table_name}
+                WHERE {where_clause}
+            """, *conditions.values())
+            
+        return [dict(row) for row in rows]
+
+    @abstractmethod
+    async def initialize_task_tables(self, task_schemas: Dict[str, Dict[str, Any]]):
+        """Initialize task-specific tables based on schemas."""
+        pass
+
     
 
     
