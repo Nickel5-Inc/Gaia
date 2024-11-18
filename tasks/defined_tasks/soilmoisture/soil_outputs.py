@@ -9,10 +9,10 @@ class SoilMoisturePrediction(BaseModel):
     """Schema for soil moisture prediction response."""
     surface_sm: NDArray[np.float32]
     rootzone_sm: NDArray[np.float32]
-    uncertainty_surface_sm: Optional[NDArray[np.float32]] = None
-    uncertainty_rootzone_sm: Optional[NDArray[np.float32]] = None
+    uncertainty_surface: Optional[NDArray[np.float32]] = None
+    uncertainty_rootzone: Optional[NDArray[np.float32]] = None
     sentinel_bounds: list[float] # [left, bottom, right, top]
-    sentinel_crs: str # EPSG code
+    sentinel_crs: int # EPSG code
     target_time: datetime
 
 class SoilMoistureOutputs(Outputs):

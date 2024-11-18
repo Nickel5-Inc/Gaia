@@ -6,6 +6,7 @@ from tasks.base.decorators import handle_validation_error
 
 class SoilMoisturePayload(BaseModel):
     """Schema for soil moisture prediction payload."""
+    region_id: int
     combined_data: bytes
     sentinel_bounds: list[float] # [left, bottom, right, top]
     sentinel_crs: int # EPSG code

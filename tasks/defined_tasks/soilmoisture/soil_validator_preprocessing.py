@@ -66,37 +66,40 @@ class SoilValidatorPreprocessing(Preprocessing):
             print(f"Error collecting soil data: {str(e)}")
             return None
 
-    def get_daily_regions(self) -> List[Dict]:
-        """Get all available regions and their data for today."""
+    async def store_region(self, region: Dict, target_time: datetime) -> int:
+        """Store region data in database."""
+        data = {
+            'region_date': target_time.date(),
+            'target_time': target_time,
+            'bbox': json.dumps(region['bbox']),
+            'combined_data': region['combined_data'],
+            'sentinel_bounds': region['sentinel_bounds'],
+            'sentinel_crs': region['sentinel_crs'],
+            'array_shape': region['array_shape'],
+            'status': 'pending'
+        }
+        return await self.db.store_task_data('soil_moisture_regions', data)
+
+    def get_daily_regions(self, target_time: datetime) -> List[Dict]:
+        """Get and store daily regions."""
         regions = []
         today = date.today()
         count = self._daily_regions.get(today, 0)
-        remaining = self.max_daily_regions - count
         
-        if remaining <= 0:
-            print(f"Daily region limit of {self.max_daily_regions} reached")
-            return regions
-            
-        current_time = datetime.now(timezone.utc)
-        target_time = self.get_next_valid_time(current_time)
-            
-        for _ in range(remaining):
+        while self._can_select_region():
             try:
-                bbox = select_random_region(
-                    self._base_cells,
-                    self._urban_cells,
-                    self._lakes_cells,
-                    min_lat=-56,
-                    max_lat=60
-                )
+                bbox = select_random_region(self._h3_data)
+                soil_data = self.get_soil_data(bbox, target_time)
                 
-                soil_data = self.get_soil_data(bbox, current_time)
                 if soil_data is not None:
-                    regions.append({
+                    region_data = {
                         'datetime': target_time,
                         'bbox': bbox,
                         **soil_data
-                    })
+                    }
+                    region_id = await self.store_region(region_data, target_time)
+                    region_data['id'] = region_id
+                    regions.append(region_data)
                     
             except Exception as e:
                 print(f"Error processing region: {str(e)}")
