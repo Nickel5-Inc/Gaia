@@ -78,7 +78,16 @@ class SoilValidatorPreprocessing(Preprocessing):
             'array_shape': region['array_shape'],
             'status': 'pending'
         }
-        return await self.db.store_task_data('soil_moisture_regions', data)
+        region_id = await self.db.store_task_data('soil_moisture_regions', data)
+
+        async with self.db.get_connection() as conn:
+            await conn.execute("""
+                UPDATE soil_moisture_regions 
+                SET status = 'sent_to_miners'
+                WHERE id = $1
+            """, region_id)
+        
+        return region_id
 
     def get_daily_regions(self, target_time: datetime) -> List[Dict]:
         """Get and store daily regions."""
@@ -107,3 +116,9 @@ class SoilValidatorPreprocessing(Preprocessing):
 
         self._daily_regions[today] = count + len(regions)
         return regions
+
+    def _update_daily_count(self, date: date) -> None:
+        """Update daily region count."""
+        if date not in self._daily_regions:
+            self._daily_regions[date] = 0
+        self._daily_regions[date] += 1
