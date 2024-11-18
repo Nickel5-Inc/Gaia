@@ -18,7 +18,12 @@ class SoilMoistureTask(Task):
         super().__init__(
             name="SoilMoistureTask",
             description="Soil moisture prediction from satellite/weather data",
-            task_type="atomic"
+            task_type="atomic",
+            metadata=Metadata(),
+            inputs=SoilMoistureInputs(),
+            outputs=SoilMoistureOutputs(),
+            scoring_mechanism=SoilMoistureScoringMechanism(),
+            preprocessing=SoilMoisturePreprocessing()
         )
         self.prediction_horizon = timedelta(hours=6)
         self.scoring_delay = timedelta(days=3)
@@ -49,7 +54,7 @@ class SoilMoistureTask(Task):
         """Execute validator workflow."""
         current_time = datetime.now(timezone.utc)
         target_time = self.get_next_valid_time(current_time)
-        region = self.inputs.get_random_region()
+        regions = self.inputs.get_daily_regions()
         input_data = self.preprocessing.prepare_region_data(region)
 
         metadata = {
@@ -87,13 +92,26 @@ class SoilMoistureTask(Task):
         """
         return self.scoring_mechanism.compute_scores(predictions, ground_truth)
 
-    def get_pending_tasks(self) -> List:
-        """Get tasks ready for scoring (past 3-day SMAP latency)."""
-        current_time = datetime.now(timezone.utc)
-        scoring_cutoff = current_time - self.scoring_delay
-        return [] 
+    def validator_score(self):
+        """Score predictions after SMAP delay."""
+        pass
 
-    def move_task_to_history(self, task: Dict, ground_truth: Dict, 
-                           scores: Dict, score_time: datetime):
+    def miner_preprocess(self, preprocessing=None, inputs=None):
+        """Preprocess data for model input."""
+        pass
+
+    def query_miners(self, data):
+        """Query miners for predictions."""
+        pass
+
+    def add_task_to_queue(self, predictions: Dict, metadata: Dict):
+        """Add task to queue for later scoring."""
+        pass
+
+    def get_pending_tasks(self) -> List[Dict]:
+        """Get tasks ready for scoring (past 3-day SMAP latency)."""
+        pass
+
+    def move_task_to_history(self, task: Dict, ground_truth: Dict, scores: Dict, score_time: datetime):
         """Move scored task to history."""
         pass
