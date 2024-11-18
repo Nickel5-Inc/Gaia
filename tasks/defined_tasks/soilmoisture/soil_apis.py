@@ -579,74 +579,79 @@ def combine_tiffs(sentinel_data, ifs_data, srtm_data_tuple, bbox, date_str, prof
         traceback.print_exc()
         return None
 
-def calculate_penman_monteith(ds):
+
+import numpy as np
+
+
+def calculate_penman_monteith(ds, params=None):
     """
-    FAO 56 Penman-Monteith equation.
+
+    Args:
+        ds (dict): Input data dictionary with keys ('t2m', 'd2m', 'ssrd', 'sp', 'u10', 'v10').
+                   Each key should map to a NumPy array or similar.
+        params (dict): Optional parameters for constants and coefficients.
+
+    Returns:
+        Tuple: (ET0, svp, avp, net_radiation)
+               ET0: Evapotranspiration (mm/day)
+               svp: Saturation vapor pressure (kPa)
+               avp: Actual vapor pressure (kPa)
+               net_radiation: Net solar radiation (MJ/m²/day)
     """
     try:
         print("\n=== Penman-Monteith Calculation ===")
-        #Temp (K to C)
-        t2m_k = ds['t2m'].values
-        d2m_k = ds['d2m'].values
-        print(f"Raw temperatures (K):")
-        print(f"t2m: {t2m_k.mean():.2f}K ({t2m_k.min():.2f} to {t2m_k.max():.2f})")
-        print(f"d2m: {d2m_k.mean():.2f}K ({d2m_k.min():.2f} to {d2m_k.max():.2f})")
-        
-        t2m = t2m_k - 273.15
-        d2m = d2m_k - 273.15
-        print(f"\nConverted temperatures (°C):")
-        print(f"t2m: {t2m.mean():.2f}°C ({t2m.min():.2f} to {t2m.max():.2f})")
-        print(f"d2m: {d2m.mean():.2f}°C ({d2m.min():.2f} to {d2m.max():.2f})")
-        
-        #Radiation (J/m² to MJ/m²/day)
-        ssrd_raw = ds['ssrd'].values
-        print(f"\nRaw radiation: {ssrd_raw.mean():.2f} J/m² ({ssrd_raw.min():.2f} to {ssrd_raw.max():.2f})")
-        ssrd = ssrd_raw / 1000000
-        print(f"Converted radiation: {ssrd.mean():.2f} MJ/m²/day ({ssrd.min():.2f} to {ssrd.max():.2f})")
-        
-        #Pressure (Pa to kPa)
-        sp_raw = ds['sp'].values
-        print(f"\nRaw pressure: {sp_raw.mean():.2f} Pa ({sp_raw.min():.2f} to {sp_raw.max():.2f})")
-        sp = sp_raw / 1000
-        print(f"Converted pressure: {sp.mean():.2f} kPa ({sp.min():.2f} to {sp.max():.2f})")
-        
-        #Wind speed (m/s)
-        u10 = ds['u10'].values
-        v10 = ds['v10'].values
-        print(f"\nWind components (m/s):")
-        print(f"u10: {u10.mean():.2f} ({u10.min():.2f} to {u10.max():.2f})")
-        print(f"v10: {v10.mean():.2f} ({v10.min():.2f} to {v10.max():.2f})")
-        wind_speed = np.sqrt(u10**2 + v10**2)
-        print(f"Calculated wind speed: {wind_speed.mean():.2f} m/s ({wind_speed.min():.2f} to {wind_speed.max():.2f})")
-        
-        #Vapor pressure (kPa)
-        svp = 0.6108 * np.exp((17.27 * t2m) / (t2m + 237.3))
-        avp = 0.6108 * np.exp((17.27 * d2m) / (d2m + 237.3))
-        print(f"\nVapor pressures (kPa):")
-        print(f"Saturation VP: {svp.mean():.2f} ({svp.min():.2f} to {svp.max():.2f})")
-        print(f"Actual VP: {avp.mean():.2f} ({avp.min():.2f} to {avp.max():.2f})")
-        
-        #Psychrometric and slope
-        psy = 0.000665 * sp
+
+        # Constants with default values
+        default_params = {
+            "albedo": 0.23,  # Albedo coefficient
+            "psychrometric_coefficient": 0.000665  # kPa/°C
+        }
+        if params:
+            default_params.update(params)
+        albedo = default_params["albedo"]
+        psy_coefficient = default_params["psychrometric_coefficient"]
+
+        # Temperature (K to °C)
+        t2m = ds['t2m'] - 273.15
+        d2m = ds['d2m'] - 273.15
+
+        # Radiation (J/m² to MJ/m²/day)
+        ssrd = ds['ssrd'] / 1e6
+
+        # Pressure (Pa to kPa)
+        sp = ds['sp'] / 1e3
+
+        # Wind speed (m/s)
+        u10 = ds['u10']
+        v10 = ds['v10']
+        wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
+
+        # Vapor pressure (kPa)
+        svp = 0.6108 * np.exp((17.27 * t2m) / (t2m + 237.3))  # Saturation vapor pressure
+        avp = 0.6108 * np.exp((17.27 * d2m) / (d2m + 237.3))  # Actual vapor pressure
+
+        # Psychrometric constant and slope of SVP curve
+        psy = psy_coefficient * sp
         delta = (4098 * svp) / ((t2m + 237.3) ** 2)
-        print(f"\nPsychrometric constants:")
-        print(f"Psychrometric constant: {psy.mean():.4f} kPa/°C")
-        print(f"Slope of SVP: {delta.mean():.4f} kPa/°C")
-        
-        #ET0
-        num = (0.408 * delta * ssrd) + (psy * (900 / (t2m + 273)) * wind_speed * (svp - avp))
+
+        # Net radiation
+        net_radiation = ssrd * (1 - albedo)
+
+        # Penman-Monteith formula
+        num = (0.408 * delta * net_radiation) + (psy * (900 / (t2m + 273)) * wind_speed * (svp - avp))
         den = delta + psy * (1 + 0.34 * wind_speed)
         et0 = num / den
-        print(f"\nFinal calculations:")
-        print(f"Numerator: {num.mean():.4f}")
-        print(f"Denominator: {den.mean():.4f}")
+
         print(f"ET0: {et0.mean():.2f} mm/day ({et0.min():.2f} to {et0.max():.2f})")
-        
-        return et0, svp, avp, ssrd * (1 - 0.23)
-        
+        return et0, svp, avp, net_radiation
+
+    except KeyError as e:
+        print(f"Missing data for calculation: {e}")
+        return None
     except Exception as e:
         print(f"Error in Penman-Monteith calculation: {str(e)}")
         return None
+
 
 def partition_evaporation(total_evap, ds):
     """
