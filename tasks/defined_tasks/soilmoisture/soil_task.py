@@ -55,17 +55,28 @@ class SoilMoistureTask(Task):
         current_time = datetime.now(timezone.utc)
         target_time = self.get_next_valid_time(current_time)
         regions = self.inputs.get_daily_regions()
-        input_data = self.preprocessing.prepare_region_data(region)
-
-        metadata = {
-            'query_time': current_time,
-            'target_time': target_time,
-            'sentinel_bounds': input_data['sentinel_bounds'],
-            'sentinel_crs': input_data['sentinel_crs'],
-            'region_shape': input_data['shape']
-        }
-        predictions = self.query_miners(input_data['combined_data'])
-        self.add_task_to_queue(predictions, metadata)
+        
+        for region in regions:
+            soil_data = self.preprocessing.get_soil_data(region['bbox'], current_time)
+            if soil_data is None:
+                print(f"Failed to get soil data for region {region['bbox']}")
+                continue
+            
+            metadata = {
+                'query_time': current_time,
+                'target_time': target_time,
+                'sentinel_bounds': soil_data['sentinel_bounds'],
+                'sentinel_crs': soil_data['sentinel_crs'],
+            }
+            
+            predictions = self.query_miners({
+                'combined_data': soil_data['combined_data'],
+                'sentinel_bounds': soil_data['sentinel_bounds'],
+                'sentinel_crs': soil_data['sentinel_crs'],
+                'target_time': target_time
+            })
+            
+            self.add_task_to_queue(predictions, metadata)
 
     def miner_execute(self, data):
         """Execute miner workflow."""
@@ -76,7 +87,7 @@ class SoilMoistureTask(Task):
             return {
                 'surface_sm': predictions['surface'],
                 'rootzone_sm': predictions['rootzone'],
-                'uncertainty': predictions.get('uncertainty', None)  #TODO: seperate surface and rootzone uncertainty
+                'uncertainty_surface': predictions.get('uncertainty', None) #TODO: seperate surface and rootzone uncertainty
             }
             
         except Exception as e:

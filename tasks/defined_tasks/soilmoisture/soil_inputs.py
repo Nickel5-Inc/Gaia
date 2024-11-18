@@ -8,7 +8,7 @@ class SoilMoisturePayload(BaseModel):
     """Schema for soil moisture prediction payload."""
     combined_data: bytes
     sentinel_bounds: list[float] # [left, bottom, right, top]
-    sentinel_crs: str # EPSG code
+    sentinel_crs: int # EPSG code
     target_time: datetime
 
 class SoilMoistureInputs(Inputs):

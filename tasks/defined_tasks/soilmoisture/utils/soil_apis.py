@@ -527,14 +527,24 @@ def get_soil_data(bbox, datetime_obj=None):
             print(f"Final combined transform: {dest.transform}")
             print(f"Final combined CRS: {dest.crs}")
             
-        return output_file, sentinel_bounds, sentinel_crs
-        
+            bounds = dest.bounds
+            # [left, bottom, right, top] format
+            sentinel_bounds = [bounds.left, bounds.bottom, bounds.right, bounds.top]
+            # EPSG code as integer
+            sentinel_crs = int(str(dest.crs).split(':')[1])
+            
+            return {
+                'combined_data': output_file,
+                'sentinel_bounds': sentinel_bounds,
+                'sentinel_crs': sentinel_crs
+            }
+            
     except Exception as e:
         print(f"\n=== Error Occurred ===")
         print(f"Error in get_soil_data: {str(e)}")
         import traceback
         print(f"Full traceback: {traceback.format_exc()}")
-        return None, None, None
+        return None
 
 def combine_tiffs(sentinel_data, ifs_data, srtm_data_tuple, bbox, date_str, profile):
     try:

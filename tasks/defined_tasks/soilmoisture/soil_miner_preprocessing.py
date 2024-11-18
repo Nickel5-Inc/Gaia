@@ -1,5 +1,5 @@
 from tasks.base.components.preprocessing import Preprocessing
-from tasks.defined_tasks.soilmoisture.inference_class import SoilMoistureInferencePreprocessor
+from tasks.defined_tasks.soilmoisture.utils.inference_class import SoilMoistureInferencePreprocessor
 from tasks.defined_tasks.soilmoisture.soil_model import SoilMoistureModel
 from huggingface_hub import hf_hub_download
 import torch
@@ -78,11 +78,11 @@ class SoilMinerPreprocessing(Preprocessing):
         """
         try:
             with torch.no_grad():
-                sentinel = model_inputs['sentinel_ndvi'].unsqueeze(0)  # Add batch dimension
+                sentinel = model_inputs['sentinel_ndvi'].unsqueeze(0)
                 era5 = model_inputs['era5'].unsqueeze(0)
                 elev_ndvi = torch.cat([
                     model_inputs['elevation'],
-                    model_inputs['sentinel_ndvi'][-1:] # Take NDVI channel
+                    model_inputs['sentinel_ndvi'][-1:]
                 ], dim=0).unsqueeze(0)
 
                 outputs = self.model(sentinel, era5, elev_ndvi)
