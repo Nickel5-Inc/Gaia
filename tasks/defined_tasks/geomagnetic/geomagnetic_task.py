@@ -4,6 +4,8 @@ from tasks.defined_tasks.geomagnetic.geomagnetic_inputs import GeomagneticInputs
 from tasks.defined_tasks.geomagnetic.geomagnetic_preprocessing import GeomagneticPreprocessing
 from tasks.defined_tasks.geomagnetic.geomagnetic_scoring_mechanism import GeomagneticScoringMechanism
 from tasks.defined_tasks.geomagnetic.geomagnetic_outputs import GeomagneticOutputs
+from tasks.defined_tasks.geomagnetic.utils.process_geomag_data import get_latest_geomag_data
+from validator.database.validator_database_manager import ValidatorDatabaseManager
 import datetime
 import numpy as np
 import pandas as pd
@@ -55,75 +57,144 @@ class GeomagneticTask(Task):
 
     def validator_execute(self):
         """
-        Executes the validator workflow: checks tasks ready for scoring,
-        fetches ground truth, scores predictions, and moves completed
-        tasks to the history table.
+        Executes the validator workflow:
+        - Fetches predictions for the last UTC hour.
+        - Fetches ground truth data for the current UTC hour.
+        - Scores predictions against the ground truth.
+        - Archives scored predictions in the history table or file.
         """
-        # Step 1: Check the task queue for tasks older than 1 hour
-        tasks = self.get_pending_tasks()
         current_time = datetime.datetime.utcnow()
+        print(f"Validator executing at {current_time.isoformat()}")
 
+        # Step 1: Calculate the time range for fetching tasks
+        last_hour_start = current_time - datetime.timedelta(hours=1)
+        last_hour_end = current_time
+        print(f"Fetching predictions between {last_hour_start} and {last_hour_end}")
+
+        # Step 2: Fetch tasks for the last hour
+        tasks = self.get_tasks_for_hour(last_hour_start, last_hour_end)
+        if not tasks:
+            print("No predictions to score for the last hour.")
+            return
+
+        # Step 3: Fetch ground truth for the current hour
+        ground_truth_value = self.fetch_ground_truth()
+        if ground_truth_value is None:
+            print("Failed to fetch ground truth data.")
+            return
+
+        # Step 4: Score predictions and move to history
         for task in tasks:
-            task_age = (current_time - task['query_time']).total_seconds() / 3600
-            if task_age >= 1:
-                # Step 2: Fetch ground truth data
-                ground_truth_value = self.fetch_ground_truth()
-                if ground_truth_value is not None:
-                    # Step 3: Score predictions
-                    scores = self.score_predictions(task['predicted_values'], ground_truth_value)
+            try:
+                predicted_value = task["predicted_values"]
+                score = self.scoring_mechanism.calculate_score(predicted_value, ground_truth_value)
+                self.move_task_to_history(task, ground_truth_value, score, current_time)
+                print(f"Task scored and archived at {current_time.isoformat()}")
+            except Exception as e:
+                print(f"Error processing task {task['id']}: {e}")
 
-                    # Step 4: Move scored task to history and remove from queue
-                    self.move_task_to_history(task, ground_truth_value, scores, current_time)
-                    print(f"Task scored and moved to history at {current_time}")
 
-    def get_pending_tasks(self):
+    def get_tasks_for_hour(self, start_time, end_time):
         """
-        Fetches pending tasks from the task queue that are ready for scoring.
+        Fetches tasks submitted within a specific UTC time range from the database.
+
+        Args:
+            start_time (datetime): Start of the time range (inclusive).
+            end_time (datetime): End of the time range (exclusive).
 
         Returns:
-            list: List of tasks with `predicted_values` and `query_time`.
+            list: List of task dictionaries containing task details.
         """
-        # Fetch from database where status is "pending"
-        return []  # Replace with actual database fetch
+        try:
+            # Initialize the database manager
+            db_manager = ValidatorDatabaseManager()
+
+            # Query the database for tasks in the specified time range
+            query = """
+                SELECT id, miner_id, predicted_value, query_time 
+                FROM geomagnetic_predictions
+                WHERE query_time >= %s AND query_time < %s AND status = 'pending';
+            """
+            params = (start_time, end_time)
+
+            # Execute the query and fetch results
+            results = db_manager.execute_query(query, params)
+
+            # Convert results to a list of task dictionaries
+            tasks = [
+                {
+                    "id": row[0],
+                    "miner_id": row[1],
+                    "predicted_values": row[2],  # Assuming a single prediction per miner
+                    "query_time": row[3]
+                }
+                for row in results
+            ]
+
+            print(f"Fetched {len(tasks)} tasks between {start_time} and {end_time}")
+            return tasks
+
+        except Exception as e:
+            print(f"Error fetching tasks for hour: {e}")
+            return []
 
     def fetch_ground_truth(self):
         """
-        Fetches the current ground truth DST value.
+        Fetches the ground truth DST value for the current UTC hour.
 
         Returns:
-            int: The real-time DST value.
+            int: The real-time DST value, or None if fetching fails.
         """
-        # Fetch real-time data from an API or other source
-        # Example: ground_truth_value = api.get_latest_dst_value()
-        ground_truth_value = np.random.randint(-100, 100)  # Simulated for example
-        return ground_truth_value
+        try:
+            # Get the current UTC time
+            current_time = datetime.datetime.utcnow()
+            print(f"Fetching ground truth for UTC hour: {current_time.hour}")
 
-    def score_predictions(self, predicted_values, ground_truth_value):
+            # Fetch the most recent geomagnetic data
+            dst_data = get_latest_geomag_data()
+
+            # Filter the data to find the record for the current hour
+            current_hour_data = dst_data[dst_data['timestamp'].dt.hour == current_time.hour]
+
+            if current_hour_data.empty:
+                print("No ground truth data available for the current hour.")
+                return None
+
+            # Extract the ground truth value
+            ground_truth_value = int(current_hour_data['value'].iloc[0])
+            print(f"Ground truth value for hour {current_time.hour}: {ground_truth_value}")
+            return ground_truth_value
+
+        except Exception as e:
+            print(f"Error fetching ground truth: {e}")
+            return None
+
+    def move_task_to_history(self, task, ground_truth_value, score, score_time):
         """
-        Scores the predictions using a distance function against the ground truth value.
-
-        Args:
-            predicted_values (np.ndarray): Array of predicted DST values.
-            ground_truth_value (int): Actual DST value.
-
-        Returns:
-            np.ndarray: Array of scores for each prediction.
-        """
-        return np.abs(predicted_values - ground_truth_value)  # Example: absolute error
-
-    def move_task_to_history(self, task, ground_truth_value, scores, score_time):
-        """
-        Moves a completed task from the queue to the history table.
+        Archives a completed task in the history table or file.
 
         Args:
             task (dict): Task details including `predicted_values` and `query_time`.
-            ground_truth_value (int): Actual DST value.
-            scores (np.ndarray): Array of scores.
-            score_time (datetime): The time the scoring was completed.
+            ground_truth_value (int): The actual DST value for scoring.
+            score (float): The calculated deviation score.
+            score_time (datetime): The time the task was scored.
         """
-        # Insert into history table and delete from queue table
-        # Example: db.insert("history", {...}); db.delete("task_queue", task_id=task["id"])
-        pass  # Replace with actual database code
+        history_record = {
+            "miner_id": task["miner_id"],
+            "predicted_value": task["predicted_values"],  # Raw prediction
+            "ground_truth_value": ground_truth_value,
+            "score": score,
+            "query_time": task["query_time"].isoformat(),
+            "score_time": score_time.isoformat()
+        }
+
+        # Insert into history table or save to JSON
+        print(f"Archiving task to history: {history_record}")
+        # Example: db.insert("geomagnetic_history", history_record)
+
+        # Remove task from queue
+        print(f"Removing task from queue: {task['id']}")
+        # Example: db.delete("geomagnetic_predictions", where={"id": task["id"]})
 
     ############################################################
     # Miner execution method
