@@ -10,7 +10,7 @@ import uvicorn
 
 from fiber.logging_utils import get_logger
 from fiber.miner import server
-from miner.utils.subnet import factory_router as get_subnet_router
+from miner.utils.subnet import factory_router 
 from fiber.miner.middleware import configure_extra_logging_middleware
 
 '''
@@ -33,17 +33,10 @@ class Miner:
         self.args = self.parser.parse_args()
 
         
-
-
-
-
-
-
     def run(self):
         try:
             app = server.factory_app(debug=True)
-            app.include_router(get_subnet_router())
-
+            app.include_router(factory_router())
             # Change host to "0.0.0.0" to allow external connections
             uvicorn.run(app, host="0.0.0.0", port=33334)
 
@@ -63,8 +56,6 @@ class Miner:
 
 
 if __name__ == "__main__":
-    
-
     miner = Miner() 
     miner.run()
 
