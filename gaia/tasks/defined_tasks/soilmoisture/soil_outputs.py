@@ -1,4 +1,4 @@
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, validator, ConfigDict
 from typing import Dict, List, Optional, Any, Tuple
 import numpy as np
 from numpy.typing import NDArray
@@ -15,6 +15,24 @@ class SoilMoisturePrediction(BaseModel):
     sentinel_bounds: list[float] # [left, bottom, right, top]
     sentinel_crs: int # EPSG code
     target_time: datetime
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @validator('surface_sm', 'rootzone_sm', 'uncertainty_surface', 'uncertainty_rootzone')
+    def validate_array(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, np.ndarray):
+            raise ValueError('Must be a numpy array')
+        if v.dtype != np.float32:
+            v = v.astype(np.float32)
+        return v
+
+    @validator('sentinel_bounds')
+    def validate_bounds(cls, v):
+        if len(v) != 4:
+            raise ValueError('Bounds must have 4 values [left, bottom, right, top]')
+        return v
 
 class SoilMoistureOutputs(Outputs):
     """Output schema definitions for soil moisture task."""
