@@ -11,6 +11,7 @@ from fiber.logging_utils import get_logger
 from fiber.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
 from substrateinterface import SubstrateInterface
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
 from gaia.tasks.defined_tasks.geomagnetic.utils.process_geomag_data import get_latest_geomag_data
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.base.components.inputs import Inputs
@@ -34,6 +35,7 @@ class GaiaValidator:
         self.database_manager = ValidatorDatabaseManager
         self.weights = None # TODO: Implement weights
         self.soil_task = SoilMoistureTask()
+        self.geomagnetic_task = GeomagneticTask()
 
     
     def setup_neuron(self) -> bool:
@@ -71,7 +73,7 @@ class GaiaValidator:
             logger.error(f"Error setting up neuron: {e}")
             return False
 
-    async def query_miners(self, httpx_client, payload: Optional[Inputs] = None) -> Outputs:
+    async def query_miners(self, httpx_client, payload: Optional[Inputs] = None, endpoint: str = None) -> Outputs:
         """Handle the miner querying logic"""
         self.metagraph.sync_nodes()
 
@@ -89,15 +91,18 @@ class GaiaValidator:
                 if symmetric_key_str and symmetric_key_uuid:
                     logger.info(f"Handshake successful with miner {miner_hotkey}")
 
-                    timestamp, dst_value = get_latest_geomag_data()
-                    payload = {
-                        "nonce": "12345",
-                        "data": {
-                            "name": "Geomagnetic data",
-                            "timestamp": str(timestamp),
-                            "value": dst_value,
-                        }
-                    }
+                    # Payload and endpoint should be passed in from the validator_execute() method
+
+
+                    # timestamp, dst_value = get_latest_geomag_data()
+                    # payload = {
+                    #     "nonce": "12345",
+                    #     "data": {
+                    #         "name": "Geomagnetic data",
+                    #         "timestamp": str(timestamp),
+                    #         "value": dst_value,
+                    #     }
+                    # }
 
                     fernet = Fernet(symmetric_key_str)
 
@@ -110,7 +115,7 @@ class GaiaValidator:
                         validator_ss58_address=self.keypair.ss58_address,
                         miner_ss58_address=miner_hotkey,
                         payload=payload,
-                        endpoint="/geomagnetic-request"
+                        endpoint=endpoint
                     )
                     resp.raise_for_status()
                     logger.info(f"Geomagnetic request sent to {miner_hotkey}! Response: {resp.text}")
@@ -120,15 +125,9 @@ class GaiaValidator:
             except Exception as e:
                 logger.error(f"Error with miner {miner_hotkey}: {e}")
 
-    async def run_soil_task(self):
-        """Run soil moisture task execution loop"""
-        while True:
-            try:
-                await self.soil_task.validator_execute()
-                await asyncio.sleep(60)
-            except Exception as e:
-                logger.error(f"Soil task error: {e}")
-                await asyncio.sleep(60)
+  
+
+    
 
     async def main(self):
         if not self.setup_neuron():
@@ -146,47 +145,23 @@ class GaiaValidator:
             try:
                 current_time = datetime.datetime.now(datetime.timezone.utc)
 
-                # Schedule metagraph sync
-                await self.database_manager.add_to_queue(
-                    process_type='network',
-                    process_name='sync_metagraph',
-                    payload=None,
-                    priority=1
-                )
+                #schedule each task execution loop in a separate thread
+                workers = [
+                    asyncio.create_task(self.soil_task.validator_execute()),
+                    asyncio.create_task(self.geomagnetic_task.validator_execute())
+                ]
 
-                # Check for tasks ready for scoring
-                for task_type in ['geomagnetic', 'soil_moisture']:
-                    pending_tasks = await self.database_manager.get_tasks_ready_for_scoring(
-                        task_type=task_type,
-                        current_time=current_time
-                    )
-                    
-                    for task in pending_tasks:
-                        # Schedule ground truth fetching
-                        await self.database_manager.add_to_queue(
-                            process_type='network',
-                            process_name='fetch_ground_truth',
-                            payload={'task_id': task['id']},
-                            priority=2
-                        )
-
-                # Schedule new process creation if needed
-                tasks_count = await self.database_manager.get_active_tasks_count()
-                if tasks_count < self.max_concurrent_tasks:
-                    await self._schedule_new_task()
 
                 await self.status_logger()
-                await asyncio.sleep(300)
+                await asyncio.sleep(60)
 
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
                 await asyncio.sleep(300)
+            finally:
+                await asyncio.gather(*workers, return_exceptions=True)
 
-        # Wait for workers to complete
-        for worker in workers:
-            worker.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
-
+     
     async def status_logger(self):
         """Log the status of the validator."""
         current_time_utc = datetime.datetime.now(datetime.timezone.utc)
