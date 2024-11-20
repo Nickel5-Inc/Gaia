@@ -1,6 +1,6 @@
-from database.database_manager import BaseDatabaseManager
-
+from gaia.database.database_manager import BaseDatabaseManager
 
 class MinerDatabaseManager(BaseDatabaseManager):
     def __init__(self):
-        super().__init__("miner")
+        # Ensure "miner" fulfills the required node_type argument for BaseDatabaseManager
+        super().__init__(node_type="miner")
