@@ -18,24 +18,33 @@ def install_system_dependencies():
         "sudo apt-get install -y postgresql postgresql-contrib",
         "sudo apt-get install -y python3-dev libpq-dev",
         "sudo systemctl start postgresql",
-        "sudo systemctl enable postgresql"
+        "sudo systemctl enable postgresql",
     ]
+    
+    # Run the basic installation commands
     for cmd in commands:
         subprocess.run(cmd.split(), check=True)
+    
+    # Set postgres password separately (don't split this command)
+    subprocess.run(
+        ["sudo", "-u", "postgres", "psql", "-c", "ALTER USER postgres PASSWORD 'postgres';"],
+        check=True
+    )
 
 def setup_postgresql():
     """Configure PostgreSQL for the project"""
     try:
-        postgres_password = getpass.getpass("Enter password for PostgreSQL superuser: ")
-        
         conn = psycopg2.connect(
             dbname='postgres',
             user='postgres',
-            password=postgres_password,
+            password='postgres',
             host='localhost'
         )
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cur = conn.cursor()
+        
+        new_postgres_password = getpass.getpass("Enter NEW password for PostgreSQL superuser: ")
+        cur.execute("ALTER USER postgres PASSWORD %s;", (new_postgres_password,))
         
         project_password = getpass.getpass("Enter password for project database user: ")
         cur.execute("CREATE USER project_user WITH PASSWORD %s;", (project_password,))
@@ -62,9 +71,9 @@ def setup_postgresql():
 def setup_python_environment():
     """Set up Python virtual environment and install dependencies"""
     try:
-        subprocess.run([sys.executable, "-m", "venv", ".gaia"], check=True)
-        python_path = ".gaia/bin/python"
-        pip_path = ".gaia/bin/pip"
+        subprocess.run([sys.executable, "-m", "venv", "../.gaia"], check=True)
+        python_path = "../.gaia/bin/python"
+        pip_path = "../.gaia/bin/pip"
         
         subprocess.run([python_path, "-m", "pip", "install", "--upgrade", "pip"], check=True)
         subprocess.run([pip_path, "install", "-r", "requirements.txt"], check=True)
@@ -74,17 +83,7 @@ def setup_python_environment():
     except Exception as e:
         print(f"Error setting up Python environment: {e}")
 
-def setup_project_structure():
-    """Create necessary project directories and files"""
-    directories = [
-        'logs',
-        'data',
-        'data/cache',
-        'config',
-    ]
-    
-    for directory in directories:
-        Path(directory).mkdir(parents=True, exist_ok=True)
+
 
 def main():
     """Main setup function"""
@@ -100,9 +99,7 @@ def main():
     
     print("\nSetting up Python environment...")
     setup_python_environment()
-    
-    print("\nCreating project structure...")
-    setup_project_structure()
+
     
     print("\nSetup completed successfully!")
     print("\nNext steps:")

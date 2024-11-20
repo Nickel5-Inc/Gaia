@@ -17,30 +17,30 @@ class SoilMinerPreprocessing(Preprocessing):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.preprocessor = SoilMoistureInferencePreprocessor()
-        self.model = self._load_model()
+    #     self.model = self._load_model()
         
-    def _load_model(self) -> SoilMoistureModel:
-        """Load model weights from local path or HuggingFace."""
-        try:
-            local_path = 'tasks/defined_tasks/soilmoisture/soil_model_weights.safetensors'
-            if os.path.exists(local_path):
-                state_dict = safetensors.torch.load_file(local_path)
-            else:
-                print("Local weights not found, downloading from HuggingFace...")
-                weights_path = hf_hub_download(
-                    repo_id="your-hf-repo/soil-moisture-task",
-                    filename="soil_model_weights.safetensors"
-                )
-                state_dict = safetensors.torch.load_file(weights_path)
+    # def _load_model(self) -> SoilMoistureModel:
+    #     """Load model weights from local path or HuggingFace."""
+    #     try:
+    #         local_path = 'tasks/defined_tasks/soilmoisture/soil_model_weights.safetensors'
+    #         if os.path.exists(local_path):
+    #             state_dict = safetensors.torch.load_file(local_path)
+    #         else:
+    #             print("Local weights not found, downloading from HuggingFace...")
+    #             weights_path = hf_hub_download(
+    #                 repo_id="your-hf-repo/soil-moisture-task",
+    #                 filename="soil_model_weights.safetensors"
+    #             )
+    #             state_dict = safetensors.torch.load_file(weights_path)
             
-            model = SoilMoistureModel()
-            model.load_state_dict(state_dict)
-            model.to(self.device)
-            model.eval()
-            return model
+    #         model = SoilMoistureModel()
+    #         model.load_state_dict(state_dict)
+    #         model.to(self.device)
+    #         model.eval()
+    #         return model
             
-        except Exception as e:
-            raise RuntimeError(f"Failed to load model weights: {str(e)}")
+    #     except Exception as e:
+    #         raise RuntimeError(f"Failed to load model weights: {str(e)}")
     
     def process_miner_data(self, data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """Process combined tiff data for model input."""

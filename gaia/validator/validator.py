@@ -32,10 +32,10 @@ class GaiaValidator:
         self.args = args
         self.metagraph = None
         self.config = None
-        self.database_manager = ValidatorDatabaseManager
+        self.database_manager = ValidatorDatabaseManager()
         self.weights = None # TODO: Implement weights
         self.soil_task = SoilMoistureTask()
-        self.geomagnetic_task = GeomagneticTask()
+        #self.geomagnetic_task = GeomagneticTask()
 
     
     def setup_neuron(self) -> bool:
