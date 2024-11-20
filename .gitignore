@@ -9,7 +9,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.encrypted
-
+nodes.json
 
 .vscode/
 data/

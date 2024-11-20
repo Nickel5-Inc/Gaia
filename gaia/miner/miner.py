@@ -1,9 +1,8 @@
 import os
 import traceback
+from dotenv import load_dotenv
 import argparse
 import uvicorn
-
-from dotenv import load_dotenv
 from fiber.logging_utils import get_logger
 from fiber.miner import server
 from fiber.miner.middleware import configure_extra_logging_middleware
@@ -12,7 +11,6 @@ from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 
 # Load environment variables
 load_dotenv("dev.env")
-
 
 class Miner:
     """
@@ -28,6 +26,7 @@ class Miner:
         self.subtensor_chain_endpoint = args.subtensor_chain_endpoint
         self.subtensor_network = args.subtensor_network
         self.database_manager = MinerDatabaseManager()
+
 
     def setup_neuron(self) -> bool:
         """
@@ -48,10 +47,8 @@ class Miner:
             self.logger.info("Starting miner server...")
             app = server.factory_app(debug=True)
             app.include_router(factory_router())
-
-            # Change host to "0.0.0.0" to allow external connections
-            uvicorn.run(app, host="0.0.0.0", port=33334)
-
+            # Use the port argument from the CLI
+            uvicorn.run(app, host="0.0.0.0", port=self.args.port)
         except Exception as e:
             self.logger.error(f"Error starting miner: {e}")
             self.logger.error(traceback.format_exc())
@@ -64,7 +61,7 @@ class Miner:
 
 
 if __name__ == "__main__":
-    # Argument parser
+    # Add arguments
     parser = argparse.ArgumentParser(description="Start the miner with optional flags.")
 
     # Wallet and network arguments
@@ -73,14 +70,14 @@ if __name__ == "__main__":
     parser.add_argument("--netuid", type=int, help="Netuid to use")
 
     # Optional arguments
-    parser.add_argument("--use_base_model", action="store_true", help="Enable base model usage")
+    parser.add_argument("--port", type=int, default=8091, help="Port to run the miner on")
+    parser.add_argument('--use_base_model', action='store_true', help='Enable base model usage')
 
     # Subtensor arguments
     parser.add_argument("--subtensor_chain_endpoint", type=str, help="Subtensor chain endpoint to use")
     parser.add_argument("--subtensor_network", type=str, default="test", help="Subtensor network to use")
 
-    # Parse arguments and start miner
+    # Parse arguments and start the miner
     args = parser.parse_args()
-
-    miner = Miner(args)
+    miner = Miner(args) 
     miner.run()

@@ -4,16 +4,17 @@
 SERVER_NAME="example.com"
 SERVER_IP="127.0.0.1"
 PORT="33333"
+FORWARDING_PORT=""  # Will be set to PORT + 1 if not specified
 
 # Function to display usage
 usage() {
-    echo "Usage: $0 --server_name <server_name> --ip <ip_address> --port <port>"
-    echo "Example: $0 --server_name example.com --ip 192.168.1.100 --port 33333"
+    echo "Usage: $0 --server_name <server_name> --ip <ip_address> --port <port> [--forwarding_port <forwarding_port>]"
+    echo "Example: $0 --server_name example.com --ip 192.168.1.100 --port 33333 --forwarding_port 33334"
     exit 1
 }
 
 # Parse flags using getopt
-OPTS=$(getopt -o '' -l server_name:,ip:,port: -- "$@")
+OPTS=$(getopt -o '' -l server_name:,ip:,port:,forwarding_port: -- "$@")
 if [ $? != 0 ]; then usage; fi
 
 eval set -- "$OPTS"
@@ -25,12 +26,19 @@ while true; do
             SERVER_IP="$2"; shift 2 ;;
         --port)
             PORT="$2"; shift 2 ;;
+        --forwarding_port)
+            FORWARDING_PORT="$2"; shift 2 ;;
         --)
             shift; break ;;
         *)
             usage ;;
     esac
 done
+
+# Set default forwarding port if not specified
+if [[ -z "$FORWARDING_PORT" ]]; then
+    FORWARDING_PORT=$((PORT + 1))
+fi
 
 # Check if IP address is provided
 if [[ -z "$SERVER_IP" ]]; then
@@ -105,7 +113,7 @@ server {
     ssl_prefer_server_ciphers off;
 
     location / {
-        proxy_pass http://127.0.0.1:$((${PORT} + 1));
+        proxy_pass http://127.0.0.1:${FORWARDING_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -138,4 +146,4 @@ else
 fi
 
 echo "NGINX setup complete! Server available on $SERVER_NAME with IP $SERVER_IP at port $PORT"
-echo "Forwarding to port $((PORT + 1))"
+echo "Forwarding to port $FORWARDING_PORT"
