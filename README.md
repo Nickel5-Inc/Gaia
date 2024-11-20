@@ -55,8 +55,10 @@ fiber-post-ip --netuid <NETUID> --external_ip <YOUR_IP> --external_port <YOUR_PO
 Gaia uses a Proxy server to handle connections to Validators. You can setup your own proxy server, or use our script for an nginx server as follows:
 
 ```bash
-./setup_proxy_server.sh --ip <YOUR IP> --port <PORT USED ABOVE> --server_name <NAME>
+./setup_proxy_server.sh --ip <YOUR IP> --port <PORT> --forwarding_port <PORT_FOR_MINER_OR_VALIDATOR> --server_name <NAME>
 ```
+
+The port chosen here should match the port that you posted to the chain above. This will forward connections to the specified `--forwarding_port` which will be used when starting up the miner or validator (defaults to +1 of `--port`).
 
 ## Gaia's Bounty Program
 
