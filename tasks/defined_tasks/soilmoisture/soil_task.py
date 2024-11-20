@@ -23,12 +23,15 @@ class SoilMoistureTask(Task):
             inputs=SoilMoistureInputs(),
             outputs=SoilMoistureOutputs(),
             scoring_mechanism=SoilMoistureScoringMechanism(),
-            preprocessing=SoilMoisturePreprocessing()
+            preprocessing=None
         )
         self.prediction_horizon = timedelta(hours=6)
         self.scoring_delay = timedelta(days=3)
         self.max_daily_regions = 10
         
+        self.validator_preprocessing = SoilValidatorPreprocessing()
+        self.miner_preprocessing = SoilMinerPreprocessing()
+
     def get_next_valid_time(self, current_time: datetime) -> datetime:
         """Get next valid SMAP measurement time."""
         valid_times = [
@@ -54,8 +57,22 @@ class SoilMoistureTask(Task):
         """Execute validator workflow."""
         current_time = datetime.now(timezone.utc)
         target_time = self.get_next_valid_time(current_time)
-        regions = await self.preprocessing.get_daily_regions(target_time)
-        
+        #5 minutes close to valid SMAP time
+        time_diff = (target_time - current_time).total_seconds() / 60
+        if time_diff > 5:  # More than 5 minutes until next valid time
+            return
+            
+        today = current_time.date()
+        if not hasattr(self, '_last_preprocessing_date') or self._last_preprocessing_date != today:
+            #once per day
+            regions = await self.validator_preprocessing.get_daily_regions(target_time)
+            self._last_preprocessing_date = today
+        else:
+            regions = await self.get_todays_regions(target_time)
+            
+        if not regions:
+            return
+            
         for region in regions:
             predictions = await self.query_miners({
                 'region_id': region['id'],
@@ -71,10 +88,24 @@ class SoilMoistureTask(Task):
                 'target_time': target_time
             })
 
+    async def get_todays_regions(self, target_time: datetime) -> List[Dict]:
+        """Get regions already selected for today."""
+        try:
+            async with self.db.get_connection() as conn:
+                regions = await conn.fetch("""
+                    SELECT * FROM soil_moisture_regions
+                    WHERE region_date = $1::date
+                    AND status = 'pending'
+                """, target_time.date())
+                return regions
+        except Exception as e:
+            print(f"Error getting today's regions: {str(e)}")
+            return []
+
     def miner_execute(self, data):
         """Execute miner workflow."""
         try:
-            processed_data = self.preprocessing.process_miner_data(data)
+            processed_data = self.miner_preprocessing.process_miner_data(data)
             predictions = self.run_model_inference(processed_data)
             
             return {
@@ -104,9 +135,56 @@ class SoilMoistureTask(Task):
         """Preprocess data for model input."""
         pass
 
-    def query_miners(self, data):
-        """Query miners for predictions."""
-        pass
+    async def query_miners(self, data: Dict) -> Dict[str, Dict]:
+        """Query miners for predictions.
+        
+        Args:
+            data: Dict containing region data to send to miners
+                {
+                    region_id: int,
+                    combined_data: bytes,
+                    sentinel_bounds: list[float],
+                    sentinel_crs: int,
+                    target_time: datetime
+                }
+        
+        Returns:
+            Dict[str, Dict]: Dictionary of miner predictions
+                {
+                    miner_id: {
+                        surface_sm: NDArray[np.float32],
+                        rootzone_sm: NDArray[np.float32],
+                        uncertainty_surface: Optional[NDArray[np.float32]],
+                        uncertainty_rootzone: Optional[NDArray[np.float32]],
+                        sentinel_bounds: list[float],
+                        sentinel_crs: int,
+                        target_time: datetime
+                    }
+                }
+        """
+        try:
+            SoilMoisturePayload(**data)
+            miner_predictions = {}
+            miners = await self.get_registered_miners()
+            
+            for miner in miners:
+                try:
+                    prediction = await self.network.query_miner(
+                        miner_id=miner.id,
+                        task_name=self.name,
+                        data=data
+                    )
+                    if prediction:
+                        miner_predictions[miner.id] = prediction
+                except Exception as e:
+                    print(f"Error querying miner {miner.id}: {str(e)}")
+                    continue
+                
+            return miner_predictions
+            
+        except Exception as e:
+            print(f"Error in query_miners: {str(e)}")
+            return {}
 
     async def add_task_to_queue(self, predictions: Dict, metadata: Dict):
         """Add miner predictions to database for later scoring."""
@@ -127,8 +205,6 @@ class SoilMoistureTask(Task):
                         pred['rootzone_sm'],
                         pred.get('uncertainty_surface'),
                         pred.get('uncertainty_rootzone'),
-                        metadata['sentinel_bounds'],
-                        metadata['sentinel_crs']
                     )
         except Exception as e:
             print(f"Error storing predictions: {str(e)}")

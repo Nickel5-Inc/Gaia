@@ -16,6 +16,7 @@ from validator.database.validator_database_manager import ValidatorDatabaseManag
 from tasks.base.components.inputs import Inputs
 from tasks.base.components.outputs import Outputs
 from argparse import ArgumentParser
+from tasks.defined_tasks.soil_moisture.soil_moisture_task import SoilMoistureTask
 
 
 logger = get_logger(__name__)
@@ -32,6 +33,7 @@ class GaiaValidator:
         self.config = None
         self.database_manager = ValidatorDatabaseManager()
         self.weights = None # TODO: Implement weights
+        self.soil_task = SoilMoistureTask()
 
     
     def setup_neuron(self) -> bool:
@@ -119,7 +121,15 @@ class GaiaValidator:
             except Exception as e:
                 logger.error(f"Error with miner {miner_hotkey}: {e}")
 
-
+    async def run_soil_task(self):
+        """Run soil moisture task execution loop"""
+        while True:
+            try:
+                await self.soil_task.validator_execute()
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"Soil task error: {e}")
+                await asyncio.sleep(60)
 
     async def main(self):
         if not self.setup_neuron():
@@ -185,7 +195,8 @@ class GaiaValidator:
         # Start workers
         workers = [
             asyncio.create_task(network_worker()),
-            asyncio.create_task(compute_worker())
+            asyncio.create_task(compute_worker()),
+            asyncio.create_task(self.run_soil_task())  # Add soil task worker
         ]
 
         # Main scheduling loop
