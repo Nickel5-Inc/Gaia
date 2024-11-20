@@ -2,8 +2,8 @@ from pydantic import BaseModel, validator
 from typing import Dict, List, Optional, Any, Tuple
 import numpy as np
 from numpy.typing import NDArray
-from tasks.base.components.outputs import Outputs
-from tasks.base.decorators import handle_validation_error
+from gaia.tasks.base.components.outputs import Outputs
+from gaia.tasks.base.decorators import handle_validation_error
 
 class SoilMoisturePrediction(BaseModel):
     """Schema for soil moisture prediction response."""
