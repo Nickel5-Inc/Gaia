@@ -1,8 +1,8 @@
-from tasks.base.components.preprocessing import Preprocessing
+from gaia.tasks.base.components.preprocessing import Preprocessing
 from datetime import datetime, timezone, date
 from huggingface_hub import hf_hub_download
-from tasks.defined_tasks.soilmoisture.utils.region_selection import select_random_region
-from tasks.defined_tasks.soilmoisture.utils.soil_apis import get_soil_data
+from gaia.tasks.defined_tasks.soilmoisture.utils.region_selection import select_random_region
+from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import get_soil_data
 import json
 from typing import Dict, Optional, List
 import os
@@ -89,7 +89,7 @@ class SoilValidatorPreprocessing(Preprocessing):
         
         return region_id
 
-    def get_daily_regions(self, target_time: datetime) -> List[Dict]:
+    async def get_daily_regions(self, target_time: datetime) -> List[Dict]:
         """Get and store daily regions."""
         regions = []
         today = date.today()
