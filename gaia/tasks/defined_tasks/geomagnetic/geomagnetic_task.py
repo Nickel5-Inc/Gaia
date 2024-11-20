@@ -9,6 +9,8 @@ from gaia.validator.database.validator_database_manager import ValidatorDatabase
 import datetime
 import numpy as np
 import pandas as pd
+import asyncio
+from uuid import uuid4
 
 
 class GeomagneticTask(Task):
@@ -58,69 +60,80 @@ class GeomagneticTask(Task):
     async def validator_execute(self, validator):
         """
         Executes the validator workflow:
+        - Aligns execution to start at the top of each UTC hour.
         - Fetches predictions for the last UTC hour.
         - Fetches ground truth data for the current UTC hour.
         - Scores predictions against the ground truth.
         - Archives scored predictions in the history table or file.
-        - runs in a continuous loop
+        - Runs in a continuous loop.
         """
         while True:
-            current_time = datetime.datetime(datetime.timezone.utc)
-            print(f"---Begin Geomagnetic Task Loop  at {current_time.isoformat()} --")
+            try:
+                # Step 1: Align to the top of the next hour
+                current_time = datetime.datetime.now(datetime.timezone.utc)
+                next_hour = current_time.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
+                sleep_duration = (next_hour - current_time).total_seconds()
 
+                print(f"Sleeping until the next hour: {next_hour.isoformat()} (in {sleep_duration} seconds)")
+                await asyncio.sleep(sleep_duration)  # Wait until the top of the next hour
 
-            # 1. Construct Payload For Query 
-            timestamp, dst_value = await get_latest_geomag_data()
-            
-            # 2. Construct Payload Template - Nonce should be unique for each query
-            payload_template = {
-                "nonce": "",
-                "data": {
-                    "name": "Geomagnetic data",
-                    "timestamp": str(timestamp),
-                    "value": dst_value,
+                # Step 2: Fetch Latest Geomagnetic Data
+                timestamp, dst_value = await get_latest_geomag_data()
+                print(f"Fetched latest geomagnetic data: timestamp={timestamp}, value={dst_value}")
+
+                # Step 3: Construct Payload for Miners
+                nonce = str(uuid4())  # Generate a unique nonce for this query
+                payload_template = {
+                    "nonce": nonce,
+                    "data": {
+                        "name": "Geomagnetic Data",
+                        "timestamp": str(timestamp),
+                        "value": dst_value,
+                    }
                 }
-            }
+                endpoint = "geomagnetic-request/"
 
-            endpoint = "geomagnetic-request/"
+                # Step 4: Query Miners
+                responses = await validator.query_miners(payload_template, endpoint)
+                print(f"Collected responses from miners: {len(responses)}")
 
-            # 2. Query Miners
-            await validator.query_miners(payload_template, endpoint)
+                # Step 5: Store Predictions in Queue
+                current_hour_start = next_hour.replace(minute=0, second=0, microsecond=0) - datetime.timedelta(hours=1)
+                for response in responses:
+                    self.add_task_to_queue(
+                        predictions=response.get("predicted_values"),
+                        query_time=current_hour_start
+                    )
 
+                # Step 6: Fetch Ground Truth for Current Hour
+                ground_truth_value = self.fetch_ground_truth()
+                if ground_truth_value is None:
+                    print("Ground truth data not available. Skipping scoring.")
+                    continue
 
-            # 3. Collect Responses and Store in Queue
-        
+                # Step 7: Score Predictions and Archive Results
+                last_hour_start = current_hour_start
+                last_hour_end = next_hour.replace(minute=0, second=0, microsecond=0)
 
-            # 4. Fetch Ground Truth
+                print(f"Fetching predictions between {last_hour_start} and {last_hour_end}")
+                tasks = self.get_tasks_for_hour(last_hour_start, last_hour_end)
 
+                if not tasks:
+                    print("No predictions to score for the last hour.")
+                    continue
 
-            # 5. Score Predictions and Archive
+                for task in tasks:
+                    try:
+                        predicted_value = task["predicted_values"]
+                        score = self.scoring_mechanism.calculate_score(predicted_value, ground_truth_value)
+                        self.move_task_to_history(task, ground_truth_value, score, current_time)
+                        print(f"Task scored and archived: task_id={task['id']}, score={score}")
+                    except Exception as e:
+                        print(f"Error processing task {task['id']}: {e}")
 
-            last_hour_start = current_time - datetime.timedelta(hours=1)
-            last_hour_end = current_time
-            print(f"Fetching predictions between {last_hour_start} and {last_hour_end}")
-
-            # Step 2: Fetch tasks for the last hour
-            tasks = self.get_tasks_for_hour(last_hour_start, last_hour_end)
-            if not tasks:
-                print("No predictions to score for the last hour.")
-                return
-
-            # Step 3: Fetch ground truth for the current hour
-            ground_truth_value = self.fetch_ground_truth()
-            if ground_truth_value is None:
-                print("Failed to fetch ground truth data.")
-                return
-
-            # Step 4: Score predictions and move to history
-            for task in tasks:
-                try:
-                    predicted_value = task["predicted_values"]
-                    score = self.scoring_mechanism.calculate_score(predicted_value, ground_truth_value)
-                    self.move_task_to_history(task, ground_truth_value, score, current_time)
-                    print(f"Task scored and archived at {current_time.isoformat()}")
-                except Exception as e:
-                    print(f"Error processing task {task['id']}: {e}")
+            except Exception as e:
+                print(f"Unexpected error in validator_execute loop: {e}")
+                await asyncio.sleep(60)  # Retry after a short delay
 
 
     def get_tasks_for_hour(self, start_time, end_time):
