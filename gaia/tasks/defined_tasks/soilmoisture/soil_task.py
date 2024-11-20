@@ -18,6 +18,10 @@ class SoilMoistureTask(Task):
         default_factory=SoilValidatorPreprocessing,
         description="Preprocessing component for validator"
     )
+    miner_preprocessing: SoilMinerPreprocessing = Field(
+        default_factory=SoilMinerPreprocessing,
+        description="Preprocessing component for miner"
+    )
     
     def __init__(self):
         super().__init__(
