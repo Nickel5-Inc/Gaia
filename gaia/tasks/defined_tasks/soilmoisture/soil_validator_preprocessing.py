@@ -1,8 +1,8 @@
-from tasks.base.components.preprocessing import Preprocessing
+from gaia.tasks.base.components.preprocessing import Preprocessing
 from datetime import datetime, timezone, date
 from huggingface_hub import hf_hub_download
-from tasks.defined_tasks.soilmoisture.utils.region_selection import select_random_region
-from tasks.defined_tasks.soilmoisture.utils.soil_apis import get_soil_data
+from gaia.tasks.defined_tasks.soilmoisture.utils.region_selection import select_random_region
+from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import get_soil_data
 import json
 from typing import Dict, Optional, List
 import os
@@ -28,7 +28,7 @@ class SoilValidatorPreprocessing(Preprocessing):
         
     def _load_h3_map(self):
         """Load H3 map data, first checking locally then from HuggingFace."""
-        local_path = 'tasks/defined_tasks/soilmoisture/full_h3_map.json'
+        local_path = './data/h3_map/full_h3_map.json'
         
         try:
             if os.path.exists(local_path):
@@ -37,14 +37,18 @@ class SoilValidatorPreprocessing(Preprocessing):
                     
             print("Local H3 map not found, downloading from HuggingFace...")
             map_path = hf_hub_download(
-                repo_id="your-hf-repo/soil-moisture-task",
-                filename="full_h3_map.json"
+                repo_id="Nickel5HF/gaia_h3_mapping",
+                filename="full_h3_map.json",
+                repo_type="dataset",
+                local_dir="./data/h3_map"
             )
             with open(map_path, 'r') as f:
                 return json.load(f)
                 
         except Exception as e:
-            raise RuntimeError(f"Failed to load H3 map: {str(e)}")
+            print(f"Error accessing H3 map: {str(e)}")
+            print("Using fallback local map...")
+            raise RuntimeError("No H3 map available")
 
     def _can_select_region(self) -> bool:
         """Check if we can select more regions today."""

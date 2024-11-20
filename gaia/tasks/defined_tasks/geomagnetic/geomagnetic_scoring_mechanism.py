@@ -1,4 +1,4 @@
-from tasks.base.components.scoring_mechanism import ScoringMechanism
+from gaia.tasks.base.components.scoring_mechanism import ScoringMechanism
 
 class GeomagneticScoringMechanism(ScoringMechanism):
     """

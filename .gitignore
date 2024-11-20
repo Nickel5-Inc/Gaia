@@ -10,3 +10,6 @@ __pycache__/
 *$py.class
 *.encrypted
 nodes.json
+
+.vscode/
+data/

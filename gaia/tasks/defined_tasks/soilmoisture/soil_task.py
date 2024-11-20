@@ -8,37 +8,32 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_validator_preprocessing import S
 from gaia.tasks.defined_tasks.soilmoisture.soil_scoring_mechanism import SoilScoringMechanism
 from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import SoilMoistureInputs, SoilMoisturePayload
 from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoistureOutputs
-
-
-
+from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMetadata
+from pydantic import Field
 
 class SoilMoistureTask(Task):
-    """
-    Task for soil moisture prediction using satellite and weather data.
-    Workflow:
-    1. Validator selects random region avoiding urban/water areas
-    2. Collects Sentinel-2, IFS weather, and SRTM elevation data
-    3. Sends combined data to miners
-    4. Miners predict soil moisture 6 hours into future
-    5. After 3-day SMAP latency, validator scores predictions
-    """
+    """Task for soil moisture prediction using satellite and weather data."""
+      
+    validator_preprocessing: SoilValidatorPreprocessing = Field(
+        default_factory=SoilValidatorPreprocessing,
+        description="Preprocessing component for validator"
+    )
+    miner_preprocessing: SoilMinerPreprocessing = Field(
+        default_factory=SoilMinerPreprocessing,
+        description="Preprocessing component for miner"
+    )
     
     def __init__(self):
         super().__init__(
             name="SoilMoistureTask",
             description="Soil moisture prediction from satellite/weather data",
             task_type="atomic",
-            metadata=Metadata(),
+            metadata=SoilMoistureMetadata(),
             inputs=SoilMoistureInputs(),
             outputs=SoilMoistureOutputs(),
-            scoring_mechanism=SoilScoringMechanism(),
-            preprocessing=None
+            scoring_mechanism=SoilScoringMechanism()
         )
-        self.prediction_horizon = timedelta(hours=6)
-        self.scoring_delay = timedelta(days=3)
-        self.max_daily_regions = 10
         
-        self.validator_preprocessing = SoilValidatorPreprocessing()
         self.miner_preprocessing = SoilMinerPreprocessing()
 
     def get_next_valid_time(self, current_time: datetime) -> datetime:

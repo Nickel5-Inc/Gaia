@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from .components.metadata import Metadata
 from .components.inputs import Inputs
 from .components.outputs import Outputs
@@ -7,21 +7,11 @@ from .components.preprocessing import Preprocessing
 from .decorators import task_timer
 from abc import ABC, abstractmethod
 import networkx as nx
-from typing import Optional
+from typing import Optional, Any
 
 class Task(BaseModel, ABC):
-    def __init__(self, 
-                 name: str, 
-                 description: str, 
-                 task_type: str, # "atomic" or "composite" 
-                 metadata: Metadata,
-                 inputs: Optional[Inputs] = None,
-                 outputs: Optional[Outputs] = None,
-                 scoring_mechanism: Optional[ScoringMechanism] = None,
-                 preprocessing: Optional[Preprocessing] = None,
-                 subtasks: Optional[nx.Graph] = None):
-           
-        '''
+    """Base class for all tasks in the system.
+
         A unified Task class that can represent either:
         1. A composite task made up of subtasks (when subtasks is provided)
         2. An atomic task (when subtasks is None)
@@ -35,22 +25,26 @@ class Task(BaseModel, ABC):
         - Defines a specific workload
         - Handles direct input/output processing
         - Manages its own execution and scoring
-        '''
-        self.name = name
-        self.description = description
-        self.task_type = task_type
-        self.metadata = metadata
-        
-        # Atomic task properties
-        self.inputs = inputs
-        self.outputs = outputs
-        self.scoring_mechanism = scoring_mechanism
-        self.preprocessing = preprocessing
-        
-        # Composite task properties
-        self.subtasks = subtasks
+    """
+    # required fields
+    name: str = Field(..., description="The name of the task")
+    description: str = Field(..., description="Description of what the task does")
+    task_type: str = Field(..., description="Type of task (atomic or composite)")
+    metadata: Metadata = Field(..., description="Task metadata")
+    
+    # atomic tasks
+    inputs: Optional[Inputs] = Field(None, description="Task inputs")
+    outputs: Optional[Outputs] = Field(None, description="Task outputs")
+    scoring_mechanism: Optional[ScoringMechanism] = Field(None, description="Scoring mechanism")
+    preprocessing: Optional[Preprocessing] = Field(None, description="Preprocessing steps")
+    
+    # composite tasks
+    subtasks: Optional[nx.Graph] = Field(None, description="Graph of subtasks for composite tasks")
 
-        self.db = None  # Will be set by validator/miner on initialization
+    db: Optional[Any] = Field(None, description="Database connection, set by validator/miner")
+    model_config = {
+        "arbitrary_types_allowed": True
+    }
 
     async def initialize_database(self):
         """Initialize task-specific database tables"""

@@ -16,9 +16,10 @@ from rasterio.merge import merge
 from rasterio.transform import from_bounds
 from rasterio.warp import transform_bounds, reproject, Resampling
 from skimage.transform import resize
-
-EARTHDATA_USERNAME = "username"
-EARTHDATA_PASSWORD = "password"
+from dotenv import load_dotenv
+load_dotenv()
+EARTHDATA_USERNAME = os.getenv('EARTHDATA_USERNAME')
+EARTHDATA_PASSWORD = os.getenv('EARTHDATA_PASSWORD')
 
 class SessionWithHeaderRedirection(requests.Session):
     AUTH_HOST = 'urs.earthdata.nasa.gov'
@@ -55,7 +56,7 @@ def fetch_hls_b4_b8(bbox, datetime_obj, download_dir='/tmp'):
             month_end = month_start.replace(month=month_start.month + 1) - timedelta(seconds=1)
         
         headers = {
-            'Authorization': 'apikey'
+            'Authorization': os.getenv('CDS_API_KEY')
         }
         params = {
             "collection_concept_id": "C2021957295-LPCLOUD",

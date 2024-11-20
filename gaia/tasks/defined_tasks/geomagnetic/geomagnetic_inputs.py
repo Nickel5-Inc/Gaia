@@ -1,5 +1,5 @@
 import pandas as pd
-from tasks.base.components.inputs import Inputs
+from gaia.tasks.base.components.inputs import Inputs
 
 
 class GeomagneticInputs(Inputs):

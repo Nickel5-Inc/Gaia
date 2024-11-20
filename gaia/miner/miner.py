@@ -5,32 +5,46 @@ import argparse
 import uvicorn
 from fiber.logging_utils import get_logger
 from fiber.miner import server
-from miner.utils.subnet import factory_router 
 from fiber.miner.middleware import configure_extra_logging_middleware
-from miner.database.miner_database_manager import MinerDatabaseManager
+from gaia.miner.utils.subnet import factory_router
+from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 
 # Load environment variables
 load_dotenv("dev.env")
 
 class Miner:
+    """
+    Miner class that sets up the neuron and processes tasks.
+    """
+
     def __init__(self, args):
         self.args = args
         self.logger = get_logger(__name__)
         self.wallet = args.wallet
         self.hotkey = args.hotkey
         self.netuid = args.netuid
-        self.subtensor_chain_endpoint = args.subtensor.chain_endpoint
-        self.subtensor_network = args.subtensor.network
+        self.subtensor_chain_endpoint = args.subtensor_chain_endpoint
+        self.subtensor_network = args.subtensor_network
         self.database_manager = MinerDatabaseManager()
+
 
     def setup_neuron(self) -> bool:
         """
-        Set up the neuron with necessary configurations and connections.
+        Set up the miner neuron with necessary configurations and connections.
+
+        Returns:
+            bool: True if setup is successful, False otherwise.
         """
-        pass
+        # Add neuron setup logic here if needed
+        self.logger.info("Setting up miner neuron...")
+        return True
 
     def run(self):
+        """
+        Run the miner application with a FastAPI server.
+        """
         try:
+            self.logger.info("Starting miner server...")
             app = server.factory_app(debug=True)
             app.include_router(factory_router())
             # Use the port argument from the CLI
@@ -40,11 +54,17 @@ class Miner:
             self.logger.error(traceback.format_exc())
             raise e
 
+        while True:
+            # Main miner loop for processing tasks
+            # Listen to routes for new tasks and process them
+            pass
+
+
 if __name__ == "__main__":
     # Add arguments
     parser = argparse.ArgumentParser(description="Start the miner with optional flags.")
-    
-    # ID arguments, should overwrite env variables
+
+    # Wallet and network arguments
     parser.add_argument("--wallet", type=str, help="Name of the wallet to use")
     parser.add_argument("--hotkey", type=str, help="Name of the hotkey to use")
     parser.add_argument("--netuid", type=int, help="Netuid to use")
@@ -54,9 +74,8 @@ if __name__ == "__main__":
     parser.add_argument('--use_base_model', action='store_true', help='Enable base model usage')
 
     # Subtensor arguments
-    subtensor_group = parser.add_argument_group('subtensor')
-    subtensor_group.add_argument("--subtensor.chain_endpoint", type=str, help="Subtensor chain endpoint to use")
-    subtensor_group.add_argument("--subtensor.network", type=str, help="Subtensor network to use", default="test")
+    parser.add_argument("--subtensor_chain_endpoint", type=str, help="Subtensor chain endpoint to use")
+    parser.add_argument("--subtensor_network", type=str, default="test", help="Subtensor network to use")
 
     # Parse arguments and start the miner
     args = parser.parse_args()
