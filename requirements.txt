@@ -12,6 +12,6 @@ pytorch-lightning==2.4.0
 rasterio==1.4.2
 safetensors==0.4.5
 scalecodec==1.2.11
-substrateinterface==1.0.0
+substrate-interface==1.7.10
 tenacity==9.0.0
 uvicorn==0.32.0
