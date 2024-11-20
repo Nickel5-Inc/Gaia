@@ -89,7 +89,7 @@ class SoilValidatorPreprocessing(Preprocessing):
         
         return region_id
 
-    def get_daily_regions(self, target_time: datetime) -> List[Dict]:
+    async def get_daily_regions(self, target_time: datetime) -> List[Dict]:
         """Get and store daily regions."""
         regions = []
         today = date.today()
