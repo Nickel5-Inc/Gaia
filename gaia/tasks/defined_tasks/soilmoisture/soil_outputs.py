@@ -4,6 +4,7 @@ import numpy as np
 from numpy.typing import NDArray
 from gaia.tasks.base.components.outputs import Outputs
 from gaia.tasks.base.decorators import handle_validation_error
+from datetime import datetime
 
 class SoilMoisturePrediction(BaseModel):
     """Schema for soil moisture prediction response."""

@@ -88,15 +88,3 @@ def select_random_region(base_cells, urban_cells_set, lakes_cells_set, min_lat=-
             return valid_bbox
     
     raise ValueError("No valid 1x1 degree box found in the selected region.")
-
-#EXAMPLE USE BELOW ---TODO: REMOVE
-with open('full_h3_map.json', 'r') as f:
-    data = json.load(f)
-base_cells = [{"index": cell["index"], "resolution": cell["resolution"]} for cell in data["base_cells"]]
-urban_cells_set = set(cell["index"] for cell in data["urban_overlay_cells"])
-lakes_cells_set = set(cell["index"] for cell in data["lakes_overlay_cells"])
-try:
-    random_region = select_random_region(base_cells, urban_cells_set, lakes_cells_set, min_lat=-56, max_lat=60)
-    print("Selected 1x1 degree region (min_lon, min_lat, max_lon, max_lat):", random_region)
-except ValueError as e:
-    print(e)
