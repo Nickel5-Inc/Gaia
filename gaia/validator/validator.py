@@ -73,7 +73,7 @@ class GaiaValidator:
             logger.error(f"Error setting up neuron: {e}")
             return False
 
-    async def query_miners(self, httpx_client, payload: Optional[Inputs] = None, endpoint: str = None) -> Outputs:
+    async def query_miners(self, payload: Optional[Inputs] = None, endpoint: str = None) -> Outputs:
         """Handle the miner querying logic"""
         self.metagraph.sync_nodes()
 
@@ -83,7 +83,7 @@ class GaiaValidator:
             try:
                 symmetric_key_str, symmetric_key_uuid = await handshake.perform_handshake(
                     keypair=self.keypair,
-                    httpx_client=httpx_client,
+                    httpx_client=self.httpx_client,
                     server_address=base_url,
                     miner_hotkey_ss58_address=miner_hotkey,
                 )
@@ -107,7 +107,7 @@ class GaiaValidator:
                     fernet = Fernet(symmetric_key_str)
 
                     resp = await vali_client.make_non_streamed_post(
-                        httpx_client=httpx_client,
+                        httpx_client=self.httpx_client,
                         server_address=base_url,
                         fernet=fernet,
                         keypair=self.keypair,
@@ -141,11 +141,23 @@ class GaiaValidator:
         # Initialize database tables
         await self.database_manager.initialize_database()
 
+        # Create a custom SSL context that ignores hostname mismatches
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE  # This is necessary for self-signed certs
+
+        self.httpx_client = httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            verify=False
+        )
+
         while True:
             try:
                 current_time = datetime.datetime.now(datetime.timezone.utc)
 
                 #schedule each task execution loop in a separate thread
+                # NOTE: this is a beta implementation that will be replaced with a more sophisticated scheduler soon
                 workers = [
                     asyncio.create_task(self.soil_task.validator_execute()),
                     asyncio.create_task(self.geomagnetic_task.validator_execute())

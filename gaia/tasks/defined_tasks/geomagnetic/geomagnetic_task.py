@@ -55,43 +55,72 @@ class GeomagneticTask(Task):
     # Validator execution method
     ############################################################
 
-    def validator_execute(self):
+    async def validator_execute(self, validator):
         """
         Executes the validator workflow:
         - Fetches predictions for the last UTC hour.
         - Fetches ground truth data for the current UTC hour.
         - Scores predictions against the ground truth.
         - Archives scored predictions in the history table or file.
+        - runs in a continuous loop
         """
-        current_time = datetime.datetime.utcnow()
-        print(f"Validator executing at {current_time.isoformat()}")
+        while True:
+            current_time = datetime.datetime(datetime.timezone.utc)
+            print(f"---Begin Geomagnetic Task Loop  at {current_time.isoformat()} --")
 
-        # Step 1: Calculate the time range for fetching tasks
-        last_hour_start = current_time - datetime.timedelta(hours=1)
-        last_hour_end = current_time
-        print(f"Fetching predictions between {last_hour_start} and {last_hour_end}")
 
-        # Step 2: Fetch tasks for the last hour
-        tasks = self.get_tasks_for_hour(last_hour_start, last_hour_end)
-        if not tasks:
-            print("No predictions to score for the last hour.")
-            return
+            # 1. Construct Payload For Query 
+            timestamp, dst_value = await get_latest_geomag_data()
+            
+            # 2. Construct Payload Template - Nonce should be unique for each query
+            payload_template = {
+                "nonce": "",
+                "data": {
+                    "name": "Geomagnetic data",
+                    "timestamp": str(timestamp),
+                    "value": dst_value,
+                }
+            }
 
-        # Step 3: Fetch ground truth for the current hour
-        ground_truth_value = self.fetch_ground_truth()
-        if ground_truth_value is None:
-            print("Failed to fetch ground truth data.")
-            return
+            endpoint = "geomagnetic-request/"
 
-        # Step 4: Score predictions and move to history
-        for task in tasks:
-            try:
-                predicted_value = task["predicted_values"]
-                score = self.scoring_mechanism.calculate_score(predicted_value, ground_truth_value)
-                self.move_task_to_history(task, ground_truth_value, score, current_time)
-                print(f"Task scored and archived at {current_time.isoformat()}")
-            except Exception as e:
-                print(f"Error processing task {task['id']}: {e}")
+            # 2. Query Miners
+            await validator.query_miners(payload_template)
+
+
+            # 3. Collect Responses and Store in Queue
+
+
+            # 4. Fetch Ground Truth
+
+
+            # 5. Score Predictions and Archive
+
+            last_hour_start = current_time - datetime.timedelta(hours=1)
+            last_hour_end = current_time
+            print(f"Fetching predictions between {last_hour_start} and {last_hour_end}")
+
+            # Step 2: Fetch tasks for the last hour
+            tasks = self.get_tasks_for_hour(last_hour_start, last_hour_end)
+            if not tasks:
+                print("No predictions to score for the last hour.")
+                return
+
+            # Step 3: Fetch ground truth for the current hour
+            ground_truth_value = self.fetch_ground_truth()
+            if ground_truth_value is None:
+                print("Failed to fetch ground truth data.")
+                return
+
+            # Step 4: Score predictions and move to history
+            for task in tasks:
+                try:
+                    predicted_value = task["predicted_values"]
+                    score = self.scoring_mechanism.calculate_score(predicted_value, ground_truth_value)
+                    self.move_task_to_history(task, ground_truth_value, score, current_time)
+                    print(f"Task scored and archived at {current_time.isoformat()}")
+                except Exception as e:
+                    print(f"Error processing task {task['id']}: {e}")
 
 
     def get_tasks_for_hour(self, start_time, end_time):

@@ -50,19 +50,6 @@ async def soilmoisture_require(
     return JSONResponse(content=response_data)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 def factory_router() -> APIRouter:
     router = APIRouter()
     router.add_api_route(
