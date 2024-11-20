@@ -28,7 +28,7 @@ class SoilValidatorPreprocessing(Preprocessing):
         
     def _load_h3_map(self):
         """Load H3 map data, first checking locally then from HuggingFace."""
-        local_path = 'tasks/defined_tasks/soilmoisture/full_h3_map.json'
+        local_path = 'Nickel5HF/gaia_h3_mapping/full_h3_map.json'
         
         try:
             if os.path.exists(local_path):
@@ -37,7 +37,7 @@ class SoilValidatorPreprocessing(Preprocessing):
                     
             print("Local H3 map not found, downloading from HuggingFace...")
             map_path = hf_hub_download(
-                repo_id="your-hf-repo/soil-moisture-task",
+                repo_id="Nickel5HF/gaia_h3_mapping/",
                 filename="full_h3_map.json"
             )
             with open(map_path, 'r') as f:
