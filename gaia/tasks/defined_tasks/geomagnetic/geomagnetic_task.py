@@ -85,11 +85,11 @@ class GeomagneticTask(Task):
             endpoint = "geomagnetic-request/"
 
             # 2. Query Miners
-            await validator.query_miners(payload_template)
+            await validator.query_miners(payload_template, endpoint)
 
 
             # 3. Collect Responses and Store in Queue
-
+        
 
             # 4. Fetch Ground Truth
 
