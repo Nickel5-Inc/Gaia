@@ -1,5 +1,5 @@
 import numpy as np
-from tasks.base.components.outputs import Outputs
+from gaia.tasks.base.components.outputs import Outputs
 
 
 class GeomagneticOutputs(Outputs):

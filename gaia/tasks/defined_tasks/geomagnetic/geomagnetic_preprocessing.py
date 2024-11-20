@@ -1,6 +1,6 @@
-from tasks.base.components.preprocessing import Preprocessing
+from gaia.tasks.base.components.preprocessing import Preprocessing
 import pandas as pd
-from models.geomag_basemodel import GeoMagBaseModel
+from gaia.models.geomag_basemodel import GeoMagBaseModel
 
 
 class GeomagneticPreprocessing(Preprocessing):
