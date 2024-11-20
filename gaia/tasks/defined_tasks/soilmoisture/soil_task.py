@@ -9,10 +9,16 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_scoring_mechanism import SoilSco
 from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import SoilMoistureInputs, SoilMoisturePayload
 from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoistureOutputs
 from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMetadata
+from pydantic import Field
 
 class SoilMoistureTask(Task):
     """Task for soil moisture prediction using satellite and weather data."""
       
+    validator_preprocessing: SoilValidatorPreprocessing = Field(
+        default_factory=SoilValidatorPreprocessing,
+        description="Preprocessing component for validator"
+    )
+    
     def __init__(self):
         super().__init__(
             name="SoilMoistureTask",
@@ -24,7 +30,6 @@ class SoilMoistureTask(Task):
             scoring_mechanism=SoilScoringMechanism()
         )
         
-        self.validator_preprocessing = SoilValidatorPreprocessing()
         self.miner_preprocessing = SoilMinerPreprocessing()
 
     def get_next_valid_time(self, current_time: datetime) -> datetime:
