@@ -1,21 +1,32 @@
 from tasks.base.components.scoring_mechanism import ScoringMechanism
 
 class GeomagneticScoringMechanism(ScoringMechanism):
-    def calculate_score(self, predicted_value: int, actual_value: int):
+    """
+    Scoring mechanism for geomagnetic tasks.
+
+    This mechanism scores miner predictions based on the deviation
+    from the ground truth DST value.
+    """
+
+    def calculate_score(self, predicted_value, actual_value):
         """
-        Calculates the score based on the absolute error between the miner's
-        predicted DST value and the actual DST value.
+        Calculates the score for a miner's prediction based on deviation.
 
         Args:
-            predicted_value (int): The DST value predicted by the miner.
-            actual_value (int): The real DST value provided by the validator.
+            predicted_value (float): The predicted DST value from the miner.
+            actual_value (int): The ground truth DST value.
 
         Returns:
-            float or None: The absolute error as the score, or None if inputs are invalid.
+            float: The absolute deviation between the predicted value and the ground truth.
         """
-        if predicted_value is None or actual_value is None:
-            print("Error: Predicted or actual value is None.")
-            return None
+        if not isinstance(predicted_value, (int, float)):
+            raise ValueError("Predicted value must be an integer or a float.")
+        if not isinstance(actual_value, int):
+            raise ValueError("Actual value must be an integer.")
 
-        return abs(predicted_value - actual_value)
+        # Calculate the absolute deviation
+        score = abs(predicted_value - actual_value)
+
+        return score
+
 
