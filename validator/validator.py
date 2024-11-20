@@ -16,7 +16,7 @@ from validator.database.validator_database_manager import ValidatorDatabaseManag
 from tasks.base.components.inputs import Inputs
 from tasks.base.components.outputs import Outputs
 from argparse import ArgumentParser
-from tasks.defined_tasks.soil_moisture.soil_moisture_task import SoilMoistureTask
+from tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
 
 
 logger = get_logger(__name__)
@@ -143,61 +143,60 @@ class GaiaValidator:
         # Initialize database tables
         await self.database_manager.initialize_database()
 
-        async def network_worker():
-            """Handle network operations (miner queries, API calls)"""
-            while True:
-                try:
-                    task = await self.database_manager.get_next_task('network')
-                    if task:
-                        try:
-                            ssl_context = ssl.create_default_context()
-                            ssl_context.check_hostname = False
-                            ssl_context.verify_mode = ssl.CERT_NONE
+        # async def network_worker():
+        #     """Handle network operations (miner queries, API calls)"""
+        #     while True:
+        #         try:
+        #             task = await self.database_manager.get_next_task('network')
+        #             if task:
+        #                 try:
+        #                     ssl_context = ssl.create_default_context()
+        #                     ssl_context.check_hostname = False
+        #                     ssl_context.verify_mode = ssl.CERT_NONE
                             
-                            async with httpx.AsyncClient(
-                                timeout=30.0,
-                                follow_redirects=True,
-                                verify=ssl_context,
-                            ) as client:
-                                if task['process_name'] == 'query_miners':
-                                    await self.query_miners(client, task['payload'])
-                                elif task['process_name'] == 'sync_metagraph':
-                                    await self.metagraph.sync_nodes()
-                                elif task['process_name'] == 'fetch_ground_truth':
-                                    await self._fetch_ground_truth(client, task)
+        #                     async with httpx.AsyncClient(
+        #                         timeout=30.0,
+        #                         follow_redirects=True,
+        #                         verify=ssl_context,
+        #                     ) as client:
+        #                         if task['process_name'] == 'query_miners':
+        #                             await self.query_miners(client, task['payload'])
+        #                         elif task['process_name'] == 'sync_metagraph':
+        #                             await self.metagraph.sync_nodes()
+        #                         elif task['process_name'] == 'fetch_ground_truth':
+        #                             await self._fetch_ground_truth(client, task)
                                 
-                                await self.database_manager.complete_task(task['id'])
-                        except Exception as e:
-                            await self.database_manager.complete_task(task['id'], str(e))
-                except Exception as e:
-                    logger.error(f"Network worker error: {e}")
-                await asyncio.sleep(1)
+        #                         await self.database_manager.complete_task(task['id'])
+        #                 except Exception as e:
+        #                     await self.database_manager.complete_task(task['id'], str(e))
+        #         except Exception as e:
+        #             logger.error(f"Network worker error: {e}")
+        #         await asyncio.sleep(1)
 
-        async def compute_worker():
-            """Handle compute-intensive processes"""
-            while True:
-                try:
-                    task = await self.database_manager.get_next_task('compute')
-                    if task:
-                        try:
-                            if task['process_name'] == 'score_predictions':
-                                await self._score_predictions(task)
-                            elif task['process_name'] == 'process_region_data':
-                                await self._process_region_data(task)
+        # async def compute_worker():
+        #     """Handle compute-intensive processes"""
+        #     while True:
+        #         try:
+        #             task = await self.database_manager.get_next_task('compute')
+        #             if task:
+        #                 try:
+        #                     if task['process_name'] == 'score_predictions':
+        #                         await self._score_predictions(task)
+        #                     elif task['process_name'] == 'process_region_data':
+        #                         await self._process_region_data(task)
                             
-                            await self.database_manager.complete_task(task['id'])
-                        except Exception as e:
-                            await self.database_manager.complete_task(task['id'], str(e))
-                except Exception as e:
-                    logger.error(f"Compute worker error: {e}")
-                await asyncio.sleep(1)
+        #                     await self.database_manager.complete_task(task['id'])
+        #                 except Exception as e:
+        #                     await self.database_manager.complete_task(task['id'], str(e))
+        #         except Exception as e:
+        #             logger.error(f"Compute worker error: {e}")
+        #         await asyncio.sleep(1)
 
-        # Start workers
-        workers = [
-            asyncio.create_task(network_worker()),
-            asyncio.create_task(compute_worker()),
-            asyncio.create_task(self.run_soil_task())  # Add soil task worker
-        ]
+        # # Start workers
+        # workers = [
+        #     asyncio.create_task(network_worker()),
+        #     asyncio.create_task(compute_worker())
+        # ]
 
         # Main scheduling loop
         while True:
