@@ -114,6 +114,7 @@ MIN_STAKE_THRESHOLD=<INT>
 
 #### Run the miner
 ```bash
+cd gaia
 cd miner
 python miner.py
 ```

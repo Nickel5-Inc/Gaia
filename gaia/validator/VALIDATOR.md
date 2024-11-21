@@ -12,6 +12,7 @@ MIN_STAKE_THRESHOLD=<INT>
 
 #### Run the validator
 ```bash
+cd gaia
 cd validator
 python validator.py
 ```

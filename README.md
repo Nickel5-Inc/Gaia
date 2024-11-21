@@ -11,7 +11,7 @@ Gaia is the intersection of geospatial data analysis and machine learning. Most 
 Gaia will begin at the cutting-edge of several different applications (beginning with two) and will expand toward a Grand Foundational Model. Geospatial data is diverse and expansive but all intertwined. Read more in our whitepaper [here] *DONT FORGET TO ATTACH LINK*
 
 ## Miners
-[Quicklink](miner/MINER.md)
+[Quicklink](gaia/miner/MINER.md)
 
 Miners develop models to understand future events. These events currently include soil moisture and geomagnetic readings at the equator. Miners will receive data from validators for the models that we have in place. They are also free to gather their own data from other resources. The tasks are consistent in design and in timing; this predictability allows miners the flexibility to retrieve any data that their model requires. 
 
@@ -19,7 +19,7 @@ Miners can choose between these two tasks or perform both. Incentive is split 50
 
 
 ## Validators
-[Quicklink](validator/VALIDATOR.md)
+[Quicklink](gaia/validator/VALIDATOR.md)
 
 Validators will connect to a few API's to provide miners with the data they need to run models.
 
