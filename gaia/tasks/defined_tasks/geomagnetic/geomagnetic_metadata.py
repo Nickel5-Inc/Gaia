@@ -1,5 +1,6 @@
 from gaia.tasks.base.components.metadata import Metadata
 
+
 class GeomagneticMetadata(Metadata):
     def __init__(self):
         self.source = "Geomagnetic Data"
@@ -15,4 +16,3 @@ class GeomagneticMetadata(Metadata):
             end_date (str or datetime): End of the date range.
         """
         self.date_range = (start_date, end_date)
-

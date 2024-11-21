@@ -1,10 +1,18 @@
 from gaia.tasks.base.task import Task
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_metadata import GeomagneticMetadata
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_metadata import (
+    GeomagneticMetadata,
+)
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_inputs import GeomagneticInputs
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_preprocessing import GeomagneticPreprocessing
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_scoring_mechanism import GeomagneticScoringMechanism
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_preprocessing import (
+    GeomagneticPreprocessing,
+)
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_scoring_mechanism import (
+    GeomagneticScoringMechanism,
+)
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_outputs import GeomagneticOutputs
-from gaia.tasks.defined_tasks.geomagnetic.utils.process_geomag_data import get_latest_geomag_data
+from gaia.tasks.defined_tasks.geomagnetic.utils.process_geomag_data import (
+    get_latest_geomag_data,
+)
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 import datetime
 import numpy as np
@@ -50,7 +58,7 @@ class GeomagneticTask(Task):
             inputs=GeomagneticInputs(),
             preprocessing=GeomagneticPreprocessing(),
             scoring_mechanism=GeomagneticScoringMechanism(),
-            outputs=GeomagneticOutputs()
+            outputs=GeomagneticOutputs(),
         )
 
     ############################################################
@@ -71,15 +79,23 @@ class GeomagneticTask(Task):
             try:
                 # Step 1: Align to the top of the next hour
                 current_time = datetime.datetime.now(datetime.timezone.utc)
-                next_hour = current_time.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
+                next_hour = current_time.replace(
+                    minute=0, second=0, microsecond=0
+                ) + datetime.timedelta(hours=1)
                 sleep_duration = (next_hour - current_time).total_seconds()
 
-                print(f"Sleeping until the next hour: {next_hour.isoformat()} (in {sleep_duration} seconds)")
-                await asyncio.sleep(sleep_duration)  # Wait until the top of the next hour
+                print(
+                    f"Sleeping until the next hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
+                )
+                await asyncio.sleep(
+                    sleep_duration
+                )  # Wait until the top of the next hour
 
                 # Step 2: Fetch Latest Geomagnetic Data
                 timestamp, dst_value = await get_latest_geomag_data()
-                print(f"Fetched latest geomagnetic data: timestamp={timestamp}, value={dst_value}")
+                print(
+                    f"Fetched latest geomagnetic data: timestamp={timestamp}, value={dst_value}"
+                )
 
                 # Step 3: Construct Payload for Miners
                 nonce = str(uuid4())  # Generate a unique nonce for this query
@@ -89,7 +105,7 @@ class GeomagneticTask(Task):
                         "name": "Geomagnetic Data",
                         "timestamp": str(timestamp),
                         "value": dst_value,
-                    }
+                    },
                 }
                 endpoint = "geomagnetic-request/"
 
@@ -98,11 +114,13 @@ class GeomagneticTask(Task):
                 print(f"Collected responses from miners: {len(responses)}")
 
                 # Step 5: Store Predictions in Queue
-                current_hour_start = next_hour.replace(minute=0, second=0, microsecond=0) - datetime.timedelta(hours=1)
+                current_hour_start = next_hour.replace(
+                    minute=0, second=0, microsecond=0
+                ) - datetime.timedelta(hours=1)
                 for response in responses:
                     self.add_task_to_queue(
                         predictions=response.get("predicted_values"),
-                        query_time=current_hour_start
+                        query_time=current_hour_start,
                     )
 
                 # Step 6: Fetch Ground Truth for Current Hour
@@ -115,7 +133,9 @@ class GeomagneticTask(Task):
                 last_hour_start = current_hour_start
                 last_hour_end = next_hour.replace(minute=0, second=0, microsecond=0)
 
-                print(f"Fetching predictions between {last_hour_start} and {last_hour_end}")
+                print(
+                    f"Fetching predictions between {last_hour_start} and {last_hour_end}"
+                )
                 tasks = self.get_tasks_for_hour(last_hour_start, last_hour_end)
 
                 if not tasks:
@@ -125,16 +145,21 @@ class GeomagneticTask(Task):
                 for task in tasks:
                     try:
                         predicted_value = task["predicted_values"]
-                        score = self.scoring_mechanism.calculate_score(predicted_value, ground_truth_value)
-                        self.move_task_to_history(task, ground_truth_value, score, current_time)
-                        print(f"Task scored and archived: task_id={task['id']}, score={score}")
+                        score = self.scoring_mechanism.calculate_score(
+                            predicted_value, ground_truth_value
+                        )
+                        self.move_task_to_history(
+                            task, ground_truth_value, score, current_time
+                        )
+                        print(
+                            f"Task scored and archived: task_id={task['id']}, score={score}"
+                        )
                     except Exception as e:
                         print(f"Error processing task {task['id']}: {e}")
 
             except Exception as e:
                 print(f"Unexpected error in validator_execute loop: {e}")
                 await asyncio.sleep(60)  # Retry after a short delay
-
 
     def get_tasks_for_hour(self, start_time, end_time):
         """
@@ -167,8 +192,10 @@ class GeomagneticTask(Task):
                 {
                     "id": row[0],
                     "miner_id": row[1],
-                    "predicted_values": row[2],  # Assuming a single prediction per miner
-                    "query_time": row[3]
+                    "predicted_values": row[
+                        2
+                    ],  # Assuming a single prediction per miner
+                    "query_time": row[3],
                 }
                 for row in results
             ]
@@ -196,15 +223,19 @@ class GeomagneticTask(Task):
             dst_data = get_latest_geomag_data()
 
             # Filter the data to find the record for the current hour
-            current_hour_data = dst_data[dst_data['timestamp'].dt.hour == current_time.hour]
+            current_hour_data = dst_data[
+                dst_data["timestamp"].dt.hour == current_time.hour
+            ]
 
             if current_hour_data.empty:
                 print("No ground truth data available for the current hour.")
                 return None
 
             # Extract the ground truth value
-            ground_truth_value = int(current_hour_data['value'].iloc[0])
-            print(f"Ground truth value for hour {current_time.hour}: {ground_truth_value}")
+            ground_truth_value = int(current_hour_data["value"].iloc[0])
+            print(
+                f"Ground truth value for hour {current_time.hour}: {ground_truth_value}"
+            )
             return ground_truth_value
 
         except Exception as e:
@@ -227,7 +258,7 @@ class GeomagneticTask(Task):
             "ground_truth_value": ground_truth_value,
             "score": score,
             "query_time": task["query_time"].isoformat(),
-            "score_time": score_time.isoformat()
+            "score_time": score_time.isoformat(),
         }
 
         # Insert into history table or save to JSON
@@ -248,12 +279,16 @@ class GeomagneticTask(Task):
         and adds predictions to task queue.
         """
         # Step 1: Query miners and collect predictions
-        predictions = self.query_miners()  # This would call miners to get their predictions
+        predictions = (
+            self.query_miners()
+        )  # This would call miners to get their predictions
 
         # Step 2: Add predictions to task queue
         query_time = datetime.datetime.utcnow()
         self.add_task_to_queue(predictions, query_time)
-        print(f"Added task to queue at {query_time} with {len(predictions)} predictions.")
+        print(
+            f"Added task to queue at {query_time} with {len(predictions)} predictions."
+        )
 
     def query_miners(self):
         """
@@ -263,7 +298,9 @@ class GeomagneticTask(Task):
             np.ndarray: Array of 256 predictions from miners.
         """
         # Simulate getting predictions from miners
-        predictions = np.random.randint(-100, 100, size=256)  # Example of simulated predictions
+        predictions = np.random.randint(
+            -100, 100, size=256
+        )  # Example of simulated predictions
         return predictions
 
     def add_task_to_queue(self, predictions, query_time):

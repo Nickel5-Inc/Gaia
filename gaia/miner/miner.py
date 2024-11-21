@@ -12,6 +12,7 @@ from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 # Load environment variables
 load_dotenv("dev.env")
 
+
 class Miner:
     """
     Miner class that sets up the neuron and processes tasks.
@@ -26,7 +27,6 @@ class Miner:
         self.subtensor_chain_endpoint = args.subtensor_chain_endpoint
         self.subtensor_network = args.subtensor_network
         self.database_manager = MinerDatabaseManager()
-
 
     def setup_neuron(self) -> bool:
         """
@@ -70,14 +70,22 @@ if __name__ == "__main__":
     parser.add_argument("--netuid", type=int, help="Netuid to use")
 
     # Optional arguments
-    parser.add_argument("--port", type=int, default=8091, help="Port to run the miner on")
-    parser.add_argument('--use_base_model', action='store_true', help='Enable base model usage')
+    parser.add_argument(
+        "--port", type=int, default=8091, help="Port to run the miner on"
+    )
+    parser.add_argument(
+        "--use_base_model", action="store_true", help="Enable base model usage"
+    )
 
     # Subtensor arguments
-    parser.add_argument("--subtensor_chain_endpoint", type=str, help="Subtensor chain endpoint to use")
-    parser.add_argument("--subtensor_network", type=str, default="test", help="Subtensor network to use")
+    parser.add_argument(
+        "--subtensor_chain_endpoint", type=str, help="Subtensor chain endpoint to use"
+    )
+    parser.add_argument(
+        "--subtensor_network", type=str, default="test", help="Subtensor network to use"
+    )
 
     # Parse arguments and start the miner
     args = parser.parse_args()
-    miner = Miner(args) 
+    miner = Miner(args)
     miner.run()

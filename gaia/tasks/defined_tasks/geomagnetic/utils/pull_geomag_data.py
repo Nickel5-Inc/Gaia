@@ -1,6 +1,7 @@
 import requests
 from datetime import datetime
 
+
 def fetch_data(url=None):
     """
     Fetch raw geomagnetic data from the specified or dynamically generated URL.
@@ -17,7 +18,7 @@ def fetch_data(url=None):
         current_year = datetime.now().year
         current_month = datetime.now().month
         # Format the URL dynamically
-        url = f'https://wdc.kugi.kyoto-u.ac.jp/dst_realtime/{current_year}{current_month:02d}/dst{str(current_year)[-2:]}{current_month:02d}.for.request'
+        url = f"https://wdc.kugi.kyoto-u.ac.jp/dst_realtime/{current_year}{current_month:02d}/dst{str(current_year)[-2:]}{current_month:02d}.for.request"
 
     print(f"Fetching data from URL: {url}")  # Debug print to verify the URL
 
@@ -27,4 +28,3 @@ def fetch_data(url=None):
         return response.text
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Error fetching data: {e}")
-

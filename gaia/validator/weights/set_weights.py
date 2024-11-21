@@ -7,10 +7,18 @@ import random
 from fiber.chain.fetch_nodes import get_nodes_for_netuid
 import sys
 from fiber.logging_utils import get_logger
+
 logger = get_logger(__name__)
 
+
 class FiberWeightSetter:
-    def __init__(self, netuid: int, wallet_name: str = "default", hotkey_name: str = "default", network: str = "finney"):
+    def __init__(
+        self,
+        netuid: int,
+        wallet_name: str = "default",
+        hotkey_name: str = "default",
+        network: str = "finney",
+    ):
         """
         Initialize the weight setter with fiber instead of bittensor
         """
@@ -19,7 +27,9 @@ class FiberWeightSetter:
         self.hotkey_name = hotkey_name
         self.network = network
         self.substrate = interface.get_substrate(subtensor_network=network)
-        self.keypair = chain_utils.load_hotkey_keypair(wallet_name=wallet_name, hotkey_name=hotkey_name)
+        self.keypair = chain_utils.load_hotkey_keypair(
+            wallet_name=wallet_name, hotkey_name=hotkey_name
+        )
         self.timer = datetime.now(timezone.utc)
 
     def is_time_to_set_weights(self) -> bool:
@@ -28,7 +38,9 @@ class FiberWeightSetter:
         return time_diff >= timedelta(hours=1)
 
     def calculate_weights(self, n_nodes: int) -> torch.Tensor:
-        random_weights = torch.tensor([random.random() for _ in range(n_nodes)], dtype=torch.float32) # Random scores for testing
+        random_weights = torch.tensor(
+            [random.random() for _ in range(n_nodes)], dtype=torch.float32
+        )  # Random scores for testing
         normalized_weights = random_weights / random_weights.sum()
         return normalized_weights
 
@@ -44,19 +56,18 @@ class FiberWeightSetter:
         """Set random weights on the network using fiber"""
         try:
             logger.info(f"\nAttempting to set weights for subnet {self.netuid}...")
-            
+
             # Get all neurons/nodes
             nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
             if not nodes:
                 logger.error(f"❗No nodes found for subnet {self.netuid}")
                 return
-            
+
             # Find validator's UID from nodes list
             validator_uid = self.find_validator_uid(nodes)
             if validator_uid is None:
                 logger.error("❗Failed to get validator UID")
                 return
-
 
             # Generate weights
             calculated_weights = self.calculate_weights(len(nodes))
@@ -76,7 +87,7 @@ class FiberWeightSetter:
                     wait_for_inclusion=True,
                     wait_for_finalization=True,
                 )
-                
+
                 # If `result` is awaitable, await it
                 if asyncio.iscoroutine(result):
                     result = await result
@@ -89,30 +100,30 @@ class FiberWeightSetter:
                 logger.error(f"❗Error setting weights: {str(e)}")
                 raise
             self.timer = datetime.now(timezone.utc)
-            
+
         except Exception as e:
             logger.error(f"❗Error setting weights: {str(e)}")
             import traceback
+
             print(traceback.format_exc())
             raise
+
 
 async def main():
     try:
         weight_setter = FiberWeightSetter(
-            netuid=237,  
-            wallet_name="gaiatest",
-            hotkey_name="default",
-            network="test"
+            netuid=237, wallet_name="gaiatest", hotkey_name="default", network="test"
         )
-        
+
         await weight_setter.set_weights()
-        
+
     except KeyboardInterrupt:
         logger.info("\nStopping...")
         sys.exit(0)
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

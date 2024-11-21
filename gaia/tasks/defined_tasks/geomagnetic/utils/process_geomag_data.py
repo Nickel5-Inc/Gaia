@@ -3,7 +3,8 @@ from datetime import datetime, timedelta
 from .pull_geomag_data import fetch_data
 
 # Constants
-PLACEHOLDER_VALUE = '9999999999999999'
+PLACEHOLDER_VALUE = "9999999999999999"
+
 
 def parse_data(data):
     dates = []
@@ -30,8 +31,11 @@ def parse_data(data):
             if value_str != PLACEHOLDER_VALUE and value_str:
                 try:
                     value = int(value_str)
-                    timestamp = (datetime(year, month, day, 0) + timedelta(days=1)
-                                 if hour == 23 else datetime(year, month, day, hour + 1))
+                    timestamp = (
+                        datetime(year, month, day, 0) + timedelta(days=1)
+                        if hour == 23
+                        else datetime(year, month, day, hour + 1)
+                    )
                     dates.append(timestamp)
                     hourly_values.append(value)
                 except ValueError:
@@ -43,16 +47,20 @@ def parse_data(data):
             parse_line(line)
 
     # Debugging output to check if any dates and values are parsed
-    #print(f"Parsed dates: {dates[:5]}")  # Display first 5 dates for inspection
-    print(f"Parsed hourly_values: {hourly_values[:1]}")  # Display first 5 values for inspection
+    # print(f"Parsed dates: {dates[:5]}")  # Display first 5 dates for inspection
+    print(
+        f"Parsed hourly_values: {hourly_values[:1]}"
+    )  # Display first 5 values for inspection
 
-    return pd.DataFrame({'timestamp': dates, 'Dst': hourly_values})
+    return pd.DataFrame({"timestamp": dates, "Dst": hourly_values})
+
 
 def clean_data(df):
-    df = df.drop_duplicates(subset='timestamp')
-    df = df[df['Dst'].between(-500, 500)]
+    df = df.drop_duplicates(subset="timestamp")
+    df = df[df["Dst"].between(-500, 500)]
     df = df.dropna().reset_index(drop=True)
     return df
+
 
 def get_latest_geomag_data():
     """
@@ -68,8 +76,10 @@ def get_latest_geomag_data():
     # Get the latest data point
     if not cleaned_df.empty:
         latest_data_point = cleaned_df.iloc[-1]
-        timestamp = latest_data_point['timestamp']
-        dst_value = int(latest_data_point['Dst'])  # Convert to native int for JSON compatibility
+        timestamp = latest_data_point["timestamp"]
+        dst_value = int(
+            latest_data_point["Dst"]
+        )  # Convert to native int for JSON compatibility
         return timestamp, dst_value
     else:
         # If no data available, return placeholders

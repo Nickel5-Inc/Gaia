@@ -42,4 +42,3 @@ class GeomagneticInputs(Inputs):
 
         print("Data validation successful.")
         return True
-

@@ -1,5 +1,6 @@
 from gaia.tasks.base.components.scoring_mechanism import ScoringMechanism
 
+
 class GeomagneticScoringMechanism(ScoringMechanism):
     """
     Scoring mechanism for geomagnetic tasks.
@@ -28,5 +29,3 @@ class GeomagneticScoringMechanism(ScoringMechanism):
         score = abs(predicted_value - actual_value)
 
         return score
-
-

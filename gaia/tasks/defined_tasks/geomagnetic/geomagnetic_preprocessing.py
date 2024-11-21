@@ -35,8 +35,12 @@ class GeomagneticPreprocessing(Preprocessing):
             model = GeoMagBaseModel()  # Initialize the base model
 
         # Ensure the timestamp is in UTC format
-        last_timestamp = processed_data['timestamp'].iloc[-1]
-        last_timestamp_utc = last_timestamp.tz_convert('UTC') if last_timestamp.tzinfo else last_timestamp
+        last_timestamp = processed_data["timestamp"].iloc[-1]
+        last_timestamp_utc = (
+            last_timestamp.tz_convert("UTC")
+            if last_timestamp.tzinfo
+            else last_timestamp
+        )
 
         try:
             # Assume the model has a `predict` method that takes the processed data
@@ -45,7 +49,4 @@ class GeomagneticPreprocessing(Preprocessing):
             print(f"Error in model prediction: {e}")
             return None
 
-        return {
-            "predicted_value": int(prediction),
-            "timestamp": last_timestamp_utc
-        }
+        return {"predicted_value": int(prediction), "timestamp": last_timestamp_utc}
