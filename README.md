@@ -8,7 +8,8 @@
 
 Gaia is the intersection of geospatial data analysis and machine learning. Most current models, whether in academia/research or industry, are purpose built for a single task. They’re often quite small and tuned on incredibly specific and well-prepared datasets. There is hardly any advancement towards a “foundational” type mega-model. There have been attempts, sure - like LLMs trained on openstreetmap data, attempts to train in spatial understanding , etc. 
 
-Gaia will begin at the cutting-edge of several different applications (beginning with two) and will expand toward a Grand Foundational Model. Geospatial data is diverse and expansive but all intertwined. Read more in our whitepaper [here] *DONT FORGET TO ATTACH LINK*
+Gaia will begin at the cutting-edge of several different applications (beginning with two) and will expand toward a Grand Foundational Model. Geospatial data is diverse and expansive but all intertwined. Read more in our [whitepaper](https://www.gaiaresearch.ai/whitepaper).
+
 
 ## Miners
 [Quicklink](gaia/miner/MINER.md)
