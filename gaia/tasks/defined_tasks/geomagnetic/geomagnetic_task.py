@@ -273,44 +273,73 @@ class GeomagneticTask(Task):
     # Miner execution method
     ############################################################
 
-    def miner_execute(self):
+    def miner_execute(self, data=None):
         """
-        Executes the miner workflow: queries miners, collects responses,
-        and adds predictions to task queue.
+        Executes the miner workflow: preprocesses data, runs model inference,
+        and adds predictions to the task queue.
         """
-        # Step 1: Query miners and collect predictions
-        predictions = (
-            self.query_miners()
-        )  # This would call miners to get their predictions
+        try:
+            # Step 1: Preprocess data if provided
+            if data:
+                processed_data = self.miner_preprocessing.process_miner_data(data)
+            else:
+                processed_data = None  # Handle cases with no input data
 
-        # Step 2: Add predictions to task queue
-        query_time = datetime.datetime.utcnow()
-        self.add_task_to_queue(predictions, query_time)
-        print(
-            f"Added task to queue at {query_time} with {len(predictions)} predictions."
-        )
+            # Step 2: Run model inference
+            predictions = self.run_model_inference(processed_data)
+
+            # Step 3: Add predictions to the task queue
+            query_time = datetime.datetime.utcnow()
+            self.add_task_to_queue(predictions, query_time)
+
+            print(f"Miner execution completed successfully at {query_time}")
+
+        except Exception as e:
+            print(f"Error in miner execution: {str(e)}")
 
     def query_miners(self):
         """
-        Simulates querying miners and collecting predictions. Replace with actual miner querying logic.
+        Simulates querying miners and collecting predictions.
 
         Returns:
-            np.ndarray: Array of 256 predictions from miners.
+            dict: Simulated predictions and metadata.
         """
-        # Simulate getting predictions from miners
-        predictions = np.random.randint(
-            -100, 100, size=256
-        )  # Example of simulated predictions
-        return predictions
+        try:
+            # Simulate prediction values
+            predictions = np.random.randint(-100, 100, size=256)  # Example predictions
+            return {"predictions": predictions}
+        except Exception as e:
+            print(f"Error querying miners: {str(e)}")
+            return None
 
     def add_task_to_queue(self, predictions, query_time):
         """
-        Adds a new task to the task queue (database or other storage).
+        Adds a new task to the task queue.
 
         Args:
             predictions (np.ndarray): Array of predictions from miners.
             query_time (datetime): The time the task was added.
         """
-        # Database insertion logic here
-        # Example: db.insert("task_queue", {"predicted_values": predictions, "query_time": query_time, "status": "pending"})
-        pass  # Replace with actual database code
+        try:
+            # Use MinerDatabaseManager to insert task into the database
+            db_manager = MinerDatabaseManager()
+            task_name = "geomagnetic_prediction"
+            miner_id = "example_miner_id"  # Replace with the actual miner ID if available
+
+            # Convert predictions to a dictionary or JSON-like structure
+            predicted_value = {"predictions": predictions.tolist()}  # Convert ndarray to list
+
+            # Add to the queue
+            asyncio.run(
+                db_manager.add_to_queue(
+                    task_name=task_name,
+                    miner_id=miner_id,
+                    predicted_value=predicted_value,
+                    query_time=query_time,
+                )
+            )
+            print(f"Task added to queue: {task_name} at {query_time}")
+
+        except Exception as e:
+            print(f"Error adding task to queue: {e}")
+
