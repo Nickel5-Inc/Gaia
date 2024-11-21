@@ -61,6 +61,58 @@ class GeomagneticTask(Task):
             outputs=GeomagneticOutputs(),
         )
 
+    def miner_preprocess(self, raw_data):
+        """
+        Preprocess raw geomagnetic data on the miner's side.
+
+        Args:
+            raw_data (dict): Raw data received by the miner.
+        Returns:
+            dict: Preprocessed data ready for prediction.
+        """
+        try:
+            processed_data = {
+                "timestamp": raw_data["timestamp"],
+                "value": raw_data["value"] / 100.0  # Normalize values
+            }
+            return processed_data
+        except Exception as e:
+            print(f"Error in miner_preprocess: {e}")
+            return None
+
+    def validator_prepare_subtasks(self, data):
+        """
+        Prepare subtasks for validation.
+
+        Args:
+            data (dict): Data received by the validator.
+        Returns:
+            list: List of subtasks to process.
+        """
+        try:
+            subtasks = [{"timestamp": data["timestamp"], "value": value} for value in data["values"]]
+            return subtasks
+        except Exception as e:
+            print(f"Error in validator_prepare_subtasks: {e}")
+            return []
+
+    def validator_score(self, prediction, ground_truth):
+        """
+        Score a miner's prediction against the ground truth.
+
+        Args:
+            prediction (float): The predicted value.
+            ground_truth (float): The actual ground truth value.
+        Returns:
+            float: A score indicating the accuracy of the prediction.
+        """
+        try:
+            score = abs(prediction - ground_truth)
+            return score
+        except Exception as e:
+            print(f"Error in validator_score: {e}")
+            return float("inf")
+
     ############################################################
     # Validator execution method
     ############################################################
