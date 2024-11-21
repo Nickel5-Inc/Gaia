@@ -1,5 +1,6 @@
 {
     "geomagnetic_predictions": {
+        "table_name": "geomagnetic_predictions",
         "description": "Stores miner predictions waiting to be validated and scored.",
         "database_type": "validator",
         "columns": {
@@ -16,6 +17,7 @@
         ]
     },
     "geomagnetic_history": {
+        "table_name": "geomagnetic_history",
         "description": "Stores validated predictions along with ground truth and scores.",
         "database_type": "validator",
         "columns": {
