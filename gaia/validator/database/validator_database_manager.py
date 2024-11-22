@@ -109,27 +109,40 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
     async def _create_task_table(self, schema: Dict[str, Any]):
         """
-        Create a database table based on the provided schema.
+        Create a database table for a task based on its schema definition.
+
+        Args:
+            schema (Dict[str, Any]): The schema definition for the task
         """
-        # Build the CREATE TABLE query
-        columns = [
-            f"{col_name} {col_type}" for col_name, col_type in schema["columns"].items()
-        ]
-        create_table_query = f"""
-            CREATE TABLE IF NOT EXISTS {schema['table_name']} (
-                {','.join(columns)}
-            )
-        """
-        async with self.engine.connect() as conn:
-            async with conn.begin():
-                await conn.execute(text(create_table_query))
-                if "indexes" in schema:
-                    for index in schema["indexes"]:
-                        await self.create_index(
-                            schema["table_name"],
-                            index["column"],
-                            unique=index.get("unique", False),
-                        )
+        try:
+            # Build the CREATE TABLE query
+            columns = [
+                f"{col_name} {col_type}" for col_name, col_type in schema["columns"].items()
+            ]
+
+            create_table_query = f"""
+                CREATE TABLE IF NOT EXISTS {schema['table_name']} (
+                    {','.join(columns)}
+                )
+            """
+
+            async with self.engine.connect() as conn:
+                async with conn.begin():
+                    # Create the table
+                    await conn.execute(text(create_table_query))
+                    print(f"Table {schema['table_name']} created or already exists.")
+
+                    # Create any specified indexes
+                    if "indexes" in schema:
+                        for index in schema["indexes"]:
+                            await self.create_index(
+                                schema["table_name"],
+                                index["column"],
+                                unique=index.get("unique", False),
+                            )
+        except Exception as e:
+            print(f"Error creating table {schema['table_name']}: {e}")
+            raise
 
     async def initialize_task_tables(self, task_schemas: Dict[str, Dict[str, Any]]):
         """Initialize validator-specific task tables."""

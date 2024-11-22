@@ -3,7 +3,7 @@
     "columns": {
         "id": "SERIAL PRIMARY KEY",
         "miner_id": "TEXT NOT NULL",
-        "predicted_value": "INTEGER NOT NULL",
+        "predicted_value": "FLOAT NOT NULL",
         "query_time": "TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP",
         "status": "TEXT NOT NULL DEFAULT 'pending'"
     },
