@@ -21,7 +21,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
+            # Pass the required 'node_type' argument to the parent __new__ method
+            cls._instance = super().__new__(cls, node_type="validator")
         return cls._instance
 
     def __init__(
@@ -97,14 +98,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
         # Add indexes
         await session.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS idx_process_queue_status ON process_queue(status)"
-            )
+            text("CREATE INDEX IF NOT EXISTS idx_process_queue_status ON process_queue(status)")
         )
         await session.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS idx_process_queue_priority ON process_queue(priority)"
-            )
+            text("CREATE INDEX IF NOT EXISTS idx_process_queue_priority ON process_queue(priority)")
         )
 
         # Load schemas
