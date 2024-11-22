@@ -132,6 +132,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     await conn.execute(text(create_table_query))
                     print(f"Table {schema['table_name']} created or already exists.")
 
+            # Separate connection for index creation
+            async with self.engine.connect() as conn:
+                async with conn.begin():
                     # Create any specified indexes
                     if "indexes" in schema:
                         for index in schema["indexes"]:
@@ -140,6 +143,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                                 index["column"],
                                 unique=index.get("unique", False),
                             )
+
         except Exception as e:
             print(f"Error creating table {schema['table_name']}: {e}")
             raise
