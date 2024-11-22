@@ -21,7 +21,6 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            # Pass the required 'node_type' argument to the parent __new__ method
             cls._instance = super().__new__(cls, node_type="validator")
         return cls._instance
 
@@ -188,3 +187,26 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     print(f"Error processing schema for {task_dir.name}: {e}")
 
         return schemas
+
+    async def create_index(
+        self, table_name: str, column_name: str, unique: bool = False
+    ):
+        """
+        Create an index on a specific column in a table.
+
+        Args:
+            table_name (str): Name of the table.
+            column_name (str): Name of the column to create the index on.
+            unique (bool): Whether the index should enforce uniqueness.
+        """
+        index_name = f"idx_{table_name}_{column_name}"
+        unique_str = "UNIQUE" if unique else ""
+
+        create_index_query = f"""
+            CREATE {unique_str} INDEX IF NOT EXISTS {index_name}
+            ON {table_name} ({column_name});
+        """
+
+        async with self.engine.connect() as conn:
+            async with conn.begin():
+                await conn.execute(text(create_index_query))
