@@ -1,8 +1,19 @@
 import pandas as pd
+from typing import Optional
 from gaia.tasks.base.components.inputs import Inputs
+from pydantic import Field
 
 
 class GeomagneticInputs(Inputs):
+    # Enable arbitrary types in the Pydantic model configuration
+    class Config:
+        arbitrary_types_allowed = True
+
+    # Define required Pydantic fields
+    inputs: Optional[pd.DataFrame] = Field(
+        default=None, description="The DataFrame containing geomagnetic inputs."
+    )
+
     def load_data(self, data: pd.DataFrame):
         """
         Accepts a preprocessed DataFrame containing geomagnetic data.
@@ -64,4 +75,3 @@ class GeomagneticInputs(Inputs):
             raise ValueError("Validation failed for input data.")
 
         return True
-

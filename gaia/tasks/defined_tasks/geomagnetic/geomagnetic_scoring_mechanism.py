@@ -9,6 +9,12 @@ class GeomagneticScoringMechanism(ScoringMechanism):
     from the ground truth DST value.
     """
 
+    def __init__(self):
+        super().__init__(
+            name="Geomagnetic Scoring",
+            description="Scoring mechanism for geomagnetic tasks based on deviation from ground truth.",
+        )
+
     def calculate_score(self, predicted_value, actual_value):
         """
         Calculates the score for a miner's prediction based on deviation.
@@ -27,5 +33,23 @@ class GeomagneticScoringMechanism(ScoringMechanism):
 
         # Calculate the absolute deviation
         score = abs(predicted_value - actual_value)
-
         return score
+
+    def score(self, predictions, ground_truth):
+        """
+        Scores multiple predictions against the ground truth.
+
+        Args:
+            predictions (list[float]): List of predicted values from miners.
+            ground_truth (int): The ground truth DST value.
+
+        Returns:
+            list[float]: List of scores for each prediction.
+        """
+        if not isinstance(predictions, list):
+            raise ValueError("Predictions must be a list of float or int values.")
+        if not isinstance(ground_truth, int):
+            raise ValueError("Ground truth must be an integer.")
+
+        # Calculate scores for all predictions
+        return [self.calculate_score(pred, ground_truth) for pred in predictions]
