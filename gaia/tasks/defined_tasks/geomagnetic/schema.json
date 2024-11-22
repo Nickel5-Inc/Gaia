@@ -1,38 +1,15 @@
 {
-    "geomagnetic_predictions": {
-        "table_name": "geomagnetic_predictions",
-        "description": "Stores miner predictions waiting to be validated and scored.",
-        "database_type": "validator",
-        "columns": {
-            "id": "SERIAL PRIMARY KEY",
-            "miner_id": "TEXT NOT NULL",
-            "predicted_value": "INTEGER NOT NULL",
-            "query_time": "TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP",
-            "status": "TEXT NOT NULL DEFAULT 'pending'"
-        },
-        "indexes": [
-            {"column": "miner_id", "unique": false},
-            {"column": "query_time", "unique": false},
-            {"column": "status", "unique": false}
-        ]
+    "table_name": "geomagnetic_predictions",
+    "columns": {
+        "id": "SERIAL PRIMARY KEY",
+        "miner_id": "TEXT NOT NULL",
+        "predicted_value": "INTEGER NOT NULL",
+        "query_time": "TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "status": "TEXT NOT NULL DEFAULT 'pending'"
     },
-    "geomagnetic_history": {
-        "table_name": "geomagnetic_history",
-        "description": "Stores validated predictions along with ground truth and scores.",
-        "database_type": "validator",
-        "columns": {
-            "id": "SERIAL PRIMARY KEY",
-            "miner_id": "TEXT NOT NULL",
-            "predicted_value": "INTEGER NOT NULL",
-            "ground_truth_value": "INTEGER NOT NULL",
-            "score": "FLOAT NOT NULL",
-            "query_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
-            "score_time": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
-        },
-        "indexes": [
-            {"column": "miner_id", "unique": false},
-            {"column": "query_time", "unique": false},
-            {"column": "score_time", "unique": false}
-        ]
-    }
+    "indexes": [
+        {"column": "miner_id", "unique": false},
+        {"column": "query_time", "unique": false},
+        {"column": "status", "unique": false}
+    ]
 }

@@ -141,8 +141,9 @@ class GaiaValidator:
             # Execute tasks in parallel
             workers = [
                 asyncio.create_task(self.soil_task.validator_execute()),
-                asyncio.create_task(self.geomagnetic_task.validator_execute()),
+                asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
             ]
+
             await asyncio.gather(*workers, return_exceptions=True)
         except Exception as e:
             logger.error(f"Main loop error: {e}")
