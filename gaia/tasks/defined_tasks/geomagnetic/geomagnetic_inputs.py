@@ -42,3 +42,26 @@ class GeomagneticInputs(Inputs):
 
         print("Data validation successful.")
         return True
+
+    def validate_inputs(self, input_data):
+        """
+        Validates input data as required by the abstract parent class.
+
+        Args:
+            input_data (any): Input data to validate.
+
+        Returns:
+            bool: True if validation is successful, False otherwise.
+
+        Raises:
+            ValueError: If validation fails.
+        """
+        if not isinstance(input_data, pd.DataFrame):
+            raise ValueError("Input data must be a pandas DataFrame.")
+
+        # Use existing validate_data logic
+        if not self.validate_data(input_data):
+            raise ValueError("Validation failed for input data.")
+
+        return True
+
