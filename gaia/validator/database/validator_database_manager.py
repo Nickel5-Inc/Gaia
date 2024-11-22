@@ -24,12 +24,12 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         return cls._instance
 
     def __init__(
-        self,
-        database: str = "validator_db",
-        host: str = "localhost",
-        port: int = 5432,
-        user: str = "postgres",
-        password: str = "postgres",
+            self,
+            database: str = "validator_db",
+            host: str = "localhost",
+            port: int = 5432,
+            user: str = "postgres",
+            password: str = "postgres",
     ):
         """
         Initialize the validator database manager (only once).
@@ -45,6 +45,17 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             )
             self._initialized = True
 
+    async def get_connection(self):
+        """
+        Provides a database connection for use within async context.
+        Ensures connections are managed properly (opened/closed).
+        """
+        if self.engine is None:
+            raise RuntimeError("Database engine is not initialized.")
+
+        async with self.engine.connect() as connection:
+            yield connection
+
     @BaseDatabaseManager.with_transaction
     async def initialize_database(self, session):
         """Initialize the queue tables and task-specific tables"""
@@ -52,27 +63,27 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         await session.execute(
             text(
                 """
-            CREATE TABLE IF NOT EXISTS process_queue (
-                id SERIAL PRIMARY KEY,
-                process_type VARCHAR(50) NOT NULL,  -- 'network' or 'compute'
-                process_name VARCHAR(100) NOT NULL,
-                task_id INTEGER, -- id of the calling task
-                task_name VARCHAR(100), -- name of the calling task
-                priority INTEGER DEFAULT 0, 
-                status VARCHAR(50) DEFAULT 'pending', -- pending, processing, completed, failed 
-                payload BYTEA,
-                start_processing_time TIMESTAMP WITH TIME ZONE,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                started_at TIMESTAMP WITH TIME ZONE,
-                completed_at TIMESTAMP WITH TIME ZONE,
-                complete_by TIMESTAMP WITH TIME ZONE,
-                expected_execution_time INTEGER,
-                execution_time INTEGER,
-                error TEXT,
-                retries INTEGER DEFAULT 0,
-                max_retries INTEGER DEFAULT 3
-            )
-        """
+                CREATE TABLE IF NOT EXISTS process_queue (
+                    id SERIAL PRIMARY KEY,
+                    process_type VARCHAR(50) NOT NULL,  -- 'network' or 'compute'
+                    process_name VARCHAR(100) NOT NULL,
+                    task_id INTEGER, -- id of the calling task
+                    task_name VARCHAR(100), -- name of the calling task
+                    priority INTEGER DEFAULT 0, 
+                    status VARCHAR(50) DEFAULT 'pending', -- pending, processing, completed, failed 
+                    payload BYTEA,
+                    start_processing_time TIMESTAMP WITH TIME ZONE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP WITH TIME ZONE,
+                    completed_at TIMESTAMP WITH TIME ZONE,
+                    complete_by TIMESTAMP WITH TIME ZONE,
+                    expected_execution_time INTEGER,
+                    execution_time INTEGER,
+                    error TEXT,
+                    retries INTEGER DEFAULT 0,
+                    max_retries INTEGER DEFAULT 3
+                )
+                """
             )
         )
 
@@ -93,16 +104,16 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
     ##### QUEUE TABLE FUNCTIONS #####
     async def add_to_queue(
-        self,
-        process_type: str,
-        process_name: str,
-        payload: bytes,
-        task_id: Optional[int] = None,
-        task_name: Optional[str] = None,
-        priority: int = 0,
-        complete_by: Optional[datetime] = None,
-        expected_execution_time: Optional[int] = None,
-        session: Optional[asyncpg.Connection] = None,
+            self,
+            process_type: str,
+            process_name: str,
+            payload: bytes,
+            task_id: Optional[int] = None,
+            task_name: Optional[str] = None,
+            priority: int = 0,
+            complete_by: Optional[datetime] = None,
+            expected_execution_time: Optional[int] = None,
+            session: Optional[asyncpg.Connection] = None,
     ):
         """
         Add a process to the queue.
@@ -130,7 +141,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 expected_execution_time
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        """,
+            """,
             process_type,
             process_name,
             payload,
@@ -142,7 +153,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         )
 
     async def get_next_task(
-        self, task_type: str = None, session: Optional[asyncpg.Connection] = None
+            self, task_type: str = None, session: Optional[asyncpg.Connection] = None
     ):
         """Get the next task from the queue"""
         query = """
@@ -165,10 +176,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         return await session.fetchrow(query, task_type if task_type else None)
 
     async def complete_task(
-        self,
-        task_id: int,
-        error: str = None,
-        session: Optional[asyncpg.Connection] = None,
+            self,
+            task_id: int,
+            error: str = None,
+            session: Optional[asyncpg.Connection] = None,
     ):
         """Mark a task as completed or failed"""
         if error:
@@ -180,7 +191,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     error = $2,
                     retries = retries + 1
                 WHERE id = $1
-            """,
+                """,
                 task_id,
                 error,
             )
@@ -191,7 +202,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 SET status = 'completed',
                     completed_at = CURRENT_TIMESTAMP
                 WHERE id = $1
-            """,
+                """,
                 task_id,
             )
 
@@ -199,109 +210,49 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
     async def load_task_schemas(self) -> Dict[str, Dict[str, Any]]:
         """
         Load database schemas for all tasks from their respective schema.json files.
-        Searches through the defined_tasks directory for schema definitions.
-
-        Returns:
-            Dict[str, Dict[str, Any]]: Dictionary mapping task names to their schema definitions
-
-        Example schema.json format:
-        {
-            "table_name": "task_validation",
-            "columns": {
-                "id": "UUID PRIMARY KEY",
-                "status": "TEXT NOT NULL",
-                "data": "JSONB",
-                "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
-            },
-            "indexes": [
-                {"column": "status", "unique": false},
-                {"column": "created_at", "unique": false}
-            ]
-        }
         """
-        # Get the absolute path to the defined_tasks directory
         try:
-            # First try to find it in the package
-            import tasks
+            tasks_dir = Path(__file__).parent.parent / "tasks" / "defined_tasks"
+            schemas = {}
 
-            tasks_dir = Path(tasks.__file__).parent / "defined_tasks"
+            for task_dir in tasks_dir.iterdir():
+                if task_dir.is_dir():
+                    schema_file = task_dir / "schema.json"
+                    if not schema_file.exists():
+                        continue
 
-            if not tasks_dir.exists():
-                # Fallback to relative path from current file
-                base_dir = Path(__file__).parent.parent.parent
-                tasks_dir = base_dir / "tasks" / "defined_tasks"
-
-            if not tasks_dir.exists():
-                raise FileNotFoundError(f"Tasks directory not found at {tasks_dir}")
-
-        except ImportError:
-            # If tasks package is not installed, use relative path
-            base_dir = Path(__file__).parent.parent.parent
-            tasks_dir = base_dir / "tasks" / "defined_tasks"
-
-            if not tasks_dir.exists():
-                raise FileNotFoundError(f"Tasks directory not found at {tasks_dir}")
-
-        schemas = {}
-
-        # Loop through all subdirectories in the tasks directory
-        for task_dir in tasks_dir.iterdir():
-            if task_dir.is_dir():
-                schema_file = task_dir / "schema.json"
-
-                # Skip if no schema file exists
-                if not schema_file.exists():
-                    continue
-
-                try:
-                    # Load and validate the schema
                     with open(schema_file, "r") as f:
                         schema = json.load(f)
-
-                    # Validate required schema components
                     if not all(key in schema for key in ["table_name", "columns"]):
                         raise ValueError(
                             f"Invalid schema in {schema_file}. "
                             "Must contain 'table_name' and 'columns'"
                         )
 
-                    # Create the table for this task
                     await self._create_task_table(schema)
-
-                    # Store the validated schema
                     schemas[task_dir.name] = schema
+            return schemas
 
-                except json.JSONDecodeError as e:
-                    print(f"Error parsing schema.json in {task_dir.name}: {e}")
-                except Exception as e:
-                    print(f"Error processing schema for {task_dir.name}: {e}")
-
-        return schemas
+        except Exception as e:
+            print(f"Error loading schemas: {e}")
+            return {}
 
     async def _create_task_table(self, schema: Dict[str, Any]):
         """
         Create a database table for a task based on its schema definition.
-
-        Args:
-            schema (Dict[str, Any]): The schema definition for the task
         """
-        # Build the CREATE TABLE query
         columns = [
             f"{col_name} {col_type}" for col_name, col_type in schema["columns"].items()
         ]
-
         create_table_query = f"""
             CREATE TABLE IF NOT EXISTS {schema['table_name']} (
                 {','.join(columns)}
             )
         """
-
-        async with self.get_connection() as conn:
+        async for conn in self.get_connection():
             async with conn.transaction():
-                # Create the table
                 await conn.execute(create_table_query)
 
-                # Create any specified indexes
                 if "indexes" in schema:
                     for index in schema["indexes"]:
                         await self.create_index(
