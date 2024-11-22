@@ -212,7 +212,13 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         Load database schemas for all tasks from their respective schema.json files.
         """
         try:
-            tasks_dir = Path(__file__).parent.parent / "tasks" / "defined_tasks"
+            # Locate tasks/defined_tasks directory correctly
+            base_dir = Path(__file__).parent.parent.parent  # Adjust relative to this file
+            tasks_dir = base_dir / "tasks" / "defined_tasks"
+
+            if not tasks_dir.exists():
+                raise FileNotFoundError(f"Tasks directory not found at {tasks_dir}")
+
             schemas = {}
 
             for task_dir in tasks_dir.iterdir():
@@ -223,14 +229,17 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
                     with open(schema_file, "r") as f:
                         schema = json.load(f)
+
+                    # Validate schema structure
                     if not all(key in schema for key in ["table_name", "columns"]):
                         raise ValueError(
                             f"Invalid schema in {schema_file}. "
-                            "Must contain 'table_name' and 'columns'"
+                            "Must contain 'table_name' and 'columns'."
                         )
 
                     await self._create_task_table(schema)
                     schemas[task_dir.name] = schema
+
             return schemas
 
         except Exception as e:
