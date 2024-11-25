@@ -2,6 +2,7 @@ import datetime
 import os
 import asyncio
 import ssl
+import traceback
 from typing import Any, Optional
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
@@ -100,6 +101,8 @@ class GaiaValidator:
 
                     fernet = Fernet(symmetric_key_str)
 
+                    logger.info(f"Sending payload to miner {miner_hotkey}: {payload}")
+
                     resp = await vali_client.make_non_streamed_post(
                         httpx_client=self.httpx_client,
                         server_address=base_url,
@@ -119,6 +122,7 @@ class GaiaValidator:
 
             except Exception as e:
                 logger.error(f"Error with miner {miner_hotkey}: {e}")
+                logger.error(f"Error details: {traceback.format_exc()}")
                 continue  # Continue to next miner on error
 
         return responses  # Always return the list, even if empty

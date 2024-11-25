@@ -163,7 +163,8 @@ class GeomagneticTask(Task):
                     },
                 }
                 endpoint = "geomagnetic-request/"
-
+                
+                logger.info(f"Querying miners with payload: {payload_template}")
                 # Step 4: Query Miners
                 responses = await validator.query_miners(payload_template, endpoint)
                 logger.info(f"Collected responses from miners: {len(responses)}")
