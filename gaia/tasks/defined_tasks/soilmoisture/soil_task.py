@@ -83,6 +83,7 @@ class SoilMoistureTask(Task):
         # 5 minutes close to valid SMAP time
         time_diff = (target_time - current_time).total_seconds() / 60
         if time_diff > 5:  # More than 5 minutes until next valid time
+            logger.info(f"Not enough time until next valid time ({time_diff} minutes). Skipping task.")
             return
 
         today = current_time.date()

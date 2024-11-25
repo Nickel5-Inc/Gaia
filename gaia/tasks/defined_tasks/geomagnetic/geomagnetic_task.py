@@ -1,3 +1,4 @@
+import traceback
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from gaia.tasks.base.task import Task
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_metadata import (
@@ -132,6 +133,7 @@ class GeomagneticTask(Task):
         """
         while True:
             try:
+                logger.info("Executing GeomagneticTask Loop...")
                 # Step 1: Align to the top of the next hour
                 
                 current_time = datetime.datetime.now(datetime.timezone.utc)
@@ -140,15 +142,12 @@ class GeomagneticTask(Task):
                 ) + datetime.timedelta(hours=1)
                 sleep_duration = (next_hour - current_time).total_seconds()
 
-                logger.info(
-                    f"Sleeping until the next hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
-                )
-                await asyncio.sleep(
-                    sleep_duration
-                )  # Wait until the top of the next hour
+                
 
+                logger.info("Fetching latest geomagnetic data...")
                 # Step 2: Fetch Latest Geomagnetic Data
-                timestamp, dst_value = await get_latest_geomag_data()
+                geomag_data = await get_latest_geomag_data()
+                timestamp, dst_value = geomag_data  # Unpack after awaiting
                 logger.info(
                     f"Fetched latest geomagnetic data: timestamp={timestamp}, value={dst_value}"
                 )
@@ -212,9 +211,19 @@ class GeomagneticTask(Task):
                         )
                     except Exception as e:
                         logger.error(f"Error processing task {task['id']}: {e}")
+                
+                logger.info(
+                    f"Sleeping until the next hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
+                )
+                if sleep_duration > 0:
+                    logger.info(f"Sleeping for {sleep_duration} seconds...")
+                    await asyncio.sleep(
+                        sleep_duration
+                )  # Wait until the top of the next hour
 
             except Exception as e:
                 logger.error(f"Unexpected error in validator_execute loop: {e}")
+                logger.error(f'{traceback.format_exc()}')
                 await asyncio.sleep(60)  # Retry after a short delay
 
     def get_tasks_for_hour(self, start_time, end_time):

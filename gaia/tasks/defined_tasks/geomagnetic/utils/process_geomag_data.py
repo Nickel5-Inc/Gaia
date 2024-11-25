@@ -62,14 +62,14 @@ def clean_data(df):
     return df
 
 
-def get_latest_geomag_data():
+async def get_latest_geomag_data():
     """
     Fetch, parse, clean, and return the latest geomagnetic data point.
 
     Returns:
         tuple: (timestamp, Dst value) of the latest geomagnetic data point.
     """
-    raw_data = fetch_data()  # Fetch raw data
+    raw_data = await fetch_data()  # Fetch raw data
     parsed_df = parse_data(raw_data)  # Parse raw data into DataFrame
     cleaned_df = clean_data(parsed_df)  # Clean data
 

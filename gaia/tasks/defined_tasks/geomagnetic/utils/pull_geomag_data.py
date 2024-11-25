@@ -1,8 +1,11 @@
-import requests
+import traceback
+import httpx
 from datetime import datetime
+from fiber.logging_utils import get_logger
 
+logger = get_logger(__name__)
 
-def fetch_data(url=None):
+async def fetch_data(url=None):
     """
     Fetch raw geomagnetic data from the specified or dynamically generated URL.
 
@@ -20,11 +23,16 @@ def fetch_data(url=None):
         # Format the URL dynamically
         url = f"https://wdc.kugi.kyoto-u.ac.jp/dst_realtime/{current_year}{current_month:02d}/dst{str(current_year)[-2:]}{current_month:02d}.for.request"
 
-    print(f"Fetching data from URL: {url}")  # Debug print to verify the URL
+    logger.info(f"Fetching data from URL: {url}")
 
     try:
-        response = requests.get(url)
-        response.raise_for_status()  # Raise an error for bad status codes
-        return response.text
-    except requests.exceptions.RequestException as e:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url)
+            response.raise_for_status()  # Raise an error for bad status codes
+            return response.text
+    except httpx.RequestError as e:
         raise RuntimeError(f"Error fetching data: {e}")
+    except Exception as e:
+        logger.error(f"Error fetching data: {e}")
+        logger.error(f'{traceback.format_exc()}')
+        raise e

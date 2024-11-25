@@ -4,8 +4,6 @@ pyproject.toml
 requirements.txt
 setup.cfg
 setup.py
-dev_utils/__init__.py
-dev_utils/examples.py
 gaia/__init__.py
 gaia.egg-info/PKG-INFO
 gaia.egg-info/SOURCES.txt
