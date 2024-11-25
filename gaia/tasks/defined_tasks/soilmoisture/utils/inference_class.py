@@ -4,101 +4,77 @@ import numpy as np
 import rasterio
 from typing import Dict
 
-
 class SoilMoistureInferencePreprocessor:
-    def __init__(self, patch_size: int = 256):
+    def __init__(self, patch_size: int = 220):
         self.patch_size = patch_size
+
+    def _normalize_channelwise(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Channel-wise min-max normalization"""
+        if tensor.dim() == 2:
+            tensor = tensor.unsqueeze(0)
+        
+        normalized = torch.zeros_like(tensor)
+        for c in range(tensor.shape[0]):
+            channel = tensor[c]
+            channel_min = channel.min()
+            channel_max = channel.max()
+            normalized[c] = (channel - channel_min) / (channel_max - channel_min + 1e-8)
+        
+        return normalized
 
     def preprocess(self, tiff_path: str) -> Dict[str, torch.Tensor]:
         try:
             with rasterio.open(tiff_path) as src:
-                sentinel_data = src.read([1, 2])  # sent2
-                ifs_data = src.read(list(range(3, 21)))  # IFS
-                srtm = src.read([20])  # srtm
-                ndvi = src.read([21])  # ndvi
-                sentinel_mask = ~(
-                    np.isnan(sentinel_data).any(axis=0)
-                    | (sentinel_data == 0).all(axis=0)
-                )
-                elevation_mask = ~(np.isnan(srtm) | (srtm == 0))
-                ndvi_mask = ~(np.isnan(ndvi) | (ndvi == 0))
-                ifs_mask = ~(np.isnan(ifs_data).any(axis=0))
-                combined_mask = (
-                    sentinel_mask
-                    & elevation_mask.squeeze()
-                    & ndvi_mask.squeeze()
-                    & ifs_mask
-                )
-                sentinel_ndvi = np.concatenate([sentinel_data, ndvi], axis=0)
-                elevation = srtm
-                ifs_data = np.nan_to_num(ifs_data, nan=0.0, posinf=1e6, neginf=-1e6)
-                sentinel_ndvi = torch.from_numpy(sentinel_ndvi).float()
+                sentinel_data = src.read([1, 2])  # B8, B4
+                ifs_data = src.read(list(range(3, 20)))  # IFS variables
+                elevation = src.read([20])  # SRTM
+                ndvi = src.read([21])  # NDVI
+
+                sentinel_ndvi = torch.from_numpy(sentinel_data).float()
                 elevation = torch.from_numpy(elevation).float()
                 ifs = torch.from_numpy(ifs_data).float()
-                mask = torch.from_numpy(combined_mask).bool()
+                ndvi = torch.from_numpy(ndvi).float()
+                elevation = self._handle_elevation_mask(elevation)
 
-                if torch.isnan(elevation).any():
-                    elevation_mean = torch.nanmean(elevation)
-                    elevation = torch.where(
-                        torch.isnan(elevation), elevation_mean, elevation
-                    )
+                sentinel_ndvi = self._normalize_channelwise(sentinel_ndvi)
+                ifs = self._normalize_channelwise(ifs)
+                elevation = self._normalize_channelwise(elevation)
+                ndvi = self._normalize_channelwise(ndvi)
 
-                def masked_normalize(x, mask):
-                    valid_data = x.reshape(x.shape[0], -1)[:, mask.reshape(-1)]
-                    mins = valid_data.min(dim=1, keepdim=True)[0]
-                    maxs = valid_data.max(dim=1, keepdim=True)[0]
-                    return (x - mins.reshape(-1, 1, 1)) / (maxs - mins + 1e-8).reshape(
-                        -1, 1, 1
-                    )
+                sentinel_ndvi = self._pad_tensor(sentinel_ndvi)
+                elevation = self._pad_tensor(elevation)
+                ifs = self._pad_tensor(ifs)
+                ndvi = self._pad_tensor(ndvi)
 
-                sentinel_ndvi = masked_normalize(sentinel_ndvi, mask)
-                ifs = masked_normalize(ifs, mask)
-                elevation = masked_normalize(elevation, mask)
-                target_size = (self.patch_size, self.patch_size)
-                sentinel_ndvi = F.pad(
-                    sentinel_ndvi,
-                    (
-                        0,
-                        target_size[1] - sentinel_ndvi.shape[2],
-                        0,
-                        target_size[0] - sentinel_ndvi.shape[1],
-                    ),
-                )
-                elevation = F.pad(
-                    elevation,
-                    (
-                        0,
-                        target_size[1] - elevation.shape[2],
-                        0,
-                        target_size[0] - elevation.shape[1],
-                    ),
-                )
-                ifs = F.pad(
-                    ifs,
-                    (
-                        0,
-                        target_size[1] - ifs.shape[2],
-                        0,
-                        target_size[0] - ifs.shape[1],
-                    ),
-                )
-                mask = F.pad(
-                    mask.unsqueeze(0),
-                    (
-                        0,
-                        target_size[1] - mask.shape[1],
-                        0,
-                        target_size[0] - mask.shape[0],
-                    ),
-                ).squeeze(0)
+                sentinel_ndvi = torch.cat([sentinel_ndvi, ndvi], dim=0)
 
                 return {
-                    "sentinel_ndvi": sentinel_ndvi,
-                    "elevation": elevation,
-                    "era5": ifs,
-                    "mask": mask,
+                    'sentinel_ndvi': sentinel_ndvi,
+                    'elevation': elevation,
+                    'era5': ifs
                 }
 
         except Exception as e:
             print(f"Error preprocessing file {tiff_path}: {str(e)}")
             return None
+
+    def _handle_elevation_mask(self, elevation: torch.Tensor) -> torch.Tensor:
+        """Handle elevation masking"""
+        elevation_mask = torch.isnan(elevation)
+        if elevation_mask.any():
+            elevation_mean = torch.nanmean(elevation)
+            elevation = torch.where(elevation_mask, elevation_mean, elevation)
+        return elevation
+
+    def _pad_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Pad tensor to target size"""
+        current_size = tensor.shape[-2:]
+        pad_h = self.patch_size - current_size[0]
+        pad_w = self.patch_size - current_size[1]
+        
+        padding = (
+            0, pad_w,
+            0, pad_h
+        )
+        
+        return F.pad(tensor, padding, mode='constant', value=0)
