@@ -19,7 +19,9 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import (
 from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoistureOutputs
 from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMetadata
 from pydantic import Field
+from fiber.logging_utils import get_logger
 
+logger = get_logger(__name__)
 
 class SoilMoistureTask(Task):
     """Task for soil moisture prediction using satellite and weather data."""
@@ -75,6 +77,7 @@ class SoilMoistureTask(Task):
 
     async def validator_execute(self):
         """Execute validator workflow."""
+        logger.info("Executing SoilMoistureTask...")
         current_time = datetime.now(timezone.utc)
         target_time = self.get_next_valid_time(current_time)
         # 5 minutes close to valid SMAP time
@@ -88,15 +91,19 @@ class SoilMoistureTask(Task):
             or self._last_preprocessing_date != today
         ):
             # once per day
+            logger.info("Getting daily regions...")
             regions = await self.validator_preprocessing.get_daily_regions(target_time)
             self._last_preprocessing_date = today
         else:
+            logger.info("Getting today's regions...")
             regions = await self.get_todays_regions(target_time)
 
         if not regions:
+            logger.info("No regions found, skipping task.")
             return
 
         for region in regions:
+            logger.info(f"Querying miners for region {region['id']}...")
             predictions = await self.query_miners(
                 {
                     "region_id": region["id"],
@@ -107,6 +114,7 @@ class SoilMoistureTask(Task):
                 }
             )
 
+            logger.info(f"Adding task to queue for region {region['id']}...")
             await self.add_task_to_queue(
                 predictions,
                 {

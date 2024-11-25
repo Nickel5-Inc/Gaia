@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from datetime import datetime
 from gaia.database.database_manager import BaseDatabaseManager
+from fiber.logging_utils import get_logger
 
+logger = get_logger(__name__)
 
 class ValidatorDatabaseManager(BaseDatabaseManager):
     """
@@ -107,21 +109,29 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         task_schemas = await self.load_task_schemas()
         await self.initialize_task_tables(task_schemas)
 
-    async def _create_task_table(self, schema: Dict[str, Any]):
+    async def _create_task_table(self, schema: Dict[str, Any], table_name: str = None):
         """
         Create a database table for a task based on its schema definition.
 
         Args:
             schema (Dict[str, Any]): The schema definition for the task
+            table_name (str, optional): Override table name for multi-table schemas
         """
         try:
+            # If this is a multi-table schema, use the passed table_name
+            if table_name:
+                table_schema = schema[table_name]
+            else:
+                table_schema = schema
+
             # Build the CREATE TABLE query
             columns = [
-                f"{col_name} {col_type}" for col_name, col_type in schema["columns"].items()
+                f"{col_name} {col_type}" 
+                for col_name, col_type in table_schema["columns"].items()
             ]
 
             create_table_query = f"""
-                CREATE TABLE IF NOT EXISTS {schema['table_name']} (
+                CREATE TABLE IF NOT EXISTS {table_schema['table_name']} (
                     {','.join(columns)}
                 )
             """
@@ -130,29 +140,38 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 async with conn.begin():
                     # Create the table
                     await conn.execute(text(create_table_query))
-                    print(f"Table {schema['table_name']} created or already exists.")
+                    print(f"Table {table_schema['table_name']} created or already exists.")
 
             # Separate connection for index creation
             async with self.engine.connect() as conn:
                 async with conn.begin():
                     # Create any specified indexes
-                    if "indexes" in schema:
-                        for index in schema["indexes"]:
+                    if "indexes" in table_schema:
+                        for index in table_schema["indexes"]:
                             await self.create_index(
-                                schema["table_name"],
+                                table_schema["table_name"],
                                 index["column"],
                                 unique=index.get("unique", False),
                             )
 
         except Exception as e:
-            print(f"Error creating table {schema['table_name']}: {e}")
+            table_id = table_name or table_schema.get('table_name', 'unknown')
+            print(f"Error creating table {table_id}: {e}")
             raise
 
     async def initialize_task_tables(self, task_schemas: Dict[str, Dict[str, Any]]):
         """Initialize validator-specific task tables."""
         for schema in task_schemas.values():
-            if schema.get("database_type") in ["validator", "both"]:
-                await self._create_task_table(schema)
+            # Check if this is a multi-table schema
+            if isinstance(schema, dict) and any(isinstance(v, dict) and "table_name" in v for v in schema.values()):
+                # Handle multi-table schema
+                for table_name, table_schema in schema.items():
+                    if table_schema.get("database_type") in ["validator", "both"]:
+                        await self._create_task_table(schema, table_name)
+            else:
+                # Handle single-table schema
+                if schema.get("database_type") in ["validator", "both"]:
+                    await self._create_task_table(schema)
 
     async def load_task_schemas(self) -> Dict[str, Dict[str, Any]]:
         """
@@ -185,15 +204,22 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     with open(schema_file, "r") as f:
                         schema = json.load(f)
 
-                    # Validate required schema components
-                    if not all(key in schema for key in ["table_name", "columns"]):
-                        raise ValueError(
-                            f"Invalid schema in {schema_file}. "
-                            "Must contain 'table_name' and 'columns'"
-                        )
-
-                    # Create the table for this task
-                    await self._create_task_table(schema)
+                    # Check if this is a multi-table schema
+                    if any(isinstance(v, dict) and "table_name" in v for v in schema.values()):
+                        # Validate each table in the schema
+                        for table_name, table_schema in schema.items():
+                            if not all(key in table_schema for key in ["table_name", "columns"]):
+                                raise ValueError(
+                                    f"Invalid table schema for {table_name} in {schema_file}. "
+                                    "Must contain 'table_name' and 'columns'"
+                                )
+                    else:
+                        # Validate single table schema
+                        if not all(key in schema for key in ["table_name", "columns"]):
+                            raise ValueError(
+                                f"Invalid schema in {schema_file}. "
+                                "Must contain 'table_name' and 'columns'"
+                            )
 
                     # Store the validated schema
                     schemas[task_dir.name] = schema

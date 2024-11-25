@@ -122,31 +122,43 @@ class GaiaValidator:
         """
         Main execution loop for the validator.
         """
+        logger.info("Setting up neuron...")
         if not self.setup_neuron():
             logger.error("Failed to setup neuron, exiting...")
             return
 
+        logger.info("Neuron setup complete.")
+
+        logger.info("Checking metagraph initialization...")
         if self.metagraph is None:
             logger.error("Metagraph not initialized, exiting...")
             return
 
-        # Initialize database tables
+        logger.info("Metagraph initialized.")
+
+        logger.info("Initializing database tables...")
         await self.database_manager.initialize_database()
 
+        logger.info("Database tables initialized.") 
+
+        logger.info("Setting up HTTP client...")
         self.httpx_client = httpx.AsyncClient(
             timeout=30.0, follow_redirects=True, verify=False
         )
+        logger.info("HTTP client setup complete.")
 
-        try:
-            # Execute tasks in parallel
-            workers = [
-                asyncio.create_task(self.soil_task.validator_execute()),
-                asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
-            ]
+        while True:
+            try:
+                # Execute tasks in parallel
+                workers = [
+                    asyncio.create_task(self.soil_task.validator_execute()),
+                    asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
+                    asyncio.create_task(self.status_logger()),
+                ]
 
-            await asyncio.gather(*workers, return_exceptions=True)
-        except Exception as e:
-            logger.error(f"Main loop error: {e}")
+                await asyncio.gather(*workers, return_exceptions=True)
+            except Exception as e:
+                logger.error(f"Main loop error: {e}")
             await asyncio.sleep(300)
 
     async def status_logger(self):

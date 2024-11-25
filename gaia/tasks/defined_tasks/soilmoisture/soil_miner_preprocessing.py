@@ -2,7 +2,7 @@ from gaia.tasks.base.components.preprocessing import Preprocessing
 from gaia.tasks.defined_tasks.soilmoisture.utils.inference_class import (
     SoilMoistureInferencePreprocessor,
 )
-from gaia.models.soil_moisture_basemodel import SoilMoistureModel
+from gaia.models.soil_moisture_basemodel import SoilModel
 from huggingface_hub import hf_hub_download
 import torch
 import io
