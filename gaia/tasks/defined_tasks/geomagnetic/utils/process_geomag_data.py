@@ -1,6 +1,6 @@
 import pandas as pd
 from datetime import datetime, timedelta
-from pull_geomag_data import fetch_data
+from gaia.tasks.defined_tasks.geomagnetic.utils.pull_geomag_data import fetch_data
 
 
 # Constants
