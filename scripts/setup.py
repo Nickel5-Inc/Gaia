@@ -17,13 +17,23 @@ def install_system_dependencies():
         "sudo apt-get update",
         "sudo apt-get install -y postgresql postgresql-contrib",
         "sudo apt-get install -y python3-dev libpq-dev",
+        "sudo apt-get install -y gdal-bin",
+        "sudo apt-get install -y libgdal-dev",
+        "sudo apt-get install -y python3-gdal",
+        "export CPLUS_INCLUDE_PATH=/usr/include/gdal",
+        "export C_INCLUDE_PATH=/usr/include/gdal",
         "sudo systemctl start postgresql",
         "sudo systemctl enable postgresql",
     ]
     
     # Run the basic installation commands
     for cmd in commands:
-        subprocess.run(cmd.split(), check=True)
+        if cmd.startswith("export"):
+            var, value = cmd.split("=")
+            var = var.replace("export ", "")
+            os.environ[var] = value
+        else:
+            subprocess.run(cmd.split(), check=True)
     
     # Set postgres password separately (don't split this command)
     subprocess.run(
@@ -75,6 +85,11 @@ def setup_python_environment():
         pip_path = "../.gaia/bin/pip"
         
         subprocess.run([python_path, "-m", "pip", "install", "--upgrade", "pip"], check=True)
+        
+        # Get GDAL version from system
+        gdal_version = subprocess.check_output(["gdal-config", "--version"]).decode().strip()
+        subprocess.run([pip_path, "install", f"GDAL=={gdal_version}"], check=True)
+        
         subprocess.run([pip_path, "install", "-r", "requirements.txt"], check=True)
         
         print("Python environment setup completed successfully")
