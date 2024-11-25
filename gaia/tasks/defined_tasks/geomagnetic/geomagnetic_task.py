@@ -1,3 +1,4 @@
+from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from gaia.tasks.base.task import Task
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_metadata import (
     GeomagneticMetadata,

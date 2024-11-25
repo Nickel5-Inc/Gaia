@@ -34,15 +34,6 @@ python validator.py
 
 
 
-## General Notes and Structure
-
-
-
-
-## Main Loop
-
-
-
 
 
 
