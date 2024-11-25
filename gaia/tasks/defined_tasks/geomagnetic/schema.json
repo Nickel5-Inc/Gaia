@@ -1,0 +1,15 @@
+{
+    "table_name": "geomagnetic_predictions",
+    "columns": {
+        "id": "SERIAL PRIMARY KEY",
+        "miner_id": "TEXT NOT NULL",
+        "predicted_value": "FLOAT NOT NULL",
+        "query_time": "TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "status": "TEXT NOT NULL DEFAULT 'pending'"
+    },
+    "indexes": [
+        {"column": "miner_id", "unique": false},
+        {"column": "query_time", "unique": false},
+        {"column": "status", "unique": false}
+    ]
+}
