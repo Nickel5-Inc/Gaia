@@ -26,9 +26,7 @@ CDS_API_KEY=<YOUR_CDS_API_KEY>
 
 #### Run the validator
 ```bash
-cd gaia
-cd validator
-python validator.py
+pm2 start --name validator --instances 1 python gaia/validator/validator.py 
 ```
 
 

@@ -43,20 +43,19 @@ def setup_postgresql():
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cur = conn.cursor()
         
-        new_postgres_password = getpass.getpass("Enter NEW password for PostgreSQL superuser: ")
-        cur.execute("ALTER USER postgres PASSWORD %s;", (new_postgres_password,))
+        cur.execute("ALTER USER postgres PASSWORD 'postgres';")
         
-        project_password = getpass.getpass("Enter password for project database user: ")
-        cur.execute("CREATE USER project_user WITH PASSWORD %s;", (project_password,))
-        
+
+        cur.execute("CREATE USER gaia WITH PASSWORD 'postgres';")
+
         databases = ['validator_db', 'miner_db']
         for db in databases:
             cur.execute(f"CREATE DATABASE {db};")
-            cur.execute(f"GRANT ALL PRIVILEGES ON DATABASE {db} TO project_user;")
+            cur.execute(f"GRANT ALL PRIVILEGES ON DATABASE {db} TO gaia;")
         
         with open('.env', 'w') as f:
-            f.write(f"DB_USER=project_user\n")
-            f.write(f"DB_PASSWORD={project_password}\n")
+            f.write(f"DB_USER=gaia\n")
+            f.write(f"DB_PASSWORD=postgres\n")
             f.write(f"DB_HOST=localhost\n")
             f.write(f"DB_PORT=5432\n")
         
@@ -104,7 +103,7 @@ def main():
     print("\nSetup completed successfully!")
     print("\nNext steps:")
     print("1. Activate virtual environment:")
-    print("   source .gaia/bin/activate")
+    print("   source ../.gaia/bin/activate")
     print("2. Configure your .env file with any additional environment variables")
     print("3. Run database migrations")
 
