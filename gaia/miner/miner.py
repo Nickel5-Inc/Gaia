@@ -11,6 +11,7 @@ from fiber.miner.middleware import configure_extra_logging_middleware
 from fiber.chain import chain_utils
 from gaia.miner.utils.subnet import factory_router
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
+import ssl
 
 
 class Miner:
@@ -85,8 +86,53 @@ class Miner:
             self.logger.info("Starting miner server...")
             app = server.factory_app(debug=True)
             app.include_router(factory_router())
-            # Use the port argument from the CLI/env
-            uvicorn.run(app, host="0.0.0.0", port=self.port)
+            
+            # Configure detailed Uvicorn logging
+            log_config = {
+                "version": 1,
+                "disable_existing_loggers": False,
+                "formatters": {
+                    "default": {
+                        "()": "uvicorn.logging.DefaultFormatter",
+                        "fmt": "%(levelprefix)s %(asctime)s | %(message)s",
+                        "use_colors": True,
+                    },
+                    "access": {
+                        "()": "uvicorn.logging.AccessFormatter",
+                        "fmt": '%(levelprefix)s %(asctime)s | %(client_addr)s - "%(request_line)s" %(status_code)s',
+                        "use_colors": True,
+                    },
+                },
+                "handlers": {
+                    "default": {
+                        "formatter": "default",
+                        "class": "logging.StreamHandler",
+                        "stream": "ext://sys.stderr",
+                    },
+                    "access": {
+                        "formatter": "access",
+                        "class": "logging.StreamHandler",
+                        "stream": "ext://sys.stdout",
+                    },
+                },
+                "loggers": {
+                    "uvicorn": {"handlers": ["default"], "level": "TRACE", "propagate": False},
+                    "uvicorn.error": {"handlers": ["default"], "level": "TRACE", "propagate": False},
+                    "uvicorn.access": {"handlers": ["access"], "level": "TRACE", "propagate": False},
+                },
+            }
+            
+            uvicorn.run(
+                app, 
+                host="0.0.0.0", 
+                port=self.port,
+                log_config=log_config,
+                log_level="trace",
+                access_log=True,
+                timeout_keep_alive=65,
+                proxy_headers=True,
+                forwarded_allow_ips="*"
+            )
         except Exception as e:
             self.logger.error(f"Error starting miner: {e}")
             self.logger.error(traceback.format_exc())
