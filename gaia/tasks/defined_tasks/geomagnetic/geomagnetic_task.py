@@ -162,7 +162,7 @@ class GeomagneticTask(Task):
                         "value": dst_value,
                     },
                 }
-                endpoint = "geomagnetic-request/"
+                endpoint = "geomagnetic-request"
                 
                 logger.info(f"Querying miners with payload: {payload_template}")
                 # Step 4: Query Miners

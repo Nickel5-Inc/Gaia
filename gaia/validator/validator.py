@@ -86,7 +86,12 @@ class GaiaValidator:
         responses = []  # Initialize empty list
 
         for miner_hotkey, node in self.metagraph.nodes.items():
+            # Construct base URL properly, ensuring endpoint is added to path not port
             base_url = f"https://{node.ip}:{node.port}"
+            if endpoint:
+                # Remove any leading/trailing slashes from endpoint to avoid double slashes
+                endpoint = endpoint.strip('/')
+                base_url = f"{base_url}/{endpoint}"
 
             try:
                 symmetric_key_str, symmetric_key_uuid = await handshake.perform_handshake(
@@ -102,7 +107,7 @@ class GaiaValidator:
                     fernet = Fernet(symmetric_key_str)
 
                     logger.info(f"Sending payload to miner {miner_hotkey}: {payload}")
-
+                    
                     resp = await vali_client.make_non_streamed_post(
                         httpx_client=self.httpx_client,
                         server_address=base_url,
