@@ -179,7 +179,7 @@ class GeomagneticTask(Task):
                     )
 
                 # Step 6: Fetch Ground Truth for Current Hour
-                ground_truth_value = self.fetch_ground_truth()
+                ground_truth_value = await self.fetch_ground_truth()
                 if ground_truth_value is None:
                     logger.warning("Ground truth data not available. Skipping scoring.")
                     continue
@@ -191,26 +191,25 @@ class GeomagneticTask(Task):
                 logger.info(
                     f"Fetching predictions between {last_hour_start} and {last_hour_end}"
                 )
-                tasks = self.get_tasks_for_hour(last_hour_start, last_hour_end)
+                tasks = await self.get_tasks_for_hour(last_hour_start, last_hour_end)
 
-                if not tasks:
+                if tasks:
+                    for task in tasks:
+                        try:
+                            predicted_value = task["predicted_values"]
+                            score = self.scoring_mechanism.calculate_score(
+                                predicted_value, ground_truth_value
+                            )
+                            self.move_task_to_history(
+                                task, ground_truth_value, score, current_time
+                            )
+                            logger.info(
+                                f"Task scored and archived: task_id={task['id']}, score={score}"
+                            )
+                        except Exception as e:
+                            logger.error(f"Error processing task {task['id']}: {e}")
+                else:
                     logger.info("No predictions to score for the last hour.")
-                    continue
-
-                for task in tasks:
-                    try:
-                        predicted_value = task["predicted_values"]
-                        score = self.scoring_mechanism.calculate_score(
-                            predicted_value, ground_truth_value
-                        )
-                        self.move_task_to_history(
-                            task, ground_truth_value, score, current_time
-                        )
-                        logger.info(
-                            f"Task scored and archived: task_id={task['id']}, score={score}"
-                        )
-                    except Exception as e:
-                        logger.error(f"Error processing task {task['id']}: {e}")
                 
                 logger.info(
                     f"Sleeping until the next hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
@@ -226,7 +225,7 @@ class GeomagneticTask(Task):
                 logger.error(f'{traceback.format_exc()}')
                 await asyncio.sleep(60)  # Retry after a short delay
 
-    def get_tasks_for_hour(self, start_time, end_time):
+    async def get_tasks_for_hour(self, start_time, end_time):
         """
         Fetches tasks submitted within a specific UTC time range from the database.
 
@@ -245,21 +244,19 @@ class GeomagneticTask(Task):
             query = """
                 SELECT id, miner_id, predicted_value, query_time 
                 FROM geomagnetic_predictions
-                WHERE query_time >= %s AND query_time < %s AND status = 'pending';
+                WHERE query_time >= :start_time AND query_time < :end_time AND status = 'pending';
             """
-            params = (start_time, end_time)
+            # Pass parameters as a dictionary instead of a tuple
+            params = {"start_time": start_time, "end_time": end_time}
 
-            # Execute the query and fetch results
-            results = db_manager.execute_query(query, params)
+            results = await db_manager.fetch_many(query, params)
 
             # Convert results to a list of task dictionaries
             tasks = [
                 {
                     "id": row[0],
                     "miner_id": row[1],
-                    "predicted_values": row[
-                        2
-                    ],  # Assuming a single prediction per miner
+                    "predicted_values": row[2],  # Assuming a single prediction per miner
                     "query_time": row[3],
                 }
                 for row in results
@@ -270,9 +267,10 @@ class GeomagneticTask(Task):
 
         except Exception as e:
             logger.error(f"Error fetching tasks for hour: {e}")
+            logger.error(f'{traceback.format_exc()}')
             return []
 
-    def fetch_ground_truth(self):
+    async def fetch_ground_truth(self):
         """
         Fetches the ground truth DST value for the current UTC hour.
 
@@ -285,26 +283,20 @@ class GeomagneticTask(Task):
             logger.info(f"Fetching ground truth for UTC hour: {current_time.hour}")
 
             # Fetch the most recent geomagnetic data
-            dst_data = get_latest_geomag_data()
+            timestamp, dst_value = await get_latest_geomag_data()
 
-            # Filter the data to find the record for the current hour
-            current_hour_data = dst_data[
-                dst_data["timestamp"].dt.hour == current_time.hour
-            ]
-
-            if current_hour_data.empty:
+            if timestamp == "N/A" or dst_value == "N/A":
                 logger.warning("No ground truth data available for the current hour.")
                 return None
 
-            # Extract the ground truth value
-            ground_truth_value = int(current_hour_data["value"].iloc[0])
             logger.info(
-                f"Ground truth value for hour {current_time.hour}: {ground_truth_value}"
+                f"Ground truth value for hour {current_time.hour}: {dst_value}"
             )
-            return ground_truth_value
+            return dst_value
 
         except Exception as e:
             logger.error(f"Error fetching ground truth: {e}")
+            logger.error(f'{traceback.format_exc()}')
             return None
 
     def move_task_to_history(self, task, ground_truth_value, score, score_time):

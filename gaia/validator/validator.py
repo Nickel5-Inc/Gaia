@@ -39,8 +39,9 @@ class GaiaValidator:
             load_dotenv(".env")
             # Set netuid and chain endpoint
             self.netuid = (
-                self.args.netuid if self.args.netuid else int(os.getenv("NETUID", 1))
+                self.args.netuid if self.args.netuid else int(os.getenv("NETUID", 237))
             )
+            logger.info(f"Using netuid: {self.netuid}")
 
             # Load chain endpoint from args or env
             self.subtensor_chain_endpoint = (
@@ -78,8 +79,10 @@ class GaiaValidator:
     async def query_miners(self, payload: Any = None, endpoint: str = None):
         """
         Handle the miner querying logic.
+        Returns a list of responses from miners.
         """
         self.metagraph.sync_nodes()
+        responses = []  # Initialize empty list
 
         for miner_hotkey, node in self.metagraph.nodes.items():
             base_url = f"https://{node.ip}:{node.port}"
@@ -109,14 +112,16 @@ class GaiaValidator:
                         endpoint=endpoint,
                     )
                     resp.raise_for_status()
-                    logger.info(
-                        f"Request sent to {miner_hotkey}! Response: {resp.text}"
-                    )
+                    responses.append(resp.text)  # Add successful response to list
+                    logger.info(f"Request sent to {miner_hotkey}! Response: {resp.text}")
                 else:
                     logger.warning(f"Failed handshake with miner {miner_hotkey}")
 
             except Exception as e:
                 logger.error(f"Error with miner {miner_hotkey}: {e}")
+                continue  # Continue to next miner on error
+
+        return responses  # Always return the list, even if empty
 
     async def main(self):
         """
