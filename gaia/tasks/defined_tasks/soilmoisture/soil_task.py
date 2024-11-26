@@ -15,11 +15,8 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMeta
 from pydantic import Field
 from fiber.logging_utils import get_logger
 from uuid import uuid4
-<<<<<<< HEAD
-=======
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from sqlalchemy import text
->>>>>>> b82a893676d3b4b57903e4ade095361a7e1cb76d
 
 logger = get_logger(__name__)
 
@@ -111,11 +108,7 @@ class SoilMoistureTask(Task):
         logger.info(f"Task preparation time: {preparation_time}")
         logger.info(f"Minutes until preparation: {time_until_prep}")
 
-<<<<<<< HEAD
-        if -180 <= time_until_prep <= 180:  ##TODO change to 10m
-=======
         if True:  # TODO: Restore time check in production: -180 <= time_until_prep <= 180
->>>>>>> b82a893676d3b4b57903e4ade095361a7e1cb76d
             try:
                 ifs_forecast_time = preparation_time.replace(
                     hour=(preparation_time.hour // 6) * 6,
@@ -231,11 +224,7 @@ class SoilMoistureTask(Task):
                 await self.add_task_to_queue(responses, task_data)
             return responses
         except Exception as e:
-<<<<<<< HEAD
-            print(f"Error querying miners: {str(e)}")
-=======
             logger.error(f"Error querying miners: {str(e)}")
->>>>>>> b82a893676d3b4b57903e4ade095361a7e1cb76d
             return None
 
     async def add_task_to_queue(self, predictions: Dict, metadata: Dict):

@@ -10,12 +10,9 @@ import json
 from typing import Dict, Optional, List
 import os
 from sqlalchemy import text
-<<<<<<< HEAD
-=======
 from fiber.logging_utils import get_logger
 
 logger = get_logger(__name__)
->>>>>>> b82a893676d3b4b57903e4ade095361a7e1cb76d
 
 class SoilValidatorPreprocessing(Preprocessing):
     """Handles region selection and data collection for soil moisture task."""
