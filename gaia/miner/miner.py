@@ -100,6 +100,10 @@ Verification Result: {verify_result}
             self.logger.info("Starting miner server...")
             app = server.factory_app(debug=True)
 
+            # Configure app to handle larger requests
+            app.body_limit = MAX_REQUEST_SIZE
+
+
 
             app.include_router(factory_router(self))
 
