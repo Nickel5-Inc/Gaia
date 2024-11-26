@@ -139,7 +139,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 async with conn.begin():
                     # Create the table
                     await conn.execute(text(create_table_query))
-                    print(f"Table {table_schema['table_name']} created or already exists.")
+                    logger.debug(f"Table {table_schema['table_name']} created or already exists.")
 
             # Separate connection for index creation
             async with self.engine.connect() as conn:

@@ -3,15 +3,9 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from gaia.tasks.base.components.metadata import Metadata
-from gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing import (
-    SoilMinerPreprocessing,
-)
-from gaia.tasks.defined_tasks.soilmoisture.soil_validator_preprocessing import (
-    SoilValidatorPreprocessing,
-)
-from gaia.tasks.defined_tasks.soilmoisture.soil_scoring_mechanism import (
-    SoilScoringMechanism,
-)
+from gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing import SoilMinerPreprocessing
+from gaia.tasks.defined_tasks.soilmoisture.soil_validator_preprocessing import SoilValidatorPreprocessing
+from gaia.tasks.defined_tasks.soilmoisture.soil_scoring_mechanism import SoilScoringMechanism
 from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import (
     SoilMoistureInputs,
     SoilMoisturePayload,
@@ -21,6 +15,8 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMeta
 from pydantic import Field
 from fiber.logging_utils import get_logger
 from uuid import uuid4
+from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from sqlalchemy import text
 
 logger = get_logger(__name__)
 
@@ -56,6 +52,8 @@ class SoilMoistureTask(Task):
         )
 
         self.miner_preprocessing = SoilMinerPreprocessing()
+        self.validator_preprocessing = SoilValidatorPreprocessing()
+        self.db = ValidatorDatabaseManager()
 
     def get_next_valid_time(self, current_time: datetime) -> datetime:
         """Get next valid SMAP measurement time."""
@@ -110,7 +108,7 @@ class SoilMoistureTask(Task):
         logger.info(f"Task preparation time: {preparation_time}")
         logger.info(f"Minutes until preparation: {time_until_prep}")
 
-        if -180 <= time_until_prep <= 180:  ##TODO change to 10m
+        if True:  # TODO: Restore time check in production: -180 <= time_until_prep <= 180
             try:
                 ifs_forecast_time = preparation_time.replace(
                     hour=(preparation_time.hour // 6) * 6,
@@ -263,9 +261,9 @@ class SoilMoistureTask(Task):
         scoring_time = datetime.now(timezone.utc) - self.scoring_delay
 
         try:
-            async with self.db.get_connection() as conn:
-                return await conn.fetch(
-                    """
+            conn = await self.db.get_connection()
+            async with conn.transaction():
+                return await conn.fetch("""
                     SELECT 
                         r.*,
                         json_agg(json_build_object(
@@ -281,12 +279,10 @@ class SoilMoistureTask(Task):
                     AND r.target_time <= $1
                     GROUP BY r.id
                     ORDER BY r.target_time ASC
-                """,
-                    scoring_time,
-                )
+                """, scoring_time)
 
         except Exception as e:
-            print(f"Error fetching pending tasks: {str(e)}")
+            logger.error(f"Error fetching pending tasks: {str(e)}")
             return []
 
     async def move_task_to_history(
