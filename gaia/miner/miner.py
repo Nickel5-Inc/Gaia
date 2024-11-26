@@ -169,7 +169,10 @@ Verification Result: {verify_result}
                 host="0.0.0.0",
                 port=self.port,
                 log_config=log_config,
-                log_level="trace"
+                log_level="trace",
+                limit_concurrency=100,
+                limit_max_requests=100,
+                http={'max_request_size': MAX_REQUEST_SIZE}  # 5MB limit
             )
         except Exception as e:
             self.logger.error(f"Error starting miner: {e}")
