@@ -98,6 +98,7 @@ class GeoMagBaseModel:
                 result = self.model.predict(data)
             else:
                 #retrain on latest data
+                logger.info("Retraining model on latest data")
                 self.model.train(data)
                 #make prediction
                 result = self.model.forecast(data)

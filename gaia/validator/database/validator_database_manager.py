@@ -256,5 +256,19 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
     async def create_score_table(self):
         """
         Create a table for storing miner scores for all tasks.
+        Schema:
+        - task_name: name of the task
+        - task_id: id of the task (uuid)
+        - score: scores of the miners - list of floats, 256 length
+        - created_at: timestamp of when the score was created
         """
-        
+        query = """
+        CREATE TABLE IF NOT EXISTS score_table (
+            task_name VARCHAR(100) NOT NULL,
+            task_id TEXT NOT NULL,
+            score FLOAT[] NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            status VARCHAR(50) DEFAULT 'pending' -- pending, completed
+        )
+        """
+        await self.execute(text(query))
