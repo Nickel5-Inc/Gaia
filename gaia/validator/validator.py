@@ -46,7 +46,6 @@ class GaiaValidator:
                 max_connections=100,
                 max_keepalive_connections=20,
                 keepalive_expiry=30,
-                max_request_size=5 * 1024 * 1024  # 5MB in bytes
             ),
             transport=httpx.AsyncHTTPTransport(
                 retries=3

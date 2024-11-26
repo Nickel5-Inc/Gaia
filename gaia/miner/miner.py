@@ -99,6 +99,19 @@ Verification Result: {verify_result}
             
             self.logger.info("Starting miner server...")
             app = server.factory_app(debug=True)
+
+            # Add request size middleware
+            @app.middleware("http")
+            async def validate_request_size(request: Request, call_next):
+                if request.headers.get("content-length"):
+                    content_length = int(request.headers["content-length"])
+                    if content_length > MAX_REQUEST_SIZE:
+                        return JSONResponse(
+                            status_code=413,
+                            content={"error": "Request too large"}
+                        )
+                return await call_next(request)
+
             app.include_router(factory_router(self))
 
             if os.getenv("ENV", "dev").lower() == "dev":
@@ -150,48 +163,7 @@ Verification Result: {verify_result}
             fh.setFormatter(formatter)
             fiber_logger.addHandler(fh)
 
-            # # Add middleware to log request verification details
-            # @app.middleware("http")
-            # async def verify_request_logging(request, call_next):
-            #     if request.url.path == '/exchange-symmetric-key':
-            #         # Log all headers
-            #         self.logger.debug("Verifying request headers:")
-            #         for header_name, header_value in request.headers.items():
-            #             self.logger.debug(f"{header_name}: {header_value}")
-                    
-            #         # Log signature verification attempt
-            #         if 'signature' in request.headers:
-            #             self.logger.debug(f"Attempting to verify signature: {request.headers['signature']}")
-            #             self.logger.debug(f"Using validator hotkey: {request.headers.get('validator-hotkey')}")
-            #             self.logger.debug(f"Using miner hotkey: {request.headers.get('miner-hotkey')}")
-            #             self.logger.debug(f"Using nonce: {request.headers.get('nonce')}")
-                
-            #     response = await call_next(request)
-                
-            #     # Log response details for failed requests
-            #     if response.status_code != 200:
-            #         self.logger.debug(f"Request failed with status {response.status_code}")
-            #         try:
-            #             body = await response.body()
-            #             self.logger.debug(f"Response body: {body.decode()}")
-            #         except Exception as e:
-            #             self.logger.error(f"Could not decode response body: {e}")
-                
-            #     return response
             
-            app = FastAPI()
-
-            @app.middleware("http")
-            async def validate_request_size(request: Request, call_next):
-                if request.headers.get("content-length"):
-                    content_length = int(request.headers["content-length"])
-                    if content_length > MAX_REQUEST_SIZE:
-                        return JSONResponse(
-                            status_code=413,
-                            content={"error": "Request too large"}
-                        )
-                return await call_next(request)
-
             uvicorn.run(
                 app,
                 host="0.0.0.0",
