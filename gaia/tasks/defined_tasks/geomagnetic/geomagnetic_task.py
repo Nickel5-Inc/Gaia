@@ -23,6 +23,7 @@ import asyncio
 from uuid import uuid4
 from fiber.logging_utils import get_logger
 import json
+from pydantic import Field
 
 logger = get_logger(__name__)
 
@@ -54,7 +55,17 @@ class GeomagneticTask(Task):
         task.validator_execute()
     """
 
-    def __init__(self, db_manager=None):
+    # Declare Pydantic fields
+    db_manager: ValidatorDatabaseManager = Field(
+        default_factory=ValidatorDatabaseManager,
+        description="Database manager for the task"
+    )
+    miner_preprocessing: GeomagneticPreprocessing = Field(
+        default_factory=GeomagneticPreprocessing,
+        description="Preprocessing component for miner"
+    )
+
+    def __init__(self, db_manager=None, **data):
         super().__init__(
             name="GeomagneticTask",
             description="Geomagnetic prediction task",
@@ -63,9 +74,10 @@ class GeomagneticTask(Task):
             inputs=GeomagneticInputs(),
             outputs=GeomagneticOutputs(),
             scoring_mechanism=GeomagneticScoringMechanism(),
+            **data
         )
-        self.db_manager = db_manager or ValidatorDatabaseManager()
-        self.miner_preprocessing = GeomagneticPreprocessing()
+        if db_manager:
+            self.db_manager = db_manager
 
     def miner_preprocess(self, raw_data):
         """
