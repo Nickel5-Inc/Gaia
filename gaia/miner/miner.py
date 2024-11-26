@@ -100,17 +100,6 @@ Verification Result: {verify_result}
             self.logger.info("Starting miner server...")
             app = server.factory_app(debug=True)
 
-            # Add request size middleware
-            @app.middleware("http")
-            async def validate_request_size(request: Request, call_next):
-                if request.headers.get("content-length"):
-                    content_length = int(request.headers["content-length"])
-                    if content_length > MAX_REQUEST_SIZE:
-                        return JSONResponse(
-                            status_code=413,
-                            content={"error": "Request too large"}
-                        )
-                return await call_next(request)
 
             app.include_router(factory_router(self))
 
@@ -163,14 +152,14 @@ Verification Result: {verify_result}
             fh.setFormatter(formatter)
             fiber_logger.addHandler(fh)
 
-            
+
+
             uvicorn.run(
                 app,
                 host="0.0.0.0",
                 port=self.port,
                 log_config=log_config,
-                log_level="trace",
-                http={"max_request_size": MAX_REQUEST_SIZE}
+                log_level="trace"
             )
         except Exception as e:
             self.logger.error(f"Error starting miner: {e}")
