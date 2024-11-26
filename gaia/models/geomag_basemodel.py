@@ -1,3 +1,4 @@
+import traceback
 import pandas as pd
 from prophet import Prophet
 from datetime import datetime, timedelta
@@ -143,4 +144,6 @@ class GeoMagBaseModel:
             
         except Exception as e:
             logger.error(f"Error during prediction: {e}")
+            logger.error(f"traceback: {traceback.format_exc()}")
+            logger.error(f"Using input value as fallback: {data.get('value', 0.0)}")
             return float(data.get('value', 0.0))
