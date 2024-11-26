@@ -7,9 +7,16 @@ from huggingface_hub import hf_hub_download
 import importlib.util
 import sys
 import numpy as np
+import json
 
 logger = get_logger(__name__)
 
+class DateTimeEncoder(json.JSONEncoder):
+    """Custom JSON encoder for datetime objects"""
+    def default(self, obj):
+        if isinstance(obj, (datetime, pd.Timestamp)):
+            return obj.isoformat()
+        return super().default(obj)
 
 class FallbackGeoMagModel:
     """A simple fallback model using Prophet when HuggingFace model isn't available."""
@@ -101,26 +108,32 @@ class GeoMagBaseModel:
     def predict(self, data) -> float:
         """Make prediction using either HuggingFace or fallback model."""
         try:
+            # Convert Timestamp to datetime
+            if isinstance(data.get('timestamp'), pd.Timestamp):
+                data = {
+                    'timestamp': data['timestamp'].to_pydatetime(),
+                    'value': data['value']
+                }
+            
             if self._is_fallback:
                 result = self.model.predict(data)
             else:
-                #retrain on latest data
-                logger.info("Retraining model on latest data")
-                self.model.train(data)
-                #make prediction
+                if hasattr(self.model, 'train'):
+                    logger.info("Retraining model on latest data")
+                    self.model.train(data)
                 result = self.model.forecast(data)
-                
-            # Convert any numpy/tensor types to Python float
+            
+            # Convert result to Python float
             if hasattr(result, 'item'):
                 result = result.item()
             elif isinstance(result, (np.ndarray, np.generic)):
                 result = float(result)
             
-            # Ensure result is within reasonable bounds
-            if not -1000 < result < 1000:
+            if not -1000 < float(result) < 1000:
                 logger.warning(f"Prediction out of reasonable range: {result}")
                 return float(data.get('value', 0.0))
-            return result
+                
+            return float(result)
             
         except Exception as e:
             logger.error(f"Error during prediction: {e}")

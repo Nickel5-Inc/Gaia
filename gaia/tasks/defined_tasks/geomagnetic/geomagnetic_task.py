@@ -329,11 +329,11 @@ class GeomagneticTask(Task):
         """
         try:
             # Get the current UTC time
-            current_time = datetime.datetime.utcnow()
+            current_time = datetime.datetime.now(datetime.timezone.utc)
             logger.info(f"Fetching ground truth for UTC hour: {current_time.hour}")
 
             # Fetch the most recent geomagnetic data
-            timestamp, dst_value = await get_latest_geomag_data()
+            timestamp, dst_value = await get_latest_geomag_data(include_historical=False)
 
             if timestamp == "N/A" or dst_value == "N/A":
                 logger.warning("No ground truth data available for the current hour.")

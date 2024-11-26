@@ -2,6 +2,7 @@ import traceback
 import httpx
 from datetime import datetime
 from fiber.logging_utils import get_logger
+import pytz
 
 logger = get_logger(__name__)
 
@@ -18,8 +19,9 @@ async def fetch_data(url=None):
     """
     # Generate the default URL based on the current year and month if not provided
     if url is None:
-        current_year = datetime.now().year
-        current_month = datetime.now().month
+        current_time = datetime.now(pytz.UTC)
+        current_year = current_time.year
+        current_month = current_time.month
         # Format the URL dynamically
         url = f"https://wdc.kugi.kyoto-u.ac.jp/dst_realtime/{current_year}{current_month:02d}/dst{str(current_year)[-2:]}{current_month:02d}.for.request"
 

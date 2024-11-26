@@ -1,3 +1,4 @@
+import traceback
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from gaia.tasks.defined_tasks.geomagnetic.utils.pull_geomag_data import fetch_data
@@ -34,7 +35,7 @@ def parse_data(data):
             if value_str != PLACEHOLDER_VALUE and value_str:
                 try:
                     value = int(value_str)
-                    timestamp = datetime(year, month, day, hour)
+                    timestamp = datetime(year, month, day, hour, tzinfo=timezone.utc)
 
                     # Only include valid timestamps and exclude future timestamps
                     if timestamp < datetime.now(timezone.utc):
@@ -53,7 +54,7 @@ def parse_data(data):
 
 
 def clean_data(df):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     # Drop duplicate timestamps
     df = df.drop_duplicates(subset="timestamp")
@@ -106,5 +107,6 @@ async def get_latest_geomag_data(include_historical=False):
         return timestamp, dst_value, historical_data
     except Exception as e:
         logger.error(f"Error fetching geomagnetic data: {e}")
+        logger.error(f'{traceback.format_exc()}')
         return "N/A", "N/A", None
 
