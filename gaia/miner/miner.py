@@ -79,23 +79,24 @@ class Miner:
             if not self.setup_neuron():
                 self.logger.error("Failed to setup neuron")
                 return
+            
             self.logger.info("Starting miner server...")
             app = server.factory_app(debug=True)
             app.include_router(factory_router())
             
-            # Enhanced logging configuration
+            # Simplified logging configuration
             log_config = {
                 "version": 1,
                 "disable_existing_loggers": False,
                 "formatters": {
                     "default": {
                         "()": "uvicorn.logging.DefaultFormatter",
-                        "fmt": "%(levelprefix)s %(asctime)s | %(client_addr)s | %(message)s",
+                        "fmt": "%(levelprefix)s %(asctime)s | %(message)s",
                         "use_colors": True,
                     },
                     "access": {
                         "()": "uvicorn.logging.AccessFormatter",
-                        "fmt": '%(levelprefix)s %(asctime)s | %(client_addr)s | "%(request_line)s" %(status_code)s | Headers: %(request_headers)s',
+                        "fmt": '%(levelprefix)s %(asctime)s | "%(request_line)s" %(status_code)s',
                         "use_colors": True,
                     },
                 },
@@ -112,27 +113,52 @@ class Miner:
                     },
                 },
                 "loggers": {
-                    "uvicorn": {"handlers": ["default"], "level": "TRACE", "propagate": False},
-                    "uvicorn.error": {"handlers": ["default"], "level": "TRACE", "propagate": False},
-                    "uvicorn.access": {"handlers": ["access"], "level": "TRACE", "propagate": False},
+                    "uvicorn": {"handlers": ["default"], "level": "INFO"},
+                    "uvicorn.error": {"handlers": ["default"], "level": "INFO"},
+                    "uvicorn.access": {"handlers": ["access"], "level": "INFO"},
                 },
             }
             
-            # Add middleware for request logging
+            # Add middleware for detailed request logging
             @app.middleware("http")
             async def log_requests(request, call_next):
-                self.logger.info(f"Incoming request: {request.method} {request.url}")
-                self.logger.info(f"Request headers: {dict(request.headers)}")
+                # Log request details
+                request_body = None
+                if request.method in ["POST", "PUT"]:
+                    try:
+                        request_body = await request.body()
+                        self.logger.info(f"Request body: {request_body.decode()}")
+                    except Exception as e:
+                        self.logger.warning(f"Could not read request body: {e}")
+
+                self.logger.info(f"""
+Request Details:
+----------------
+Method: {request.method}
+URL: {request.url}
+Client Host: {request.client.host if request.client else 'Unknown'}
+Headers: {dict(request.headers)}
+                """)
+                
+                # Process the request
                 response = await call_next(request)
-                self.logger.info(f"Response status: {response.status_code}")
+                
+                # Log response details
+                self.logger.info(f"""
+Response Details:
+----------------
+Status: {response.status_code}
+Headers: {dict(response.headers)}
+                """)
+                
                 return response
             
             uvicorn.run(
-                app, 
-                host="0.0.0.0", 
+                app,
+                host="0.0.0.0",
                 port=self.port,
                 log_config=log_config,
-                log_level="trace",
+                log_level="info",
                 access_log=True,
                 timeout_keep_alive=65,
                 proxy_headers=True,
