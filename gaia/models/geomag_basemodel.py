@@ -143,7 +143,6 @@ class GeoMagBaseModel:
         try:
             # Ensure data is in the correct format
             if isinstance(data, pd.DataFrame):
-                # Data is already a DataFrame, just ensure columns are correct
                 df = data.copy()
                 if 'ds' not in df.columns:
                     df = df.rename(columns={
@@ -168,19 +167,16 @@ class GeoMagBaseModel:
             if df['ds'].dt.tz is not None:
                 df['ds'] = df['ds'].dt.tz_convert('UTC').dt.tz_localize(None)
             
-            # Create future dates for prediction
-            last_date = df['ds'].max()
-            future_dates = pd.date_range(
-                start=last_date,
-                periods=2,  # One extra period for prediction
-                freq='H',
-                tz=None  # Ensure timezone-naive
-            )
-            future_df = pd.DataFrame({'ds': future_dates})
-            
             if self._is_fallback:
                 # Use Prophet model
                 self.model.fit(df)
+                future_dates = pd.date_range(
+                    start=df['ds'].max(),
+                    periods=2,  # One extra period for prediction
+                    freq='h',
+                    tz=None  # Ensure timezone-naive
+                )
+                future_df = pd.DataFrame({'ds': future_dates})
                 forecast = self.model.predict(future_df)
                 result = forecast['yhat'].iloc[-1]
             else:
@@ -188,8 +184,8 @@ class GeoMagBaseModel:
                 if hasattr(self.model, 'train'):
                     logger.info("Retraining model on latest data")
                     self.model.train(df)
-                # Pass both current data and future dates
-                result = self.model.forecast({'data': df, 'future': future_df})
+                # Pass only the DataFrame for forecasting
+                result = self.model.forecast(df)
             
             # Convert result to Python float and handle invalid values
             if hasattr(result, 'item'):
