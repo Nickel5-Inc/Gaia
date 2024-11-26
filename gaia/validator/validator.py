@@ -32,7 +32,7 @@ class GaiaValidator:
         self.metagraph = None
         self.config = None
         self.database_manager = ValidatorDatabaseManager()
-        self.soil_task = SoilMoistureTask()
+        self.soil_task = SoilMoistureTask(node_type="validator")
         self.geomagnetic_task = GeomagneticTask()  # Initialize GeomagneticTask
         self.weights = [0.0] * 256
         self.last_set_weights_block = 0
