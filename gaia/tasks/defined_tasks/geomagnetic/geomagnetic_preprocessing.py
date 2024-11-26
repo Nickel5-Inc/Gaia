@@ -55,22 +55,29 @@ class GeomagneticPreprocessing(Preprocessing):
 
         return {"predicted_value": int(prediction), "timestamp": last_timestamp_utc}
 
-    def process_miner_data(self, data: Dict) -> Dict:
+    def process_miner_data(self, data: pd.DataFrame) -> pd.DataFrame:
         """
         Process raw geomagnetic data for model input.
         
         Args:
-            data (Dict): Dictionary containing:
+            data (pd.DataFrame): DataFrame containing:
                 - timestamp: UTC timestamp
                 - value: DST value
         Returns:
-            Dict: Processed data ready for model input
+            pd.DataFrame: Processed data ready for model input
         """
         try:
-            return {
-                "timestamp": pd.to_datetime(data["timestamp"]),
-                "value": data["value"] / 100.0  # Normalize values
-            }
+            # Ensure data is a DataFrame
+            if not isinstance(data, pd.DataFrame):
+                raise ValueError("Input must be a pandas DataFrame")
+            
+            # Normalize values and ensure timestamp is datetime
+            processed_df = data.copy()
+            processed_df['value'] = processed_df['value'] / 100.0  # Normalize values
+            processed_df['timestamp'] = pd.to_datetime(processed_df['timestamp'])
+            
+            return processed_df
+            
         except Exception as e:
             logger.error(f"Error in process_miner_data: {e}")
             raise
