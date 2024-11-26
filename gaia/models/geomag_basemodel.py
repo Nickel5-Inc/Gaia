@@ -5,6 +5,7 @@ from fiber.logging_utils import get_logger
 from huggingface_hub import hf_hub_download
 import importlib.util
 import sys
+import numpy as np
 
 logger = get_logger(__name__)
 
@@ -71,9 +72,14 @@ class GeoMagBaseModel:
             spec.loader.exec_module(module)
             
             # Initialize the model from the loaded module
-            self.model = module.GeoMagModel()
-            self._is_fallback = False
-            logger.info("Successfully loaded GeoMagModel from Hugging Face.")
+            model_instance = module.GeoMagModel()
+            # Wrap the forecast method as predict if needed
+            if hasattr(model_instance, 'forecast'):
+                self.model = model_instance
+                self._is_fallback = False
+                logger.info("Successfully loaded GeoMagModel from Hugging Face.")
+            else:
+                raise AttributeError("Model does not have required 'forecast' method")
             
         except Exception as e:
             logger.warning(f"Failed to load HuggingFace model: {e}")
@@ -88,8 +94,23 @@ class GeoMagBaseModel:
     def predict(self, data) -> float:
         """Make prediction using either HuggingFace or fallback model."""
         try:
-            return self.model.predict(data)
+            if self._is_fallback:
+                result = self.model.predict(data)
+            else:
+                result = self.model.forecast(data)
+                
+            # Convert any numpy/tensor types to Python float
+            if hasattr(result, 'item'):
+                result = result.item()
+            elif isinstance(result, (np.ndarray, np.generic)):
+                result = float(result)
+            
+            # Ensure result is within reasonable bounds
+            if not -1000 < result < 1000:
+                logger.warning(f"Prediction out of reasonable range: {result}")
+                return float(data.get('value', 0.0))
+            return result
+            
         except Exception as e:
             logger.error(f"Error during prediction: {e}")
-            # Return input value as persistence forecast
             return float(data.get('value', 0.0))
