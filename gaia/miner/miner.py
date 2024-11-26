@@ -49,29 +49,25 @@ class Miner:
     def setup_neuron(self) -> bool:
         """
         Set up the miner neuron with necessary configurations and connections.
-
-        Returns:
-            bool: True if setup is successful, False otherwise.
         """
-
-
-
-        # Add neuron setup logic here if needed
         self.logger.info("Setting up miner neuron...")
-
         
-
-        self.keypair = chain_utils.load_hotkey_keypair(
-            self.wallet, self.hotkey
-        )
-        self.logger.info(f"Keypair: {self.keypair}")
+        # Add detailed logging for keypair and wallet info
+        self.keypair = chain_utils.load_hotkey_keypair(self.wallet, self.hotkey)
+        self.logger.info(f"Wallet: {self.wallet}")
+        self.logger.info(f"Hotkey: {self.hotkey}")
+        self.logger.info(f"Keypair SS58 Address: {self.keypair.ss58_address}")
         self.logger.info(f"Subtensor chain endpoint: {self.subtensor_chain_endpoint}")
         
-        #print current env (for debugging)
-        self.logger.info(f"Current env: {os.environ}")
-        #Check config
+        # Log all environment variables (excluding sensitive data)
+        safe_env = {k: v for k, v in os.environ.items() if not any(sensitive in k.lower() for sensitive in ['key', 'password', 'secret'])}
+        self.logger.info(f"Environment variables: {safe_env}")
+        
+        # Log detailed config
         self.config = configuration.factory_config()
-        self.logger.info(f"Config: {self.config}")
+        self.logger.info(f"Detailed config:")
+        for key, value in vars(self.config).items():
+            self.logger.info(f"  {key}: {value}")
 
         return True
 
@@ -87,19 +83,19 @@ class Miner:
             app = server.factory_app(debug=True)
             app.include_router(factory_router())
             
-            # Configure detailed Uvicorn logging
+            # Enhanced logging configuration
             log_config = {
                 "version": 1,
                 "disable_existing_loggers": False,
                 "formatters": {
                     "default": {
                         "()": "uvicorn.logging.DefaultFormatter",
-                        "fmt": "%(levelprefix)s %(asctime)s | %(message)s",
+                        "fmt": "%(levelprefix)s %(asctime)s | %(client_addr)s | %(message)s",
                         "use_colors": True,
                     },
                     "access": {
                         "()": "uvicorn.logging.AccessFormatter",
-                        "fmt": '%(levelprefix)s %(asctime)s | %(client_addr)s - "%(request_line)s" %(status_code)s',
+                        "fmt": '%(levelprefix)s %(asctime)s | %(client_addr)s | "%(request_line)s" %(status_code)s | Headers: %(request_headers)s',
                         "use_colors": True,
                     },
                 },
@@ -121,6 +117,15 @@ class Miner:
                     "uvicorn.access": {"handlers": ["access"], "level": "TRACE", "propagate": False},
                 },
             }
+            
+            # Add middleware for request logging
+            @app.middleware("http")
+            async def log_requests(request, call_next):
+                self.logger.info(f"Incoming request: {request.method} {request.url}")
+                self.logger.info(f"Request headers: {dict(request.headers)}")
+                response = await call_next(request)
+                self.logger.info(f"Response status: {response.status_code}")
+                return response
             
             uvicorn.run(
                 app, 

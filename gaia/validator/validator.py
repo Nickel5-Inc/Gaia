@@ -100,6 +100,8 @@ class GaiaValidator:
                     server_address=base_url,
                     miner_hotkey_ss58_address=miner_hotkey,
                 )
+                logger.info(f"Symmetric key str: {symmetric_key_str}")
+                logger.info(f"Symmetric key uuid: {symmetric_key_uuid}")
 
                 if symmetric_key_str and symmetric_key_uuid:
                     logger.info(f"Handshake successful with miner {miner_hotkey}")
@@ -121,6 +123,7 @@ class GaiaValidator:
                         payload=payload,
                         endpoint=endpoint,
                     )
+                    logger.info(f"Response: {resp.text}")
                     resp.raise_for_status()
                     responses.append(resp.text)  # Add successful response to list
                     logger.info(f"Request sent to {miner_hotkey}! Response: {resp.text}")
