@@ -73,23 +73,24 @@ class GeomagneticPreprocessing(Preprocessing):
             
             # Create a copy and convert timestamp to naive UTC datetime
             processed_df = data.copy()
-            processed_df['timestamp'] = pd.to_datetime(processed_df['timestamp']).dt.tz_convert('UTC').dt.tz_localize(None)
+            
+            # Convert timestamps to pandas datetime and remove timezone
+            processed_df['timestamp'] = pd.to_datetime(processed_df['timestamp'])
+            if processed_df['timestamp'].dt.tz is not None:
+                processed_df['timestamp'] = processed_df['timestamp'].dt.tz_convert('UTC').dt.tz_localize(None)
             
             # Get current values (now in naive UTC)
             current_timestamp = processed_df['timestamp'].iloc[-1]
             current_value = processed_df['value'].iloc[-1]
             
-            # Create historical points (last 3 hours) - already in naive UTC
-            historical_data = []
-            for i in range(1, 4):
-                historical_data.append({
-                    'timestamp': current_timestamp - pd.Timedelta(hours=i),
-                    'value': current_value  # Use current value as a simple baseline
-                })
+            # Create historical points using proper pandas datetime handling
+            historical_data = pd.DataFrame({
+                'timestamp': [current_timestamp - pd.Timedelta(hours=i) for i in range(1, 4)],
+                'value': [current_value] * 3
+            })
             
             # Combine historical and current data
-            historical_df = pd.DataFrame(historical_data)
-            processed_df = pd.concat([historical_df, processed_df], ignore_index=True)
+            processed_df = pd.concat([historical_data, processed_df], ignore_index=True)
             
             # Normalize values
             processed_df['value'] = processed_df['value'] / 100.0
@@ -101,7 +102,7 @@ class GeomagneticPreprocessing(Preprocessing):
             })
             
             # Sort by timestamp
-            processed_df = processed_df.sort_values('ds')
+            processed_df = processed_df.sort_values('ds').reset_index(drop=True)
             
             return processed_df
             
