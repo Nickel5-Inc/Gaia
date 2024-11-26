@@ -82,75 +82,70 @@ class SoilMoistureTask(Task):
             hour=next_time[0], minute=next_time[1], second=0, microsecond=0
         )
 
-    async def validator_execute(self):
+    async def validator_execute(self, validator):
         """Execute validator workflow."""
-        current_time = datetime.now(timezone.utc)
-        logger.info(f"Current time (UTC): {current_time}")
+        try:
+            current_time = datetime.now(timezone.utc)
+            ifs_forecast_time = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+            next_smap_time = ifs_forecast_time + timedelta(days=3)
 
-        # check for tasks ready for scoring (3 days)
-        pending_tasks = await self.get_pending_tasks()
-        if pending_tasks:
-            logger.info(f"Found {len(pending_tasks)} tasks ready for scoring")
-            for task in pending_tasks:
-                try:
-                    logger.info(f"Processing task {task['id']} from {task['target_time']}")
-                    ground_truth = await self.collect_ground_truth(task['target_time'])
-                    if ground_truth:
-                        await self.process_scoring(task, ground_truth)
-                except Exception as e:
-                    logger.error(f"Error processing task {task['id']}: {str(e)}")
+            logger.info(f"Using IFS forecast from: {ifs_forecast_time}")
+            logger.info(f"For prediction target: {next_smap_time}")
 
-        next_smap_time = self.get_next_valid_time(current_time)
-        preparation_time = next_smap_time - self.prediction_horizon  # 6 hours before
-        
-        time_until_prep = (preparation_time - current_time).total_seconds() / 60
-        logger.info(f"Next SMAP measurement time: {next_smap_time}")
-        logger.info(f"Task preparation time: {preparation_time}")
-        logger.info(f"Minutes until preparation: {time_until_prep}")
+            regions = await self.validator_preprocessing.get_daily_regions(
+                target_time=next_smap_time,
+                ifs_forecast_time=ifs_forecast_time
+            )
 
-        if True:  # TODO: Restore time check in production: -180 <= time_until_prep <= 180
-            try:
-                ifs_forecast_time = preparation_time.replace(
-                    hour=(preparation_time.hour // 6) * 6,
-                    minute=0, second=0, microsecond=0
-                )
-                logger.info(f"Using IFS forecast from: {ifs_forecast_time}")
-                logger.info(f"For prediction target: {next_smap_time}")
+            if regions:
+                logger.info(f"Selected {len(regions)} new regions")
+                for region in regions:
+                    try:
+                        task_data = {
+                            'region_id': region['id'],
+                            'data_collection_time': current_time,
+                            'ifs_forecast_time': ifs_forecast_time,
+                            'target_prediction_time': next_smap_time,
+                            'combined_data': region['combined_data'],
+                            'sentinel_bounds': region['sentinel_bounds'],
+                            'sentinel_crs': region['sentinel_crs']
+                        }
 
-                regions = await self.validator_preprocessing.get_daily_regions(
-                    target_time=next_smap_time,
-                    ifs_forecast_time=ifs_forecast_time
-                )
+                        payload = {
+                            "nonce": str(uuid4()),
+                            "data": task_data
+                        }
 
-                if regions:
-                    logger.info(f"Selected {len(regions)} new regions")
-                    for region in regions:
-                        try:
-                            task_data = {
-                                'region_id': region['id'],
-                                'data_collection_time': current_time,
-                                'ifs_forecast_time': ifs_forecast_time,
-                                'target_prediction_time': next_smap_time,
-                                'combined_data': region['combined_data'],
-                                'sentinel_bounds': region['sentinel_bounds'],
-                                'sentinel_crs': region['sentinel_crs']
+                        responses = await validator.query_miners(
+                            payload=payload,
+                            endpoint="/soilmoisture"
+                        )
+
+                        if responses:
+                            metadata = {
+                                "region_id": region['id'],
+                                "target_time": next_smap_time,
+                                "data_collection_time": current_time,
+                                "ifs_forecast_time": ifs_forecast_time
                             }
-                            await self.query_miners(task_data)
-                            
-                            async with self.db.get_connection() as conn:
-                                await conn.execute("""
-                                    UPDATE soil_moisture_regions 
-                                    SET status = 'sent_to_miners'
-                                    WHERE id = $1
-                                """, region['id'])
-                                
-                        except Exception as e:
-                            logger.error(f"Error preparing region: {str(e)}")
-                            continue
-            except Exception as e:
-                logger.error(f"Error in task preparation: {str(e)}")
-        else:
-            logger.debug(f"Not in preparation window. Next preparation in {time_until_prep:.2f} minutes")
+                            await self.add_task_to_queue(responses, metadata)
+
+                            await self.db.execute(
+                                """
+                                UPDATE soil_moisture_regions 
+                                SET status = 'sent_to_miners'
+                                WHERE id = :region_id
+                                """,
+                                {"region_id": region['id']}
+                            )
+
+                    except Exception as e:
+                        logger.error(f"Error preparing region: {str(e)}")
+                        continue
+
+        except Exception as e:
+            logger.error(f"Error in validator execute: {str(e)}")
+            raise
 
     async def get_todays_regions(self, target_time: datetime) -> List[Dict]:
         """Get regions already selected for today."""
@@ -201,54 +196,32 @@ class SoilMoistureTask(Task):
         """Preprocess data for model input."""
         pass
 
-    async def query_miners(self, task_data: Dict):
-        """Send task to miners and collect responses."""
-        try:
-            async with self.db.get_connection() as conn:
-                region = await conn.fetchrow("""
-                    SELECT combined_data, sentinel_bounds, sentinel_crs, target_time
-                    FROM soil_moisture_regions 
-                    WHERE id = $1
-                """, task_data['region_id'])
-            soil_inputs = SoilMoistureInputs()
-            payload = soil_inputs.format_miner_payload(
-                region_id=task_data['region_id'],
-                combined_data=region['combined_data'],
-                sentinel_bounds=region['sentinel_bounds'],
-                sentinel_crs=region['sentinel_crs'],
-                target_time=region['target_time']
-            )
-            soil_inputs.validate_inputs(payload)
-            responses = await self.broadcast_task(payload)
-            if responses:
-                await self.add_task_to_queue(responses, task_data)
-            return responses
-        except Exception as e:
-            logger.error(f"Error querying miners: {str(e)}")
-            return None
-
     async def add_task_to_queue(self, predictions: Dict, metadata: Dict):
         """Add miner predictions to database for later scoring."""
         try:
-            for miner_id, pred in predictions.items():
-                await self.db.execute(
-                    """
-                    INSERT INTO soil_moisture_predictions 
-                    (region_id, miner_id, target_time, surface_sm, rootzone_sm, 
-                     uncertainty_surface, uncertainty_rootzone)
-                    VALUES (:region_id, :miner_id, :target_time, :surface_sm, 
-                           :rootzone_sm, :uncertainty_surface, :uncertainty_rootzone)
-                    """,
-                    {
-                        "region_id": metadata["region_id"],
-                        "miner_id": miner_id,
-                        "target_time": metadata["target_time"],
-                        "surface_sm": pred["surface_sm"],
-                        "rootzone_sm": pred["rootzone_sm"],
-                        "uncertainty_surface": pred.get("uncertainty_surface"),
-                        "uncertainty_rootzone": pred.get("uncertainty_rootzone")
-                    }
-                )
+            predictions_data = [
+                {
+                    "region_id": metadata["region_id"],
+                    "miner_id": miner_id,
+                    "target_time": metadata["target_time"],
+                    "surface_sm": pred["surface_sm"],
+                    "rootzone_sm": pred["rootzone_sm"],
+                    "uncertainty_surface": pred.get("uncertainty_surface"),
+                    "uncertainty_rootzone": pred.get("uncertainty_rootzone")
+                }
+                for miner_id, pred in predictions.items()
+            ]
+            
+            await self.db.execute_many(
+                """
+                INSERT INTO soil_moisture_predictions 
+                (region_id, miner_id, target_time, surface_sm, rootzone_sm, 
+                 uncertainty_surface, uncertainty_rootzone)
+                VALUES (:region_id, :miner_id, :target_time, :surface_sm, 
+                       :rootzone_sm, :uncertainty_surface, :uncertainty_rootzone)
+                """,
+                predictions_data
+            )
         except Exception as e:
             logger.error(f"Error storing predictions: {str(e)}")
             raise

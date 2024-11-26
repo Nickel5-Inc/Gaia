@@ -9,6 +9,9 @@ from fiber.logging_utils import get_logger
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
 import numpy as np
 from datetime import datetime, timezone
+from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import SoilMoisturePayload
+from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
+from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoisturePrediction
 
 logger = get_logger(__name__)
 
@@ -59,8 +62,8 @@ async def geomagnetic_require(
 
 
 class SoilmoistureRequest(BaseModel):
-    nonce: str | None = None  # Make nonce optional
-    data: DataModel | None = None  # Add data field as optional
+    nonce: str | None = None
+    data: SoilMoisturePayload
 
 
 async def soilmoisture_require(
@@ -68,13 +71,27 @@ async def soilmoisture_require(
         partial(decrypt_general_payload, SoilmoistureRequest),
     ),
 ):
-    logger.info(f"Received decrypted payload: {decrypted_payload}")
-    if decrypted_payload.data:
-        logger.info(f"Received data: {decrypted_payload.data}")
-
-    # Process the data here; return it as response_data to be sent to the Validator
-    response_data = decrypted_payload.model_dump()
-    return JSONResponse(content=response_data)
+    logger.info(f"Received soil moisture request")
+    try:
+        if decrypted_payload.data:
+            soil_task = SoilMoistureTask()
+            result = soil_task.miner_execute(decrypted_payload.data.model_dump())
+            
+            if result is None:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "Failed to process soil moisture prediction"}
+                )
+                
+            prediction = SoilMoisturePrediction(**result)
+            return JSONResponse(content=prediction.model_dump())
+            
+    except Exception as e:
+        logger.error(f"Error processing soil moisture request: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 
 def factory_router() -> APIRouter:
