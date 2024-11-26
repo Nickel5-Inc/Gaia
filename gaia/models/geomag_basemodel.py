@@ -8,6 +8,7 @@ import importlib.util
 import sys
 import numpy as np
 import json
+import torch
 
 logger = get_logger(__name__)
 
@@ -108,12 +109,16 @@ class GeoMagBaseModel:
     def predict(self, data) -> float:
         """Make prediction using either HuggingFace or fallback model."""
         try:
-            # Convert Timestamp to datetime
-            if isinstance(data.get('timestamp'), pd.Timestamp):
+            # Ensure data is in the correct format
+            if isinstance(data, (torch.Tensor, np.ndarray)):
                 data = {
-                    'timestamp': data['timestamp'].to_pydatetime(),
-                    'value': data['value']
+                    'timestamp': datetime.now(pytz.UTC),
+                    'value': float(data.item() if hasattr(data, 'item') else data)
                 }
+            
+            # Convert Timestamp to datetime if needed
+            if isinstance(data.get('timestamp'), pd.Timestamp):
+                data['timestamp'] = data['timestamp'].to_pydatetime()
             
             if self._is_fallback:
                 result = self.model.predict(data)
@@ -123,16 +128,17 @@ class GeoMagBaseModel:
                     self.model.train(data)
                 result = self.model.forecast(data)
             
-            # Convert result to Python float
+            # Convert result to Python float and handle invalid values
             if hasattr(result, 'item'):
                 result = result.item()
             elif isinstance(result, (np.ndarray, np.generic)):
                 result = float(result)
             
-            if not -1000 < float(result) < 1000:
-                logger.warning(f"Prediction out of reasonable range: {result}")
+            # Handle NaN/Inf values
+            if np.isnan(result) or np.isinf(result) or not -1000 < float(result) < 1000:
+                logger.warning(f"Invalid prediction value: {result}, using input value")
                 return float(data.get('value', 0.0))
-                
+            
             return float(result)
             
         except Exception as e:

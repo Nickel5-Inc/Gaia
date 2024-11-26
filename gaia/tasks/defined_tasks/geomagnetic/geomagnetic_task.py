@@ -391,19 +391,25 @@ class GeomagneticTask(Task):
             float: Predicted value.
         """
         try:
-            # Prepare input tensor for the model
-            input_tensor = torch.tensor(
-                [[processed_data['value']]], dtype=torch.float32
-            ).unsqueeze(0)  # Add batch and time dimensions
-
+            # Ensure we're passing a dictionary to the model
+            if isinstance(processed_data, torch.Tensor):
+                processed_data = {
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc),
+                    "value": float(processed_data.item())
+                }
+            
             # Perform prediction using the model
-            prediction = self.model.predict(input_tensor)
-
-            # Extract the prediction (convert tensor to float)
-            return prediction.item()
+            prediction = self.model.predict(processed_data)
+            
+            # Handle NaN or infinite values
+            if np.isnan(prediction) or np.isinf(prediction):
+                logger.warning("Model returned NaN/Inf, using fallback value")
+                return float(processed_data['value'])  # Use input value as fallback
+            
+            return float(prediction)  # Ensure we return a Python float
         except Exception as e:
             logger.error(f"Error during model inference: {e}")
-            return float("nan")  # Return NaN on failure
+            return float(processed_data.get('value', 0.0))  # Return input value or 0.0 as fallback
 
     def miner_execute(self, data=None):
         """
