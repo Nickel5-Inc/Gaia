@@ -1,6 +1,7 @@
 import pandas as pd
 from prophet import Prophet
 from datetime import datetime, timedelta
+import pytz
 from fiber.logging_utils import get_logger
 from huggingface_hub import hf_hub_download
 import importlib.util
@@ -32,9 +33,14 @@ class FallbackGeoMagModel:
             float: Predicted DST value for next hour
         """
         try:
+            # Ensure timestamp is timezone-aware
+            timestamp = pd.to_datetime(x['timestamp'])
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=pytz.UTC)
+            
             # Convert input to Prophet format
             df = pd.DataFrame({
-                'ds': [pd.to_datetime(x['timestamp'])],
+                'ds': [timestamp],
                 'y': [float(x['value'])]
             })
             
@@ -43,6 +49,7 @@ class FallbackGeoMagModel:
             
             # Make prediction for next hour
             future = self.model.make_future_dataframe(periods=1, freq='H')
+            future['ds'] = future['ds'].dt.tz_localize(pytz.UTC)
             forecast = self.model.predict(future)
             
             # Return the predicted value
