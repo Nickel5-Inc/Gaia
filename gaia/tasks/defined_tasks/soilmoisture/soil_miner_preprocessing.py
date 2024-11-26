@@ -40,7 +40,7 @@ class SoilMinerPreprocessing(Preprocessing):
                  )
                  state_dict = safetensors.torch.load_file(weights_path)
 
-             model = SoilMoistureModel()
+             model = SoilModel()
              model.load_state_dict(state_dict)
              model.to(self.device)
              model.eval()

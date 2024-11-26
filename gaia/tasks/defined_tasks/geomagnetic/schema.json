@@ -1,7 +1,8 @@
 {
     "table_name": "geomagnetic_predictions",
+    "database_type": "validator",
     "columns": {
-        "id": "SERIAL PRIMARY KEY",
+        "id": "TEXT UNIQUE NOT NULL",
         "miner_uid": "TEXT NOT NULL",
         "miner_hotkey": "TEXT NOT NULL",
         "predicted_value": "FLOAT NOT NULL",
@@ -9,7 +10,8 @@
         "status": "TEXT NOT NULL DEFAULT 'pending'"
     },
     "indexes": [
-        {"column": "miner_id", "unique": false},
+        {"column": "miner_uid", "unique": false},
+        {"column": "miner_hotkey", "unique": false},
         {"column": "query_time", "unique": false},
         {"column": "status", "unique": false}
     ]

@@ -3,7 +3,7 @@ import os
 import asyncio
 import ssl
 import traceback
-from typing import Any, Optional
+from typing import Any, Optional, List
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import httpx
@@ -18,6 +18,7 @@ from gaia.validator.database.validator_database_manager import ValidatorDatabase
 from argparse import ArgumentParser
 import pandas as pd
 import json
+from gaia.validator.weights.set_weights import FiberWeightSetter
 
 logger = get_logger(__name__)
 
@@ -33,7 +34,10 @@ class GaiaValidator:
         self.database_manager = ValidatorDatabaseManager()
         self.soil_task = SoilMoistureTask()
         self.geomagnetic_task = GeomagneticTask()  # Initialize GeomagneticTask
-
+        self.weights = [0.0] * 256
+        self.last_set_weights_block = 0
+        self.current_block = 0
+        
     def setup_neuron(self) -> bool:
         """
         Set up the neuron with necessary configurations and connections.
@@ -129,8 +133,17 @@ class GaiaValidator:
                     )
                     
                     resp.raise_for_status()
-                    responses.append(resp.text)
-                    logger.info(f"Request sent to {miner_hotkey}! Response: {resp.text}")
+                    logger.debug(f"Response from miner {miner_hotkey}: {resp}")
+                    logger.debug(f"Response text from miner {miner_hotkey}: {resp.headers}")
+                    # Create a dictionary with both response text and metadata
+                    response_data = {
+                        'text': resp.text,
+                        'hotkey': miner_hotkey,
+                        'port': node.port,
+                        'ip': node.ip
+                    }
+                    responses.append(response_data)
+                    logger.info(f"Request sent to {miner_hotkey}! Response: {response_data}")
                 else:
                     logger.warning(f"Failed handshake with miner {miner_hotkey}")
 
@@ -181,6 +194,7 @@ class GaiaValidator:
                     asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
                     #asyncio.create_task(self.soil_task.validator_execute(self)),
                     asyncio.create_task(self.status_logger()),
+                    asyncio.create_task(self.main_scoring()),  # Add scoring task
                 ]
 
                 await asyncio.gather(*workers, return_exceptions=True)
@@ -188,11 +202,120 @@ class GaiaValidator:
                 logger.error(f"Main loop error: {e}")
             await asyncio.sleep(300)
 
+    async def main_scoring(self):
+        """
+        Run scoring every 300 blocks, with weight setting 50 blocks after scoring.
+        """
+        while True:
+            try:
+                # Update current block
+                self.current_block = self.substrate.get_block().header.number
+                
+                # Calculate blocks until next scoring round (aligns to 300 blocks, no offset)
+                blocks_until_scoring = 300 - (self.current_block % 300)
+                
+                logger.info(f"Current block: {self.current_block}, Scoring in {blocks_until_scoring} blocks")
+                await asyncio.sleep(blocks_until_scoring * 12)
+                
+                # Sync metagraph and calculate scores
+                self.metagraph.sync()
+                geomagnetic_scores = await self.database_manager.get_recent_scores('geomagnetic')
+                soil_scores = await self.database_manager.get_recent_scores('soil')
+                
+                # Initialize and calculate weights
+                weights = [0.0] * len(self.metagraph.uids)
+                for idx, uid in enumerate(self.metagraph.uids):
+                    hotkey = self.metagraph.hotkeys[idx]
+                    geo_score = geomagnetic_scores.get(hotkey, 0.0)
+                    soil_score = soil_scores.get(hotkey, 0.0)
+                    aggregate_score = (0.5 * geo_score) + (0.5 * soil_score)
+                    weights[idx] = max(0.0, min(1.0, aggregate_score))
+                
+                # Store weights for later setting
+                self.weights = weights
+                logger.info("Scores calculated, waiting 50 blocks to set weights")
+                
+                # Wait 50 blocks before setting weights
+                await asyncio.sleep(50 * 12)
+                
+                # Set weights if enough blocks have passed since last setting
+                blocks_since_last = self.current_block - self.last_set_weights_block
+                if blocks_since_last >= 250:  # Only set weights if enough blocks have passed
+                    success = await self.set_weights(self.weights)
+                    if success:
+                        logger.info(f"Successfully set weights at block {self.current_block}")
+                    else:
+                        logger.error(f"Failed to set weights at block {self.current_block}")
+                else:
+                    logger.warning(f"Skipping weight setting, only {blocks_since_last} blocks since last set")
+                
+            except Exception as e:
+                logger.error(f"Error in main_scoring: {e}")
+                logger.error(traceback.format_exc())
+                await asyncio.sleep(60)
+
+    async def set_weights(self, weights: List[float]) -> bool:
+        """
+        Set weights on the chain.
+        
+        Args:
+            weights (List[float]): List of weights aligned with UIDs
+            
+        Returns:
+            bool: True if weights were set successfully, False otherwise
+        """
+        try:
+            weight_setter = FiberWeightSetter(
+                netuid=self.netuid,
+                wallet_name=self.wallet_name,
+                hotkey_name=self.hotkey_name,
+                network=self.subtensor_network
+            )
+            
+            await weight_setter.set_weights()
+            self.last_set_weights_block = self.current_block
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error setting weights: {e}")
+            logger.error(traceback.format_exc())
+            return False
+
     async def status_logger(self):
-        """Log the status of the validator."""
-        current_time_utc = datetime.datetime.now(datetime.timezone.utc)
-        formatted_time = current_time_utc.strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"Current time (UTC): {formatted_time}")
+        """Log the status of the validator periodically."""
+        while True:
+            try:
+                current_time_utc = datetime.datetime.now(datetime.timezone.utc)
+                formatted_time = current_time_utc.strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Try to get current block, handle connection errors
+                try:
+                    current_block = self.substrate.get_block().header.number
+                    blocks_since_weights = current_block - self.last_set_weights_block
+                except Exception as block_error:
+                    logger.error(f"Failed to get current block: {block_error}")
+                    # Try to reconnect to substrate
+                    try:
+                        self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
+                        logger.info("Successfully reconnected to substrate")
+                    except Exception as e:
+                        logger.error(f"Failed to reconnect to substrate: {e}")
+                    current_block = 0
+                    blocks_since_weights = 0
+                
+                active_nodes = len(self.metagraph.nodes) if self.metagraph else 0
+                
+                logger.info(f"Status Update:")
+                logger.info(f"Current time (UTC): {formatted_time}")
+                logger.info(f"Current block: {current_block}")
+                logger.info(f"Active nodes: {active_nodes}/256")
+                logger.info(f"Last set weights: {blocks_since_weights} blocks ago")
+                
+            except Exception as e:
+                logger.error(f"Error in status logger: {e}")
+                logger.error(f'{traceback.format_exc()}')
+            finally:
+                await asyncio.sleep(60)  # Sleep at the end to ensure we always get the interval
     
     def serialize_datetime(self, obj):
         """Custom JSON serializer for handling datetime objects."""
