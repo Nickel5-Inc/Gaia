@@ -39,18 +39,6 @@ class SoilmoistureRequest(BaseModel):
 def factory_router(miner_instance) -> APIRouter:
     """Create router with miner instance available to route handlers."""
     router = APIRouter()
-    
-    # Add middleware for request size
-    @router.middleware("http")
-    async def validate_request_size(request: Request, call_next):
-        if request.headers.get("content-length"):
-            content_length = int(request.headers["content-length"])
-            if content_length > MAX_REQUEST_SIZE:
-                return JSONResponse(
-                    status_code=413,
-                    content={"error": "Request too large"}
-                )
-        return await call_next(request)
 
     async def geomagnetic_require(
         decrypted_payload: GeomagneticRequest = Depends(

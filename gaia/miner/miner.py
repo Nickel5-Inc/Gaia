@@ -14,7 +14,11 @@ from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 import ssl
 import logging
 from fiber import logging_utils
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
+# Define max request size (5MB in bytes)
+MAX_REQUEST_SIZE = 5 * 1024 * 1024  # 5MB
 
 class Miner:
     """
@@ -175,6 +179,19 @@ Verification Result: {verify_result}
                 
             #     return response
             
+            app = FastAPI()
+
+            @app.middleware("http")
+            async def validate_request_size(request: Request, call_next):
+                if request.headers.get("content-length"):
+                    content_length = int(request.headers["content-length"])
+                    if content_length > MAX_REQUEST_SIZE:
+                        return JSONResponse(
+                            status_code=413,
+                            content={"error": "Request too large"}
+                        )
+                return await call_next(request)
+
             uvicorn.run(
                 app,
                 host="0.0.0.0",
