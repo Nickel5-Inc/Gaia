@@ -65,25 +65,43 @@ def clean_data(df):
     return df.reset_index(drop=True)
 
 
-async def get_latest_geomag_data():
+async def get_latest_geomag_data(include_historical=False):
     """
     Fetch, parse, clean, and return the latest valid geomagnetic data point.
 
-    Returns:
-        tuple: (timestamp, Dst value) of the latest geomagnetic data point.
-    """
-    raw_data = await fetch_data()  # Fetch raw data
-    parsed_df = parse_data(raw_data)  # Parse raw data into DataFrame
-    cleaned_df = clean_data(parsed_df)  # Clean data
+    Args:
+        include_historical (bool): Whether to include current month's historical data.
 
-    # Get the latest data point
-    if not cleaned_df.empty:
-        latest_data_point = cleaned_df.iloc[-1]
-        timestamp = latest_data_point["timestamp"]
-        dst_value = int(
-            latest_data_point["Dst"]
-        )  # Convert to native int for JSON compatibility
-        return timestamp, dst_value
-    else:
-        # If no data available, return placeholders
-        return "N/A", "N/A"
+    Returns:
+        tuple: (timestamp, Dst value, historical_data) of the latest geomagnetic data point.
+               `historical_data` will be a DataFrame if `include_historical=True`, otherwise None.
+    """
+    try:
+        # Fetch raw data
+        raw_data = await fetch_data()
+
+        # Parse and clean raw data into DataFrame
+        parsed_df = parse_data(raw_data)
+        cleaned_df = clean_data(parsed_df)
+
+        # Extract the latest data point
+        if not cleaned_df.empty:
+            latest_data_point = cleaned_df.iloc[-1]
+            timestamp = latest_data_point["timestamp"]
+            dst_value = int(latest_data_point["Dst"])  # Convert to native int for JSON compatibility
+        else:
+            # If no valid data available
+            return "N/A", "N/A", None
+
+        # If historical data is requested, filter the DataFrame for the current month
+        historical_data = None
+        if include_historical:
+            now = datetime.datetime.utcnow()
+            start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            historical_data = cleaned_df[cleaned_df["timestamp"] >= start_of_month]
+
+        return timestamp, dst_value, historical_data
+    except Exception as e:
+        logger.error(f"Error fetching geomagnetic data: {e}")
+        return "N/A", "N/A", None
+

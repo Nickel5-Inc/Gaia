@@ -169,15 +169,17 @@ class GeomagneticTask(Task):
                 ) + datetime.timedelta(hours=1)
                 sleep_duration = (next_hour - current_time).total_seconds()
 
-                
-
                 logger.info("Fetching latest geomagnetic data...")
                 # Step 2: Fetch Latest Geomagnetic Data
-                geomag_data = await get_latest_geomag_data()
-                timestamp, dst_value = geomag_data  # Unpack after awaiting
+                timestamp, dst_value, historical_data = await get_latest_geomag_data(
+                    include_historical=True)  # Fetch historical data
                 logger.info(
                     f"Fetched latest geomagnetic data: timestamp={timestamp}, value={dst_value}"
                 )
+                if historical_data is not None:
+                    logger.info(f"Fetched historical data for the current month: {len(historical_data)} records")
+                else:
+                    logger.warning("No historical data available for the current month.")
 
                 # Step 3: Construct Payload for Miners
                 nonce = str(uuid4())  # Generate a unique nonce for this query
@@ -187,10 +189,12 @@ class GeomagneticTask(Task):
                         "name": "Geomagnetic Data",
                         "timestamp": str(timestamp),
                         "value": dst_value,
+                        "historical_values": historical_data.to_dict(
+                            orient="records") if historical_data is not None else [],  # Include historical data
                     },
                 }
                 endpoint = "/geomagnetic-request"
-                
+
                 logger.info(f"Querying miners with payload: {payload_template}")
                 # Step 4: Query Miners
                 responses = await validator.query_miners(payload_template, endpoint)
