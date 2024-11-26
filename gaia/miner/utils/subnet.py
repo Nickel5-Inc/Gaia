@@ -13,7 +13,8 @@ logger = get_logger(__name__)
 
 class DataModel(BaseModel):
     name: str
-    value: int
+    timestamp: str
+    value: float
 
 
 class GeomagneticRequest(BaseModel):

@@ -1,6 +1,10 @@
 from gaia.tasks.base.components.preprocessing import Preprocessing
 import pandas as pd
 from gaia.models.geomag_basemodel import GeoMagBaseModel
+from typing import Dict
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class GeomagneticPreprocessing(Preprocessing):
@@ -50,3 +54,23 @@ class GeomagneticPreprocessing(Preprocessing):
             return None
 
         return {"predicted_value": int(prediction), "timestamp": last_timestamp_utc}
+
+    def process_miner_data(self, data: Dict) -> Dict:
+        """
+        Process raw geomagnetic data for model input.
+        
+        Args:
+            data (Dict): Dictionary containing:
+                - timestamp: UTC timestamp
+                - value: DST value
+        Returns:
+            Dict: Processed data ready for model input
+        """
+        try:
+            return {
+                "timestamp": pd.to_datetime(data["timestamp"]),
+                "value": data["value"] / 100.0  # Normalize values
+            }
+        except Exception as e:
+            logger.error(f"Error in process_miner_data: {e}")
+            raise

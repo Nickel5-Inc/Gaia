@@ -54,17 +54,18 @@ class GeomagneticTask(Task):
         task.validator_execute()
     """
 
-    def __init__(self):
+    def __init__(self, db_manager=None):
         super().__init__(
             name="GeomagneticTask",
-            description="Task for geomagnetic data processing",
+            description="Geomagnetic prediction task",
             task_type="atomic",
             metadata=GeomagneticMetadata(),
             inputs=GeomagneticInputs(),
-            preprocessing=GeomagneticPreprocessing(),
-            scoring_mechanism=GeomagneticScoringMechanism(),
             outputs=GeomagneticOutputs(),
+            scoring_mechanism=GeomagneticScoringMechanism(),
         )
+        self.db_manager = db_manager or ValidatorDatabaseManager()
+        self.miner_preprocessing = GeomagneticPreprocessing()
 
     def miner_preprocess(self, raw_data):
         """
@@ -353,32 +354,33 @@ class GeomagneticTask(Task):
     def miner_execute(self, data=None):
         """
         Executes the miner workflow: preprocesses data, runs model inference,
-        and adds predictions to the task queue.
+        and returns predictions.
         """
         try:
-            # Step 1: Preprocess data if provided
-            if data:
-                processed_data = self.miner_preprocessing.process_miner_data(data)
+            # Extract data from the request payload
+            if data and data.get('data'):
+                input_data = {
+                    'timestamp': data['data']['timestamp'],
+                    'value': float(data['data']['value'])
+                }
+                processed_data = self.miner_preprocessing.process_miner_data(input_data)
             else:
-                processed_data = None  # Handle cases with no input data
+                logger.error("No data provided in request")
+                return None
 
-            # Step 2: Run model inference
+            # Run model inference
             predictions = self.run_model_inference(processed_data)
-            logger.info(f"Miner execution completed successfully at {query_time}")
-
-            # Step 3: Add predictions to the task queue
-            query_time = datetime.datetime.now(datetime.timezone.utc)
-
+            
+            # Format response according to MINER.md requirements
             return {
-                "predicted_values": predictions,
-                "query_time": query_time
+                "predicted_values": float(predictions),
+                "timestamp": input_data['timestamp'],
+                "miner_id": "your_miner_id_here"  # Add proper miner ID
             }
-            
-
-            
 
         except Exception as e:
             logger.error(f"Error in miner execution: {str(e)}")
+            return None
 
     def query_miners(self):
         """
