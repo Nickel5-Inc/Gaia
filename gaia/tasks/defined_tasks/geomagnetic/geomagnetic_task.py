@@ -385,31 +385,25 @@ class GeomagneticTask(Task):
         Run the GeoMag model inference.
 
         Args:
-            processed_data (dict): Preprocessed input data for the model.
+            processed_data (pd.DataFrame): Preprocessed input data for the model.
 
         Returns:
             float: Predicted value.
         """
         try:
-            # Ensure we're passing a dictionary to the model
-            if isinstance(processed_data, torch.Tensor):
-                processed_data = {
-                    "timestamp": datetime.datetime.now(datetime.timezone.utc),
-                    "value": float(processed_data.item())
-                }
-            
             # Perform prediction using the model
             prediction = self.model.predict(processed_data)
             
             # Handle NaN or infinite values
             if np.isnan(prediction) or np.isinf(prediction):
                 logger.warning("Model returned NaN/Inf, using fallback value")
-                return float(processed_data['value'])  # Use input value as fallback
+                return float(processed_data['value'].iloc[-1])  # Use input value as fallback
             
             return float(prediction)  # Ensure we return a Python float
+            
         except Exception as e:
             logger.error(f"Error during model inference: {e}")
-            return float(processed_data.get('value', 0.0))  # Return input value or 0.0 as fallback
+            return float(processed_data['value'].iloc[-1])  # Return input value as fallback
 
     def miner_execute(self, data=None):
         """
@@ -419,10 +413,12 @@ class GeomagneticTask(Task):
         try:
             # Extract data from the request payload
             if data and data.get('data'):
-                input_data = {
-                    'timestamp': data['data']['timestamp'],
-                    'value': float(data['data']['value'])
-                }
+                # Convert input data to DataFrame format as expected by the model
+                input_data = pd.DataFrame({
+                    'timestamp': [pd.to_datetime(data['data']['timestamp'])],
+                    'value': [float(data['data']['value'])]
+                })
+                
                 processed_data = self.miner_preprocessing.process_miner_data(input_data)
             else:
                 logger.error("No data provided in request")
@@ -434,7 +430,7 @@ class GeomagneticTask(Task):
             # Format response according to MINER.md requirements
             return {
                 "predicted_values": float(predictions),
-                "timestamp": input_data['timestamp'],
+                "timestamp": data['data']['timestamp'],
                 "miner_id": "your_miner_id_here"  # Replace with actual miner ID logic
             }
 
