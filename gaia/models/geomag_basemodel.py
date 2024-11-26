@@ -142,23 +142,54 @@ class GeoMagBaseModel:
         """Make prediction using either HuggingFace or fallback model."""
         try:
             # Ensure data is in the correct format
-            if isinstance(data, (torch.Tensor, np.ndarray)):
-                data = {
-                    'timestamp': datetime.now(pytz.UTC),
-                    'value': float(data.item() if hasattr(data, 'item') else data)
-                }
+            if isinstance(data, pd.DataFrame):
+                # Data is already a DataFrame, just ensure columns are correct
+                df = data.copy()
+                if 'ds' not in df.columns:
+                    df = df.rename(columns={
+                        'timestamp': 'ds',
+                        'value': 'y'
+                    })
+            else:
+                # Convert to DataFrame if it's not already
+                if isinstance(data, (torch.Tensor, np.ndarray)):
+                    data = {
+                        'timestamp': datetime.now(pytz.UTC),
+                        'value': float(data.item() if hasattr(data, 'item') else data)
+                    }
+                
+                # Create DataFrame from dict
+                df = pd.DataFrame({
+                    'ds': [pd.to_datetime(data.get('timestamp', data.get('ds')))],
+                    'y': [float(data.get('value', data.get('y', 0.0)))]
+                })
             
-            # Convert Timestamp to datetime if needed
-            if isinstance(data.get('timestamp'), pd.Timestamp):
-                data['timestamp'] = data['timestamp'].to_pydatetime()
+            # Ensure timestamps are timezone-naive
+            if df['ds'].dt.tz is not None:
+                df['ds'] = df['ds'].dt.tz_convert('UTC').dt.tz_localize(None)
+            
+            # Create future dates for prediction
+            last_date = df['ds'].max()
+            future_dates = pd.date_range(
+                start=last_date,
+                periods=2,  # One extra period for prediction
+                freq='H',
+                tz=None  # Ensure timezone-naive
+            )
+            future_df = pd.DataFrame({'ds': future_dates})
             
             if self._is_fallback:
-                result = self.model.predict(data)
+                # Use Prophet model
+                self.model.fit(df)
+                forecast = self.model.predict(future_df)
+                result = forecast['yhat'].iloc[-1]
             else:
+                # Use HuggingFace model
                 if hasattr(self.model, 'train'):
                     logger.info("Retraining model on latest data")
-                    self.model.train(data)
-                result = self.model.forecast(data)
+                    self.model.train(df)
+                # Pass both current data and future dates
+                result = self.model.forecast({'data': df, 'future': future_df})
             
             # Convert result to Python float and handle invalid values
             if hasattr(result, 'item'):
@@ -169,12 +200,12 @@ class GeoMagBaseModel:
             # Handle NaN/Inf values
             if np.isnan(result) or np.isinf(result) or not -1000 < float(result) < 1000:
                 logger.warning(f"Invalid prediction value: {result}, using input value")
-                return float(data.get('value', 0.0))
+                return float(df['y'].iloc[-1])
             
             return float(result)
             
         except Exception as e:
             logger.error(f"Error during prediction: {e}")
             logger.error(f"traceback: {traceback.format_exc()}")
-            logger.error(f"Using input value as fallback: {data.get('value', 0.0)}")
-            return float(data.get('value', 0.0))
+            logger.error(f"Using input value as fallback: {data.get('value', 0.0) if isinstance(data, dict) else df['y'].iloc[-1] if 'df' in locals() else 0.0}")
+            return float(data.get('value', 0.0) if isinstance(data, dict) else df['y'].iloc[-1] if 'df' in locals() else 0.0)
