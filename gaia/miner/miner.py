@@ -54,21 +54,27 @@ class Miner:
         
         # Add detailed logging for keypair and wallet info
         self.keypair = chain_utils.load_hotkey_keypair(self.wallet, self.hotkey)
-        self.logger.info(f"Wallet: {self.wallet}")
-        self.logger.info(f"Hotkey: {self.hotkey}")
-        self.logger.info(f"Keypair SS58 Address: {self.keypair.ss58_address}")
-        self.logger.info(f"Subtensor chain endpoint: {self.subtensor_chain_endpoint}")
+        self.logger.info(f"""
+Neuron Configuration:
+--------------------
+Wallet: {self.wallet}
+Hotkey: {self.hotkey}
+Keypair SS58 Address: {self.keypair.ss58_address}
+Subtensor Chain Endpoint: {self.subtensor_chain_endpoint}
+Network: {self.subtensor_network}
+Port: {self.port}
+        """)
         
-        # Log all environment variables (excluding sensitive data)
-        safe_env = {k: v for k, v in os.environ.items() if not any(sensitive in k.lower() for sensitive in ['key', 'password', 'secret'])}
-        self.logger.info(f"Environment variables: {safe_env}")
+        # Test signature generation
+        test_message = "test_message"
+        test_sig = self.keypair.sign(test_message)
+        self.logger.info(f"""
+Signature Test:
+--------------
+Test Message: {test_message}
+Test Signature: {test_sig}
+        """)
         
-        # Log detailed config
-        self.config = configuration.factory_config()
-        self.logger.info(f"Detailed config:")
-        for key, value in vars(self.config).items():
-            self.logger.info(f"  {key}: {value}")
-
         return True
 
     def run(self):
@@ -132,23 +138,23 @@ class Miner:
                         self.logger.warning(f"Could not read request body: {e}")
 
                 self.logger.info(f"""
-Request Details:
-----------------
-Method: {request.method}
-URL: {request.url}
-Client Host: {request.client.host if request.client else 'Unknown'}
-Headers: {dict(request.headers)}
-                """)
-                
+                Request Details:
+                ----------------
+                Method: {request.method}
+                URL: {request.url}
+                Client Host: {request.client.host if request.client else 'Unknown'}
+                Headers: {dict(request.headers)}
+                                """)
+                                
                 # Process the request
                 response = await call_next(request)
-                
+                                
                 # Log response details
                 self.logger.info(f"""
-Response Details:
-----------------
-Status: {response.status_code}
-Headers: {dict(response.headers)}
+                Response Details:
+                ----------------
+                Status: {response.status_code}
+                Headers: {dict(response.headers)}
                 """)
                 
                 return response
@@ -158,7 +164,7 @@ Headers: {dict(response.headers)}
                 host="0.0.0.0",
                 port=self.port,
                 log_config=log_config,
-                log_level="info",
+                log_level="trace",
                 access_log=True,
                 timeout_keep_alive=65,
                 proxy_headers=True,
