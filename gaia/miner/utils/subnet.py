@@ -31,6 +31,9 @@ async def geomagnetic_require(
 
     # Process the data here; return it as response_data to be sent to the Validator
     response_data = decrypted_payload.model_dump()
+
+    # Call the geomagnetic task on the miner
+    
     return JSONResponse(content=response_data)
 
 

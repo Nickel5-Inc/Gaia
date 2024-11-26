@@ -22,6 +22,7 @@ import pandas as pd
 import asyncio
 from uuid import uuid4
 from fiber.logging_utils import get_logger
+import json
 
 logger = get_logger(__name__)
 
@@ -174,10 +175,27 @@ class GeomagneticTask(Task):
                     minute=0, second=0, microsecond=0
                 ) - datetime.timedelta(hours=1)
                 for response in responses:
-                    self.add_task_to_queue(
-                        predictions=response.get("predicted_values"),
-                        query_time=current_hour_start,
-                    )
+                    try:
+                        # Parse the string response into a dictionary
+                        response_data = json.loads(response)
+                        predicted_value = response_data.get("predicted_values")
+                        
+                        if predicted_value is not None:
+                            await self.add_prediction_to_queue(
+                                miner_id=response_data.get("miner_id", "unknown"),  # Get miner_id from response or use "unknown"
+                                predicted_value=predicted_value,
+                                query_time=current_hour_start
+                            )
+                        else:
+                            logger.warning(f"No predicted value in response: {response_data}")
+                            
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse miner response as JSON: {e}")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error processing miner response: {e}")
+                        logger.error(f'{traceback.format_exc()}')
+                        continue
 
                 # Step 6: Fetch Ground Truth for Current Hour
                 ground_truth_value = await self.fetch_ground_truth()
@@ -375,7 +393,7 @@ class GeomagneticTask(Task):
         Adds a new task to the task queue.
 
         Args:
-            predictions (np.ndarray): Array of predictions from miners.
+            predictions (np.ndarray or None): Array of predictions from miners.
             query_time (datetime): The time the task was added.
         """
         try:
@@ -384,8 +402,16 @@ class GeomagneticTask(Task):
             task_name = "geomagnetic_prediction"
             miner_id = "example_miner_id"  # Replace with the actual miner ID if available
 
+            # Validate predictions
+            if predictions is None:
+                logger.warning("Received None predictions, skipping queue addition")
+                return
+
             # Convert predictions to a dictionary or JSON-like structure
-            predicted_value = {"predictions": predictions.tolist()}  # Convert ndarray to list
+            if isinstance(predictions, np.ndarray):
+                predicted_value = {"predictions": predictions.tolist()}
+            else:
+                predicted_value = {"predictions": predictions}
 
             # Add to the queue
             asyncio.run(
@@ -400,4 +426,48 @@ class GeomagneticTask(Task):
 
         except Exception as e:
             logger.error(f"Error adding task to queue: {e}")
+
+    async def add_prediction_to_queue(
+        self,
+        miner_id: str,
+        predicted_value: float,
+        query_time: datetime,
+        status: str = "pending"
+    ) -> None:
+        """
+        Add a prediction to the geomagnetic_predictions table.
+
+        Args:
+            miner_id (str): ID of the miner submitting the prediction
+            predicted_value (float): The predicted DST value
+            query_time (datetime): Timestamp for when the prediction was made
+            status (str, optional): Current status of the prediction. Defaults to "pending"
+        """
+        try:
+            # Initialize the database manager
+            db_manager = ValidatorDatabaseManager()
+
+            # Construct the query based on schema.json
+            query = """
+                INSERT INTO geomagnetic_predictions 
+                (miner_id, predicted_value, query_time, status)
+                VALUES (:miner_id, :predicted_value, :query_time, :status)
+            """
+            
+            # Prepare parameters
+            params = {
+                "miner_id": miner_id,
+                "predicted_value": float(predicted_value),  # Ensure float type
+                "query_time": query_time,
+                "status": status
+            }
+
+            # Execute the query
+            await db_manager.execute(query, params)
+            logger.info(f"Added prediction from miner {miner_id} to queue")
+
+        except Exception as e:
+            logger.error(f"Error adding prediction to queue: {e}")
+            logger.error(f'{traceback.format_exc()}')
+            raise
 
