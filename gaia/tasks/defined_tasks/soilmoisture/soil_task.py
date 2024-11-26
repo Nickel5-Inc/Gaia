@@ -20,6 +20,7 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoistureOutpu
 from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMetadata
 from pydantic import Field
 from fiber.logging_utils import get_logger
+from uuid import uuid4
 
 logger = get_logger(__name__)
 
@@ -33,6 +34,14 @@ class SoilMoistureTask(Task):
     miner_preprocessing: SoilMinerPreprocessing = Field(
         default_factory=SoilMinerPreprocessing,
         description="Preprocessing component for miner",
+    )
+    prediction_horizon: timedelta = Field(
+        default_factory=lambda: timedelta(hours=6),
+        description="Prediction horizon for the task",
+    )
+    scoring_delay: timedelta = Field(
+        default_factory=lambda: timedelta(days=3),
+        description="Delay before scoring due to SMAP data latency",
     )
 
     def __init__(self):
@@ -77,53 +86,73 @@ class SoilMoistureTask(Task):
 
     async def validator_execute(self):
         """Execute validator workflow."""
-        logger.info("Executing SoilMoistureTask...")
         current_time = datetime.now(timezone.utc)
-        target_time = self.get_next_valid_time(current_time)
-        # 5 minutes close to valid SMAP time
-        time_diff = (target_time - current_time).total_seconds() / 60
-        if time_diff > 5:  # More than 5 minutes until next valid time
-            logger.info(f"Not enough time until next valid time ({time_diff} minutes). Skipping task.")
-            return
+        logger.info(f"Current time (UTC): {current_time}")
 
-        today = current_time.date()
-        if (
-            not hasattr(self, "_last_preprocessing_date")
-            or self._last_preprocessing_date != today
-        ):
-            # once per day
-            logger.info("Getting daily regions...")
-            regions = await self.validator_preprocessing.get_daily_regions(target_time)
-            self._last_preprocessing_date = today
+        # check for tasks ready for scoring (3 days)
+        pending_tasks = await self.get_pending_tasks()
+        if pending_tasks:
+            logger.info(f"Found {len(pending_tasks)} tasks ready for scoring")
+            for task in pending_tasks:
+                try:
+                    logger.info(f"Processing task {task['id']} from {task['target_time']}")
+                    ground_truth = await self.collect_ground_truth(task['target_time'])
+                    if ground_truth:
+                        await self.process_scoring(task, ground_truth)
+                except Exception as e:
+                    logger.error(f"Error processing task {task['id']}: {str(e)}")
+
+        next_smap_time = self.get_next_valid_time(current_time)
+        preparation_time = next_smap_time - self.prediction_horizon  # 6 hours before
+        
+        time_until_prep = (preparation_time - current_time).total_seconds() / 60
+        logger.info(f"Next SMAP measurement time: {next_smap_time}")
+        logger.info(f"Task preparation time: {preparation_time}")
+        logger.info(f"Minutes until preparation: {time_until_prep}")
+
+        if -180 <= time_until_prep <= 180:  ##TODO change to 10m
+            try:
+                ifs_forecast_time = preparation_time.replace(
+                    hour=(preparation_time.hour // 6) * 6,
+                    minute=0, second=0, microsecond=0
+                )
+                logger.info(f"Using IFS forecast from: {ifs_forecast_time}")
+                logger.info(f"For prediction target: {next_smap_time}")
+
+                regions = await self.validator_preprocessing.get_daily_regions(
+                    target_time=next_smap_time,
+                    ifs_forecast_time=ifs_forecast_time
+                )
+
+                if regions:
+                    logger.info(f"Selected {len(regions)} new regions")
+                    for region in regions:
+                        try:
+                            task_data = {
+                                'region_id': region['id'],
+                                'data_collection_time': current_time,
+                                'ifs_forecast_time': ifs_forecast_time,
+                                'target_prediction_time': next_smap_time,
+                                'combined_data': region['combined_data'],
+                                'sentinel_bounds': region['sentinel_bounds'],
+                                'sentinel_crs': region['sentinel_crs']
+                            }
+                            await self.query_miners(task_data)
+                            
+                            async with self.db.get_connection() as conn:
+                                await conn.execute("""
+                                    UPDATE soil_moisture_regions 
+                                    SET status = 'sent_to_miners'
+                                    WHERE id = $1
+                                """, region['id'])
+                                
+                        except Exception as e:
+                            logger.error(f"Error preparing region: {str(e)}")
+                            continue
+            except Exception as e:
+                logger.error(f"Error in task preparation: {str(e)}")
         else:
-            logger.info("Getting today's regions...")
-            regions = await self.get_todays_regions(target_time)
-
-        if not regions:
-            logger.info("No regions found, skipping task.")
-            return
-
-        for region in regions:
-            logger.info(f"Querying miners for region {region['id']}...")
-            predictions = await self.query_miners(
-                {
-                    "region_id": region["id"],
-                    "combined_data": region["combined_data"],
-                    "sentinel_bounds": region["sentinel_bounds"],
-                    "sentinel_crs": region["sentinel_crs"],
-                    "target_time": target_time,
-                }
-            )
-
-            logger.info(f"Adding task to queue for region {region['id']}...")
-            await self.add_task_to_queue(
-                predictions,
-                {
-                    "region_id": region["id"],
-                    "query_time": current_time,
-                    "target_time": target_time,
-                },
-            )
+            logger.debug(f"Not in preparation window. Next preparation in {time_until_prep:.2f} minutes")
 
     async def get_todays_regions(self, target_time: datetime) -> List[Dict]:
         """Get regions already selected for today."""
@@ -169,62 +198,36 @@ class SoilMoistureTask(Task):
         """
         return self.scoring_mechanism.compute_scores(predictions, ground_truth)
 
-    def validator_score(self):
-        """Score predictions after SMAP delay."""
-        pass
 
     def miner_preprocess(self, preprocessing=None, inputs=None):
         """Preprocess data for model input."""
         pass
 
-    async def query_miners(self, data: Dict) -> Dict[str, Dict]:
-        """Query miners for predictions.
-
-        Args:
-            data: Dict containing region data to send to miners
-                {
-                    region_id: int,
-                    combined_data: bytes,
-                    sentinel_bounds: list[float],
-                    sentinel_crs: int,
-                    target_time: datetime
-                }
-
-        Returns:
-            Dict[str, Dict]: Dictionary of miner predictions
-                {
-                    miner_id: {
-                        surface_sm: NDArray[np.float32],
-                        rootzone_sm: NDArray[np.float32],
-                        uncertainty_surface: Optional[NDArray[np.float32]],
-                        uncertainty_rootzone: Optional[NDArray[np.float32]],
-                        sentinel_bounds: list[float],
-                        sentinel_crs: int,
-                        target_time: datetime
-                    }
-                }
-        """
+    async def query_miners(self, task_data: Dict):
+        """Send task to miners and collect responses."""
         try:
-            SoilMoisturePayload(**data)
-            miner_predictions = {}
-            miners = await self.get_registered_miners()
-
-            for miner in miners:
-                try:
-                    prediction = await self.network.query_miner(
-                        miner_id=miner.id, task_name=self.name, data=data
-                    )
-                    if prediction:
-                        miner_predictions[miner.id] = prediction
-                except Exception as e:
-                    print(f"Error querying miner {miner.id}: {str(e)}")
-                    continue
-
-            return miner_predictions
-
+            async with self.db.get_connection() as conn:
+                region = await conn.fetchrow("""
+                    SELECT combined_data, sentinel_bounds, sentinel_crs, target_time
+                    FROM soil_moisture_regions 
+                    WHERE id = $1
+                """, task_data['region_id'])
+            soil_inputs = SoilMoistureInputs()
+            payload = soil_inputs.format_miner_payload(
+                region_id=task_data['region_id'],
+                combined_data=region['combined_data'],
+                sentinel_bounds=region['sentinel_bounds'],
+                sentinel_crs=region['sentinel_crs'],
+                target_time=region['target_time']
+            )
+            soil_inputs.validate_inputs(payload)
+            responses = await self.broadcast_task(payload)
+            if responses:
+                await self.add_task_to_queue(responses, task_data)
+            return responses
         except Exception as e:
-            print(f"Error in query_miners: {str(e)}")
-            return {}
+            print(f"Error querying miners: {str(e)}")
+            return None
 
     async def add_task_to_queue(self, predictions: Dict, metadata: Dict):
         """Add miner predictions to database for later scoring."""
