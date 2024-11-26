@@ -230,56 +230,55 @@ class SoilMoistureTask(Task):
     async def add_task_to_queue(self, predictions: Dict, metadata: Dict):
         """Add miner predictions to database for later scoring."""
         try:
-            async with self.db.get_connection() as conn:
-                for miner_id, pred in predictions.items():
-                    await conn.execute(
-                        """
-                        INSERT INTO soil_moisture_predictions 
-                        (region_id, miner_id, target_time, surface_sm, 
-                         rootzone_sm, uncertainty_surface, uncertainty_rootzone,
-                         sentinel_bounds, sentinel_crs)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            for miner_id, pred in predictions.items():
+                await self.db.execute(
+                    """
+                    INSERT INTO soil_moisture_predictions 
+                    (region_id, miner_id, target_time, surface_sm, rootzone_sm, 
+                     uncertainty_surface, uncertainty_rootzone)
+                    VALUES (:region_id, :miner_id, :target_time, :surface_sm, 
+                           :rootzone_sm, :uncertainty_surface, :uncertainty_rootzone)
                     """,
-                        metadata["region_id"],
-                        miner_id,
-                        metadata["target_time"],
-                        pred["surface_sm"],
-                        pred["rootzone_sm"],
-                        pred.get("uncertainty_surface"),
-                        pred.get("uncertainty_rootzone"),
-                    )
+                    {
+                        "region_id": metadata["region_id"],
+                        "miner_id": miner_id,
+                        "target_time": metadata["target_time"],
+                        "surface_sm": pred["surface_sm"],
+                        "rootzone_sm": pred["rootzone_sm"],
+                        "uncertainty_surface": pred.get("uncertainty_surface"),
+                        "uncertainty_rootzone": pred.get("uncertainty_rootzone")
+                    }
+                )
         except Exception as e:
             logger.error(f"Error storing predictions: {str(e)}")
             raise
 
-    async def get_pending_tasks(self) -> List[Dict]:
-        """Get tasks ready for scoring (past 3 day SMAP delay and predictions present).
-
-        Returns:
-            List[Dict]: List of tasks containing region info and predictions
-        """
+    async def get_pending_tasks(self):
+        """Get tasks that are ready for scoring."""
         scoring_time = datetime.now(timezone.utc) - self.scoring_delay
 
         try:
-            conn = await self.db.get_connection()
-            async with conn.transaction():
-                return await conn.fetch("""
-                    SELECT 
-                        r.*,
-                        json_agg(json_build_object(
-                            'miner_id', p.miner_id,
-                            'surface_sm', p.surface_sm,
-                            'rootzone_sm', p.rootzone_sm,
-                            'uncertainty_surface', p.uncertainty_surface,
-                            'uncertainty_rootzone', p.uncertainty_rootzone
-                        )) as predictions
-                    FROM soil_moisture_regions r
-                    JOIN soil_moisture_predictions p ON p.region_id = r.id
-                    WHERE r.status = 'sent_to_miners'
-                    AND r.target_time <= $1
-                    GROUP BY r.id
-                    ORDER BY r.target_time ASC
-                """, scoring_time)
+            result = await self.db.fetch_many(
+                """
+                SELECT 
+                    r.*,
+                    json_agg(json_build_object(
+                        'miner_id', p.miner_id,
+                        'surface_sm', p.surface_sm,
+                        'rootzone_sm', p.rootzone_sm,
+                        'uncertainty_surface', p.uncertainty_surface,
+                        'uncertainty_rootzone', p.uncertainty_rootzone
+                    )) as predictions
+                FROM soil_moisture_regions r
+                JOIN soil_moisture_predictions p ON p.region_id = r.id
+                WHERE r.status = 'sent_to_miners'
+                AND r.target_time <= :scoring_time
+                GROUP BY r.id
+                ORDER BY r.target_time ASC
+                """,
+                {"scoring_time": scoring_time}
+            )
+            return result
 
         except Exception as e:
             logger.error(f"Error fetching pending tasks: {str(e)}")
