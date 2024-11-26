@@ -61,8 +61,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         """
         Provide a database session/connection.
         """
-        async with self.async_session() as session:
-            yield session
+        return self.async_session()
 
     @BaseDatabaseManager.with_transaction
     async def initialize_database(self, session):
