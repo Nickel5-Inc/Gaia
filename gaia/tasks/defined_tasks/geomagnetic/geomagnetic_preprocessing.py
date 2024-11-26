@@ -71,16 +71,15 @@ class GeomagneticPreprocessing(Preprocessing):
             if not isinstance(data, pd.DataFrame):
                 raise ValueError("Input must be a pandas DataFrame")
             
-            # Create a copy to avoid modifying the original
+            # Create a copy and convert timestamp to naive UTC datetime
             processed_df = data.copy()
+            processed_df['timestamp'] = pd.to_datetime(processed_df['timestamp']).dt.tz_convert('UTC').dt.tz_localize(None)
             
-            # Add historical context - create synthetic data points for the past few hours
-            current_timestamp = pd.to_datetime(processed_df['timestamp'].iloc[-1])
-            if current_timestamp.tzinfo:
-                current_timestamp = current_timestamp.tz_convert('UTC').tz_localize(None)
+            # Get current values (now in naive UTC)
+            current_timestamp = processed_df['timestamp'].iloc[-1]
             current_value = processed_df['value'].iloc[-1]
             
-            # Create historical points (last 3 hours)
+            # Create historical points (last 3 hours) - already in naive UTC
             historical_data = []
             for i in range(1, 4):
                 historical_data.append({
@@ -91,9 +90,6 @@ class GeomagneticPreprocessing(Preprocessing):
             # Combine historical and current data
             historical_df = pd.DataFrame(historical_data)
             processed_df = pd.concat([historical_df, processed_df], ignore_index=True)
-            
-            # Convert timestamps to naive datetime (remove timezone while preserving UTC time)
-            processed_df['timestamp'] = pd.to_datetime(processed_df['timestamp']).dt.tz_localize(None)
             
             # Normalize values
             processed_df['value'] = processed_df['value'] / 100.0
