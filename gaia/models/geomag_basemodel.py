@@ -97,6 +97,9 @@ class GeoMagBaseModel:
             if self._is_fallback:
                 result = self.model.predict(data)
             else:
+                #retrain on latest data
+                self.model.train(data)
+                #make prediction
                 result = self.model.forecast(data)
                 
             # Convert any numpy/tensor types to Python float
