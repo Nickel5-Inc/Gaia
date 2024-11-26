@@ -1,6 +1,7 @@
 from gaia.tasks.base.components.preprocessing import Preprocessing
 from datetime import datetime, timezone, date
 from huggingface_hub import hf_hub_download
+from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.defined_tasks.soilmoisture.utils.region_selection import (
     select_random_region,
 )
@@ -8,13 +9,14 @@ from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import get_soil_data
 import json
 from typing import Dict, Optional, List
 import os
-
+from sqlalchemy import text
 
 class SoilValidatorPreprocessing(Preprocessing):
     """Handles region selection and data collection for soil moisture task."""
 
     def __init__(self):
         super().__init__()
+        self.db = ValidatorDatabaseManager()
         self._h3_data = self._load_h3_map()
         self._base_cells = [
             {"index": cell["index"], "resolution": cell["resolution"]}
@@ -27,7 +29,7 @@ class SoilValidatorPreprocessing(Preprocessing):
             cell["index"] for cell in self._h3_data["lakes_overlay_cells"]
         )
         self._daily_regions = {}
-        self.max_daily_regions = 10
+        self.max_daily_regions = 2
 
     def _load_h3_map(self):
         """Load H3 map data, first checking locally then from HuggingFace."""
@@ -75,52 +77,90 @@ class SoilValidatorPreprocessing(Preprocessing):
 
     async def store_region(self, region: Dict, target_time: datetime) -> int:
         """Store region data in database."""
+        # Read the tiff file into bytes
+        with open(region["combined_data"], 'rb') as f:
+            combined_data_bytes = f.read()
+        
+        sentinel_bounds = [float(x) for x in region["sentinel_bounds"]]
+        sentinel_crs = int(str(region["sentinel_crs"]).split(':')[-1])
+        
         data = {
             "region_date": target_time.date(),
             "target_time": target_time,
             "bbox": json.dumps(region["bbox"]),
-            "combined_data": region["combined_data"],
-            "sentinel_bounds": region["sentinel_bounds"],
-            "sentinel_crs": region["sentinel_crs"],
+            "combined_data": combined_data_bytes,
+            "sentinel_bounds": sentinel_bounds,
+            "sentinel_crs": sentinel_crs,
             "array_shape": region["array_shape"],
             "status": "pending",
         }
-        region_id = await self.db.store_task_data("soil_moisture_regions", data)
 
-        async with self.db.get_connection() as conn:
-            await conn.execute(
-                """
-                UPDATE soil_moisture_regions 
-                SET status = 'sent_to_miners'
-                WHERE id = $1
-            """,
-                region_id,
+        conn = await self.db.get_connection()
+        try:
+            result = await conn.execute(
+                text("""
+                    INSERT INTO soil_moisture_regions 
+                    (region_date, target_time, bbox, combined_data, 
+                     sentinel_bounds, sentinel_crs, array_shape, status)
+                    VALUES (:region_date, :target_time, :bbox, :combined_data, 
+                            :sentinel_bounds, :sentinel_crs, :array_shape, :status)
+                    RETURNING id
+                """), 
+                data
             )
+            region_id = result.scalar_one()
+            
+            await conn.execute(
+                text("""
+                    UPDATE soil_moisture_regions 
+                    SET status = 'sent_to_miners'
+                    WHERE id = :id
+                """), 
+                {"id": region_id}
+            )
+            
+            await conn.commit()
+            return region_id
+        finally:
+            await conn.close()
 
-        return region_id
-
-    async def get_daily_regions(self, target_time: datetime) -> List[Dict]:
-        """Get and store daily regions."""
+    async def get_daily_regions(
+        self, target_time: datetime, ifs_forecast_time: datetime
+    ) -> List[Dict]:
+        """Get regions for today, selecting new ones if needed."""
         regions = []
         today = date.today()
         count = self._daily_regions.get(today, 0)
 
         while self._can_select_region():
             try:
-                bbox = select_random_region(self._h3_data)
-                soil_data = self.get_soil_data(bbox, target_time)
+                bbox = select_random_region(
+                    base_cells=self._base_cells,
+                    urban_cells_set=self._urban_cells,
+                    lakes_cells_set=self._lakes_cells
+                )
+                soil_data = self.get_soil_data(bbox, ifs_forecast_time)
 
                 if soil_data is not None:
-                    region_data = {"datetime": target_time, "bbox": bbox, **soil_data}
+                    tiff_path, bounds, crs = soil_data
+                    region_data = {
+                        "datetime": target_time,
+                        "bbox": bbox,
+                        "combined_data": tiff_path,
+                        "sentinel_bounds": bounds,
+                        "sentinel_crs": crs,
+                        "array_shape": (222, 222)
+                    }
                     region_id = await self.store_region(region_data, target_time)
                     region_data["id"] = region_id
                     regions.append(region_data)
+                    count += 1
+                    self._daily_regions[today] = count
 
             except Exception as e:
                 print(f"Error processing region: {str(e)}")
                 continue
 
-        self._daily_regions[today] = count + len(regions)
         return regions
 
     def _update_daily_count(self, date: date) -> None:
