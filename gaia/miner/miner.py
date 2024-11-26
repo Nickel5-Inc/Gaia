@@ -95,7 +95,7 @@ Verification Result: {verify_result}
             
             self.logger.info("Starting miner server...")
             app = server.factory_app(debug=True)
-            app.include_router(factory_router())
+            app.include_router(factory_router(self))
 
             if os.getenv("ENV", "dev").lower() == "dev":
                 configure_extra_logging_middleware(app)

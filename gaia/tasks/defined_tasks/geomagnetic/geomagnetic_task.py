@@ -394,7 +394,7 @@ class GeomagneticTask(Task):
             logger.error(f"Error during model inference: {e}")
             return float(processed_data['value'].iloc[-1])  # Return input value as fallback
 
-    def miner_execute(self, data=None):
+    def miner_execute(self, miner,data=None):
         """
         Executes the miner workflow:
         - Preprocesses the received data along with historical data.
@@ -433,7 +433,7 @@ class GeomagneticTask(Task):
             return {
                 "predicted_values": float(predictions),
                 "timestamp": data['data']['timestamp'],
-                "miner_hotkey": f"{self.wallet.hotkey.ss58_address}"  # Use the actual miner's hotkey address   
+                "miner_hotkey": f"{miner.wallet.hotkey.ss58_address}"  # Use the actual miner's hotkey address   
             }
 
         except Exception as e:
