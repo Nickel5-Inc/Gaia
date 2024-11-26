@@ -12,7 +12,7 @@ from fiber.logging_utils import get_logger
 from fiber.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
 from substrateinterface import SubstrateInterface
-#from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
 from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from argparse import ArgumentParser
@@ -209,7 +209,8 @@ class GaiaValidator:
         while True:
             try:
                 # Update current block
-                self.current_block = self.substrate.get_block().header.number
+                block = self.substrate.get_block()
+                self.current_block = block['header']['number']
                 
                 # Calculate blocks until next scoring round (aligns to 300 blocks, no offset)
                 blocks_until_scoring = 300 - (self.current_block % 300)
@@ -290,7 +291,8 @@ class GaiaValidator:
                 
                 # Try to get current block, handle connection errors
                 try:
-                    current_block = self.substrate.get_block().header.number
+                    block = self.substrate.get_block()
+                    current_block = block['header']['number']
                     blocks_since_weights = current_block - self.last_set_weights_block
                 except Exception as block_error:
                     logger.error(f"Failed to get current block: {block_error}")
