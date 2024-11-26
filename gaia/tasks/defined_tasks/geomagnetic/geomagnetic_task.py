@@ -16,6 +16,8 @@ from gaia.tasks.defined_tasks.geomagnetic.utils.process_geomag_data import (
     get_latest_geomag_data,
 )
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.models.geomag_basemodel import GeoMagBaseModel
+import torch
 import datetime
 import numpy as np
 import pandas as pd
@@ -76,8 +78,16 @@ class GeomagneticTask(Task):
             scoring_mechanism=GeomagneticScoringMechanism(),
             **data
         )
+        self.model = GeoMagBaseModel()  # Initialize GeoMagBaseModel instance
         if db_manager:
             self.db_manager = db_manager
+
+        # Log whether the fallback model is being used
+        if self.model.is_fallback:
+            logger.warning("Using fallback GeoMag model for predictions.")
+        else:
+            logger.info("Using Hugging Face GeoMag model for predictions.")
+
 
     def miner_preprocess(self, raw_data):
         """
@@ -363,6 +373,31 @@ class GeomagneticTask(Task):
     # Miner execution method
     ############################################################
 
+    def run_model_inference(self, processed_data):
+        """
+        Run the GeoMag model inference.
+
+        Args:
+            processed_data (dict): Preprocessed input data for the model.
+
+        Returns:
+            float: Predicted value.
+        """
+        try:
+            # Prepare input tensor for the model
+            input_tensor = torch.tensor(
+                [[processed_data['value']]], dtype=torch.float32
+            ).unsqueeze(0)  # Add batch and time dimensions
+
+            # Perform prediction using the model
+            prediction = self.model.predict(input_tensor)
+
+            # Extract the prediction (convert tensor to float)
+            return prediction.item()
+        except Exception as e:
+            logger.error(f"Error during model inference: {e}")
+            return float("nan")  # Return NaN on failure
+
     def miner_execute(self, data=None):
         """
         Executes the miner workflow: preprocesses data, runs model inference,
@@ -382,12 +417,12 @@ class GeomagneticTask(Task):
 
             # Run model inference
             predictions = self.run_model_inference(processed_data)
-            
+
             # Format response according to MINER.md requirements
             return {
                 "predicted_values": float(predictions),
                 "timestamp": input_data['timestamp'],
-                "miner_id": "your_miner_id_here"  # Add proper miner ID
+                "miner_id": "your_miner_id_here"  # Replace with actual miner ID logic
             }
 
         except Exception as e:
