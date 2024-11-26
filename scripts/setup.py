@@ -15,6 +15,7 @@ def install_system_dependencies():
     """Install system-level dependencies"""
     commands = [
         "sudo apt-get update",
+        "sudo apt-get install -y curl",
         "sudo apt-get install -y postgresql postgresql-contrib",
         "sudo apt-get install -y python3-dev libpq-dev",
         "sudo apt-get install -y gdal-bin",

@@ -103,12 +103,10 @@ class SoilMoistureTask(Task):
                     try:
                         task_data = {
                             'region_id': region['id'],
-                            'data_collection_time': current_time,
-                            'ifs_forecast_time': ifs_forecast_time,
-                            'target_prediction_time': next_smap_time,
                             'combined_data': region['combined_data'],
-                            'sentinel_bounds': region['sentinel_bounds'],
-                            'sentinel_crs': region['sentinel_crs']
+                            'sentinel_bounds': [float(x) for x in region['sentinel_bounds']],
+                            'sentinel_crs': int(str(region['sentinel_crs']).split(':')[-1]),
+                            'target_time': next_smap_time
                         }
 
                         payload = {
@@ -118,7 +116,7 @@ class SoilMoistureTask(Task):
 
                         responses = await validator.query_miners(
                             payload=payload,
-                            endpoint="/soilmoisture"
+                            endpoint="/soilmoisture-request"
                         )
 
                         if responses:
