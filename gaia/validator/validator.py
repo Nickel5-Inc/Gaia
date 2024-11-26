@@ -38,6 +38,25 @@ class GaiaValidator:
         self.last_set_weights_block = 0
         self.current_block = 0
         
+        self.httpx_client = httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            verify=False,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30,
+            ),
+            transport=httpx.AsyncHTTPTransport(
+                retries=3,
+                pool_limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=20,
+                    keepalive_expiry=30,
+                ),
+            ),
+        )
+        
     def setup_neuron(self) -> bool:
         """
         Set up the neuron with necessary configurations and connections.
@@ -98,7 +117,7 @@ class GaiaValidator:
         if payload and isinstance(payload, dict):
             try:
                 # Use custom serializer for JSON dumps
-                payload = json.loads(json.dumps(payload, default=self.serialize_datetime))
+                payload = json.loads(json.dumps(payload, default=self.custom_serializer))
             except Exception as e:
                 logger.error(f"Error serializing payload: {e}")
                 return responses
@@ -191,7 +210,7 @@ class GaiaValidator:
             try:
                 # Execute tasks in parallel
                 workers = [
-                    asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
+                    #asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
                     asyncio.create_task(self.soil_task.validator_execute(self)),
                     asyncio.create_task(self.status_logger()),
                     asyncio.create_task(self.main_scoring()),  # Add scoring task
@@ -319,10 +338,12 @@ class GaiaValidator:
             finally:
                 await asyncio.sleep(60)  # Sleep at the end to ensure we always get the interval
     
-    def serialize_datetime(self, obj):
-        """Custom JSON serializer for handling datetime objects."""
+    def custom_serializer(self, obj):
+        """Custom JSON serializer for handling datetime objects and bytes."""
         if isinstance(obj, (pd.Timestamp, datetime.datetime)):
             return obj.isoformat()
+        elif isinstance(obj, bytes):
+            return obj.hex()  # Convert bytes to hex string representation
         raise TypeError(f"Type {type(obj)} not serializable")
     
     async def update_miner_table(self):

@@ -116,14 +116,7 @@ class SoilValidatorPreprocessing(Preprocessing):
             )
             region_id = result.scalar_one()
             
-            await conn.execute(
-                text("""
-                    UPDATE soil_moisture_regions 
-                    SET status = 'sent_to_miners'
-                    WHERE id = :id
-                """), 
-                {"id": region_id}
-            )
+
             
             await conn.commit()
             return region_id

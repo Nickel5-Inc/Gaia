@@ -1,5 +1,5 @@
 from functools import partial  # Add this line at the top of your file
-from fastapi import Depends
+from fastapi import Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRouter
 from pydantic import BaseModel
@@ -12,6 +12,11 @@ from datetime import datetime, timezone
 from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import SoilMoisturePayload
 from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
 from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoisturePrediction
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+
+# Define max request size (5MB in bytes)
+MAX_REQUEST_SIZE = 5 * 1024 * 1024  # 5MB
 
 logger = get_logger(__name__)
 
@@ -34,6 +39,18 @@ class SoilmoistureRequest(BaseModel):
 def factory_router(miner_instance) -> APIRouter:
     """Create router with miner instance available to route handlers."""
     router = APIRouter()
+    
+    # Add middleware for request size
+    @router.middleware("http")
+    async def validate_request_size(request: Request, call_next):
+        if request.headers.get("content-length"):
+            content_length = int(request.headers["content-length"])
+            if content_length > MAX_REQUEST_SIZE:
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": "Request too large"}
+                )
+        return await call_next(request)
 
     async def geomagnetic_require(
         decrypted_payload: GeomagneticRequest = Depends(
