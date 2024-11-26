@@ -33,12 +33,10 @@ eth-utils==2.3.2
 exceptiongroup==1.2.2
 executing==2.1.0
 fastapi==0.112.0
-fiber @ git+https://github.com/rayonlabs/fiber.git@199d6432b748c2a93c3ee0c34db72418b19c6d7f
 filelock==3.16.1
 fonttools==4.55.0
 frozenlist==1.5.0
 fsspec==2024.10.0
--e git+https://github.com/Nickel5-Inc/Gaia.git@3708534bc2136b7f0777242cadd406aa43e37e73#egg=gaia
 h11==0.14.0
 h3==4.1.2
 httpcore==1.0.6
@@ -111,7 +109,6 @@ SQLAlchemy==2.0.36
 stack-data==0.6.3
 starlette==0.37.2
 substrate-interface==1.7.10
-substrateinterface==1.0.0
 sympy==1.13.1
 tenacity==9.0.0
 tifffile==2024.9.20
@@ -131,3 +128,6 @@ websocket-client==1.8.0
 xarray==2024.7.0
 xxhash==3.5.0
 yarl==1.17.2
+
+
+

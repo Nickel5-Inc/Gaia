@@ -17,20 +17,14 @@ from fiber.logging_utils import get_logger
 from uuid import uuid4
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from sqlalchemy import text
+from gaia.models.soil_moisture_basemodel import SoilModel
+import traceback
 
 logger = get_logger(__name__)
 
 class SoilMoistureTask(Task):
     """Task for soil moisture prediction using satellite and weather data."""
 
-    validator_preprocessing: SoilValidatorPreprocessing = Field(
-        default_factory=SoilValidatorPreprocessing,
-        description="Preprocessing component for validator",
-    )
-    miner_preprocessing: SoilMinerPreprocessing = Field(
-        default_factory=SoilMinerPreprocessing,
-        description="Preprocessing component for miner",
-    )
     prediction_horizon: timedelta = Field(
         default_factory=lambda: timedelta(hours=6),
         description="Prediction horizon for the task",
@@ -40,20 +34,31 @@ class SoilMoistureTask(Task):
         description="Delay before scoring due to SMAP data latency",
     )
 
-    def __init__(self):
+    validator_preprocessing: Optional[SoilValidatorPreprocessing] = None
+    miner_preprocessing: Optional[SoilMinerPreprocessing] = None
+    model: Optional[SoilModel] = None
+
+    def __init__(self, db_manager=None, node_type=None, **data):
         super().__init__(
             name="SoilMoistureTask",
-            description="Soil moisture prediction from satellite/weather data",
+            description="Soil moisture prediction task",
             task_type="atomic",
             metadata=SoilMoistureMetadata(),
             inputs=SoilMoistureInputs(),
             outputs=SoilMoistureOutputs(),
             scoring_mechanism=SoilScoringMechanism(),
+            **data
         )
 
-        self.miner_preprocessing = SoilMinerPreprocessing()
-        self.validator_preprocessing = SoilValidatorPreprocessing()
-        self.db = ValidatorDatabaseManager()
+        if node_type == "validator":
+            self.validator_preprocessing = SoilValidatorPreprocessing()
+            self.db = ValidatorDatabaseManager() if not db_manager else db_manager
+            logger.info("Initialized validator components for SoilMoistureTask")
+            
+        elif node_type == "miner":
+            self.miner_preprocessing = SoilMinerPreprocessing()
+            self.model = SoilModel()
+            logger.info("Initialized miner components for SoilMoistureTask")
 
     def get_next_valid_time(self, current_time: datetime) -> datetime:
         """Get next valid SMAP measurement time."""
@@ -162,22 +167,21 @@ class SoilMoistureTask(Task):
             logger.error(f"Error getting today's regions: {str(e)}")
             return []
 
-    def miner_execute(self, data):
+    def miner_execute(self, data, miner):
         """Execute miner workflow."""
         try:
-            processed_data = self.miner_preprocessing.process_miner_data(data)
+            processed_data = self.miner_preprocessing.process_miner_data(data['data'])
             predictions = self.run_model_inference(processed_data)
 
             return {
-                "surface_sm": predictions["surface"],
-                "rootzone_sm": predictions["rootzone"],
-                "uncertainty_surface": predictions.get(
-                    "uncertainty", None
-                ),  # TODO: seperate surface and rootzone uncertainty
+                "surface_sm": float(predictions["surface"]),
+                "rootzone_sm": float(predictions["rootzone"]),
+                "miner_hotkey": miner.keypair.ss58_address
             }
 
         except Exception as e:
             logger.error(f"Error in miner execution: {str(e)}")
+            logger.error(f'{traceback.format_exc()}')
             return None
 
     def score_predictions(self, predictions: Dict, ground_truth: Dict) -> Dict:
@@ -320,3 +324,10 @@ class SoilMoistureTask(Task):
             List[Dict]: List of subtasks
         """
         pass
+
+    def run_model_inference(self, processed_data):
+        """Run model inference on processed data."""
+        if not self.model:
+            raise RuntimeError("Model not initialized. Are you running on a miner node?")
+            
+        return self.miner_preprocessing.predict_smap(processed_data, self.model)
