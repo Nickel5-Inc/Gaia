@@ -76,6 +76,8 @@ class GeomagneticPreprocessing(Preprocessing):
             
             # Add historical context - create synthetic data points for the past few hours
             current_timestamp = pd.to_datetime(processed_df['timestamp'].iloc[-1])
+            if current_timestamp.tzinfo:
+                current_timestamp = current_timestamp.tz_convert('UTC').tz_localize(None)
             current_value = processed_df['value'].iloc[-1]
             
             # Create historical points (last 3 hours)
@@ -90,6 +92,9 @@ class GeomagneticPreprocessing(Preprocessing):
             historical_df = pd.DataFrame(historical_data)
             processed_df = pd.concat([historical_df, processed_df], ignore_index=True)
             
+            # Convert timestamps to naive datetime (remove timezone while preserving UTC time)
+            processed_df['timestamp'] = pd.to_datetime(processed_df['timestamp']).dt.tz_localize(None)
+            
             # Normalize values
             processed_df['value'] = processed_df['value'] / 100.0
             
@@ -98,9 +103,6 @@ class GeomagneticPreprocessing(Preprocessing):
                 'timestamp': 'ds',
                 'value': 'y'
             })
-            
-            # Ensure timestamp is datetime
-            processed_df['ds'] = pd.to_datetime(processed_df['ds'])
             
             # Sort by timestamp
             processed_df = processed_df.sort_values('ds')
