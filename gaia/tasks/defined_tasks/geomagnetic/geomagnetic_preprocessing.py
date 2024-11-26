@@ -71,10 +71,20 @@ class GeomagneticPreprocessing(Preprocessing):
             if not isinstance(data, pd.DataFrame):
                 raise ValueError("Input must be a pandas DataFrame")
             
-            # Normalize values and ensure timestamp is datetime
+            # Create a copy to avoid modifying the original
             processed_df = data.copy()
-            processed_df['value'] = processed_df['value'] / 100.0  # Normalize values
-            processed_df['timestamp'] = pd.to_datetime(processed_df['timestamp'])
+            
+            # Normalize values
+            processed_df['value'] = processed_df['value'] / 100.0
+            
+            # Rename columns to match Prophet requirements
+            processed_df = processed_df.rename(columns={
+                'timestamp': 'ds',
+                'value': 'y'
+            })
+            
+            # Ensure timestamp is datetime
+            processed_df['ds'] = pd.to_datetime(processed_df['ds'])
             
             return processed_df
             
