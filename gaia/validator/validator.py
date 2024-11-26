@@ -12,7 +12,7 @@ from fiber.logging_utils import get_logger
 from fiber.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
 from substrateinterface import SubstrateInterface
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
+#from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
 from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from argparse import ArgumentParser
@@ -31,8 +31,8 @@ class GaiaValidator:
         self.metagraph = None
         self.config = None
         self.database_manager = ValidatorDatabaseManager()
-        self.soil_task = SoilMoistureTask()
-        self.geomagnetic_task = GeomagneticTask()  # Initialize GeomagneticTask
+        self.soil_task = SoilMoistureTask(node_type="validator")
+       # self.geomagnetic_task = GeomagneticTask()  # Initialize GeomagneticTask
 
     def setup_neuron(self) -> bool:
         """
@@ -178,8 +178,8 @@ class GaiaValidator:
             try:
                 # Execute tasks in parallel
                 workers = [
-                    asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
-                    #asyncio.create_task(self.soil_task.validator_execute(self)),
+                    #asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
+                    asyncio.create_task(self.soil_task.validator_execute(self)),
                     asyncio.create_task(self.status_logger()),
                 ]
 
