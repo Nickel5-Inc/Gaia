@@ -1,3 +1,4 @@
+import traceback
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
@@ -104,7 +105,13 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             text("CREATE INDEX IF NOT EXISTS idx_process_queue_priority ON process_queue(priority)")
         )
 
-        # Load schemas
+        # Create miner table
+        await self.create_miner_table()
+
+        # Create score table
+        await self.create_score_table()
+
+        # Load schemas and initialize task tables
         task_schemas = await self.load_task_schemas()
         await self.initialize_task_tables(task_schemas)
 
@@ -271,4 +278,199 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             status VARCHAR(50) DEFAULT 'pending' -- pending, completed
         )
         """
-        await self.execute(text(query))
+        await self.execute(query)
+
+    async def _create_node_table(self):
+        """Create the base node table."""
+        sql = """
+        CREATE TABLE IF NOT EXISTS node_table (
+            uid INTEGER PRIMARY KEY,
+            hotkey TEXT,
+            coldkey TEXT,
+            ip TEXT,
+            ip_type TEXT,
+            port INTEGER,
+            incentive FLOAT,
+            stake FLOAT,
+            trust FLOAT,
+            vtrust FLOAT,
+            protocol TEXT,
+            last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            CHECK (uid >= 0 AND uid < 256)
+        );
+        """
+        await self.execute(sql)
+
+    async def _create_trigger_function(self):
+        """Create the trigger function for size checking."""
+        sql = """
+        CREATE OR REPLACE FUNCTION check_node_table_size()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF (SELECT COUNT(*) FROM node_table) > 256 THEN
+                RAISE EXCEPTION 'Cannot exceed 256 rows in node_table';
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+        await self.execute(sql)
+
+    async def _create_trigger(self):
+        """Create the trigger for enforcing table size."""
+        # First drop the existing trigger if it exists
+        drop_trigger = """
+        DROP TRIGGER IF EXISTS enforce_node_table_size ON node_table;
+        """
+        await self.execute(drop_trigger)
+
+        # Then create the new trigger
+        create_trigger = """
+        CREATE TRIGGER enforce_node_table_size
+        BEFORE INSERT ON node_table
+        EXECUTE FUNCTION check_node_table_size();
+        """
+        await self.execute(create_trigger)
+
+    async def _initialize_rows(self):
+        """Initialize the table with 256 empty rows."""
+        sql = """
+        INSERT INTO node_table (uid)
+        SELECT generate_series(0, 255) as uid
+        WHERE NOT EXISTS (SELECT 1 FROM node_table LIMIT 1);
+        """
+        await self.execute(sql)
+
+    async def create_miner_table(self):
+        """
+        Create a table for storing miner information with exactly 256 rows.
+        Initially all rows are null except for an ID column that serves as the index.
+        """
+        try:
+            await self._create_node_table()
+            await self._create_trigger_function()
+            await self._create_trigger()
+            await self._initialize_rows()
+            
+        except Exception as e:
+            logger.error(f"Error creating miner table: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+    async def update_miner_info(
+        self, 
+        index: int, 
+        hotkey: str, 
+        coldkey: str,
+        ip: str = None,
+        ip_type: str = None,
+        port: int = None,
+        incentive: float = None,
+        stake: float = None,
+        trust: float = None,
+        vtrust: float = None,
+        protocol: str = None
+    ):
+        """
+        Update miner information at a specific index.
+        
+        Args:
+            index (int): Index in the table (0-255)
+            hotkey (str): Miner's hotkey
+            coldkey (str): Miner's coldkey
+            ip (str, optional): Miner's IP address
+            ip_type (str, optional): Type of IP address
+            port (int, optional): Port number
+            incentive (float, optional): Miner's incentive
+            stake (float, optional): Miner's stake
+            trust (float, optional): Miner's trust score
+            vtrust (float, optional): Miner's vtrust score
+            protocol (str, optional): Protocol used
+        """
+        query = """
+        UPDATE node_table 
+        SET 
+            hotkey = :hotkey,
+            coldkey = :coldkey,
+            ip = :ip,
+            ip_type = :ip_type,
+            port = :port,
+            incentive = :incentive,
+            stake = :stake,
+            trust = :trust,
+            vtrust = :vtrust,
+            protocol = :protocol,
+            last_updated = CURRENT_TIMESTAMP
+        WHERE uid = :index
+        """
+        params = {
+            "index": index,
+            "hotkey": hotkey,
+            "coldkey": coldkey,
+            "ip": ip,
+            "ip_type": ip_type,
+            "port": port,
+            "incentive": incentive,
+            "stake": stake,
+            "trust": trust,
+            "vtrust": vtrust,
+            "protocol": protocol
+        }
+        await self.execute(query, params)
+
+    async def clear_miner_info(self, index: int):
+        """
+        Clear miner information at a specific index, setting values back to NULL.
+        
+        Args:
+            index (int): Index in the table (0-255)
+        """
+        query = """
+        UPDATE node_table 
+        SET 
+            hotkey = NULL,
+            coldkey = NULL,
+            ip = NULL,
+            ip_type = NULL,
+            port = NULL,
+            incentive = NULL,
+            stake = NULL,
+            trust = NULL,
+            vtrust = NULL,
+            protocol = NULL,
+            last_updated = CURRENT_TIMESTAMP
+        WHERE uid = :index
+        """
+        await self.execute(query, {"index": index})
+
+    async def get_miner_info(self, index: int):
+        """
+        Get miner information for a specific index.
+        
+        Args:
+            index (int): Index in the table (0-255)
+            
+        Returns:
+            dict: Miner information or None if not found
+        """
+        query = """
+        SELECT * FROM node_table 
+        WHERE uid = :index
+        """
+        result = await self.fetch_one(query, {"index": index})
+        return dict(result) if result else None
+
+    async def get_all_active_miners(self):
+        """
+        Get information for all miners with non-null hotkeys.
+        
+        Returns:
+            list[dict]: List of active miner information
+        """
+        query = """
+        SELECT * FROM node_table 
+        WHERE hotkey IS NOT NULL
+        ORDER BY uid
+        """
+        results = await self.fetch_many(query)
+        return [dict(row) for row in results]

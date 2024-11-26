@@ -56,7 +56,7 @@ async def geomagnetic_require(
         result = {
             "predicted_values": 0.0,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "miner_id": "error_fallback"
+            "miner_hotkey": "error_fallback"
         }
     
     return JSONResponse(content=result)

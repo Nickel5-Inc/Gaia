@@ -219,7 +219,7 @@ class GeomagneticTask(Task):
                             )
                         else:
                             logger.warning(f"No predicted value in response: {response_data}")
-                            
+                        
                     except json.JSONDecodeError as e:
                         logger.error(f"Failed to parse miner response as JSON: {e}")
                         continue
@@ -227,6 +227,7 @@ class GeomagneticTask(Task):
                         logger.error(f"Error processing miner response: {e}")
                         logger.error(f'{traceback.format_exc()}')
                         continue
+                logger.info(f"Added {len(responses)} predictions to the database")
 
                 # Step 6: Fetch Ground Truth for Current Hour
                 ground_truth_value = await self.fetch_ground_truth()
@@ -296,21 +297,30 @@ class GeomagneticTask(Task):
                 FROM geomagnetic_predictions
                 WHERE query_time >= :start_time AND query_time < :end_time AND status = 'pending';
             """
-            # Pass parameters as a dictionary instead of a tuple
             params = {"start_time": start_time, "end_time": end_time}
 
             results = await db_manager.fetch_many(query, params)
 
             # Convert results to a list of task dictionaries
-            tasks = [
-                {
-                    "id": row[0],
-                    "miner_id": row[1],
-                    "predicted_values": row[2],  # Assuming a single prediction per miner
-                    "query_time": row[3],
-                }
-                for row in results
-            ]
+            tasks = []
+            for row in results:
+                # Handle both tuple and dictionary results
+                if isinstance(row, (tuple, list)):
+                    task = {
+                        "id": row[0],
+                        "miner_id": row[1],
+                        "predicted_values": row[2],
+                        "query_time": row[3],
+                    }
+                else:
+                    # Assuming row is a dictionary-like object
+                    task = {
+                        "id": row['id'],
+                        "miner_id": row['miner_id'],
+                        "predicted_values": row['predicted_value'],
+                        "query_time": row['query_time'],
+                    }
+                tasks.append(task)
 
             logger.info(f"Fetched {len(tasks)} tasks between {start_time} and {end_time}")
             return tasks
@@ -444,7 +454,7 @@ class GeomagneticTask(Task):
             return {
                 "predicted_values": float(predictions),
                 "timestamp": data['data']['timestamp'],
-                "miner_id": "your_miner_id_here"  # Replace with actual miner ID logic
+                "miner_hotkey": f"{self.wallet.hotkey.ss58_address}"  # Use the actual miner's hotkey address   
             }
 
         except Exception as e:

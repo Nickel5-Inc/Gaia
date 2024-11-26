@@ -170,6 +170,10 @@ class GaiaValidator:
         )
         logger.info("HTTP client setup complete.")
 
+        logger.info("Updating miner table...")
+        await self.update_miner_table()
+        logger.info("Miner table updated.")
+
         while True:
             try:
                 # Execute tasks in parallel
@@ -195,6 +199,42 @@ class GaiaValidator:
         if isinstance(obj, (pd.Timestamp, datetime.datetime)):
             return obj.isoformat()
         raise TypeError(f"Type {type(obj)} not serializable")
+    
+    async def update_miner_table(self):
+        """Update the miner table with the latest miner information from the metagraph."""
+        try:
+            # Ensure metagraph is initialized
+            if self.metagraph is None:
+                logger.error("Metagraph not initialized")
+                return
+
+            # Sync metagraph to get latest node information
+            self.metagraph.sync_nodes()
+            logger.info(f"Synced {len(self.metagraph.nodes)} nodes from the network")
+
+            # Use enumerate to get the correct index for each node
+            for index, (hotkey, node) in enumerate(self.metagraph.nodes.items()):
+                await self.database_manager.update_miner_info(
+                    index=index,  # Use the enumerated index
+                    hotkey=node.hotkey,
+                    coldkey=node.coldkey,
+                    ip=node.ip,
+                    ip_type=str(node.ip_type),
+                    port=node.port,
+                    incentive=float(node.incentive),
+                    stake=float(node.stake),
+                    trust=float(node.trust),
+                    vtrust=float(node.vtrust),
+                    protocol=str(node.protocol)
+                )
+                logger.debug(f"Updated information for node {index}")
+
+            logger.info("Successfully updated miner table")
+
+        except Exception as e:
+            logger.error(f"Error updating miner table: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
 
 if __name__ == "__main__":
