@@ -80,9 +80,12 @@ class SoilValidatorPreprocessing(Preprocessing):
 
     async def store_region(self, region: Dict, target_time: datetime) -> int:
         """Store region data in database."""
+        logger.info(f"Storing region with bbox: {region['bbox']}")
+        
         # Read the tiff file into bytes
         with open(region["combined_data"], 'rb') as f:
             combined_data_bytes = f.read()
+            logger.info(f"Read TIFF file, size: {len(combined_data_bytes) / (1024 * 1024):.2f} MB")
         
         sentinel_bounds = [float(x) for x in region["sentinel_bounds"]]
         sentinel_crs = int(str(region["sentinel_crs"]).split(':')[-1])

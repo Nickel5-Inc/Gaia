@@ -94,31 +94,59 @@ class SoilMoistureTask(Task):
             ifs_forecast_time = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
             next_smap_time = ifs_forecast_time + timedelta(days=3)
 
-            logger.info(f"Using IFS forecast from: {ifs_forecast_time}")
-            logger.info(f"For prediction target: {next_smap_time}")
+            logger.info("=== Starting Validator Execute ===")
+            logger.info(f"IFS forecast time: {ifs_forecast_time}")
+            logger.info(f"Target SMAP time: {next_smap_time}")
 
-            regions = await self.validator_preprocessing.get_daily_regions(
+            # First get new regions and store them
+            logger.info("Calling get_daily_regions to collect and store new data...")
+            await self.validator_preprocessing.get_daily_regions(
                 target_time=next_smap_time,
                 ifs_forecast_time=ifs_forecast_time
             )
+            logger.info("Finished get_daily_regions call")
+
+            # Then pull pending regions from DB
+            logger.info("Fetching pending regions from database...")
+            regions = await self.db.fetch_many(
+                """
+                SELECT * FROM soil_moisture_regions 
+                WHERE status = 'pending'
+                """
+            )
+            logger.info(f"Found {len(regions) if regions else 0} pending regions in database")
 
             if regions:
-                logger.info(f"Selected {len(regions)} new regions")
                 for region in regions:
                     try:
+                        logger.info(f"Processing region {region['id']}")
+                        
+                        if 'combined_data' not in region:
+                            logger.error(f"Region {region['id']} missing combined_data field")
+                            continue
+                        
+                        if not region['combined_data']:
+                            logger.error(f"Region {region['id']} has null combined_data")
+                            continue
+
+                        logger.info(f"Region {region['id']} TIFF size: {len(region['combined_data']) / (1024 * 1024):.2f} MB")
+
                         task_data = {
                             'region_id': region['id'],
                             'combined_data': region['combined_data'],
-                            'sentinel_bounds': [float(x) for x in region['sentinel_bounds']],
-                            'sentinel_crs': int(str(region['sentinel_crs']).split(':')[-1]),
+                            'sentinel_bounds': region['sentinel_bounds'],
+                            'sentinel_crs': region['sentinel_crs'],
                             'target_time': next_smap_time
                         }
+
+                        logger.info(f"Payload TIFF size before sending: {len(task_data['combined_data']) / (1024 * 1024):.2f} MB")
 
                         payload = {
                             "nonce": str(uuid4()),
                             "data": task_data
                         }
 
+                        logger.info(f"Sending region {region['id']} to miners...")
                         responses = await validator.query_miners(
                             payload=payload,
                             endpoint="/soilmoisture-request"
