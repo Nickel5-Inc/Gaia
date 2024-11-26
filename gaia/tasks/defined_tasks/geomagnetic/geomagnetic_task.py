@@ -200,33 +200,12 @@ class GeomagneticTask(Task):
                 responses = await validator.query_miners(payload_template, endpoint)
                 logger.info(f"Collected responses from miners: {len(responses)}")
 
-                # Step 5: Store Predictions in Queue
+                # Step 5: Validate and Store Predictions in Queue
                 current_hour_start = next_hour.replace(
                     minute=0, second=0, microsecond=0
                 ) - datetime.timedelta(hours=1)
-                for response in responses:
-                    try:
-                        # Parse the string response into a dictionary
-                        response_data = json.loads(response)
-                        predicted_value = response_data.get("predicted_values")
-                        miner_id = response_data.get("miner_id")
-                        
-                        if predicted_value and miner_id:
-                            await self.add_prediction_to_queue(
-                                miner_id=miner_id,
-                                predicted_value=predicted_value,
-                                query_time=current_hour_start
-                            )
-                        else:
-                            logger.warning(f"No predicted value in response: {response_data}")
-                        
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Failed to parse miner response as JSON: {e}")
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error processing miner response: {e}")
-                        logger.error(f'{traceback.format_exc()}')
-                        continue
+                
+                await self.process_miner_responses(responses, current_hour_start)
                 logger.info(f"Added {len(responses)} predictions to the database")
 
                 # Step 6: Fetch Ground Truth for Current Hour
@@ -558,4 +537,50 @@ class GeomagneticTask(Task):
             logger.error(f"Error adding prediction to queue: {e}")
             logger.error(f'{traceback.format_exc()}')
             raise
+
+    async def process_miner_responses(self, responses: list, current_hour_start: datetime.datetime) -> None:
+        """
+        Process responses from miners and add valid predictions to the queue.
+
+        Args:
+            responses (list): List of JSON response strings from miners
+            current_hour_start (datetime.datetime): Start time of the current hour
+        """
+        for response in responses:
+            try:
+                # Parse the string response into a dictionary 
+                response_data = json.loads(response)
+                logger.debug(f"Received response from miner: {response_data}")
+                predicted_value = response_data.get("predicted_values")
+                miner_hotkey = response_data.get("miner_hotkey")
+                
+                # Validate the response
+
+                if predicted_value and miner_hotkey:
+                    await self.add_prediction_to_queue(
+
+                        miner_hotkey=miner_hotkey,
+                        predicted_value=predicted_value,
+                        query_time=current_hour_start
+                    )
+                else:
+                    logger.warning(f"No predicted value in response: {response_data}")
+                    
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse miner response as JSON: {e}")
+                continue
+            except Exception as e:
+                logger.error(f"Error processing miner response: {e}")
+                logger.error(f'{traceback.format_exc()}')
+                continue
+
+
+                    
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse miner response as JSON: {e}")
+                continue
+            except Exception as e:
+                logger.error(f"Error processing miner response: {e}")
+                logger.error(f'{traceback.format_exc()}')
+                continue
 
