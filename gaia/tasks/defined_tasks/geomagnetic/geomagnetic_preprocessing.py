@@ -64,7 +64,7 @@ class GeomagneticPreprocessing(Preprocessing):
                 - timestamp: UTC timestamp
                 - value: DST value
         Returns:
-            pd.DataFrame: Processed data ready for model input
+            pd.DataFrame: Processed data ready for model input with historical context
         """
         try:
             # Ensure data is a DataFrame
@@ -73,6 +73,22 @@ class GeomagneticPreprocessing(Preprocessing):
             
             # Create a copy to avoid modifying the original
             processed_df = data.copy()
+            
+            # Add historical context - create synthetic data points for the past few hours
+            current_timestamp = pd.to_datetime(processed_df['timestamp'].iloc[-1])
+            current_value = processed_df['value'].iloc[-1]
+            
+            # Create historical points (last 3 hours)
+            historical_data = []
+            for i in range(1, 4):
+                historical_data.append({
+                    'timestamp': current_timestamp - pd.Timedelta(hours=i),
+                    'value': current_value  # Use current value as a simple baseline
+                })
+            
+            # Combine historical and current data
+            historical_df = pd.DataFrame(historical_data)
+            processed_df = pd.concat([historical_df, processed_df], ignore_index=True)
             
             # Normalize values
             processed_df['value'] = processed_df['value'] / 100.0
@@ -85,6 +101,9 @@ class GeomagneticPreprocessing(Preprocessing):
             
             # Ensure timestamp is datetime
             processed_df['ds'] = pd.to_datetime(processed_df['ds'])
+            
+            # Sort by timestamp
+            processed_df = processed_df.sort_values('ds')
             
             return processed_df
             
