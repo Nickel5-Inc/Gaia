@@ -252,3 +252,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         async with self.engine.connect() as conn:
             async with conn.begin():
                 await conn.execute(text(create_index_query))
+
+    async def create_score_table(self):
+        """
+        Create a table for storing miner scores for all tasks.
+        """
+        

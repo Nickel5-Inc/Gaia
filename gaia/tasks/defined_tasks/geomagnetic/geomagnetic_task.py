@@ -66,6 +66,10 @@ class GeomagneticTask(Task):
         default_factory=GeomagneticPreprocessing,
         description="Preprocessing component for miner"
     )
+    model: GeoMagBaseModel = Field(
+        default_factory=GeoMagBaseModel,
+        description="The geomagnetic prediction model"
+    )
 
     def __init__(self, db_manager=None, **data):
         super().__init__(
@@ -78,7 +82,6 @@ class GeomagneticTask(Task):
             scoring_mechanism=GeomagneticScoringMechanism(),
             **data
         )
-        self.model = GeoMagBaseModel()  # Initialize GeoMagBaseModel instance
         if db_manager:
             self.db_manager = db_manager
 
