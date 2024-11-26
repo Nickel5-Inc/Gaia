@@ -184,8 +184,16 @@ class GeoMagBaseModel:
                 if hasattr(self.model, 'train'):
                     logger.info("Retraining model on latest data")
                     self.model.train(df)
-                # Pass only the DataFrame for forecasting
-                result = self.model.forecast(df)
+                
+                # Define the number of periods and frequency
+                periods = 1  # Forecasting the next hour
+                freq = 'h'    # Hourly frequency
+
+                # Call forecast with correct parameters
+                forecast = self.model.forecast(periods=periods, freq=freq)
+                
+                # Assuming the forecast method returns a DataFrame similar to Prophet's
+                result = forecast['yhat'].iloc[-1]
             
             # Convert result to Python float and handle invalid values
             if hasattr(result, 'item'):
@@ -203,5 +211,6 @@ class GeoMagBaseModel:
         except Exception as e:
             logger.error(f"Error during prediction: {e}")
             logger.error(f"traceback: {traceback.format_exc()}")
-            logger.error(f"Using input value as fallback: {data.get('value', 0.0) if isinstance(data, dict) else df['y'].iloc[-1] if 'df' in locals() else 0.0}")
-            return float(data.get('value', 0.0) if isinstance(data, dict) else df['y'].iloc[-1] if 'df' in locals() else 0.0)
+            fallback_value = data.get('value', 0.0) if isinstance(data, dict) else df['y'].iloc[-1] if 'df' in locals() else 0.0
+            logger.error(f"Using input value as fallback: {fallback_value}")
+            return float(fallback_value)
