@@ -72,6 +72,9 @@ class GaiaValidator:
             self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
             self.metagraph = Metagraph(substrate=self.substrate, netuid=self.netuid)
 
+            #print the entire set of environment variables
+            logger.info(f"{os.environ}")
+
             return True
         except Exception as e:
             logger.error(f"Error setting up neuron: {e}")

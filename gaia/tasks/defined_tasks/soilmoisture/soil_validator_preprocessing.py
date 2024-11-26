@@ -10,6 +10,9 @@ import json
 from typing import Dict, Optional, List
 import os
 from sqlalchemy import text
+from fiber.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 class SoilValidatorPreprocessing(Preprocessing):
     """Handles region selection and data collection for soil moisture task."""
@@ -40,7 +43,7 @@ class SoilValidatorPreprocessing(Preprocessing):
                 with open(local_path, "r") as f:
                     return json.load(f)
 
-            print("Local H3 map not found, downloading from HuggingFace...")
+            logger.info("Local H3 map not found, downloading from HuggingFace...")
             map_path = hf_hub_download(
                 repo_id="Nickel5HF/gaia_h3_mapping",
                 filename="full_h3_map.json",
@@ -51,8 +54,8 @@ class SoilValidatorPreprocessing(Preprocessing):
                 return json.load(f)
 
         except Exception as e:
-            print(f"Error accessing H3 map: {str(e)}")
-            print("Using fallback local map...")
+            logger.error(f"Error accessing H3 map: {str(e)}")
+            logger.info("Using fallback local map...")
             raise RuntimeError("No H3 map available")
 
     def _can_select_region(self) -> bool:
@@ -66,13 +69,13 @@ class SoilValidatorPreprocessing(Preprocessing):
         try:
             soil_data = get_soil_data(bbox=bbox, datetime_obj=current_time)
             if soil_data is None:
-                print(f"Failed to get soil data for region {bbox}")
+                logger.warning(f"Failed to get soil data for region {bbox}")
                 return None
 
             return soil_data
 
         except Exception as e:
-            print(f"Error collecting soil data: {str(e)}")
+            logger.error(f"Error collecting soil data: {str(e)}")
             return None
 
     async def store_region(self, region: Dict, target_time: datetime) -> int:
@@ -158,7 +161,7 @@ class SoilValidatorPreprocessing(Preprocessing):
                     self._daily_regions[today] = count
 
             except Exception as e:
-                print(f"Error processing region: {str(e)}")
+                logger.error(f"Error processing region: {str(e)}")
                 continue
 
         return regions

@@ -166,7 +166,7 @@ class SoilMoistureTask(Task):
                 )
                 return regions
         except Exception as e:
-            print(f"Error getting today's regions: {str(e)}")
+            logger.error(f"Error getting today's regions: {str(e)}")
             return []
 
     def miner_execute(self, data):
@@ -184,7 +184,7 @@ class SoilMoistureTask(Task):
             }
 
         except Exception as e:
-            print(f"Error in miner execution: {str(e)}")
+            logger.error(f"Error in miner execution: {str(e)}")
             return None
 
     def score_predictions(self, predictions: Dict, ground_truth: Dict) -> Dict:
@@ -224,7 +224,7 @@ class SoilMoistureTask(Task):
                 await self.add_task_to_queue(responses, task_data)
             return responses
         except Exception as e:
-            print(f"Error querying miners: {str(e)}")
+            logger.error(f"Error querying miners: {str(e)}")
             return None
 
     async def add_task_to_queue(self, predictions: Dict, metadata: Dict):
@@ -249,7 +249,7 @@ class SoilMoistureTask(Task):
                         pred.get("uncertainty_rootzone"),
                     )
         except Exception as e:
-            print(f"Error storing predictions: {str(e)}")
+            logger.error(f"Error storing predictions: {str(e)}")
             raise
 
     async def get_pending_tasks(self) -> List[Dict]:
@@ -332,7 +332,7 @@ class SoilMoistureTask(Task):
                 )
 
         except Exception as e:
-            print(f"Error moving task to history: {str(e)}")
+            logger.error(f"Error moving task to history: {str(e)}")
             raise
 
     async def validator_score(self, result=None):
