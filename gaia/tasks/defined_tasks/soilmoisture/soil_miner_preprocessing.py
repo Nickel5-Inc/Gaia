@@ -24,9 +24,9 @@ class SoilMinerPreprocessing(Preprocessing):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.preprocessor = SoilMoistureInferencePreprocessor()
 
-         self.model = self._load_model()
+        self.model = self._load_model()
 
-    def _load_model(self) -> SoilMoistureModel:
+    def _load_model(self) -> SoilModel:
          """Load model weights from local path or HuggingFace."""
          try:
              local_path = 'tasks/defined_tasks/soilmoisture/model.safetensors'
