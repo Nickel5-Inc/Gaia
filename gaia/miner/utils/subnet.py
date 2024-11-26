@@ -56,14 +56,14 @@ async def soilmoisture_require(
 def factory_router() -> APIRouter:
     router = APIRouter()
     router.add_api_route(
-        "/geomagnetic-request/",
+        "/geomagnetic-request",
         geomagnetic_require,
         tags=["Geomagnetic"],
         dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
         methods=["POST"],
     )
     router.add_api_route(
-        "/soilmoisture-request/",
+        "/soilmoisture-request",
         soilmoisture_require,
         tags=["Soilmoisture"],
         dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],

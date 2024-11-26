@@ -89,9 +89,9 @@ class GaiaValidator:
             # Construct base URL properly, ensuring endpoint is added to path not port
             base_url = f"https://{node.ip}:{node.port}"
             if endpoint:
-                # Remove any leading/trailing slashes from endpoint to avoid double slashes
-                endpoint = endpoint.strip('/')
-                base_url = f"{base_url}/{endpoint}"
+                
+                endpoint = endpoint
+                base_url = f"{base_url}"
 
             try:
                 symmetric_key_str, symmetric_key_uuid = await handshake.perform_handshake(
@@ -107,7 +107,9 @@ class GaiaValidator:
                     fernet = Fernet(symmetric_key_str)
 
                     logger.info(f"Sending payload to miner {miner_hotkey}: {payload}")
-                    
+                    logger.info(f"Base URL: {base_url}")
+                    logger.info(f"Endpoint: {endpoint}")
+                    logger.info(f"Final URL: {base_url}+{endpoint}")
                     resp = await vali_client.make_non_streamed_post(
                         httpx_client=self.httpx_client,
                         server_address=base_url,
