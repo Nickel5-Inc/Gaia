@@ -407,19 +407,31 @@ class GeomagneticTask(Task):
 
     def miner_execute(self, data=None):
         """
-        Executes the miner workflow: preprocesses data, runs model inference,
-        and returns predictions.
+        Executes the miner workflow:
+        - Preprocesses the received data along with historical data.
+        - Runs model inference.
+        - Returns formatted predictions.
         """
         try:
             # Extract data from the request payload
             if data and data.get('data'):
-                # Convert input data to DataFrame format as expected by the model
+                # Current data
                 input_data = pd.DataFrame({
                     'timestamp': [pd.to_datetime(data['data']['timestamp'])],
                     'value': [float(data['data']['value'])]
                 })
                 
-                processed_data = self.miner_preprocessing.process_miner_data(input_data)
+                # Check and process historical data
+                if data['data'].get('historical_values'):
+                    historical_df = pd.DataFrame(data['data']['historical_values'])
+                    historical_df['timestamp'] = pd.to_datetime(historical_df['timestamp'])
+                    historical_df = historical_df[['timestamp', 'value']]  # Ensure correct columns
+                    combined_df = pd.concat([historical_df, input_data], ignore_index=True)
+                else:
+                    combined_df = input_data
+                
+                # Preprocess combined data
+                processed_data = self.miner_preprocessing.process_miner_data(combined_df)
             else:
                 logger.error("No data provided in request")
                 return None

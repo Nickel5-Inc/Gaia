@@ -139,7 +139,15 @@ class GeoMagBaseModel:
         return self._is_fallback
     
     def predict(self, data) -> float:
-        """Make prediction using either HuggingFace or fallback model."""
+        """
+        Make prediction using either HuggingFace or fallback model.
+
+        Args:
+            data (pd.DataFrame): Processed geomagnetic data with historical context.
+
+        Returns:
+            float: Predicted DST value.
+        """
         try:
             # Ensure data is in the correct format
             if isinstance(data, pd.DataFrame):
