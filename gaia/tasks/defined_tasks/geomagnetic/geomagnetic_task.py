@@ -424,6 +424,7 @@ class GeomagneticTask(Task):
                 # Check and process historical data
                 if data['data'].get('historical_values'):
                     historical_df = pd.DataFrame(data['data']['historical_values'])
+                    historical_df = historical_df.rename(columns={'Dst': 'value'})  # Rename Dst to value
                     historical_df['timestamp'] = pd.to_datetime(historical_df['timestamp'])
                     historical_df = historical_df[['timestamp', 'value']]  # Ensure correct columns
                     combined_df = pd.concat([historical_df, input_data], ignore_index=True)

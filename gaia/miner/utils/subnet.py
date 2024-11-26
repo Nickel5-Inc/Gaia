@@ -20,7 +20,7 @@ class DataModel(BaseModel):
     name: str
     timestamp: str
     value: float
-    historical_values: list[float] | None = None
+    historical_values: list[dict] | None = None
 
 
 class GeomagneticRequest(BaseModel):
