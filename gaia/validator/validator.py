@@ -173,8 +173,8 @@ class GaiaValidator:
             try:
                 # Execute tasks in parallel
                 workers = [
-                    asyncio.create_task(self.soil_task.validator_execute()),
                     asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
+                    #asyncio.create_task(self.soil_task.validator_execute()),
                     asyncio.create_task(self.status_logger()),
                 ]
 

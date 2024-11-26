@@ -179,10 +179,11 @@ class GeomagneticTask(Task):
                         # Parse the string response into a dictionary
                         response_data = json.loads(response)
                         predicted_value = response_data.get("predicted_values")
+                        miner_id = response_data.get("miner_id")
                         
-                        if predicted_value is not None:
+                        if predicted_value and miner_id:
                             await self.add_prediction_to_queue(
-                                miner_id=response_data.get("miner_id", "unknown"),  # Get miner_id from response or use "unknown"
+                                miner_id=miner_id,
                                 predicted_value=predicted_value,
                                 query_time=current_hour_start
                             )
@@ -363,12 +364,18 @@ class GeomagneticTask(Task):
 
             # Step 2: Run model inference
             predictions = self.run_model_inference(processed_data)
+            logger.info(f"Miner execution completed successfully at {query_time}")
 
             # Step 3: Add predictions to the task queue
-            query_time = datetime.datetime.utcnow()
-            self.add_task_to_queue(predictions, query_time)
+            query_time = datetime.datetime.now(datetime.timezone.utc)
 
-            logger.info(f"Miner execution completed successfully at {query_time}")
+            return {
+                "predicted_values": predictions,
+                "query_time": query_time
+            }
+            
+
+            
 
         except Exception as e:
             logger.error(f"Error in miner execution: {str(e)}")
