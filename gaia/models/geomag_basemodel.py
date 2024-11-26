@@ -2,6 +2,9 @@ import pandas as pd
 from prophet import Prophet
 from datetime import datetime, timedelta
 from fiber.logging_utils import get_logger
+from huggingface_hub import hf_hub_download
+import importlib.util
+import sys
 
 logger = get_logger(__name__)
 
@@ -52,19 +55,41 @@ class FallbackGeoMagModel:
 class GeoMagBaseModel:
     """Wrapper class for geomagnetic prediction models."""
     
-    def __init__(self, repo_id="Nickel5HF/geomagmodel", filename="prophet_model.pkl"):
+    def __init__(self, repo_id="Nickel5HF/geomagmodel", filename="BaseModel.py"):
         self.model = None
+        self._is_fallback = True
+        
         try:
-            # Try to load Prophet model from HuggingFace
-            logger.info(f"Attempting to load Prophet model from {repo_id}")
-            # TODO: Implement HuggingFace model loading
-            raise NotImplementedError("HuggingFace model loading not implemented yet")
+            # Download the model file from HuggingFace
+            logger.info(f"Attempting to download model from repo: {repo_id}, file: {filename}")
+            model_path = hf_hub_download(repo_id=repo_id, filename=filename)
+            
+            # Load the module dynamically
+            spec = importlib.util.spec_from_file_location("geomag_model", model_path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["geomag_model"] = module
+            spec.loader.exec_module(module)
+            
+            # Initialize the model from the loaded module
+            self.model = module.GeoMagModel()
+            self._is_fallback = False
+            logger.info("Successfully loaded GeoMagModel from Hugging Face.")
             
         except Exception as e:
             logger.warning(f"Failed to load HuggingFace model: {e}")
             logger.info("Using fallback Prophet model")
             self.model = FallbackGeoMagModel()
     
+    @property
+    def is_fallback(self) -> bool:
+        """Check if using fallback model"""
+        return self._is_fallback
+    
     def predict(self, data) -> float:
         """Make prediction using either HuggingFace or fallback model."""
-        return self.model.predict(data)
+        try:
+            return self.model.predict(data)
+        except Exception as e:
+            logger.error(f"Error during prediction: {e}")
+            # Return input value as persistence forecast
+            return float(data.get('value', 0.0))
