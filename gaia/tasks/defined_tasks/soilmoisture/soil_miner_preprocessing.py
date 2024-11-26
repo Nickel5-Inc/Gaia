@@ -12,6 +12,7 @@ import rasterio
 import os
 import numpy as np
 from fiber.logging_utils import get_logger
+import tempfile
 
 logger = get_logger(__name__)
 
@@ -54,11 +55,24 @@ class SoilMinerPreprocessing(Preprocessing):
     def process_miner_data(self, data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """Process combined tiff data for model input."""
         try:
-
-            logger.info(f"####Received tiff data size: {len(data['combined_data'])} bytes")
-
-            with rasterio.io.MemoryFile(data['combined_data']) as memfile:
-                with memfile.open() as dataset:
+            combined_data = data['combined_data']
+            logger.info(f"####Received hex data size: {len(combined_data)} bytes")
+            
+            # Convert hex string to bytes
+            if isinstance(combined_data, str):
+                tiff_bytes = bytes.fromhex(combined_data)
+            else:
+                tiff_bytes = combined_data
+            
+            logger.info(f"####Decoded TIFF size: {len(tiff_bytes)} bytes")
+            
+            # Create a temporary file to write the TIFF data
+            with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as temp_file:
+                temp_file.write(tiff_bytes)
+                temp_file.flush()
+                
+                # Open the temporary file with rasterio
+                with rasterio.open(temp_file.name) as dataset:
                     logger.info(f"####Successfully opened TIFF with shape: {dataset.shape}")
                     logger.info(f"####TIFF metadata: {dataset.profile}")
                     logger.info(f"####Band order: {dataset.tags().get('band_order', 'Not found')}")
@@ -73,9 +87,16 @@ class SoilMinerPreprocessing(Preprocessing):
 
                     return model_inputs
 
+        except ValueError as e:
+            logger.error(f"Error deserializing TIFF data: {str(e)}")
+            raise RuntimeError(f"Error deserializing TIFF data: {str(e)}")
         except Exception as e:
             logger.error(f"Error processing TIFF data: {str(e)}")
             raise RuntimeError(f"Error processing miner data: {str(e)}")
+        finally:
+            # Clean up the temporary file
+            if 'temp_file' in locals():
+                os.unlink(temp_file.name)
 
     def predict_smap(
         self, model_inputs: Dict[str, torch.Tensor]
