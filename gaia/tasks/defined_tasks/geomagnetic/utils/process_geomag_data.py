@@ -103,8 +103,8 @@ async def get_latest_geomag_data(include_historical=False):
             now = datetime.now(timezone.utc)
             start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             historical_data = cleaned_df[cleaned_df["timestamp"] >= start_of_month]
-
-        return timestamp, dst_value, historical_data
+            return timestamp, dst_value, historical_data
+        return timestamp, dst_value
     except Exception as e:
         logger.error(f"Error fetching geomagnetic data: {e}")
         logger.error(f'{traceback.format_exc()}')
