@@ -17,6 +17,7 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from argparse import ArgumentParser
 import pandas as pd
+import json
 
 logger = get_logger(__name__)
 
@@ -89,13 +90,14 @@ class GaiaValidator:
         self.metagraph.sync_nodes()
         responses = []  # Initialize empty list
 
-        # Convert any Timestamp objects in payload to ISO format strings
+        # Convert payload to JSON-serializable format
         if payload and isinstance(payload, dict):
-            if 'timestamp' in payload and isinstance(payload['timestamp'], pd.Timestamp):
-                payload['timestamp'] = payload['timestamp'].isoformat()
-            if 'data' in payload and isinstance(payload['data'], dict):
-                if 'timestamp' in payload['data'] and isinstance(payload['data']['timestamp'], pd.Timestamp):
-                    payload['data']['timestamp'] = payload['data']['timestamp'].isoformat()
+            try:
+                # Use custom serializer for JSON dumps
+                payload = json.loads(json.dumps(payload, default=self.serialize_datetime))
+            except Exception as e:
+                logger.error(f"Error serializing payload: {e}")
+                return responses
 
         for miner_hotkey, node in self.metagraph.nodes.items():
             # Construct base URL properly
@@ -187,6 +189,12 @@ class GaiaValidator:
         current_time_utc = datetime.datetime.now(datetime.timezone.utc)
         formatted_time = current_time_utc.strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"Current time (UTC): {formatted_time}")
+    
+    def serialize_datetime(self, obj):
+        """Custom JSON serializer for handling datetime objects."""
+        if isinstance(obj, (pd.Timestamp, datetime.datetime)):
+            return obj.isoformat()
+        raise TypeError(f"Type {type(obj)} not serializable")
 
 
 if __name__ == "__main__":
