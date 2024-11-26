@@ -32,7 +32,7 @@ class SoilValidatorPreprocessing(Preprocessing):
             cell["index"] for cell in self._h3_data["lakes_overlay_cells"]
         )
         self._daily_regions = {}
-        self.max_daily_regions = 2
+        self.max_daily_regions = 1
 
     def _load_h3_map(self):
         """Load H3 map data, first checking locally then from HuggingFace."""
