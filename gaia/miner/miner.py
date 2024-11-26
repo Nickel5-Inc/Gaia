@@ -53,6 +53,9 @@ class Miner:
         Set up the miner neuron with necessary configurations and connections.
         """
         self.logger.info("Setting up miner neuron...")
+
+        if os.getenv("ENV", "dev").lower() == "dev":
+            configure_extra_logging_middleware(self.logger)
         
         # Add detailed logging for keypair and wallet info
         self.keypair = chain_utils.load_hotkey_keypair(self.wallet, self.hotkey)
@@ -175,11 +178,7 @@ Verification Result: {verify_result}
                 host="0.0.0.0",
                 port=self.port,
                 log_config=log_config,
-                log_level="trace",
-                access_log=True,
-                timeout_keep_alive=65,
-                proxy_headers=True,
-                forwarded_allow_ips="*"
+                log_level="trace"
             )
         except Exception as e:
             self.logger.error(f"Error starting miner: {e}")
