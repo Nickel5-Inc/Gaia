@@ -32,8 +32,8 @@ class GaiaValidator:
         self.metagraph = None
         self.config = None
         self.database_manager = ValidatorDatabaseManager()
-        self.soil_task = SoilMoistureTask()
-        self.geomagnetic_task = GeomagneticTask()  # Initialize GeomagneticTask
+        self.soil_task = SoilMoistureTask(db_manager=self.database_manager, node_type="validator")
+        self.geomagnetic_task = GeomagneticTask(db_manager=self.database_manager)
         self.weights = [0.0] * 256
         self.last_set_weights_block = 0
         self.current_block = 0
@@ -191,7 +191,7 @@ class GaiaValidator:
             try:
                 # Execute tasks in parallel
                 workers = [
-                    #asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
+                    asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
                     asyncio.create_task(self.soil_task.validator_execute(self)),
                     asyncio.create_task(self.status_logger()),
                     asyncio.create_task(self.main_scoring()),  # Add scoring task

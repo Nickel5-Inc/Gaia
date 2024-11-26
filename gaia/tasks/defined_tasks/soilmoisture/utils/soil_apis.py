@@ -43,10 +43,13 @@ class SessionWithHeaderRedirection(requests.Session):
 
 session = SessionWithHeaderRedirection(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
 
-def fetch_hls_b4_b8(bbox, datetime_obj, download_dir='/tmp'):
+def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
     """
     Fetch monthly Sentinel-2 B4 and B8 bands, falling back to previous month if needed.
     """
+    if download_dir is None:
+        download_dir = get_data_dir()
+    
     def try_month(search_date):
         base_url = "https://cmr.earthdata.nasa.gov/search/granules.json"
         bbox_str = f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
@@ -156,8 +159,11 @@ def fetch_hls_b4_b8(bbox, datetime_obj, download_dir='/tmp'):
     print("No suitable Sentinel-2 data found in current or previous month")
     return None
 
-def download_srtm_tile(lat, lon, download_dir='/tmp'):
+def download_srtm_tile(lat, lon, download_dir=None):
     """Download SRTM tile using proper Earthdata authentication."""
+    if download_dir is None:
+        download_dir = get_data_dir()
+    
     try:
         lat_prefix = 'N' if lat >= 0 else 'S'
         lon_prefix = 'E' if lon >= 0 else 'W'
@@ -205,7 +211,7 @@ def fetch_srtm(bbox, sentinel_bounds=None, sentinel_crs=None, sentinel_shape=Non
     """Fetch and merge SRTM tiles using Sentinel-2 as reference."""
     try:
         print("\n=== Fetching SRTM Data ===")
-        temp_dir = tempfile.mkdtemp()
+        temp_dir = tempfile.mkdtemp(dir=get_data_dir())
         
         if not (sentinel_bounds and sentinel_crs):
             raise ValueError("Sentinel-2 bounds and CRS required")
@@ -263,7 +269,8 @@ def get_current_ifs_path():
         print(f"Within first 2 hours of UTC, using data from {current_date.date()}")
     
     date_str = current_date.strftime("%Y%m%d")
-    processed_path = f"ecmwf_forecast_{date_str}.nc"
+    processed_path = os.path.join(get_data_dir(), 'ifs', f"ecmwf_forecast_{date_str}.nc")
+    os.makedirs(os.path.dirname(processed_path), exist_ok=True)
     
     return current_date, date_str, processed_path
 
@@ -318,8 +325,9 @@ def fetch_ifs_forecast(bbox, datetime_obj, sentinel_bounds=None, sentinel_crs=No
     try:
         current_utc = datetime.now(timezone.utc)
         target_date = current_utc - timedelta(days=1) if current_utc.hour < 2 else current_utc
-        cache_file = f"ecmwf_forecast_{target_date.strftime('%Y%m%d')}.nc"
-        prev_cache = f"ecmwf_forecast_{(target_date - timedelta(days=1)).strftime('%Y%m%d')}.nc"
+        data_dir = get_data_dir()
+        cache_file = os.path.join(data_dir, f"ecmwf_forecast_{target_date.strftime('%Y%m%d')}.nc")
+        prev_cache = os.path.join(data_dir, f"ecmwf_forecast_{(target_date - timedelta(days=1)).strftime('%Y%m%d')}.nc")
 
         for cache_path in [cache_file, prev_cache]:
             if os.path.exists(cache_path):
@@ -555,7 +563,8 @@ def combine_tiffs(sentinel_data, ifs_data, srtm_data_tuple, bbox, date_str, prof
         print(f"SRTM shape after resize: {srtm_resized.shape}")
         print(f"Sentinel data shapes: {[band.shape for band in sentinel_data]}")
         print(f"IFS data shapes: {[band.shape for band in ifs_data]}")
-        output_file = f"combined_{bbox[0]}_{bbox[1]}_{bbox[2]}_{bbox[3]}_{date_str}.tif"
+        output_dir = get_data_dir()
+        output_file = os.path.join(output_dir, f"combined_{bbox[0]}_{bbox[1]}_{bbox[2]}_{bbox[3]}_{date_str}.tif")
         
         with rasterio.open(output_file, 'w', **profile) as dst:
             band_idx = 1
@@ -715,4 +724,12 @@ def get_target_shape(bbox, target_resolution=500):
     height_pixels = int(round(height_meters / target_resolution))
     
     return (height_pixels, width_pixels)
+
+def get_data_dir():
+    """Get the path to the root project's data directory, creating it if it doesn't exist."""
+    current_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))))
+    data_dir = os.path.join(current_dir, 'data')
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+    return data_dir
 
