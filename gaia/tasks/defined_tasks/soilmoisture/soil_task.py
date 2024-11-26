@@ -3,15 +3,9 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from gaia.tasks.base.components.metadata import Metadata
-from gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing import (
-    SoilMinerPreprocessing,
-)
-from gaia.tasks.defined_tasks.soilmoisture.soil_validator_preprocessing import (
-    SoilValidatorPreprocessing,
-)
-from gaia.tasks.defined_tasks.soilmoisture.soil_scoring_mechanism import (
-    SoilScoringMechanism,
-)
+from gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing import SoilMinerPreprocessing
+from gaia.tasks.defined_tasks.soilmoisture.soil_validator_preprocessing import SoilValidatorPreprocessing
+from gaia.tasks.defined_tasks.soilmoisture.soil_scoring_mechanism import SoilScoringMechanism
 from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import (
     SoilMoistureInputs,
     SoilMoisturePayload,
@@ -21,6 +15,11 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMeta
 from pydantic import Field
 from fiber.logging_utils import get_logger
 from uuid import uuid4
+<<<<<<< HEAD
+=======
+from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from sqlalchemy import text
+>>>>>>> b82a893676d3b4b57903e4ade095361a7e1cb76d
 
 logger = get_logger(__name__)
 
@@ -56,6 +55,8 @@ class SoilMoistureTask(Task):
         )
 
         self.miner_preprocessing = SoilMinerPreprocessing()
+        self.validator_preprocessing = SoilValidatorPreprocessing()
+        self.db = ValidatorDatabaseManager()
 
     def get_next_valid_time(self, current_time: datetime) -> datetime:
         """Get next valid SMAP measurement time."""
@@ -110,7 +111,11 @@ class SoilMoistureTask(Task):
         logger.info(f"Task preparation time: {preparation_time}")
         logger.info(f"Minutes until preparation: {time_until_prep}")
 
+<<<<<<< HEAD
         if -180 <= time_until_prep <= 180:  ##TODO change to 10m
+=======
+        if True:  # TODO: Restore time check in production: -180 <= time_until_prep <= 180
+>>>>>>> b82a893676d3b4b57903e4ade095361a7e1cb76d
             try:
                 ifs_forecast_time = preparation_time.replace(
                     hour=(preparation_time.hour // 6) * 6,
@@ -168,7 +173,7 @@ class SoilMoistureTask(Task):
                 )
                 return regions
         except Exception as e:
-            print(f"Error getting today's regions: {str(e)}")
+            logger.error(f"Error getting today's regions: {str(e)}")
             return []
 
     def miner_execute(self, data):
@@ -186,7 +191,7 @@ class SoilMoistureTask(Task):
             }
 
         except Exception as e:
-            print(f"Error in miner execution: {str(e)}")
+            logger.error(f"Error in miner execution: {str(e)}")
             return None
 
     def score_predictions(self, predictions: Dict, ground_truth: Dict) -> Dict:
@@ -226,67 +231,68 @@ class SoilMoistureTask(Task):
                 await self.add_task_to_queue(responses, task_data)
             return responses
         except Exception as e:
+<<<<<<< HEAD
             print(f"Error querying miners: {str(e)}")
+=======
+            logger.error(f"Error querying miners: {str(e)}")
+>>>>>>> b82a893676d3b4b57903e4ade095361a7e1cb76d
             return None
 
     async def add_task_to_queue(self, predictions: Dict, metadata: Dict):
         """Add miner predictions to database for later scoring."""
         try:
-            async with self.db.get_connection() as conn:
-                for miner_id, pred in predictions.items():
-                    await conn.execute(
-                        """
-                        INSERT INTO soil_moisture_predictions 
-                        (region_id, miner_id, target_time, surface_sm, 
-                         rootzone_sm, uncertainty_surface, uncertainty_rootzone,
-                         sentinel_bounds, sentinel_crs)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            for miner_id, pred in predictions.items():
+                await self.db.execute(
+                    """
+                    INSERT INTO soil_moisture_predictions 
+                    (region_id, miner_id, target_time, surface_sm, rootzone_sm, 
+                     uncertainty_surface, uncertainty_rootzone)
+                    VALUES (:region_id, :miner_id, :target_time, :surface_sm, 
+                           :rootzone_sm, :uncertainty_surface, :uncertainty_rootzone)
                     """,
-                        metadata["region_id"],
-                        miner_id,
-                        metadata["target_time"],
-                        pred["surface_sm"],
-                        pred["rootzone_sm"],
-                        pred.get("uncertainty_surface"),
-                        pred.get("uncertainty_rootzone"),
-                    )
+                    {
+                        "region_id": metadata["region_id"],
+                        "miner_id": miner_id,
+                        "target_time": metadata["target_time"],
+                        "surface_sm": pred["surface_sm"],
+                        "rootzone_sm": pred["rootzone_sm"],
+                        "uncertainty_surface": pred.get("uncertainty_surface"),
+                        "uncertainty_rootzone": pred.get("uncertainty_rootzone")
+                    }
+                )
         except Exception as e:
-            print(f"Error storing predictions: {str(e)}")
+            logger.error(f"Error storing predictions: {str(e)}")
             raise
 
-    async def get_pending_tasks(self) -> List[Dict]:
-        """Get tasks ready for scoring (past 3 day SMAP delay and predictions present).
-
-        Returns:
-            List[Dict]: List of tasks containing region info and predictions
-        """
+    async def get_pending_tasks(self):
+        """Get tasks that are ready for scoring."""
         scoring_time = datetime.now(timezone.utc) - self.scoring_delay
 
         try:
-            async with self.db.get_connection() as conn:
-                return await conn.fetch(
-                    """
-                    SELECT 
-                        r.*,
-                        json_agg(json_build_object(
-                            'miner_id', p.miner_id,
-                            'surface_sm', p.surface_sm,
-                            'rootzone_sm', p.rootzone_sm,
-                            'uncertainty_surface', p.uncertainty_surface,
-                            'uncertainty_rootzone', p.uncertainty_rootzone
-                        )) as predictions
-                    FROM soil_moisture_regions r
-                    JOIN soil_moisture_predictions p ON p.region_id = r.id
-                    WHERE r.status = 'sent_to_miners'
-                    AND r.target_time <= $1
-                    GROUP BY r.id
-                    ORDER BY r.target_time ASC
+            result = await self.db.fetch_many(
+                """
+                SELECT 
+                    r.*,
+                    json_agg(json_build_object(
+                        'miner_id', p.miner_id,
+                        'surface_sm', p.surface_sm,
+                        'rootzone_sm', p.rootzone_sm,
+                        'uncertainty_surface', p.uncertainty_surface,
+                        'uncertainty_rootzone', p.uncertainty_rootzone
+                    )) as predictions
+                FROM soil_moisture_regions r
+                JOIN soil_moisture_predictions p ON p.region_id = r.id
+                WHERE r.status = 'sent_to_miners'
+                AND r.target_time <= :scoring_time
+                GROUP BY r.id
+                ORDER BY r.target_time ASC
                 """,
-                    scoring_time,
-                )
+                {"scoring_time": scoring_time}
+            )
+            return result
 
         except Exception as e:
-            print(f"Error fetching pending tasks: {str(e)}")
+            logger.error(f"Error fetching pending tasks: {str(e)}")
             return []
 
     async def move_task_to_history(
@@ -336,7 +342,7 @@ class SoilMoistureTask(Task):
                 )
 
         except Exception as e:
-            print(f"Error moving task to history: {str(e)}")
+            logger.error(f"Error moving task to history: {str(e)}")
             raise
 
     async def validator_score(self, result=None):

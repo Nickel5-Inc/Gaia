@@ -12,6 +12,8 @@ from fiber.chain import chain_utils
 from gaia.miner.utils.subnet import factory_router
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 import ssl
+import logging
+from fiber import logging_utils
 
 
 class Miner:
@@ -51,28 +53,33 @@ class Miner:
         Set up the miner neuron with necessary configurations and connections.
         """
         self.logger.info("Setting up miner neuron...")
+
+
         
         # Add detailed logging for keypair and wallet info
         self.keypair = chain_utils.load_hotkey_keypair(self.wallet, self.hotkey)
-        self.logger.info(f"""
-Neuron Configuration:
---------------------
-Wallet: {self.wallet}
-Hotkey: {self.hotkey}
+        self.logger.debug(f"""
+Detailed Neuron Configuration:
+----------------------------
+Wallet Path: {self.wallet}
+Hotkey Path: {self.hotkey}
 Keypair SS58 Address: {self.keypair.ss58_address}
+Keypair Public Key: {self.keypair.public_key}
 Subtensor Chain Endpoint: {self.subtensor_chain_endpoint}
 Network: {self.subtensor_network}
 Port: {self.port}
         """)
         
-        # Test signature generation
+        # Test signature verification
         test_message = "test_message"
         test_sig = self.keypair.sign(test_message)
-        self.logger.info(f"""
-Signature Test:
---------------
+        verify_result = self.keypair.verify(test_message, test_sig)
+        self.logger.debug(f"""
+Signature Verification Test:
+-------------------------
 Test Message: {test_message}
 Test Signature: {test_sig}
+Verification Result: {verify_result}
         """)
         
         return True
@@ -89,6 +96,9 @@ Test Signature: {test_sig}
             self.logger.info("Starting miner server...")
             app = server.factory_app(debug=True)
             app.include_router(factory_router())
+
+            if os.getenv("ENV", "dev").lower() == "dev":
+                configure_extra_logging_middleware(app)
             
             # Simplified logging configuration
             log_config = {
@@ -125,50 +135,52 @@ Test Signature: {test_sig}
                 },
             }
             
-            # Add middleware for detailed request logging
-            @app.middleware("http")
-            async def log_requests(request, call_next):
-                # Log request details
-                request_body = None
-                if request.method in ["POST", "PUT"]:
-                    try:
-                        request_body = await request.body()
-                        self.logger.info(f"Request body: {request_body.decode()}")
-                    except Exception as e:
-                        self.logger.warning(f"Could not read request body: {e}")
+            # Set Fiber logging to DEBUG
+            fiber_logger = logging_utils.get_logger("fiber")
+            fiber_logger.setLevel(logging.DEBUG)
 
-                self.logger.info(f"""
-                Request Details:
-                ----------------
-                Method: {request.method}
-                URL: {request.url}
-                Client Host: {request.client.host if request.client else 'Unknown'}
-                Headers: {dict(request.headers)}
-                                """)
-                                
-                # Process the request
-                response = await call_next(request)
-                                
-                # Log response details
-                self.logger.info(f"""
-                Response Details:
-                ----------------
-                Status: {response.status_code}
-                Headers: {dict(response.headers)}
-                """)
+            # Add a file handler for detailed logging
+            fh = logging.FileHandler('fiber_debug.log')
+            fh.setLevel(logging.DEBUG)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            fh.setFormatter(formatter)
+            fiber_logger.addHandler(fh)
+
+            # # Add middleware to log request verification details
+            # @app.middleware("http")
+            # async def verify_request_logging(request, call_next):
+            #     if request.url.path == '/exchange-symmetric-key':
+            #         # Log all headers
+            #         self.logger.debug("Verifying request headers:")
+            #         for header_name, header_value in request.headers.items():
+            #             self.logger.debug(f"{header_name}: {header_value}")
+                    
+            #         # Log signature verification attempt
+            #         if 'signature' in request.headers:
+            #             self.logger.debug(f"Attempting to verify signature: {request.headers['signature']}")
+            #             self.logger.debug(f"Using validator hotkey: {request.headers.get('validator-hotkey')}")
+            #             self.logger.debug(f"Using miner hotkey: {request.headers.get('miner-hotkey')}")
+            #             self.logger.debug(f"Using nonce: {request.headers.get('nonce')}")
                 
-                return response
+            #     response = await call_next(request)
+                
+            #     # Log response details for failed requests
+            #     if response.status_code != 200:
+            #         self.logger.debug(f"Request failed with status {response.status_code}")
+            #         try:
+            #             body = await response.body()
+            #             self.logger.debug(f"Response body: {body.decode()}")
+            #         except Exception as e:
+            #             self.logger.error(f"Could not decode response body: {e}")
+                
+            #     return response
             
             uvicorn.run(
                 app,
                 host="0.0.0.0",
                 port=self.port,
                 log_config=log_config,
-                log_level="trace",
-                access_log=True,
-                timeout_keep_alive=65,
-                proxy_headers=True,
-                forwarded_allow_ips="*"
+                log_level="trace"
             )
         except Exception as e:
             self.logger.error(f"Error starting miner: {e}")

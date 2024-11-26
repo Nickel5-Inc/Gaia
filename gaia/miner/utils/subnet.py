@@ -6,13 +6,15 @@ from pydantic import BaseModel
 from fiber.miner.dependencies import blacklist_low_stake, verify_request
 from fiber.miner.security.encryption import decrypt_general_payload
 from fiber.logging_utils import get_logger
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
 
 logger = get_logger(__name__)
 
 
 class DataModel(BaseModel):
     name: str
-    value: int
+    timestamp: str
+    value: float
 
 
 class GeomagneticRequest(BaseModel):
@@ -28,10 +30,17 @@ async def geomagnetic_require(
     logger.info(f"Received decrypted payload: {decrypted_payload}")
     if decrypted_payload.data:
         logger.info(f"Received data: {decrypted_payload.data}")
+        # Process the data here; return it as response_data to be sent to the Validator
+        response_data = decrypted_payload.model_dump()
+        geomagnetic_task = GeomagneticTask()
+        logger.info(f"Received response data: {response_data}")
+        logger.info(f"Miner executing...")
+        result = geomagnetic_task.miner_execute(response_data)
+        logger.info(f"Miner execution completed: {result}")
 
-    # Process the data here; return it as response_data to be sent to the Validator
-    response_data = decrypted_payload.model_dump()
-    return JSONResponse(content=response_data)
+    # Call the geomagnetic task on the miner
+    
+    return JSONResponse(content=result)
 
 
 class SoilmoistureRequest(BaseModel):

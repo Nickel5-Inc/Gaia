@@ -72,6 +72,9 @@ class GaiaValidator:
             self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
             self.metagraph = Metagraph(substrate=self.substrate, netuid=self.netuid)
 
+            #print the entire set of environment variables
+            logger.info(f"{os.environ}")
+
             return True
         except Exception as e:
             logger.error(f"Error setting up neuron: {e}")
@@ -170,8 +173,8 @@ class GaiaValidator:
             try:
                 # Execute tasks in parallel
                 workers = [
-                    asyncio.create_task(self.soil_task.validator_execute()),
                     asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
+                    #asyncio.create_task(self.soil_task.validator_execute()),
                     asyncio.create_task(self.status_logger()),
                 ]
 

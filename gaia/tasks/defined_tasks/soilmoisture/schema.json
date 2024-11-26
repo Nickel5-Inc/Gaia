@@ -35,6 +35,7 @@
             "uncertainty_rootzone": "FLOAT[][]",
             "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
             "sentinel_bounds": "FLOAT[]",
+            "status": "TEXT NOT NULL DEFAULT 'pending'",
             "sentinel_crs": "INTEGER"
         },
         "indexes": [
