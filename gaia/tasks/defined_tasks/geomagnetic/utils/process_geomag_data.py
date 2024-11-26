@@ -1,11 +1,14 @@
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from gaia.tasks.defined_tasks.geomagnetic.utils.pull_geomag_data import fetch_data
 
 
 # Constants
 PLACEHOLDER_VALUE = "999999999999999"  # Adjusted for realistic placeholder length
 
+from fiber.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 def parse_data(data):
     dates = []
@@ -34,7 +37,7 @@ def parse_data(data):
                     timestamp = datetime(year, month, day, hour)
 
                     # Only include valid timestamps and exclude future timestamps
-                    if timestamp < datetime.utcnow():
+                    if timestamp < datetime.now(timezone.utc):
                         dates.append(timestamp)
                         hourly_values.append(value)
                 except ValueError:
@@ -96,7 +99,7 @@ async def get_latest_geomag_data(include_historical=False):
         # If historical data is requested, filter the DataFrame for the current month
         historical_data = None
         if include_historical:
-            now = datetime.datetime.utcnow()
+            now = datetime.now(timezone.utc)
             start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             historical_data = cleaned_df[cleaned_df["timestamp"] >= start_of_month]
 
