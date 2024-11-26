@@ -60,32 +60,52 @@ class SoilMinerPreprocessing(Preprocessing):
             
             # Convert hex string to bytes
             if isinstance(combined_data, str):
-                tiff_bytes = bytes.fromhex(combined_data)
+                try:
+                    # Remove any whitespace or newlines that might have been added
+                    combined_data = combined_data.strip()
+                    tiff_bytes = bytes.fromhex(combined_data)
+                except ValueError as e:
+                    logger.error(f"Error decoding hex string: {str(e)}")
+                    raise ValueError(f"Invalid hex string: {str(e)}")
             else:
                 tiff_bytes = combined_data
             
             logger.info(f"####Decoded TIFF size: {len(tiff_bytes)} bytes")
             
+            # Verify TIFF magic number
+            if not (tiff_bytes.startswith(b'II\x2A\x00') or tiff_bytes.startswith(b'MM\x00\x2A')):
+                logger.error("Invalid TIFF format: Missing TIFF header")
+                raise ValueError("Invalid TIFF format: Missing TIFF header")
+            
             # Create a temporary file to write the TIFF data
-            with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as temp_file:
+            with tempfile.NamedTemporaryFile(suffix='.tif', delete=False, mode='wb') as temp_file:
                 temp_file.write(tiff_bytes)
                 temp_file.flush()
+                os.fsync(temp_file.fileno())  # Ensure all data is written to disk
                 
                 # Open the temporary file with rasterio
-                with rasterio.open(temp_file.name) as dataset:
-                    logger.info(f"####Successfully opened TIFF with shape: {dataset.shape}")
-                    logger.info(f"####TIFF metadata: {dataset.profile}")
-                    logger.info(f"####Band order: {dataset.tags().get('band_order', 'Not found')}")
-                    
-                    model_inputs = self.preprocessor.preprocess(dataset)
-                    if model_inputs is None:
-                        raise ValueError("####Failed to preprocess input data")
+                try:
+                    with rasterio.open(temp_file.name) as dataset:
+                        logger.info(f"####Successfully opened TIFF with shape: {dataset.shape}")
+                        logger.info(f"####TIFF metadata: {dataset.profile}")
+                        logger.info(f"####Band order: {dataset.tags().get('band_order', 'Not found')}")
+                        
+                        model_inputs = self.preprocessor.preprocess(dataset)
+                        if model_inputs is None:
+                            raise ValueError("####Failed to preprocess input data")
 
-                    for key in model_inputs:
-                        if isinstance(model_inputs[key], torch.Tensor):
-                            model_inputs[key] = model_inputs[key].to(self.device)
+                        for key in model_inputs:
+                            if isinstance(model_inputs[key], torch.Tensor):
+                                model_inputs[key] = model_inputs[key].to(self.device)
 
-                    return model_inputs
+                        return model_inputs
+
+                except rasterio.errors.RasterioIOError as e:
+                    # Log the first few bytes of the file for debugging
+                    with open(temp_file.name, 'rb') as f:
+                        header = f.read(16)
+                    logger.error(f"TIFF header bytes: {header.hex()}")
+                    raise
 
         except ValueError as e:
             logger.error(f"Error deserializing TIFF data: {str(e)}")
@@ -96,7 +116,10 @@ class SoilMinerPreprocessing(Preprocessing):
         finally:
             # Clean up the temporary file
             if 'temp_file' in locals():
-                os.unlink(temp_file.name)
+                try:
+                    os.unlink(temp_file.name)
+                except Exception as e:
+                    logger.error(f"Error cleaning up temporary file: {str(e)}")
 
     def predict_smap(
         self, model_inputs: Dict[str, torch.Tensor]
