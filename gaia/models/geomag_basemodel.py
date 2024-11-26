@@ -42,31 +42,62 @@ class FallbackGeoMagModel:
             float: Predicted DST value for next hour
         """
         try:
-            # Ensure timestamp is timezone-aware
-            timestamp = pd.to_datetime(x['timestamp'])
-            if timestamp.tzinfo is None:
-                timestamp = timestamp.replace(tzinfo=pytz.UTC)
+            # Ensure data is in the correct format
+            if isinstance(x, pd.DataFrame):
+                # Data is already a DataFrame, just ensure columns are correct
+                df = x.copy()
+            else:
+                # Convert to DataFrame if it's not already
+                if isinstance(x, (torch.Tensor, np.ndarray)):
+                    x = {
+                        'ds': datetime.now(pytz.UTC),
+                        'y': float(x.item() if hasattr(x, 'item') else x)
+                    }
+                # Create DataFrame from dict
+                df = pd.DataFrame({
+                    'ds': [pd.to_datetime(x['ds'] if 'ds' in x else x['timestamp'])],
+                    'y': [float(x['y'] if 'y' in x else x['value'])]
+                })
             
-            # Convert input to Prophet format
-            df = pd.DataFrame({
-                'ds': [timestamp],
-                'y': [float(x['value'])]
-            })
+            # Ensure timestamps are timezone-naive
+            if df['ds'].dt.tz is not None:
+                df['ds'] = df['ds'].dt.tz_localize(None)
             
-            # Fit model on current data point
-            self.model.fit(df)
+            if self._is_fallback:
+                # Fit model on current data
+                self.model.fit(df)
+                
+                # Create future dates properly
+                last_date = df['ds'].max()
+                future_dates = pd.date_range(
+                    start=last_date,
+                    periods=2,  # One extra period for prediction
+                    freq='H',
+                    tz=None  # Ensure timezone-naive
+                )
+                future = pd.DataFrame({'ds': future_dates})
+                
+                # Make prediction
+                forecast = self.model.predict(future)
+                result = forecast['yhat'].iloc[-1]
+            else:
+                if hasattr(self.model, 'train'):
+                    logger.info("Retraining model on latest data")
+                    self.model.train(df)
+                result = self.model.forecast(df)
             
-            # Make prediction for next hour
-            future = self.model.make_future_dataframe(periods=1, freq='H')
-            future['ds'] = future['ds'].dt.tz_localize(pytz.UTC)
-            forecast = self.model.predict(future)
+            # Handle NaN/Inf values
+            if np.isnan(result) or np.isinf(result) or not -1000 < float(result) < 1000:
+                logger.warning(f"Invalid prediction value: {result}, using input value")
+                return float(df['y'].iloc[-1])
             
-            # Return the predicted value
-            return float(forecast['yhat'].iloc[-1])
+            return float(result)
             
         except Exception as e:
-            logger.error(f"Error in Prophet prediction: {e}")
-            return float(x['value'])  # Fallback to persistence forecast
+            logger.error(f"Error during prediction: {e}")
+            logger.error(f"traceback: {traceback.format_exc()}")
+            logger.error(f"Using input value as fallback: {x.get('y', 0.0) if isinstance(x, dict) else 0.0}")
+            return float(x.get('y', 0.0) if isinstance(x, dict) else df['y'].iloc[-1] if 'df' in locals() else 0.0)
 
 
 class GeoMagBaseModel:
