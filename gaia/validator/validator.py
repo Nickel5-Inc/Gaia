@@ -1,4 +1,3 @@
-
 import datetime
 import os
 os.environ["NODE_TYPE"] = "validator"
@@ -284,31 +283,50 @@ class GaiaValidator:
                     geomagnetic_score = geomagnetic_scores[idx]
                     soil_score = soil_scores[idx]
                     
-                    # Handle nan values
+                    logger.debug(f"Raw scores - UID {idx}: geo={geomagnetic_score}, soil={soil_score}")
+                    
+                    # Handle nan values and normalize scores
                     if math.isnan(geomagnetic_score) and math.isnan(soil_score):
                         weights[idx] = 0.0
+                        logger.debug(f"Both scores nan - setting weight to 0")
                     elif math.isnan(geomagnetic_score):
                         weights[idx] = 0.5 * soil_score
+                        logger.debug(f"Geo score nan - using soil score: {weights[idx]}")
                     elif math.isnan(soil_score):
-                        weights[idx] = 0.5 * -geomagnetic_score  # invert geomagnetic scores
+                        # Convert geomagnetic error to score (0 to 1 range)
+                        if geomagnetic_score < 0 or geomagnetic_score > 10:
+                            logger.warning(f"Invalid geomagnetic score {geomagnetic_score} for UID {idx}")
+                            weights[idx] = 0.0
+                        else:
+                            geo_normalized = 1 - (geomagnetic_score / 10)  # Removed max(0, ...) to see raw value
+                            weights[idx] = 0.5 * geo_normalized
+                            logger.debug(f"Soil score nan - normalized geo score: {geo_normalized} -> weight: {weights[idx]}")
                     else:
-                        weights[idx] = (0.5 * -geomagnetic_score) + (0.5 * soil_score)
+                        # Normalize both scores
+                        if geomagnetic_score < 0 or geomagnetic_score > 10:
+                            logger.warning(f"Invalid geomagnetic score {geomagnetic_score} for UID {idx}")
+                            weights[idx] = 0.5 * soil_score  # Use only soil score if geo is invalid
+                        else:
+                            geo_normalized = 1 - (geomagnetic_score / 10)
+                            weights[idx] = (0.5 * geo_normalized) + (0.5 * soil_score)
+                            logger.debug(f"Both scores valid - geo_norm: {geo_normalized}, soil: {soil_score} -> weight: {weights[idx]}")
                     
-                    logger.info(f"UID {idx}: geo={geomagnetic_score}, soil={soil_score}, weight={weights[idx]}")
+                    logger.info(f"UID {idx}: geo={geomagnetic_score} (norm={geo_normalized if 'geo_normalized' in locals() else 'nan'}), soil={soil_score}, weight={weights[idx]}")
                 
                 logger.info(f"Weights before normalization: {weights}")
                 
                 # Only proceed if we have any non-zero weights
                 non_zero_weights = [w for w in weights if w != 0.0]
                 if non_zero_weights:
-                    # Sort indices by weight for ranking
-                    sorted_indices = sorted(range(len(weights)), key=lambda k: weights[k], reverse=True)
+                    # Sort indices by weight for ranking (negative scores = higher error = lower rank)
+                    sorted_indices = sorted(range(len(weights)), 
+                                         key=lambda k: weights[k] if weights[k] != 0.0 else float('-inf'))
                     
                     # Calculate new weights based on rank position
                     new_weights = [0.0] * len(weights)
                     for rank, idx in enumerate(sorted_indices):
-                        if weights[idx] > 0:  # Only assign weights to nodes with positive scores
-                            normalized_rank = 1.0 - (rank / len(non_zero_weights))  # Only consider non-zero weights
+                        if weights[idx] != 0.0:  # Assign weights to any non-zero score
+                            normalized_rank = 1.0 - (rank / len(non_zero_weights))
                             new_weights[idx] = 1 / (1 + math.exp(-20 * (normalized_rank - 0.5)))
                     
                     # Normalize final weights
