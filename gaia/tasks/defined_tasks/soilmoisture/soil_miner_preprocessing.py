@@ -1,3 +1,4 @@
+import traceback
 from gaia.tasks.base.components.preprocessing import Preprocessing
 from gaia.tasks.defined_tasks.soilmoisture.utils.inference_class import (
     SoilMoistureInferencePreprocessor,
@@ -79,40 +80,41 @@ class SoilMinerPreprocessing(Preprocessing):
                 raise ValueError("Invalid TIFF format: File does not start with valid TIFF header")
             
             # Create a temporary file to write the TIFF data
-            with tempfile.NamedTemporaryFile(suffix='.tif', delete=False, mode='wb') as temp_file:
+            with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as temp_file:
                 temp_file.write(tiff_bytes)
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
-                
-                # Double check the file content
-                temp_file.seek(0)
-                header = temp_file.read(4)
+
+            # Now open the file separately for reading to check the header
+            with open(temp_file.name, 'rb') as check_file:
+                header = check_file.read(4)
                 logger.info(f"Written file header: {header.hex()}")
-                
-                try:
-                    with rasterio.open(temp_file.name) as dataset:
-                        logger.info(f"####Successfully opened TIFF with shape: {dataset.shape}")
-                        logger.info(f"####TIFF metadata: {dataset.profile}")
-                        logger.info(f"####Band order: {dataset.tags().get('band_order', 'Not found')}")
-                        
-                        model_inputs = self.preprocessor.preprocess(dataset)
-                        if model_inputs is None:
-                            raise ValueError("####Failed to preprocess input data")
 
-                        for key in model_inputs:
-                            if isinstance(model_inputs[key], torch.Tensor):
-                                model_inputs[key] = model_inputs[key].to(self.device)
+            try:
+                with rasterio.open(temp_file.name) as dataset:
+                    logger.info(f"####Successfully opened TIFF with shape: {dataset.shape}")
+                    logger.info(f"####TIFF metadata: {dataset.profile}")
+                    logger.info(f"####Band order: {dataset.tags().get('band_order', 'Not found')}")
+                    
+                    model_inputs = self.preprocessor.preprocess(dataset)
+                    if model_inputs is None:
+                        raise ValueError("####Failed to preprocess input data")
 
-                        return model_inputs
+                    for key in model_inputs:
+                        if isinstance(model_inputs[key], torch.Tensor):
+                            model_inputs[key] = model_inputs[key].to(self.device)
 
-                except rasterio.errors.RasterioIOError as e:
-                    with open(temp_file.name, 'rb') as f:
-                        header = f.read(16)
-                    logger.error(f"TIFF header bytes: {header.hex()}")
-                    raise
+                    return model_inputs
+
+            except rasterio.errors.RasterioIOError as e:
+                with open(temp_file.name, 'rb') as f:
+                    header = f.read(16)
+                logger.error(f"TIFF header bytes: {header.hex()}")
+                raise
 
         except Exception as e:
             logger.error(f"Error processing TIFF data: {str(e)}")
+            logger.error(f"Error trace: {traceback.format_exc()}")
             raise RuntimeError(f"Error processing miner data: {str(e)}")
         finally:
             if 'temp_file' in locals():
