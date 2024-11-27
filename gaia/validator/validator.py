@@ -94,8 +94,11 @@ class GaiaValidator:
             self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
             self.metagraph = Metagraph(substrate=self.substrate, netuid=self.netuid)
 
+            self.current_block = self.substrate.get_block()['header']['number']
+            self.last_set_weights_block = self.current_block - 300
+
             #print the entire set of environment variables
-            logger.info(f"{os.environ}")
+            #logger.info(f"{os.environ}")
 
             return True
         except Exception as e:
@@ -248,43 +251,46 @@ class GaiaValidator:
         while True:
             try:
                 # Update current block
+                self.metagraph.sync_nodes()
                 block = self.substrate.get_block()
                 self.current_block = block['header']['number']
+                logger.info(f"Fetched current block: {self.current_block}")
                 
                 # Calculate blocks until next scoring round (aligns to 300 blocks, no offset)
                 blocks_until_scoring = 300 - (self.current_block % 300)
+                logger.info(f"Blocks until next scoring: {blocks_until_scoring}")
                 
-                logger.info(f"Current block: {self.current_block}, Scoring in {blocks_until_scoring} blocks")
-                await asyncio.sleep(blocks_until_scoring * 12)
+                # Reduce initial sleep time to ensure first execution happens sooner
+                await asyncio.sleep(min(blocks_until_scoring * 12, 60))
                 
                 # Sync metagraph and calculate scores
+                logger.info("Syncing metagraph nodes...")
                 self.metagraph.sync_nodes()
+                logger.info("Metagraph synced. Fetching recent scores...")
+                
                 geomagnetic_scores = await self.database_manager.get_recent_scores('geomagnetic')
                 soil_scores = await self.database_manager.get_recent_scores('soil')
+                logger.info("Recent scores fetched. Calculating aggregate scores...")
                 
                 # Calculate weights
                 weights = [0.0] * 256
                 for idx in range(256):
                     aggregate_score = (0.5 * -geomagnetic_scores[idx]) + (0.5 * soil_scores[idx]) # invert geomagnetic scores as higher is worse
                     weights[idx] = aggregate_score
+                logger.info("Aggregate scores calculated. Normalizing weights...")
                 
                 # Normalize weights to sum to 1
                 total_weight = sum(weights)
                 if total_weight > 0:
                     weights = [weight / total_weight for weight in weights]
+                logger.info("Weights normalized. Sorting indices by weight...")
                 
                 # Sort indices by weight for ranking
                 sorted_indices = sorted(range(len(weights)), key=lambda k: weights[k], reverse=True)
                 
                 # Apply sigmoid transformation
-                def sigmoid_transform(x, steepness=20):  # Increased steepness from 10 to 20
-                    """
-                    Transform normalized rank (0-1) to weight using sigmoid.
-                    Adjusted steepness to better approximate 80/20 rule:
-                    - steepness=10 -> top 20% get ~70% of weight
-                    - steepness=20 -> top 20% get ~80% of weight
-                    - steepness=30 -> top 20% get ~85% of weight
-                    """
+                logger.info("Applying sigmoid transformation to weights...")
+                def sigmoid_transform(x, steepness=20):
                     import math
                     return 1 / (1 + math.exp(-steepness * (x - 0.5)))
 
@@ -293,6 +299,7 @@ class GaiaValidator:
                 for rank, idx in enumerate(sorted_indices):
                     normalized_rank = 1.0 - (rank / len(weights))
                     new_weights[idx] = sigmoid_transform(normalized_rank)
+                logger.info("Sigmoid transformation applied. Normalizing new weights...")
                 
                 # Normalize to ensure sum = 1
                 total = sum(new_weights)
@@ -311,7 +318,10 @@ class GaiaValidator:
                 
                 # Set weights if enough blocks have passed since last setting
                 blocks_since_last = self.current_block - self.last_set_weights_block
-                if blocks_since_last >= 250:  # Only set weights if enough blocks have passed
+                logger.info(f"Blocks since last weight set: {blocks_since_last}")
+                
+                if blocks_since_last >= 250:
+                    logger.info("Setting weights on the chain...")
                     success = await self.set_weights(self.weights)
                     if success:
                         logger.info(f"Successfully set weights at block {self.current_block}")
@@ -368,8 +378,7 @@ class GaiaValidator:
                     self.current_block = block['header']['number']
                     blocks_since_weights = (
                         self.current_block - self.last_set_weights_block 
-                        if self.last_set_weights_block > 0 
-                        else 0
+
                     )
                 except Exception as block_error:
                     #logger.warning(f"Failed to get current block: {block_error}")

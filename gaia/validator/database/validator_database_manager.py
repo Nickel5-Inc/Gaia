@@ -478,12 +478,11 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
     async def get_recent_scores(self, task_type: str, window_hours: int = 24) -> dict:
         try:
-            # Get the most recent score row for the task type
             query = """
                 SELECT score 
                 FROM score_table 
                 WHERE task_name = :task_type 
-                AND created_at > NOW() - (:window_hours || ' hour')::interval
+                AND created_at > NOW() - (:window_hours * INTERVAL '1 hour')
                 AND status = 'completed'
                 ORDER BY created_at DESC 
                 LIMIT 1
@@ -491,7 +490,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             
             result = await self.fetch_one(query, {
                 "task_type": task_type,
-                "window_hours": window_hours
+                "window_hours": window_hours  # Pass as integer
             })
 
             if not result:

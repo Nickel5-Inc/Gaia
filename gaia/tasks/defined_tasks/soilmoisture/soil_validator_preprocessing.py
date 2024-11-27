@@ -70,10 +70,10 @@ class SoilValidatorPreprocessing(Preprocessing):
             
         return self._daily_regions[today][hour] < self.regions_per_timestep
 
-    def get_soil_data(self, bbox: Dict, current_time: datetime) -> Optional[Dict]:
+    async def get_soil_data(self, bbox: Dict, current_time: datetime) -> Optional[Dict]:
         """Collect and prepare data for a given region."""
         try:
-            soil_data = get_soil_data(bbox=bbox, datetime_obj=current_time)
+            soil_data = await get_soil_data(bbox=bbox, datetime_obj=current_time)
             if soil_data is None:
                 logger.warning(f"Failed to get soil data for region {bbox}")
                 return None
@@ -152,7 +152,7 @@ class SoilValidatorPreprocessing(Preprocessing):
                     urban_cells_set=self._urban_cells,
                     lakes_cells_set=self._lakes_cells
                 )
-                soil_data = self.get_soil_data(bbox, ifs_forecast_time)
+                soil_data = await self.get_soil_data(bbox, ifs_forecast_time)
 
                 if soil_data is not None:
                     tiff_path, bounds, crs = soil_data

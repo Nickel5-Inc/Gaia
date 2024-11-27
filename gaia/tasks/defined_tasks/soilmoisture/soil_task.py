@@ -97,7 +97,6 @@ class SoilMoistureTask(Task):
                 if not self.should_run_validator(current_time):
                     # Sleep for 5 minutes before next check
                     await asyncio.sleep(100)
-                    logger.info(f"Sleeping until next validator window: {self.get_next_validator_window(current_time)}")
                     continue
 
                 target_smap_time = self.get_smap_time_for_validator(current_time)
@@ -230,7 +229,7 @@ class SoilMoistureTask(Task):
     async def miner_execute(self, data: Dict[str, Any], miner) -> Dict[str, Any]:
         """Execute miner workflow."""
         try:
-            processed_data = self.miner_preprocessing.process_miner_data(data['data'])
+            processed_data = await self.miner_preprocessing.process_miner_data(data['data'])
             predictions = self.run_model_inference(processed_data)
             try:
                 import matplotlib.pyplot as plt
