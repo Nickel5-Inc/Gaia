@@ -21,6 +21,7 @@ from gaia.models.soil_moisture_basemodel import SoilModel
 import traceback
 import base64
 import json
+import asyncio
 
 logger = get_logger(__name__)
 
@@ -89,113 +90,125 @@ class SoilMoistureTask(Task):
 
     async def validator_execute(self, validator):
         """Execute validator workflow."""
-        try:
-            current_time = datetime.now(timezone.utc)
-            
-            if not self.should_run_validator(current_time):
-                logger.info("Not a valid execution time, skipping")
-                return
+        while True:
+            try:
+                current_time = datetime.now(timezone.utc)
+                
+                if not self.should_run_validator(current_time):
+                    # Sleep for 5 minutes before next check
+                    await asyncio.sleep(100)
+                    logger.info(f"Sleeping until next validator window: {self.get_next_validator_window(current_time)}")
+                    continue
 
-            target_smap_time = self.get_smap_time_for_validator(current_time)
-            ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
-            
-            # If in preparation window, only collect data
-            if current_time.minute < 30:  # In preparation window
-                logger.info("In preparation window, collecting data...")
-                await self.validator_preprocessing.get_daily_regions(
-                    target_time=target_smap_time,
-                    ifs_forecast_time=ifs_forecast_time
+                target_smap_time = self.get_smap_time_for_validator(current_time)
+                ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
+                
+                # If in preparation window, only collect data
+                if current_time.minute < 30:
+                    logger.info(f"In preparation window, collecting data for SMAP time: {target_smap_time}")
+                    await self.validator_preprocessing.get_daily_regions(
+                        target_time=target_smap_time,
+                        ifs_forecast_time=ifs_forecast_time
+                    )
+                    # Sleep until execution window (30 minutes)
+                    await asyncio.sleep(1800)
+                    continue
+
+                # If in execution window, query miners with prepared data
+                logger.info(f"In execution window for SMAP time: {target_smap_time}")
+                regions = await self.db.fetch_many(
+                    """
+                    SELECT * FROM soil_moisture_regions 
+                    WHERE status = 'pending'
+                    AND datetime = :target_time
+                    """,
+                    {"target_time": target_smap_time}
                 )
-                return
 
-            # If in execution window, query miners with prepared data
-            logger.info("In execution window, querying miners...")
-            regions = await self.db.fetch_many(
-                """
-                SELECT * FROM soil_moisture_regions 
-                WHERE status = 'pending'
-                AND datetime = :target_time
-                """,
-                {"target_time": target_smap_time}
-            )
-            logger.info(f"Found {len(regions) if regions else 0} pending regions for SMAP time {target_smap_time}")
+                if regions:
+                    for region in regions:
+                        try:
+                            logger.info(f"Processing region {region['id']}")
+                            
+                            if 'combined_data' not in region:
+                                logger.error(f"Region {region['id']} missing combined_data field")
+                                continue
+                            
+                            if not region['combined_data']:
+                                logger.error(f"Region {region['id']} has null combined_data")
+                                continue
 
-            if regions:
-                for region in regions:
-                    try:
-                        logger.info(f"Processing region {region['id']}")
-                        
-                        if 'combined_data' not in region:
-                            logger.error(f"Region {region['id']} missing combined_data field")
-                            continue
-                        
-                        if not region['combined_data']:
-                            logger.error(f"Region {region['id']} has null combined_data")
-                            continue
+                            # Validate TIFF data retrieved from database
+                            combined_data = region['combined_data']
+                            if not isinstance(combined_data, bytes):
+                                logger.error(f"Region {region['id']} has invalid data type: {type(combined_data)}")
+                                continue
 
-                        # Validate TIFF data retrieved from database
-                        combined_data = region['combined_data']
-                        if not isinstance(combined_data, bytes):
-                            logger.error(f"Region {region['id']} has invalid data type: {type(combined_data)}")
-                            continue
+                            if not (combined_data.startswith(b'II\x2A\x00') or combined_data.startswith(b'MM\x00\x2A')):
+                                logger.error(f"Region {region['id']} has invalid TIFF header")
+                                logger.error(f"First 16 bytes: {combined_data[:16].hex()}")
+                                continue
 
-                        if not (combined_data.startswith(b'II\x2A\x00') or combined_data.startswith(b'MM\x00\x2A')):
-                            logger.error(f"Region {region['id']} has invalid TIFF header")
-                            logger.error(f"First 16 bytes: {combined_data[:16].hex()}")
-                            continue
+                            logger.info(f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB")
+                            logger.info(f"Region {region['id']} TIFF header: {combined_data[:4]}")
+                            logger.info(f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}")
 
-                        logger.info(f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB")
-                        logger.info(f"Region {region['id']} TIFF header: {combined_data[:4]}")
-                        logger.info(f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}")
+                            # Explicitly encode as base64
+                            encoded_data = base64.b64encode(combined_data)  # This returns bytes
+                            logger.info(f"Base64 first 16 chars: {encoded_data[:16]}")
 
-                        # Explicitly encode as base64
-                        encoded_data = base64.b64encode(combined_data)  # This returns bytes
-                        logger.info(f"Base64 first 16 chars: {encoded_data[:16]}")
-
-                        task_data = {
-                            'region_id': region['id'],
-                            'combined_data': encoded_data.decode('ascii'),
-                            'sentinel_bounds': region['sentinel_bounds'],
-                            'sentinel_crs': region['sentinel_crs'],
-                            'target_time': target_smap_time.isoformat()
-                        }
-
-                        payload = {
-                            "nonce": str(uuid4()),
-                            "data": task_data
-                        }
-
-                        logger.info(f"Sending region {region['id']} to miners...")
-                        responses = await validator.query_miners(
-                            payload=payload,
-                            endpoint="/soilmoisture-request"
-                        )
-
-                        if responses:
-                            metadata = {
-                                "region_id": region['id'],
-                                "target_time": target_smap_time,
-                                "data_collection_time": current_time,
-                                "ifs_forecast_time": ifs_forecast_time
+                            task_data = {
+                                'region_id': region['id'],
+                                'combined_data': encoded_data.decode('ascii'),
+                                'sentinel_bounds': region['sentinel_bounds'],
+                                'sentinel_crs': region['sentinel_crs'],
+                                'target_time': target_smap_time.isoformat()
                             }
-                            await self.add_task_to_queue(responses, metadata)
 
-                            await self.db.execute(
-                                """
-                                UPDATE soil_moisture_regions 
-                                SET status = 'sent_to_miners'
-                                WHERE id = :region_id
-                                """,
-                                {"region_id": region['id']}
+                            payload = {
+                                "nonce": str(uuid4()),
+                                "data": task_data
+                            }
+
+                            logger.info(f"Sending region {region['id']} to miners...")
+                            responses = await validator.query_miners(
+                                payload=payload,
+                                endpoint="/soilmoisture-request"
                             )
 
-                    except Exception as e:
-                        logger.error(f"Error preparing region: {str(e)}")
-                        continue
+                            if responses:
+                                metadata = {
+                                    "region_id": region['id'],
+                                    "target_time": target_smap_time,
+                                    "data_collection_time": current_time,
+                                    "ifs_forecast_time": ifs_forecast_time
+                                }
+                                await self.add_task_to_queue(responses, metadata)
 
-        except Exception as e:
-            logger.error(f"Error in validator execute: {str(e)}")
-            raise
+                                await self.db.execute(
+                                    """
+                                    UPDATE soil_moisture_regions 
+                                    SET status = 'sent_to_miners'
+                                    WHERE id = :region_id
+                                    """,
+                                    {"region_id": region['id']}
+                                )
+
+                        except Exception as e:
+                            logger.error(f"Error preparing region: {str(e)}")
+                            continue
+
+                # Sleep until next preparation window
+                next_prep_time = self.get_next_preparation_time(current_time)
+                sleep_seconds = (next_prep_time - datetime.now(timezone.utc)).total_seconds()
+                if sleep_seconds > 0:
+                    logger.info(f"Sleeping until next preparation window: {next_prep_time}")
+                    await asyncio.sleep(sleep_seconds)
+
+            except Exception as e:
+                logger.error(f"Error in validator_execute: {e}")
+                logger.error(traceback.format_exc())
+                await asyncio.sleep(60)
 
     async def get_todays_regions(self, target_time: datetime) -> List[Dict]:
         """Get regions already selected for today."""
@@ -456,20 +469,40 @@ class SoilMoistureTask(Task):
 
     def should_run_validator(self, current_time: datetime) -> bool:
         """Check if validator should run at current time."""
-        # Start data collection 30 mins before execution
+        # Debug logging
+        logger.info(f"Checking validator time: {current_time.hour}:{current_time.minute}")
+        
         validator_windows = [
-            (1, 30, 2, 0),    # Prep 1:30-2:00
-            (7, 0, 7, 30),    # Prep 7:00-7:30
-            (13, 30, 14, 0),  # Prep 13:30-14:00
-            (19, 0, 19, 30)   # Prep 19:00-19:30
+            (1, 30, 2, 0),     # Prep 1:30-2:00
+            (7, 0, 7, 30),     # Prep 7:00-7:30
+            (13, 30, 14, 0),   # Prep 13:30-14:00
+            (19, 0, 19, 30),   # Prep 19:00-19:30
+            (20, 0, 20, 5)     # Test window 20:00-20:05
         ]
         
-        for start_hr, start_min, end_hr, end_min in validator_windows:
-            start_time = current_time.replace(hour=start_hr, minute=start_min)
-            end_time = current_time.replace(hour=end_hr, minute=end_min)
+        for window in validator_windows:
+            start_hr, start_min, end_hr, end_min = window
+            current_time_mins = current_time.hour * 60 + current_time.minute
+            window_start_mins = start_hr * 60 + start_min
+            window_end_mins = end_hr * 60 + end_min
             
-            if start_time <= current_time <= end_time:
+            if window_start_mins <= current_time_mins < window_end_mins:
+                logger.info(f"Found valid time window: {start_hr}:{start_min:02d}-{end_hr}:{end_min:02d}")
                 return True
+            
+        # Find next window
+        current_mins = current_time.hour * 60 + current_time.minute
+        next_window = None
+        for window in validator_windows:
+            window_start_mins = window[0] * 60 + window[1]
+            if window_start_mins > current_mins:
+                next_window = window
+                break
+        
+        if next_window is None:  # If no future window today, use first window tomorrow
+            next_window = validator_windows[0]
+        
+        logger.info(f"Next execution window: {next_window[0]}:{next_window[1]:02d}")
         return False
 
     def get_ifs_time_for_smap(self, smap_time: datetime) -> datetime:
