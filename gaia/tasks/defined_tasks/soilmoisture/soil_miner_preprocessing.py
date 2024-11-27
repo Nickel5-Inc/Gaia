@@ -69,9 +69,13 @@ class SoilMinerPreprocessing(Preprocessing):
                         import base64
                         combined_data = combined_data.split(',')[1]
                         tiff_bytes = base64.b64decode(combined_data)
+                        logger.info("####Decoded data as base64")
+                        logger.info(f"####Decoded data size: {len(tiff_bytes)} bytes")
                     else:
                         # Try hex decoding
                         tiff_bytes = bytes.fromhex(combined_data)
+                        logger.info("####Decoded data as hex")
+                        logger.info(f"####Decoded data size: {len(tiff_bytes)} bytes")
                 except ValueError as e:
                     logger.error(f"Error decoding data: {str(e)}")
                     logger.error(f"First 100 chars of data: {combined_data[:100]}")
@@ -82,11 +86,22 @@ class SoilMinerPreprocessing(Preprocessing):
             logger.info(f"####Decoded data size: {len(tiff_bytes)} bytes")
             logger.info(f"####First 16 bytes: {tiff_bytes[:16].hex()}")
             
+            # Validate TIFF header before writing to file
+            if not (tiff_bytes.startswith(b'II\x2A\x00') or tiff_bytes.startswith(b'MM\x00\x2A')):
+                logger.error(f"Invalid TIFF header detected")
+                logger.error(f"First 16 bytes: {tiff_bytes[:16].hex()}")
+                raise ValueError("Invalid TIFF format: File does not start with valid TIFF header")
+            
             # Create a temporary file to write the TIFF data
             with tempfile.NamedTemporaryFile(suffix='.tif', delete=False, mode='wb') as temp_file:
                 temp_file.write(tiff_bytes)
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
+                
+                # Double check the file content
+                temp_file.seek(0)
+                header = temp_file.read(4)
+                logger.info(f"Written file header: {header.hex()}")
                 
                 try:
                     with rasterio.open(temp_file.name) as dataset:

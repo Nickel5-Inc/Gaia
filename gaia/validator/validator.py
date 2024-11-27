@@ -19,6 +19,7 @@ from argparse import ArgumentParser
 import pandas as pd
 import json
 from gaia.validator.weights.set_weights import FiberWeightSetter
+import base64
 
 logger = get_logger(__name__)
 
@@ -338,7 +339,7 @@ class GaiaValidator:
         if isinstance(obj, (pd.Timestamp, datetime.datetime)):
             return obj.isoformat()
         elif isinstance(obj, bytes):
-            return obj.hex()  # Convert bytes to hex string representation
+            return base64.b64encode(obj).decode('ascii')  # Convert bytes to base64 string
         raise TypeError(f"Type {type(obj)} not serializable")
     
     async def update_miner_table(self):
