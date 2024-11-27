@@ -476,23 +476,14 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         results = await self.fetch_many(query)
         return [dict(row) for row in results]
 
-    async def get_recent_scores(self, task_type: str, window_hours: int = 24) -> list:
-        """
-        Get the most recent scores from score_table for a specific task type.
-        
-        Args:
-            task_type (str): Type of task ('geomagnetic' or 'soil')
-            window_hours (int): Hours of history to consider
-        
-        Returns:
-            list: Array of 256 scores where index corresponds to node index
-        """
+    async def get_recent_scores(self, task_type: str, window_hours: int = 24) -> dict:
         try:
+            # Get the most recent score row for the task type
             query = """
                 SELECT score 
                 FROM score_table 
                 WHERE task_name = :task_type 
-                AND created_at > NOW() - interval :window_hours hour
+                AND created_at > NOW() - (:window_hours || ' hour')::interval
                 AND status = 'completed'
                 ORDER BY created_at DESC 
                 LIMIT 1
@@ -505,8 +496,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
             if not result:
                 logger.warning(f"No recent scores found for task type: {task_type}")
-                return [0.0] * 256  # Return zero scores if no data found
-            
+                return [0.0] * 256
+                
             return result['score']
             
         except Exception as e:

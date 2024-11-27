@@ -38,6 +38,7 @@ class GaiaValidator:
         self.weights = [0.0] * 256
         self.last_set_weights_block = 0
         self.current_block = 0
+        self.nodes = {}  # Initialize the in-memory node table state
         
         self.httpx_client = httpx.AsyncClient(
             timeout=30.0,
@@ -231,7 +232,8 @@ class GaiaValidator:
                     asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
                     asyncio.create_task(self.soil_task.validator_execute(self)),
                     asyncio.create_task(self.status_logger()),
-                    asyncio.create_task(self.main_scoring()),  # Add scoring task
+                    asyncio.create_task(self.main_scoring()),
+                    asyncio.create_task(self.handle_miner_deregistration_loop())
                 ]
 
                 await asyncio.gather(*workers, return_exceptions=True)
@@ -341,9 +343,12 @@ class GaiaValidator:
                 network=self.subtensor_network
             )
             
-            await weight_setter.set_weights()
-            self.last_set_weights_block = self.current_block
-            return True
+            success = await weight_setter.set_weights()
+            if success:
+                # Update last_set_weights_block only on successful weight setting
+                self.last_set_weights_block = self.current_block
+                logger.info(f"Successfully set weights at block {self.current_block}")
+            return success
             
         except Exception as e:
             logger.error(f"Error setting weights: {e}")
@@ -360,26 +365,29 @@ class GaiaValidator:
                 # Try to get current block, handle connection errors
                 try:
                     block = self.substrate.get_block()
-                    current_block = block['header']['number']
-                    blocks_since_weights = current_block - self.last_set_weights_block
+                    self.current_block = block['header']['number']
+                    blocks_since_weights = (
+                        self.current_block - self.last_set_weights_block 
+                        if self.last_set_weights_block > 0 
+                        else 0
+                    )
                 except Exception as block_error:
-                    logger.warning(f"Failed to get current block: {block_error}")
+                    #logger.warning(f"Failed to get current block: {block_error}")
                     # Try to reconnect to substrate
                     try:
                         self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
-                        logger.info("Successfully reconnected to substrate")
+                        #logger.info("Successfully reconnected to substrate")
                     except Exception as e:
                         logger.error(f"Failed to reconnect to substrate: {e}")
-                    current_block = 0
-                    blocks_since_weights = 0
+                    
                 
                 active_nodes = len(self.metagraph.nodes) if self.metagraph else 0
                 
                 logger.info(
                     f"\n"
-                    f"---Status Update ---\n "
+                    f"---Status Update ---\n"
                     f"Time (UTC): {formatted_time} | \n"
-                    f"Block: {current_block} | \n"
+                    f"Block: {self.current_block} | \n"
                     f"Nodes: {active_nodes}/256 | \n"
                     f"Weights Set: {blocks_since_weights} blocks ago"
                 )
@@ -388,7 +396,7 @@ class GaiaValidator:
                 logger.error(f"Error in status logger: {e}")
                 logger.error(f'{traceback.format_exc()}')
             finally:
-                await asyncio.sleep(60)  # Sleep at the end to ensure we always get the interval
+                await asyncio.sleep(60)
     
     async def update_miner_table(self):
         """Update the miner table with the latest miner information from the metagraph."""
@@ -417,15 +425,72 @@ class GaiaValidator:
                     vtrust=float(node.vtrust),
                     protocol=str(node.protocol)
                 )
+                # Update in-memory state
+                self.nodes[index] = {'hotkey': node.hotkey, 'uid': index}
                 logger.debug(f"Updated information for node {index}")
 
-            logger.info("Successfully updated miner table")
+            logger.info("Successfully updated miner table and in-memory state")
 
         except Exception as e:
             logger.error(f"Error updating miner table: {str(e)}")
             logger.error(traceback.format_exc())
             raise
-
+    async def handle_miner_deregistration_loop(self):
+        """Run miner deregistration checks every 60 seconds."""
+        while True:
+            try:
+                # Sync metagraph to get current network state
+                self.metagraph.sync_nodes()
+                
+                # Create mapping of current network state
+                active_miners = {
+                    idx: {'hotkey': hotkey, 'uid': idx} 
+                    for idx, (hotkey, _) in enumerate(self.metagraph.nodes.items())
+                }
+                
+                # Check for changes in the node table
+                if not self.nodes:
+                    # Initial load of node table state
+                    query = "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL"
+                    rows = await self.database_manager.fetch_many(query)
+                    self.nodes = {row['uid']: {'hotkey': row['hotkey'], 'uid': row['uid']} for row in rows}
+                
+                # Find deregistered miners by comparing hotkeys at each UID
+                deregistered_miners = []
+                for uid, registered in self.nodes.items():
+                    # If UID has a different hotkey now, miner was deregistered
+                    if active_miners[uid]['hotkey'] != registered['hotkey']:
+                        deregistered_miners.append(registered)
+                
+                if deregistered_miners:
+                    logger.info(f"Found {len(deregistered_miners)} deregistered miners:")
+                    for miner in deregistered_miners:
+                        logger.info(f"UID {miner['uid']}: {miner['hotkey']} -> {active_miners[miner['uid']]['hotkey']}")
+                    
+                    # Update in-memory node table state
+                    for miner in deregistered_miners:
+                        self.nodes[miner['uid']]['hotkey'] = active_miners[miner['uid']]['hotkey']
+                    
+                    # Get list of UIDs for recalculation
+                    uids = [int(miner['uid']) for miner in deregistered_miners]
+                    
+                    # Set weights to 0 for deregistered miners
+                    for idx in uids:
+                        self.weights[idx] = 0.0
+                        
+                    # Recalculate scores for both tasks
+                    await self.soil_task.recalculate_recent_scores(uids)
+                    await self.geomagnetic_task.recalculate_recent_scores(uids)
+                    
+                    logger.info(f"Processed {len(deregistered_miners)} deregistered miners")
+                else:
+                    logger.debug("No deregistered miners found")
+                
+            except Exception as e:
+                logger.error(f"Error in deregistration loop: {e}")
+                logger.error(traceback.format_exc())
+            finally:
+                await asyncio.sleep(60)
 
 if __name__ == "__main__":
     parser = ArgumentParser()

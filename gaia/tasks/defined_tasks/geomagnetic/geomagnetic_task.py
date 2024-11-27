@@ -725,6 +725,66 @@ class GeomagneticTask(Task):
             logger.error(f'{traceback.format_exc()}')
             return None
 
-            # build score row from tasks
-            
+    async def recalculate_recent_scores(self, uids: list):
+        """
+        Recalculate recent scores for the given UIDs by removing their predictions
+        and updating the score table.
+        
+        Args:
+            uids (list): List of UIDs to recalculate scores for.
+        """
+        try:
+            # Step 1: Delete predictions for the given UIDs
+            delete_query = """
+            DELETE FROM geomagnetic_predictions
+            WHERE miner_uid = ANY(:uids)
+            """
+            await self.db_manager.execute(delete_query, {"uids": uids})
+            logger.info(f"Deleted predictions for UIDs: {uids}")
+
+            # Step 2: Recalculate scores
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            current_hour = current_time.replace(minute=0, second=0, microsecond=0)
+            previous_hour = current_hour - datetime.timedelta(hours=1)
+
+            # Fetch tasks for the previous hour
+            tasks = await self.get_tasks_for_hour(previous_hour, current_hour)
+
+            # Initialize scores array with NaN values
+            scores = [float('nan')] * 256
+
+            # Get mapping of hotkeys to UIDs from node_table
+            query = """
+            SELECT uid, hotkey FROM node_table 
+            WHERE hotkey IS NOT NULL
+            """
+            miner_mappings = await self.db_manager.fetch_many(query)
+            hotkey_to_uid = {row['hotkey']: row['uid'] for row in miner_mappings}
+
+            # Fill scores array with task scores at proper indices
+            for task in tasks:
+                miner_hotkey = task['miner_hotkey']
+                if miner_hotkey in hotkey_to_uid:
+                    uid = hotkey_to_uid[miner_hotkey]
+                    scores[uid] = task.get('score', float('nan'))
+
+            # Create new score row
+            score_row = {
+                'task_name': 'geomagnetic',
+                'task_id': str(current_hour.timestamp()),
+                'score': scores,
+                'status': 'completed'
+            }
+
+            # Insert new score row into score_table
+            insert_query = """
+            INSERT INTO score_table (task_name, task_id, score, status)
+            VALUES (:task_name, :task_id, :score, :status)
+            """
+            await self.db_manager.execute(insert_query, score_row)
+            logger.info(f"Recalculated and inserted new score row for UIDs: {uids}")
+
+        except Exception as e:
+            logger.error(f"Error recalculating recent scores: {e}")
+            logger.error(traceback.format_exc())
 
