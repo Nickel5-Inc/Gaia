@@ -16,9 +16,13 @@ import logging
 from fiber import logging_utils
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
 
 # Define max request size (5MB in bytes)
 MAX_REQUEST_SIZE = 5 * 1024 * 1024  # 5MB
+
+
+os.environ["NODE_TYPE"] = "miner"
 
 class Miner:
     """
@@ -51,6 +55,7 @@ class Miner:
         )
         
         self.database_manager = MinerDatabaseManager()
+        self.soil_task = SoilMoistureTask(db_manager=self.database_manager, node_type="miner")
 
     def setup_neuron(self) -> bool:
         """

@@ -20,9 +20,11 @@ import pandas as pd
 import json
 from gaia.validator.weights.set_weights import FiberWeightSetter
 import base64
+import math
 
 logger = get_logger(__name__)
 
+os.environ["NODE_TYPE"] = "validator"
 
 class GaiaValidator:
     def __init__(self, args):
@@ -250,17 +252,17 @@ class GaiaValidator:
         """
         while True:
             try:
-                # Update current block
+                # Sync metagraph and get current block
                 self.metagraph.sync_nodes()
                 block = self.substrate.get_block()
                 self.current_block = block['header']['number']
                 logger.info(f"Fetched current block: {self.current_block}")
                 
-                # Calculate blocks until next scoring round (aligns to 300 blocks, no offset)
+                # Calculate blocks until next scoring round
                 blocks_until_scoring = 300 - (self.current_block % 300)
                 logger.info(f"Blocks until next scoring: {blocks_until_scoring}")
                 
-                # Reduce initial sleep time to ensure first execution happens sooner
+                # Sleep until next scoring round (max 60 seconds per sleep)
                 await asyncio.sleep(min(blocks_until_scoring * 12, 60))
                 
                 # Sync metagraph and calculate scores
@@ -277,58 +279,36 @@ class GaiaValidator:
                 for idx in range(256):
                     aggregate_score = (0.5 * -geomagnetic_scores[idx]) + (0.5 * soil_scores[idx]) # invert geomagnetic scores as higher is worse
                     weights[idx] = aggregate_score
-                logger.info("Aggregate scores calculated. Normalizing weights...")
                 
-                # Normalize weights to sum to 1
-                total_weight = sum(weights)
-                if total_weight > 0:
-                    weights = [weight / total_weight for weight in weights]
-                logger.info("Weights normalized. Sorting indices by weight...")
-                
-                # Sort indices by weight for ranking
-                sorted_indices = sorted(range(len(weights)), key=lambda k: weights[k], reverse=True)
-                
-                # Apply sigmoid transformation
-                logger.info("Applying sigmoid transformation to weights...")
-                def sigmoid_transform(x, steepness=20):
-                    import math
-                    return 1 / (1 + math.exp(-steepness * (x - 0.5)))
-
-                # Calculate new weights based on rank position
-                new_weights = [0.0] * len(weights)
-                for rank, idx in enumerate(sorted_indices):
-                    normalized_rank = 1.0 - (rank / len(weights))
-                    new_weights[idx] = sigmoid_transform(normalized_rank)
-                logger.info("Sigmoid transformation applied. Normalizing new weights...")
-                
-                # Normalize to ensure sum = 1
-                total = sum(new_weights)
-                self.weights = [w / total for w in new_weights]
-                
-                # Log distribution stats
-                top_20_weight = sum(sorted(self.weights, reverse=True)[:int(len(weights)*0.2)])
-                logger.info(f"Weight distribution: top 20% of nodes hold {top_20_weight*100:.1f}% of total weight")
-                
-                # Store weights for later setting
-                self.weights = weights
-                logger.info("Scores calculated, waiting 50 blocks to set weights")
-                
-                # Wait 50 blocks before setting weights
-                await asyncio.sleep(50 * 12)
-                
-                # Set weights if enough blocks have passed since last setting
-                blocks_since_last = self.current_block - self.last_set_weights_block
-                logger.info(f"Blocks since last weight set: {blocks_since_last}")
-                
-                if blocks_since_last >= 250:
+                # Normalize and apply sigmoid transformation
+                if sum(weights) > 0:
+                    # Sort indices by weight for ranking
+                    sorted_indices = sorted(range(len(weights)), key=lambda k: weights[k], reverse=True)
+                    
+                    # Calculate new weights based on rank position
+                    new_weights = [0.0] * len(weights)
+                    for rank, idx in enumerate(sorted_indices):
+                        normalized_rank = 1.0 - (rank / len(weights))
+                        new_weights[idx] = 1 / (1 + math.exp(-20 * (normalized_rank - 0.5)))  # sigmoid with steepness=20
+                    
+                    # Normalize final weights
+                    total = sum(new_weights)
+                    self.weights = [w / total for w in new_weights]
+                    
+                    # Log distribution stats
+                    top_20_weight = sum(sorted(self.weights, reverse=True)[:int(len(weights)*0.2)])
+                    logger.info(f"Weight distribution: top 20% of nodes hold {top_20_weight*100:.1f}% of total weight")
+                    
+                    # Set weights on chain
                     logger.info("Setting weights on the chain...")
                     success = await self.set_weights(self.weights)
                     if success:
+                        self.last_set_weights_block = self.current_block
                         logger.info(f"Successfully set weights at block {self.current_block}")
                     else:
                         logger.error(f"Failed to set weights at block {self.current_block}")
                 else:
-                    logger.warning(f"Skipping weight setting, only {blocks_since_last} blocks since last set")
+                    logger.warning("All weights are zero, skipping weight setting")
                 
             except Exception as e:
                 logger.error(f"Error in main_scoring: {e}")

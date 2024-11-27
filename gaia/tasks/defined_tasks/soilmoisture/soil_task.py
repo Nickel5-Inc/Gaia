@@ -4,7 +4,6 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from gaia.tasks.base.components.metadata import Metadata
 from gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing import SoilMinerPreprocessing
-from gaia.tasks.defined_tasks.soilmoisture.soil_validator_preprocessing import SoilValidatorPreprocessing
 from gaia.tasks.defined_tasks.soilmoisture.soil_scoring_mechanism import SoilScoringMechanism
 from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import (
     SoilMoistureInputs,
@@ -22,8 +21,15 @@ import traceback
 import base64
 import json
 import asyncio
+import os
 
 logger = get_logger(__name__)
+
+# Conditional imports based on node type
+if os.environ.get("NODE_TYPE") == "validator":
+    from gaia.tasks.defined_tasks.soilmoisture.soil_validator_preprocessing import SoilValidatorPreprocessing
+else:
+    SoilValidatorPreprocessing = None  # type: ignore
 
 class SoilMoistureTask(Task):
     """Task for soil moisture prediction using satellite and weather data."""
@@ -37,11 +43,11 @@ class SoilMoistureTask(Task):
         description="Delay before scoring due to SMAP data latency",
     )
 
-    validator_preprocessing: Optional[SoilValidatorPreprocessing] = None
-    miner_preprocessing: Optional[SoilMinerPreprocessing] = None
+    validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None  # type: ignore
+    miner_preprocessing: Optional["SoilMinerPreprocessing"] = None  # type: ignore
     model: Optional[SoilModel] = None
 
-    def __init__(self, db_manager=None, node_type=None, **data):
+    def __init__(self, db_manager, node_type: str = "miner"):
         super().__init__(
             name="SoilMoistureTask",
             description="Soil moisture prediction task",
@@ -50,16 +56,16 @@ class SoilMoistureTask(Task):
             inputs=SoilMoistureInputs(),
             outputs=SoilMoistureOutputs(),
             scoring_mechanism=SoilScoringMechanism(),
-            **data
         )
 
+        self.db_manager = db_manager
+        self.node_type = node_type
+        
+        # Initialize appropriate preprocessing based on node type
         if node_type == "validator":
-            self.validator_preprocessing = SoilValidatorPreprocessing()
-            self.db = ValidatorDatabaseManager() if not db_manager else db_manager
-            logger.info("Initialized validator components for SoilMoistureTask")
-            
-        elif node_type == "miner":
-            self.miner_preprocessing = SoilMinerPreprocessing()
+            self.validator_preprocessing = SoilValidatorPreprocessing(db_manager)
+        else:
+            self.miner_preprocessing = SoilMinerPreprocessing(db_manager)
             self.model = self.miner_preprocessing.model
             logger.info("Initialized miner components for SoilMoistureTask")
 
@@ -115,7 +121,7 @@ class SoilMoistureTask(Task):
 
                 # If in execution window, query miners with prepared data
                 logger.info(f"In execution window for SMAP time: {target_smap_time}")
-                regions = await self.db.fetch_many(
+                regions = await self.db_manager.fetch_many(
                     """
                     SELECT * FROM soil_moisture_regions 
                     WHERE status = 'pending'
@@ -184,7 +190,7 @@ class SoilMoistureTask(Task):
                                 }
                                 await self.add_task_to_queue(responses, metadata)
 
-                                await self.db.execute(
+                                await self.db_manager.execute(
                                     """
                                     UPDATE soil_moisture_regions 
                                     SET status = 'sent_to_miners'
@@ -212,7 +218,7 @@ class SoilMoistureTask(Task):
     async def get_todays_regions(self, target_time: datetime) -> List[Dict]:
         """Get regions already selected for today."""
         try:
-            async with self.db.get_connection() as conn:
+            async with self.db_manager.get_connection() as conn:
                 regions = await conn.fetch(
                     """
                     SELECT * FROM soil_moisture_regions
@@ -305,7 +311,7 @@ class SoilMoistureTask(Task):
             SELECT uid, hotkey FROM node_table 
             WHERE hotkey IS NOT NULL
             """
-            miner_mappings = await self.db.fetch_many(query)
+            miner_mappings = await self.db_manager.fetch_many(query)
             hotkey_to_uid = {row['hotkey']: str(row['uid']) for row in miner_mappings}
             
             for miner_hotkey, response in responses.items():
@@ -335,7 +341,7 @@ class SoilMoistureTask(Task):
                         "status": "pending"
                     }
 
-                    await self.db.execute(
+                    await self.db_manager.execute(
                         """
                         INSERT INTO soil_moisture_predictions 
                         (region_id, miner_uid, miner_hotkey, target_time, surface_sm, rootzone_sm, 
@@ -367,7 +373,7 @@ class SoilMoistureTask(Task):
         scoring_time = datetime.now(timezone.utc) - self.scoring_delay
 
         try:
-            result = await self.db.fetch_many(
+            result = await self.db_manager.fetch_many(
                 """
                 SELECT 
                     r.*,
@@ -405,7 +411,7 @@ class SoilMoistureTask(Task):
             scores (Dict): Computed scores for each miner
         """
         try:
-            async with self.db.get_connection() as conn:
+            async with self.db_manager.get_connection() as conn:
                 for miner_id, score in scores.items():
                     await conn.execute(
                         """
