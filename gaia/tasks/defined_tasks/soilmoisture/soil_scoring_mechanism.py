@@ -2,8 +2,10 @@ from gaia.tasks.base.components.scoring_mechanism import ScoringMechanism
 from gaia.tasks.base.decorators import task_timer
 import numpy as np
 from typing import Dict, Optional
-import matplotlib.pyplot as plt
-
+from rasterio.coords import BoundingBox
+from rasterio.crs import CRS
+import torch.nn.functional as F
+from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 class SoilScoringMechanism(ScoringMechanism):
     """Scoring mechanism for soil moisture predictions."""
@@ -37,12 +39,7 @@ class SoilScoringMechanism(ScoringMechanism):
     ) -> dict:
         """
         Compute RMSE and SSIM between model predictions and SMAP data for valid pixels only.
-        """
-        from rasterio.coords import BoundingBox
-        from rasterio.crs import CRS
-        import torch.nn.functional as F
-        from torchmetrics.functional import structural_similarity_index_measure as ssim
-        
+        """       
         device = model_predictions.device
         sentinel_bounds = BoundingBox(left=bounds[0], bottom=bounds[1], right=bounds[2], top=bounds[3])
         sentinel_crs = CRS.from_epsg(int(crs))
