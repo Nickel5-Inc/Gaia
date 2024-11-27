@@ -346,7 +346,7 @@ def fetch_ifs_forecast(bbox, datetime_obj, sentinel_bounds=None, sentinel_crs=No
         base_url = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"
         time = "00z"
         
-        timesteps = range(6, 25, 6)  # 6, 12, 18, 24
+        timesteps = range(0, 19, 6)  # 0, 6, 12, 18
         urls = [
             f"{base_url}/{date_str}/{time}/ifs/0p25/oper/{date_str}000000-{step}h-oper-fc.grib2"
             for step in timesteps

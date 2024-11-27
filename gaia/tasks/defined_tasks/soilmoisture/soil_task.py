@@ -62,17 +62,15 @@ class SoilMoistureTask(Task):
             self.model = self.miner_preprocessing.model
             logger.info("Initialized miner components for SoilMoistureTask")
 
+        self._prepared_regions = {}  # Format: {target_time: regions_data}
+
     def get_next_valid_time(self, current_time: datetime) -> datetime:
         """Get next valid SMAP measurement time."""
         valid_times = [
             (1, 30),
-            (4, 30),
             (7, 30),
-            (10, 30),
             (13, 30),
-            (16, 30),
             (19, 30),
-            (22, 30),
         ]
         target_time = current_time + self.prediction_horizon
         current_hour = target_time.hour
@@ -93,30 +91,34 @@ class SoilMoistureTask(Task):
         """Execute validator workflow."""
         try:
             current_time = datetime.now(timezone.utc)
-            ifs_forecast_time = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
-            next_smap_time = ifs_forecast_time + timedelta(days=3)
+            
+            if not self.should_run_validator(current_time):
+                logger.info("Not a valid execution time, skipping")
+                return
 
-            logger.info("=== Starting Validator Execute ===")
-            logger.info(f"IFS forecast time: {ifs_forecast_time}")
-            logger.info(f"Target SMAP time: {next_smap_time}")
+            target_smap_time = self.get_smap_time_for_validator(current_time)
+            ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
+            
+            # If in preparation window, only collect data
+            if current_time.minute < 30:  # In preparation window
+                logger.info("In preparation window, collecting data...")
+                await self.validator_preprocessing.get_daily_regions(
+                    target_time=target_smap_time,
+                    ifs_forecast_time=ifs_forecast_time
+                )
+                return
 
-            # First get new regions and store them
-            logger.info("Calling get_daily_regions to collect and store new data...")
-            await self.validator_preprocessing.get_daily_regions(
-                target_time=next_smap_time,
-                ifs_forecast_time=ifs_forecast_time
-            )
-            logger.info("Finished get_daily_regions call")
-
-            # Then pull pending regions from DB
-            logger.info("Fetching pending regions from database...")
+            # If in execution window, query miners with prepared data
+            logger.info("In execution window, querying miners...")
             regions = await self.db.fetch_many(
                 """
                 SELECT * FROM soil_moisture_regions 
                 WHERE status = 'pending'
-                """
+                AND datetime = :target_time
+                """,
+                {"target_time": target_smap_time}
             )
-            logger.info(f"Found {len(regions) if regions else 0} pending regions in database")
+            logger.info(f"Found {len(regions) if regions else 0} pending regions for SMAP time {target_smap_time}")
 
             if regions:
                 for region in regions:
@@ -155,7 +157,7 @@ class SoilMoistureTask(Task):
                             'combined_data': encoded_data.decode('ascii'),
                             'sentinel_bounds': region['sentinel_bounds'],
                             'sentinel_crs': region['sentinel_crs'],
-                            'target_time': next_smap_time.isoformat()
+                            'target_time': target_smap_time.isoformat()
                         }
 
                         payload = {
@@ -172,7 +174,7 @@ class SoilMoistureTask(Task):
                         if responses:
                             metadata = {
                                 "region_id": region['id'],
-                                "target_time": next_smap_time,
+                                "target_time": target_smap_time,
                                 "data_collection_time": current_time,
                                 "ifs_forecast_time": ifs_forecast_time
                             }
@@ -287,13 +289,12 @@ class SoilMoistureTask(Task):
     async def add_task_to_queue(self, responses: Dict, metadata: Dict) -> None:
         """Add task responses to the database queue."""
         try:
-            # Get mapping of hotkeys to UIDs from node_table
             query = """
             SELECT uid, hotkey FROM node_table 
             WHERE hotkey IS NOT NULL
             """
             miner_mappings = await self.db.fetch_many(query)
-            hotkey_to_uid = {row['hotkey']: str(row['uid']) for row in miner_mappings}  # Convert UID to string
+            hotkey_to_uid = {row['hotkey']: str(row['uid']) for row in miner_mappings}
             
             for miner_hotkey, response in responses.items():
                 try:
@@ -302,17 +303,15 @@ class SoilMoistureTask(Task):
                         logger.warning(f"Miner hotkey {miner_hotkey} not found in node_table, skipping")
                         continue
                         
-                    miner_uid = hotkey_to_uid[miner_hotkey]  # Already a string from the mapping
+                    miner_uid = hotkey_to_uid[miner_hotkey]
                     response_data = json.loads(response['text'])
                     
-                    # Convert numpy arrays to database-compatible format
                     surface_sm = np.array(response_data["surface_sm"]).astype(np.float32).tolist()
                     rootzone_sm = np.array(response_data["rootzone_sm"]).astype(np.float32).tolist()
                     
-                    # Create prediction record
                     prediction_data = {
                         "region_id": metadata["region_id"],
-                        "miner_uid": miner_uid,  # Now guaranteed to be a string
+                        "miner_uid": miner_uid,
                         "miner_hotkey": miner_hotkey,
                         "target_time": metadata["target_time"],
                         "surface_sm": surface_sm,
@@ -454,3 +453,48 @@ class SoilMoistureTask(Task):
             raise RuntimeError("Model not initialized. Are you running on a miner node?")
             
         return self.miner_preprocessing.predict_smap(processed_data, self.model)
+
+    def should_run_validator(self, current_time: datetime) -> bool:
+        """Check if validator should run at current time."""
+        # Start data collection 30 mins before execution
+        validator_windows = [
+            (1, 30, 2, 0),    # Prep 1:30-2:00
+            (7, 0, 7, 30),    # Prep 7:00-7:30
+            (13, 30, 14, 0),  # Prep 13:30-14:00
+            (19, 0, 19, 30)   # Prep 19:00-19:30
+        ]
+        
+        for start_hr, start_min, end_hr, end_min in validator_windows:
+            start_time = current_time.replace(hour=start_hr, minute=start_min)
+            end_time = current_time.replace(hour=end_hr, minute=end_min)
+            
+            if start_time <= current_time <= end_time:
+                return True
+        return False
+
+    def get_ifs_time_for_smap(self, smap_time: datetime) -> datetime:
+        """Get corresponding IFS forecast time for SMAP target time."""
+        smap_to_ifs = {
+            1: 0,    # 01:30 uses 00:00 forecast
+            7: 6,    # 07:30 uses 06:00 forecast
+            13: 12,  # 13:30 uses 12:00 forecast
+            19: 18,  # 19:30 uses 18:00 forecast
+        }
+        ifs_hour = smap_to_ifs.get(smap_time.hour)
+        if ifs_hour is None:
+            raise ValueError(f"Invalid SMAP time: {smap_time.hour}:30")
+        return smap_time.replace(hour=ifs_hour, minute=0, second=0, microsecond=0)
+
+    def get_smap_time_for_validator(self, current_time: datetime) -> datetime:
+        """Get SMAP time based on validator execution time."""
+        validator_to_smap = {
+            2: 1,   # 02:00 validator → 01:30 SMAP
+            8: 7,   # 08:00 validator → 07:30 SMAP
+            14: 13, # 14:00 validator → 13:30 SMAP
+            20: 19  # 20:00 validator → 19:30 SMAP
+        }
+        smap_hour = validator_to_smap.get(current_time.hour)
+        if smap_hour is None:
+            raise ValueError(f"Invalid validator time: {current_time.hour}:00")
+        
+        return current_time.replace(hour=smap_hour, minute=30, second=0, microsecond=0)

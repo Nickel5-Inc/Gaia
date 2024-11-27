@@ -32,7 +32,7 @@ class SoilValidatorPreprocessing(Preprocessing):
             cell["index"] for cell in self._h3_data["lakes_overlay_cells"]
         )
         self._daily_regions = {}
-        self.max_daily_regions = 1
+        self.regions_per_timestep = 5
 
     def _load_h3_map(self):
         """Load H3 map data, first checking locally then from HuggingFace."""
@@ -58,11 +58,17 @@ class SoilValidatorPreprocessing(Preprocessing):
             logger.info("Using fallback local map...")
             raise RuntimeError("No H3 map available")
 
-    def _can_select_region(self) -> bool:
-        """Check if we can select more regions today."""
-        today = date.today()
-        count = self._daily_regions.get(today, 0)
-        return count < self.max_daily_regions
+    def _can_select_region(self, target_time: datetime) -> bool:
+        """Check if we can select more regions for this timestep."""
+        today = target_time.date()
+        hour = target_time.hour
+        
+        if today not in self._daily_regions:
+            self._daily_regions[today] = {}
+        if hour not in self._daily_regions[today]:
+            self._daily_regions[today][hour] = 0
+            
+        return self._daily_regions[today][hour] < self.regions_per_timestep
 
     def get_soil_data(self, bbox: Dict, current_time: datetime) -> Optional[Dict]:
         """Collect and prepare data for a given region."""
@@ -138,10 +144,8 @@ class SoilValidatorPreprocessing(Preprocessing):
     ) -> List[Dict]:
         """Get regions for today, selecting new ones if needed."""
         regions = []
-        today = date.today()
-        count = self._daily_regions.get(today, 0)
 
-        while self._can_select_region():
+        while self._can_select_region(target_time):
             try:
                 bbox = select_random_region(
                     base_cells=self._base_cells,
@@ -163,8 +167,7 @@ class SoilValidatorPreprocessing(Preprocessing):
                     region_id = await self.store_region(region_data, target_time)
                     region_data["id"] = region_id
                     regions.append(region_data)
-                    count += 1
-                    self._daily_regions[today] = count
+                    self._update_daily_count(target_time)
 
             except Exception as e:
                 logger.error(f"Error processing region: {str(e)}")
@@ -172,8 +175,14 @@ class SoilValidatorPreprocessing(Preprocessing):
 
         return regions
 
-    def _update_daily_count(self, date: date) -> None:
-        """Update daily region count."""
-        if date not in self._daily_regions:
-            self._daily_regions[date] = 0
-        self._daily_regions[date] += 1
+    def _update_daily_count(self, target_time: datetime) -> None:
+        """Update region count for specific timestep."""
+        today = target_time.date()
+        hour = target_time.hour
+        
+        if today not in self._daily_regions:
+            self._daily_regions[today] = {}
+        if hour not in self._daily_regions[today]:
+            self._daily_regions[today][hour] = 0
+            
+        self._daily_regions[today][hour] += 1
