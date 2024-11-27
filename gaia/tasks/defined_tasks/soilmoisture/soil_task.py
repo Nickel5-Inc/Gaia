@@ -129,11 +129,23 @@ class SoilMoistureTask(Task):
                             logger.error(f"Region {region['id']} has null combined_data")
                             continue
 
-                        logger.info(f"Region {region['id']} TIFF size: {len(region['combined_data']) / (1024 * 1024):.2f} MB")
+                        # Validate TIFF data retrieved from database
+                        combined_data = region['combined_data']
+                        if not isinstance(combined_data, bytes):
+                            logger.error(f"Region {region['id']} has invalid data type: {type(combined_data)}")
+                            continue
+
+                        if not (combined_data.startswith(b'II\x2A\x00') or combined_data.startswith(b'MM\x00\x2A')):
+                            logger.error(f"Region {region['id']} has invalid TIFF header")
+                            logger.error(f"First 16 bytes: {combined_data[:16].hex()}")
+                            continue
+
+                        logger.info(f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB")
+                        logger.info(f"Region {region['id']} TIFF header: {combined_data[:4]}")
 
                         task_data = {
                             'region_id': region['id'],
-                            'combined_data': region['combined_data'],
+                            'combined_data': combined_data,
                             'sentinel_bounds': region['sentinel_bounds'],
                             'sentinel_crs': region['sentinel_crs'],
                             'target_time': next_smap_time

@@ -80,48 +80,58 @@ class SoilValidatorPreprocessing(Preprocessing):
 
     async def store_region(self, region: Dict, target_time: datetime) -> int:
         """Store region data in database."""
-        logger.info(f"Storing region with bbox: {region['bbox']}")
-        
-        # Read the tiff file into bytes
-        with open(region["combined_data"], 'rb') as f:
-            combined_data_bytes = f.read()
-            logger.info(f"Read TIFF file, size: {len(combined_data_bytes) / (1024 * 1024):.2f} MB")
-        
-        sentinel_bounds = [float(x) for x in region["sentinel_bounds"]]
-        sentinel_crs = int(str(region["sentinel_crs"]).split(':')[-1])
-        
-        data = {
-            "region_date": target_time.date(),
-            "target_time": target_time,
-            "bbox": json.dumps(region["bbox"]),
-            "combined_data": combined_data_bytes,
-            "sentinel_bounds": sentinel_bounds,
-            "sentinel_crs": sentinel_crs,
-            "array_shape": region["array_shape"],
-            "status": "pending",
-        }
-
-        conn = await self.db.get_connection()
         try:
-            result = await conn.execute(
-                text("""
-                    INSERT INTO soil_moisture_regions 
-                    (region_date, target_time, bbox, combined_data, 
-                     sentinel_bounds, sentinel_crs, array_shape, status)
-                    VALUES (:region_date, :target_time, :bbox, :combined_data, 
-                            :sentinel_bounds, :sentinel_crs, :array_shape, :status)
-                    RETURNING id
-                """), 
-                data
-            )
-            region_id = result.scalar_one()
+            logger.info(f"Storing region with bbox: {region['bbox']}")
             
+            # Read and validate the tiff file
+            with open(region["combined_data"], 'rb') as f:
+                combined_data_bytes = f.read()
+                logger.info(f"Read TIFF file, size: {len(combined_data_bytes) / (1024 * 1024):.2f} MB")
+                
+                # Check TIFF header (supports both little-endian 'II' and big-endian 'MM' formats)
+                if not (combined_data_bytes.startswith(b'II\x2A\x00') or 
+                       combined_data_bytes.startswith(b'MM\x00\x2A')):
+                    logger.error("Invalid TIFF format: Missing TIFF header")
+                    logger.error(f"First 16 bytes: {combined_data_bytes[:16].hex()}")
+                    raise ValueError("Invalid TIFF format: File does not start with valid TIFF header")
+            
+            sentinel_bounds = [float(x) for x in region["sentinel_bounds"]]
+            sentinel_crs = int(str(region["sentinel_crs"]).split(':')[-1])
+            
+            data = {
+                "region_date": target_time.date(),
+                "target_time": target_time,
+                "bbox": json.dumps(region["bbox"]),
+                "combined_data": combined_data_bytes,
+                "sentinel_bounds": sentinel_bounds,
+                "sentinel_crs": sentinel_crs,
+                "array_shape": region["array_shape"],
+                "status": "pending",
+            }
 
-            
-            await conn.commit()
-            return region_id
-        finally:
-            await conn.close()
+            conn = await self.db.get_connection()
+            try:
+                result = await conn.execute(
+                    text("""
+                        INSERT INTO soil_moisture_regions 
+                        (region_date, target_time, bbox, combined_data, 
+                         sentinel_bounds, sentinel_crs, array_shape, status)
+                        VALUES (:region_date, :target_time, :bbox, :combined_data, 
+                                :sentinel_bounds, :sentinel_crs, :array_shape, :status)
+                        RETURNING id
+                    """), 
+                    data
+                )
+                region_id = result.scalar_one()
+                await conn.commit()
+                return region_id
+                
+            finally:
+                await conn.close()
+                
+        except Exception as e:
+            logger.error(f"Error storing region: {str(e)}")
+            raise RuntimeError(f"Failed to store region: {str(e)}")
 
     async def get_daily_regions(
         self, target_time: datetime, ifs_forecast_time: datetime

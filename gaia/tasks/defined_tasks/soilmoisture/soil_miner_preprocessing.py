@@ -56,34 +56,38 @@ class SoilMinerPreprocessing(Preprocessing):
         """Process combined tiff data for model input."""
         try:
             combined_data = data['combined_data']
-            logger.info(f"####Received hex data size: {len(combined_data)} bytes")
+            logger.info(f"####Received data type: {type(combined_data)}")
+            logger.info(f"####Received data size: {len(combined_data)} bytes")
             
-            # Convert hex string to bytes
+            # Convert hex string to bytes if needed
             if isinstance(combined_data, str):
                 try:
-                    # Remove any whitespace or newlines that might have been added
+                    # Remove any whitespace or newlines
                     combined_data = combined_data.strip()
-                    tiff_bytes = bytes.fromhex(combined_data)
+                    # Handle base64 encoding if present
+                    if combined_data.startswith('data:image/tiff;base64,'):
+                        import base64
+                        combined_data = combined_data.split(',')[1]
+                        tiff_bytes = base64.b64decode(combined_data)
+                    else:
+                        # Try hex decoding
+                        tiff_bytes = bytes.fromhex(combined_data)
                 except ValueError as e:
-                    logger.error(f"Error decoding hex string: {str(e)}")
-                    raise ValueError(f"Invalid hex string: {str(e)}")
+                    logger.error(f"Error decoding data: {str(e)}")
+                    logger.error(f"First 100 chars of data: {combined_data[:100]}")
+                    raise ValueError(f"Invalid data format: {str(e)}")
             else:
                 tiff_bytes = combined_data
             
-            logger.info(f"####Decoded TIFF size: {len(tiff_bytes)} bytes")
-            
-            # Verify TIFF magic number
-            if not (tiff_bytes.startswith(b'II\x2A\x00') or tiff_bytes.startswith(b'MM\x00\x2A')):
-                logger.error("Invalid TIFF format: Missing TIFF header")
-                raise ValueError("Invalid TIFF format: Missing TIFF header")
+            logger.info(f"####Decoded data size: {len(tiff_bytes)} bytes")
+            logger.info(f"####First 16 bytes: {tiff_bytes[:16].hex()}")
             
             # Create a temporary file to write the TIFF data
             with tempfile.NamedTemporaryFile(suffix='.tif', delete=False, mode='wb') as temp_file:
                 temp_file.write(tiff_bytes)
                 temp_file.flush()
-                os.fsync(temp_file.fileno())  # Ensure all data is written to disk
+                os.fsync(temp_file.fileno())
                 
-                # Open the temporary file with rasterio
                 try:
                     with rasterio.open(temp_file.name) as dataset:
                         logger.info(f"####Successfully opened TIFF with shape: {dataset.shape}")
@@ -101,20 +105,15 @@ class SoilMinerPreprocessing(Preprocessing):
                         return model_inputs
 
                 except rasterio.errors.RasterioIOError as e:
-                    # Log the first few bytes of the file for debugging
                     with open(temp_file.name, 'rb') as f:
                         header = f.read(16)
                     logger.error(f"TIFF header bytes: {header.hex()}")
                     raise
 
-        except ValueError as e:
-            logger.error(f"Error deserializing TIFF data: {str(e)}")
-            raise RuntimeError(f"Error deserializing TIFF data: {str(e)}")
         except Exception as e:
             logger.error(f"Error processing TIFF data: {str(e)}")
             raise RuntimeError(f"Error processing miner data: {str(e)}")
         finally:
-            # Clean up the temporary file
             if 'temp_file' in locals():
                 try:
                     os.unlink(temp_file.name)
