@@ -3,7 +3,7 @@ import os
 import asyncio
 import ssl
 import traceback
-from typing import Any, Optional, List
+from typing import Any, Optional, List, Dict
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import httpx
@@ -101,73 +101,88 @@ class GaiaValidator:
             logger.error(f"Error setting up neuron: {e}")
             return False
 
-    async def query_miners(self, payload: Any = None, endpoint: str = None):
-        """
-        Handle the miner querying logic.
-        Returns a list of responses from miners.
-        """
-        self.metagraph.sync_nodes()
-        responses = []  # Initialize empty list
+    def custom_serializer(self, obj):
+        """Custom JSON serializer for handling datetime objects and bytes."""
+        if isinstance(obj, (pd.Timestamp, datetime.datetime)):
+            return obj.isoformat()
+        elif isinstance(obj, bytes):
+            # For bytes, return a dictionary with encoding information
+            return {
+                '_type': 'bytes',
+                'encoding': 'base64',
+                'data': base64.b64encode(obj).decode('ascii')
+            }
+        raise TypeError(f"Type {type(obj)} not serializable")
 
-        # Convert payload to JSON-serializable format
-        if payload and isinstance(payload, dict):
-            try:
-                # Use custom serializer for JSON dumps
-                payload = json.loads(json.dumps(payload, default=self.custom_serializer))
-            except Exception as e:
-                logger.error(f"Error serializing payload: {e}")
-                return responses
+    async def query_miners(self, payload: Dict, endpoint: str) -> Dict:
+        """Query miners with the given payload."""
+        try:
+            logger.info(f"Querying miners with payload size: {len(str(payload))} bytes")
+            if 'data' in payload and 'combined_data' in payload['data']:
+                logger.info(f"TIFF data size before serialization: {len(payload['data']['combined_data'])} bytes")
+                if isinstance(payload['data']['combined_data'], bytes):
+                    logger.info(f"TIFF header before serialization: {payload['data']['combined_data'][:4]}")
 
-        for miner_hotkey, node in self.metagraph.nodes.items():
-            # Construct base URL properly
-            base_url = f"https://{node.ip}:{node.port}"
+            # Use json.dumps with the custom serializer
+            serialized_payload = json.dumps(payload, default=self.custom_serializer)
             
-            try:
-                symmetric_key_str, symmetric_key_uuid = await handshake.perform_handshake(
-                    keypair=self.keypair,
-                    httpx_client=self.httpx_client,
-                    server_address=base_url,
-                    miner_hotkey_ss58_address=miner_hotkey,
-                )
+            responses = {}
+            self.metagraph.sync_nodes()
 
-                if symmetric_key_str and symmetric_key_uuid:
-                    logger.info(f"Handshake successful with miner {miner_hotkey}")
-                    fernet = Fernet(symmetric_key_str)
-
-                    # Use json.dumps with custom encoder for the payload
-                    resp = await vali_client.make_non_streamed_post(
+            for miner_hotkey, node in self.metagraph.nodes.items():
+                # Construct base URL properly
+                base_url = f"https://{node.ip}:{node.port}"
+                
+                try:
+                    symmetric_key_str, symmetric_key_uuid = await handshake.perform_handshake(
+                        keypair=self.keypair,
                         httpx_client=self.httpx_client,
                         server_address=base_url,
-                        fernet=fernet,
-                        keypair=self.keypair,
-                        symmetric_key_uuid=symmetric_key_uuid,
-                        validator_ss58_address=self.keypair.ss58_address,
-                        miner_ss58_address=miner_hotkey,
-                        payload=payload,
-                        endpoint=endpoint,
+                        miner_hotkey_ss58_address=miner_hotkey,
                     )
-                    
-                    resp.raise_for_status()
-                    logger.debug(f"Response from miner {miner_hotkey}: {resp}")
-                    logger.debug(f"Response text from miner {miner_hotkey}: {resp.headers}")
-                    # Create a dictionary with both response text and metadata
-                    response_data = {
-                        'text': resp.text,
-                        'hotkey': miner_hotkey,
-                        'port': node.port,
-                        'ip': node.ip
-                    }
-                    responses.append(response_data)
-                    logger.info(f"Request sent to {miner_hotkey}! Response: {response_data}")
-                else:
-                    logger.warning(f"Failed handshake with miner {miner_hotkey}")
 
-            except Exception as e:
-                logger.error(f"Error with miner {miner_hotkey}: {e}")
-                logger.error(f"Error details: {traceback.format_exc()}")
-                continue  # Continue to next miner on error
+                    if symmetric_key_str and symmetric_key_uuid:
+                        logger.info(f"Handshake successful with miner {miner_hotkey}")
+                        fernet = Fernet(symmetric_key_str)
 
-        return responses  # Always return the list, even if empty
+                        # Use json.dumps with custom encoder for the payload
+                        resp = await vali_client.make_non_streamed_post(
+                            httpx_client=self.httpx_client,
+                            server_address=base_url,
+                            fernet=fernet,
+                            keypair=self.keypair,
+                            symmetric_key_uuid=symmetric_key_uuid,
+                            validator_ss58_address=self.keypair.ss58_address,
+                            miner_ss58_address=miner_hotkey,
+                            payload=serialized_payload,
+                            endpoint=endpoint,
+                        )
+                        
+                        resp.raise_for_status()
+                        logger.debug(f"Response from miner {miner_hotkey}: {resp}")
+                        logger.debug(f"Response text from miner {miner_hotkey}: {resp.headers}")
+                        # Create a dictionary with both response text and metadata
+                        response_data = {
+                            'text': resp.text,
+                            'hotkey': miner_hotkey,
+                            'port': node.port,
+                            'ip': node.ip
+                        }
+                        responses[miner_hotkey] = response_data
+                        logger.info(f"Request sent to {miner_hotkey}! Response: {response_data}")
+                    else:
+                        logger.warning(f"Failed handshake with miner {miner_hotkey}")
+
+                except Exception as e:
+                    logger.error(f"Error with miner {miner_hotkey}: {e}")
+                    logger.error(f"Error details: {traceback.format_exc()}")
+                    continue  # Continue to next miner on error
+
+            return responses  # Always return the list, even if empty
+
+        except Exception as e:
+            logger.error(f"Error in query_miners: {str(e)}")
+            return {}
 
     async def main(self):
         """
@@ -333,14 +348,6 @@ class GaiaValidator:
                 logger.error(f'{traceback.format_exc()}')
             finally:
                 await asyncio.sleep(60)  # Sleep at the end to ensure we always get the interval
-    
-    def custom_serializer(self, obj):
-        """Custom JSON serializer for handling datetime objects and bytes."""
-        if isinstance(obj, (pd.Timestamp, datetime.datetime)):
-            return obj.isoformat()
-        elif isinstance(obj, bytes):
-            return base64.b64encode(obj).decode('ascii')  # Convert bytes to base64 string
-        raise TypeError(f"Type {type(obj)} not serializable")
     
     async def update_miner_table(self):
         """Update the miner table with the latest miner information from the metagraph."""

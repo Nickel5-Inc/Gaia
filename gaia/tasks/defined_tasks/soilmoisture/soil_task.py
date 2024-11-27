@@ -19,6 +19,7 @@ from gaia.validator.database.validator_database_manager import ValidatorDatabase
 from sqlalchemy import text
 from gaia.models.soil_moisture_basemodel import SoilModel
 import traceback
+import base64
 
 logger = get_logger(__name__)
 
@@ -142,10 +143,16 @@ class SoilMoistureTask(Task):
 
                         logger.info(f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB")
                         logger.info(f"Region {region['id']} TIFF header: {combined_data[:4]}")
+                        logger.info(f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}")
+
+                        # Explicitly encode as base64
+                        encoded_data = base64.b64encode(combined_data)  # This returns bytes
+                        logger.info(f"Base64 first 16 chars: {encoded_data[:16]}")
 
                         task_data = {
                             'region_id': region['id'],
-                            'combined_data': combined_data,
+                            'combined_data': encoded_data,  # Send as bytes
+                            'encoding': 'base64',
                             'sentinel_bounds': region['sentinel_bounds'],
                             'sentinel_crs': region['sentinel_crs'],
                             'target_time': next_smap_time

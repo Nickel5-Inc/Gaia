@@ -13,6 +13,7 @@ import os
 import numpy as np
 from fiber.logging_utils import get_logger
 import tempfile
+import base64
 
 logger = get_logger(__name__)
 
@@ -57,34 +58,24 @@ class SoilMinerPreprocessing(Preprocessing):
         try:
             combined_data = data['combined_data']
             logger.info(f"####Received data type: {type(combined_data)}")
-            logger.info(f"####Received data size: {len(combined_data)} bytes")
             
-            # Convert hex string to bytes if needed
-            if isinstance(combined_data, str):
-                try:
-                    # Remove any whitespace or newlines
-                    combined_data = combined_data.strip()
-                    # Handle base64 encoding if present
-                    if combined_data.startswith('data:image/tiff;base64,'):
-                        import base64
-                        combined_data = combined_data.split(',')[1]
-                        tiff_bytes = base64.b64decode(combined_data)
-                        logger.info("####Decoded data as base64")
-                        logger.info(f"####Decoded data size: {len(tiff_bytes)} bytes")
-                    else:
-                        # Try hex decoding
-                        tiff_bytes = bytes.fromhex(combined_data)
-                        logger.info("####Decoded data as hex")
-                        logger.info(f"####Decoded data size: {len(tiff_bytes)} bytes")
-                except ValueError as e:
-                    logger.error(f"Error decoding data: {str(e)}")
-                    logger.error(f"First 100 chars of data: {combined_data[:100]}")
-                    raise ValueError(f"Invalid data format: {str(e)}")
+            # Handle structured byte data from validator
+            if isinstance(combined_data, dict) and combined_data.get('_type') == 'bytes':
+                encoding = combined_data.get('encoding')
+                encoded_data = combined_data.get('data')
+                logger.info(f"####Received structured data with {encoding} encoding")
+                
+                if encoding == 'base64':
+                    tiff_bytes = base64.b64decode(encoded_data)
+                else:
+                    raise ValueError(f"Unsupported encoding: {encoding}")
             else:
-                tiff_bytes = combined_data
-            
+                # Fallback for direct bytes or other formats
+                tiff_bytes = combined_data if isinstance(combined_data, bytes) else base64.b64decode(combined_data)
+                
             logger.info(f"####Decoded data size: {len(tiff_bytes)} bytes")
-            logger.info(f"####First 16 bytes: {tiff_bytes[:16].hex()}")
+            logger.info(f"####First 16 bytes hex: {tiff_bytes[:16].hex()}")
+            logger.info(f"####First 4 bytes raw: {tiff_bytes[:4]}")
             
             # Validate TIFF header before writing to file
             if not (tiff_bytes.startswith(b'II\x2A\x00') or tiff_bytes.startswith(b'MM\x00\x2A')):
