@@ -124,7 +124,9 @@ class SoilMinerPreprocessing(Preprocessing):
             raise RuntimeError(f"Error processing miner data: {str(e)}")
 
     def predict_smap(
-        self, model_inputs: Dict[str, torch.Tensor]
+        self, 
+        model_inputs: Dict[str, torch.Tensor],
+        model: Optional[SoilModel] = None
     ) -> Dict[str, np.ndarray]:
         """Run model inference to predict SMAP soil moisture.
 
@@ -141,6 +143,9 @@ class SoilMinerPreprocessing(Preprocessing):
                 - rootzone: [H, W] Root zone soil moisture predictions
         """
         try:
+            if model is None:
+                model = self._load_model()
+                
             with torch.no_grad():
                 sentinel = model_inputs["sentinel_ndvi"].unsqueeze(0)
                 era5 = model_inputs["era5"].unsqueeze(0)
@@ -149,7 +154,7 @@ class SoilMinerPreprocessing(Preprocessing):
                     dim=0,
                 ).unsqueeze(0)
 
-                outputs = self.model(sentinel, era5, elev_ndvi)
+                outputs = model(sentinel, era5, elev_ndvi)
                 mask = model_inputs["mask"].cpu().numpy()
                 predictions = {
                     "surface": outputs["surface_sm"].squeeze().cpu().numpy() * mask,
