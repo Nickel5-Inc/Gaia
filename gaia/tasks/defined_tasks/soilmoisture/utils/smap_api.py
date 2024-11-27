@@ -11,9 +11,11 @@ from skimage.transform import resize
 from tqdm import tqdm
 import shutil
 import matplotlib.pyplot as plt
+from dotenv import load_dotenv
 
-EARTHDATA_USERNAME = "username"
-EARTHDATA_PASSWORD = "password"
+load_dotenv()
+EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
+EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 BASE_URL = "https://n5eil01u.ecs.nsidc.org/SMAP/SPL4SMGP.007"
 
 
