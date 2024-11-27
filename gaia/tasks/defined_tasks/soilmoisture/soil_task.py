@@ -287,44 +287,64 @@ class SoilMoistureTask(Task):
     async def add_task_to_queue(self, responses: Dict, metadata: Dict) -> None:
         """Add task responses to the database queue."""
         try:
-            for miner_key, response in responses.items():
-                response_data = json.loads(response['text'])
-                
-                # Convert numpy arrays to database-compatible format
-                surface_sm = np.array(response_data["surface_sm"]).astype(np.float32).tolist()
-                rootzone_sm = np.array(response_data["rootzone_sm"]).astype(np.float32).tolist()
-                
-                # Create prediction record
-                prediction_data = {
-                    "region_id": metadata["region_id"],
-                    "miner_id": miner_key,
-                    "target_time": metadata["target_time"],
-                    "surface_sm": surface_sm,
-                    "rootzone_sm": rootzone_sm,
-                    "uncertainty_surface": response_data.get("uncertainty_surface"),
-                    "uncertainty_rootzone": response_data.get("uncertainty_rootzone"),
-                    "sentinel_bounds": response_data["sentinel_bounds"],
-                    "sentinel_crs": response_data["sentinel_crs"],
-                    "status": "pending"
-                }
+            # Get mapping of hotkeys to UIDs from node_table
+            query = """
+            SELECT uid, hotkey FROM node_table 
+            WHERE hotkey IS NOT NULL
+            """
+            miner_mappings = await self.db.fetch_many(query)
+            hotkey_to_uid = {row['hotkey']: str(row['uid']) for row in miner_mappings}  # Convert UID to string
+            
+            for miner_hotkey, response in responses.items():
+                try:
+                    # Validate miner hotkey exists in node_table
+                    if miner_hotkey not in hotkey_to_uid:
+                        logger.warning(f"Miner hotkey {miner_hotkey} not found in node_table, skipping")
+                        continue
+                        
+                    miner_uid = hotkey_to_uid[miner_hotkey]  # Already a string from the mapping
+                    response_data = json.loads(response['text'])
+                    
+                    # Convert numpy arrays to database-compatible format
+                    surface_sm = np.array(response_data["surface_sm"]).astype(np.float32).tolist()
+                    rootzone_sm = np.array(response_data["rootzone_sm"]).astype(np.float32).tolist()
+                    
+                    # Create prediction record
+                    prediction_data = {
+                        "region_id": metadata["region_id"],
+                        "miner_uid": miner_uid,  # Now guaranteed to be a string
+                        "miner_hotkey": miner_hotkey,
+                        "target_time": metadata["target_time"],
+                        "surface_sm": surface_sm,
+                        "rootzone_sm": rootzone_sm,
+                        "uncertainty_surface": response_data.get("uncertainty_surface"),
+                        "uncertainty_rootzone": response_data.get("uncertainty_rootzone"),
+                        "sentinel_bounds": response_data["sentinel_bounds"],
+                        "sentinel_crs": response_data["sentinel_crs"],
+                        "status": "pending"
+                    }
 
-                # Insert into database with correct PostgreSQL array syntax
-                await self.db.execute(
-                    """
-                    INSERT INTO soil_moisture_predictions 
-                    (region_id, miner_id, target_time, surface_sm, rootzone_sm, 
-                    uncertainty_surface, uncertainty_rootzone, sentinel_bounds, 
-                    sentinel_crs, status)
-                    VALUES 
-                    (:region_id, :miner_id, :target_time, 
-                    :surface_sm, :rootzone_sm,
-                    :uncertainty_surface, :uncertainty_rootzone, :sentinel_bounds,
-                    :sentinel_crs, :status)
-                    """,
-                    prediction_data
-                )
-                
-                logger.info(f"Stored predictions from miner {miner_key} for region {metadata['region_id']}")
+                    await self.db.execute(
+                        """
+                        INSERT INTO soil_moisture_predictions 
+                        (region_id, miner_uid, miner_hotkey, target_time, surface_sm, rootzone_sm, 
+                        uncertainty_surface, uncertainty_rootzone, sentinel_bounds, 
+                        sentinel_crs, status)
+                        VALUES 
+                        (:region_id, :miner_uid, :miner_hotkey, :target_time, 
+                        :surface_sm, :rootzone_sm,
+                        :uncertainty_surface, :uncertainty_rootzone, :sentinel_bounds,
+                        :sentinel_crs, :status)
+                        """,
+                        prediction_data
+                    )
+                    
+                    logger.info(f"Stored predictions from miner {miner_hotkey} (UID: {miner_uid}) for region {metadata['region_id']}")
+
+                except Exception as e:
+                    logger.error(f"Error processing response from miner {miner_hotkey}: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    continue
 
         except Exception as e:
             logger.error(f"Error storing predictions: {str(e)}")

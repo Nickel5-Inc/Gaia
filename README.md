@@ -54,11 +54,6 @@ pip install "git+https://github.com/rayonlabs/fiber.git@1.0.0#egg=fiber[full]"
 btcli subnets register --subtensor.network <NETWORK> --netuid <NETUID> --wallet.name <COLDKEY> --wallet.hotkey <HOTKEY>
 ```
 
-#### Post IP to chain -- IMPORTANT
-```bash
-fiber-post-ip --netuid <NETUID> --external_ip <YOUR_IP> --external_port <YOUR_PORT> --subtensor.network <NETWORK> --wallet.name <COLDKEY> --wallet.hotkey <HOTKEY> 
-```
--- You only need to do this once per key, but if you get deregistered or your IP changes, you'll need to re-post your IP. We recommend using a static IP for all nodes.
 
 
 #### Setup Proxy server
@@ -69,10 +64,24 @@ Gaia uses a Proxy server to handle connections to Validators. You can setup your
 ```
 
 - this will run as a background process, but it must be running for proper communication between Miners and Validators
+- IMPORTANT:the port argument is your external facing port, and the forwarding port is the INTERNAL port that the miner or validator will be using to communicate with the proxy server
+- the server name argument is optional and could be set to whatever you'd like
+
+#### Post IP to chain -- IMPORTANT
+```bash
+fiber-post-ip --netuid <NETUID> --external_ip <YOUR_IP> --external_port <YOUR_PORT> --subtensor.network <NETWORK> --wallet.name <COLDKEY> --wallet.hotkey <HOTKEY> 
+```
+-- You only need to do this once per key, but if you get deregistered or your IP changes, you'll need to re-post your IP. We recommend using a static IP for all nodes.
+-- make sure that you use the EXTERNAL port that you configured in the proxy server script above
+-- This will be automated in a future version, but for now you'll need to post your IP manually
 
 
-The port chosen here should match the port that you posted to the chain above. This will forward connections to the specified `--forwarding_port` which will be used when starting up the miner or validator (defaults to +1 of `--port`).
+## Starting Miner
+- further instructions are linked below, but ensure that you start the miner with the --port argument pointing to the FORWARDING/INTERNAL port configured in the proxy server script above.
 
+
+
+s
 
 ## Follow the Setup Guides for Miner or Validator
 [Miner](docs/MINER.md)

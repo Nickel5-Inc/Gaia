@@ -119,9 +119,9 @@ class GaiaValidator:
         try:
             logger.info(f"Querying miners with payload size: {len(str(payload))} bytes")
             if 'data' in payload and 'combined_data' in payload['data']:
-                logger.info(f"TIFF data size before serialization: {len(payload['data']['combined_data'])} bytes")
+                logger.debug(f"TIFF data size before serialization: {len(payload['data']['combined_data'])} bytes")
                 if isinstance(payload['data']['combined_data'], bytes):
-                    logger.info(f"TIFF header before serialization: {payload['data']['combined_data'][:4]}")
+                    logger.debug(f"TIFF header before serialization: {payload['data']['combined_data'][:4]}")
 
             
             responses = {}
@@ -156,8 +156,8 @@ class GaiaValidator:
                         )
                         
                         #resp.raise_for_status()
-                        logger.debug(f"Response from miner {miner_hotkey}: {resp}")
-                        logger.debug(f"Response text from miner {miner_hotkey}: {resp.headers}")
+                        #logger.debug(f"Response from miner {miner_hotkey}: {resp}")
+                        #logger.debug(f"Response text from miner {miner_hotkey}: {resp.headers}")
                         # Create a dictionary with both response text and metadata
                         response_data = {
                             'text': resp.text,
@@ -166,14 +166,24 @@ class GaiaValidator:
                             'ip': node.ip
                         }
                         responses[miner_hotkey] = response_data
-                        logger.info(f"Completed request to {miner_hotkey} Response: {response_data}")
+                        logger.info(f"Completed request to {miner_hotkey}")
                     else:
                         logger.warning(f"Failed handshake with miner {miner_hotkey}")
+                except httpx.HTTPStatusError as e:
+                    logger.warning(f"HTTP error from miner {miner_hotkey}: {e}")
+                    #logger.debug(f"Error details: {traceback.format_exc()}")
+                    continue  # Continue to next miner on error
+
+                except httpx.RequestError as e:
+                    logger.warning(f"Request error from miner {miner_hotkey}: {e}")
+                    #logger.debug(f"Error details: {traceback.format_exc()}")
+                    continue  # Continue to next miner on error
 
                 except Exception as e:
                     logger.error(f"Error with miner {miner_hotkey}: {e}")
                     logger.error(f"Error details: {traceback.format_exc()}")
                     continue  # Continue to next miner on error
+            
 
             return responses  # Always return the list, even if empty
 
@@ -246,7 +256,7 @@ class GaiaValidator:
                 await asyncio.sleep(blocks_until_scoring * 12)
                 
                 # Sync metagraph and calculate scores
-                self.metagraph.sync()
+                self.metagraph.sync_nodes()
                 geomagnetic_scores = await self.database_manager.get_recent_scores('geomagnetic')
                 soil_scores = await self.database_manager.get_recent_scores('soil')
                 

@@ -27,7 +27,8 @@
         "columns": {
             "id": "SERIAL PRIMARY KEY",
             "region_id": "INTEGER REFERENCES soil_moisture_regions(id) ON DELETE SET NULL",
-            "miner_id": "TEXT NOT NULL",
+            "miner_uid": "TEXT NOT NULL",
+            "miner_hotkey": "TEXT NOT NULL",
             "target_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
             "surface_sm": "FLOAT[][]",
             "rootzone_sm": "FLOAT[][]",
@@ -40,7 +41,8 @@
         },
         "indexes": [
             {"column": "region_id", "unique": false},
-            {"column": "miner_id", "unique": false},
+            {"column": "miner_uid", "unique": false},
+            {"column": "miner_hotkey", "unique": false},
             {"column": "target_time", "unique": false},
             {"column": "status", "unique": false}
         ],
@@ -58,7 +60,8 @@
         "columns": {
             "id": "SERIAL PRIMARY KEY",
             "region_id": "INTEGER REFERENCES soil_moisture_regions(id)",
-            "miner_id": "TEXT NOT NULL",
+            "miner_uid": "TEXT NOT NULL",
+            "miner_hotkey": "TEXT NOT NULL",
             "target_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
             "surface_sm_pred": "FLOAT[][]",
             "rootzone_sm_pred": "FLOAT[][]",
@@ -72,7 +75,8 @@
         },
         "indexes": [
             {"column": "region_id", "unique": false},
-            {"column": "miner_id", "unique": false},
+            {"column": "miner_uid", "unique": false},
+            {"column": "miner_hotkey", "unique": false},
             {"column": "target_time", "unique": false}
         ],
         "foreign_keys": [
