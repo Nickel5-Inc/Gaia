@@ -260,14 +260,45 @@ class GaiaValidator:
                 geomagnetic_scores = await self.database_manager.get_recent_scores('geomagnetic')
                 soil_scores = await self.database_manager.get_recent_scores('soil')
                 
-                # Initialize and calculate weights
-                weights = [0.0] * len(self.metagraph.uids)
-                for idx, uid in enumerate(self.metagraph.uids):
-                    hotkey = self.metagraph.hotkeys[idx]
-                    geo_score = geomagnetic_scores.get(hotkey, 0.0)
-                    soil_score = soil_scores.get(hotkey, 0.0)
-                    aggregate_score = (0.5 * geo_score) + (0.5 * soil_score)
-                    weights[idx] = max(0.0, min(1.0, aggregate_score))
+                # Calculate weights
+                weights = [0.0] * 256
+                for idx in range(256):
+                    aggregate_score = (0.5 * -geomagnetic_scores[idx]) + (0.5 * soil_scores[idx]) # invert geomagnetic scores as higher is worse
+                    weights[idx] = aggregate_score
+                
+                # Normalize weights to sum to 1
+                total_weight = sum(weights)
+                if total_weight > 0:
+                    weights = [weight / total_weight for weight in weights]
+                
+                # Sort indices by weight for ranking
+                sorted_indices = sorted(range(len(weights)), key=lambda k: weights[k], reverse=True)
+                
+                # Apply sigmoid transformation
+                def sigmoid_transform(x, steepness=20):  # Increased steepness from 10 to 20
+                    """
+                    Transform normalized rank (0-1) to weight using sigmoid.
+                    Adjusted steepness to better approximate 80/20 rule:
+                    - steepness=10 -> top 20% get ~70% of weight
+                    - steepness=20 -> top 20% get ~80% of weight
+                    - steepness=30 -> top 20% get ~85% of weight
+                    """
+                    import math
+                    return 1 / (1 + math.exp(-steepness * (x - 0.5)))
+
+                # Calculate new weights based on rank position
+                new_weights = [0.0] * len(weights)
+                for rank, idx in enumerate(sorted_indices):
+                    normalized_rank = 1.0 - (rank / len(weights))
+                    new_weights[idx] = sigmoid_transform(normalized_rank)
+                
+                # Normalize to ensure sum = 1
+                total = sum(new_weights)
+                self.weights = [w / total for w in new_weights]
+                
+                # Log distribution stats
+                top_20_weight = sum(sorted(self.weights, reverse=True)[:int(len(weights)*0.2)])
+                logger.info(f"Weight distribution: top 20% of nodes hold {top_20_weight*100:.1f}% of total weight")
                 
                 # Store weights for later setting
                 self.weights = weights
@@ -332,7 +363,7 @@ class GaiaValidator:
                     current_block = block['header']['number']
                     blocks_since_weights = current_block - self.last_set_weights_block
                 except Exception as block_error:
-                    logger.error(f"Failed to get current block: {block_error}")
+                    logger.warning(f"Failed to get current block: {block_error}")
                     # Try to reconnect to substrate
                     try:
                         self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
@@ -344,11 +375,14 @@ class GaiaValidator:
                 
                 active_nodes = len(self.metagraph.nodes) if self.metagraph else 0
                 
-                logger.info(f"Status Update:")
-                logger.info(f"Current time (UTC): {formatted_time}")
-                logger.info(f"Current block: {current_block}")
-                logger.info(f"Active nodes: {active_nodes}/256")
-                logger.info(f"Last set weights: {blocks_since_weights} blocks ago")
+                logger.info(
+                    f"\n"
+                    f"---Status Update ---\n "
+                    f"Time (UTC): {formatted_time} | \n"
+                    f"Block: {current_block} | \n"
+                    f"Nodes: {active_nodes}/256 | \n"
+                    f"Weights Set: {blocks_since_weights} blocks ago"
+                )
                 
             except Exception as e:
                 logger.error(f"Error in status logger: {e}")

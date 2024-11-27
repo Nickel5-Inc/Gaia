@@ -1,4 +1,5 @@
 import traceback
+import numpy as np
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
@@ -475,36 +476,40 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         results = await self.fetch_many(query)
         return [dict(row) for row in results]
 
-    async def get_recent_scores(self, task_type: str, window_hours: int = 24) -> dict:
+    async def get_recent_scores(self, task_type: str, window_hours: int = 24) -> list:
         """
-        Get the most recent scores for each miner for a specific task type.
+        Get the most recent scores from score_table for a specific task type.
         
         Args:
             task_type (str): Type of task ('geomagnetic' or 'soil')
             window_hours (int): Hours of history to consider
         
         Returns:
-            dict: Dictionary mapping hotkey to their most recent score
+            list: Array of 256 scores where index corresponds to node index
         """
         try:
             query = """
-                SELECT hotkey, score 
-                FROM task_scores 
-                WHERE task_type = :task_type 
-                AND timestamp > NOW() - interval :window_hours hours
-                AND score IS NOT NULL
-                ORDER BY timestamp DESC
+                SELECT score 
+                FROM score_table 
+                WHERE task_name = :task_type 
+                AND created_at > NOW() - interval :window_hours hour
+                AND status = 'completed'
+                ORDER BY created_at DESC 
+                LIMIT 1
             """
             
-            scores = {}
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, task_type, window_hours)
-                for row in rows:
-                    if row['hotkey'] not in scores:  # Take first (most recent) score for each hotkey
-                        scores[row['hotkey']] = float(row['score'])
+            result = await self.fetch_one(query, {
+                "task_type": task_type,
+                "window_hours": window_hours
+            })
+
+            if not result:
+                logger.warning(f"No recent scores found for task type: {task_type}")
+                return [0.0] * 256  # Return zero scores if no data found
             
-            return scores
-        
+            return result['score']
+            
         except Exception as e:
             logger.error(f"Error getting recent scores: {e}")
-            return {}
+            logger.error(traceback.format_exc())
+            return [0.0] * 256

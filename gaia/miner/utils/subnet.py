@@ -54,8 +54,8 @@ def factory_router(miner_instance) -> APIRouter:
                 logger.info(f"Received data: {decrypted_payload.data}")
                 response_data = decrypted_payload.model_dump()
                 geomagnetic_task = GeomagneticTask()
-                logger.info(f"Received response data: {response_data}")
-                logger.info(f"Miner executing...")
+                #logger.info(f"Received response data: {response_data}")
+                logger.info(f"Miner executing geomagnetic prediction ...")
                 result = geomagnetic_task.miner_execute(response_data, miner_instance)
                 logger.info(f"Miner execution completed: {result}")
 
