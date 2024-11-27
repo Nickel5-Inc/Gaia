@@ -46,6 +46,8 @@ class SoilMoistureTask(Task):
     validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None  # type: ignore
     miner_preprocessing: Optional["SoilMinerPreprocessing"] = None  # type: ignore
     model: Optional[SoilModel] = None
+    db_manager: Any = Field(default=None)
+    node_type: str = Field(default="miner")
 
     def __init__(self, db_manager, node_type: str = "miner"):
         super().__init__(
