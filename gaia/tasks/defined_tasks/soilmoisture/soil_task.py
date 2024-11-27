@@ -220,6 +220,7 @@ class SoilMoistureTask(Task):
             return {
                 "surface_sm": predictions["surface"],
                 "rootzone_sm": predictions["rootzone"],
+                "miner_hotkey": miner.keypair.ss58_address,
                 "uncertainty_surface": None,
                 "uncertainty_rootzone": None,
                 "sentinel_bounds": data["bounds"],
