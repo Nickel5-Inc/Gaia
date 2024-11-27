@@ -20,6 +20,7 @@ from sqlalchemy import text
 from gaia.models.soil_moisture_basemodel import SoilModel
 import traceback
 import base64
+import json
 
 logger = get_logger(__name__)
 
@@ -283,34 +284,51 @@ class SoilMoistureTask(Task):
         """Preprocess data for model input."""
         pass
 
-    async def add_task_to_queue(self, predictions: Dict, metadata: Dict):
-        """Add miner predictions to database for later scoring."""
+    async def add_task_to_queue(self, responses: Dict, metadata: Dict) -> None:
+        """Add task responses to the database queue."""
         try:
-            predictions_data = [
-                {
+            for miner_key, response in responses.items():
+                response_data = json.loads(response['text'])
+                
+                # Convert numpy arrays to database-compatible format
+                surface_sm = np.array(response_data["surface_sm"]).astype(np.float32).tolist()
+                rootzone_sm = np.array(response_data["rootzone_sm"]).astype(np.float32).tolist()
+                
+                # Create prediction record
+                prediction_data = {
                     "region_id": metadata["region_id"],
-                    "miner_id": miner_id,
+                    "miner_id": miner_key,
                     "target_time": metadata["target_time"],
-                    "surface_sm": pred["surface_sm"],
-                    "rootzone_sm": pred["rootzone_sm"],
-                    "uncertainty_surface": pred.get("uncertainty_surface"),
-                    "uncertainty_rootzone": pred.get("uncertainty_rootzone")
+                    "surface_sm": surface_sm,
+                    "rootzone_sm": rootzone_sm,
+                    "uncertainty_surface": response_data.get("uncertainty_surface"),
+                    "uncertainty_rootzone": response_data.get("uncertainty_rootzone"),
+                    "sentinel_bounds": response_data["sentinel_bounds"],
+                    "sentinel_crs": response_data["sentinel_crs"],
+                    "status": "pending"
                 }
-                for miner_id, pred in predictions.items()
-            ]
-            
-            await self.db.execute_many(
-                """
-                INSERT INTO soil_moisture_predictions 
-                (region_id, miner_id, target_time, surface_sm, rootzone_sm, 
-                 uncertainty_surface, uncertainty_rootzone)
-                VALUES (:region_id, :miner_id, :target_time, :surface_sm, 
-                       :rootzone_sm, :uncertainty_surface, :uncertainty_rootzone)
-                """,
-                predictions_data
-            )
+
+                # Insert into database with correct PostgreSQL array syntax
+                await self.db.execute(
+                    """
+                    INSERT INTO soil_moisture_predictions 
+                    (region_id, miner_id, target_time, surface_sm, rootzone_sm, 
+                    uncertainty_surface, uncertainty_rootzone, sentinel_bounds, 
+                    sentinel_crs, status)
+                    VALUES 
+                    (:region_id, :miner_id, :target_time, 
+                    :surface_sm, :rootzone_sm,
+                    :uncertainty_surface, :uncertainty_rootzone, :sentinel_bounds,
+                    :sentinel_crs, :status)
+                    """,
+                    prediction_data
+                )
+                
+                logger.info(f"Stored predictions from miner {miner_key} for region {metadata['region_id']}")
+
         except Exception as e:
             logger.error(f"Error storing predictions: {str(e)}")
+            logger.error(traceback.format_exc())
             raise
 
     async def get_pending_tasks(self):

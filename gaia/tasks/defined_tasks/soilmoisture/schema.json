@@ -35,13 +35,14 @@
             "uncertainty_rootzone": "FLOAT[][]",
             "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
             "sentinel_bounds": "FLOAT[]",
-            "status": "TEXT NOT NULL DEFAULT 'pending'",
-            "sentinel_crs": "INTEGER"
+            "sentinel_crs": "INTEGER",
+            "status": "TEXT NOT NULL DEFAULT 'pending'"
         },
         "indexes": [
             {"column": "region_id", "unique": false},
             {"column": "miner_id", "unique": false},
-            {"column": "target_time", "unique": false}
+            {"column": "target_time", "unique": false},
+            {"column": "status", "unique": false}
         ],
         "foreign_keys": [
             {
