@@ -14,6 +14,7 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
 from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoisturePrediction
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+import traceback
 
 # Define max request size (5MB in bytes)
 MAX_REQUEST_SIZE = 5 * 1024 * 1024  # 5MB
@@ -75,10 +76,11 @@ def factory_router(miner_instance) -> APIRouter:
 
     async def soilmoisture_require(
         decrypted_payload: SoilmoistureRequest = Depends(
-            partial(decrypt_general_payload, SoilmoistureRequest),
+            partial(decrypt_general_payload, SoilmoistureRequest)
         ),
     ):
-        logger.info(f"Received soil moisture request")
+        """Handle soil moisture prediction requests."""
+        logger.info("Received soil moisture request")
         try:
             if decrypted_payload.data:
                 soil_task = SoilMoistureTask(node_type="miner")
@@ -87,7 +89,7 @@ def factory_router(miner_instance) -> APIRouter:
                     "nonce": decrypted_payload.nonce
                 }
                 
-                result = soil_task.miner_execute(payload_data, miner_instance)
+                result = await soil_task.miner_execute(payload_data, miner_instance)
                 
                 if result is None:
                     return JSONResponse(
@@ -95,11 +97,11 @@ def factory_router(miner_instance) -> APIRouter:
                         content={"error": "Failed to process soil moisture prediction"}
                     )
                     
-                prediction = SoilMoisturePrediction(**result)
-                return JSONResponse(content=prediction.model_dump())
+                return JSONResponse(content=result)
                 
         except Exception as e:
             logger.error(f"Error processing soil moisture request: {str(e)}")
+            logger.error(traceback.format_exc())
             return JSONResponse(
                 status_code=500,
                 content={"error": str(e)}

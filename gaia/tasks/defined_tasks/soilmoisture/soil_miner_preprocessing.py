@@ -26,32 +26,38 @@ class SoilMinerPreprocessing(Preprocessing):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.preprocessor = SoilMoistureInferencePreprocessor()
-        self.model = None
+        self.model = self._load_model()
 
     def _load_model(self) -> SoilModel:
         """Load model weights from local path or HuggingFace."""
         try:
-            if self.model is None:
-                self.model = SoilModel()
-                local_path = 'tasks/defined_tasks/soilmoisture/model.safetensors'
-                
-                if os.path.exists(local_path):
-                    state_dict = safetensors.torch.load_file(local_path)
-                else:
-                    logger.info("Local weights not found, downloading from HuggingFace...")
-                    weights_path = hf_hub_download(
-                        repo_id="Nickel5HF/soil-moisture-model",
-                        filename="model.safetensors"
-                    )
-                    state_dict = safetensors.torch.load_file(weights_path)
+            local_path = 'tasks/defined_tasks/soilmoisture/SoilModel.ckpt'
+            
+            if os.path.exists(local_path):
+                logger.info(f"Loading model from local path: {local_path}")
+                model = SoilModel.load_from_checkpoint(local_path)
+            else:
+                logger.info("Local checkpoint not found, downloading from HuggingFace...")
+                checkpoint_path = hf_hub_download(
+                    repo_id="Nickel5HF/soil-moisture-model",
+                    filename="SoilModel.ckpt",
+                    local_dir='tasks/defined_tasks/soilmoisture/'
+                )
+                logger.info(f"Loading model from HuggingFace: {checkpoint_path}")
+                model = SoilModel.load_from_checkpoint(checkpoint_path)
 
-                self.model.load_state_dict(state_dict)
-                self.model.to(self.device)
-                self.model.eval()
-            return self.model
+            model.to(self.device)
+            model.eval()
+
+            param_count = sum(p.numel() for p in model.parameters())
+            logger.info(f"Model loaded successfully with {param_count:,} parameters")
+            logger.info(f"Model device: {next(model.parameters()).device}")
+            
+            return model
 
         except Exception as e:
             logger.error(f"Error loading model: {str(e)}")
+            logger.error(traceback.format_exc())
             raise RuntimeError(f"Failed to load model weights: {str(e)}")
 
     def process_miner_data(self, data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
@@ -59,9 +65,8 @@ class SoilMinerPreprocessing(Preprocessing):
         try:
             combined_data = data['combined_data']
             logger.info(f"####Received data type: {type(combined_data)}")
-            logger.info(f"####Received data: {combined_data[:100]}")  # Log first 100 chars
-            
-            # Always treat as base64 string first
+            logger.info(f"####Received data: {combined_data[:100]}")
+
             try:
                 tiff_bytes = base64.b64decode(combined_data)
             except Exception as e:

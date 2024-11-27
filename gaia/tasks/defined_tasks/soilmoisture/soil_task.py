@@ -10,7 +10,7 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import (
     SoilMoistureInputs,
     SoilMoisturePayload,
 )
-from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoistureOutputs
+from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoistureOutputs, SoilMoisturePrediction
 from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMetadata
 from pydantic import Field
 from fiber.logging_utils import get_logger
@@ -58,7 +58,7 @@ class SoilMoistureTask(Task):
             
         elif node_type == "miner":
             self.miner_preprocessing = SoilMinerPreprocessing()
-            self.model = SoilModel()
+            self.model = self.miner_preprocessing.model
             logger.info("Initialized miner components for SoilMoistureTask")
 
     def get_next_valid_time(self, current_time: datetime) -> datetime:
@@ -211,21 +211,57 @@ class SoilMoistureTask(Task):
             logger.error(f"Error getting today's regions: {str(e)}")
             return []
 
-    async def miner_execute(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    async def miner_execute(self, data: Dict[str, Any], miner) -> Dict[str, Any]:
         """Execute miner workflow."""
         try:
-            processed_data = self.miner_preprocessing.process_miner_data(data)
+            processed_data = self.miner_preprocessing.process_miner_data(data['data'])
             predictions = self.run_model_inference(processed_data)
-
+            try:
+                import matplotlib.pyplot as plt
+                import numpy as np
+                
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                surface_plot = ax1.imshow(predictions["surface"], cmap='viridis')
+                ax1.set_title('Surface Soil Moisture')
+                plt.colorbar(surface_plot, ax=ax1, label='Moisture Content')
+                rootzone_plot = ax2.imshow(predictions["rootzone"], cmap='viridis')
+                ax2.set_title('Root Zone Soil Moisture')
+                plt.colorbar(rootzone_plot, ax=ax2, label='Moisture Content')
+                
+                plt.tight_layout()
+                plt.savefig('soil_moisture_predictions.png')
+                plt.close()
+                
+                logger.info("Saved prediction visualization to soil_moisture_predictions.png")
+                logger.info(f"Surface moisture stats - Min: {predictions['surface'].min():.3f}, "
+                          f"Max: {predictions['surface'].max():.3f}, "
+                          f"Mean: {predictions['surface'].mean():.3f}")
+                logger.info(f"Root zone moisture stats - Min: {predictions['rootzone'].min():.3f}, "
+                          f"Max: {predictions['rootzone'].max():.3f}, "
+                          f"Mean: {predictions['rootzone'].mean():.3f}")
+                
+            except Exception as e:
+                logger.error(f"Error creating visualization: {str(e)}")
+            target_time = data['data']["target_time"]
+            if isinstance(target_time, datetime):
+                pass
+            elif isinstance(target_time, str):
+                target_time = datetime.fromisoformat(target_time)
+            else:
+                logger.error(f"Unexpected target_time type: {type(target_time)}")
+                raise ValueError(f"Unexpected target_time format: {target_time}")
+            
+            prediction_time = self.get_next_valid_time(target_time)
+            
             return {
-                "surface_sm": predictions["surface"],
-                "rootzone_sm": predictions["rootzone"],
-                "miner_hotkey": miner.keypair.ss58_address,
+                "surface_sm": predictions["surface"].tolist(),
+                "rootzone_sm": predictions["rootzone"].tolist(),
                 "uncertainty_surface": None,
                 "uncertainty_rootzone": None,
-                "sentinel_bounds": data["bounds"],
-                "sentinel_crs": data["crs"],
-                "target_time": data["target_time"]
+                "miner_hotkey": miner.keypair.ss58_address,
+                "sentinel_bounds": data['data']["sentinel_bounds"],
+                "sentinel_crs": data['data']["sentinel_crs"],
+                "target_time": prediction_time.isoformat()
             }
 
         except Exception as e:
