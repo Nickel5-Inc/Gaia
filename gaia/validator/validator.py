@@ -280,6 +280,7 @@ class GaiaValidator:
                     aggregate_score = (0.5 * -geomagnetic_scores[idx]) + (0.5 * soil_scores[idx]) # invert geomagnetic scores as higher is worse
                     weights[idx] = aggregate_score
                 
+                logger.info(f"Weights before normalization: {weights}")
                 # Normalize and apply sigmoid transformation
                 if sum(weights) > 0:
                     # Sort indices by weight for ranking
@@ -299,6 +300,7 @@ class GaiaValidator:
                     top_20_weight = sum(sorted(self.weights, reverse=True)[:int(len(weights)*0.2)])
                     logger.info(f"Weight distribution: top 20% of nodes hold {top_20_weight*100:.1f}% of total weight")
                     
+                    logger.info(f"Weights: {self.weights}")
                     # Set weights on chain
                     logger.info("Setting weights on the chain...")
                     success = await self.set_weights(self.weights)
