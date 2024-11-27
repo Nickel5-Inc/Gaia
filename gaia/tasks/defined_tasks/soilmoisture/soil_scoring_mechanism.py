@@ -1,11 +1,17 @@
+import datetime
+from distutils import core
+import tempfile
 from gaia.tasks.base.components.scoring_mechanism import ScoringMechanism
 from gaia.tasks.base.decorators import task_timer
 import numpy as np
 from typing import Dict, Optional
 from rasterio.coords import BoundingBox
 from rasterio.crs import CRS
+import torch
 import torch.nn.functional as F
 from torchmetrics.functional import structural_similarity_index_measure as ssim
+
+from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import construct_smap_url, download_smap_data, get_smap_data_for_sentinel_bounds
 
 class SoilScoringMechanism(ScoringMechanism):
     """Scoring mechanism for soil moisture predictions."""
@@ -29,7 +35,8 @@ class SoilScoringMechanism(ScoringMechanism):
         self, predictions: np.ndarray, ground_truth: np.ndarray
     ) -> Dict[str, float]:
         """Score predictions against ground truth."""
-        return score
+
+        pass
 
     def compute_smap_score_metrics(
         bounds: tuple[float, float, float, float],
