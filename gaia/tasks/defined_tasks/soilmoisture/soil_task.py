@@ -1,7 +1,7 @@
 from gaia.tasks.base.task import Task
 from datetime import datetime, timedelta, timezone
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from gaia.tasks.base.components.metadata import Metadata
 from gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing import SoilMinerPreprocessing
 from gaia.tasks.defined_tasks.soilmoisture.soil_validator_preprocessing import SoilValidatorPreprocessing
@@ -211,22 +211,26 @@ class SoilMoistureTask(Task):
             logger.error(f"Error getting today's regions: {str(e)}")
             return []
 
-    def miner_execute(self, data, miner):
+    async def miner_execute(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Execute miner workflow."""
         try:
-            processed_data = self.miner_preprocessing.process_miner_data(data['data'])
+            processed_data = self.miner_preprocessing.process_miner_data(data)
             predictions = self.run_model_inference(processed_data)
 
             return {
-                "surface_sm": float(predictions["surface"]),
-                "rootzone_sm": float(predictions["rootzone"]),
-                "miner_hotkey": miner.keypair.ss58_address
+                "surface_sm": predictions["surface"],
+                "rootzone_sm": predictions["rootzone"],
+                "uncertainty_surface": None,
+                "uncertainty_rootzone": None,
+                "sentinel_bounds": data["bounds"],
+                "sentinel_crs": data["crs"],
+                "target_time": data["target_time"]
             }
 
         except Exception as e:
             logger.error(f"Error in miner execution: {str(e)}")
-            logger.error(f'{traceback.format_exc()}')
-            return None
+            logger.error(traceback.format_exc())
+            raise
 
     def score_predictions(self, predictions: Dict, ground_truth: Dict) -> Dict:
         """
