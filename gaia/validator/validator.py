@@ -123,14 +123,11 @@ class GaiaValidator:
                 if isinstance(payload['data']['combined_data'], bytes):
                     logger.info(f"TIFF header before serialization: {payload['data']['combined_data'][:4]}")
 
-            # Use json.dumps with the custom serializer
-            serialized_payload = json.dumps(payload, default=self.custom_serializer)
-            
+            # Don't serialize the payload here - let the client handle it
             responses = {}
             self.metagraph.sync_nodes()
 
             for miner_hotkey, node in self.metagraph.nodes.items():
-                # Construct base URL properly
                 base_url = f"https://{node.ip}:{node.port}"
                 
                 try:
@@ -145,7 +142,7 @@ class GaiaValidator:
                         logger.info(f"Handshake successful with miner {miner_hotkey}")
                         fernet = Fernet(symmetric_key_str)
 
-                        # Use json.dumps with custom encoder for the payload
+                        # Pass the original payload dict
                         resp = await vali_client.make_non_streamed_post(
                             httpx_client=self.httpx_client,
                             server_address=base_url,
@@ -154,7 +151,7 @@ class GaiaValidator:
                             symmetric_key_uuid=symmetric_key_uuid,
                             validator_ss58_address=self.keypair.ss58_address,
                             miner_ss58_address=miner_hotkey,
-                            payload=serialized_payload,
+                            payload=payload,  # Pass the original dict
                             endpoint=endpoint,
                         )
                         

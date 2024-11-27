@@ -58,20 +58,15 @@ class SoilMinerPreprocessing(Preprocessing):
         try:
             combined_data = data['combined_data']
             logger.info(f"####Received data type: {type(combined_data)}")
+            logger.info(f"####Received data: {combined_data[:100]}")  # Log first 100 chars
             
-            # Handle structured byte data from validator
-            if isinstance(combined_data, dict) and combined_data.get('_type') == 'bytes':
-                encoding = combined_data.get('encoding')
-                encoded_data = combined_data.get('data')
-                logger.info(f"####Received structured data with {encoding} encoding")
-                
-                if encoding == 'base64':
-                    tiff_bytes = base64.b64decode(encoded_data)
-                else:
-                    raise ValueError(f"Unsupported encoding: {encoding}")
-            else:
-                # Fallback for direct bytes or other formats
-                tiff_bytes = combined_data if isinstance(combined_data, bytes) else base64.b64decode(combined_data)
+            # Always treat as base64 string first
+            try:
+                tiff_bytes = base64.b64decode(combined_data)
+            except Exception as e:
+                logger.error(f"Failed to decode base64: {str(e)}")
+                # If base64 decode fails, try direct bytes
+                tiff_bytes = combined_data if isinstance(combined_data, bytes) else combined_data.encode('utf-8')
                 
             logger.info(f"####Decoded data size: {len(tiff_bytes)} bytes")
             logger.info(f"####First 16 bytes hex: {tiff_bytes[:16].hex()}")

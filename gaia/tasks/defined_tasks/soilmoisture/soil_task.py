@@ -151,14 +151,11 @@ class SoilMoistureTask(Task):
 
                         task_data = {
                             'region_id': region['id'],
-                            'combined_data': encoded_data,  # Send as bytes
-                            'encoding': 'base64',
+                            'combined_data': encoded_data.decode('ascii'),
                             'sentinel_bounds': region['sentinel_bounds'],
                             'sentinel_crs': region['sentinel_crs'],
-                            'target_time': next_smap_time
+                            'target_time': next_smap_time.isoformat()
                         }
-
-                        logger.info(f"Payload TIFF size before sending: {len(task_data['combined_data']) / (1024 * 1024):.2f} MB")
 
                         payload = {
                             "nonce": str(uuid4()),
