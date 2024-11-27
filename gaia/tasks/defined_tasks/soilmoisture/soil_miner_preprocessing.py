@@ -124,18 +124,15 @@ class SoilMinerPreprocessing(Preprocessing):
             raise RuntimeError(f"Error processing miner data: {str(e)}")
 
     def predict_smap(
-        self, 
-        model_inputs: Dict[str, torch.Tensor],
-        model: Optional[SoilModel] = None
+        self, model_inputs: Dict[str, torch.Tensor], model: torch.nn.Module
     ) -> Dict[str, np.ndarray]:
         """Run model inference to predict SMAP soil moisture.
 
         Args:
             model_inputs: Dictionary containing preprocessed tensors
-                - sentinel_ndvi: [B, C, H, W] Sentinel bands + NDVI
-                - elevation: [B, 1, H, W] Elevation data
-                - era5: [B, C, H, W] Weather data
-                - mask: [H, W] Boolean mask
+                - sentinel_ndvi: [C, H, W] Sentinel bands + NDVI
+                - elevation: [1, H, W] Elevation data
+                - era5: [C, H, W] Weather data
 
         Returns:
             Dictionary containing:
@@ -143,25 +140,25 @@ class SoilMinerPreprocessing(Preprocessing):
                 - rootzone: [H, W] Root zone soil moisture predictions
         """
         try:
-            if model is None:
-                model = self._load_model()
-                
+            device = next(model.parameters()).device
+            sentinel = model_inputs['sentinel_ndvi'][:2].unsqueeze(0).to(device)
+            era5 = model_inputs['era5'].unsqueeze(0).to(device)
+            elevation = model_inputs['elevation']
+            ndvi = model_inputs['sentinel_ndvi'][2:3]
+            elev_ndvi = torch.cat([elevation, ndvi], dim=0).unsqueeze(0).to(device)
+
             with torch.no_grad():
-                sentinel = model_inputs["sentinel_ndvi"].unsqueeze(0)
-                era5 = model_inputs["era5"].unsqueeze(0)
-                elev_ndvi = torch.cat(
-                    [model_inputs["elevation"], model_inputs["sentinel_ndvi"][-1:]],
-                    dim=0,
-                ).unsqueeze(0)
-
                 outputs = model(sentinel, era5, elev_ndvi)
-                mask = model_inputs["mask"].cpu().numpy()
+                mask = model_inputs.get("mask", torch.ones_like(outputs[0, 0])).cpu().numpy()
+                
                 predictions = {
-                    "surface": outputs["surface_sm"].squeeze().cpu().numpy() * mask,
-                    "rootzone": outputs["rootzone_sm"].squeeze().cpu().numpy() * mask,
+                    "surface": outputs[0, 0].cpu().numpy() * mask,
+                    "rootzone": outputs[0, 1].cpu().numpy() * mask
                 }
-
+                logger.info(f"*********Predictions********* {predictions}")
                 return predictions
 
         except Exception as e:
+            logger.error(f"Error during model inference: {str(e)}")
+            logger.error(f"Input shapes - sentinel: {sentinel.shape}, era5: {era5.shape}, elev_ndvi: {elev_ndvi.shape}")
             raise RuntimeError(f"Error during model inference: {str(e)}")
