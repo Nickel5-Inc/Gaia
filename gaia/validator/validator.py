@@ -123,7 +123,7 @@ class GaiaValidator:
                 if isinstance(payload['data']['combined_data'], bytes):
                     logger.info(f"TIFF header before serialization: {payload['data']['combined_data'][:4]}")
 
-            # Don't serialize the payload here - let the client handle it
+            
             responses = {}
             self.metagraph.sync_nodes()
 
@@ -155,7 +155,7 @@ class GaiaValidator:
                             endpoint=endpoint,
                         )
                         
-                        resp.raise_for_status()
+                        #resp.raise_for_status()
                         logger.debug(f"Response from miner {miner_hotkey}: {resp}")
                         logger.debug(f"Response text from miner {miner_hotkey}: {resp.headers}")
                         # Create a dictionary with both response text and metadata
@@ -166,7 +166,7 @@ class GaiaValidator:
                             'ip': node.ip
                         }
                         responses[miner_hotkey] = response_data
-                        logger.info(f"Request sent to {miner_hotkey}! Response: {response_data}")
+                        logger.info(f"Completed request to {miner_hotkey} Response: {response_data}")
                     else:
                         logger.warning(f"Failed handshake with miner {miner_hotkey}")
 
@@ -218,8 +218,8 @@ class GaiaValidator:
             try:
                 # Execute tasks in parallel
                 workers = [
-                    #asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
-                    asyncio.create_task(self.soil_task.validator_execute(self)),
+                    asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
+                    #asyncio.create_task(self.soil_task.validator_execute(self)),
                     asyncio.create_task(self.status_logger()),
                     asyncio.create_task(self.main_scoring()),  # Add scoring task
                 ]

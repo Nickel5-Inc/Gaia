@@ -1,4 +1,5 @@
 import traceback
+from typing import Any, Dict
 import uuid
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from gaia.tasks.base.task import Task
@@ -208,13 +209,23 @@ class GeomagneticTask(Task):
         """Query miners with current data and process responses."""
         # Construct Payload for Miners
         nonce = str(uuid4())
+        
+        # Convert historical data to serializable format
+        historical_records = []
+        if historical_data is not None:
+            for _, row in historical_data.iterrows():
+                historical_records.append({
+                    'timestamp': row['timestamp'].isoformat(),
+                    'Dst': row['Dst']
+                })
+        
         payload_template = {
             "nonce": nonce,
             "data": {
                 "name": "Geomagnetic Data",
-                "timestamp": str(timestamp),
+                "timestamp": timestamp.isoformat(),
                 "value": dst_value,
-                "historical_values": historical_data.to_dict(orient="records") if historical_data is not None else [],
+                "historical_values": historical_records,
             },
         }
         endpoint = "/geomagnetic-request"
@@ -284,9 +295,25 @@ class GeomagneticTask(Task):
                 FROM RankedTasks
                 WHERE rn = 1;
             """
+            # Convert timestamps to UTC if they aren't already
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=datetime.timezone.utc)
+            if end_time.tzinfo is None:
+                end_time = end_time.replace(tzinfo=datetime.timezone.utc)
+                
+            logger.info(f"Querying tasks with:")
+            logger.info(f"  start_time: {start_time} (tzinfo: {start_time.tzinfo})")
+            logger.info(f"  end_time: {end_time} (tzinfo: {end_time.tzinfo})")
+            
             params = {"start_time": start_time, "end_time": end_time}
+            
+            # Log the query parameters for debugging
+            logger.info(f"Querying with start_time: {start_time}, end_time: {end_time}")
 
             results = await self.db_manager.fetch_many(query, params)
+            
+            # Log raw results for debugging
+            logger.info(f"Raw query results: {results}")
 
             # Convert results to a list of task dictionaries
             tasks = []
@@ -539,6 +566,8 @@ class GeomagneticTask(Task):
                 "status": status
             }
 
+            logger.info(f"Adding prediction to queue with params: {params}")
+
             # Execute the query
             await db_manager.execute(query, params)
             logger.info(f"Added prediction from miner {miner_uid} to queue")
@@ -548,58 +577,58 @@ class GeomagneticTask(Task):
             logger.error(f'{traceback.format_exc()}')
             raise
 
-    async def process_miner_responses(self, responses: list, current_hour_start: datetime.datetime, validator) -> None:
-        """
-        Process responses from miners and add valid predictions to the queue.
-
-        Args:
-            responses (list): List of response dictionaries containing text and metadata
-            current_hour_start (datetime.datetime): Start time of the current hour
-            validator: Validator instance containing metagraph
-        """
-        for response_data in responses:
+    async def process_miner_responses(self, responses: Dict[str, Any], current_hour_start: datetime.datetime, validator) -> None:
+        """Process responses from miners and add valid predictions to the queue."""
+        logger.info(f"Processing responses with current_hour_start: {current_hour_start} (tzinfo: {current_hour_start.tzinfo})")
+        
+        for hotkey, response_data in responses.items():
             try:
-                # Parse the string response into a dictionary 
-                response = json.loads(response_data['text'])
-                logger.debug(f"Received response from miner: {response}")
+                logger.info(f"Processing response for hotkey {hotkey}: {response_data}")
                 
+                # Handle response object with 'text' field
+                if isinstance(response_data, dict) and 'text' in response_data:
+                    try:
+                        response = json.loads(response_data['text'])
+                        logger.debug(f"Successfully parsed response: {response}")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse response text for {hotkey}: {e}")
+                        continue
+                else:
+                    logger.warning(f"Invalid response format for {hotkey}: {response_data}")
+                    continue
+
                 # Extract values from response
-                predicted_value = response.get("predicted_values")
-                miner_hotkey = response.get("miner_hotkey")
+                predicted_value = float(response.get("predicted_values"))  # Ensure numeric
+                miner_hotkey = hotkey  # Use the key from responses dict
                 
-                # Get miner UID from node_table if not in response
-                miner_uid = response_data.get('uid')
-                if miner_uid is None and miner_hotkey:
-                    query = """
-                    SELECT uid FROM node_table 
-                    WHERE hotkey = :miner_hotkey
-                    """
-                    result = await self.db_manager.fetch_one(query, {"miner_hotkey": miner_hotkey})
-                    if result:
-                        miner_uid = result['uid']
-
-                # Validate the response
-                if not all([miner_uid, miner_hotkey, predicted_value is not None]):
-                    logger.warning(f"Invalid response missing required fields: {response}")
+                # Get miner UID from hotkey
+                miner_uid = None
+                query = "SELECT uid FROM node_table WHERE hotkey = :miner_hotkey"
+                result = await self.db_manager.fetch_one(query, {"miner_hotkey": miner_hotkey})
+                if result:
+                    miner_uid = result['uid']
+                    logger.info(f"Found miner UID {miner_uid} for hotkey {miner_hotkey}")
+                else:
+                    logger.warning(f"No UID found for hotkey {miner_hotkey}")
                     continue
 
-                # Verify miner is in metagraph
-                if miner_hotkey not in validator.metagraph.nodes:
-                    logger.warning(f"Miner {miner_hotkey} not in metagraph")
+                # Validate response
+                if predicted_value is None:
+                    logger.warning(f"Missing predicted value in response: {response}")
                     continue
 
+                # Add to queue with proper timestamp handling
+                logger.info(f"Adding prediction to queue for {miner_hotkey} with value {predicted_value}")
                 await self.add_prediction_to_queue(
                     miner_uid=str(miner_uid),
                     miner_hotkey=miner_hotkey,
-                    predicted_value=float(predicted_value),
-                    query_time=current_hour_start
+                    predicted_value=predicted_value,
+                    query_time=current_hour_start,
+                    status="pending"  # Explicitly set status
                 )
-                    
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse miner response as JSON: {e}")
-                continue
+
             except Exception as e:
-                logger.error(f"Error processing miner response: {e}")
+                logger.error(f"Error processing miner response for {hotkey}: {e}")
                 logger.error(f'{traceback.format_exc()}')
                 continue
 
