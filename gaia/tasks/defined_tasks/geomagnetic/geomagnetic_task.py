@@ -369,34 +369,49 @@ class GeomagneticTask(Task):
             logger.error(f'{traceback.format_exc()}')
             return None
 
-    def move_task_to_history(self, task, ground_truth_value, score, score_time):
+    async def move_task_to_history(self, task: dict, ground_truth_value: float, score: float, score_time: datetime):
         """
-        Archives a completed task in the history table or file.
+        Archives a completed task in the history table.
 
         Args:
-            task (dict): Task details including `predicted_values` and `query_time`.
-            ground_truth_value (int): The actual DST value for scoring.
-            score (float): The calculated deviation score.
-            score_time (datetime): The time the task was scored.
+            task (dict): Task details including predicted_values and query_time
+            ground_truth_value (float): The actual observed value
+            score (float): The calculated score
+            score_time (datetime): When the task was scored
         """
-        history_record = {
-            "miner_uid": task["miner_uid"],
-            "miner_hotkey": task["miner_hotkey"],
-            "predicted_value": task["predicted_values"],  # Raw prediction
-            "ground_truth_value": ground_truth_value,
-            "score": score,
-            "query_time": task["query_time"].isoformat(),
-            "score_time": score_time.isoformat(),
-        }
+        try:
+            # Insert into history table
+            query = """
+                INSERT INTO geomagnetic_history 
+                (miner_uid, miner_hotkey, query_time, predicted_value, ground_truth_value, score, scored_at)
+                VALUES (:miner_uid, :miner_hotkey, :query_time, :predicted_value, :ground_truth_value, :score, :scored_at)
+            """
+            
+            params = {
+                "miner_uid": task["miner_uid"],
+                "miner_hotkey": task["miner_hotkey"],
+                "query_time": task["query_time"],
+                "predicted_value": task["predicted_values"],
+                "ground_truth_value": ground_truth_value,
+                "score": score,
+                "scored_at": score_time
+            }
+            
+            await self.db_manager.execute(query, params)
+            logger.info(f"Archived task to history: {task['id']}")
 
-        # Insert into history table or save to JSON
-        logger.info(f"Archiving task to history: {history_record}")
-        # Example: db.insert("geomagnetic_history", history_record)
+            # Remove from predictions table
+            delete_query = """
+                DELETE FROM geomagnetic_predictions 
+                WHERE id = :task_id
+            """
+            await self.db_manager.execute(delete_query, {"task_id": task["id"]})
+            logger.info(f"Removed task from predictions: {task['id']}")
 
-        # Remove task from queue
-        logger.info(f"Removing task from queue: {task['id']}")
-        # Example: db.delete("geomagnetic_predictions", where={"id": task["id"]})
-        # Example: db.delete("geomagnetic_predictions", where={"id": task["id"]})
+        except Exception as e:
+            logger.error(f"Error moving task to history: {e}")
+            logger.error(traceback.format_exc())
+            raise
 
     ############################################################
     # Miner execution method
@@ -633,41 +648,38 @@ class GeomagneticTask(Task):
                 continue
 
     async def score_tasks(self, tasks, ground_truth_value, current_time):
-        """
-        Score tasks against ground truth value and archive them.
-
-        Args:
-            tasks (list): List of tasks to score
-            ground_truth_value (float): The actual value to score against
-            current_time (datetime): Current timestamp
-        """
         if tasks:
+            scored_tasks = []
             for task in tasks:
                 try:
                     predicted_value = task["predicted_values"]
                     score = self.scoring_mechanism.calculate_score(
                         predicted_value, ground_truth_value
                     )
-                    self.move_task_to_history(
+                    await self.move_task_to_history(
                         task, ground_truth_value, score, current_time
                     )
+                    task['score'] = score  # Add score to task dict
+                    scored_tasks.append(task)
                     logger.info(
                         f"Task scored and archived: task_id={task['id']}, score={score}"
                     )
                 except Exception as e:
                     logger.error(f"Error processing task {task['id']}: {e}")
+                    logger.error(traceback.format_exc())
                     
             current_hour = datetime.datetime.now(datetime.timezone.utc).hour
-            await self.build_score_row(current_hour)
+            await self.build_score_row(current_hour, scored_tasks)
         else:
             logger.info("No predictions to score for the last hour.")
 
-    async def build_score_row(self, current_hour):
+    async def build_score_row(self, current_hour, recent_tasks=None):
         '''
-        Build a score row from recent tasks from the current hour
+        Build a score row from recent tasks and historical data
         
         Args:
             current_hour (datetime): Current hour timestamp
+            recent_tasks (list, optional): List of recently scored tasks
             
         Returns:
             dict: Dictionary containing task_name, task_id, and scores array
@@ -682,9 +694,6 @@ class GeomagneticTask(Task):
                 current_datetime = current_hour
                 previous_datetime = current_datetime - datetime.timedelta(hours=1)
 
-            # get recent scored tasks from the last hour
-            tasks = await self.get_tasks_for_hour(previous_datetime, current_datetime)
-            
             # Initialize scores array with NaN values
             scores = [float('nan')] * 256
             
@@ -696,12 +705,32 @@ class GeomagneticTask(Task):
             miner_mappings = await self.db_manager.fetch_many(query)
             hotkey_to_uid = {row['hotkey']: row['uid'] for row in miner_mappings}
             
-            # Fill scores array with task scores at proper indices
-            for task in tasks:
+            # Check historical table for any tasks in this time period
+            historical_query = """
+            SELECT miner_hotkey, score
+            FROM geomagnetic_history
+            WHERE query_time >= :start_time 
+            AND query_time < :end_time
+            """
+            historical_tasks = await self.db_manager.fetch_many(
+                historical_query, 
+                {"start_time": previous_datetime, "end_time": current_datetime}
+            )
+            
+            # Process historical tasks
+            for task in historical_tasks:
                 miner_hotkey = task['miner_hotkey']
                 if miner_hotkey in hotkey_to_uid:
                     uid = hotkey_to_uid[miner_hotkey]
-                    scores[uid] = task.get('score', float('nan'))
+                    scores[uid] = task['score']
+            
+            # Process recent tasks (overwrite historical scores if exists)
+            if recent_tasks:
+                for task in recent_tasks:
+                    miner_hotkey = task['miner_hotkey']
+                    if miner_hotkey in hotkey_to_uid:
+                        uid = hotkey_to_uid[miner_hotkey]
+                        scores[uid] = task.get('score', float('nan'))
             
             # Create score row
             score_row = {
@@ -718,11 +747,12 @@ class GeomagneticTask(Task):
             """
             await self.db_manager.execute(query, score_row)
             
+            logger.info(f"Built score row for hour {current_datetime} with {len([s for s in scores if not np.isnan(s)])} scores")
             return score_row
             
         except Exception as e:
             logger.error(f"Error building score row: {e}")
-            logger.error(f'{traceback.format_exc()}')
+            logger.error(traceback.format_exc())
             return None
 
     async def recalculate_recent_scores(self, uids: list):
@@ -763,6 +793,7 @@ class GeomagneticTask(Task):
 
             # Fill scores array with task scores at proper indices
             for task in tasks:
+                logger.info(f"Task: {task}")
                 miner_hotkey = task['miner_hotkey']
                 if miner_hotkey in hotkey_to_uid:
                     uid = hotkey_to_uid[miner_hotkey]

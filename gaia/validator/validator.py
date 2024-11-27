@@ -273,46 +273,65 @@ class GaiaValidator:
                 logger.info("Metagraph synced. Fetching recent scores...")
                 
                 geomagnetic_scores = await self.database_manager.get_recent_scores('geomagnetic')
+                logger.info(f"Geomagnetic scores: {geomagnetic_scores}")
                 soil_scores = await self.database_manager.get_recent_scores('soil')
+                logger.info(f"Soil scores: {soil_scores}")
                 logger.info("Recent scores fetched. Calculating aggregate scores...")
                 
                 # Calculate weights
                 weights = [0.0] * 256
                 for idx in range(256):
-                    aggregate_score = (0.5 * -geomagnetic_scores[idx]) + (0.5 * soil_scores[idx]) # invert geomagnetic scores as higher is worse
-                    weights[idx] = aggregate_score
+                    geomagnetic_score = geomagnetic_scores[idx]
+                    soil_score = soil_scores[idx]
+                    
+                    # Handle nan values
+                    if math.isnan(geomagnetic_score) and math.isnan(soil_score):
+                        weights[idx] = 0.0
+                    elif math.isnan(geomagnetic_score):
+                        weights[idx] = 0.5 * soil_score
+                    elif math.isnan(soil_score):
+                        weights[idx] = 0.5 * -geomagnetic_score  # invert geomagnetic scores
+                    else:
+                        weights[idx] = (0.5 * -geomagnetic_score) + (0.5 * soil_score)
+                    
+                    logger.info(f"UID {idx}: geo={geomagnetic_score}, soil={soil_score}, weight={weights[idx]}")
                 
                 logger.info(f"Weights before normalization: {weights}")
-                # Normalize and apply sigmoid transformation
-                if sum(weights) > 0:
+                
+                # Only proceed if we have any non-zero weights
+                non_zero_weights = [w for w in weights if w != 0.0]
+                if non_zero_weights:
                     # Sort indices by weight for ranking
                     sorted_indices = sorted(range(len(weights)), key=lambda k: weights[k], reverse=True)
                     
                     # Calculate new weights based on rank position
                     new_weights = [0.0] * len(weights)
                     for rank, idx in enumerate(sorted_indices):
-                        normalized_rank = 1.0 - (rank / len(weights))
-                        new_weights[idx] = 1 / (1 + math.exp(-20 * (normalized_rank - 0.5)))  # sigmoid with steepness=20
+                        if weights[idx] > 0:  # Only assign weights to nodes with positive scores
+                            normalized_rank = 1.0 - (rank / len(non_zero_weights))  # Only consider non-zero weights
+                            new_weights[idx] = 1 / (1 + math.exp(-20 * (normalized_rank - 0.5)))
                     
                     # Normalize final weights
                     total = sum(new_weights)
-                    self.weights = [w / total for w in new_weights]
-                    
-                    # Log distribution stats
-                    top_20_weight = sum(sorted(self.weights, reverse=True)[:int(len(weights)*0.2)])
-                    logger.info(f"Weight distribution: top 20% of nodes hold {top_20_weight*100:.1f}% of total weight")
-                    
-                    logger.info(f"Weights: {self.weights}")
-                    # Set weights on chain
-                    logger.info("Setting weights on the chain...")
-                    success = await self.set_weights(self.weights)
-                    if success:
-                        self.last_set_weights_block = self.current_block
-                        logger.info(f"Successfully set weights at block {self.current_block}")
+                    if total > 0:
+                        self.weights = [w / total for w in new_weights]
+                        
+                        # Log distribution stats
+                        top_20_weight = sum(sorted(self.weights, reverse=True)[:int(len(weights)*0.2)])
+                        logger.info(f"Weight distribution: top 20% of nodes hold {top_20_weight*100:.1f}% of total weight")
+                        
+                        # Set weights on chain
+                        logger.info("Setting weights on the chain...")
+                        success = await self.set_weights(self.weights)
+                        if success:
+                            self.last_set_weights_block = self.current_block
+                            logger.info(f"Successfully set weights at block {self.current_block}")
+                        else:
+                            logger.error(f"Failed to set weights at block {self.current_block}")
                     else:
-                        logger.error(f"Failed to set weights at block {self.current_block}")
+                        logger.warning("No positive weights after normalization")
                 else:
-                    logger.warning("All weights are zero, skipping weight setting")
+                    logger.warning("All weights are zero or nan, skipping weight setting")
                 
             except Exception as e:
                 logger.error(f"Error in main_scoring: {e}")

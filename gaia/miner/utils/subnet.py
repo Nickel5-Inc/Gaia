@@ -52,7 +52,7 @@ def factory_router(miner_instance) -> APIRouter:
         
         try:
             if decrypted_payload.data:
-                logger.info(f"Received data: {decrypted_payload.data}")
+                #logger.info(f"Received data: {decrypted_payload.data}")
                 response_data = decrypted_payload.model_dump()
                 geomagnetic_task = GeomagneticTask()
                 #logger.info(f"Received response data: {response_data}")

@@ -493,6 +493,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 "window_hours": window_hours  # Pass as integer
             })
 
+            logger.info(f"Recent scores for {task_type}: {result}")
+
             if not result:
                 logger.warning(f"No recent scores found for task type: {task_type}")
                 return [0.0] * 256
