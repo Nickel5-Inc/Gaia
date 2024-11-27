@@ -15,6 +15,7 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoisturePredi
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 import traceback
+from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 
 # Define max request size (5MB in bytes)
 MAX_REQUEST_SIZE = 5 * 1024 * 1024  # 5MB
@@ -74,19 +75,20 @@ def factory_router(miner_instance) -> APIRouter:
         
         return JSONResponse(content=result)
 
-    async def soilmoisture_require(
-        decrypted_payload: SoilmoistureRequest = Depends(
-            partial(decrypt_general_payload, SoilmoistureRequest)
-        ),
-    ):
+    async def soilmoisture_require(request: Request):
         """Handle soil moisture prediction requests."""
         logger.info("Received soil moisture request")
         try:
-            if decrypted_payload.data:
-                soil_task = SoilMoistureTask(node_type="miner")
+            # Initialize database manager
+            db_manager = MinerDatabaseManager()
+            
+            # Create task with database manager
+            soil_task = SoilMoistureTask(db_manager=db_manager, node_type="miner")
+            
+            if request.data:
                 payload_data = {
-                    "data": decrypted_payload.data.model_dump(),
-                    "nonce": decrypted_payload.nonce
+                    "data": request.data.model_dump(),
+                    "nonce": request.nonce
                 }
                 
                 result = await soil_task.miner_execute(payload_data, miner_instance)

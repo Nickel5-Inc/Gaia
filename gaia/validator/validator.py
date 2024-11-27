@@ -1,5 +1,7 @@
+
 import datetime
 import os
+os.environ["NODE_TYPE"] = "validator"
 import asyncio
 import ssl
 import traceback
@@ -24,7 +26,7 @@ import math
 
 logger = get_logger(__name__)
 
-os.environ["NODE_TYPE"] = "validator"
+
 
 class GaiaValidator:
     def __init__(self, args):

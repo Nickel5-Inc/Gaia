@@ -65,7 +65,7 @@ class SoilMoistureTask(Task):
         
         # Initialize appropriate preprocessing based on node type
         if node_type == "validator":
-            self.validator_preprocessing = SoilValidatorPreprocessing(db_manager=db_manager)
+            self.validator_preprocessing = SoilValidatorPreprocessing()
         else:
             self.miner_preprocessing = SoilMinerPreprocessing()
             self.model = self.miner_preprocessing.model
