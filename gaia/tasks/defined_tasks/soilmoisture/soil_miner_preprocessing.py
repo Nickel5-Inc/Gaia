@@ -99,7 +99,8 @@ class SoilMinerPreprocessing(Preprocessing):
                     logger.info(f"####TIFF metadata: {dataset.profile}")
                     logger.info(f"####Band order: {dataset.tags().get('band_order', 'Not found')}")
                     
-                    model_inputs = self.preprocessor.preprocess(dataset)
+                    # Pass the file path instead of the dataset
+                    model_inputs = self.preprocessor.preprocess(temp_file_path)
                     if model_inputs is None:
                         raise ValueError("####Failed to preprocess input data")
 
