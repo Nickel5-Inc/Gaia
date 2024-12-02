@@ -1,0 +1,22 @@
+# Virtual Environment
+venv/
+env/
+.env
+.venv/
+dev.env
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.encrypted
+nodes.json
+
+# Editor/IDE settings
+.vscode/
+.idea/
+
+# Miscellaneous
+data/
+
+gaia.egg-info/

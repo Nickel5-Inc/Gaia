@@ -1,0 +1,90 @@
+{
+    "soil_moisture_regions": {
+        "table_name": "soil_moisture_regions",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "region_date": "DATE NOT NULL",
+            "target_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "bbox": "JSONB NOT NULL",
+            "combined_data": "BYTEA",
+            "sentinel_bounds": "FLOAT[]",
+            "sentinel_crs": "INTEGER",
+            "status": "TEXT NOT NULL DEFAULT 'pending'",
+            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
+            "data_cleared_at": "TIMESTAMP WITH TIME ZONE",
+            "array_shape": "INTEGER[] NOT NULL"
+        },
+        "indexes": [
+            {"column": "region_date", "unique": false},
+            {"column": "target_time", "unique": false},
+            {"column": "status", "unique": false}
+        ]
+    },
+    "soil_moisture_predictions": {
+        "table_name": "soil_moisture_predictions",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "region_id": "INTEGER REFERENCES soil_moisture_regions(id) ON DELETE SET NULL",
+            "miner_uid": "TEXT NOT NULL",
+            "miner_hotkey": "TEXT NOT NULL",
+            "target_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "surface_sm": "FLOAT[][]",
+            "rootzone_sm": "FLOAT[][]",
+            "uncertainty_surface": "FLOAT[][]",
+            "uncertainty_rootzone": "FLOAT[][]",
+            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
+            "sentinel_bounds": "FLOAT[]",
+            "sentinel_crs": "INTEGER",
+            "status": "TEXT NOT NULL DEFAULT 'pending'"
+        },
+        "indexes": [
+            {"column": "region_id", "unique": false},
+            {"column": "miner_uid", "unique": false},
+            {"column": "miner_hotkey", "unique": false},
+            {"column": "target_time", "unique": false},
+            {"column": "status", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "region_id",
+                "references": "soil_moisture_regions(id)",
+                "on_delete": "SET NULL"
+            }
+        ]
+    },
+    "soil_moisture_history": {
+        "table_name": "soil_moisture_history",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "region_id": "INTEGER REFERENCES soil_moisture_regions(id)",
+            "miner_uid": "TEXT NOT NULL",
+            "miner_hotkey": "TEXT NOT NULL",
+            "target_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "surface_sm_pred": "FLOAT[][]",
+            "rootzone_sm_pred": "FLOAT[][]",
+            "surface_sm_truth": "FLOAT[][]",
+            "rootzone_sm_truth": "FLOAT[][]",
+            "surface_rmse": "FLOAT",
+            "rootzone_rmse": "FLOAT",
+            "surface_structure_score": "FLOAT",
+            "rootzone_structure_score": "FLOAT",
+            "scored_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+        },
+        "indexes": [
+            {"column": "region_id", "unique": false},
+            {"column": "miner_uid", "unique": false},
+            {"column": "miner_hotkey", "unique": false},
+            {"column": "target_time", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "region_id",
+                "references": "soil_moisture_regions(id)",
+                "on_delete": "CASCADE"
+            }
+        ]
+    }
+}

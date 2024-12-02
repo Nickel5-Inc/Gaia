@@ -1,0 +1,93 @@
+Metadata-Version: 2.1
+Name: gaia
+Version: 1.0.0
+Summary: This project implements the Gaia subnet for Bittensor
+Author: geardici, oneandahalfcats, qucat, gabby
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: fiber[full]@ git+https://github.com/rayonlabs/fiber.git@1.0.0
+Requires-Dist: gaia==1.0.0
+Requires-Dist: ipykernel==6.29.5
+Requires-Dist: psycopg2-binary==2.9.10
+Requires-Dist: pytorch-msssim==1.0.0
+
+![Project Logo](logo-full.png)
+
+# <center>Welcome to Gaia</center>
+
+<div style="text-align: center;"><a href="https://www.gaiaresearch.ai/">Website</a></div>
+
+----
+
+Gaia is a platform for research and development of geospatial machine learning models. 
+Read more about the long-term vision in our [whitepaper](https://www.gaiaresearch.ai/whitepaper).
+
+>[!NOTE]
+>BETA VERSION = 1.0.0
+>
+> The beta version of Gaia launches with limited functionality. Many of the planned features are not yet available, however we are still accepting miners and validators for the initial tasks. 
+
+
+
+## Miners
+[Quicklink](docs/MINER.md)
+
+Miners develop models to understand future events. These events currently include soil moisture and geomagnetic readings at the equator. Miners will receive data from validators for the models that we have in place. They are also free to gather their own data from other resources. The tasks are consistent in design and in timing; this predictability allows miners the flexibility to retrieve any data that their model requires. 
+
+Miners can choose between these two tasks or perform both. Incentive is split 50:50 between the tasks.
+
+
+## Validators
+[Quicklink](docs/VALIDATOR.md)
+
+Validators will connect to a few API's to provide miners with the data they need to run models.
+
+## Installation (For ALL Neurons)
+
+Gaia is built on [Fiber](https://github.com/rayonlabs/fiber) - special thanks to namoray and the Rayon labs team.
+
+### Run the setup script
+
+```bash
+python./scripts/setup.py
+```
+- This will create a virtual environment and install all dependencies
+- The virtual environment (.gaia) will be located above the gaia directory, you'll need to activate it after running the setup script using `source ../.gaia/bin/activate`
+
+
+### Install fiber
+----
+```bash
+pip install "git+https://github.com/rayonlabs/fiber.git@1.0.0#egg=fiber[full]"
+```
+
+
+#### Register miner and/or validator on subnet
+```bash
+btcli subnets register --subtensor.network <NETWORK> --netuid <NETUID> --wallet.name <COLDKEY> --wallet.hotkey <HOTKEY>
+```
+
+#### Post IP to chain -- IMPORTANT
+```bash
+fiber-post-ip --netuid <NETUID> --external_ip <YOUR_IP> --external_port <YOUR_PORT> --subtensor.network <NETWORK> --wallet.name <COLDKEY> --wallet.hotkey <HOTKEY> 
+```
+-- You only need to do this once per key, but if you get deregistered or your IP changes, you'll need to re-post your IP. We recommend using a static IP for all nodes.
+
+
+#### Setup Proxy server
+Gaia uses a Proxy server to handle connections to Validators. You can setup your own proxy server, or use our script for an nginx server as follows:
+
+```bash
+./setup_proxy_server.sh --ip <YOUR IP> --port <PORT> --forwarding_port <PORT_FOR_MINER_OR_VALIDATOR> --server_name <NAME>
+```
+
+- this will run as a background process, but it must be running for proper communication between Miners and Validators
+
+
+The port chosen here should match the port that you posted to the chain above. This will forward connections to the specified `--forwarding_port` which will be used when starting up the miner or validator (defaults to +1 of `--port`).
+
+
+## Follow the Setup Guides for Miner or Validator
+[Miner](docs/MINER.md)
+[Validator](docs/VALIDATOR.md)
