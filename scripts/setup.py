@@ -19,6 +19,7 @@ def install_system_dependencies():
         "sudo apt-get update",
         "sudo apt-get install -y curl",
         "sudo apt-get install -y postgresql postgresql-contrib",
+        "sudo apt-get install -y python3-psycopg2",
         "sudo apt-get install -y python3-dev libpq-dev",
         "sudo apt-get install -y gdal-bin",
         "sudo apt-get install -y libgdal-dev",
@@ -52,11 +53,15 @@ def install_system_dependencies():
     )
 
 
-def setup_postgresql():
+def setup_postgresql(default_user="postgres", default_password="postgres"):
     """Configure PostgreSQL for the project"""
     try:
+        # Allow overriding the default user and password with environment variables
+        postgres_user = os.getenv("POSTGRES_USER", default_user)
+        postgres_password = os.getenv("POSTGRES_PASSWORD", default_password)
+
         conn = psycopg2.connect(
-            dbname="postgres", user="postgres", password="postgres", host="localhost"
+            dbname="postgres", user=postgres_user, password=postgres_password, host="localhost"
         )
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cur = conn.cursor()
@@ -64,10 +69,10 @@ def setup_postgresql():
         # Check if role exists before creating
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname='gaia'")
         role_exists = cur.fetchone() is not None
-        
+
         if not role_exists:
             cur.execute("CREATE USER gaia WITH PASSWORD 'postgres';")
-        
+
         # Drop existing databases if they exist
         databases = ["validator_db", "miner_db"]
         for db in databases:
@@ -76,8 +81,8 @@ def setup_postgresql():
             cur.execute(f"GRANT ALL PRIVILEGES ON DATABASE {db} TO gaia;")
 
         with open(".env", "w") as f:
-            f.write(f"DB_USER=gaia\n")
-            f.write(f"DB_PASSWORD=postgres\n")
+            f.write(f"DB_USER={postgres_user}\n")
+            f.write(f"DB_PASSWORD={postgres_password}\n")
             f.write(f"DB_HOST=localhost\n")
             f.write(f"DB_PORT=5432\n")
 
