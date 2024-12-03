@@ -109,7 +109,7 @@ WALLET_NAME=<YOUR_WALLET.NAME>
 HOTKEY_NAME=<YOUR_WALLET_HOTKEY>
 NETUID=<NETUID>
 SUBTENSOR_NETWORK=<NETWORK> # finney or test
-MIN_STAKE_THRESHOLD=<INT> # 100000 for mainnet, 5 for testnet
+MIN_STAKE_THRESHOLD=<INT> # 10000 for mainnet, 5 for testnet
 SUBTENSOR_ADDRESS=<SUBTENSOR_ADDRESS> # wss://test.finney.opentensor.ai:443/ for testnet, wss://finney.opentensor.ai:443/ for mainnet (chain endpoint)
 ```
 

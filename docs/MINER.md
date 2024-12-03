@@ -109,7 +109,7 @@ WALLET_NAME=<YOUR_WALLET.NAME>
 HOTKEY_NAME=<YOUR_WALLET_HOTKEY>
 NETUID=<NETUID> # 57 for mainnet, 237 for testnet
 SUBTENSOR_NETWORK=<NETWORK> # finney or test
-MIN_STAKE_THRESHOLD=<INT> # 100000 for mainnet, 5 for testnet
+MIN_STAKE_THRESHOLD=<INT> # 10000 for mainnet, 5 for testnet
 ```
 
 #### Run the miner
