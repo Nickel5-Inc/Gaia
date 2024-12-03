@@ -78,7 +78,7 @@ class GaiaValidator:
                 if hasattr(self.args, "subtensor")
                 and hasattr(self.args.subtensor, "chain_endpoint")
                 else os.getenv(
-                    "SUBSTRATE_CHAIN_ENDPOINT", "wss://test.finney.opentensor.ai:443/"
+                    "SUBTENSOR_ADDRESS", "wss://test.finney.opentensor.ai:443/"
                 )
             )
 
@@ -86,7 +86,7 @@ class GaiaValidator:
                 self.args.subtensor.network
                 if hasattr(self.args, "subtensor")
                 and hasattr(self.args.subtensor, "network")
-                else os.getenv("SUBSTRATE_NETWORK", "test")
+                else os.getenv("SUBTENSOR_NETWORK", "test")
             )
 
             # Load wallet and keypair

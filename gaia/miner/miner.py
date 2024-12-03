@@ -52,7 +52,7 @@ class Miner:
             if hasattr(self.args, "subtensor")
             and hasattr(self.args.subtensor, "chain_endpoint")
             else os.getenv(
-                "SUBSTRATE_CHAIN_ENDPOINT", "wss://test.finney.opentensor.ai:443/"
+                "SUBTENSOR_ADDRESS", "wss://test.finney.opentensor.ai:443/"
             )
         )
 
