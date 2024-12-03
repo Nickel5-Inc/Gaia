@@ -114,5 +114,5 @@ MIN_STAKE_THRESHOLD=<INT> # 100000 for mainnet, 5 for testnet
 
 #### Run the miner
 ```bash
-pm2 start --name miner --instances 1 python -- gaia/miner/miner.py
+pm2 start --name miner --instances 1 python -- gaia/miner/miner.py --port <INTERNAL PORT, the one you set as the forwarding port in the nginx config>
 ```
