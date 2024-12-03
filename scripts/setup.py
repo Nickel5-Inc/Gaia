@@ -81,8 +81,8 @@ def setup_postgresql(default_user="postgres", default_password="postgres"):
             cur.execute(f"GRANT ALL PRIVILEGES ON DATABASE {db} TO gaia;")
 
         with open(".env", "w") as f:
-            f.write(f"DB_USER=gaia\n")
-            f.write(f"DB_PASSWORD=postgres\n")
+            f.write(f"DB_USER={postgres_user}\n")
+            f.write(f"DB_PASSWORD={postgres_password}\n")
             f.write(f"DB_HOST=localhost\n")
             f.write(f"DB_PORT=5432\n")
 
