@@ -239,7 +239,7 @@ class SoilMoistureTask(Task):
                         f"Not in any preparation or execution window: {current_time}"
                     )
                     logger.info(
-                        f"Next preparation time: {self.get_next_preparation_time(current_time)}"
+                        f"Next soil task time: {self.get_next_preparation_time(current_time)}"
                     )
                     logger.info(f"Sleeping for 60 seconds")
                     await asyncio.sleep(60)
@@ -402,7 +402,7 @@ class SoilMoistureTask(Task):
                     ).total_seconds()
                     if sleep_seconds > 0:
                         logger.info(
-                            f"Sleeping until next preparation window: {next_prep_time}"
+                            f"Sleeping until next soil task window: {next_prep_time}"
                         )
                         await asyncio.sleep(sleep_seconds)
 
@@ -500,6 +500,13 @@ class SoilMoistureTask(Task):
             if not self.db_manager:
                 raise RuntimeError("Database manager not initialized")
 
+            region_update = """
+            UPDATE soil_moisture_regions 
+            SET status = 'sent_to_miners' 
+            WHERE id = :region_id
+            """
+            await self.db_manager.execute(region_update, {"region_id": metadata["region_id"]})
+
             for miner_hotkey, response_data in responses.items():
                 try:
                     # Get miner UID from hotkey
@@ -577,8 +584,9 @@ class SoilMoistureTask(Task):
             raise
 
     async def get_pending_tasks(self):
-        """Get tasks that are ready for scoring."""
-        scoring_time = datetime.now(timezone.utc) - self.scoring_delay
+        """Get tasks that are ready for scoring and haven't been scored yet."""
+        scoring_time = datetime.now(timezone.utc)
+        #scoring_time = datetime.now(timezone.utc) - self.scoring_delay
 
         try:
             result = await self.db_manager.fetch_many(
@@ -594,7 +602,8 @@ class SoilMoistureTask(Task):
                     )) as predictions
                 FROM soil_moisture_regions r
                 JOIN soil_moisture_predictions p ON p.region_id = r.id
-                WHERE r.status = 'sent_to_miners'
+                WHERE r.status = 'sent_to_miners' 
+                AND p.status = 'pending'
                 AND r.target_time <= :scoring_time
                 GROUP BY r.id
                 ORDER BY r.target_time ASC
@@ -671,6 +680,13 @@ class SoilMoistureTask(Task):
                             f"Stored scores for miner {miner_id} in region {region['id']}"
                         )
 
+                        update_query = text("""
+                            UPDATE soil_moisture_predictions 
+                            SET status = 'scored'
+                            WHERE region_id = :region_id AND miner_uid = :miner_uid
+                        """)
+                        await session.execute(update_query, params)
+
         except Exception as e:
             logger.error(f"Error moving task to history: {str(e)}")
             raise
@@ -688,7 +704,8 @@ class SoilMoistureTask(Task):
             scoring_results = {}
             tasks_by_time = {}
             for task in pending_tasks:
-                target_time = task["target_time"]
+                # Subtract 7 days from target_time right before grouping
+                target_time = task["target_time"] - timedelta(days=7)
                 if target_time not in tasks_by_time:
                     tasks_by_time[target_time] = []
                 tasks_by_time[target_time].append(task)
@@ -807,8 +824,6 @@ class SoilMoistureTask(Task):
             # In test mode, round to nearest SMAP time (1:30, 7:30, 13:30, or 19:30)
             smap_hours = [1, 7, 13, 19]
             current_hour = current_time.hour
-
-            # Find the closest SMAP hour
             closest_hour = min(smap_hours, key=lambda x: abs(x - current_hour))
             return current_time.replace(
                 hour=closest_hour, minute=30, second=0, microsecond=0
@@ -816,18 +831,18 @@ class SoilMoistureTask(Task):
 
         # Normal mode with strict window checks
         validator_to_smap = {
-            1: 1,  # 1:30 prep → 1:30 SMAP
-            2: 1,  # 2:00 execution → 1:30 SMAP
-            7: 7,  # 7:30 prep → 7:30 SMAP
-            8: 7,  # 8:00 execution → 7:30 SMAP
+            2: 1,    # 1:30 prep → 1:30 SMAP
+            3: 1,    # 2:00 execution → 1:30 SMAP
+            9: 7,    # 9:30 prep → 7:30 SMAP (updated)
+            10: 7,   # 10:00 execution → 7:30 SMAP (updated)
             13: 13,  # 13:30 prep → 13:30 SMAP
             14: 13,  # 14:00 execution → 13:30 SMAP
-            19: 19,  # 16:30 prep → 19:30 SMAP (modified)
-            20: 19,  # 17:00 execution → 19:30 SMAP (modified)
+            19: 19,  # 19:30 prep → 19:30 SMAP
+            20: 19,  # 20:00 execution → 19:30 SMAP
         }
         smap_hour = validator_to_smap.get(current_time.hour)
         if smap_hour is None:
-            raise ValueError(f"Invalid validator time: {current_time.hour}:00")
+            raise ValueError(f"No SMAP time mapping for validator hour {current_time.hour}")
 
         return current_time.replace(hour=smap_hour, minute=30, second=0, microsecond=0)
 
@@ -836,12 +851,12 @@ class SoilMoistureTask(Task):
         return [
             (1, 30, 2, 30),  # Prep window for 1:30 SMAP time
             (2, 0, 2, 30),  # Execution window for 1:30 SMAP time
-            (7, 30, 8, 0),  # Prep window for 7:30 SMAP time
-            (8, 0, 8, 30),  # Execution window for 7:30 SMAP time
+            (9, 30, 10, 0),  # Prep window for 7:30 SMAP time
+            (10, 0, 10, 30),  # Execution window for 7:30 SMAP time
             (13, 30, 14, 0),  # Prep window for 13:30 SMAP time
             (14, 0, 14, 30),  # Execution window for 13:30 SMAP time
-            (19, 30, 20, 0),  # Prep window for 19:30 SMAP time (modified)
-            (20, 0, 20, 30),  # Execution window for 19:30 SMAP time (modified)
+            (19, 30, 20, 0),  # Prep window for 19:30 SMAP time
+            (20, 0, 20, 30),  # Execution window for 19:30 SMAP time
         ]
 
     def is_in_window(

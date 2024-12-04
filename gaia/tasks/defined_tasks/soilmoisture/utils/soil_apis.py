@@ -167,71 +167,89 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
 
 
 async def download_srtm_tile(lat, lon, download_dir=None):
-    """Download SRTM tile using Earthdata token authentication asynchronously."""
     if download_dir is None:
         download_dir = get_data_dir()
 
     try:
         lat_prefix = "N" if lat >= 0 else "S"
         lon_prefix = "E" if lon >= 0 else "W"
-        tile_name = (
-            f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.SRTMGL1.hgt.zip"
-        )
-        url = f"https://e4ftl01.cr.usgs.gov/MEASURES/SRTMGL1.003/2000.02.11/{tile_name}"
-        tile_path = os.path.join(download_dir, tile_name)
-
-        headers = {"Authorization": f'Bearer {os.getenv("EARTHDATA_API_KEY")}'}
-
+        
+        lat_str = f"{lat_prefix}{abs(lat):02d}_00"
+        lon_str = f"{lon_prefix}{abs(lon):03d}_00"
+        
+        print(f"\n=== SRTM Download Debug for {lat_str}_{lon_str} ===")
+        
+        # Primary source (Copernicus DEM)
+        primary_url = f"https://prism-dem-open.copernicus.eu/pd-desk-open-access/prismDownload/COP-DEM_GLO-30-DGED__2022_1/Copernicus_DSM_10_{lat_str}_{lon_str}.tar"
+        print(f"Attempting primary URL: {primary_url}")
+        
+        # Fallback source (CGIAR)
+        fallback_url = f"https://srtm.csi.cgiar.org/wp-content/uploads/files/srtm_{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.zip"
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    with open(tile_path, "wb") as f:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
-                            f.write(chunk)
-                    print(f"Downloaded SRTM tile: {tile_name}")
-                elif response.status == 401:
-                    print(
-                        f"Unauthorized access for {tile_name}: {response.status} {response.reason}"
-                    )
-                    return None
-                else:
-                    print(
-                        f"Failed to download {tile_name}: {response.status} {response.reason}"
-                    )
-                    return None
-
-        # Proceed with processing the downloaded tile
-        with zipfile.ZipFile(tile_path, "r") as zip_ref:
-            hgt_filename = zip_ref.namelist()[0]
-            zip_ref.extract(hgt_filename, download_dir)
-
-        hgt_path = os.path.join(download_dir, hgt_filename)
-        tif_path = os.path.join(
-            download_dir, f"{os.path.splitext(hgt_filename)[0]}.tif"
-        )
-
-        cmd = [
-            "gdal_translate",
-            "-of",
-            "GTiff",
-            "-co",
-            "COMPRESS=LZW",
-            "-a_srs",
-            "EPSG:4326",
-            hgt_path,
-            tif_path,
-        ]
-        proc = await asyncio.create_subprocess_exec(*cmd)
-        await proc.communicate()
-
-        # Clean up temporary files
-        os.remove(tile_path)
-        os.remove(hgt_path)
-
-        return tif_path
+            try:
+                print("Initiating primary source download...")
+                async with session.get(primary_url) as response:
+                    print(f"Primary source status code: {response.status}")
+                    
+                    if response.status == 200:
+                        # Download tar file
+                        tar_path = os.path.join(download_dir, f"{lat_str}_{lon_str}.tar")
+                        final_tif_path = os.path.join(download_dir, f"{lat_str}_{lon_str}.tif")
+                        
+                        with open(tar_path, "wb") as f:
+                            async for chunk in response.content.iter_chunked(1024 * 1024):
+                                f.write(chunk)
+                        
+                        print(f"Downloaded tar file to: {tar_path}")
+                        
+                        # Extract DEM file from tar
+                        import tarfile
+                        with tarfile.open(tar_path) as tar:
+                            dem_file = None
+                            for member in tar.getmembers():
+                                if member.name.endswith('_DEM.tif'):
+                                    dem_file = member
+                                    break
+                            
+                            if dem_file:
+                                print(f"Extracting DEM file: {dem_file.name}")
+                                tar.extract(dem_file, download_dir)
+                                os.rename(
+                                    os.path.join(download_dir, dem_file.name),
+                                    final_tif_path
+                                )
+                                os.remove(tar_path)  # Clean up tar file
+                                return final_tif_path
+                            else:
+                                raise Exception("No DEM file found in tar archive")
+                    else:
+                        raise Exception(f"Primary source failed with status {response.status}")
+                        
+            except Exception as e:
+                print(f"Primary source error: {str(e)}")
+                print("Attempting fallback source...")
+                
+                # Fallback source handling remains the same
+                async with session.get(fallback_url) as response:
+                    if response.status == 200:
+                        zip_path = os.path.join(download_dir, f"{lat_str}_{lon_str}.zip")
+                        final_tif_path = os.path.join(download_dir, f"{lat_str}_{lon_str}.tif")
+                        
+                        with open(zip_path, "wb") as f:
+                            async for chunk in response.content.iter_chunked(1024 * 1024):
+                                f.write(chunk)
+                        
+                        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                            zip_ref.extractall(download_dir)
+                        os.remove(zip_path)
+                        return final_tif_path
+                    else:
+                        print(f"Both sources failed for {lat_str}_{lon_str}")
+                        return None
 
     except Exception as e:
-        print(f"Error downloading SRTM tile {tile_name}: {str(e)}")
+        print(f"Error downloading SRTM tile: {str(e)}")
         return None
 
 

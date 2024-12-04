@@ -18,6 +18,7 @@ from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import (
 from pydantic import Field
 from fiber.logging_utils import get_logger
 import os
+import traceback
 
 logger = get_logger(__name__)
 
@@ -204,20 +205,33 @@ class SoilScoringMechanism(ScoringMechanism):
             if not smap_data:
                 return None
 
-            surface_sm = (
-                torch.from_numpy(smap_data["surface_sm"])
-                .float()
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .to(device)
-            )
-            rootzone_sm = (
-                torch.from_numpy(smap_data["rootzone_sm"])
-                .float()
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .to(device)
-            )
+            if model_predictions.shape[2] == 0 or model_predictions.shape[3] == 0:
+                logger.error(f"Empty model predictions detected with shape: {model_predictions.shape}")
+                return None
+
+            if model_predictions.shape[-2:] != (11, 11):
+                logger.error(f"Invalid model prediction shape: {model_predictions.shape}, expected last dimensions to be (11, 11)")
+                return None
+
+            surface_sm = torch.from_numpy(smap_data["surface_sm"]).float()
+            rootzone_sm = torch.from_numpy(smap_data["rootzone_sm"]).float()
+
+            if surface_sm.dim() == 2:
+                surface_sm = surface_sm.unsqueeze(0).unsqueeze(0)
+            if rootzone_sm.dim() == 2:
+                rootzone_sm = rootzone_sm.unsqueeze(0).unsqueeze(0)
+
+            surface_sm = surface_sm.to(device)
+            rootzone_sm = rootzone_sm.to(device)
+
+            logger.info(f"Model predictions shape: {model_predictions.shape}")
+            logger.info(f"SMAP data shapes - surface: {smap_data['surface_sm'].shape}, rootzone: {smap_data['rootzone_sm'].shape}")
+            logger.info(f"Processed shapes - surface: {surface_sm.shape}, rootzone: {rootzone_sm.shape}, model: {model_predictions.shape}")
+
+            if model_predictions.shape[1] != 2:
+                logger.error(f"Model predictions should have 2 channels, got shape: {model_predictions.shape}")
+                return None
+
             surface_sm_11x11 = F.interpolate(
                 surface_sm, size=(11, 11), mode="bilinear", align_corners=False
             )
@@ -307,6 +321,7 @@ class SoilScoringMechanism(ScoringMechanism):
 
         except Exception as e:
             logger.error(f"Error processing SMAP data: {str(e)}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
         finally:
             if temp_file:

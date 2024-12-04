@@ -5,10 +5,11 @@ from gaia.validator.database.validator_database_manager import ValidatorDatabase
 from gaia.tasks.defined_tasks.soilmoisture.utils.region_selection import (
     select_random_region,
 )
-from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import get_soil_data
+from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import get_soil_data, get_data_dir
 import json
 from typing import Dict, Optional, List
 import os
+import shutil
 from sqlalchemy import text
 from fiber.logging_utils import get_logger
 
@@ -206,6 +207,22 @@ class SoilValidatorPreprocessing(Preprocessing):
                         region_data["id"] = region_id
                         regions.append(region_data)
                         self._update_daily_count(target_time)
+
+                        data_dir = get_data_dir()
+                        for filename in os.listdir(data_dir):
+                            filepath = os.path.join(data_dir, filename)
+                            if os.path.isdir(filepath) and filename.startswith('tmp'):
+                                try:
+                                    shutil.rmtree(filepath)
+                                    logger.info(f"Removed temp directory: {filepath}")
+                                except Exception as e:
+                                    logger.error(f"Failed to remove temp directory {filepath}: {e}")
+                            elif filename.endswith('.tif'):
+                                try:
+                                    os.remove(filepath)
+                                    logger.info(f"Removed tif file: {filepath}")
+                                except Exception as e:
+                                    logger.error(f"Failed to remove tif file {filepath}: {e}")
 
                 except Exception as e:
                     logger.error(f"Error processing region: {str(e)}")
