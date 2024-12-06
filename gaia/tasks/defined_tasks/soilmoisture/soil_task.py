@@ -31,6 +31,7 @@ import asyncio
 import os
 import tempfile
 import math
+import glob
 
 logger = get_logger(__name__)
 
@@ -69,7 +70,7 @@ class SoilMoistureTask(Task):
             metadata=SoilMoistureMetadata(),
             inputs=SoilMoistureInputs(),
             outputs=SoilMoistureOutputs(),
-            scoring_mechanism=SoilScoringMechanism(),
+            scoring_mechanism=SoilScoringMechanism(db_manager=db_manager),
         )
 
         self.db_manager = db_manager
@@ -549,7 +550,7 @@ class SoilMoistureTask(Task):
                         "sentinel_crs": response_data.get(
                             "sentinel_crs", metadata.get("sentinel_crs")
                         ),
-                        "status": "pending",
+                        "status": "sent_to_miner",
                     }
 
                     await self.db_manager.execute(
@@ -585,16 +586,30 @@ class SoilMoistureTask(Task):
 
     async def get_pending_tasks(self):
         """Get tasks that are ready for scoring and haven't been scored yet."""
-        scoring_time = datetime.now(timezone.utc)
-        #scoring_time = datetime.now(timezone.utc) - self.scoring_delay
-
+        scoring_time = datetime.now(timezone.utc) - timedelta(days=3)
+        #scoring_time = scoring_time.replace(hour=19, minute=30, second=0, microsecond=0)
+        
         try:
+            # First query to check what predictions exist
+            debug_result = await self.db_manager.fetch_many(
+                """
+                SELECT p.status, COUNT(*) as count, MIN(r.target_time) as earliest, MAX(r.target_time) as latest
+                FROM soil_moisture_predictions p
+                JOIN soil_moisture_regions r ON p.region_id = r.id
+                GROUP BY p.status
+                """
+            )
+            logger.info("Current prediction status counts:")
+            for row in debug_result:
+                logger.info(f"Status: {row['status']}, Count: {row['count']}, Time Range: {row['earliest']} to {row['latest']}")
+
             result = await self.db_manager.fetch_many(
                 """
                 SELECT 
                     r.*,
                     json_agg(json_build_object(
                         'miner_id', p.miner_uid,
+                        'miner_hotkey', p.miner_hotkey,
                         'surface_sm', p.surface_sm,
                         'rootzone_sm', p.rootzone_sm,
                         'uncertainty_surface', p.uncertainty_surface,
@@ -602,14 +617,14 @@ class SoilMoistureTask(Task):
                     )) as predictions
                 FROM soil_moisture_regions r
                 JOIN soil_moisture_predictions p ON p.region_id = r.id
-                WHERE r.status = 'sent_to_miners' 
-                AND p.status = 'pending'
-                AND r.target_time <= :scoring_time
-                GROUP BY r.id
+                WHERE r.target_time <= :scoring_time
+                AND p.status = 'sent_to_miner'
+                GROUP BY r.id, r.target_time, r.sentinel_bounds, r.sentinel_crs, r.status
                 ORDER BY r.target_time ASC
                 """,
-                {"scoring_time": scoring_time},
+                {"scoring_time": scoring_time}
             )
+            logger.info(f"Found {len(result) if result else 0} pending tasks")
             return result
 
         except Exception as e:
@@ -687,9 +702,15 @@ class SoilMoistureTask(Task):
                         """)
                         await session.execute(update_query, params)
 
+            await self.cleanup_predictions(
+                bounds=region["sentinel_bounds"],
+                target_time=region["target_time"],
+                miner_uid=miner_id
+            )
+            
         except Exception as e:
-            logger.error(f"Error moving task to history: {str(e)}")
-            raise
+            logger.error(f"Failed to move task to history: {str(e)}")
+            logger.error(traceback.format_exc())
         finally:
             if conn:
                 await conn.close()
@@ -704,8 +725,7 @@ class SoilMoistureTask(Task):
             scoring_results = {}
             tasks_by_time = {}
             for task in pending_tasks:
-                # Subtract 7 days from target_time right before grouping
-                target_time = task["target_time"] - timedelta(days=7)
+                target_time = task["target_time"]
                 if target_time not in tasks_by_time:
                     tasks_by_time[target_time] = []
                 tasks_by_time[target_time].append(task)
@@ -725,12 +745,17 @@ class SoilMoistureTask(Task):
                                 "crs": task["sentinel_crs"],
                                 "predictions": prediction,
                                 "target_time": target_time,
+                                "region": {
+                                    "id": task["id"]
+                                },
+                                "miner_id": prediction["miner_id"],
+                                "miner_hotkey": prediction["miner_hotkey"]
                             }
-                            score_result = await self.scoring_mechanism.score(pred_data)
-
-                            if score_result:
-                                scores[prediction["miner_id"]] = score_result
-                                task["score"] = score_result
+                            
+                            score = await self.scoring_mechanism.score(pred_data)
+                            if score:
+                                scores = score
+                                task["score"] = score
                                 scored_tasks.append(task)
 
                     except Exception as e:
@@ -775,7 +800,14 @@ class SoilMoistureTask(Task):
                                         logger.error(
                                             f"Error cleaning up file {file}: {str(e)}"
                                         )
-
+                                        
+                        tmp_files = glob.glob('/tmp/tmp*.h5')
+                        for file in tmp_files:
+                            try:
+                                os.remove(file)
+                                logger.info(f"Cleaned up temporary file in /tmp: {file}")
+                            except Exception as e:
+                                logger.error(f"Error cleaning up tmp file {file}: {str(e)}")
                     except Exception as e:
                         logger.error(f"Error moving task to history: {str(e)}")
                         raise
@@ -821,20 +853,18 @@ class SoilMoistureTask(Task):
     def get_smap_time_for_validator(self, current_time: datetime) -> datetime:
         """Get SMAP time based on validator execution time."""
         if self.test_mode:
-            # In test mode, round to nearest SMAP time (1:30, 7:30, 13:30, or 19:30)
             smap_hours = [1, 7, 13, 19]
             current_hour = current_time.hour
             closest_hour = min(smap_hours, key=lambda x: abs(x - current_hour))
             return current_time.replace(
-                hour=closest_hour, minute=30, second=0, microsecond=0
+                hour=7, minute=30, second=0, microsecond=0
             )
 
-        # Normal mode with strict window checks
         validator_to_smap = {
-            2: 1,    # 1:30 prep → 1:30 SMAP
-            3: 1,    # 2:00 execution → 1:30 SMAP
-            9: 7,    # 9:30 prep → 7:30 SMAP (updated)
-            10: 7,   # 10:00 execution → 7:30 SMAP (updated)
+            1: 1,    # 1:30 prep → 1:30 SMAP
+            2: 1,    # 2:00 execution → 1:30 SMAP
+            9: 7,    # 9:30 prep → 7:30 SMAP
+            10: 7,   # 10:00 execution → 7:30 SMAP
             13: 13,  # 13:30 prep → 13:30 SMAP
             14: 13,  # 14:00 execution → 13:30 SMAP
             19: 19,  # 19:30 prep → 19:30 SMAP
@@ -849,7 +879,7 @@ class SoilMoistureTask(Task):
     def get_validator_windows(self) -> List[Tuple[int, int, int, int]]:
         """Get all validator windows (hour_start, min_start, hour_end, min_end)."""
         return [
-            (1, 30, 2, 30),  # Prep window for 1:30 SMAP time
+            (1, 30, 2, 0),  # Prep window for 1:30 SMAP time
             (2, 0, 2, 30),  # Execution window for 1:30 SMAP time
             (9, 30, 10, 0),  # Prep window for 7:30 SMAP time
             (10, 0, 10, 30),  # Execution window for 7:30 SMAP time
@@ -1056,4 +1086,42 @@ class SoilMoistureTask(Task):
 
         except Exception as e:
             logger.error(f"Error recalculating recent scores: {e}")
+            logger.error(traceback.format_exc())
+
+    async def cleanup_predictions(self, bounds, target_time=None, miner_uid=None):
+        """Clean up predictions after they've been processed and moved to history."""
+        try:
+            conn = await self.db_manager.get_connection()
+            try:
+                async with conn.begin():
+                    result = await conn.execute(
+                        text("""
+                        DELETE FROM soil_moisture_predictions p
+                        USING soil_moisture_regions r
+                        WHERE p.region_id = r.id 
+                        AND r.sentinel_bounds = :bounds
+                        AND r.target_time = :target_time
+                        AND p.miner_uid = :miner_uid
+                        AND p.status = 'scored'
+                        RETURNING p.id
+                        """),
+                        {
+                            "bounds": bounds,
+                            "target_time": target_time,
+                            "miner_uid": miner_uid
+                        }
+                    )
+                    
+                    deleted_count = result.rowcount
+                    logger.info(
+                        f"Cleaned up {deleted_count} predictions for bounds {bounds}"
+                        f"{f', time {target_time}' if target_time else ''}"
+                        f"{f', miner {miner_uid}' if miner_uid else ''}"
+                    )
+                    
+            finally:
+                await conn.close()
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup predictions: {str(e)}")
             logger.error(traceback.format_exc())

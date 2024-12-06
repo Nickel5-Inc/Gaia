@@ -167,84 +167,94 @@ def get_smap_data(datetime_obj, regions):
     """
     try:
         smap_url = construct_smap_url(datetime_obj)
-        with tempfile.NamedTemporaryFile(suffix=".h5") as temp_file:
-            if not download_smap_data(smap_url, temp_file.name):
-                return None
+        cache_dir = Path("smap_cache")
+        cache_dir.mkdir(exist_ok=True)
+        temp_filename = f"temp_smap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5"
+        temp_filepath = cache_dir / temp_filename
+        
+        if not download_smap_data(smap_url, str(temp_filepath)):
+            return None
 
-            results = {}
-            with xr.open_dataset(temp_file.name, group="Geophysical_Data") as ds:
-                surface_data = ds["sm_surface"].values
-                rootzone_data = ds["sm_rootzone"].values
+        results = {}
+        with xr.open_dataset(str(temp_filepath), group="Geophysical_Data") as ds:
+            surface_data = ds["sm_surface"].values
+            rootzone_data = ds["sm_rootzone"].values
 
-                for i, region in enumerate(regions):
-                    bounds = region["bounds"]
-                    crs = region["crs"]
+            for i, region in enumerate(regions):
+                bounds = region["bounds"]
+                crs = region["crs"]
 
-                    if crs != "EPSG:4326":
-                        transformer = Transformer.from_crs(
-                            crs, "EPSG:4326", always_xy=True
-                        )
-                        left, bottom = transformer.transform(bounds[0], bounds[1])
-                        right, top = transformer.transform(bounds[2], bounds[3])
-                    else:
-                        left, bottom, right, top = bounds
-
-                    smap_y_size, smap_x_size = surface_data.shape
-                    smap_lat_range = (-85.0445, 85.0445)
-                    smap_lon_range = (-180, 180)
-
-                    y_idx_start = int(
-                        (smap_lat_range[1] - top)
-                        * smap_y_size
-                        / (smap_lat_range[1] - smap_lat_range[0])
+                if crs != "EPSG:4326":
+                    transformer = Transformer.from_crs(
+                        crs, "EPSG:4326", always_xy=True
                     )
-                    y_idx_end = int(
-                        (smap_lat_range[1] - bottom)
-                        * smap_y_size
-                        / (smap_lat_range[1] - smap_lat_range[0])
-                    )
-                    x_idx_start = int(
-                        (left - smap_lon_range[0])
-                        * smap_x_size
-                        / (smap_lon_range[1] - smap_lon_range[0])
-                    )
-                    x_idx_end = int(
-                        (right - smap_lon_range[0])
-                        * smap_x_size
-                        / (smap_lon_range[1] - smap_lon_range[0])
-                    )
+                    left, bottom = transformer.transform(bounds[0], bounds[1])
+                    right, top = transformer.transform(bounds[2], bounds[3])
+                else:
+                    left, bottom, right, top = bounds
 
-                    y_idx_start = max(0, min(y_idx_start, smap_y_size))
-                    y_idx_end = max(0, min(y_idx_end, smap_y_size))
-                    x_idx_start = max(0, min(x_idx_start, smap_x_size))
-                    x_idx_end = max(0, min(x_idx_end, smap_x_size))
+                smap_y_size, smap_x_size = surface_data.shape
+                smap_lat_range = (-85.0445, 85.0445)
+                smap_lon_range = (-180, 180)
 
-                    surface_roi = surface_data[
-                        y_idx_start:y_idx_end, x_idx_start:x_idx_end
-                    ]
-                    rootzone_roi = rootzone_data[
-                        y_idx_start:y_idx_end, x_idx_start:x_idx_end
-                    ]
+                y_idx_start = int(
+                    (smap_lat_range[1] - top)
+                    * smap_y_size
+                    / (smap_lat_range[1] - smap_lat_range[0])
+                )
+                y_idx_end = int(
+                    (smap_lat_range[1] - bottom)
+                    * smap_y_size
+                    / (smap_lat_range[1] - smap_lat_range[0])
+                )
+                x_idx_start = int(
+                    (left - smap_lon_range[0])
+                    * smap_x_size
+                    / (smap_lon_range[1] - smap_lon_range[0])
+                )
+                x_idx_end = int(
+                    (right - smap_lon_range[0])
+                    * smap_x_size
+                    / (smap_lon_range[1] - smap_lon_range[0])
+                )
 
-                    results[f"region_{i}"] = {
-                        "surface_sm": surface_roi,
-                        "rootzone_sm": rootzone_roi,
-                        "bounds": {
-                            "original": bounds,
-                            "transformed": (left, bottom, right, top),
-                        },
-                        "shape": surface_roi.shape,
-                    }
+                y_idx_start = max(0, min(y_idx_start, smap_y_size))
+                y_idx_end = max(0, min(y_idx_end, smap_y_size))
+                x_idx_start = max(0, min(x_idx_start, smap_x_size))
+                x_idx_end = max(0, min(x_idx_end, smap_x_size))
 
-                    print(f"\nRegion {i}:")
-                    print(f"Extracted shape: {surface_roi.shape}")
-                    print(f"Bounds: {bounds}")
+                surface_roi = surface_data[
+                    y_idx_start:y_idx_end, x_idx_start:x_idx_end
+                ]
+                rootzone_roi = rootzone_data[
+                    y_idx_start:y_idx_end, x_idx_start:x_idx_end
+                ]
 
-            return results
+                results[f"region_{i}"] = {
+                    "surface_sm": surface_roi,
+                    "rootzone_sm": rootzone_roi,
+                    "bounds": {
+                        "original": bounds,
+                        "transformed": (left, bottom, right, top),
+                    },
+                    "shape": surface_roi.shape,
+                }
+
+                print(f"\nRegion {i}:")
+                print(f"Extracted shape: {surface_roi.shape}")
+                print(f"Bounds: {bounds}")
+
+        return results
 
     except Exception as e:
         print(f"Error getting SMAP data: {str(e)}")
         return None
+    finally:
+        if 'temp_filepath' in locals() and temp_filepath.exists():
+            try:
+                temp_filepath.unlink()
+            except Exception as e:
+                print(f"Error cleaning up temp file: {str(e)}")
 
 
 def get_valid_smap_time(datetime_obj):
