@@ -4,7 +4,7 @@ import tempfile
 from gaia.tasks.base.components.scoring_mechanism import ScoringMechanism
 from gaia.tasks.base.decorators import task_timer
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from rasterio.coords import BoundingBox
 from rasterio.crs import CRS
 import torch
@@ -18,6 +18,10 @@ from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import (
 from pydantic import Field
 from fiber.logging_utils import get_logger
 import os
+import traceback
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.sql import text
+from datetime import timezone
 
 logger = get_logger(__name__)
 
@@ -28,14 +32,19 @@ class SoilScoringMechanism(ScoringMechanism):
     alpha: float = Field(default=10, description="Sigmoid steepness parameter")
     beta: float = Field(default=0.1, description="Sigmoid midpoint parameter")
     baseline_rmse: float = Field(default=50, description="Baseline RMSE value")
+    db_manager: Any = Field(default=None)
 
-    def __init__(self, baseline_rmse: float = 50, alpha: float = 10, beta: float = 0.1):
+    def __init__(self, baseline_rmse: float = 50, alpha: float = 10, beta: float = 0.1, db_manager=None):
         super().__init__(
             name="SoilMoistureScoringMechanism",
             description="Evaluates soil moisture predictions using RMSE and SSIM",
             normalize_score=True,
             max_score=1.0,
         )
+        self.alpha = alpha
+        self.beta = beta
+        self.baseline_rmse = baseline_rmse
+        self.db_manager = db_manager
 
     def sigmoid_rmse(self, rmse: float) -> float:
         """Convert RMSE to score using sigmoid function. (higher is better)"""
@@ -133,6 +142,7 @@ class SoilScoringMechanism(ScoringMechanism):
                 crs=predictions["crs"],
                 model_predictions=predictions["predictions"],
                 target_date=predictions["target_time"],
+                miner_id=predictions["miner_id"]
             )
 
             if not metrics:
@@ -169,6 +179,7 @@ class SoilScoringMechanism(ScoringMechanism):
         crs: float,
         model_predictions: torch.Tensor,
         target_date: datetime,
+        miner_id: str,
     ) -> dict:
         """
         Compute RMSE and SSIM between model predictions and SMAP data for valid pixels only.
@@ -178,6 +189,7 @@ class SoilScoringMechanism(ScoringMechanism):
             crs: EPSG code as float
             model_predictions: tensor of shape [1, 2, 11, 11] for surface and rootzone
             target_date: datetime for SMAP data
+            miner_id: miner's unique identifier
         """
         device = model_predictions.device
 
@@ -204,20 +216,33 @@ class SoilScoringMechanism(ScoringMechanism):
             if not smap_data:
                 return None
 
-            surface_sm = (
-                torch.from_numpy(smap_data["surface_sm"])
-                .float()
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .to(device)
-            )
-            rootzone_sm = (
-                torch.from_numpy(smap_data["rootzone_sm"])
-                .float()
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .to(device)
-            )
+            if model_predictions.shape[2] == 0 or model_predictions.shape[3] == 0:
+                logger.error(f"Empty model predictions detected with shape: {model_predictions.shape}")
+                return None
+
+            if model_predictions.shape[-2:] != (11, 11):
+                logger.error(f"Invalid model prediction shape: {model_predictions.shape}, expected last dimensions to be (11, 11)")
+                return None
+
+            surface_sm = torch.from_numpy(smap_data["surface_sm"]).float()
+            rootzone_sm = torch.from_numpy(smap_data["rootzone_sm"]).float()
+
+            if surface_sm.dim() == 2:
+                surface_sm = surface_sm.unsqueeze(0).unsqueeze(0)
+            if rootzone_sm.dim() == 2:
+                rootzone_sm = rootzone_sm.unsqueeze(0).unsqueeze(0)
+
+            surface_sm = surface_sm.to(device)
+            rootzone_sm = rootzone_sm.to(device)
+
+            logger.info(f"Model predictions shape: {model_predictions.shape}")
+            logger.info(f"SMAP data shapes - surface: {smap_data['surface_sm'].shape}, rootzone: {smap_data['rootzone_sm'].shape}")
+            logger.info(f"Processed shapes - surface: {surface_sm.shape}, rootzone: {rootzone_sm.shape}, model: {model_predictions.shape}")
+
+            if model_predictions.shape[1] != 2:
+                logger.error(f"Model predictions should have 2 channels, got shape: {model_predictions.shape}")
+                return None
+
             surface_sm_11x11 = F.interpolate(
                 surface_sm, size=(11, 11), mode="bilinear", align_corners=False
             )
@@ -230,6 +255,9 @@ class SoilScoringMechanism(ScoringMechanism):
             # early return if no valid pixels (.i.e no valid smap data)
             if not (surface_mask_11x11.any() or rootzone_mask_11x11.any()):
                 logger.warning(f"No valid SMAP data found for bounds {bounds}")
+                cleanup_success = await self.cleanup_invalid_prediction(bounds, target_date, miner_id)
+                if not cleanup_success:
+                    logger.error(f"Failed to cleanup invalid prediction for bounds {bounds}")
                 return None
 
             results = {"validation_metrics": {}}
@@ -307,6 +335,7 @@ class SoilScoringMechanism(ScoringMechanism):
 
         except Exception as e:
             logger.error(f"Error processing SMAP data: {str(e)}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
         finally:
             if temp_file:
@@ -315,3 +344,62 @@ class SoilScoringMechanism(ScoringMechanism):
 
                 except:
                     pass
+
+    async def cleanup_invalid_prediction(self, bounds, target_time: datetime, miner_id: str, conn=None):
+        """Clean up predictions for a specific miner and timestamp."""
+        try:
+            if not conn:
+                conn = await self.db_manager.get_connection()
+            
+            async with conn.begin():
+                debug_result = await conn.execute(
+                    text("""
+                    SELECT 
+                        p.id as pred_id,
+                        p.miner_uid,
+                        r.target_time,
+                        r.region_date,
+                        r.sentinel_bounds
+                    FROM soil_moisture_predictions p
+                    JOIN soil_moisture_regions r ON p.region_id = r.id
+                    WHERE p.miner_uid = :miner_id 
+                    AND p.status = 'sent_to_miner'
+                    AND r.sentinel_bounds = ARRAY[:b1, :b2, :b3, :b4]::float[]
+                    """),
+                    {
+                        "miner_id": miner_id,
+                        "b1": bounds[0],
+                        "b2": bounds[1],
+                        "b3": bounds[2],
+                        "b4": bounds[3]
+                    }
+                )
+                
+                row = debug_result.first()
+                if row:
+                    logger.info(f"Found prediction - ID: {row.pred_id}, Time: {row.target_time}, Date: {row.region_date}")
+                    result = await conn.execute(
+                        text("""
+                        DELETE FROM soil_moisture_predictions p
+                        WHERE p.id = :pred_id
+                        RETURNING p.id
+                        """),
+                        {"pred_id": row.pred_id}
+                    )
+                    
+                    deleted = result.first()
+                    if deleted:
+                        logger.info(f"Removed prediction {deleted.id}")
+                        return True
+                else:
+                    logger.warning(f"No predictions found for miner {miner_id} with bounds {bounds}")
+                
+                return False
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup invalid prediction: {e}")
+            logger.error(traceback.format_exc())
+            return False
+        finally:
+            if conn and not isinstance(conn, AsyncSession):
+                await conn.close()

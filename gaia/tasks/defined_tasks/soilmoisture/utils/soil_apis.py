@@ -1,11 +1,11 @@
 import asyncio
 import math
 import os
+import subprocess
 import tempfile
 import traceback
 import zipfile
 from datetime import datetime, timedelta, timezone
-
 import aiohttp
 import numpy as np
 import rasterio
@@ -18,6 +18,10 @@ from rasterio.merge import merge
 from rasterio.transform import from_bounds
 from rasterio.warp import transform_bounds, reproject, Resampling
 from skimage.transform import resize
+import requests
+import boto3
+from botocore.config import Config
+from botocore.client import UNSIGNED
 
 load_dotenv()
 EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
@@ -25,6 +29,26 @@ EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 
 EARTHDATA_AUTH = BasicAuth(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
 
+class SessionWithHeaderRedirection(requests.Session):
+    AUTH_HOST = 'urs.earthdata.nasa.gov'
+
+    def __init__(self, username, password):
+        super().__init__()
+        self.auth = (username, password)
+
+    def rebuild_auth(self, prepared_request, response):
+        headers = prepared_request.headers
+        url = prepared_request.url
+        if 'Authorization' in headers:
+            original_parsed = requests.utils.urlparse(response.request.url)
+            redirect_parsed = requests.utils.urlparse(url)
+            if (original_parsed.hostname != redirect_parsed.hostname) and \
+                    redirect_parsed.hostname != self.AUTH_HOST and \
+                    original_parsed.hostname != self.AUTH_HOST:
+                del headers['Authorization']
+        return
+
+session = SessionWithHeaderRedirection(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
 
 async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
     """
@@ -167,77 +191,104 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
 
 
 async def download_srtm_tile(lat, lon, download_dir=None):
-    """Download SRTM tile using Earthdata token authentication asynchronously."""
     if download_dir is None:
         download_dir = get_data_dir()
 
     try:
         lat_prefix = "N" if lat >= 0 else "S"
         lon_prefix = "E" if lon >= 0 else "W"
-        tile_name = (
-            f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.SRTMGL1.hgt.zip"
-        )
-        url = f"https://e4ftl01.cr.usgs.gov/MEASURES/SRTMGL1.003/2000.02.11/{tile_name}"
-        tile_path = os.path.join(download_dir, tile_name)
-
-        headers = {"Authorization": f'Bearer {os.getenv("EARTHDATA_API_KEY")}'}
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    with open(tile_path, "wb") as f:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
-                            f.write(chunk)
-                    print(f"Downloaded SRTM tile: {tile_name}")
-                elif response.status == 401:
-                    print(
-                        f"Unauthorized access for {tile_name}: {response.status} {response.reason}"
-                    )
+        
+        # Primary source (Earthdata)
+        tile_name = f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.SRTMGL1.hgt.zip"
+        earthdata_url = f"https://e4ftl01.cr.usgs.gov/MEASURES/SRTMGL1.003/2000.02.11/{tile_name}"
+        print(f"\n=== SRTM Download Debug for {tile_name} ===")
+        
+        timeout = aiohttp.ClientTimeout(total=300)
+        async with aiohttp.ClientSession(timeout=timeout, auth=EARTHDATA_AUTH) as session:
+            try:
+                print("Attempting primary Earthdata source...")
+                async with session.get(earthdata_url) as response:
+                    print(f"Earthdata status code: {response.status}")
+                    
+                    if response.status == 200:
+                        zip_path = os.path.join(download_dir, tile_name)
+                        final_tif_path = os.path.join(download_dir, f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.tif")
+                        
+                        with open(zip_path, "wb") as f:
+                            async for chunk in response.content.iter_chunked(1024 * 1024):
+                                f.write(chunk)
+                        
+                        print(f"Downloaded zip file to: {zip_path}")
+                        
+                        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                            hgt_filename = zip_ref.namelist()[0]
+                            zip_ref.extract(hgt_filename, download_dir)
+                        
+                        hgt_path = os.path.join(download_dir, hgt_filename)
+                        
+                        import subprocess
+                        subprocess.run([
+                            'gdal_translate',
+                            '-of', 'GTiff',
+                            '-co', 'COMPRESS=LZW',
+                            '-a_srs', 'EPSG:4326',
+                            hgt_path,
+                            final_tif_path
+                        ], check=True)
+                        
+                        os.remove(zip_path)
+                        os.remove(hgt_path)
+                        
+                        return final_tif_path
+                    else:
+                        raise Exception(f"Earthdata source failed with status {response.status}")
+                        
+            except Exception as e:
+                print(f"Earthdata source error: {str(e)}")
+                print("Attempting Copernicus DEM fallback source...")
+                
+                s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
+                
+                lat_abs = abs(lat)
+                lon_abs = abs(lon)
+                lat_dir = "N" if lat >= 0 else "S"
+                lon_dir = "E" if lon >= 0 else "W"
+                
+                for resolution_code in ["COG_10", "COG_30"]:
+                    bucket = "copernicus-dem-30m"
+                    key = (f"Copernicus_DSM_{resolution_code}_{lat_dir}{lat_abs:02d}_00_"
+                          f"{lon_dir}{lon_abs:03d}_00_DEM/Copernicus_DSM_{resolution_code}_"
+                          f"{lat_dir}{lat_abs:02d}_00_{lon_dir}{lon_abs:03d}_00_DEM.tif")
+                    
+                    print(f"Trying Copernicus GLO-30 mirror with {resolution_code} at s3://{bucket}/{key}")
+                    try:
+                        final_tif_path = os.path.join(download_dir, f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.tif")
+                        await asyncio.to_thread(s3.download_file, bucket, key, final_tif_path)
+                        return final_tif_path
+                    except Exception as e:
+                        print(f"Copernicus GLO-30 {resolution_code} failed: {str(e)}")
+                        continue
+                
+                bucket = "copernicus-dem-90m"
+                key = (f"Copernicus_DSM_COG_90_{lat_dir}{lat_abs:02d}_00_"
+                      f"{lon_dir}{lon_abs:03d}_00_DEM/Copernicus_DSM_COG_90_"
+                      f"{lat_dir}{lat_abs:02d}_00_{lon_dir}{lon_abs:03d}_00_DEM.tif")
+                
+                print(f"Trying Copernicus GLO-90 mirror at s3://{bucket}/{key}")
+                try:
+                    final_tif_path = os.path.join(download_dir, f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.tif")
+                    await asyncio.to_thread(s3.download_file, bucket, key, final_tif_path)
+                    return final_tif_path
+                except Exception as e:
+                    print(f"Copernicus GLO-90 failed: {str(e)}")
                     return None
-                else:
-                    print(
-                        f"Failed to download {tile_name}: {response.status} {response.reason}"
-                    )
-                    return None
-
-        # Proceed with processing the downloaded tile
-        with zipfile.ZipFile(tile_path, "r") as zip_ref:
-            hgt_filename = zip_ref.namelist()[0]
-            zip_ref.extract(hgt_filename, download_dir)
-
-        hgt_path = os.path.join(download_dir, hgt_filename)
-        tif_path = os.path.join(
-            download_dir, f"{os.path.splitext(hgt_filename)[0]}.tif"
-        )
-
-        cmd = [
-            "gdal_translate",
-            "-of",
-            "GTiff",
-            "-co",
-            "COMPRESS=LZW",
-            "-a_srs",
-            "EPSG:4326",
-            hgt_path,
-            tif_path,
-        ]
-        proc = await asyncio.create_subprocess_exec(*cmd)
-        await proc.communicate()
-
-        # Clean up temporary files
-        os.remove(tile_path)
-        os.remove(hgt_path)
-
-        return tif_path
 
     except Exception as e:
-        print(f"Error downloading SRTM tile {tile_name}: {str(e)}")
+        print(f"Error downloading SRTM tile: {str(e)}")
         return None
 
 
-async def fetch_srtm(
-    bbox, sentinel_bounds=None, sentinel_crs=None, sentinel_shape=None
-):
+async def fetch_srtm(bbox, sentinel_bounds=None, sentinel_crs=None, sentinel_shape=None):
     """Fetch and merge SRTM tiles using Sentinel-2 as reference asynchronously."""
     try:
         print("\n=== Fetching SRTM Data ===")

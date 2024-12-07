@@ -11,6 +11,7 @@ asyncpg==0.30.0
 attrs==24.2.0
 base58==2.1.1
 black==24.10.0
+boto3==1.35.75
 certifi==2024.8.30
 cffi==1.17.1
 cfgrib==0.9.14.1
