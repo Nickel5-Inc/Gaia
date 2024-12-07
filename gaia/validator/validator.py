@@ -1,4 +1,4 @@
-import datetime
+from datetime import datetime, timezone, timedelta
 import os
 
 os.environ["NODE_TYPE"] = "validator"
@@ -66,13 +66,11 @@ class GaiaValidator:
         """
         try:
             load_dotenv(".env")
-            # Set netuid and chain endpoint
             self.netuid = (
                 self.args.netuid if self.args.netuid else int(os.getenv("NETUID", 237))
             )
             logger.info(f"Using netuid: {self.netuid}")
 
-            # Load chain endpoint from args or env
             self.subtensor_chain_endpoint = (
                 self.args.subtensor.chain_endpoint
                 if hasattr(self.args, "subtensor")
@@ -89,7 +87,6 @@ class GaiaValidator:
                 else os.getenv("SUBTENSOR_NETWORK", "test")
             )
 
-            # Load wallet and keypair
             self.wallet_name = (
                 self.args.wallet
                 if self.args.wallet
@@ -104,7 +101,6 @@ class GaiaValidator:
                 self.wallet_name, self.hotkey_name
             )
 
-            # Setup substrate interface and metagraph
             self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
             self.metagraph = Metagraph(substrate=self.substrate, netuid=self.netuid)
 
@@ -124,7 +120,6 @@ class GaiaValidator:
         if isinstance(obj, (pd.Timestamp, datetime.datetime)):
             return obj.isoformat()
         elif isinstance(obj, bytes):
-            # For bytes, return a dictionary with encoding information
             return {
                 "_type": "bytes",
                 "encoding": "base64",
@@ -165,7 +160,6 @@ class GaiaValidator:
                         logger.info(f"Handshake successful with miner {miner_hotkey}")
                         fernet = Fernet(symmetric_key_str)
 
-                        # Pass the original payload dict
                         resp = await vali_client.make_non_streamed_post(
                             httpx_client=self.httpx_client,
                             server_address=base_url,
@@ -174,7 +168,7 @@ class GaiaValidator:
                             symmetric_key_uuid=symmetric_key_uuid,
                             validator_ss58_address=self.keypair.ss58_address,
                             miner_ss58_address=miner_hotkey,
-                            payload=payload,  # Pass the original dict
+                            payload=payload,
                             endpoint=endpoint,
                         )
 
@@ -195,19 +189,19 @@ class GaiaValidator:
                 except httpx.HTTPStatusError as e:
                     logger.warning(f"HTTP error from miner {miner_hotkey}: {e}")
                     # logger.debug(f"Error details: {traceback.format_exc()}")
-                    continue  # Continue to next miner on error
+                    continue
 
                 except httpx.RequestError as e:
                     logger.warning(f"Request error from miner {miner_hotkey}: {e}")
                     # logger.debug(f"Error details: {traceback.format_exc()}")
-                    continue  # Continue to next miner on error
+                    continue
 
                 except Exception as e:
                     logger.error(f"Error with miner {miner_hotkey}: {e}")
                     logger.error(f"Error details: {traceback.format_exc()}")
-                    continue  # Continue to next miner on error
+                    continue
 
-            return responses  # Always return the list, even if empty
+            return responses
 
         except Exception as e:
             logger.error(f"Error in query_miners: {str(e)}")
@@ -266,7 +260,6 @@ class GaiaValidator:
 
         while True:
             try:
-                # Execute tasks in parallel
                 workers = [
                     asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
                     asyncio.create_task(self.soil_task.validator_execute(self)),
@@ -287,41 +280,50 @@ class GaiaValidator:
         """
         while True:
             try:
-                # Sync metagraph and get current block
                 self.metagraph.sync_nodes()
                 block = self.substrate.get_block()
                 self.current_block = block["header"]["number"]
+               
                 logger.info(f"Fetched current block: {self.current_block}")
-
-                # Calculate blocks until next scoring round
                 blocks_until_scoring = 300 - (self.current_block % 300)
                 logger.info(f"Blocks until next scoring: {blocks_until_scoring}")
-
-                # Sleep until next scoring round (max 60 seconds per sleep)
+                
                 await asyncio.sleep(min(blocks_until_scoring * 12, 60))
-
-                # Sync metagraph and calculate scores
+                
                 logger.info("Syncing metagraph nodes...")
                 self.metagraph.sync_nodes()
                 logger.info("Metagraph synced. Fetching recent scores...")
 
-                geomagnetic_scores = await self.database_manager.get_recent_scores(
-                    "geomagnetic"
+                three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+                
+                query = """
+                SELECT score 
+                FROM score_table 
+                WHERE task_name = :task_name
+                AND created_at >= :start_time
+                ORDER BY created_at DESC 
+                LIMIT 1
+                """
+                
+                geomagnetic_result = await self.database_manager.fetch_one(
+                    query, 
+                    {"task_name": "geomagnetic", "start_time": three_days_ago}
                 )
-                logger.info(f"Geomagnetic scores: {geomagnetic_scores}")
-                soil_scores = await self.database_manager.get_recent_scores("soil")
-                logger.info(f"Soil scores: {soil_scores}")
+                soil_result = await self.database_manager.fetch_one(
+                    query,
+                    {"task_name": "soil_moisture", "start_time": three_days_ago}
+                )
+
+                geomagnetic_scores = geomagnetic_result["score"] if geomagnetic_result else [float("nan")] * 256
+                soil_scores = soil_result["score"] if soil_result else [float("nan")] * 256
+
                 logger.info("Recent scores fetched. Calculating aggregate scores...")
 
-                # Calculate weights
                 weights = [0.0] * 256
                 for idx in range(256):
                     geomagnetic_score = geomagnetic_scores[idx]
                     soil_score = soil_scores[idx]
 
-                    # logger.debug(f"Raw scores - UID {idx}: geo={geomagnetic_score}, soil={soil_score}")
-
-                    # Handle nan values and normalize scores
                     if math.isnan(geomagnetic_score) and math.isnan(soil_score):
                         weights[idx] = 0.0
                         logger.debug(f"Both scores nan - setting weight to 0")
@@ -331,14 +333,12 @@ class GaiaValidator:
                             f"Geo score nan - using soil score: {weights[idx]}"
                         )
                     elif math.isnan(soil_score):
-                        # Convert geomagnetic error to score using exponential decay
                         geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
                         weights[idx] = 0.5 * geo_normalized
                         logger.debug(
                             f"UID {idx}: Soil score nan - normalized geo score: {geo_normalized} -> weight: {weights[idx]}"
                         )
                     else:
-                        # Normalize both scores using exponential decay for geomagnetic
                         geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
                         weights[idx] = (0.5 * geo_normalized) + (0.5 * soil_score)
                         logger.debug(
@@ -351,7 +351,6 @@ class GaiaValidator:
 
                 logger.info(f"Weights before normalization: {weights}")
 
-                # Only proceed if we have any non-zero weights
                 non_zero_weights = [w for w in weights if w != 0.0]
                 if non_zero_weights:
                     # Sort indices by weight for ranking (negative scores = higher error = lower rank)
@@ -362,13 +361,11 @@ class GaiaValidator:
                         ),
                     )
 
-                    # Calculate new weights based on rank position
                     new_weights = [0.0] * len(weights)
                     for rank, idx in enumerate(sorted_indices):
-                        if weights[idx] != 0.0:  # Assign weights to any non-zero score
+                        if weights[idx] != 0.0:
                             try:
                                 normalized_rank = 1.0 - (rank / len(non_zero_weights))
-                                # Clamp the exponent to prevent overflow
                                 exponent = max(
                                     min(-20 * (normalized_rank - 0.5), 709), -709
                                 )
@@ -377,18 +374,17 @@ class GaiaValidator:
                                 logger.warning(
                                     f"Overflow prevented for rank {rank}, idx {idx}"
                                 )
-                                # Fallback values based on extreme cases
+
                                 if normalized_rank > 0.5:
                                     new_weights[idx] = 1.0
                                 else:
                                     new_weights[idx] = 0.0
 
-                    # Normalize final weights
+
                     total = sum(new_weights)
                     if total > 0:
                         self.weights = [w / total for w in new_weights]
 
-                        # Log distribution stats
                         top_20_weight = sum(
                             sorted(self.weights, reverse=True)[
                                 : int(len(weights) * 0.2)
@@ -398,18 +394,15 @@ class GaiaValidator:
                             f"Weight distribution: top 20% of nodes hold {top_20_weight*100:.1f}% of total weight"
                         )
 
-                        # Set weights on chain
-                        logger.info("Setting weights on the chain...")
+                        logger.info("Attempting to set weights...")
                         success = await self.set_weights(self.weights)
                         if success:
-                            self.last_set_weights_block = self.current_block
-                            logger.info(
-                                f"Successfully set weights at block {self.current_block}"
-                            )
+                            if self.current_block == self.last_set_weights_block:
+                                logger.info(f"Successfully set weights at block {self.current_block}")
+                            else:
+                                logger.info("Waiting for next weight setting interval")
                         else:
-                            logger.error(
-                                f"Failed to set weights at block {self.current_block}"
-                            )
+                            logger.error(f"Error setting weights at block {self.current_block}")
                     else:
                         logger.warning("No positive weights after normalization")
                 else:
@@ -433,23 +426,33 @@ class GaiaValidator:
             bool: True if weights were set successfully, False otherwise
         """
         try:
+            block = self.substrate.get_block()
+            self.current_block = block["header"]["number"]
+            
+            if self.last_set_weights_block:
+                blocks_since_last = self.current_block - self.last_set_weights_block
+                if blocks_since_last < 300:
+                    blocks_remaining = 300 - blocks_since_last
+                    next_block = self.last_set_weights_block + 300
+                    logger.info(f"Waiting for block interval - {blocks_remaining} blocks remaining")
+                    logger.info(f"Last set: block {self.last_set_weights_block}")
+                    logger.info(f"Next possible: block {next_block} (current: {self.current_block})")
+                    return True
+
             weight_setter = FiberWeightSetter(
                 netuid=self.netuid,
                 wallet_name=self.wallet_name,
                 hotkey_name=self.hotkey_name,
                 network=self.subtensor_network,
+                last_set_block=self.last_set_weights_block,
+                current_block=self.current_block
             )
 
-            success = await weight_setter.set_weights()
+            success = await weight_setter.set_weights(weights)
             if success:
-                # Update last_set_weights_block only on successful weight setting
                 self.last_set_weights_block = self.current_block
                 logger.info(f"Successfully set weights at block {self.current_block}")
-            else:
-                logger.error(f"Failed to set weights at block {self.current_block}")
-                self.last_set_weights_block = (
-                    self.current_block - 250
-                )  # offset to prevent immediate re-setting
+                logger.info(f"Next weight set possible at block {self.current_block + 300}")
             return success
 
         except Exception as e:
@@ -461,10 +464,9 @@ class GaiaValidator:
         """Log the status of the validator periodically."""
         while True:
             try:
-                current_time_utc = datetime.datetime.now(datetime.timezone.utc)
+                current_time_utc = datetime.now(timezone.utc)
                 formatted_time = current_time_utc.strftime("%Y-%m-%d %H:%M:%S")
 
-                # Try to get current block, handle connection errors
                 try:
                     block = self.substrate.get_block()
                     self.current_block = block["header"]["number"]
@@ -472,13 +474,11 @@ class GaiaValidator:
                         self.current_block - self.last_set_weights_block
                     )
                 except Exception as block_error:
-                    # logger.warning(f"Failed to get current block: {block_error}")
-                    # Try to reconnect to substrate
+
                     try:
                         self.substrate = SubstrateInterface(
                             url=self.subtensor_chain_endpoint
                         )
-                        # logger.info("Successfully reconnected to substrate")
                     except Exception as e:
                         logger.error(f"Failed to reconnect to substrate: {e}")
 
@@ -502,16 +502,13 @@ class GaiaValidator:
     async def update_miner_table(self):
         """Update the miner table with the latest miner information from the metagraph."""
         try:
-            # Ensure metagraph is initialized
             if self.metagraph is None:
                 logger.error("Metagraph not initialized")
                 return
 
-            # Sync metagraph to get latest node information
             self.metagraph.sync_nodes()
             logger.info(f"Synced {len(self.metagraph.nodes)} nodes from the network")
 
-            # Use enumerate to get the correct index for each node
             for index, (hotkey, node) in enumerate(self.metagraph.nodes.items()):
                 await self.database_manager.update_miner_info(
                     index=index,  # Use the enumerated index
@@ -526,7 +523,6 @@ class GaiaValidator:
                     vtrust=float(node.vtrust),
                     protocol=str(node.protocol),
                 )
-                # Update in-memory state
                 self.nodes[index] = {"hotkey": node.hotkey, "uid": index}
                 logger.debug(f"Updated information for node {index}")
 
@@ -541,18 +537,13 @@ class GaiaValidator:
         """Run miner deregistration checks every 60 seconds."""
         while True:
             try:
-                # Sync metagraph to get current network state
                 self.metagraph.sync_nodes()
-
-                # Create mapping of current network state
                 active_miners = {
                     idx: {"hotkey": hotkey, "uid": idx}
                     for idx, (hotkey, _) in enumerate(self.metagraph.nodes.items())
                 }
 
-                # Check for changes in the node table
                 if not self.nodes:
-                    # Initial load of node table state
                     query = (
                         "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL"
                     )
@@ -578,20 +569,17 @@ class GaiaValidator:
                             f"UID {miner['uid']}: {miner['hotkey']} -> {active_miners[miner['uid']]['hotkey']}"
                         )
 
-                    # Update in-memory node table state
                     for miner in deregistered_miners:
                         self.nodes[miner["uid"]]["hotkey"] = active_miners[
                             miner["uid"]
                         ]["hotkey"]
 
-                    # Get list of UIDs for recalculation
                     uids = [int(miner["uid"]) for miner in deregistered_miners]
 
                     # Set weights to 0 for deregistered miners
                     for idx in uids:
                         self.weights[idx] = 0.0
 
-                    # Recalculate scores for both tasks
                     await self.soil_task.recalculate_recent_scores(uids)
                     await self.geomagnetic_task.recalculate_recent_scores(uids)
 
@@ -611,10 +599,8 @@ class GaiaValidator:
 if __name__ == "__main__":
     parser = ArgumentParser()
 
-    # Create a subtensor group
     subtensor_group = parser.add_argument_group("subtensor")
 
-    # Required arguments
     parser.add_argument("--wallet", type=str, help="Name of the wallet to use")
     parser.add_argument("--hotkey", type=str, help="Name of the hotkey to use")
     parser.add_argument("--netuid", type=int, help="Netuid to use")
@@ -622,14 +608,12 @@ if __name__ == "__main__":
         "--subtensor.chain_endpoint", type=str, help="Subtensor chain endpoint to use"
     )
 
-    # Add test-soil argument
     parser.add_argument(
         "--test-soil",
         action="store_true",
         help="Run soil moisture task immediately without waiting for windows",
     )
 
-    # Parse arguments
     args = parser.parse_args()
 
     validator = GaiaValidator(args)

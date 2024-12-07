@@ -32,6 +32,7 @@ import os
 import tempfile
 import math
 import glob
+from collections import defaultdict
 
 logger = get_logger(__name__)
 
@@ -55,7 +56,7 @@ class SoilMoistureTask(Task):
         description="Delay before scoring due to SMAP data latency",
     )
 
-    validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None  # type: ignore
+    validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None
     miner_preprocessing: Optional["SoilMinerPreprocessing"] = None
     model: Optional[SoilModel] = None
     db_manager: Any = Field(default=None)
@@ -152,7 +153,6 @@ class SoilMoistureTask(Task):
                                     )
                                     continue
 
-                                # Validate TIFF data retrieved from database
                                 combined_data = region["combined_data"]
                                 if not isinstance(combined_data, bytes):
                                     logger.error(
@@ -199,7 +199,6 @@ class SoilMoistureTask(Task):
                                 logger.info(
                                     f"Sending region {region['id']} to miners..."
                                 )
-                                # logger.info(f"Payload: {payload}")
                                 responses = await validator.query_miners(
                                     payload=payload, endpoint="/soilmoisture-request"
                                 )
@@ -520,10 +519,8 @@ class SoilMoistureTask(Task):
                         logger.warning(f"No UID found for hotkey {miner_hotkey}")
                         continue
 
-                    # Convert miner_uid to string for database
                     miner_uid = str(result["uid"])
 
-                    # Parse response data if it's in text format
                     if isinstance(response_data, dict) and "text" in response_data:
                         try:
                             response_data = json.loads(response_data["text"])
@@ -586,11 +583,10 @@ class SoilMoistureTask(Task):
 
     async def get_pending_tasks(self):
         """Get tasks that are ready for scoring and haven't been scored yet."""
-        scoring_time = datetime.now(timezone.utc) - timedelta(days=3)
-        #scoring_time = scoring_time.replace(hour=19, minute=30, second=0, microsecond=0)
+        scoring_time = datetime.now(timezone.utc) - self.scoring_delay
+        #scoring_time = scoring_time.replace(hour=19, minute=30, second=0, microsecond=0) this is for testing
         
         try:
-            # First query to check what predictions exist
             debug_result = await self.db_manager.fetch_many(
                 """
                 SELECT p.status, COUNT(*) as count, MIN(r.target_time) as earliest, MAX(r.target_time) as latest
@@ -599,9 +595,9 @@ class SoilMoistureTask(Task):
                 GROUP BY p.status
                 """
             )
-            logger.info("Current prediction status counts:")
+            logger.debug("Current prediction status counts:")
             for row in debug_result:
-                logger.info(f"Status: {row['status']}, Count: {row['count']}, Time Range: {row['earliest']} to {row['latest']}")
+                logger.debug(f"Status: {row['status']}, Count: {row['count']}, Time Range: {row['earliest']} to {row['latest']}")
 
             result = await self.db_manager.fetch_many(
                 """
@@ -624,7 +620,7 @@ class SoilMoistureTask(Task):
                 """,
                 {"scoring_time": scoring_time}
             )
-            logger.info(f"Found {len(result) if result else 0} pending tasks")
+            logger.debug(f"Found {len(result) if result else 0} pending tasks")
             return result
 
         except Exception as e:
@@ -725,7 +721,7 @@ class SoilMoistureTask(Task):
             scoring_results = {}
             tasks_by_time = {}
             for task in pending_tasks:
-                target_time = task["target_time"]
+                target_time = task["target_time"] # - timedelta(days=3) this is for testing
                 if target_time not in tasks_by_time:
                     tasks_by_time[target_time] = []
                 tasks_by_time[target_time].append(task)
@@ -906,6 +902,9 @@ class SoilMoistureTask(Task):
     async def build_score_row(self, target_time, recent_tasks=None):
         """Build score row for global scoring mechanism."""
         try:
+            current_time = datetime.now(timezone.utc)
+            scores = [float("nan")] * 256
+            
             miner_query = """
             SELECT uid, hotkey FROM node_table 
             WHERE hotkey IS NOT NULL
@@ -914,40 +913,43 @@ class SoilMoistureTask(Task):
             hotkey_to_uid = {row["hotkey"]: row["uid"] for row in miner_mappings}
             logger.info(f"Found {len(hotkey_to_uid)} miner mappings: {hotkey_to_uid}")
 
-            score_rows = []
+            scores = [float("nan")] * 256
             current_datetime = datetime.fromisoformat(str(target_time))
 
             if recent_tasks:
                 logger.info(f"Processing {len(recent_tasks)} recent tasks")
-                for task_idx, task in enumerate(recent_tasks):
-                    scores = [float("nan")] * 256
+                miner_scores = {}
+                
+                for task in recent_tasks:
                     task_score = task.get("score", {})
-
                     for prediction in task.get("predictions", []):
                         miner_id = prediction.get("miner_id")
-                        if miner_id and isinstance(
-                            task_score.get("total_score"), (int, float)
-                        ):
-                            scores[int(miner_id)] = float(task_score["total_score"])
-                            logger.info(
-                                f"Added score {task_score['total_score']} for miner_id {miner_id} in region {task['id']}"
-                            )
+                        if miner_id not in miner_scores:
+                            miner_scores[miner_id] = []
+                        if isinstance(task_score.get("total_score"), (int, float)):
+                            miner_scores[miner_id].append(float(task_score["total_score"]))
+                            logger.info(f"Added score {task_score['total_score']} for miner_id {miner_id} in region {task['id']}")
 
-                    score_rows.append(
-                        {
-                            "task_name": f"soil_moisture_region_{task['id']}",
-                            "task_id": str(current_datetime.timestamp()),
-                            "score": scores,
-                            "status": "completed",
-                        }
-                    )
+                for miner_id, scores_list in miner_scores.items():
+                    if scores_list:
+                        scores[int(miner_id)] = sum(scores_list) / len(scores_list)
+                        logger.info(f"Final average score for miner {miner_id}: {scores[int(miner_id)]} across {len(scores_list)} regions")
 
-                return score_rows
+                score_row = {
+                    "task_name": "soil_moisture",
+                    "task_id": str(current_datetime.timestamp()),
+                    "score": scores,
+                    "status": "completed"
+                }
+                
+                logger.info(f"Raw score row being inserted: {json.dumps({**score_row, 'score': [f'{s:.4f}' if not math.isnan(s) else 'nan' for s in score_row['score']]})}")
+                
+                return [score_row]
 
         except Exception as e:
-            logger.error(f"Error building score row: {str(e)}")
+            logger.error(f"Error building score row: {e}")
             logger.error(traceback.format_exc())
-            return None
+            return []
 
     async def recalculate_recent_scores(self, uids: list):
         """
