@@ -7,7 +7,7 @@ from fiber.chain import chain_utils
 from gaia.miner.miner import Miner
 import requests
 
-#####Temp Health Check to run on local
+######Temp Health Check to run on local
 
 
 # Configure logging

@@ -3,7 +3,7 @@ import sys
 import logging
 from unittest.mock import patch
 
-#####Temp Health Check to run on local
+######Temp Health Check to run on local
 
 # Mock environment variables for local testing
 os.environ["WALLET_NAME"] = "mock_wallet"
