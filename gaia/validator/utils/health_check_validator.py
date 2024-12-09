@@ -3,7 +3,7 @@ import sys
 import logging
 from unittest.mock import patch
 
-######Temp Health Check to run on local
+#####Temp Health Check to run on local
 
 # Mock environment variables for local testing
 os.environ["WALLET_NAME"] = "mock_wallet"
@@ -14,10 +14,12 @@ os.environ["NETUID"] = "237"
 # Patch EARTHDATA_AUTH in soil_apis before importing anything else
 with patch.dict(
     "os.environ",
-    {"EARTHDATA_USERNAME": "mock_user", "EARTHDATA_PASSWORD": "mock_password"}
+    {"EARTHDATA_USERNAME": "mock_user", "EARTHDATA_PASSWORD": "mock_password"},
 ):
     from gaia.validator.validator import GaiaValidator
-    from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+    from gaia.validator.database.validator_database_manager import (
+        ValidatorDatabaseManager,
+    )
     import requests
 
 # Configure logging
@@ -26,6 +28,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
 
 # Mock Subtensor and Blockchain Interactions
 class MockSubtensorInterface:
@@ -133,11 +136,16 @@ def check_subtensor_endpoint(endpoint):
         # Attempt a POST request with dummy payload
         response = requests.post(endpoint, json={"test": "health_check"}, timeout=5)
 
-        if response.status_code in [200, 405]:  # Allow 405 if it's a known expected behavior
+        if response.status_code in [
+            200,
+            405,
+        ]:  # Allow 405 if it's a known expected behavior
             logger.info("Subtensor endpoint is reachable.")
             return True
         else:
-            logger.error(f"Subtensor endpoint returned status code {response.status_code}.")
+            logger.error(
+                f"Subtensor endpoint returned status code {response.status_code}."
+            )
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to reach Subtensor endpoint: {e}")
     return False
@@ -154,7 +162,7 @@ def check_validator_initialization():
             hotkey = None
             netuid = 237
             test_soil = False
-            subtensor = type('subtensor', (), {"chain_endpoint": None, "network": None})
+            subtensor = type("subtensor", (), {"chain_endpoint": None, "network": None})
 
         # Inject mocks
         GaiaValidator.__init__ = lambda self, args: None
