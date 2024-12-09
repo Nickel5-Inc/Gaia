@@ -2,8 +2,6 @@ import os
 import sys
 import logging
 from unittest.mock import patch
-from dotenv import load_dotenv
-from fiber.chain import chain_utils
 from gaia.miner.miner import Miner
 import requests
 
@@ -38,11 +36,16 @@ def check_subtensor_endpoint(endpoint):
         # Attempt a POST request with dummy payload (adjust based on API requirements)
         response = requests.post(endpoint, json={"test": "health_check"}, timeout=5)
 
-        if response.status_code in [200, 405]:  # Allow 405 if it's a known expected behavior
+        if response.status_code in [
+            200,
+            405,
+        ]:  # Allow 405 if it's a known expected behavior
             logger.info("Subtensor endpoint is reachable.")
             return True
         else:
-            logger.error(f"Subtensor endpoint returned status code {response.status_code}.")
+            logger.error(
+                f"Subtensor endpoint returned status code {response.status_code}."
+            )
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to reach Subtensor endpoint: {e}")
     return False
@@ -59,19 +62,25 @@ def check_miner_initialization():
             hotkey = None
             netuid = None
             port = 8091
-            subtensor = type('subtensor', (), {"chain_endpoint": None, "network": None})
+            subtensor = type("subtensor", (), {"chain_endpoint": None, "network": None})
 
         # Mock model loading and any file creation
-        with patch("gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing.SoilMinerPreprocessing._load_model") as mock_load_model, \
-             patch("os.makedirs") as mock_makedirs, \
-             patch("builtins.open") as mock_open, \
-             patch("tempfile.NamedTemporaryFile") as mock_tempfile, \
-             patch("os.unlink") as mock_unlink:
+        with patch(
+            "gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing.SoilMinerPreprocessing._load_model"
+        ) as mock_load_model, patch("os.makedirs") as mock_makedirs, patch(
+            "builtins.open"
+        ) as mock_open, patch(
+            "tempfile.NamedTemporaryFile"
+        ) as mock_tempfile, patch(
+            "os.unlink"
+        ) as mock_unlink:
             # Mock return values to prevent unnecessary operations
             mock_load_model.return_value = None  # Simulate successful model loading
             mock_makedirs.return_value = None
             mock_open.return_value = None
-            mock_tempfile.return_value.__enter__.return_value.name = "/mock/tempfile.tif"
+            mock_tempfile.return_value.__enter__.return_value.name = (
+                "/mock/tempfile.tif"
+            )
             mock_unlink.return_value = None
 
             # Initialize the Miner class
@@ -98,7 +107,13 @@ def run_health_checks():
     os.environ["PORT"] = "8091"
 
     # Check required environment variables
-    required_vars = ["WALLET_NAME", "HOTKEY_NAME", "SUBTENSOR_ADDRESS", "NETUID", "PORT"]
+    required_vars = [
+        "WALLET_NAME",
+        "HOTKEY_NAME",
+        "SUBTENSOR_ADDRESS",
+        "NETUID",
+        "PORT",
+    ]
     if not check_environment_variables(required_vars):
         logger.error("Environment variable check failed.")
         return False
