@@ -164,14 +164,19 @@ class GeomagneticTask(Task):
         """
         while True:
             try:
-                logger.info("Executing GeomagneticTask Loop...")
-
                 # Step 1: Align to the top of the next hour
                 current_time = datetime.datetime.now(datetime.timezone.utc)
                 next_hour = current_time.replace(
                     minute=0, second=0, microsecond=0
                 ) + datetime.timedelta(hours=1)
                 sleep_duration = (next_hour - current_time).total_seconds()
+
+                logger.info(
+                    f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
+                )
+                await asyncio.sleep(sleep_duration)
+
+                logger.info("Starting GeomagneticTask execution...")
 
                 # Step 2: Fetch Latest Geomagnetic Data
                 timestamp, dst_value, historical_data = await self._fetch_geomag_data()
@@ -185,19 +190,11 @@ class GeomagneticTask(Task):
                 # Step 4: Process Scores
                 await self._process_scores(validator, current_hour_start, next_hour)
 
-                # Sleep until next hour
-                current_time = datetime.datetime.now(datetime.timezone.utc)
-                sleep_duration = (next_hour - current_time).total_seconds()
-                if sleep_duration > 0:
-                    logger.info(
-                        f"Sleeping until next hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
-                    )
-                    await asyncio.sleep(sleep_duration)
-
             except Exception as e:
                 logger.error(f"Unexpected error in validator_execute loop: {e}")
-                logger.error(f"{traceback.format_exc()}")
-                await asyncio.sleep(60)
+                logger.error(traceback.format_exc())
+
+                await asyncio.sleep(3600)
 
     async def _fetch_geomag_data(self):
         """Fetch latest geomagnetic data."""
