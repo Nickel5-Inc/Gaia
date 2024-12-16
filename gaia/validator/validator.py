@@ -283,12 +283,13 @@ class GaiaValidator:
                 self.metagraph.sync_nodes()
                 block = self.substrate.get_block()
                 self.current_block = block["header"]["number"]
-               
-                logger.info(f"Fetched current block: {self.current_block}")
-                blocks_until_scoring = 300 - (self.current_block % 300)
-                logger.info(f"Blocks until next scoring: {blocks_until_scoring}")
                 
-                await asyncio.sleep(min(blocks_until_scoring * 12, 60))
+                next_weight_block = ((self.current_block // 300) * 300) + 50
+                blocks_until_weights = next_weight_block - self.current_block
+                
+                logger.info(f"Fetched current block: {self.current_block}")
+                logger.info(f"Next weight setting at block: {next_weight_block}")
+                await asyncio.sleep(blocks_until_weights * 12)
                 
                 logger.info("Syncing metagraph nodes...")
                 self.metagraph.sync_nodes()
@@ -428,11 +429,9 @@ class GaiaValidator:
             bool: True if weights were set successfully, False otherwise.
         """
         try:
-            # Get the current block
             block = self.substrate.get_block()
             self.current_block = block["header"]["number"]
 
-            # Check for block interval conditions
             if self.last_set_weights_block:
                 blocks_since_last = self.current_block - self.last_set_weights_block
                 if blocks_since_last < 300:
@@ -443,7 +442,6 @@ class GaiaValidator:
                     logger.info(f"Next possible: block {next_block} (current: {self.current_block})")
                     return True
 
-            # Initialize FiberWeightSetter
             weight_setter = FiberWeightSetter(
                 netuid=self.netuid,
                 wallet_name=self.wallet_name,
@@ -453,12 +451,10 @@ class GaiaValidator:
                 current_block=self.current_block
             )
 
-            # Retry logic with exponential backoff
             attempt = 0
             delay = 1
             while attempt < max_retries:
                 try:
-                    # Attempt to set weights with a timeout
                     success = await asyncio.wait_for(weight_setter.set_weights(weights), timeout=timeout)
                     if success:
                         self.last_set_weights_block = self.current_block
@@ -468,18 +464,16 @@ class GaiaValidator:
                     else:
                         logger.warning("❌ Failed to set weights, retrying...")
                 except asyncio.TimeoutError:
-                    logger.error(f"⏳ Timeout occurred while setting weights (attempt {attempt + 1}/{max_retries})")
+                    logger.debug(f"⏳ Timeout occurred while setting weights (attempt {attempt + 1}/{max_retries})")
                 except Exception as e:
                     logger.error(f"❌ Error during weight setting (attempt {attempt + 1}/{max_retries}): {e}")
                     logger.error(traceback.format_exc())
 
-                # Increment attempts and apply backoff delay
                 attempt += 1
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, 10)  # Exponential backoff, capped at 10 seconds
+                delay = min(delay * 2, 10)
 
-            logger.error("❌ Exceeded maximum retry attempts. Weight setting failed.")
-            return False  # <- Correct placement of return statement
+            return False
 
         except Exception as e:
             logger.error(f"Unexpected error in set_weights: {e}")
@@ -579,10 +573,8 @@ class GaiaValidator:
                         for row in rows
                     }
 
-                # Find deregistered miners by comparing hotkeys at each UID
                 deregistered_miners = []
                 for uid, registered in self.nodes.items():
-                    # If UID has a different hotkey now, miner was deregistered
                     if active_miners[uid]["hotkey"] != registered["hotkey"]:
                         deregistered_miners.append(registered)
 
@@ -602,7 +594,6 @@ class GaiaValidator:
 
                     uids = [int(miner["uid"]) for miner in deregistered_miners]
 
-                    # Set weights to 0 for deregistered miners
                     for idx in uids:
                         self.weights[idx] = 0.0
 
