@@ -24,6 +24,7 @@ class SoilMoistureInferencePreprocessor:
         return normalized
 
     def preprocess(self, tiff_path: str) -> Dict[str, torch.Tensor]:
+        """ Preprocessing for base model with normalization and masking"""
         try:
             with rasterio.open(tiff_path) as src:
                 sentinel_data = src.read([1, 2])  # B8, B4
@@ -76,3 +77,27 @@ class SoilMoistureInferencePreprocessor:
         padding = (0, pad_w, 0, pad_h)
 
         return F.pad(tensor, padding, mode="constant", value=0)
+
+    def preprocess_raw(self, tiff_path: str) -> Dict[str, np.ndarray]:
+        """
+        Lightweight preprocessing for custom models - reads raw data into numpy arrays
+        """
+        try:
+            with rasterio.open(tiff_path) as src:
+                sentinel_data = src.read([1, 2])  # B8, B4 bands
+                ifs_data = src.read(list(range(3, 20)))  # IFS variables
+                elevation = src.read([20])  # SRTM
+                ndvi = src.read([21])  # NDVI
+
+                sentinel_ndvi = np.vstack([sentinel_data, ndvi])  # [3, H, W]
+
+                return {
+                    "sentinel_ndvi": sentinel_ndvi,  # [3, H, W]
+                    "elevation": elevation,          # [1, H, W]
+                    "era5": ifs_data,                    # [17, H, W]
+                }
+
+        except Exception as e:
+            print(f"Error preprocessing file {tiff_path}: {str(e)}")
+            return None
+            

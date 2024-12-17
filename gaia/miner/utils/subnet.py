@@ -47,30 +47,54 @@ def factory_router(miner_instance) -> APIRouter:
     router = APIRouter()
 
     async def geomagnetic_require(
-        decrypted_payload: GeomagneticRequest = Depends(
-            partial(decrypt_general_payload, GeomagneticRequest),
-        ),
+            decrypted_payload: GeomagneticRequest = Depends(
+                partial(decrypt_general_payload, GeomagneticRequest),
+            ),
     ):
+        """
+        Handles geomagnetic prediction requests, ensuring predictions are validated
+        and a timestamp is always included for scoring purposes.
+        """
         logger.info(f"Received decrypted payload: {decrypted_payload}")
         result = None
 
         try:
             if decrypted_payload.data:
-                # logger.info(f"Received data: {decrypted_payload.data}")
+                # Extract data and initialize task
                 response_data = decrypted_payload.model_dump()
                 geomagnetic_task = GeomagneticTask()
-                # logger.info(f"Received response data: {response_data}")
                 logger.info(f"Miner executing geomagnetic prediction ...")
+
+                # Run the miner execution
                 result = geomagnetic_task.miner_execute(response_data, miner_instance)
                 logger.info(f"Miner execution completed: {result}")
 
-                # Ensure prediction is valid for JSON serialization
-                if result and "predicted_values" in result:
-                    pred_value = result["predicted_values"]
-                    if np.isnan(pred_value) or np.isinf(pred_value):
+                # Validate prediction result
+                if result:
+                    # Ensure predicted_values is valid
+                    if "predicted_values" in result:
+                        pred_value = result["predicted_values"]
+                        if np.isnan(pred_value) or np.isinf(pred_value):
+                            logger.warning("Invalid prediction value received, setting to 0.0")
+                            result["predicted_values"] = float(0.0)
+                    else:
+                        logger.error("Missing 'predicted_values' in result. Setting to default 0.0")
                         result["predicted_values"] = float(0.0)
+
+                    # Ensure timestamp is present
+                    if "timestamp" not in result:
+                        logger.warning("Missing timestamp in result, using fallback timestamp")
+                        result["timestamp"] = datetime.now(timezone.utc).isoformat()
+                else:
+                    logger.error("Result is empty, returning default response.")
+                    result = {
+                        "predicted_values": 0.0,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "miner_hotkey": miner_instance.keypair.ss58_address,
+                    }
         except Exception as e:
             logger.error(f"Error in geomagnetic_require: {e}")
+            logger.error(traceback.format_exc())
             result = {
                 "predicted_values": 0.0,
                 "timestamp": datetime.now(timezone.utc).isoformat(),

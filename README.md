@@ -90,6 +90,7 @@ fiber-post-ip --netuid <NETUID> --external_ip <YOUR_IP> --external_port <YOUR_PO
 
 
 ### Follow the Setup Guides for [Miner](docs/MINER.md) or [Validator](docs/VALIDATOR.md)
+#### Custom Miner Models: [HERE](gaia/models/custom_models/CUSTOMMODELS.md)
 
 ---
 

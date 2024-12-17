@@ -2,6 +2,8 @@ from gaia.tasks.base.task import Task
 from datetime import datetime, timedelta, timezone
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
+import importlib.util
+import os
 from gaia.tasks.base.components.metadata import Metadata
 from gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing import (
     SoilMinerPreprocessing,
@@ -28,7 +30,6 @@ import traceback
 import base64
 import json
 import asyncio
-import os
 import tempfile
 import math
 import glob
@@ -62,6 +63,7 @@ class SoilMoistureTask(Task):
     db_manager: Any = Field(default=None)
     node_type: str = Field(default="miner")
     test_mode: bool = Field(default=False)
+    use_raw_preprocessing: bool = Field(default=False)
 
     def __init__(self, db_manager=None, node_type=None, test_mode=False, **data):
         super().__init__(
@@ -81,8 +83,22 @@ class SoilMoistureTask(Task):
         if node_type == "validator":
             self.validator_preprocessing = SoilValidatorPreprocessing()
         else:
-            self.miner_preprocessing = SoilMinerPreprocessing()
-            self.model = self.miner_preprocessing.model
+            self.miner_preprocessing = SoilMinerPreprocessing(task=self)
+
+            custom_model_path = "gaia/models/custom_models/custom_soil_model.py"
+            if os.path.exists(custom_model_path):
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("custom_soil_model", custom_model_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                self.model = module.CustomSoilModel()
+                self.use_raw_preprocessing = True
+                logger.info("Initialized custom soil model")
+            else:
+                self.model = self.miner_preprocessing.model
+                self.use_raw_preprocessing = False
+                logger.info("Initialized base soil model")
+                
             logger.info("Initialized miner components for SoilMoistureTask")
 
         self._prepared_regions = {}
@@ -434,7 +450,12 @@ class SoilMoistureTask(Task):
             processed_data = await self.miner_preprocessing.process_miner_data(
                 data["data"]
             )
-            predictions = self.run_model_inference(processed_data)
+            
+            if hasattr(self.model, "run_inference"):
+                predictions = self.model.run_inference(processed_data) # Custom model inference
+            else:
+                predictions = self.run_model_inference(processed_data) # Base model inference
+
             try:
                 # Visualization disabled for now
                 # import matplotlib.pyplot as plt

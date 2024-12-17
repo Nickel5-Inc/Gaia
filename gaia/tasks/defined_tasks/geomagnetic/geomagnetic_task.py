@@ -28,6 +28,8 @@ from uuid import uuid4
 from fiber.logging_utils import get_logger
 import json
 from pydantic import Field
+import os
+import importlib.util
 
 logger = get_logger(__name__)
 
@@ -87,11 +89,24 @@ class GeomagneticTask(Task):
         if db_manager:
             self.db_manager = db_manager
 
-        # Log whether the fallback model is being used
-        if self.model.is_fallback:
-            logger.warning("Using fallback GeoMag model for predictions.")
-        else:
-            logger.info("Using Hugging Face GeoMag model for predictions.")
+        # Try to load custom model first
+        try:
+            custom_model_path = "gaia/models/custom_models/custom_geomagnetic_model.py"
+            if os.path.exists(custom_model_path):
+                spec = importlib.util.spec_from_file_location(
+                    "custom_geomagnetic_model", custom_model_path
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                self.model = module.CustomGeomagneticModel()
+                logger.info("Successfully loaded custom geomagnetic model")
+            else:
+                # Fall back to base model
+                self.model = GeoMagBaseModel()
+                logger.info("No custom model found, using base model")
+        except Exception as e:
+            logger.warning(f"Error loading custom model: {e}, falling back to base model")
+            self.model = GeoMagBaseModel()
 
     def miner_preprocess(self, raw_data):
         """
@@ -469,13 +484,20 @@ class GeomagneticTask(Task):
         """
         Executes the miner workflow:
         - Preprocesses the received data along with historical data.
-        - Runs model inference.
+        - Dynamically determines whether to use a custom or base model for inference.
         - Returns formatted predictions.
+
+        Args:
+            data: Raw input data received from the request.
+            miner: Miner instance executing the task.
+
+        Returns:
+            dict: Prediction results formatted as per requirements.
         """
         try:
-            # Extract data from the request payload
+            # Extract and validate data from the request payload
             if data and data.get("data"):
-                # Current data
+                # Process current data
                 input_data = pd.DataFrame(
                     {
                         "timestamp": [pd.to_datetime(data["data"]["timestamp"])],
@@ -483,7 +505,7 @@ class GeomagneticTask(Task):
                     }
                 )
 
-                # Check and process historical data
+                # Check and process historical data if available
                 if data["data"].get("historical_values"):
                     historical_df = pd.DataFrame(data["data"]["historical_values"])
                     historical_df = historical_df.rename(
@@ -502,27 +524,40 @@ class GeomagneticTask(Task):
                     combined_df = input_data
 
                 # Preprocess combined data
-                processed_data = self.miner_preprocessing.process_miner_data(
-                    combined_df
-                )
+                processed_data = self.miner_preprocessing.process_miner_data(combined_df)
             else:
                 logger.error("No data provided in request")
                 return None
 
-            # Run model inference
-            predictions = self.run_model_inference(processed_data)
+            # Run model inference: Check for custom model first
+            if hasattr(self.model, "run_inference"):
+                logger.info("Using custom geomagnetic model for inference.")
+                predictions = self.model.run_inference(processed_data)
+            else:
+                logger.info("Using base geomagnetic model for inference.")
+                raw_prediction = self.run_model_inference(processed_data)
+                predictions = {
+                    "predicted_value": float(raw_prediction),
+                    "prediction_time": data["data"]["timestamp"]
+                }
 
-            # Format response according to MINER.md requirements
+            # Format response as per MINER.md requirements
             return {
-                "predicted_values": float(predictions),
-                "timestamp": data["data"]["timestamp"],
-                "miner_hotkey": miner.keypair.ss58_address,  # Use the miner's keypair directly
+                "predicted_values": float(predictions.get("predicted_value", 0.0)),
+                "timestamp": predictions.get("prediction_time", data["data"]["timestamp"]),
+                "miner_hotkey": miner.keypair.ss58_address,
             }
 
         except Exception as e:
             logger.error(f"Error in miner execution: {str(e)}")
-            logger.error(f"{traceback.format_exc()}")
-            return None
+            logger.error(traceback.format_exc())
+            # Fix datetime usage
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            return {
+                "predicted_values": "N/A",
+                "timestamp": current_time.isoformat(),
+                "miner_hotkey": miner.keypair.ss58_address,
+            }
 
     def query_miners(self):
         """

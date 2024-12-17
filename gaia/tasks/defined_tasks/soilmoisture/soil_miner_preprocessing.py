@@ -22,8 +22,9 @@ logger = get_logger(__name__)
 class SoilMinerPreprocessing(Preprocessing):
     """Handles preprocessing of input data for soil moisture prediction."""
 
-    def __init__(self):
+    def __init__(self, task=None):
         super().__init__()
+        self.task = task
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.preprocessor = SoilMoistureInferencePreprocessor()
         self.model = self._load_model()
@@ -66,25 +67,23 @@ class SoilMinerPreprocessing(Preprocessing):
         """Process combined tiff data for model input."""
         try:
             combined_data = data["combined_data"]
-            logger.info(f"####Received data type: {type(combined_data)}")
-            logger.info(f"####Received data: {combined_data[:100]}")
+            logger.info(f"Received data type: {type(combined_data)}")
+            logger.info(f"Received data: {combined_data[:100]}")
 
             try:
                 tiff_bytes = base64.b64decode(combined_data)
             except Exception as e:
                 logger.error(f"Failed to decode base64: {str(e)}")
-                # If base64 decode fails, try direct bytes
                 tiff_bytes = (
                     combined_data
                     if isinstance(combined_data, bytes)
                     else combined_data.encode("utf-8")
                 )
 
-            logger.info(f"####Decoded data size: {len(tiff_bytes)} bytes")
-            logger.info(f"####First 16 bytes hex: {tiff_bytes[:16].hex()}")
-            logger.info(f"####First 4 bytes raw: {tiff_bytes[:4]}")
+            logger.info(f"Decoded data size: {len(tiff_bytes)} bytes")
+            logger.info(f"First 16 bytes hex: {tiff_bytes[:16].hex()}")
+            logger.info(f"First 4 bytes raw: {tiff_bytes[:4]}")
 
-            # Validate TIFF header before writing to file
             if not (
                 tiff_bytes.startswith(b"II\x2A\x00")
                 or tiff_bytes.startswith(b"MM\x00\x2A")
@@ -95,7 +94,6 @@ class SoilMinerPreprocessing(Preprocessing):
                     "Invalid TIFF format: File does not start with valid TIFF header"
                 )
 
-            # Create a temporary file to write the TIFF data
             temp_file_path = None
             try:
                 with tempfile.NamedTemporaryFile(
@@ -106,34 +104,30 @@ class SoilMinerPreprocessing(Preprocessing):
                     temp_file.flush()
                     os.fsync(temp_file.fileno())
 
-                # Now read the file after it's closed
                 with open(temp_file_path, "rb") as check_file:
                     header = check_file.read(4)
                     logger.info(f"Written file header: {header.hex()}")
 
-                # Process with rasterio
                 with rasterio.open(temp_file_path) as dataset:
                     logger.info(
-                        f"####Successfully opened TIFF with shape: {dataset.shape}"
+                        f"Successfully opened TIFF with shape: {dataset.shape}"
                     )
-                    logger.info(f"####TIFF metadata: {dataset.profile}")
+                    logger.info(f"TIFF metadata: {dataset.profile}")
                     logger.info(
-                        f"####Band order: {dataset.tags().get('band_order', 'Not found')}"
+                        f"Band order: {dataset.tags().get('band_order', 'Not found')}"
                     )
 
-                    # Pass the file path instead of the dataset
-                    model_inputs = self.preprocessor.preprocess(temp_file_path)
-                    if model_inputs is None:
-                        raise ValueError("####Failed to preprocess input data")
-
-                    for key in model_inputs:
-                        if isinstance(model_inputs[key], torch.Tensor):
-                            model_inputs[key] = model_inputs[key].to(self.device)
+                    if self.task.use_raw_preprocessing:
+                        model_inputs = self.preprocessor.preprocess_raw(temp_file_path) # Base model
+                    else:
+                        model_inputs = self.preprocessor.preprocess(temp_file_path) # Custom model
+                        for key in model_inputs:
+                            if isinstance(model_inputs[key], torch.Tensor):
+                                model_inputs[key] = model_inputs[key].to(self.device)
 
                     return model_inputs
 
             finally:
-                # Clean up the temporary file
                 if temp_file_path and os.path.exists(temp_file_path):
                     try:
                         os.unlink(temp_file_path)
@@ -181,7 +175,7 @@ class SoilMinerPreprocessing(Preprocessing):
                     "surface": outputs[0, 0].cpu().numpy() * mask,
                     "rootzone": outputs[0, 1].cpu().numpy() * mask,
                 }
-                logger.info(f"*********Predictions********* {predictions}")
+                logger.info(f"Soil Predictions {predictions}")
                 return predictions
 
         except Exception as e:
