@@ -28,6 +28,8 @@ from uuid import uuid4
 from fiber.logging_utils import get_logger
 import json
 from pydantic import Field
+import os
+import importlib.util
 
 logger = get_logger(__name__)
 
@@ -87,11 +89,24 @@ class GeomagneticTask(Task):
         if db_manager:
             self.db_manager = db_manager
 
-        # Log whether the fallback model is being used
-        if self.model.is_fallback:
-            logger.warning("Using fallback GeoMag model for predictions.")
-        else:
-            logger.info("Using Hugging Face GeoMag model for predictions.")
+        # Try to load custom model first
+        try:
+            custom_model_path = "gaia/models/custom_models/custom_geomagnetic_model.py"
+            if os.path.exists(custom_model_path):
+                spec = importlib.util.spec_from_file_location(
+                    "custom_geomagnetic_model", custom_model_path
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                self.model = module.CustomGeomagneticModel()
+                logger.info("Successfully loaded custom geomagnetic model")
+            else:
+                # Fall back to base model
+                self.model = GeoMagBaseModel()
+                logger.info("No custom model found, using base model")
+        except Exception as e:
+            logger.warning(f"Error loading custom model: {e}, falling back to base model")
+            self.model = GeoMagBaseModel()
 
     def miner_preprocess(self, raw_data):
         """
@@ -520,7 +535,11 @@ class GeomagneticTask(Task):
                 predictions = self.model.run_inference(processed_data)
             else:
                 logger.info("Using base geomagnetic model for inference.")
-                predictions = self.run_model_inference(processed_data)
+                raw_prediction = self.run_model_inference(processed_data)
+                predictions = {
+                    "predicted_value": float(raw_prediction),
+                    "prediction_time": data["data"]["timestamp"]
+                }
 
             # Format response as per MINER.md requirements
             return {
@@ -532,9 +551,11 @@ class GeomagneticTask(Task):
         except Exception as e:
             logger.error(f"Error in miner execution: {str(e)}")
             logger.error(traceback.format_exc())
+            # Fix datetime usage
+            current_time = datetime.datetime.now(datetime.timezone.utc)
             return {
                 "predicted_values": "N/A",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": current_time.isoformat(),
                 "miner_hotkey": miner.keypair.ss58_address,
             }
 

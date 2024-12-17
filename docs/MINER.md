@@ -103,7 +103,32 @@ The soil moisture model integrates various datasets to provide comprehensive ins
 
 **These datasets are aligned based on the Sentinel-2 region boundaries to ensure spatial consistency and precision.**
 
-#### How to Run the Model
+#### **Weather Data Details**
+
+IFS weather variables (in order):
+- t2m: Surface air temperature (2m height) (Kelvin)
+- tp: Total precipitation (m/day)
+- ssrd: Surface solar radiation downwards (Joules/m²)
+- st: Soil temperature at surface (Kelvin)
+- stl2: Soil temperature at 2m depth (Kelvin)
+- stl3: Soil temperature at 3m depth (Kelvin)
+- sp: Surface pressure (Pascals)
+- d2m: Dewpoint temperature (Kelvin)
+- u10: Wind components at 10m (m/s)
+- v10: Wind components at 10m (m/s)
+- ro: Total runoff (m/day)
+- msl: Mean sea level pressure (Pascals)
+- et0: Reference evapotranspiration (mm/day)
+- bare_soil_evap: Bare soil evaporation (mm/day)
+- svp: Saturated vapor pressure (kPa)
+- avp: Actual vapor pressure (kPa)
+- r_n: Net radiation (MJ/m²/day) 
+
+#### Task Pipeline
+
+The task will automatically run the model, and return the predictions in the format specified in the model. The base model is used by default. See [CUSTOMMODELS.md](gaia/models/custom_models/CUSTOMMODELS.md) for more information on integrating a custom model.
+
+This outline describes hows the task functions end to end, it is done automatically but displayed here for clarity and understanding.
 
 ##### Step 1: Prepare Data
 - Use **`region_selection.py`** to select random regions for analysis, avoiding urban areas and large water bodies.

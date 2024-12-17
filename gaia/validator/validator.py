@@ -289,127 +289,129 @@ class GaiaValidator:
                 
                 logger.info(f"Fetched current block: {self.current_block}")
                 logger.info(f"Next weight setting at block: {next_weight_block}")
-                await asyncio.sleep(blocks_until_weights * 12)
                 
-                logger.info("Syncing metagraph nodes...")
-                self.metagraph.sync_nodes()
-                logger.info("Metagraph synced. Fetching recent scores...")
+                await asyncio.sleep(30)
 
-                three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
-                
-                query = """
-                SELECT score 
-                FROM score_table 
-                WHERE task_name = :task_name
-                AND created_at >= :start_time
-                ORDER BY created_at DESC 
-                LIMIT 1
-                """
-                
-                geomagnetic_result = await self.database_manager.fetch_one(
-                    query, 
-                    {"task_name": "geomagnetic", "start_time": three_days_ago}
-                )
-                soil_result = await self.database_manager.fetch_one(
-                    query,
-                    {"task_name": "soil_moisture", "start_time": three_days_ago}
-                )
+                if self.current_block >= next_weight_block:
+                    logger.info("Syncing metagraph nodes...")
+                    self.metagraph.sync_nodes()
+                    logger.info("Metagraph synced. Fetching recent scores...")
 
-                geomagnetic_scores = geomagnetic_result["score"] if geomagnetic_result else [float("nan")] * 256
-                soil_scores = soil_result["score"] if soil_result else [float("nan")] * 256
-
-                logger.info("Recent scores fetched. Calculating aggregate scores...")
-
-                weights = [0.0] * 256
-                for idx in range(256):
-                    geomagnetic_score = geomagnetic_scores[idx]
-                    soil_score = soil_scores[idx]
-
-                    if math.isnan(geomagnetic_score) and math.isnan(soil_score):
-                        weights[idx] = 0.0
-                        logger.debug(f"Both scores nan - setting weight to 0")
-                    elif math.isnan(geomagnetic_score):
-                        weights[idx] = 0.5 * soil_score
-                        logger.debug(
-                            f"Geo score nan - using soil score: {weights[idx]}"
-                        )
-                    elif math.isnan(soil_score):
-                        geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
-                        weights[idx] = 0.5 * geo_normalized
-                        logger.debug(
-                            f"UID {idx}: Soil score nan - normalized geo score: {geo_normalized} -> weight: {weights[idx]}"
-                        )
-                    else:
-                        geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
-                        weights[idx] = (0.5 * geo_normalized) + (0.5 * soil_score)
-                        logger.debug(
-                            f"UID {idx}: Both scores valid - geo_norm: {geo_normalized}, soil: {soil_score} -> weight: {weights[idx]}"
-                        )
-
-                    logger.info(
-                        f"UID {idx}: geo={geomagnetic_score} (norm={geo_normalized if 'geo_normalized' in locals() else 'nan'}), soil={soil_score}, weight={weights[idx]}"
+                    three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+                    
+                    query = """
+                    SELECT score 
+                    FROM score_table 
+                    WHERE task_name = :task_name
+                    AND created_at >= :start_time
+                    ORDER BY created_at DESC 
+                    LIMIT 1
+                    """
+                    
+                    geomagnetic_result = await self.database_manager.fetch_one(
+                        query, 
+                        {"task_name": "geomagnetic", "start_time": three_days_ago}
+                    )
+                    soil_result = await self.database_manager.fetch_one(
+                        query,
+                        {"task_name": "soil_moisture", "start_time": three_days_ago}
                     )
 
-                logger.info(f"Weights before normalization: {weights}")
+                    geomagnetic_scores = geomagnetic_result["score"] if geomagnetic_result else [float("nan")] * 256
+                    soil_scores = soil_result["score"] if soil_result else [float("nan")] * 256
 
-                non_zero_weights = [w for w in weights if w != 0.0]
-                if non_zero_weights:
-                    # Sort indices by weight for ranking (negative scores = higher error = lower rank)
-                    sorted_indices = sorted(
-                        range(len(weights)),
-                        key=lambda k: (
-                            weights[k] if weights[k] != 0.0 else float("-inf")
-                        ),
-                    )
+                    logger.info("Recent scores fetched. Calculating aggregate scores...")
 
-                    new_weights = [0.0] * len(weights)
-                    for rank, idx in enumerate(sorted_indices):
-                        if weights[idx] != 0.0:
-                            try:
-                                normalized_rank = 1.0 - (rank / len(non_zero_weights))
-                                exponent = max(
-                                    min(-20 * (normalized_rank - 0.5), 709), -709
-                                )
-                                new_weights[idx] = 1 / (1 + math.exp(exponent))
-                            except OverflowError:
-                                logger.warning(
-                                    f"Overflow prevented for rank {rank}, idx {idx}"
-                                )
+                    weights = [0.0] * 256
+                    for idx in range(256):
+                        geomagnetic_score = geomagnetic_scores[idx]
+                        soil_score = soil_scores[idx]
 
-                                if normalized_rank > 0.5:
-                                    new_weights[idx] = 1.0
-                                else:
-                                    new_weights[idx] = 0.0
-
-
-                    total = sum(new_weights)
-                    if total > 0:
-                        self.weights = [w / total for w in new_weights]
-
-                        top_20_weight = sum(
-                            sorted(self.weights, reverse=True)[
-                                : int(len(weights) * 0.2)
-                            ]
-                        )
-                        logger.info(
-                            f"Weight distribution: top 20% of nodes hold {top_20_weight*100:.1f}% of total weight"
-                        )
-
-                        logger.info("Attempting to set weights...")
-                        success = await self.set_weights(self.weights)
-                        if success:
-                            if self.current_block == self.last_set_weights_block:
-                                logger.info(f"Successfully set weights at block {self.current_block}")
-                            else:
-                                logger.info("Waiting for next weight setting interval")
+                        if math.isnan(geomagnetic_score) and math.isnan(soil_score):
+                            weights[idx] = 0.0
+                            logger.debug(f"Both scores nan - setting weight to 0")
+                        elif math.isnan(geomagnetic_score):
+                            weights[idx] = 0.5 * soil_score
+                            logger.debug(
+                                f"Geo score nan - using soil score: {weights[idx]}"
+                            )
+                        elif math.isnan(soil_score):
+                            geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
+                            weights[idx] = 0.5 * geo_normalized
+                            logger.debug(
+                                f"UID {idx}: Soil score nan - normalized geo score: {geo_normalized} -> weight: {weights[idx]}"
+                            )
                         else:
-                            logger.error(f"Error setting weights at block {self.current_block}")
+                            geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
+                            weights[idx] = (0.5 * geo_normalized) + (0.5 * soil_score)
+                            logger.debug(
+                                f"UID {idx}: Both scores valid - geo_norm: {geo_normalized}, soil: {soil_score} -> weight: {weights[idx]}"
+                            )
+
+                        logger.info(
+                            f"UID {idx}: geo={geomagnetic_score} (norm={geo_normalized if 'geo_normalized' in locals() else 'nan'}), soil={soil_score}, weight={weights[idx]}"
+                        )
+
+                    logger.info(f"Weights before normalization: {weights}")
+
+                    non_zero_weights = [w for w in weights if w != 0.0]
+                    if non_zero_weights:
+                        # Sort indices by weight for ranking (negative scores = higher error = lower rank)
+                        sorted_indices = sorted(
+                            range(len(weights)),
+                            key=lambda k: (
+                                weights[k] if weights[k] != 0.0 else float("-inf")
+                            ),
+                        )
+
+                        new_weights = [0.0] * len(weights)
+                        for rank, idx in enumerate(sorted_indices):
+                            if weights[idx] != 0.0:
+                                try:
+                                    normalized_rank = 1.0 - (rank / len(non_zero_weights))
+                                    exponent = max(
+                                        min(-20 * (normalized_rank - 0.5), 709), -709
+                                    )
+                                    new_weights[idx] = 1 / (1 + math.exp(exponent))
+                                except OverflowError:
+                                    logger.warning(
+                                        f"Overflow prevented for rank {rank}, idx {idx}"
+                                    )
+
+                                    if normalized_rank > 0.5:
+                                        new_weights[idx] = 1.0
+                                    else:
+                                        new_weights[idx] = 0.0
+
+
+                        total = sum(new_weights)
+                        if total > 0:
+                            self.weights = [w / total for w in new_weights]
+
+                            top_20_weight = sum(
+                                sorted(self.weights, reverse=True)[
+                                    : int(len(weights) * 0.2)
+                                ]
+                            )
+                            logger.info(
+                                f"Weight distribution: top 20% of nodes hold {top_20_weight*100:.1f}% of total weight"
+                            )
+
+                            logger.info("Attempting to set weights...")
+                            success = await self.set_weights(self.weights)
+                            if success:
+                                if self.current_block == self.last_set_weights_block:
+                                    logger.info(f"Successfully set weights at block {self.current_block}")
+                                else:
+                                    logger.info("Waiting for next weight setting interval")
+                            else:
+                                logger.error(f"Error setting weights at block {self.current_block}")
+                        else:
+                            logger.warning("No positive weights after normalization")
                     else:
-                        logger.warning("No positive weights after normalization")
-                else:
-                    logger.warning(
-                        "All weights are zero or nan, skipping weight setting"
-                    )
+                        logger.warning(
+                            "All weights are zero or nan, skipping weight setting"
+                        )
 
             except Exception as e:
                 logger.error(f"Error in main_scoring: {e}")

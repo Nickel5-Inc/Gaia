@@ -94,7 +94,7 @@ class SoilMoistureInferencePreprocessor:
                 return {
                     "sentinel_ndvi": sentinel_ndvi,  # [3, H, W]
                     "elevation": elevation,          # [1, H, W]
-                    "era5": ifs,                    # [17, H, W]
+                    "era5": ifs_data,                    # [17, H, W]
                 }
 
         except Exception as e:
