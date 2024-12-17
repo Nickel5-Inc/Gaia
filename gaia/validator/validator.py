@@ -283,12 +283,13 @@ class GaiaValidator:
                 self.metagraph.sync_nodes()
                 block = self.substrate.get_block()
                 self.current_block = block["header"]["number"]
-               
-                logger.info(f"Fetched current block: {self.current_block}")
-                blocks_until_scoring = 300 - (self.current_block % 300)
-                logger.info(f"Blocks until next scoring: {blocks_until_scoring}")
                 
-                await asyncio.sleep(min(blocks_until_scoring * 12, 60))
+                next_weight_block = ((self.current_block // 300) * 300) + 50
+                blocks_until_weights = next_weight_block - self.current_block
+                
+                logger.info(f"Fetched current block: {self.current_block}")
+                logger.info(f"Next weight setting at block: {next_weight_block}")
+                await asyncio.sleep(blocks_until_weights * 12)
                 
                 logger.info("Syncing metagraph nodes...")
                 self.metagraph.sync_nodes()
@@ -415,20 +416,22 @@ class GaiaValidator:
                 logger.error(traceback.format_exc())
                 await asyncio.sleep(60)
 
-    async def set_weights(self, weights: List[float]) -> bool:
+    async def set_weights(self, weights: List[float], timeout: int = 30, max_retries: int = 3) -> bool:
         """
-        Set weights on the chain.
+        Set weights on the chain with timeout and retry logic.
 
         Args:
-            weights (List[float]): List of weights aligned with UIDs
+            weights (List[float]): List of weights aligned with UIDs.
+            timeout (int): Maximum time to wait for the operation (in seconds).
+            max_retries (int): Maximum number of retries if the operation fails.
 
         Returns:
-            bool: True if weights were set successfully, False otherwise
+            bool: True if weights were set successfully, False otherwise.
         """
         try:
             block = self.substrate.get_block()
             self.current_block = block["header"]["number"]
-            
+
             if self.last_set_weights_block:
                 blocks_since_last = self.current_block - self.last_set_weights_block
                 if blocks_since_last < 300:
@@ -448,15 +451,32 @@ class GaiaValidator:
                 current_block=self.current_block
             )
 
-            success = await weight_setter.set_weights(weights)
-            if success:
-                self.last_set_weights_block = self.current_block
-                logger.info(f"Successfully set weights at block {self.current_block}")
-                logger.info(f"Next weight set possible at block {self.current_block + 300}")
-            return success
+            attempt = 0
+            delay = 1
+            while attempt < max_retries:
+                try:
+                    success = await asyncio.wait_for(weight_setter.set_weights(weights), timeout=timeout)
+                    if success:
+                        self.last_set_weights_block = self.current_block
+                        logger.info(f"✅ Successfully set weights at block {self.current_block}")
+                        logger.info(f"Next weight set possible at block {self.current_block + 300}")
+                        return True
+                    else:
+                        logger.warning("❌ Failed to set weights, retrying...")
+                except asyncio.TimeoutError:
+                    logger.debug(f"⏳ Timeout occurred while setting weights (attempt {attempt + 1}/{max_retries})")
+                except Exception as e:
+                    logger.error(f"❌ Error during weight setting (attempt {attempt + 1}/{max_retries}): {e}")
+                    logger.error(traceback.format_exc())
+
+                attempt += 1
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 10)
+
+            return False
 
         except Exception as e:
-            logger.error(f"Error setting weights: {e}")
+            logger.error(f"Unexpected error in set_weights: {e}")
             logger.error(traceback.format_exc())
             return False
 
@@ -471,7 +491,7 @@ class GaiaValidator:
                     block = self.substrate.get_block()
                     self.current_block = block["header"]["number"]
                     blocks_since_weights = (
-                        self.current_block - self.last_set_weights_block
+                            self.current_block - self.last_set_weights_block
                     )
                 except Exception as block_error:
 
@@ -553,10 +573,8 @@ class GaiaValidator:
                         for row in rows
                     }
 
-                # Find deregistered miners by comparing hotkeys at each UID
                 deregistered_miners = []
                 for uid, registered in self.nodes.items():
-                    # If UID has a different hotkey now, miner was deregistered
                     if active_miners[uid]["hotkey"] != registered["hotkey"]:
                         deregistered_miners.append(registered)
 
@@ -576,7 +594,6 @@ class GaiaValidator:
 
                     uids = [int(miner["uid"]) for miner in deregistered_miners]
 
-                    # Set weights to 0 for deregistered miners
                     for idx in uids:
                         self.weights[idx] = 0.0
 
