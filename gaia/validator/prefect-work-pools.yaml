@@ -1,0 +1,47 @@
+version: 1
+
+work-pools:
+  - name: gaia-validator-${NETWORK}
+    type: ray
+    base_job_template:
+      env:
+        SUBTENSOR_NETWORK: ${NETWORK}
+        DB_NAME: gaia_${NETWORK}
+        PYTHONPATH: /root/dev/Gaia
+      ray_config:
+        runtime_env:
+          working_dir: /root/dev/Gaia
+          pip: 
+            - prefect>=2.14.0
+            - ray>=2.9.0
+            - sqlalchemy[asyncio]>=2.0.0
+            - asyncpg>=0.29.0
+        compute_config:
+          # Start with modest resources, can be tuned based on needs
+          cpu: 2
+          memory: 4096  # MB
+          use_gpu: false
+    description: |
+      Work pool for Gaia validator tasks on ${NETWORK} network.
+      Handles all validator operations including:
+      - Geomagnetic predictions
+      - Soil moisture analysis
+      - Scoring and weight management
+      - System monitoring
+    job_variables:
+      command: python -m gaia.validator
+      log_level: INFO
+      max_retries: 3
+      retry_delay_seconds: 30
+      timeout_seconds: 3600  # 1 hour default timeout
+    
+    scheduling:
+      # Default scheduling parameters
+      max_concurrent_jobs: 10
+      queue_timeout_seconds: 300
+      default_interval_seconds: 60
+      
+    tags:
+      - gaia
+      - validator
+      - ${NETWORK}

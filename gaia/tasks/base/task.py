@@ -8,6 +8,9 @@ from .decorators import task_timer
 from abc import ABC, abstractmethod
 import networkx as nx
 from typing import Optional, Any
+from prefect import flow, task, get_run_logger
+from datetime import timedelta, datetime, timezone
+from uuid import uuid4
 
 
 class Task(BaseModel, ABC):
@@ -54,6 +57,9 @@ class Task(BaseModel, ABC):
     )
     model_config = {"arbitrary_types_allowed": True}
 
+    # Default schedule for the task flow
+    default_schedule: str = "*/5 * * * *"  # Every 5 minutes by default
+
     async def initialize_database(self):
         """Initialize task-specific database tables"""
         if not self.db:
@@ -64,41 +70,105 @@ class Task(BaseModel, ABC):
     ############################################################
 
     @abstractmethod
-    @task_timer
-    def validator_prepare_subtasks(self):
-        """
-        Prepare the subtasks for execution. Read the graph structure, determine the order of execution, and prepare the inputs for each subtask.
-        """
+    async def fetch_data(self):
+        """Fetch necessary data for task execution."""
         pass
 
     @abstractmethod
-    @task_timer
-    def validator_execute(self):
-        """
-        Execute the task from the validator neuron. For composite tasks, this orchestrates subtask execution.
-        For atomic tasks, this executes the actual workload. This call should define the order and execution of the subtasks or
-        any preprocessing that needs to be done, as well as calling the scoring method once miners have returned their results.
-        """
-        if self.subtasks is not None:
-            # Composite task execution
-            pass
-        else:
-            # Atomic task execution
-            pass
+    async def query_miners(self, validator, data):
+        """Query miners with the fetched data."""
+        pass
 
     @abstractmethod
-    @task_timer
-    def validator_score(self, result=None):
-        """
-        Score the task results. For composite tasks, this may aggregate subtask scores.
-        For atomic tasks, this uses the defined scoring mechanism.
-        """
-        if self.subtasks is not None:
-            # Composite task scoring
-            pass
-        else:
-            # Atomic task scoring using self.scoring_mechanism
-            pass
+    async def process_responses(self, responses, context):
+        """Process and validate miner responses."""
+        pass
+
+    @abstractmethod
+    async def score_responses(self, responses, context):
+        """Score the processed responses."""
+        pass
+
+    @abstractmethod
+    async def update_scores(self, scores, context):
+        """Update the scoring system with new scores."""
+        pass
+
+    def create_flow(self, validator):
+        """Create a Prefect flow for this task."""
+        task_name = self.name.lower().replace(" ", "_")
+        
+        @task(
+            name=f"{task_name}_fetch",
+            retries=3,
+            retry_delay_seconds=60,
+            description=f"Fetch data for {self.name}"
+        )
+        async def fetch_task():
+            return await self.fetch_data()
+
+        @task(
+            name=f"{task_name}_query",
+            retries=3,
+            retry_delay_seconds=60,
+            description=f"Query miners for {self.name}"
+        )
+        async def query_task(data):
+            return await self.query_miners(validator, data)
+
+        @task(
+            name=f"{task_name}_process",
+            retries=3,
+            retry_delay_seconds=60,
+            description=f"Process responses for {self.name}"
+        )
+        async def process_task(responses, context):
+            return await self.process_responses(responses, context)
+
+        @task(
+            name=f"{task_name}_score",
+            retries=3,
+            retry_delay_seconds=60,
+            description=f"Score responses for {self.name}"
+        )
+        async def score_task(responses, context):
+            return await self.validator_score(responses, context)
+
+        @task(
+            name=f"{task_name}_update",
+            retries=3,
+            retry_delay_seconds=60,
+            description=f"Update scores for {self.name}"
+        )
+        async def update_task(scores, context):
+            return await self.update_scores(scores, context)
+
+        @flow(
+            name=f"{task_name}_flow",
+            description=f"Flow for {self.name}",
+            version=validator.args.version
+        )
+        async def task_flow():
+            flow_logger = get_run_logger()
+            flow_logger.info(f"Starting {self.name} flow")
+            
+            # Create execution context with validator instance
+            context = {
+                'current_time': datetime.now(timezone.utc),
+                'validator': validator,
+                'flow_id': str(uuid4())
+            }
+            
+            # Execute flow steps
+            data = await fetch_task()
+            responses = await query_task(data)
+            processed = await process_task(responses, context)
+            scores = await score_task(processed, context)
+            await update_task(scores, context)
+
+        # Set the schedule from the task's default_schedule
+        task_flow.default_schedule = self.default_schedule
+        return task_flow
 
     ############################################################
     # Miner methods

@@ -1,7 +1,7 @@
 from gaia.tasks.base.components.preprocessing import Preprocessing
 from datetime import datetime, timezone, date
 from huggingface_hub import hf_hub_download
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.validator.database.database_manager import ValidatorDatabaseManager
 from gaia.tasks.defined_tasks.soilmoisture.utils.region_selection import (
     select_random_region,
 )

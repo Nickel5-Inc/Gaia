@@ -1,7 +1,7 @@
 from gaia.tasks.base.task import Task
 from datetime import datetime, timedelta, timezone
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 import importlib.util
 import os
 from gaia.tasks.base.components.metadata import Metadata
@@ -23,7 +23,7 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMeta
 from pydantic import Field
 from fiber.logging_utils import get_logger
 from uuid import uuid4
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.validator.database.database_manager import ValidatorDatabaseManager
 from sqlalchemy import text
 from gaia.models.soil_moisture_basemodel import SoilModel
 import traceback
@@ -34,6 +34,7 @@ import tempfile
 import math
 import glob
 from collections import defaultdict
+from prefect import flow, get_run_logger, task
 
 logger = get_logger(__name__)
 
@@ -43,6 +44,132 @@ if os.environ.get("NODE_TYPE") == "validator":
     )
 else:
     SoilValidatorPreprocessing = None
+
+
+class CircuitBreakerState:
+    """Track circuit breaker state with automatic recovery."""
+    def __init__(self, failure_threshold=3, recovery_timeout=300):
+        self.failure_count = 0
+        self.is_open = False
+        self.last_failure_time = None
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+
+    def record_failure(self):
+        """Record a failure and update circuit state."""
+        self.failure_count += 1
+        self.last_failure_time = datetime.now(timezone.utc)
+        if self.failure_count >= self.failure_threshold:
+            self.is_open = True
+
+    def record_success(self):
+        """Record a success and update circuit state."""
+        self.failure_count = 0
+        self.is_open = False
+        self.last_failure_time = None
+
+    def can_try_request(self) -> bool:
+        """Check if a request can be attempted."""
+        if not self.is_open:
+            return True
+        
+        if self.last_failure_time is None:
+            return True
+            
+        time_since_failure = (datetime.now(timezone.utc) - self.last_failure_time).total_seconds()
+        if time_since_failure >= self.recovery_timeout:
+            self.is_open = False
+            self.failure_count = 0
+            return True
+            
+        return False
+
+
+class OperationError(Exception):
+    """Base class for operation-specific errors."""
+    def __init__(self, message: str, operation: str, is_recoverable: bool = True):
+        self.message = message
+        self.operation = operation
+        self.is_recoverable = is_recoverable
+        super().__init__(self.message)
+
+
+class DataFetchError(OperationError):
+    """Error during data fetching operations."""
+    def __init__(self, message: str, is_recoverable: bool = True):
+        super().__init__(message, "data_fetch", is_recoverable)
+
+
+class MinerQueryError(OperationError):
+    """Error during miner query operations."""
+    def __init__(self, message: str, is_recoverable: bool = True):
+        super().__init__(message, "miner_query", is_recoverable)
+
+
+class ScoringError(OperationError):
+    """Error during scoring operations."""
+    def __init__(self, message: str, is_recoverable: bool = True):
+        super().__init__(message, "scoring", is_recoverable)
+
+
+class TaskStateManager:
+    """Manages task state persistence and recovery."""
+    
+    def __init__(self, db_manager):
+        self.db_manager = db_manager
+        
+    async def save_task_state(self, task_id: str, state: dict):
+        """Save task state to database."""
+        try:
+            # Convert sets to lists for JSON serialization
+            state_copy = state.copy()
+            state_copy['processed_regions'] = list(state['processed_regions'])
+            state_copy['failed_regions'] = list(state['failed_regions'])
+            
+            await self.db_manager.execute(
+                """
+                INSERT INTO task_states (task_id, state, created_at, updated_at)
+                VALUES (:task_id, :state, NOW(), NOW())
+                ON CONFLICT (task_id) 
+                DO UPDATE SET state = :state, updated_at = NOW()
+                """,
+                {
+                    "task_id": task_id,
+                    "state": json.dumps(state_copy)
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error saving task state: {str(e)}")
+            
+    async def get_task_state(self, task_id: str) -> Optional[dict]:
+        """Retrieve task state from database."""
+        try:
+            result = await self.db_manager.fetch_one(
+                "SELECT state FROM task_states WHERE task_id = :task_id",
+                {"task_id": task_id}
+            )
+            if result and result['state']:
+                state = json.loads(result['state'])
+                # Convert lists back to sets
+                state['processed_regions'] = set(state['processed_regions'])
+                state['failed_regions'] = set(state['failed_regions'])
+                return state
+        except Exception as e:
+            logger.error(f"Error retrieving task state: {str(e)}")
+        return None
+        
+    async def cleanup_old_states(self, days_old: int = 7):
+        """Clean up task states older than specified days."""
+        try:
+            await self.db_manager.execute(
+                """
+                DELETE FROM task_states 
+                WHERE updated_at < NOW() - INTERVAL ':days days'
+                """,
+                {"days": days_old}
+            )
+        except Exception as e:
+            logger.error(f"Error cleaning up old task states: {str(e)}")
 
 
 class SoilMoistureTask(Task):
@@ -57,13 +184,14 @@ class SoilMoistureTask(Task):
         description="Delay before scoring due to SMAP data latency",
     )
 
-    validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None
+    validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None # type: ignore
     miner_preprocessing: Optional["SoilMinerPreprocessing"] = None
     model: Optional[SoilModel] = None
     db_manager: Any = Field(default=None)
     node_type: str = Field(default="miner")
     test_mode: bool = Field(default=False)
     use_raw_preprocessing: bool = Field(default=False)
+    state_manager: Optional["TaskStateManager"] = None
 
     def __init__(self, db_manager=None, node_type=None, test_mode=False, **data):
         super().__init__(
@@ -79,6 +207,7 @@ class SoilMoistureTask(Task):
         self.db_manager = db_manager
         self.node_type = node_type
         self.test_mode = test_mode
+        self.state_manager = TaskStateManager(db_manager) if db_manager else None
 
         if node_type == "validator":
             self.validator_preprocessing = SoilValidatorPreprocessing()
@@ -102,6 +231,53 @@ class SoilMoistureTask(Task):
             logger.info("Initialized miner components for SoilMoistureTask")
 
         self._prepared_regions = {}
+        
+        # Initialize circuit breakers for critical services
+        self.circuit_breakers = {
+            'smap_api': CircuitBreakerState(),
+            'miner_query': CircuitBreakerState(failure_threshold=5),
+            'database': CircuitBreakerState(recovery_timeout=600),
+            'sentinel_api': CircuitBreakerState(),
+            'ifs_api': CircuitBreakerState()
+        }
+
+    async def _check_circuit_state(self, service_name: str) -> Dict[str, Any]:
+        """Check if circuit breaker is closed for a service."""
+        if service_name not in self.circuit_breakers:
+            return {"is_closed": True, "failure_count": 0, "next_attempt": datetime.now(timezone.utc)}
+            
+        breaker = self.circuit_breakers[service_name]
+        if not breaker.can_try_request():
+            next_attempt = breaker.last_failure_time + timedelta(seconds=breaker.recovery_timeout)
+            return {
+                "is_closed": False,
+                "failure_count": breaker.failure_count,
+                "next_attempt": next_attempt
+            }
+            
+        return {
+            "is_closed": True,
+            "failure_count": breaker.failure_count,
+            "next_attempt": datetime.now(timezone.utc)
+        }
+
+    async def _record_failure(self, service_name: str):
+        """Record a service failure and update circuit breaker state."""
+        if service_name in self.circuit_breakers:
+            breaker = self.circuit_breakers[service_name]
+            breaker.record_failure()
+            
+            logger.warning(
+                f"Service {service_name} failed. Failure count: {breaker.failure_count}. "
+                f"Circuit breaker {'open' if breaker.is_open else 'closed'}."
+            )
+
+    async def _close_circuit(self, service_name: str):
+        """Reset circuit breaker state after successful operation."""
+        if service_name in self.circuit_breakers:
+            breaker = self.circuit_breakers[service_name]
+            breaker.record_success()
+            logger.info(f"Circuit breaker closed for service: {service_name}")
 
     def get_next_preparation_time(self, current_time: datetime) -> datetime:
         """Get the next preparation window start time."""
@@ -648,90 +824,14 @@ class SoilMoistureTask(Task):
             logger.error(f"Error fetching pending tasks: {str(e)}")
             return []
 
-    async def move_task_to_history(
-        self, region: Dict, predictions: Dict, ground_truth: Dict, scores: Dict
-    ):
-        conn = None
-        try:
-            logger.info(f"Final scores for region {region['id']}:")
-            logger.info(f"Surface RMSE: {scores['metrics'].get('surface_rmse'):.4f}")
-            logger.info(f"Surface SSIM: {scores['metrics'].get('surface_ssim', 0):.4f}")
-            logger.info(f"Rootzone RMSE: {scores['metrics'].get('rootzone_rmse'):.4f}")
-            logger.info(
-                f"Rootzone SSIM: {scores['metrics'].get('rootzone_ssim', 0):.4f}"
-            )
-            logger.info(f"Total Score: {scores.get('total_score', 0):.4f}")
-
-            conn = await self.db_manager.get_connection()
-            async with conn as session:
-                async with session.begin():
-                    for prediction in predictions:
-                        miner_id = prediction["miner_id"]
-                        params = {
-                            "region_id": region["id"],
-                            "miner_uid": miner_id,
-                            "miner_hotkey": prediction.get("miner_hotkey", ""),
-                            "target_time": region["target_time"],
-                            "surface_sm_pred": prediction["surface_sm"],
-                            "rootzone_sm_pred": prediction["rootzone_sm"],
-                            "surface_sm_truth": (
-                                ground_truth["surface_sm"] if ground_truth else None
-                            ),
-                            "rootzone_sm_truth": (
-                                ground_truth["rootzone_sm"] if ground_truth else None
-                            ),
-                            "surface_rmse": scores["metrics"].get("surface_rmse"),
-                            "rootzone_rmse": scores["metrics"].get("rootzone_rmse"),
-                            "surface_structure_score": scores["metrics"].get(
-                                "surface_ssim", 0
-                            ),
-                            "rootzone_structure_score": scores["metrics"].get(
-                                "rootzone_ssim", 0
-                            ),
-                        }
-
-                        query = text(
-                            """
-                            INSERT INTO soil_moisture_history 
-                            (region_id, miner_uid, miner_hotkey, target_time, 
-                             surface_sm_pred, rootzone_sm_pred,
-                             surface_sm_truth, rootzone_sm_truth,
-                             surface_rmse, rootzone_rmse,
-                             surface_structure_score, rootzone_structure_score)
-                            VALUES 
-                            (:region_id, :miner_uid, :miner_hotkey, :target_time,
-                             :surface_sm_pred, :rootzone_sm_pred,
-                             :surface_sm_truth, :rootzone_sm_truth,
-                             :surface_rmse, :rootzone_rmse,
-                             :surface_structure_score, :rootzone_structure_score)
-                        """
-                        )
-
-                        await session.execute(query, params)
-                        logger.info(
-                            f"Stored scores for miner {miner_id} in region {region['id']}"
-                        )
-
-                        update_query = text("""
-                            UPDATE soil_moisture_predictions 
-                            SET status = 'scored'
-                            WHERE region_id = :region_id AND miner_uid = :miner_uid
-                        """)
-                        await session.execute(update_query, params)
-
-            await self.cleanup_predictions(
-                bounds=region["sentinel_bounds"],
-                target_time=region["target_time"],
-                miner_uid=miner_id
-            )
-            
-        except Exception as e:
-            logger.error(f"Failed to move task to history: {str(e)}")
-            logger.error(traceback.format_exc())
-        finally:
-            if conn:
-                await conn.close()
-
+    @task(
+        name="validator_score_task",
+        retries=3,
+        retry_delay_seconds=lambda x: 60 * (2 ** x),
+        retry_jitter_factor=0.2,
+        tags=["scoring"],
+        description="Score pending predictions and update task history"
+    )
     async def validator_score(self, result=None):
         """Score task results by timestamp to minimize SMAP data downloads."""
         try:
@@ -742,15 +842,13 @@ class SoilMoistureTask(Task):
             scoring_results = {}
             tasks_by_time = {}
             for task in pending_tasks:
-                target_time = task["target_time"] # - timedelta(days=3) this is for testing
+                target_time = task["target_time"]
                 if target_time not in tasks_by_time:
                     tasks_by_time[target_time] = []
                 tasks_by_time[target_time].append(task)
 
             for target_time, tasks in tasks_by_time.items():
-                logger.info(
-                    f"Processing {len(tasks)} predictions for timestamp {target_time}"
-                )
+                logger.info(f"Processing {len(tasks)} predictions for timestamp {target_time}")
                 scored_tasks = []
 
                 for task in tasks:
@@ -762,9 +860,7 @@ class SoilMoistureTask(Task):
                                 "crs": task["sentinel_crs"],
                                 "predictions": prediction,
                                 "target_time": target_time,
-                                "region": {
-                                    "id": task["id"]
-                                },
+                                "region": {"id": task["id"]},
                                 "miner_id": prediction["miner_id"],
                                 "miner_hotkey": prediction["miner_hotkey"]
                             }
@@ -782,17 +878,21 @@ class SoilMoistureTask(Task):
                 if scored_tasks:
                     current_time = datetime.now(timezone.utc)
                     try:
+                        # Move tasks to history using Prefect task
                         for task in scored_tasks:
-                            await self.move_task_to_history(
+                            await self.move_task_to_history_task.submit(
                                 region=task,
                                 predictions=task["predictions"],
                                 ground_truth=task["score"].get("ground_truth"),
-                                scores=task["score"],
+                                scores=task["score"]
                             )
 
-                        score_rows = await self.build_score_row(
-                            target_time, scored_tasks
+                        # Build and store score rows using Prefect task
+                        score_rows = await self.build_score_row_task.submit(
+                            target_time=target_time,
+                            recent_tasks=scored_tasks
                         )
+                        
                         if score_rows:
                             query = """
                             INSERT INTO score_table (task_name, task_id, score, status)
@@ -800,34 +900,14 @@ class SoilMoistureTask(Task):
                             """
                             for row in score_rows:
                                 await self.db_manager.execute(query, row)
-                            logger.info(
-                                f"Stored global scores for timestamp {target_time}"
-                            )
+                            logger.info(f"Stored global scores for timestamp {target_time}")
 
-                        await asyncio.sleep(1)
-                        smap_cache_dir = "smap_cache"
-                        if os.path.exists(smap_cache_dir):
-                            for file in os.listdir(smap_cache_dir):
-                                if file.endswith(".h5"):
-                                    file_path = os.path.join(smap_cache_dir, file)
-                                    try:
-                                        os.remove(file_path)
-                                        logger.info(f"Cleaned up SMAP file {file}")
-                                    except Exception as e:
-                                        logger.error(
-                                            f"Error cleaning up file {file}: {str(e)}"
-                                        )
-                                        
-                        tmp_files = glob.glob('/tmp/tmp*.h5')
-                        for file in tmp_files:
-                            try:
-                                os.remove(file)
-                                logger.info(f"Cleaned up temporary file in /tmp: {file}")
-                            except Exception as e:
-                                logger.error(f"Error cleaning up tmp file {file}: {str(e)}")
+                        # Cleanup using Prefect task
+                        await self.cleanup_smap_files_task.submit()
                     except Exception as e:
-                        logger.error(f"Error moving task to history: {str(e)}")
-                        raise
+                        logger.error(f"Error processing scored tasks: {str(e)}")
+                        logger.error(traceback.format_exc())
+                        continue
 
             return {"status": "success", "results": scoring_results}
 
@@ -835,13 +915,223 @@ class SoilMoistureTask(Task):
             logger.error(f"Error in validator_score: {str(e)}")
             return {"status": "error", "message": str(e)}
 
-    async def validator_prepare_subtasks(self):
-        """Prepare the subtasks for execution.
+    @task(
+        name="move_task_to_history_task",
+        retries=2,
+        retry_delay_seconds=30,
+        tags=["database"],
+        description="Move scored task to history table"
+    )
+    async def move_task_to_history_task(
+        self,
+        region: Dict,
+        predictions: Dict,
+        ground_truth: Dict,
+        scores: Dict
+    ):
+        """Move scored task to history with proper error handling."""
+        conn = None
+        try:
+            logger.info(f"Moving task to history for region {region['id']}")
+            logger.info(f"Final scores for region {region['id']}:")
+            logger.info(f"Surface RMSE: {scores['metrics'].get('surface_rmse'):.4f}")
+            logger.info(f"Surface SSIM: {scores['metrics'].get('surface_ssim', 0):.4f}")
+            logger.info(f"Rootzone RMSE: {scores['metrics'].get('rootzone_rmse'):.4f}")
+            logger.info(f"Rootzone SSIM: {scores['metrics'].get('rootzone_ssim', 0):.4f}")
+            logger.info(f"Total Score: {scores.get('total_score', 0):.4f}")
 
-        Returns:
-            List[Dict]: List of subtasks
-        """
-        pass
+            conn = await self.db_manager.get_connection()
+            async with conn as session:
+                async with session.begin():
+                    for prediction in predictions:
+                        miner_id = prediction["miner_id"]
+                        params = {
+                            "region_id": region["id"],
+                            "miner_uid": miner_id,
+                            "miner_hotkey": prediction.get("miner_hotkey", ""),
+                            "target_time": region["target_time"],
+                            "surface_sm_pred": prediction["surface_sm"],
+                            "rootzone_sm_pred": prediction["rootzone_sm"],
+                            "surface_sm_truth": ground_truth["surface_sm"] if ground_truth else None,
+                            "rootzone_sm_truth": ground_truth["rootzone_sm"] if ground_truth else None,
+                            "surface_rmse": scores["metrics"].get("surface_rmse"),
+                            "rootzone_rmse": scores["metrics"].get("rootzone_rmse"),
+                            "surface_structure_score": scores["metrics"].get("surface_ssim", 0),
+                            "rootzone_structure_score": scores["metrics"].get("rootzone_ssim", 0),
+                        }
+
+                        await session.execute(
+                            text("""
+                                INSERT INTO soil_moisture_history 
+                                (region_id, miner_uid, miner_hotkey, target_time, 
+                                 surface_sm_pred, rootzone_sm_pred,
+                                 surface_sm_truth, rootzone_sm_truth,
+                                 surface_rmse, rootzone_rmse,
+                                 surface_structure_score, rootzone_structure_score)
+                                VALUES 
+                                (:region_id, :miner_uid, :miner_hotkey, :target_time,
+                                 :surface_sm_pred, :rootzone_sm_pred,
+                                 :surface_sm_truth, :rootzone_sm_truth,
+                                 :surface_rmse, :rootzone_rmse,
+                                 :surface_structure_score, :rootzone_structure_score)
+                            """),
+                            params
+                        )
+                        logger.info(f"Stored scores for miner {miner_id} in region {region['id']}")
+
+                        await session.execute(
+                            text("""
+                                UPDATE soil_moisture_predictions 
+                                SET status = 'scored'
+                                WHERE region_id = :region_id AND miner_uid = :miner_uid
+                            """),
+                            params
+                        )
+
+            # Trigger cleanup after successful history move
+            await self.cleanup_predictions_task.submit(
+                bounds=region["sentinel_bounds"],
+                target_time=region["target_time"],
+                miner_uid=miner_id
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to move task to history: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+        finally:
+            if conn:
+                await conn.close()
+
+    @task(
+        name="build_score_row_task",
+        retries=2,
+        retry_delay_seconds=30,
+        tags=["scoring"],
+        description="Build score row for global scoring mechanism"
+    )
+    async def build_score_row_task(self, target_time, recent_tasks=None):
+        """Build score row for global scoring mechanism with proper error handling."""
+        try:
+            current_time = datetime.now(timezone.utc)
+            scores = [float("nan")] * 256
+            
+            miner_query = "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL"
+            miner_mappings = await self.db_manager.fetch_many(miner_query)
+            hotkey_to_uid = {row["hotkey"]: row["uid"] for row in miner_mappings}
+            logger.info(f"Found {len(hotkey_to_uid)} miner mappings")
+
+            if recent_tasks:
+                logger.info(f"Processing {len(recent_tasks)} recent tasks")
+                miner_scores = {}
+                
+                for task in recent_tasks:
+                    task_score = task.get("score", {})
+                    for prediction in task.get("predictions", []):
+                        miner_id = prediction.get("miner_id")
+                        if miner_id not in miner_scores:
+                            miner_scores[miner_id] = []
+                        if isinstance(task_score.get("total_score"), (int, float)):
+                            miner_scores[miner_id].append(float(task_score["total_score"]))
+
+                for miner_id, scores_list in miner_scores.items():
+                    if scores_list:
+                        scores[int(miner_id)] = sum(scores_list) / len(scores_list)
+                        logger.info(f"Final average score for miner {miner_id}: {scores[int(miner_id)]}")
+
+                score_row = {
+                    "task_name": "soil_moisture",
+                    "task_id": str(current_time.timestamp()),
+                    "score": scores,
+                    "status": "completed"
+                }
+                
+                return [score_row]
+
+        except Exception as e:
+            logger.error(f"Error building score row: {e}")
+            logger.error(traceback.format_exc())
+            return []
+
+    @task(
+        name="cleanup_predictions_task",
+        retries=2,
+        retry_delay_seconds=30,
+        tags=["cleanup"],
+        description="Clean up processed predictions"
+    )
+    async def cleanup_predictions_task(self, bounds, target_time=None, miner_uid=None):
+        """Clean up predictions after processing with proper error handling."""
+        try:
+            conn = await self.db_manager.get_connection()
+            try:
+                async with conn.begin():
+                    result = await conn.execute(
+                        text("""
+                        DELETE FROM soil_moisture_predictions p
+                        USING soil_moisture_regions r
+                        WHERE p.region_id = r.id 
+                        AND r.sentinel_bounds = :bounds
+                        AND r.target_time = :target_time
+                        AND p.miner_uid = :miner_uid
+                        AND p.status = 'scored'
+                        RETURNING p.id
+                        """),
+                        {
+                            "bounds": bounds,
+                            "target_time": target_time,
+                            "miner_uid": miner_uid
+                        }
+                    )
+                    
+                    deleted_count = result.rowcount
+                    logger.info(
+                        f"Cleaned up {deleted_count} predictions for bounds {bounds}"
+                        f"{f', time {target_time}' if target_time else ''}"
+                        f"{f', miner {miner_uid}' if miner_uid else ''}"
+                    )
+                    
+            finally:
+                await conn.close()
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup predictions: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+    @task(
+        name="cleanup_smap_files_task",
+        retries=2,
+        retry_delay_seconds=30,
+        tags=["cleanup"],
+        description="Clean up SMAP files after processing"
+    )
+    async def cleanup_smap_files_task(self):
+        """Clean up SMAP files after processing."""
+        try:
+            smap_cache_dir = "smap_cache"
+            if os.path.exists(smap_cache_dir):
+                for file in os.listdir(smap_cache_dir):
+                    if file.endswith(".h5"):
+                        file_path = os.path.join(smap_cache_dir, file)
+                        try:
+                            os.remove(file_path)
+                            logger.info(f"Cleaned up SMAP file {file}")
+                        except Exception as e:
+                            logger.error(f"Error cleaning up file {file}: {str(e)}")
+                            
+            tmp_files = glob.glob('/tmp/tmp*.h5')
+            for file in tmp_files:
+                try:
+                    os.remove(file)
+                    logger.info(f"Cleaned up temporary file in /tmp: {file}")
+                except Exception as e:
+                    logger.error(f"Error cleaning up tmp file {file}: {str(e)}")
+                    
+        except Exception as e:
+            logger.error(f"Error in cleanup_smap_files: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
     def run_model_inference(self, processed_data):
         """Run model inference on processed data."""
@@ -920,231 +1210,234 @@ class SoilMoistureTask(Task):
         """Preprocess data for model input."""
         pass
 
-    async def build_score_row(self, target_time, recent_tasks=None):
-        """Build score row for global scoring mechanism."""
-        try:
-            current_time = datetime.now(timezone.utc)
-            scores = [float("nan")] * 256
+    async def create_flow(self, validator):
+        """Create a Prefect flow for this task."""
+        task_name = self.name.lower().replace(" ", "_")
+        
+        @flow(
+            name=f"{task_name}_flow",
+            description=f"Flow for {self.name}",
+            version=validator.args.version,
+            retries=3,
+            retry_delay_seconds=60,
+            timeout_seconds=3600
+        )
+        async def task_flow():
+            flow_logger = get_run_logger()
+            flow_logger.info(f"Starting {self.name} flow")
             
-            miner_query = """
-            SELECT uid, hotkey FROM node_table 
-            WHERE hotkey IS NOT NULL
-            """
-            miner_mappings = await self.db_manager.fetch_many(miner_query)
-            hotkey_to_uid = {row["hotkey"]: row["uid"] for row in miner_mappings}
-            logger.info(f"Found {len(hotkey_to_uid)} miner mappings: {hotkey_to_uid}")
-
-            scores = [float("nan")] * 256
-            current_datetime = datetime.fromisoformat(str(target_time))
-
-            if recent_tasks:
-                logger.info(f"Processing {len(recent_tasks)} recent tasks")
-                miner_scores = {}
-                
-                for task in recent_tasks:
-                    task_score = task.get("score", {})
-                    for prediction in task.get("predictions", []):
-                        miner_id = prediction.get("miner_id")
-                        if miner_id not in miner_scores:
-                            miner_scores[miner_id] = []
-                        if isinstance(task_score.get("total_score"), (int, float)):
-                            miner_scores[miner_id].append(float(task_score["total_score"]))
-                            logger.info(f"Added score {task_score['total_score']} for miner_id {miner_id} in region {task['id']}")
-
-                for miner_id, scores_list in miner_scores.items():
-                    if scores_list:
-                        scores[int(miner_id)] = sum(scores_list) / len(scores_list)
-                        logger.info(f"Final average score for miner {miner_id}: {scores[int(miner_id)]} across {len(scores_list)} regions")
-
-                score_row = {
-                    "task_name": "soil_moisture",
-                    "task_id": str(current_datetime.timestamp()),
-                    "score": scores,
-                    "status": "completed"
-                }
-                
-                logger.info(f"Raw score row being inserted: {json.dumps({**score_row, 'score': [f'{s:.4f}' if not math.isnan(s) else 'nan' for s in score_row['score']]})}")
-                
-                return [score_row]
-
-        except Exception as e:
-            logger.error(f"Error building score row: {e}")
-            logger.error(traceback.format_exc())
-            return []
-
-    async def recalculate_recent_scores(self, uids: list):
-        """
-        Recalculate recent scores for the given UIDs across the 3-day scoring window
-        and update all affected score_table rows.
-
-        Args:
-            uids (list): List of UIDs to recalculate scores for.
-        """
-        try:
-
-            delete_query = """
-            DELETE FROM soil_moisture_predictions
-            WHERE miner_uid = ANY(:uids)
-            """
-            await self.db_manager.execute(delete_query, {"uids": uids})
-            logger.info(f"Deleted predictions for UIDs: {uids}")
-
-            current_time = datetime.now(timezone.utc)
-            history_window = current_time - self.scoring_delay  # 3 days
-
-            delete_scores_query = """
-            DELETE FROM score_table 
-            WHERE task_name = 'soil_moisture'
-            AND task_id::float >= :start_timestamp
-            AND task_id::float <= :end_timestamp
-            """
-            await self.db_manager.execute(
-                delete_scores_query,
-                {
-                    "start_timestamp": history_window.timestamp(),
-                    "end_timestamp": current_time.timestamp(),
-                },
-            )
-            logger.info(
-                f"Deleted score rows for period {history_window} to {current_time}"
-            )
-
-            history_query = """
-            SELECT 
-                miner_uid,
-                miner_hotkey,
-                surface_rmse,
-                rootzone_rmse,
-                surface_structure_score,
-                rootzone_structure_score,
-                target_time
-            FROM soil_moisture_history
-            WHERE target_time >= :history_window
-            ORDER BY target_time ASC
-            """
-
-            history_results = await self.db_manager.fetch_many(
-                history_query, {"history_window": history_window}
-            )
-
-            daily_records = {}
-            for record in history_results:
-                day_key = record["target_time"].replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-                if day_key not in daily_records:
-                    daily_records[day_key] = []
-                daily_records[day_key].append(record)
-
-            for day, records in daily_records.items():
-                miner_scores = {}
-                for record in records:
-                    miner_uid = int(record["miner_uid"])
-                    if miner_uid not in miner_scores:
-                        miner_scores[miner_uid] = {
-                            "surface_rmse": [],
-                            "rootzone_rmse": [],
-                            "surface_ssim": [],
-                            "rootzone_ssim": [],
-                        }
-
-                    miner_scores[miner_uid]["surface_rmse"].append(
-                        record["surface_rmse"]
-                    )
-                    miner_scores[miner_uid]["rootzone_rmse"].append(
-                        record["rootzone_rmse"]
-                    )
-                    miner_scores[miner_uid]["surface_ssim"].append(
-                        record["surface_structure_score"]
-                    )
-                    miner_scores[miner_uid]["rootzone_ssim"].append(
-                        record["rootzone_structure_score"]
-                    )
-
-                scores = [float("nan")] * 256
-                for miner_uid, score_lists in miner_scores.items():
-                    if score_lists["surface_rmse"] and score_lists["rootzone_rmse"]:
-                        avg_surface_rmse = sum(score_lists["surface_rmse"]) / len(
-                            score_lists["surface_rmse"]
-                        )
-                        avg_rootzone_rmse = sum(score_lists["rootzone_rmse"]) / len(
-                            score_lists["rootzone_rmse"]
-                        )
-                        avg_surface_ssim = sum(score_lists["surface_ssim"]) / len(
-                            score_lists["surface_ssim"]
-                        )
-                        avg_rootzone_ssim = sum(score_lists["rootzone_ssim"]) / len(
-                            score_lists["rootzone_ssim"]
-                        )
-
-                        surface_score = math.exp(-abs(avg_surface_rmse) / 10)
-                        rootzone_score = math.exp(-abs(avg_rootzone_rmse) / 10)
-
-                        total_score = (
-                            0.25 * surface_score
-                            + 0.25 * rootzone_score
-                            + 0.25 * avg_surface_ssim
-                            + 0.25 * avg_rootzone_ssim
-                        )
-
-                        scores[miner_uid] = total_score
-
-                score_row = {
-                    "task_name": "soil_moisture",
-                    "task_id": str(day.timestamp()),
-                    "score": scores,
-                    "status": "completed",
-                }
-
-                insert_query = """
-                INSERT INTO score_table (task_name, task_id, score, status)
-                VALUES (:task_name, :task_id, :score, :status)
-                """
-                await self.db_manager.execute(insert_query, score_row)
-                logger.info(f"Recalculated and inserted score row for day {day}")
-
-            logger.info(
-                f"Completed recalculation of scores for UIDs: {uids} over 3-day window"
-            )
-
-        except Exception as e:
-            logger.error(f"Error recalculating recent scores: {e}")
-            logger.error(traceback.format_exc())
-
-    async def cleanup_predictions(self, bounds, target_time=None, miner_uid=None):
-        """Clean up predictions after they've been processed and moved to history."""
-        try:
-            conn = await self.db_manager.get_connection()
+            # Initialize flow metrics
+            flow_metrics = {
+                'processing_time': {},
+                'success_rate': {},
+                'error_counts': {},
+                'prediction_stats': {}
+            }
+            
+            # Initialize flow state
+            flow_state = {
+                'current_time': datetime.now(timezone.utc),
+                'validator': validator,
+                'flow_id': str(uuid4()),
+                'status': 'running',
+                'error_count': 0,
+                'last_successful_step': None,
+                'recovery_attempts': 0,
+                'metrics': flow_metrics
+            }
+            
             try:
-                async with conn.begin():
-                    result = await conn.execute(
-                        text("""
-                        DELETE FROM soil_moisture_predictions p
-                        USING soil_moisture_regions r
-                        WHERE p.region_id = r.id 
-                        AND r.sentinel_bounds = :bounds
-                        AND r.target_time = :target_time
-                        AND p.miner_uid = :miner_uid
-                        AND p.status = 'scored'
-                        RETURNING p.id
-                        """),
-                        {
-                            "bounds": bounds,
-                            "target_time": target_time,
-                            "miner_uid": miner_uid
-                        }
+                # Execute the validator task
+                await self.validator_execute_task.submit(validator=validator)
+                flow_state['status'] = 'completed'
+                
+            except Exception as e:
+                flow_state['status'] = 'failed'
+                flow_state['error_count'] += 1
+                flow_metrics['error_counts'][str(e)] = flow_metrics['error_counts'].get(str(e), 0) + 1
+                
+                flow_logger.error(f"Flow failed: {str(e)}")
+                flow_logger.error(traceback.format_exc())
+                raise
+                
+            return flow_state
+            
+        return task_flow
+
+    @task(
+        name="validator_execute_task",
+        retries=3,
+        retry_delay_seconds=lambda x: 60 * (2 ** x),
+        retry_jitter_factor=0.2,
+        tags=["validator"],
+        description="Execute validator workflow for soil moisture predictions"
+    )
+    async def validator_execute_task(self, validator):
+        """Execute validator workflow with proper error handling and state recovery."""
+        flow_logger = get_run_logger()
+        flow_logger.info("Starting validator execution task")
+        
+        # Initialize task state
+        task_state = {
+            'current_step': None,
+            'last_successful_step': None,
+            'retry_count': defaultdict(int),
+            'errors': defaultdict(list),
+            'processed_regions': set(),
+            'failed_regions': set()
+        }
+        
+        try:
+            current_time = datetime.now(timezone.utc)
+            task_state['current_step'] = 'initialization'
+            
+            # Check if we need to score any pending predictions
+            if current_time.minute % 1 == 0:
+                task_state['current_step'] = 'scoring'
+                try:
+                    await self.validator_score()
+                    task_state['last_successful_step'] = 'scoring'
+                except Exception as e:
+                    task_state['errors']['scoring'].append(str(e))
+                    flow_logger.error(f"Error in scoring step: {str(e)}")
+                    # Continue execution as scoring errors are non-fatal
+
+            # Handle test mode execution
+            if self.test_mode:
+                flow_logger.info("Running in test mode - bypassing window checks")
+                target_smap_time = self.get_smap_time_for_validator(current_time)
+                ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
+                
+                task_state['current_step'] = 'test_mode_execution'
+                
+                # Get daily regions with circuit breaker and state tracking
+                circuit_state = await self._check_circuit_state("sentinel_api")
+                if not circuit_state['is_closed']:
+                    task_state['errors']['sentinel_api'].append("Circuit breaker open")
+                    raise DataFetchError(
+                        f"Circuit breaker open for sentinel_api until {circuit_state['next_attempt']}",
+                        is_recoverable=False
+                    )
+                
+                try:
+                    regions = await self.get_daily_regions(
+                        target_time=target_smap_time,
+                        ifs_forecast_time=ifs_forecast_time
+                    )
+                    await self._close_circuit("sentinel_api")
+                    task_state['last_successful_step'] = 'get_daily_regions'
+                except Exception as e:
+                    await self._record_failure("sentinel_api")
+                    task_state['errors']['get_daily_regions'].append(str(e))
+                    raise DataFetchError(f"Error getting daily regions: {str(e)}")
+
+                if regions:
+                    for region in regions:
+                        task_state['current_step'] = f"processing_region_{region['id']}"
+                        try:
+                            result = await self.process_region(
+                                region=region,
+                                target_time=target_smap_time,
+                                ifs_forecast_time=ifs_forecast_time,
+                                current_time=current_time,
+                                validator=validator
+                            )
+                            if result:
+                                task_state['processed_regions'].add(region['id'])
+                                task_state['last_successful_step'] = f"processed_region_{region['id']}"
+                        except Exception as e:
+                            task_state['failed_regions'].add(region['id'])
+                            task_state['errors'][f"region_{region['id']}"].append(str(e))
+                            flow_logger.error(f"Error processing region {region['id']}: {str(e)}")
+                            continue
+                            
+                flow_logger.info("Test mode execution complete. Disabling test mode.")
+                self.test_mode = False
+                return task_state
+                
+            # Normal execution mode
+            task_state['current_step'] = 'normal_execution'
+            windows = self.get_validator_windows()
+            current_window = next(
+                (w for w in windows if self.is_in_window(current_time, w)), None
+            )
+
+            if not current_window:
+                flow_logger.info(f"Not in any preparation or execution window: {current_time}")
+                flow_logger.info(f"Next soil task time: {self.get_next_preparation_time(current_time)}")
+                task_state['last_successful_step'] = 'window_check'
+                return task_state
+
+            is_prep = current_window[1] == 30  # If minutes = 30, it's a prep window
+            target_smap_time = self.get_smap_time_for_validator(current_time)
+            ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
+
+            if is_prep:
+                task_state['current_step'] = 'preparation_window'
+                # Preparation window with circuit breaker and state tracking
+                circuit_state = await self._check_circuit_state("sentinel_api")
+                if not circuit_state['is_closed']:
+                    task_state['errors']['sentinel_api'].append("Circuit breaker open")
+                    raise DataFetchError(
+                        f"Circuit breaker open for sentinel_api until {circuit_state['next_attempt']}",
+                        is_recoverable=False
+                    )
+                
+                try:
+                    await self.get_daily_regions(
+                        target_time=target_smap_time,
+                        ifs_forecast_time=ifs_forecast_time
+                    )
+                    await self._close_circuit("sentinel_api")
+                    task_state['last_successful_step'] = 'preparation_complete'
+                except Exception as e:
+                    await self._record_failure("sentinel_api")
+                    task_state['errors']['preparation'].append(str(e))
+                    raise DataFetchError(f"Error in preparation window: {str(e)}")
+                    
+            else:
+                task_state['current_step'] = 'execution_window'
+                # Execution window with state tracking
+                try:
+                    regions = await self.db_manager.fetch_many(
+                        """
+                        SELECT * FROM soil_moisture_regions 
+                        WHERE status = 'pending'
+                        AND target_time = :target_time
+                        """,
+                        {"target_time": target_smap_time},
                     )
                     
-                    deleted_count = result.rowcount
-                    logger.info(
-                        f"Cleaned up {deleted_count} predictions for bounds {bounds}"
-                        f"{f', time {target_time}' if target_time else ''}"
-                        f"{f', miner {miner_uid}' if miner_uid else ''}"
-                    )
-                    
-            finally:
-                await conn.close()
+                    if regions:
+                        for region in regions:
+                            task_state['current_step'] = f"processing_region_{region['id']}"
+                            try:
+                                result = await self.process_region(
+                                    region=region,
+                                    target_time=target_smap_time,
+                                    ifs_forecast_time=ifs_forecast_time,
+                                    current_time=current_time,
+                                    validator=validator
+                                )
+                                if result:
+                                    task_state['processed_regions'].add(region['id'])
+                                    task_state['last_successful_step'] = f"processed_region_{region['id']}"
+                            except Exception as e:
+                                task_state['failed_regions'].add(region['id'])
+                                task_state['errors'][f"region_{region['id']}"].append(str(e))
+                                flow_logger.error(f"Error processing region {region['id']}: {str(e)}")
+                                continue
+                                
+                except Exception as e:
+                    task_state['errors']['execution'].append(str(e))
+                    raise MinerQueryError(f"Error in execution window: {str(e)}")
+
+            # Log final task state
+            flow_logger.info(f"Task completed with state: {task_state}")
+            return task_state
 
         except Exception as e:
-            logger.error(f"Failed to cleanup predictions: {str(e)}")
-            logger.error(traceback.format_exc())
+            task_state['errors']['fatal'].append(str(e))
+            flow_logger.error(f"Fatal error in validator execution: {str(e)}")
+            flow_logger.error(traceback.format_exc())
+            raise

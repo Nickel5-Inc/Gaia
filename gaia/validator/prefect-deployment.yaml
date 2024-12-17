@@ -1,0 +1,100 @@
+name: gaia-validator
+description: "Gaia Validator deployment configuration"
+version: 1
+
+deployments:
+  - name: geomagnetic-flow-${NETWORK}
+    flow_name: geomagnetic_flow
+    work_pool: gaia-validator-${NETWORK}
+    schedule:
+      interval: 300  # 5 minutes
+    tags:
+      - gaia
+      - validator
+      - geomagnetic
+      - ${NETWORK}
+    parameters:
+      network: ${NETWORK}
+    description: |
+      Geomagnetic prediction flow for ${NETWORK} network.
+      Handles data collection, validation, and scoring.
+
+  - name: soil-moisture-flow-${NETWORK}
+    flow_name: soil_moisture_flow
+    work_pool: gaia-validator-${NETWORK}
+    schedule:
+      interval: 600  # 10 minutes
+    tags:
+      - gaia
+      - validator
+      - soil-moisture
+      - ${NETWORK}
+    parameters:
+      network: ${NETWORK}
+    description: |
+      Soil moisture analysis flow for ${NETWORK} network.
+      Handles data collection, processing, and scoring.
+
+  - name: scoring-flow-${NETWORK}
+    flow_name: scoring_flow
+    work_pool: gaia-validator-${NETWORK}
+    schedule:
+      interval: 300  # 5 minutes
+    tags:
+      - gaia
+      - validator
+      - scoring
+      - ${NETWORK}
+    parameters:
+      network: ${NETWORK}
+    description: |
+      Weight management and scoring flow for ${NETWORK} network.
+      Aggregates task scores and updates chain weights.
+
+  - name: monitoring-flow-${NETWORK}
+    flow_name: monitoring_flow
+    work_pool: gaia-validator-${NETWORK}
+    schedule:
+      interval: 60  # 1 minute
+    tags:
+      - gaia
+      - validator
+      - monitoring
+      - ${NETWORK}
+    parameters:
+      network: ${NETWORK}
+    description: |
+      System monitoring flow for ${NETWORK} network.
+      Handles miner registration, status logging, and updates.
+
+storage:
+  type: "local"
+  path: "."
+
+infrastructure:
+  type: "process"
+  env:
+    PYTHONPATH: "."
+    RAY_ADDRESS: "auto"  # Auto-detect Ray cluster
+    RAY_DISABLE_MEMORY_MONITOR: "1"  # Prevent Ray from killing memory-intensive tasks
+
+flow_name: "main_scoring_flow"
+entrypoint: "gaia.validator.validator:GaiaValidator.main_scoring"
+
+parameters: {}  # Parameters are handled through command line args
+
+tags:
+  - "gaia"
+  - "validator"
+
+task_runner:
+  type: "ray"
+  max_retries: 3
+  ray_init_kwargs:
+    num_cpus: null  # Use all available CPUs
+    include_dashboard: true
+    dashboard_host: "0.0.0.0"
+    dashboard_port: 8265
+    _system_config:
+      max_direct_call_object_size: 10485760  # 10MB
+      task_rpc_timeout_seconds: 120

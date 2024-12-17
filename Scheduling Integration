@@ -1,0 +1,210 @@
+# Prefect Scheduling Integration Plan
+
+## Current Progress
+
+### Completed Items ✓
+1. Database Infrastructure
+   - Network-specific databases (test/finney)
+   - SQLAlchemy async models
+   - Automatic migrations
+   - Schema versioning
+   - Task state tracking
+
+2. Core Models
+   - Node table with 256-row enforcement
+   - Score table with array support
+   - Process queue for task management
+   - Task state for Prefect integration
+
+3. Database Operations
+   - Async session management
+   - Prefect task decorators
+   - Retry logic
+   - Error handling
+
+### In Progress 🔄
+1. Flow Structure
+   - Base flow implementation
+   - Task dependencies
+   - Block-based scheduling
+
+2. Migration Process
+   - Database schema updates
+   - Task conversion
+   - Parallel operation support
+
+## Next Steps
+
+### 1. Flow Implementation
+
+#### Base Flow Structure
+```python
+from prefect import flow, task
+from contextlib import asynccontextmanager
+
+class BaseValidatorFlow:
+    """Base class for all validator flows."""
+    def __init__(self, db_manager, network):
+        self.db_manager = db_manager
+        self.network = network  # test/finney
+
+    @asynccontextmanager
+    async def flow_context(self, name: str):
+        """Context manager for flow execution."""
+        try:
+            await self.db_manager.update_task_state(
+                flow_name=name,
+                task_name="start",
+                status="running"
+            )
+            yield
+            await self.db_manager.update_task_state(
+                flow_name=name,
+                task_name="complete",
+                status="completed"
+            )
+        except Exception as e:
+            await self.db_manager.update_task_state(
+                flow_name=name,
+                task_name="error",
+                status="failed",
+                error_message=str(e)
+            )
+            raise
+```
+
+#### Task Implementation
+```python
+@flow(name="scoring_flow")
+class ScoringFlow(BaseValidatorFlow):
+    @task(retries=3)
+    async def collect_scores(self):
+        async with self.flow_context("score_collection"):
+            return await self.db_manager.get_recent_scores(
+                task_name="all",
+                limit=100
+            )
+
+    @task
+    async def calculate_weights(self, scores):
+        async with self.flow_context("weight_calculation"):
+            # Weight calculation logic
+            pass
+
+    @task(retries=2)
+    async def update_chain(self, weights):
+        async with self.flow_context("chain_update"):
+            # Chain update logic
+            pass
+
+    def __call__(self):
+        scores = self.collect_scores()
+        weights = self.calculate_weights(scores)
+        self.update_chain(weights)
+```
+
+### 2. Deployment Configuration
+
+#### Work Pool Setup
+```yaml
+# prefect-work-pools.yaml
+work-pools:
+  - name: gaia-validator-${NETWORK}
+    type: process
+    base_job_template:
+      env:
+        SUBTENSOR_NETWORK: ${NETWORK}
+        DB_NAME: gaia_${NETWORK}
+    job_variables:
+      working_dir: /root/dev/Gaia
+      command: python -m gaia.validator
+```
+
+#### Flow Deployment
+```yaml
+# prefect-deployment.yaml
+deployments:
+  - name: scoring-flow-${NETWORK}
+    flow_name: scoring_flow
+    work_pool: gaia-validator-${NETWORK}
+    schedule:
+      interval: 300  # 5 minutes
+    tags:
+      - gaia
+      - validator
+      - ${NETWORK}
+```
+
+### 3. Recovery Mechanisms
+
+#### Automatic Recovery
+```python
+class RecoveryManager:
+    """Handles flow and task recovery after crashes."""
+    
+    async def recover_flows(self):
+        """Recover any interrupted flows."""
+        async with self.db_manager.get_session() as session:
+            # Find interrupted flows
+            interrupted = await session.execute(
+                select(TaskState).where(
+                    TaskState.status == "running"
+                )
+            )
+            
+            for flow in interrupted:
+                await self.restart_flow(flow)
+
+    async def restart_flow(self, flow_state):
+        """Restart a specific flow."""
+        await self.db_manager.update_task_state(
+            flow_name=flow_state.flow_name,
+            task_name=flow_state.task_name,
+            status="pending",
+            metadata={"recovery": True}
+        )
+```
+
+## Implementation Timeline
+
+### Phase 1: Core Integration (Current) 🔄
+- [x] Database setup
+- [x] Model implementation
+- [x] Migration system
+- [ ] Base flow structure
+
+### Phase 2: Flow Migration
+- [ ] Convert geomagnetic task
+- [ ] Convert soil task
+- [ ] Implement scoring flow
+- [ ] Add recovery mechanisms
+
+### Phase 3: Deployment
+- [ ] Configure work pools
+- [ ] Set up deployments
+- [ ] Implement monitoring
+- [ ] Test recovery
+
+### Phase 4: Parallel Operation
+- [ ] Run both systems
+- [ ] Compare results
+- [ ] Tune performance
+- [ ] Validate stability
+
+## Success Criteria
+
+### Performance
+- Task completion within 110% of current times
+- Resource usage within 120% of baseline
+- Error rates below 1%
+
+### Reliability
+- Automatic recovery from crashes
+- No data loss during transitions
+- Proper network separation (test/finney)
+
+### Monitoring
+- Full task visibility
+- Performance metrics
+- Error tracking
+- Resource usage monitoring

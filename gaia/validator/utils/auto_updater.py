@@ -244,16 +244,17 @@ async def perform_update(validator):
                     logger.error(f"Failed to reset scoring system: {e}")
                     logger.error(traceback.format_exc())
 
-            # Handle PM2 restart
+            # Get PM2 process name
             process_name = await get_pm2_process_name()
             if process_name:
-                logger.info(f"Restarting PM2 process: {process_name}")
+                logger.info(f"Restarting deployment via PM2: {process_name}")
+                # This will restart the entire deployment including Prefect
                 success = await restart_pm2_process(process_name)
                 if not success:
                     logger.error("Failed to restart via PM2")
                     return False
             else:
-                logger.warning("Not running under PM2, manual restart may be required")
+                logger.warning("Not running under PM2, manual restart required")
 
             return True
 

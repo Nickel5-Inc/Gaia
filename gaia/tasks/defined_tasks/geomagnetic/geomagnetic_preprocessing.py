@@ -1,116 +1,133 @@
 from gaia.tasks.base.components.preprocessing import Preprocessing
 import pandas as pd
 from gaia.models.geomag_basemodel import GeoMagBaseModel
-from typing import Dict
+from typing import Dict, Any, Optional, List
 import logging
+from prefect import task
+from uuid import uuid4
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 
 class GeomagneticPreprocessing(Preprocessing):
-    def preprocess(self, data: pd.DataFrame):
-        """
-        Prepares the cleaned DST DataFrame for prediction.
+    """Preprocessing component for geomagnetic data."""
 
+    COLUMN_MAPPINGS = {
+        'input': {'timestamp': 'timestamp', 'value': 'Dst'},
+        'model': {'timestamp': 'ds', 'value': 'y'}
+    }
+
+    @task(
+        name="prepare_historical_data",
+        retries=3,
+        retry_delay_seconds=60,
+        description="Prepare historical data for prediction"
+    )
+    def prepare_historical_data(self, data: Dict[str, Any]) -> pd.DataFrame:
+        """
+        Prepare historical data for prediction.
+        
         Args:
-            data (pd.DataFrame): The recent DST data provided by the validator.
-
+            data (Dict[str, Any]): Raw data containing timestamp, dst_value, and optional historical_data
+            
         Returns:
-            pd.DataFrame: Processed data, if further processing is needed.
+            pd.DataFrame: Processed DataFrame with historical context
         """
-        # Perform any necessary preprocessing (if required)
-        return data
+        # Create DataFrame with current data point
+        df = pd.DataFrame({
+            'timestamp': [pd.to_datetime(data['timestamp'])],
+            'Dst': [float(data['dst_value'])]
+        })
+        
+        # Add historical data if available
+        if data.get('historical_data') is not None:
+            historical_df = pd.DataFrame(data['historical_data'])
+            df = pd.concat([historical_df, df], ignore_index=True)
+        
+        return self._standardize_dataframe(df)
 
-    def predict_next_hour(self, processed_data: pd.DataFrame, model=None):
+    @task(
+        name="preprocess_geomag_data",
+        retries=3,
+        retry_delay_seconds=60,
+        description="Preprocess geomagnetic data for prediction"
+    )
+    def preprocess(self, data: pd.DataFrame) -> pd.DataFrame:
         """
-        Predicts the DST index for the next hour using the specified model.
-
-        If no model is provided, uses the base model from geomag_basemodel.
-
+        Prepare data for model input.
+        
         Args:
-            processed_data (pd.DataFrame): The DataFrame with recent DST values.
-            model (object, optional): A custom model object with a `predict` method.
-
+            data (pd.DataFrame): DataFrame with timestamp and Dst columns
+            
         Returns:
-            dict: Predicted DST value and timestamp in UTC.
+            pd.DataFrame: Processed data ready for model input
         """
-        # Use the provided model, or fall back to the base model if none is provided
-        if model is None:
-            model = GeoMagBaseModel()  # Initialize the base model
+        df = self._standardize_dataframe(data)
+        
+        # Normalize values for model input
+        df['y'] = df['Dst'] / 100.0
+        
+        # Rename columns for model compatibility
+        return df.rename(columns=self.COLUMN_MAPPINGS['model'])
 
-        # Ensure the timestamp is in UTC format
-        last_timestamp = processed_data["timestamp"].iloc[-1]
-        last_timestamp_utc = (
-            last_timestamp.tz_convert("UTC")
-            if last_timestamp.tzinfo
-            else last_timestamp
-        )
-
-        try:
-            # Assume the model has a `predict` method that takes the processed data
-            prediction = model.predict(processed_data)
-        except Exception as e:
-            print(f"Error in model prediction: {e}")
-            return None
-
-        return {"predicted_value": int(prediction), "timestamp": last_timestamp_utc}
-
-    def process_miner_data(self, data: pd.DataFrame) -> pd.DataFrame:
+    @task(
+        name="prepare_miner_query",
+        retries=3,
+        retry_delay_seconds=60,
+        description="Prepare data for miner query"
+    )
+    async def prepare_miner_query(
+        self,
+        data: Dict[str, Any],
+        context: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """
-        Process raw geomagnetic data for model input.
-
+        Prepare data payload for querying miners.
+        
         Args:
-            data (pd.DataFrame): DataFrame containing:
-                - timestamp: UTC timestamp
-                - value: DST value
+            data (Dict[str, Any]): Data containing timestamp, dst_value, and historical_data
+            context (Dict[str, Any]): Execution context
+            
         Returns:
-            pd.DataFrame: Processed data ready for model input with historical context
+            Dict[str, Any]: Formatted payload for miner query
         """
-        try:
-            # Ensure data is a DataFrame
-            if not isinstance(data, pd.DataFrame):
-                raise ValueError("Input must be a pandas DataFrame")
+        historical_records = self._format_historical_records(data.get('historical_data'))
+        
+        return {
+            "nonce": str(uuid4()),
+            "data": {
+                "name": "Geomagnetic Data",
+                "timestamp": data['timestamp'].isoformat(),
+                "value": data['dst_value'],
+                "historical_values": historical_records
+            }
+        }
 
-            # Create a copy and convert timestamp to naive UTC datetime
-            processed_df = data.copy()
+    def _standardize_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Standardize DataFrame format."""
+        df = df.copy()
+        
+        # Ensure timestamp column is datetime with UTC
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        if df['timestamp'].dt.tz is not None:
+            df['timestamp'] = df['timestamp'].dt.tz_convert('UTC')
+        
+        # Ensure value column is named consistently
+        if 'value' in df.columns:
+            df = df.rename(columns={'value': 'Dst'})
+        
+        return df.sort_values('timestamp').reset_index(drop=True)
 
-            # Convert timestamps to pandas datetime and remove timezone
-            processed_df["timestamp"] = pd.to_datetime(processed_df["timestamp"])
-            if processed_df["timestamp"].dt.tz is not None:
-                processed_df["timestamp"] = (
-                    processed_df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
-                )
-
-            # Get current values (now in naive UTC)
-            current_timestamp = processed_df["timestamp"].iloc[-1]
-            current_value = processed_df["value"].iloc[-1]
-
-            # Create historical points using proper pandas datetime handling
-            historical_data = pd.DataFrame(
-                {
-                    "timestamp": [
-                        current_timestamp - pd.Timedelta(hours=i) for i in range(1, 4)
-                    ],
-                    "value": [current_value] * 3,
-                }
-            )
-
-            # Combine historical and current data
-            processed_df = pd.concat([historical_data, processed_df], ignore_index=True)
-
-            # Normalize values
-            processed_df["value"] = processed_df["value"] / 100.0
-
-            # Rename columns to match Prophet requirements
-            processed_df = processed_df.rename(
-                columns={"timestamp": "ds", "value": "y"}
-            )
-
-            # Sort by timestamp
-            processed_df = processed_df.sort_values("ds").reset_index(drop=True)
-
-            return processed_df
-
-        except Exception as e:
-            logger.error(f"Error in process_miner_data: {e}")
-            raise
+    def _format_historical_records(self, historical_data: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
+        """Format historical data for API response."""
+        if historical_data is None:
+            return []
+            
+        return [
+            {
+                "timestamp": row["timestamp"].isoformat(),
+                "Dst": row["Dst"]
+            }
+            for _, row in historical_data.iterrows()
+        ]
