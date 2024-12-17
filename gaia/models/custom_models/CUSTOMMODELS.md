@@ -105,43 +105,44 @@ The output must be a dictionary with:
 > - Be named exactly `CustomGeomagneticModel`
 > - Implement a method named exactly `run_inference()` as specified below
 
-    class CustomGeomagneticModel:
-        def __init__(self):
-            """Initialize your custom geomagnetic model."""
-            self._load_model()
+```python
+class CustomGeomagneticModel:
+    def __init__(self):
+        """Initialize your custom geomagnetic model."""
+        self._load_model()
 
-        def _load_model(self):
-            """
-            Load your model implementation.
-    
-            Use this method to load any resources needed for the model, such as
-            machine learning weights, configuration files, or constants.
-            """
+    def _load_model(self):
+        """
+        Load your model implementation.
 
-        def run_inference(self, inputs: pd.DataFrame) -> float:
-            """
-            Required method that must be implemented to run model predictions.
-            This method should call all necessary methods to preprocess data,
-            and run the model end-to-end.
+        Use this method to load any resources needed for the model, such as
+        machine learning weights, configuration files, or constants.
+        """
 
-            Args:
-                inputs (pd.DataFrame): Preprocessed input data for the model, containing:
-                    - `timestamp` (datetime): Datetime information (column can also be named `ds`).
-                    - `value` (float): Geomagnetic Dst index (column can also be named `y`).
-    
-            Returns:
-                float: Predicted Dst value for the next hour.
+    def run_inference(self, inputs: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Required method that must be implemented to run model predictions.
+        This method should call all necessary methods to preprocess data,
+        and run the model end-to-end.
 
-            Example:
-                model = CustomGeomagneticModel()
-                predictions = model.run_inference(
-                    pd.DataFrame({
-                        "timestamp": [datetime(2024, 12, 10, 0, 0), datetime(2024, 12, 10, 1, 0)],
-                        "value": [-20, -25]
-                    })
-                )
-                print(predictions)  # Output: -24.5
-            """
+        Args:
+            inputs (pd.DataFrame): Preprocessed input data for the model, containing:
+                - `timestamp` (datetime): Datetime information (column can also be named `ds`).
+                - `value` (float): Geomagnetic Dst index (column can also be named `y`).
+
+        Returns:
+            Dict[str, Any]: Predicted Dst value for the next hour.
+
+        Example:
+            model = CustomGeomagneticModel()
+            predictions = model.run_inference(
+                pd.DataFrame({
+                    "timestamp": [datetime(2024, 12, 10, 0, 0), datetime(2024, 12, 10, 1, 0)],
+                    "value": [-20, -25]
+                })
+            )
+            print(predictions)  # Output: -24.5
+        """
 
 #### **Input Format**
 
