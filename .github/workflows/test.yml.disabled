@@ -1,0 +1,78 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  TEST_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL || '' }}
+  EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME || '' }}
+  EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD || '' }}
+  EARTHDATA_API_KEY: ${{ secrets.EARTHDATA_API_KEY || '' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.9, '3.10']
+
+    services:
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v2
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio pytest-cov pytest-mock
+
+    - name: Run unit tests
+      run: |
+        pytest tests/ -v -m "not integration and not database and not api" --cov=gaia
+
+    - name: Run integration tests
+      run: |
+        pytest tests/ -v -m "integration" --cov=gaia --cov-append
+
+    - name: Run database tests
+      if: env.TEST_DATABASE_URL != ''
+      run: |
+        pytest tests/ -v -m "database" --cov=gaia --cov-append
+
+    - name: Skip database tests
+      if: env.TEST_DATABASE_URL == ''
+      run: |
+        echo "Skipping database tests - Database URL not configured"
+
+    - name: Run API tests
+      if: env.EARTHDATA_USERNAME != ''
+      run: |
+        pytest tests/ -v -m "api" --cov=gaia --cov-append
+
+    - name: Skip API tests
+      if: env.EARTHDATA_USERNAME == ''
+      run: |
+        echo "Skipping API tests - Earthdata credentials not configured"
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v2
+      with:
+        fail_ci_if_error: true
