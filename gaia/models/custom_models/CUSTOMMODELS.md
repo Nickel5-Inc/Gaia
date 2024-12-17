@@ -157,11 +157,11 @@ see soil_apis.py for more information on the data processing, transformations, a
 1. **File Requirements**
 
 > - The custom model file must be named `custom_geomagnetic_model.py`
-> - **It must be placed in the directory:** `Gaia/gaia/models/custom_models/`
+> - **Place it in the following directory:** `Gaia/gaia/models/custom_models/`
 
 2. **Implementing the Custom Model**
 
-> **IMPORTANT: This Class must**:
+> **IMPORTANT: This class must**:
 > - Be named exactly `CustomGeomagneticModel`
 > - Implement a method named exactly `run_inference()` as specified below
 
@@ -216,10 +216,23 @@ The input to `run_inference` is a pandas DataFrame with:
 - `timestamp`: Datetime values representing observation times.
 - `value`: Float values representing the Dst index.
 
-**Output Format**
-
-The output must be a dictionary with:
+**Output Format**  
+The output must be a dictionary with the following keys:
 
 - `predicted_value`: A single float representing the predicted Dst index.
-- `prediction_time`: A string representing the associated timestamp.
+- `prediction_time`: A string in UTC using the ISO 8601 format.
+
+**Example Output**:
+```python
+{
+    "predicted_value": -24.5,
+    "prediction_time": "2024-12-10T02:00:00+00:00"
+}
+```
+
+### Handling Dependencies
+
+If your custom model requires external libraries (e.g., `pytorch`, `scikit-learn`), ensure they are included in your environment.
+
+You can update your `requirements.txt` file with any additional dependencies.
 
