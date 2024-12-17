@@ -20,6 +20,7 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import (
     SoilMoisturePrediction,
 )
 from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMetadata
+from gaia.tasks.defined_tasks.soilmoisture.utils.model_manager import ModelManager
 from pydantic import Field
 from fiber.logging_utils import get_logger
 from uuid import uuid4
@@ -186,7 +187,7 @@ class SoilMoistureTask(Task):
 
     validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None # type: ignore
     miner_preprocessing: Optional["SoilMinerPreprocessing"] = None
-    model: Optional[SoilModel] = None
+    model_manager: Optional[ModelManager] = None
     db_manager: Any = Field(default=None)
     node_type: str = Field(default="miner")
     test_mode: bool = Field(default=False)
@@ -213,21 +214,17 @@ class SoilMoistureTask(Task):
             self.validator_preprocessing = SoilValidatorPreprocessing()
         else:
             self.miner_preprocessing = SoilMinerPreprocessing(task=self)
+            self.model_manager = ModelManager()
+            
+            try:
+                self.model_manager.initialize_model()
+                self.use_raw_preprocessing = self.model_manager.get_model_type() == "custom"
+                logger.info(f"Initialized {self.model_manager.get_model_type()} soil model")
+            except Exception as e:
+                logger.error(f"Error initializing model: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise RuntimeError(f"Failed to initialize model: {str(e)}")
 
-            custom_model_path = "gaia/models/custom_models/custom_soil_model.py"
-            if os.path.exists(custom_model_path):
-                import importlib.util
-                spec = importlib.util.spec_from_file_location("custom_soil_model", custom_model_path)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                self.model = module.CustomSoilModel()
-                self.use_raw_preprocessing = True
-                logger.info("Initialized custom soil model")
-            else:
-                self.model = self.miner_preprocessing.model
-                self.use_raw_preprocessing = False
-                logger.info("Initialized base soil model")
-                
             logger.info("Initialized miner components for SoilMoistureTask")
 
         self._prepared_regions = {}
@@ -734,7 +731,9 @@ class SoilMoistureTask(Task):
                         "target_time": metadata["target_time"],
                         "surface_sm": response_data.get("surface_sm", []),
                         "rootzone_sm": response_data.get("rootzone_sm", []),
-                        "uncertainty_surface": response_data.get("uncertainty_surface"),
+                        "uncertainty_surface": response_data.get(
+                            "uncertainty_surface"
+                        ),
                         "uncertainty_rootzone": response_data.get(
                             "uncertainty_rootzone"
                         ),
@@ -878,20 +877,34 @@ class SoilMoistureTask(Task):
                 if scored_tasks:
                     current_time = datetime.now(timezone.utc)
                     try:
-                        # Move tasks to history using Prefect task
+                        # Create task group for scoring operations
+                        history_futures = []
+                        score_row_futures = []
+                        cleanup_futures = []
+
+                        # Submit history tasks first
                         for task in scored_tasks:
-                            await self.move_task_to_history_task.submit(
+                            future = await self.move_task_to_history_task.submit(
                                 region=task,
                                 predictions=task["predictions"],
                                 ground_truth=task["score"].get("ground_truth"),
                                 scores=task["score"]
                             )
+                            history_futures.append(future)
 
-                        # Build and store score rows using Prefect task
-                        score_rows = await self.build_score_row_task.submit(
+                        # Wait for history tasks to complete
+                        await asyncio.gather(*history_futures)
+
+                        # Submit score row task
+                        score_row_future = await self.build_score_row_task.submit(
                             target_time=target_time,
                             recent_tasks=scored_tasks
                         )
+                        score_row_futures.append(score_row_future)
+
+                        # Wait for score row task to complete
+                        score_rows = await asyncio.gather(*score_row_futures)
+                        score_rows = score_rows[0]  # Unpack single result
                         
                         if score_rows:
                             query = """
@@ -902,8 +915,21 @@ class SoilMoistureTask(Task):
                                 await self.db_manager.execute(query, row)
                             logger.info(f"Stored global scores for timestamp {target_time}")
 
-                        # Cleanup using Prefect task
+                        # Submit cleanup tasks only after history and scoring are complete
+                        for task in scored_tasks:
+                            cleanup_future = await self.cleanup_predictions_task.submit(
+                                bounds=task["sentinel_bounds"],
+                                target_time=task["target_time"],
+                                miner_uid=task["predictions"][0]["miner_id"]
+                            )
+                            cleanup_futures.append(cleanup_future)
+
+                        # Wait for all cleanup tasks
+                        await asyncio.gather(*cleanup_futures)
+
+                        # Finally, cleanup SMAP files
                         await self.cleanup_smap_files_task.submit()
+
                     except Exception as e:
                         logger.error(f"Error processing scored tasks: {str(e)}")
                         logger.error(traceback.format_exc())
@@ -1135,12 +1161,21 @@ class SoilMoistureTask(Task):
 
     def run_model_inference(self, processed_data):
         """Run model inference on processed data."""
-        if not self.model:
+        if not self.model_manager:
             raise RuntimeError(
-                "Model not initialized. Are you running on a miner node?"
+                "Model manager not initialized. Are you running on a miner node?"
             )
 
-        return self.miner_preprocessing.predict_smap(processed_data, self.model)
+        model = self.model_manager.get_model()
+        if not model:
+            raise RuntimeError("No model available for inference")
+
+        if self.use_raw_preprocessing:
+            # Custom model handles its own preprocessing
+            return model.run_inference(processed_data)
+        else:
+            # Use base model preprocessing
+            return self.miner_preprocessing.predict_smap(processed_data, model)
 
     def get_ifs_time_for_smap(self, smap_time: datetime) -> datetime:
         """Get corresponding IFS forecast time for SMAP target time."""
@@ -1277,19 +1312,34 @@ class SoilMoistureTask(Task):
         flow_logger = get_run_logger()
         flow_logger.info("Starting validator execution task")
         
-        # Initialize task state
-        task_state = {
-            'current_step': None,
-            'last_successful_step': None,
-            'retry_count': defaultdict(int),
-            'errors': defaultdict(list),
-            'processed_regions': set(),
-            'failed_regions': set()
-        }
+        # Generate unique task ID for this execution
+        task_id = f"soil_moisture_task_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{str(uuid4())[:8]}"
+        
+        # Try to recover existing state
+        task_state = None
+        if self.state_manager:
+            task_state = await self.state_manager.get_task_state(task_id)
+        
+        # Initialize new state if none exists
+        if not task_state:
+            task_state = {
+                'task_id': task_id,
+                'current_step': None,
+                'last_successful_step': None,
+                'retry_count': defaultdict(int),
+                'errors': defaultdict(list),
+                'processed_regions': set(),
+                'failed_regions': set(),
+                'start_time': datetime.now(timezone.utc).isoformat()
+            }
         
         try:
             current_time = datetime.now(timezone.utc)
             task_state['current_step'] = 'initialization'
+            
+            # Persist initial state
+            if self.state_manager:
+                await self.state_manager.save_task_state(task_id, task_state)
             
             # Check if we need to score any pending predictions
             if current_time.minute % 1 == 0:
@@ -1297,9 +1347,14 @@ class SoilMoistureTask(Task):
                 try:
                     await self.validator_score()
                     task_state['last_successful_step'] = 'scoring'
+                    if self.state_manager:
+                        await self.state_manager.save_task_state(task_id, task_state)
                 except Exception as e:
                     task_state['errors']['scoring'].append(str(e))
+                    task_state['retry_count']['scoring'] += 1
                     flow_logger.error(f"Error in scoring step: {str(e)}")
+                    if self.state_manager:
+                        await self.state_manager.save_task_state(task_id, task_state)
                     # Continue execution as scoring errors are non-fatal
 
             # Handle test mode execution
@@ -1309,31 +1364,62 @@ class SoilMoistureTask(Task):
                 ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
                 
                 task_state['current_step'] = 'test_mode_execution'
+                if self.state_manager:
+                    await self.state_manager.save_task_state(task_id, task_state)
                 
                 # Get daily regions with circuit breaker and state tracking
                 circuit_state = await self._check_circuit_state("sentinel_api")
                 if not circuit_state['is_closed']:
                     task_state['errors']['sentinel_api'].append("Circuit breaker open")
+                    if self.state_manager:
+                        await self.state_manager.save_task_state(task_id, task_state)
                     raise DataFetchError(
                         f"Circuit breaker open for sentinel_api until {circuit_state['next_attempt']}",
                         is_recoverable=False
                     )
                 
                 try:
-                    regions = await self.get_daily_regions(
-                        target_time=target_smap_time,
-                        ifs_forecast_time=ifs_forecast_time
-                    )
+                    # Check if we already have regions from a previous attempt
+                    regions = None
+                    if task_state.get('cached_regions'):
+                        regions = task_state['cached_regions']
+                        flow_logger.info("Recovered regions from previous state")
+                    else:
+                        regions = await self.get_daily_regions(
+                            target_time=target_smap_time,
+                            ifs_forecast_time=ifs_forecast_time
+                        )
+                        task_state['cached_regions'] = regions
+                        
                     await self._close_circuit("sentinel_api")
                     task_state['last_successful_step'] = 'get_daily_regions'
+                    if self.state_manager:
+                        await self.state_manager.save_task_state(task_id, task_state)
+                        
                 except Exception as e:
                     await self._record_failure("sentinel_api")
                     task_state['errors']['get_daily_regions'].append(str(e))
+                    task_state['retry_count']['get_daily_regions'] += 1
+                    if self.state_manager:
+                        await self.state_manager.save_task_state(task_id, task_state)
                     raise DataFetchError(f"Error getting daily regions: {str(e)}")
 
                 if regions:
                     for region in regions:
+                        # Skip already processed regions
+                        if region['id'] in task_state['processed_regions']:
+                            flow_logger.info(f"Skipping already processed region {region['id']}")
+                            continue
+                            
+                        # Skip failed regions that exceeded retry limit
+                        if region['id'] in task_state['failed_regions'] and task_state['retry_count'].get(f"region_{region['id']}", 0) >= 3:
+                            flow_logger.info(f"Skipping failed region {region['id']} (exceeded retry limit)")
+                            continue
+                            
                         task_state['current_step'] = f"processing_region_{region['id']}"
+                        if self.state_manager:
+                            await self.state_manager.save_task_state(task_id, task_state)
+                            
                         try:
                             result = await self.process_region(
                                 region=region,
@@ -1345,18 +1431,29 @@ class SoilMoistureTask(Task):
                             if result:
                                 task_state['processed_regions'].add(region['id'])
                                 task_state['last_successful_step'] = f"processed_region_{region['id']}"
+                                if self.state_manager:
+                                    await self.state_manager.save_task_state(task_id, task_state)
                         except Exception as e:
                             task_state['failed_regions'].add(region['id'])
                             task_state['errors'][f"region_{region['id']}"].append(str(e))
+                            task_state['retry_count'][f"region_{region['id']}"] += 1
                             flow_logger.error(f"Error processing region {region['id']}: {str(e)}")
+                            if self.state_manager:
+                                await self.state_manager.save_task_state(task_id, task_state)
                             continue
                             
                 flow_logger.info("Test mode execution complete. Disabling test mode.")
                 self.test_mode = False
+                task_state['current_step'] = 'completed'
+                if self.state_manager:
+                    await self.state_manager.save_task_state(task_id, task_state)
                 return task_state
-                
+
             # Normal execution mode
             task_state['current_step'] = 'normal_execution'
+            if self.state_manager:
+                await self.state_manager.save_task_state(task_id, task_state)
+                
             windows = self.get_validator_windows()
             current_window = next(
                 (w for w in windows if self.is_in_window(current_time, w)), None
@@ -1366,6 +1463,8 @@ class SoilMoistureTask(Task):
                 flow_logger.info(f"Not in any preparation or execution window: {current_time}")
                 flow_logger.info(f"Next soil task time: {self.get_next_preparation_time(current_time)}")
                 task_state['last_successful_step'] = 'window_check'
+                if self.state_manager:
+                    await self.state_manager.save_task_state(task_id, task_state)
                 return task_state
 
             is_prep = current_window[1] == 30  # If minutes = 30, it's a prep window
@@ -1374,29 +1473,50 @@ class SoilMoistureTask(Task):
 
             if is_prep:
                 task_state['current_step'] = 'preparation_window'
+                if self.state_manager:
+                    await self.state_manager.save_task_state(task_id, task_state)
+                    
                 # Preparation window with circuit breaker and state tracking
                 circuit_state = await self._check_circuit_state("sentinel_api")
                 if not circuit_state['is_closed']:
                     task_state['errors']['sentinel_api'].append("Circuit breaker open")
+                    if self.state_manager:
+                        await self.state_manager.save_task_state(task_id, task_state)
                     raise DataFetchError(
                         f"Circuit breaker open for sentinel_api until {circuit_state['next_attempt']}",
                         is_recoverable=False
                     )
                 
                 try:
-                    await self.get_daily_regions(
-                        target_time=target_smap_time,
-                        ifs_forecast_time=ifs_forecast_time
-                    )
+                    # Check if we already have regions from a previous attempt
+                    regions = None
+                    if task_state.get('cached_regions'):
+                        regions = task_state['cached_regions']
+                        flow_logger.info("Recovered regions from previous state")
+                    else:
+                        regions = await self.get_daily_regions(
+                            target_time=target_smap_time,
+                            ifs_forecast_time=ifs_forecast_time
+                        )
+                        task_state['cached_regions'] = regions
+                        
                     await self._close_circuit("sentinel_api")
                     task_state['last_successful_step'] = 'preparation_complete'
+                    if self.state_manager:
+                        await self.state_manager.save_task_state(task_id, task_state)
                 except Exception as e:
                     await self._record_failure("sentinel_api")
                     task_state['errors']['preparation'].append(str(e))
+                    task_state['retry_count']['preparation'] += 1
+                    if self.state_manager:
+                        await self.state_manager.save_task_state(task_id, task_state)
                     raise DataFetchError(f"Error in preparation window: {str(e)}")
                     
             else:
                 task_state['current_step'] = 'execution_window'
+                if self.state_manager:
+                    await self.state_manager.save_task_state(task_id, task_state)
+                    
                 # Execution window with state tracking
                 try:
                     regions = await self.db_manager.fetch_many(
@@ -1410,7 +1530,20 @@ class SoilMoistureTask(Task):
                     
                     if regions:
                         for region in regions:
+                            # Skip already processed regions
+                            if region['id'] in task_state['processed_regions']:
+                                flow_logger.info(f"Skipping already processed region {region['id']}")
+                                continue
+                                
+                            # Skip failed regions that exceeded retry limit
+                            if region['id'] in task_state['failed_regions'] and task_state['retry_count'].get(f"region_{region['id']}", 0) >= 3:
+                                flow_logger.info(f"Skipping failed region {region['id']} (exceeded retry limit)")
+                                continue
+                                
                             task_state['current_step'] = f"processing_region_{region['id']}"
+                            if self.state_manager:
+                                await self.state_manager.save_task_state(task_id, task_state)
+                                
                             try:
                                 result = await self.process_region(
                                     region=region,
@@ -1422,22 +1555,243 @@ class SoilMoistureTask(Task):
                                 if result:
                                     task_state['processed_regions'].add(region['id'])
                                     task_state['last_successful_step'] = f"processed_region_{region['id']}"
+                                    if self.state_manager:
+                                        await self.state_manager.save_task_state(task_id, task_state)
                             except Exception as e:
                                 task_state['failed_regions'].add(region['id'])
                                 task_state['errors'][f"region_{region['id']}"].append(str(e))
+                                task_state['retry_count'][f"region_{region['id']}"] += 1
                                 flow_logger.error(f"Error processing region {region['id']}: {str(e)}")
+                                if self.state_manager:
+                                    await self.state_manager.save_task_state(task_id, task_state)
                                 continue
                                 
                 except Exception as e:
                     task_state['errors']['execution'].append(str(e))
+                    if self.state_manager:
+                        await self.state_manager.save_task_state(task_id, task_state)
                     raise MinerQueryError(f"Error in execution window: {str(e)}")
 
             # Log final task state
             flow_logger.info(f"Task completed with state: {task_state}")
+            task_state['current_step'] = 'completed'
+            if self.state_manager:
+                await self.state_manager.save_task_state(task_id, task_state)
             return task_state
 
         except Exception as e:
             task_state['errors']['fatal'].append(str(e))
+            task_state['current_step'] = 'failed'
+            if self.state_manager:
+                await self.state_manager.save_task_state(task_id, task_state)
             flow_logger.error(f"Fatal error in validator execution: {str(e)}")
             flow_logger.error(traceback.format_exc())
+            raise
+
+    @task(
+        name="get_daily_regions_task",
+        retries=3,
+        retry_delay_seconds=lambda x: 60 * (2 ** x),
+        retry_jitter_factor=0.2,
+        tags=["external_service"],
+        description="Fetch and prepare daily regions for soil moisture prediction"
+    )
+    async def get_daily_regions(
+        self,
+        target_time: datetime,
+        ifs_forecast_time: datetime
+    ) -> List[Dict[str, Any]]:
+        """Fetch and prepare daily regions for soil moisture prediction."""
+        circuit_state = await self._check_circuit_state("sentinel_api")
+        if not circuit_state['is_closed']:
+            raise DataFetchError(
+                f"Circuit breaker open for sentinel_api until {circuit_state['next_attempt']}",
+                is_recoverable=False
+            )
+        
+        try:
+            logger.info(f"Getting daily regions for target time: {target_time}")
+            regions = await self.validator_preprocessing.get_daily_regions(
+                target_time=target_time,
+                ifs_forecast_time=ifs_forecast_time
+            )
+            
+            await self._close_circuit("sentinel_api")
+            return regions
+            
+        except Exception as e:
+            await self._record_failure("sentinel_api")
+            raise DataFetchError(f"Error getting daily regions: {str(e)}")
+
+    @task(
+        name="process_region_task",
+        retries=3,
+        retry_delay_seconds=lambda x: 30 * (2 ** x),
+        retry_jitter_factor=0.1,
+        tags=["data_processing"],
+        description="Process a single region and prepare it for miners"
+    )
+    async def process_region(
+        self,
+        region: Dict[str, Any],
+        target_time: datetime,
+        ifs_forecast_time: datetime,
+        current_time: datetime,
+        validator: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Process a single region and prepare it for miners."""
+        try:
+            if "combined_data" not in region:
+                logger.error(f"Region {region['id']} missing combined_data field")
+                return None
+
+            if not region["combined_data"]:
+                logger.error(f"Region {region['id']} has null combined_data")
+                return None
+
+            combined_data = region["combined_data"]
+            if not isinstance(combined_data, bytes):
+                logger.error(f"Region {region['id']} has invalid data type: {type(combined_data)}")
+                return None
+
+            if not (
+                combined_data.startswith(b"II\x2A\x00")
+                or combined_data.startswith(b"MM\x00\x2A")
+            ):
+                logger.error(f"Region {region['id']} has invalid TIFF header")
+                logger.error(f"First 16 bytes: {combined_data[:16].hex()}")
+                return None
+
+            logger.info(f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB")
+            logger.info(f"Region {region['id']} TIFF header: {combined_data[:4]}")
+            logger.info(f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}")
+            
+            encoded_data = base64.b64encode(combined_data)
+            logger.info(f"Base64 first 16 chars: {encoded_data[:16]}")
+
+            task_data = {
+                "region_id": region["id"],
+                "combined_data": encoded_data.decode("ascii"),
+                "sentinel_bounds": region["sentinel_bounds"],
+                "sentinel_crs": region["sentinel_crs"],
+                "target_time": target_time.isoformat(),
+            }
+
+            payload = {"nonce": str(uuid4()), "data": task_data}
+
+            logger.info(f"Sending region {region['id']} to miners...")
+            responses = await validator.query_miners(
+                payload=payload, endpoint="/soilmoisture-request"
+            )
+
+            if responses:
+                metadata = {
+                    "region_id": region["id"],
+                    "target_time": target_time,
+                    "data_collection_time": current_time,
+                    "ifs_forecast_time": ifs_forecast_time,
+                }
+                await self.add_task_to_queue.submit(responses, metadata)
+
+                await self.db_manager.execute(
+                    """
+                    UPDATE soil_moisture_regions 
+                    SET status = 'sent_to_miners'
+                    WHERE id = :region_id
+                    """,
+                    {"region_id": region["id"]},
+                )
+                
+                return {
+                    "region_id": region["id"],
+                    "responses": responses,
+                    "metadata": metadata
+                }
+
+        except Exception as e:
+            logger.error(f"Error processing region: {str(e)}")
+            logger.error(traceback.format_exc())
+            return None
+
+    @task(
+        name="add_task_to_queue_task",
+        retries=3,
+        retry_delay_seconds=60,
+        tags=["database"],
+        description="Add processed miner responses to the task queue"
+    )
+    async def add_task_to_queue(
+        self,
+        responses: Dict[str, Any],
+        metadata: Dict[str, Any]
+    ) -> None:
+        """Add processed miner responses to the task queue."""
+        try:
+            if not self.db_manager:
+                raise RuntimeError("Database manager not initialized")
+
+            region_update = """
+            UPDATE soil_moisture_regions 
+            SET status = 'sent_to_miners' 
+            WHERE id = :region_id
+            """
+            await self.db_manager.execute(region_update, {"region_id": metadata["region_id"]})
+
+            for miner_hotkey, response_data in responses.items():
+                try:
+                    # Get miner UID from hotkey
+                    query = "SELECT uid FROM node_table WHERE hotkey = :miner_hotkey"
+                    result = await self.db_manager.fetch_one(
+                        query, {"miner_hotkey": miner_hotkey}
+                    )
+
+                    if not result:
+                        logger.warning(f"No UID found for hotkey {miner_hotkey}")
+                        continue
+
+                    miner_uid = str(result["uid"])
+
+                    if isinstance(response_data, dict) and "text" in response_data:
+                        try:
+                            response_data = json.loads(response_data["text"])
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse response text for {miner_hotkey}: {e}")
+                            continue
+
+                    prediction_data = {
+                        "region_id": metadata["region_id"],
+                        "miner_uid": miner_uid,
+                        "miner_hotkey": miner_hotkey,
+                        "target_time": metadata["target_time"],
+                        "surface_sm": response_data.get("surface_sm", []),
+                        "rootzone_sm": response_data.get("rootzone_sm", []),
+                        "uncertainty_surface": response_data.get("uncertainty_surface"),
+                        "uncertainty_rootzone": response_data.get("uncertainty_rootzone"),
+                        "sentinel_bounds": response_data.get("sentinel_bounds", metadata.get("sentinel_bounds")),
+                        "sentinel_crs": response_data.get("sentinel_crs", metadata.get("sentinel_crs")),
+                        "status": "sent_to_miner",
+                    }
+
+                    await self.db_manager.execute(
+                        """
+                        INSERT INTO soil_moisture_predictions 
+                        (region_id, miner_uid, miner_hotkey, target_time, surface_sm, rootzone_sm, 
+                        uncertainty_surface, uncertainty_rootzone, sentinel_bounds, 
+                        sentinel_crs, status)
+                        VALUES 
+                        (:region_id, :miner_uid, :miner_hotkey, :target_time, 
+                        :surface_sm, :rootzone_sm,
+                        :uncertainty_surface, :uncertainty_rootzone, :sentinel_bounds,
+                        :sentinel_crs, :status)
+                        """,
+                        prediction_data,
+                    )
+
+                except Exception as e:
+                    logger.error(f"Error processing response from {miner_hotkey}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error in add_task_to_queue: {e}")
+            logger.error(traceback.format_exc())
             raise

@@ -22,12 +22,17 @@ import requests
 import boto3
 from botocore.config import Config
 from botocore.client import UNSIGNED
+from fiber.logging_utils import get_logger
+
 
 load_dotenv()
 EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
 EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 
+logger = get_logger(__name__)
+
 EARTHDATA_AUTH = BasicAuth(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
+
 
 class SessionWithHeaderRedirection(requests.Session):
     AUTH_HOST = 'urs.earthdata.nasa.gov'

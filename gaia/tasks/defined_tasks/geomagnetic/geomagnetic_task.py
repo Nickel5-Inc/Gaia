@@ -2,7 +2,7 @@ import os
 import asyncio
 import traceback
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Union, Type
 import numpy as np
 import pandas as pd
 from uuid import uuid4
@@ -31,6 +31,7 @@ from gaia.tasks.defined_tasks.geomagnetic.validation import (
     validate_batch_predictions,
     validate_batch_scores
 )
+import torch
 
 
 logger = get_logger(__name__)
@@ -99,6 +100,114 @@ class ScoringError(OperationError):
         super().__init__(message, "scoring", is_recoverable)
 
 
+class GeomagneticModelManager:
+    """Manages model loading, validation, and state persistence for geomagnetic models."""
+    
+    def __init__(self, cache_dir: Optional[str] = None):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.cache_dir = cache_dir or "tasks/defined_tasks/geomagnetic/"
+        self.model: Optional[Any] = None
+        self.model_type: str = "base"
+        
+    def validate_custom_model(self, model_class: Type) -> bool:
+        """Validate that custom model implements required interface."""
+        try:
+            required_methods = ['run_inference']
+            
+            for method in required_methods:
+                if not hasattr(model_class, method):
+                    logger.error(f"Custom model missing required method: {method}")
+                    return False
+                    
+            # Validate initialization
+            model_instance = model_class()
+            if not hasattr(model_instance, '_load_model'):
+                logger.warning("Custom model missing recommended _load_model method")
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating custom model: {str(e)}")
+            return False
+            
+    def load_base_model(self) -> Optional[GeoMagBaseModel]:
+        """Load the base GeoMagBaseModel."""
+        try:
+            model = GeoMagBaseModel()
+            model.to(self.device)
+            model.eval()
+            
+            param_count = sum(p.numel() for p in model.parameters())
+            logger.info(f"Base model loaded successfully with {param_count:,} parameters")
+            
+            return model
+            
+        except Exception as e:
+            logger.error(f"Error loading base model: {str(e)}")
+            logger.error(traceback.format_exc())
+            return None
+            
+    def load_custom_model(self) -> Optional[Any]:
+        """Load custom model if available."""
+        try:
+            custom_model_path = "gaia/models/custom_models/custom_geomagnetic_model.py"
+            
+            if not os.path.exists(custom_model_path):
+                logger.info("No custom model found")
+                return None
+                
+            spec = importlib.util.spec_from_file_location(
+                "custom_geomagnetic_model", 
+                custom_model_path
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            
+            if not hasattr(module, 'CustomGeomagneticModel'):
+                logger.error("Custom model file missing CustomGeomagneticModel class")
+                return None
+                
+            model_class = getattr(module, 'CustomGeomagneticModel')
+            
+            if not self.validate_custom_model(model_class):
+                logger.error("Custom model validation failed")
+                return None
+                
+            model = model_class()
+            logger.info("Custom model loaded successfully")
+            return model
+            
+        except Exception as e:
+            logger.error(f"Error loading custom model: {str(e)}")
+            logger.error(traceback.format_exc())
+            return None
+            
+    def initialize_model(self) -> None:
+        """Initialize either custom or base model."""
+        self.model = self.load_custom_model()
+        
+        if self.model is not None:
+            self.model_type = "custom"
+            logger.info("Using custom geomagnetic model")
+        else:
+            self.model = self.load_base_model()
+            if self.model is not None:
+                self.model_type = "base"
+                logger.info("Using base geomagnetic model")
+            else:
+                raise RuntimeError("Failed to load either custom or base model")
+                
+    def get_model(self) -> Any:
+        """Get the current model instance."""
+        if self.model is None:
+            self.initialize_model()
+        return self.model
+        
+    def get_model_type(self) -> str:
+        """Get the type of currently loaded model."""
+        return self.model_type
+
+
 class GeomagneticTask(Task):
     """
     A task class for processing and analyzing geomagnetic data, with
@@ -121,9 +230,8 @@ class GeomagneticTask(Task):
         default_factory=GeomagneticPreprocessing,
         description="Preprocessing component for miner",
     )
-    model: GeoMagBaseModel = Field(
-        default_factory=GeoMagBaseModel, description="The geomagnetic prediction model"
-    )
+    model_manager: Optional[GeomagneticModelManager] = None
+    model: Optional[Any] = None
 
     # Set task-specific schedule
     default_schedule = "0 * * * *"  # Run at the start of every hour
@@ -142,24 +250,17 @@ class GeomagneticTask(Task):
         if db_manager:
             self.db_manager = db_manager
 
-        # Try to load custom model first
+        # Initialize model manager and load model
         try:
-            custom_model_path = "gaia/models/custom_models/custom_geomagnetic_model.py"
-            if os.path.exists(custom_model_path):
-                spec = importlib.util.spec_from_file_location(
-                    "custom_geomagnetic_model", custom_model_path
-                )
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                self.model = module.CustomGeomagneticModel()
-                logger.info("Successfully loaded custom geomagnetic model")
-            else:
-                # Fall back to base model
-                self.model = GeoMagBaseModel()
-                logger.info("No custom model found, using base model")
+            self.model_manager = GeomagneticModelManager()
+            self.model_manager.initialize_model()
+            self.model = self.model_manager.get_model()
+            logger.info(f"Initialized {self.model_manager.get_model_type()} geomagnetic model")
         except Exception as e:
-            logger.warning(f"Error loading custom model: {e}, falling back to base model")
-            self.model = GeoMagBaseModel()
+            logger.error(f"Error initializing model: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise RuntimeError(f"Failed to initialize model: {str(e)}")
+
         # Initialize circuit breakers for critical services
         self.circuit_breakers = {
             'geomag_api': CircuitBreakerState(),
@@ -838,64 +939,45 @@ class GeomagneticTask(Task):
             dict: Prediction results formatted as per requirements.
         """
         try:
-            # Extract and validate data from the request payload
-            if data and data.get("data"):
-                # Process current data
-                input_data = pd.DataFrame(
-                    {
-                        "timestamp": [pd.to_datetime(data["data"]["timestamp"])],
-                        "value": [float(data["data"]["value"])],
-                    }
-                )
+            # Process input data
+            processed_data = self.miner_preprocess(data["data"])
+            if processed_data is None:
+                raise ValueError("Failed to preprocess input data")
 
-                # Check and process historical data if available
-                if data["data"].get("historical_values"):
-                    historical_df = pd.DataFrame(data["data"]["historical_values"])
-                    historical_df = historical_df.rename(
-                        columns={"Dst": "value"}
-                    )  # Rename Dst to value
-                    historical_df["timestamp"] = pd.to_datetime(
-                        historical_df["timestamp"]
-                    )
-                    historical_df = historical_df[
-                        ["timestamp", "value"]
-                    ]  # Ensure correct columns
-                    combined_df = pd.concat(
-                        [historical_df, input_data], ignore_index=True
-                    )
+            # Run model inference with proper error handling
+            try:
+                if self.model_manager.get_model_type() == "custom":
+                    logger.info("Using custom geomagnetic model for inference")
+                    predictions = self.model.run_inference(processed_data)
                 else:
-                    combined_df = input_data
+                    logger.info("Using base geomagnetic model for inference")
+                    raw_prediction = self.run_model_inference(processed_data)
+                    predictions = {
+                        "predicted_value": float(raw_prediction),
+                        "prediction_time": data["data"]["timestamp"]
+                    }
 
-                # Preprocess combined data
-                processed_data = self.miner_preprocessing.process_miner_data(combined_df)
-            else:
-                logger.error("No data provided in request")
-                return None
+                # Validate predictions
+                if not isinstance(predictions.get("predicted_value"), (int, float)):
+                    raise ValueError("Model did not return a valid numeric prediction")
 
-            # Run model inference: Check for custom model first
-            if hasattr(self.model, "run_inference"):
-                logger.info("Using custom geomagnetic model for inference.")
-                predictions = self.model.run_inference(processed_data)
-            else:
-                logger.info("Using base geomagnetic model for inference.")
-                raw_prediction = self.run_model_inference(processed_data)
-                predictions = {
-                    "predicted_value": float(raw_prediction),
-                    "prediction_time": data["data"]["timestamp"]
+                # Format response
+                return {
+                    "predicted_values": float(predictions.get("predicted_value", 0.0)),
+                    "timestamp": predictions.get("prediction_time", data["data"]["timestamp"]),
+                    "miner_hotkey": miner.keypair.ss58_address,
                 }
 
-            # Format response as per MINER.md requirements
-            return {
-                "predicted_values": float(predictions.get("predicted_value", 0.0)),
-                "timestamp": predictions.get("prediction_time", data["data"]["timestamp"]),
-                "miner_hotkey": miner.keypair.ss58_address,
-            }
+            except Exception as e:
+                logger.error(f"Model inference failed: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise
 
         except Exception as e:
             logger.error(f"Error in miner execution: {str(e)}")
             logger.error(traceback.format_exc())
-            # Fix datetime usage
-            current_time = datetime.datetime.now(datetime.timezone.utc)
+            # Return safe fallback response
+            current_time = datetime.now(timezone.utc)
             return {
                 "predicted_values": "N/A",
                 "timestamp": current_time.isoformat(),
