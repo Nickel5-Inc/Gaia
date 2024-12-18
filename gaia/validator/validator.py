@@ -3,6 +3,7 @@ import os
 
 os.environ["NODE_TYPE"] = "validator"
 import asyncio
+import configparser
 import ssl
 import traceback
 from typing import Any, Optional, List, Dict
@@ -24,6 +25,8 @@ from gaia.validator.weights.set_weights import FiberWeightSetter
 import base64
 import math
 from gaia.validator.utils.auto_updater import perform_update
+from gaia.APIcalls.miner_score_sender import MinerScoreSender
+from gaia.APIcalls.website_api import GaiaCommunicator
 
 logger = get_logger(__name__)
 
@@ -47,7 +50,8 @@ class GaiaValidator:
         self.last_set_weights_block = 0
         self.current_block = 0
         self.nodes = {}  # Initialize the in-memory node table state
-
+        self.miner_score_sender = MinerScoreSender(database_manager=self.database_manager)
+        self.gaia_communicator = GaiaCommunicator()
         self.httpx_client = httpx.AsyncClient(
             timeout=30.0,
             follow_redirects=True,
@@ -258,6 +262,9 @@ class GaiaValidator:
         await self.update_miner_table()
         logger.info("Miner table updated.")
 
+        logger.info("Sending validator version to Gaia API...")
+        await self.get_and_send_version()
+
         while True:
             try:
                 workers = [
@@ -267,6 +274,8 @@ class GaiaValidator:
                     asyncio.create_task(self.main_scoring()),
                     asyncio.create_task(self.handle_miner_deregistration_loop()),
                     asyncio.create_task(self.check_for_updates()),
+                    asyncio.create_task(self.send_geomagnetic_scores()),
+                    asyncio.create_task(self.send_soil_scores()),
                 ]
 
                 await asyncio.gather(*workers, return_exceptions=True)
@@ -613,6 +622,46 @@ class GaiaValidator:
                 logger.error(traceback.format_exc())
             finally:
                 await asyncio.sleep(60)
+
+    async def send_geomagnetic_scores(self):
+        """Send geomagnetic scores to Gaia API periodically."""
+        while True:
+            try:
+                logger.info("Starting geomagnetic score sending...")
+                await self.miner_score_sender.send_geomagnetic_scores_to_gaia()
+                logger.info("Geomagnetic scores sent successfully.")
+            except Exception as e:
+                logger.error(f"Error sending geomagnetic scores: {e}")
+            finally:
+                await asyncio.sleep(3600)
+
+    async def send_soil_scores(self):
+        """Send soil moisture scores to Gaia API periodically."""
+        while True:
+            try:
+                logger.info("Starting soil moisture score sending...")
+                await self.miner_score_sender.send_soil_scores_to_gaia()
+                logger.info("Soil moisture scores sent successfully.")
+            except Exception as e:
+                logger.error(f"Error sending soil moisture scores: {e}")
+            finally:
+                await asyncio.sleep(3600)
+
+    async def get_and_send_version(self):
+        """Send the validator's version to Gaia API."""
+        try:
+            version_file = os.path.join(os.path.dirname(__file__), "setup.cfg")
+            config = configparser.ConfigParser()
+            config.read(version_file)
+
+            version = config.get("metadata", "version", fallback="Unknown")
+            data_to_send = {"version": version}
+
+            logger.info(f"Sending version {version} to Gaia API.")
+            self.gaia_communicator.send_data(data=data_to_send)
+            logger.info("Version sent successfully.")
+        except Exception as e:
+            logger.error(f"Error sending version to Gaia API: {e}")
 
 
 if __name__ == "__main__":

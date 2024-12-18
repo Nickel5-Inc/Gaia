@@ -403,3 +403,46 @@ class SoilScoringMechanism(ScoringMechanism):
         finally:
             if conn and not isinstance(conn, AsyncSession):
                 await conn.close()
+
+    def prepare_soil_history_records(self, miner_id: str, miner_hotkey: str, metrics: Dict, target_time: datetime) -> Dict[str, Any]:
+        """
+        Prepare data for insertion into the soil_moisture_history table.
+
+        Args:
+            miner_id (str): Unique identifier for the miner.
+            miner_hotkey (str): Hotkey associated with the miner.
+            metrics (Dict): Validation metrics including RMSE and SSIM.
+            target_time (datetime): Target time of the prediction.
+
+        Returns:
+            Dict[str, Any]: Record formatted for soil_moisture_history table.
+        """
+        try:
+            surface_rmse = metrics["validation_metrics"].get("surface_rmse")
+            rootzone_rmse = metrics["validation_metrics"].get("rootzone_rmse")
+            surface_ssim = metrics["validation_metrics"].get("surface_ssim", 0)
+            rootzone_ssim = metrics["validation_metrics"].get("rootzone_ssim", 0)
+
+            if not all(isinstance(x, (int, float)) for x in [surface_rmse, rootzone_rmse]):
+                logger.error("RMSE values must be numeric and not None")
+                return None
+
+            if not all(-1 <= x <= 1 for x in [surface_ssim, rootzone_ssim]):
+                logger.error("SSIM values must be in the range [-1, 1]")
+                return None
+
+            record = {
+                "miner_id": miner_id,
+                "miner_hotkey": miner_hotkey,
+                "surface_rmse": surface_rmse,
+                "rootzone_rmse": rootzone_rmse,
+                "surface_structure_score": surface_ssim,
+                "rootzone_structure_score": rootzone_ssim,
+                "scored_at": target_time,
+            }
+            return record
+
+        except Exception as e:
+            logger.error(f"Error preparing soil history record: {str(e)}")
+            return None
+
