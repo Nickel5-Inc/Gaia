@@ -114,7 +114,9 @@ class FiberWeightSetter:
 
             logger.info(f"\nAttempting to set weights for subnet {self.netuid}...")
             
-            if not self.is_time_to_set_weights():
+            blocks_since_last = self.current_block - self.last_set_block if self.last_set_block else 999999
+            if blocks_since_last < 300:
+                logger.info(f"Too soon to set weights. {300 - blocks_since_last} blocks remaining")
                 return False
 
             nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
@@ -127,25 +129,31 @@ class FiberWeightSetter:
                 logger.error("❗Failed to get validator UID")
                 return False
 
-            calculated_weights = self.calculate_weights(len(nodes), weights)
-            if calculated_weights is None:
-                logger.info("No valid weights to set")
-                return False
-
             node_ids = [node.node_id for node in nodes]
-            logger.info("Setting weights on chain...")
+
+            rpc_call = self.substrate.compose_call(
+                call_module="SubtensorModule",
+                call_function="set_weights",
+                call_params={
+                    "dests": node_ids,
+                    "weights": weights,
+                    "netuid": self.netuid,
+                    "version_key": 0,
+                },
+            )
+
+            extrinsic = self.substrate.create_signed_extrinsic(
+                call=rpc_call, 
+                keypair=self.keypair,
+                era={"period": 5}
+            )
 
             try:
                 result = await asyncio.wait_for(
-                    self._async_set_node_weights(
-                        substrate=self.substrate,
-                        keypair=self.keypair,
-                        node_ids=node_ids,
-                        node_weights=calculated_weights.tolist(),
-                        netuid=self.netuid,
-                        validator_node_id=validator_uid,
+                    self._submit_extrinsic(
+                        extrinsic,
                         wait_for_inclusion=True,
-                        wait_for_finalization=True,
+                        wait_for_finalization=True
                     ),
                     timeout=self.timeout
                 )
@@ -154,25 +162,34 @@ class FiberWeightSetter:
                     logger.info("✅ Successfully set weights and finalized")
                     self.last_set_block = self.current_block
                     return True
-                return False
+                else:
+                    logger.error("Failed to set weights")
+                    self.last_set_block = self.current_block - 250
+                    return False
 
-            except Exception as e:
-                logger.error(f"##Error setting weights: {str(e)}")
-                logger.error(traceback.format_exc())
+            except asyncio.TimeoutError:
+                logger.error("Timeout setting weights")
+                self.last_set_block = self.current_block - 250
                 return False
 
         except Exception as e:
-            logger.error(f"❗#Error in weight setting: {str(e)}")
+            logger.error(f"❗Error in weight setting: {str(e)}")
             logger.error(traceback.format_exc())
+            self.last_set_block = self.current_block - 250
             return False
 
-    async def _async_set_node_weights(self, **kwargs):
-        """Async wrapper for the synchronous set_node_weights function"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: w.set_node_weights(**kwargs)
-        )
+    async def _submit_extrinsic(self, extrinsic, wait_for_inclusion=True, wait_for_finalization=True):
+        """Async wrapper for substrate extrinsic submission"""
+        try:
+            response = self.substrate.submit_extrinsic(
+                extrinsic,
+                wait_for_inclusion=wait_for_inclusion,
+                wait_for_finalization=wait_for_finalization
+            )
+            return True if response.is_success else False
+        except Exception as e:
+            logger.error(f"Error submitting extrinsic: {str(e)}")
+            return False
 
 async def main():
     try:

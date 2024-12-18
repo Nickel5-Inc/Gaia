@@ -275,21 +275,26 @@ class GaiaValidator:
             await asyncio.sleep(300)
 
     async def main_scoring(self):
-        """
-        Run scoring every 300 blocks, with weight setting 50 blocks after scoring.
-        """
+        """Run scoring loop and set weights when possible."""
         while True:
             try:
                 self.metagraph.sync_nodes()
                 block = self.substrate.get_block()
                 self.current_block = block["header"]["number"]
-                blocks_since_last = self.current_block - self.last_set_weights_block if self.last_set_weights_block else 999999 
+                blocks_since_last = self.current_block - self.last_set_weights_block if self.last_set_weights_block else 999999
+                current_interval = (self.current_block // 300) * 300
+                next_weight_block = current_interval + 50
+                
+                if self.current_block > next_weight_block:
+                    next_weight_block = ((self.current_block // 300) + 1) * 300 + 50
+                
                 logger.info(f"Current block: {self.current_block}")
-                logger.info(f"Blocks since last set: {blocks_since_last}")
+                logger.info(f"Next weight setting at block: {next_weight_block}")
+                logger.info(f"Blocks until next: {next_weight_block - self.current_block}")
                 
                 await asyncio.sleep(30)
 
-                if blocks_since_last >= 300:
+                if blocks_since_last >= 300 and self.current_block >= next_weight_block:
                     logger.info("Syncing metagraph nodes...")
                     self.metagraph.sync_nodes()
                     logger.info("Metagraph synced. Fetching recent scores...")
