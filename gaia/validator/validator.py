@@ -283,16 +283,13 @@ class GaiaValidator:
                 self.metagraph.sync_nodes()
                 block = self.substrate.get_block()
                 self.current_block = block["header"]["number"]
-                
-                next_weight_block = ((self.current_block // 300) * 300) + 50
-                blocks_until_weights = next_weight_block - self.current_block
-                
-                logger.info(f"Fetched current block: {self.current_block}")
-                logger.info(f"Next weight setting at block: {next_weight_block}")
+                blocks_since_last = self.current_block - self.last_set_weights_block if self.last_set_weights_block else 999999 
+                logger.info(f"Current block: {self.current_block}")
+                logger.info(f"Blocks since last set: {blocks_since_last}")
                 
                 await asyncio.sleep(30)
 
-                if self.current_block >= next_weight_block:
+                if blocks_since_last >= 300:
                     logger.info("Syncing metagraph nodes...")
                     self.metagraph.sync_nodes()
                     logger.info("Metagraph synced. Fetching recent scores...")
@@ -397,15 +394,13 @@ class GaiaValidator:
                                 f"Weight distribution: top 20% of nodes hold {top_20_weight*100:.1f}% of total weight"
                             )
 
-                            logger.info("Attempting to set weights...")
-                            success = await self.set_weights(self.weights)
-                            if success:
-                                if self.current_block == self.last_set_weights_block:
+                            if sum(self.weights) > 0:
+                                logger.info("Attempting to set weights...")
+                                success = await self.set_weights(self.weights)
+                                if success:
                                     logger.info(f"Successfully set weights at block {self.current_block}")
                                 else:
-                                    logger.info("Waiting for next weight setting interval")
-                            else:
-                                logger.error(f"Error setting weights at block {self.current_block}")
+                                    logger.error(f"Failed to set weights at block {self.current_block}")
                         else:
                             logger.warning("No positive weights after normalization")
                     else:
@@ -434,51 +429,25 @@ class GaiaValidator:
             block = self.substrate.get_block()
             self.current_block = block["header"]["number"]
 
-            if self.last_set_weights_block:
-                blocks_since_last = self.current_block - self.last_set_weights_block
-                if blocks_since_last < 300:
-                    blocks_remaining = 300 - blocks_since_last
-                    next_block = self.last_set_weights_block + 300
-                    logger.info(f"Waiting for block interval - {blocks_remaining} blocks remaining")
-                    logger.info(f"Last set: block {self.last_set_weights_block}")
-                    logger.info(f"Next possible: block {next_block} (current: {self.current_block})")
-                    return True
-
             weight_setter = FiberWeightSetter(
                 netuid=self.netuid,
                 wallet_name=self.wallet_name,
                 hotkey_name=self.hotkey_name,
                 network=self.subtensor_network,
                 last_set_block=self.last_set_weights_block,
-                current_block=self.current_block
+                current_block=self.current_block,
+                timeout=timeout,
+                max_retries=max_retries
             )
 
-            attempt = 0
-            delay = 1
-            while attempt < max_retries:
-                try:
-                    success = await asyncio.wait_for(weight_setter.set_weights(weights), timeout=timeout)
-                    if success:
-                        self.last_set_weights_block = self.current_block
-                        logger.info(f"✅ Successfully set weights at block {self.current_block}")
-                        logger.info(f"Next weight set possible at block {self.current_block + 300}")
-                        return True
-                    else:
-                        logger.warning("❌ Failed to set weights, retrying...")
-                except asyncio.TimeoutError:
-                    logger.debug(f"⏳ Timeout occurred while setting weights (attempt {attempt + 1}/{max_retries})")
-                except Exception as e:
-                    logger.error(f"❌ Error during weight setting (attempt {attempt + 1}/{max_retries}): {e}")
-                    logger.error(traceback.format_exc())
-
-                attempt += 1
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 10)
-
-            return False
+            success = await weight_setter.set_weights(weights)
+            if success:
+                self.last_set_weights_block = self.current_block
+                
+            return success
 
         except Exception as e:
-            logger.error(f"Unexpected error in set_weights: {e}")
+            logger.error(f"Error in set_weights: {e}")
             logger.error(traceback.format_exc())
             return False
 

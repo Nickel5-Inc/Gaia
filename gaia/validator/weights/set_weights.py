@@ -45,11 +45,16 @@ class FiberWeightSetter:
             return True
         
         blocks_since_last = self.current_block - self.last_set_block
-        if blocks_since_last < 300:
-            logger.debug(f"Next weight set possible at block {self.last_set_block + 300}")
-            return False
         
-        if blocks_since_last < 305:
+        current_interval = (self.current_block // 300) * 300
+        next_weight_block = current_interval + 50
+        
+        if blocks_since_last < 300 or self.current_block < next_weight_block:
+            logger.info(f"Too soon to set weights:")
+            logger.info(f"Last set: {self.last_set_block}")
+            logger.info(f"Current: {self.current_block}")
+            logger.info(f"Next interval: {next_weight_block}")
+            logger.info(f"Blocks until next: {next_weight_block - self.current_block}")
             return False
         
         return True
@@ -110,10 +115,7 @@ class FiberWeightSetter:
             logger.info(f"\nAttempting to set weights for subnet {self.netuid}...")
             
             if not self.is_time_to_set_weights():
-                blocks_remaining = 300 - (self.current_block - self.last_set_block)
-                logger.info(f"Too soon to set weights. Wait {blocks_remaining} more blocks.")
-                logger.info(f"Next possible at block {self.last_set_block + 300}")
-                return True 
+                return False
 
             nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
             if not nodes:
