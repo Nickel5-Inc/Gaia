@@ -126,7 +126,7 @@ IFS weather variables (in order):
 
 #### Task Pipeline
 
-The task will automatically run the model, and return the predictions in the format specified in the model. The base model is used by default. See [CUSTOMMODELS.md](gaia/models/custom_models/CUSTOMMODELS.md) for more information on integrating a custom model.
+The task will automatically run the model, and return the predictions in the format specified in the model. The base model is used by default. See [CUSTOMMODELS.md](../gaia/models/custom_models/CUSTOMMODELS.md) for more information on integrating a custom model.
 
 This outline describes hows the task functions end to end, it is done automatically but displayed here for clarity and understanding.
 
