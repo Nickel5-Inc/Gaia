@@ -147,17 +147,27 @@ class GaiaValidator:
                 base_url = f"https://{node.ip}:{node.port}"
 
                 try:
-                    async with vali_client.create_client(
+                    payload_str = json.dumps(payload).encode()
+
+                    headers = vali_client.get_headers_with_nonce(
+                        payload_str=payload_str,
+                        validator_ss58_address=self.keypair.ss58_address,
+                        miner_ss58_address=miner_hotkey,
+                        keypair=self.keypair
+                    )
+
+                    resp = await vali_client.make_non_streamed_post(
+                        httpx_client=self.httpx_client,
+                        server_address=base_url,
+                        validator_ss58_address=self.keypair.ss58_address,
+                        miner_ss58_address=miner_hotkey,
                         keypair=self.keypair,
-                        server_url=base_url,
-                        miner_hotkey=miner_hotkey
-                    ) as client:
-                        logger.info(f"Established connection with miner {miner_hotkey}")
-                        
-                        resp = await client.post(
-                            endpoint=endpoint,
-                            payload=payload
-                        )
+                        endpoint=endpoint,
+                        payload=payload
+                    )
+
+                    logger.debug(f"Raw response from miner {miner_hotkey}: {resp.text}")
+                    logger.debug(f"Response status code from miner {miner_hotkey}: {resp.status_code}")
 
                     # resp.raise_for_status()
                     # logger.debug(f"Response from miner {miner_hotkey}: {resp}")
@@ -185,6 +195,10 @@ class GaiaValidator:
                     logger.error(f"Error with miner {miner_hotkey}: {e}")
                     logger.error(f"Error details: {traceback.format_exc()}")
                     continue
+
+            logger.debug(f"Raw responses received: {responses}")
+            for hotkey, response in responses.items():
+                logger.debug(f"Response from {hotkey}: {response['text']}")
 
             return responses
 
