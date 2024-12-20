@@ -132,6 +132,6 @@ websocket-client==1.8.0
 xarray==2024.7.0
 xxhash==3.5.0
 yarl==1.17.2
-fiber[full] @ git+https://github.com/rayonlabs/fiber.git@1.0.0
+fiber[full] @ git+https://github.com/rayonlabs/fiber.git@production
 
 

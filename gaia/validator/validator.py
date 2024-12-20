@@ -11,7 +11,7 @@ from cryptography.fernet import Fernet
 import httpx
 from fiber.chain import chain_utils
 from fiber.logging_utils import get_logger
-from fiber.validator import client as vali_client, handshake
+from fiber.validator import client as vali_client
 from fiber.chain.metagraph import Metagraph
 from substrateinterface import SubstrateInterface
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
@@ -147,45 +147,30 @@ class GaiaValidator:
                 base_url = f"https://{node.ip}:{node.port}"
 
                 try:
-                    symmetric_key_str, symmetric_key_uuid = (
-                        await handshake.perform_handshake(
-                            keypair=self.keypair,
-                            httpx_client=self.httpx_client,
-                            server_address=base_url,
-                            miner_hotkey_ss58_address=miner_hotkey,
-                        )
-                    )
-
-                    if symmetric_key_str and symmetric_key_uuid:
-                        logger.info(f"Handshake successful with miner {miner_hotkey}")
-                        fernet = Fernet(symmetric_key_str)
-
-                        resp = await vali_client.make_non_streamed_post(
-                            httpx_client=self.httpx_client,
-                            server_address=base_url,
-                            fernet=fernet,
-                            keypair=self.keypair,
-                            symmetric_key_uuid=symmetric_key_uuid,
-                            validator_ss58_address=self.keypair.ss58_address,
-                            miner_ss58_address=miner_hotkey,
-                            payload=payload,
+                    async with vali_client.create_client(
+                        keypair=self.keypair,
+                        server_url=base_url,
+                        miner_hotkey=miner_hotkey
+                    ) as client:
+                        logger.info(f"Established connection with miner {miner_hotkey}")
+                        
+                        resp = await client.post(
                             endpoint=endpoint,
+                            payload=payload
                         )
 
-                        # resp.raise_for_status()
-                        # logger.debug(f"Response from miner {miner_hotkey}: {resp}")
-                        # logger.debug(f"Response text from miner {miner_hotkey}: {resp.headers}")
-                        # Create a dictionary with both response text and metadata
-                        response_data = {
-                            "text": resp.text,
-                            "hotkey": miner_hotkey,
-                            "port": node.port,
-                            "ip": node.ip,
-                        }
-                        responses[miner_hotkey] = response_data
-                        logger.info(f"Completed request to {miner_hotkey}")
-                    else:
-                        logger.warning(f"Failed handshake with miner {miner_hotkey}")
+                    # resp.raise_for_status()
+                    # logger.debug(f"Response from miner {miner_hotkey}: {resp}")
+                    # logger.debug(f"Response text from miner {miner_hotkey}: {resp.headers}")
+                    # Create a dictionary with both response text and metadata
+                    response_data = {
+                        "text": resp.text,
+                        "hotkey": miner_hotkey,
+                        "port": node.port,
+                        "ip": node.ip,
+                    }
+                    responses[miner_hotkey] = response_data
+                    logger.info(f"Completed request to {miner_hotkey}")
                 except httpx.HTTPStatusError as e:
                     logger.warning(f"HTTP error from miner {miner_hotkey}: {e}")
                     # logger.debug(f"Error details: {traceback.format_exc()}")
@@ -266,7 +251,7 @@ class GaiaValidator:
                     asyncio.create_task(self.status_logger()),
                     asyncio.create_task(self.main_scoring()),
                     asyncio.create_task(self.handle_miner_deregistration_loop()),
-                    asyncio.create_task(self.check_for_updates()),
+                   # asyncio.create_task(self.check_for_updates()),
                 ]
 
                 await asyncio.gather(*workers, return_exceptions=True)

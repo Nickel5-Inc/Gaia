@@ -1,5 +1,7 @@
 import traceback
 import pandas as pd
+import logging
+logging.getLogger("prophet.plot").disabled = True
 from prophet import Prophet
 from datetime import datetime, timedelta
 import pytz
