@@ -5,7 +5,7 @@ from sqlalchemy.exc import SQLAlchemyError
 import bittensor as bt
 
 from gaia.APIcalls.website_api import GaiaCommunicator
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager  # Is this the correct one?
+from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 
 
 class MinerScoreSender:
@@ -30,63 +30,90 @@ class MinerScoreSender:
             result = await session.execute(query)
             return [{"uid": row[0], "hotkey": row[1], "coldkey": row[2]} for row in result.fetchall()]
 
-    async def fetch_geomagnetic_history(self, miner_hotkey: str) -> dict:
+    async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
         """
-        Fetch predicted values and scores from geomagnetic_history.
+        Fetch geomagnetic prediction history.
 
         Args:
             miner_hotkey: Hotkey of the miner.
 
         Returns:
-            Dictionary containing predicted values and scores.
+            List of dictionaries containing geomagnetic prediction details.
         """
         async with self.database_manager.get_connection() as session:
             query = """
-                SELECT predicted_value, score, scored_at 
-                FROM geomagnetic_history 
-                WHERE miner_hotkey = :miner_hotkey 
-                ORDER BY scored_at DESC 
-                LIMIT 1
+                SELECT id, prediction_datetime, predicted_value, ground_truth_value, score, scored_at
+                FROM geomagnetic_history
+                WHERE miner_hotkey = :miner_hotkey
+                ORDER BY scored_at DESC
+                LIMIT 10
             """
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
-            row = result.fetchone()
-            if row:
-                return {
-                    "predicted_value": row[0],
-                    "score": row[1],
-                    "scored_at": row[2]
+            return [
+                {
+                    "predictionID": row[0],
+                    "predictionDateTime": row[1].isoformat(),
+                    "metrics": {
+                        "geomagneticPredictionTargetDate": row[1].isoformat(),
+                        "geomagneticPredictionInput": {"inputDateTime": row[1].isoformat()},
+                        "geomagneticPredictedValue": row[2],
+                        "geomagneticGroundTruthValue": row[3],
+                        "geomagneticScore": row[4]
+                    },
+                    "scoreGenerationDate": row[5].isoformat()
                 }
-            return {}
+                for row in result.fetchall()
+            ]
 
-    async def fetch_soil_moisture_history(self, miner_hotkey: str) -> dict:
+    async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
         """
-        Fetch scores and structure scores from soil_moisture_history.
+        Fetch soil moisture prediction history.
 
         Args:
             miner_hotkey: Hotkey of the miner.
 
         Returns:
-            Dictionary containing surface RMSE, rootzone RMSE, and structure scores.
+            List of dictionaries containing soil moisture prediction details.
         """
         async with self.database_manager.get_connection() as session:
             query = """
-                SELECT surface_rmse, rootzone_rmse, surface_structure_score, rootzone_structure_score, scored_at 
-                FROM soil_moisture_history 
-                WHERE miner_hotkey = :miner_hotkey 
-                ORDER BY scored_at DESC 
-                LIMIT 1
+                SELECT id, prediction_datetime, region_id, sentinel_bounds, sentinel_crs,
+                       target_date, surface_rmse, rootzone_rmse, surface_predicted_values,
+                       rootzone_predicted_values, surface_ground_truth_values,
+                       rootzone_ground_truth_values, surface_structure_score,
+                       rootzone_structure_score, scored_at
+                FROM soil_moisture_history
+                WHERE miner_hotkey = :miner_hotkey
+                ORDER BY scored_at DESC
+                LIMIT 10
             """
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
-            row = result.fetchone()
-            if row:
-                return {
-                    "surface_rmse": row[0],
-                    "rootzone_rmse": row[1],
-                    "surface_structure_score": row[2],
-                    "rootzone_structure_score": row[3],
-                    "scored_at": row[4]
+            return [
+                {
+                    "predictionID": row[0],
+                    "predictionDateTime": row[1].isoformat(),
+                    "metrics": {
+                        "soilPredictionRegionID": row[2],
+                        "sentinelRegionBounds": row[3],
+                        "sentinelRegionCRS": row[4],
+                        "soilPredictionTargetDate": row[5].isoformat(),
+                        "soilSurfaceRMSE": row[6],
+                        "soilRootzoneRMSE": row[7],
+                        "soilSurfacePredictedValues": row[8],
+                        "soilRootzonePredictedValues": row[9],
+                        "soilSurfaceGroundTruthValues": row[10],
+                        "soilRootzoneGroundTruthValues": row[11],
+                        "soilSurfaceStructureScore": row[12],
+                        "soilRootzoneStructureScore": row[13]
+                    },
+                    "files": {
+                        "soilPredictionInput": "input.tif",
+                        "soilPredictionOutput": "output.tif"
+                    },
+                    "scoreGenerationDate": row[14].isoformat()
                 }
-            return {}
+                for row in result.fetchall()
+            ]
 
     async def send_miner_scores_to_gaia(self) -> None:
         """
@@ -106,24 +133,23 @@ class MinerScoreSender:
         for miner in active_miners:
             uid, hotkey, coldkey = miner["uid"], miner["hotkey"], miner["coldkey"]
 
-            # Fetch data from geomagnetic_history
-            geomagnetic_data = await self.fetch_geomagnetic_history(hotkey)
+            # Fetch predictions
+            geomagnetic_predictions = await self.fetch_geomagnetic_history(hotkey)
+            soil_moisture_predictions = await self.fetch_soil_moisture_history(hotkey)
 
-            # Fetch data from soil_moisture_history
-            soil_moisture_data = await self.fetch_soil_moisture_history(hotkey)
+            # Get the most recent weight (placeholder logic)
+            most_recent_weight = 0.5  # Replace with actual weight logic
 
             # Prepare the payload
             data_to_send.append({
                 "minerUID": uid,
                 "minerHotKey": hotkey,
                 "minerColdKey": coldkey,
-                "geomagneticPredictedValue": geomagnetic_data.get("predicted_value", 0),
-                "geomagneticScore": geomagnetic_data.get("score", 0),
-                "soilSurfaceRMSE": soil_moisture_data.get("surface_rmse", 0),
-                "soilRootzoneRMSE": soil_moisture_data.get("rootzone_rmse", 0),
-                "soilSurfaceStructureScore": soil_moisture_data.get("surface_structure_score", 0),
-                "soilRootzoneStructureScore": soil_moisture_data.get("rootzone_structure_score", 0),
-                "scoreGenerationDate": geomagnetic_data.get("scored_at") or soil_moisture_data.get("scored_at") or datetime.now(timezone.utc).isoformat()
+                "predictions": {
+                    "geomagnetic_predictions": geomagnetic_predictions,
+                    "soil_moisture_predictions": soil_moisture_predictions
+                },
+                "mostRecentWeight": most_recent_weight
             })
 
         bt.logging.info(f"| {current_thread} | ⛵ Sending {len(data_to_send)} miner scores to Gaia.")
@@ -131,8 +157,7 @@ class MinerScoreSender:
         # Step 3: Send data to Gaia
         gaia_communicator = GaiaCommunicator("/Validator/Info")
         for miner_data in data_to_send:
-            version = miner_data["scoreGenerationDate"]
-            gaia_communicator.send_data(version=version)
+            gaia_communicator.send_data(data=miner_data)
 
     def run(self):
         """
