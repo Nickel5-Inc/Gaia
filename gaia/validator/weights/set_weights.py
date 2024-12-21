@@ -1,192 +1,258 @@
-import torch
-from datetime import datetime, timezone, timedelta
-from typing import List
-import asyncio
-import traceback
-from fiber.chain import interface, chain_utils, weights as w
-from fiber.chain.fetch_nodes import get_nodes_for_netuid
-import sys
+import functools
+import multiprocessing
+import time
+from functools import wraps
+from typing import Any, Callable, Tuple
+
+from scalecodec import ScaleType
+from substrateinterface import Keypair, SubstrateInterface
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from fiber import constants as fcst
+from fiber.chain.chain_utils import format_error_message
+from fiber.chain.interface import get_substrate
 from fiber.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+@staticmethod
+def timeout_with_multiprocess(seconds):
+    # Thanks Omron/Rapido (SN2) for the timeout decorator
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            def target_func(result_dict, *args, **kwargs):
+                try:
+                    result_dict["result"] = func(*args, **kwargs)
+                except Exception as e:
+                    result_dict["exception"] = e
 
-class FiberWeightSetter:
-    def __init__(
-        self,
-        netuid: int,
-        wallet_name: str = "default",
-        hotkey_name: str = "default",
-        network: str = "finney",
-        last_set_block: int = None,
-        current_block: int = None,
-        timeout: int = 30,
-        max_retries: int = 3,
-    ):
-        """
-        Initialize the weight setter with fiber instead of bittensor
-        """
-        self.netuid = netuid
-        self.wallet_name = wallet_name
-        self.hotkey_name = hotkey_name
-        self.network = network
-        self.substrate = interface.get_substrate(subtensor_network=network)
-        self.keypair = chain_utils.load_hotkey_keypair(
-            wallet_name=wallet_name, hotkey_name=hotkey_name
-        )
-        self.last_set_block = last_set_block
-        self.current_block = current_block
-        self.timeout = timeout
-        self.max_retries = max_retries
+            manager = multiprocessing.Manager()
+            result_dict = manager.dict()
+            process = multiprocessing.Process(
+                target=target_func, args=(result_dict, *args), kwargs=kwargs
+            )
+            process.start()
+            process.join(seconds)
 
-    def is_time_to_set_weights(self) -> bool:
-        """Check if enough blocks have passed since last weight setting."""
-        if self.last_set_block is None:
-            return True
-        
-        blocks_since_last = self.current_block - self.last_set_block
-        if blocks_since_last < 300:
-            logger.debug(f"Next weight set possible at block {self.last_set_block + 300}")
-            return False
-        
-        if blocks_since_last < 305:
-            return False
-        
-        return True
-
-    def calculate_weights(self, n_nodes: int, weights: List[float] = None) -> torch.Tensor:
-        """Convert input weights to normalized tensor."""
-        if weights is None:
-            logger.warning("No weights provided")
-            return None
-
-        nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
-        node_ids = [node.node_id for node in nodes]
-        aligned_weights = [
-            max(0.0, weights[node_id]) if node_id < len(weights) else 0.0
-            for node_id in node_ids
-        ]
-
-        weights_tensor = torch.tensor(aligned_weights, dtype=torch.float32)
-        active_nodes = (weights_tensor > 0).sum().item()
-
-        if active_nodes == 0:
-            logger.warning("No active nodes found")
-            return None
-
-        weights_tensor /= weights_tensor.sum()
-
-        min_weight = 1.0 / (2 * active_nodes)
-        max_weight = 0.5  # Maximum 50% weight for any node
-
-        mask = weights_tensor > 0
-        weights_tensor[mask] = torch.clamp(weights_tensor[mask], min_weight, max_weight)
-        weights_tensor /= weights_tensor.sum()  # Renormalize
-
-        logger.info(
-            f"Weight distribution stats:"
-            f"\n- Active nodes: {active_nodes}"
-            f"\n- Max weight: {weights_tensor.max().item():.4f}"
-            f"\n- Min non-zero weight: {weights_tensor[weights_tensor > 0].min().item():.4f}"
-            f"\n- Total weight: {weights_tensor.sum().item():.4f}"
-        )
-
-        return weights_tensor
-
-    def find_validator_uid(self, nodes) -> int:
-        """Find the validator's UID from the list of nodes."""
-        for node in nodes:
-            if node.hotkey == self.keypair.ss58_address:
-                return node.node_id
-        logger.info("❗Validator not found in nodes list")
-        return None
-
-    async def set_weights(self, weights: List[float] = None) -> bool:
-        try:
-            if weights is None:
-                logger.info("No weights provided - skipping weight setting")
-                return False
-
-            logger.info(f"\nAttempting to set weights for subnet {self.netuid}...")
-            
-            if not self.is_time_to_set_weights():
-                blocks_remaining = 300 - (self.current_block - self.last_set_block)
-                logger.info(f"Too soon to set weights. Wait {blocks_remaining} more blocks.")
-                logger.info(f"Next possible at block {self.last_set_block + 300}")
-                return True 
-
-            nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
-            if not nodes:
-                logger.error(f"❗No nodes found for subnet {self.netuid}")
-                return False
-
-            validator_uid = self.find_validator_uid(nodes)
-            if validator_uid is None:
-                logger.error("❗Failed to get validator UID")
-                return False
-
-            calculated_weights = self.calculate_weights(len(nodes), weights)
-            if calculated_weights is None:
-                logger.info("No valid weights to set")
-                return False
-
-            node_ids = [node.node_id for node in nodes]
-            logger.info("Setting weights on chain...")
-
-            try:
-                result = await asyncio.wait_for(
-                    self._async_set_node_weights(
-                        substrate=self.substrate,
-                        keypair=self.keypair,
-                        node_ids=node_ids,
-                        node_weights=calculated_weights.tolist(),
-                        netuid=self.netuid,
-                        validator_node_id=validator_uid,
-                        wait_for_inclusion=True,
-                        wait_for_finalization=True,
-                    ),
-                    timeout=self.timeout
+            if process.is_alive():
+                process.terminate()
+                process.join()
+                logger.warning(
+                    f"Function '{func.__name__}' timed out after {seconds} seconds"
                 )
+                return None
 
-                if result:
-                    logger.info("✅ Successfully set weights and finalized")
-                    self.last_set_block = self.current_block
-                    return True
-                return False
+            if "exception" in result_dict:
+                raise result_dict["exception"]
 
-            except Exception as e:
-                logger.error(f"##Error setting weights: {str(e)}")
-                logger.error(traceback.format_exc())
-                return False
+            return result_dict.get("result", None)
 
-        except Exception as e:
-            logger.error(f"❗#Error in weight setting: {str(e)}")
-            logger.error(traceback.format_exc())
-            return False
+        return wrapper
 
-    async def _async_set_node_weights(self, **kwargs):
-        """Async wrapper for the synchronous set_node_weights function"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: w.set_node_weights(**kwargs)
-        )
+    return decorator
 
-async def main():
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=4),
+    reraise=True,
+)
+def _query_subtensor(
+    substrate: SubstrateInterface,
+    name: str,
+    block: int | None = None,
+    params: int | None = None,
+) -> ScaleType:
     try:
-        weight_setter = FiberWeightSetter(
-            netuid=237, wallet_name="gaiatest", hotkey_name="default", network="test"
+        return substrate.query(
+            module="SubtensorModule",
+            storage_function=name,
+            params=params,  # type: ignore
+            block_hash=(None if block is None else substrate.get_block_hash(block)),  # type: ignore
         )
-
-        await weight_setter.set_weights()
-
-    except KeyboardInterrupt:
-        logger.info("\nStopping...")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Fatal error: {str(e)}")
-        sys.exit(1)
+    except Exception:
+        # Should prevent SSL errors
+        substrate = get_substrate(subtensor_address=substrate.url)
+        raise
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+def _get_hyperparameter(
+    substrate: SubstrateInterface,
+    param_name: str,
+    netuid: int,
+    block: int | None = None,
+) -> list[int] | int | None:
+    subnet_exists = getattr(
+        _query_subtensor(substrate, "NetworksAdded", block, [netuid]),  # type: ignore
+        "value",
+        False,
+    )
+    if not subnet_exists:
+        return None
+    return getattr(
+        _query_subtensor(substrate, param_name, block, [netuid]),  # type: ignore
+        "value",
+        None,
+    )
+
+
+def _blocks_since_last_update(substrate: SubstrateInterface, netuid: int, node_id: int) -> int | None:
+    current_block = substrate.get_block_number(None)  # type: ignore
+    last_updated = _get_hyperparameter(substrate, "LastUpdate", netuid)
+    assert not isinstance(last_updated, int), "LastUpdate should be a list of ints"
+    if last_updated is None:
+        return None
+    return current_block - int(last_updated[node_id])
+
+
+def _min_interval_to_set_weights(substrate: SubstrateInterface, netuid: int) -> int:
+    weights_set_rate_limit = _get_hyperparameter(substrate, "WeightsSetRateLimit", netuid)
+    assert isinstance(weights_set_rate_limit, int), "WeightsSetRateLimit should be an int"
+    return weights_set_rate_limit
+
+
+def _normalize_and_quantize_weights(node_ids: list[int], node_weights: list[float]) -> tuple[list[int], list[int]]:
+    if len(node_ids) != len(node_weights) or any(uid < 0 for uid in node_ids) or any(weight < 0 for weight in node_weights):
+        raise ValueError("Invalid input: length mismatch or negative values")
+    if not any(node_weights):
+        return [], []
+    scaling_factor = fcst.U16_MAX / max(node_weights)
+
+    node_weights_formatted = []
+    node_ids_formatted = []
+    for node_id, node_weight in zip(node_ids, node_weights):
+        if node_weight > 0:
+            node_ids_formatted.append(node_id)
+            node_weights_formatted.append(round(node_weight * scaling_factor))
+
+    return node_ids_formatted, node_weights_formatted
+
+
+def _log_and_reraise(func: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.exception(f"Exception in {func.__name__}: {str(e)}")
+            raise
+
+    return wrapper
+
+
+def _can_set_weights(substrate: SubstrateInterface, netuid: int, validator_node_id: int) -> Tuple[bool, int]:
+    blocks_since_update = _blocks_since_last_update(substrate, netuid, validator_node_id)
+    min_interval = _min_interval_to_set_weights(substrate, netuid)
+    if min_interval is None:
+        return True, 0
+    return blocks_since_update is not None and blocks_since_update > min_interval, blocks_since_update
+
+
+def _send_weights_to_chain(
+    substrate: SubstrateInterface,
+    keypair: Keypair,
+    node_ids: list[int],
+    node_weights: list[float],
+    netuid: int,
+    version_key: int = 0,
+    wait_for_inclusion: bool = False,
+    wait_for_finalization: bool = False,
+) -> tuple[bool, str | None]:
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1.5, min=2, max=5),
+        reraise=True,
+    )
+    @_log_and_reraise
+    def _set_weights():
+        with substrate as si:
+            rpc_call = si.compose_call(
+                call_module="SubtensorModule",
+                call_function="set_weights",
+                call_params={
+                    "dests": node_ids,
+                    "weights": node_weights,
+                    "netuid": netuid,
+                    "version_key": version_key,
+                },
+            )
+            extrinsic_to_send = si.create_signed_extrinsic(call=rpc_call, keypair=keypair, era={"period": 5})
+
+            response = si.submit_extrinsic(
+                extrinsic_to_send,
+                wait_for_inclusion=wait_for_inclusion,
+                wait_for_finalization=wait_for_finalization,
+            )
+
+            if not wait_for_finalization and not wait_for_inclusion:
+                return True, "Not waiting for finalization or inclusion."
+            response.process_events()
+
+            if response.is_success:
+                return True, "Successfully set weights."
+
+            return False, format_error_message(response.error_message)
+
+    return _set_weights()
+
+@timeout_with_multiprocess(seconds=60)
+def set_node_weights(
+    substrate: SubstrateInterface,
+    keypair: Keypair,
+    node_ids: list[int],
+    node_weights: list[float],
+    netuid: int,
+    validator_node_id: int,
+    version_key: int = 0,
+    wait_for_inclusion: bool = False,
+    wait_for_finalization: bool = False,
+    max_attempts: int = 1,
+) -> bool:
+    node_ids_formatted, node_weights_formatted = _normalize_and_quantize_weights(node_ids, node_weights)
+
+    # Fetch a new substrate object to reset the connection
+    substrate = get_substrate(subtensor_address=substrate.url)
+
+    weights_can_be_set = False
+    for attempt in range(1, max_attempts + 1):
+        if not _can_set_weights(substrate, netuid, validator_node_id):
+            logger.info(logger.info(f"Skipping attempt {attempt}/{max_attempts}. Too soon to set weights. Will wait 30 secs..."))
+            time.sleep(30)
+            continue
+        else:
+            weights_can_be_set = True
+            break
+
+    if not weights_can_be_set:
+        logger.error("No attempt to set weightsmade. Perhaps it is too soon to set weights!")
+        return False
+
+    #logger.info("Attempting to set weights...")
+    success, error_message = _send_weights_to_chain(
+        substrate,
+        keypair,
+        node_ids_formatted,
+        node_weights_formatted,
+        netuid,
+        version_key,
+        wait_for_inclusion,
+        wait_for_finalization,
+    )
+
+    if not wait_for_finalization and not wait_for_inclusion:
+        logger.info("Not waiting for finalization or inclusion to set weights. Returning immediately.")
+        return success
+
+    if success:
+        if wait_for_finalization:
+            logger.info("✅ Successfully set weights and finalized")
+        elif wait_for_inclusion:
+            logger.info("✅ Successfully set weights and included")
+        else:
+            logger.info("✅ Successfully set weights")
+    else:
+        logger.error(f"❌ Failed to set weights: {error_message}")
+
+    substrate.close()
+    return success
