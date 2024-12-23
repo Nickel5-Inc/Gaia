@@ -5,9 +5,9 @@ import argparse
 from fiber import SubstrateInterface
 import uvicorn
 from fiber.logging_utils import get_logger
-from fiber.miner import server
-from fiber.miner.core import configuration
-from fiber.miner.middleware import configure_extra_logging_middleware
+from fiber.encrypted.miner import server
+from fiber.encrypted.miner.core import configuration
+from fiber.encrypted.miner.middleware import configure_extra_logging_middleware
 from fiber.chain import chain_utils
 from gaia.miner.utils.subnet import factory_router
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
@@ -73,9 +73,16 @@ class Miner:
         Set up the miner neuron with necessary configurations and connections.
         """
         self.logger.info("Setting up miner neuron...")
-
-        # Add detailed logging for keypair and wallet info
         self.keypair = chain_utils.load_hotkey_keypair(self.wallet, self.hotkey)
+        
+        config = configuration.factory_config()
+        config.keypair = self.keypair
+        config.min_stake_threshold = float(os.getenv("MIN_STAKE_THRESHOLD", 5))
+        config.netuid = self.netuid
+        config.subtensor_network = self.subtensor_network
+        config.chain_endpoint = self.subtensor_chain_endpoint
+        self.config = config
+
         self.logger.debug(
             f"""
 Detailed Neuron Configuration:
@@ -87,20 +94,7 @@ Keypair Public Key: {self.keypair.public_key}
 Subtensor Chain Endpoint: {self.subtensor_chain_endpoint}
 Network: {self.subtensor_network}
 Port: {self.port}
-        """
-        )
-
-        # Test signature verification
-        test_message = "test_message"
-        test_sig = self.keypair.sign(test_message)
-        verify_result = self.keypair.verify(test_message, test_sig)
-        self.logger.debug(
-            f"""
-Signature Verification Test:
--------------------------
-Test Message: {test_message}
-Test Signature: {test_sig}
-Verification Result: {verify_result}
+Min Stake Threshold: {config.min_stake_threshold}
         """
         )
 
