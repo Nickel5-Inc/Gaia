@@ -51,15 +51,13 @@ class MinerScoreSender:
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
                 {
-                    "predictionID": row[0],
-                    "predictionDateTime": row[1].isoformat(),
-                    "metrics": {
-                        "geomagneticPredictionTargetDate": row[1].isoformat(),
-                        "geomagneticPredictionInput": {"inputDateTime": row[1].isoformat()},
-                        "geomagneticPredictedValue": row[2],
-                        "geomagneticGroundTruthValue": row[3],
-                        "geomagneticScore": row[4]
-                    },
+                    "predictionId": row[0],
+                    "predictionDate": row[1].isoformat(),
+                    "geomagneticPredictionTargetDate": row[1].isoformat(),
+                    "geomagneticPredictionInputDate": row[1].isoformat(),
+                    "geomagneticPredictedValue": row[2],
+                    "geomagneticGroundTruthValue": row[3],
+                    "geomagneticScore": row[4],
                     "scoreGenerationDate": row[5].isoformat()
                 }
                 for row in result.fetchall()
@@ -90,26 +88,20 @@ class MinerScoreSender:
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
                 {
-                    "predictionID": row[0],
-                    "predictionDateTime": row[1].isoformat(),
-                    "metrics": {
-                        "soilPredictionRegionID": row[2],
-                        "sentinelRegionBounds": row[3],
-                        "sentinelRegionCRS": row[4],
-                        "soilPredictionTargetDate": row[5].isoformat(),
-                        "soilSurfaceRMSE": row[6],
-                        "soilRootzoneRMSE": row[7],
-                        "soilSurfacePredictedValues": row[8],
-                        "soilRootzonePredictedValues": row[9],
-                        "soilSurfaceGroundTruthValues": row[10],
-                        "soilRootzoneGroundTruthValues": row[11],
-                        "soilSurfaceStructureScore": row[12],
-                        "soilRootzoneStructureScore": row[13]
-                    },
-                    "files": {
-                        "soilPredictionInput": "input.tif",
-                        "soilPredictionOutput": "output.tif"
-                    },
+                    "predictionId": row[0],
+                    "predictionDate": row[1].isoformat(),
+                    "soilPredictionRegionId": row[2],
+                    "sentinelRegionBounds": row[3],
+                    "sentinelRegionCrs": row[4],
+                    "soilPredictionTargetDate": row[5].isoformat(),
+                    "soilSurfaceRmse": row[6],
+                    "soilRootzoneRmse": row[7],
+                    "soilSurfacePredictedValues": row[8],
+                    "soilRootzonePredictedValues": row[9],
+                    "soilSurfaceGroundTruthValues": row[10],
+                    "soilRootzoneGroundTruthValues": row[11],
+                    "soilSurfaceStructureScore": row[12],
+                    "soilRootzoneStructureScore": row[13],
                     "scoreGenerationDate": row[14].isoformat()
                 }
                 for row in result.fetchall()
@@ -142,20 +134,16 @@ class MinerScoreSender:
 
             # Prepare the payload
             data_to_send.append({
-                "minerUID": uid,
                 "minerHotKey": hotkey,
                 "minerColdKey": coldkey,
-                "predictions": {
-                    "geomagnetic_predictions": geomagnetic_predictions,
-                    "soil_moisture_predictions": soil_moisture_predictions
-                },
-                "mostRecentWeight": most_recent_weight
+                "geomagneticPredictions": geomagnetic_predictions,
+                "soilMoisturePredictions": soil_moisture_predictions
             })
 
         bt.logging.info(f"| {current_thread} | ⛵ Sending {len(data_to_send)} miner scores to Gaia.")
 
         # Step 3: Send data to Gaia
-        gaia_communicator = GaiaCommunicator("/Validator/Info")
+        gaia_communicator = GaiaCommunicator("/Predictions")
         for miner_data in data_to_send:
             gaia_communicator.send_data(data=miner_data)
 
