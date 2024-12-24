@@ -931,20 +931,6 @@ class GaiaValidator:
 
         # Task configuration with timeouts and retry limits
         task_configs = {
-            "geomagnetic": {
-                "name": "Geomagnetic Task",
-                "heartbeat_timeout": 300,  
-                "max_retries": 3,
-                "retry_delay": 60,
-                "creator": lambda validator, task_wrapper: validator.geomagnetic_task.validator_execute(validator=validator, task_wrapper=task_wrapper)
-            },
-            "soil": {
-                "name": "Soil Moisture Task",
-                "heartbeat_timeout": 300,
-                "max_retries": 3,
-                "retry_delay": 60,
-                "creator": lambda validator, task_wrapper: validator.soil_task.validator_execute(validator=validator, task_wrapper=task_wrapper)
-            },
             "status": {
                 "name": "Status Logger",
                 "heartbeat_timeout": 60,
@@ -975,7 +961,7 @@ class GaiaValidator:
             }
         }
 
-        # Task state tracking
+
         task_states = {
             name: {
                 "retries": 0,
@@ -1157,7 +1143,10 @@ class GaiaValidator:
                     continue  # Retry the task
 
         try:
-            # Initial task creation
+            active_tasks = {}
+            active_tasks["soil"] = asyncio.create_task(self.soil_task.validator_execute(validator=self))
+            active_tasks["geomagnetic"] = asyncio.create_task(self.geomagnetic_task.validator_execute(validator=self))
+
             for task_name in task_configs:
                 active_tasks[task_name] = asyncio.create_task(
                     create_task_with_timeout(task_name)

@@ -57,7 +57,7 @@ class SoilMoistureTask(Task):
         description="Delay before scoring due to SMAP data latency",
     )
 
-    validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None #type: ignore
+    validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None
     miner_preprocessing: Optional["SoilMinerPreprocessing"] = None
     model: Optional[SoilModel] = None
     db_manager: Any = Field(default=None)
@@ -121,356 +121,311 @@ class SoilMoistureTask(Task):
             hour=first_window[0], minute=first_window[1], second=0, microsecond=0
         )
 
-    async def validator_execute(self, validator, task_wrapper=None):
+    async def validator_execute(self, validator):
         """Execute validator workflow."""
-        task_log = logger
         if not hasattr(self, "db_manager") or self.db_manager is None:
             self.db_manager = validator.db_manager
 
         while True:
             try:
-                if task_wrapper:
-                    async with task_wrapper.activity() as task_log:
-                        current_time = datetime.now(timezone.utc)
-                        if current_time.minute % 1 == 0:
-                            await self.validator_score()
+                current_time = datetime.now(timezone.utc)
 
-                    if self.test_mode:
-                        async with task_wrapper.activity() as task_log:
-                            task_log.info("Running in test mode - bypassing window checks")
-                            target_smap_time = self.get_smap_time_for_validator(current_time)
-                            ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
+                if current_time.minute % 1 == 0:
+                    await self.validator_score()
 
-                            await self.validator_preprocessing.get_daily_regions(
-                                target_time=target_smap_time,
-                                ifs_forecast_time=ifs_forecast_time,
-                            )
+                if self.test_mode:
+                    logger.info("Running in test mode - bypassing window checks")
+                    target_smap_time = self.get_smap_time_for_validator(current_time)
+                    ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
 
-                            regions = await self.db_manager.fetch_many(
-                                """
-                                SELECT * FROM soil_moisture_regions 
-                                WHERE status = 'pending'
-                                AND target_time = :target_time
-                                """,
-                                {"target_time": target_smap_time},
-                            )
-
-                            if regions:
-                                for region in regions:
-                                    async with task_wrapper.activity() as task_log:
-                                        try:
-                                            task_log.info(f"Processing region {region['id']}")
-
-                                            if "combined_data" not in region:
-                                                task_log.error(
-                                                    f"Region {region['id']} missing combined_data field"
-                                                )
-                                                continue
-
-                                            if not region["combined_data"]:
-                                                task_log.error(
-                                                    f"Region {region['id']} has null combined_data"
-                                                )
-                                                continue
-
-                                            combined_data = region["combined_data"]
-                                            if not isinstance(combined_data, bytes):
-                                                task_log.error(
-                                                    f"Region {region['id']} has invalid data type: {type(combined_data)}"
-                                                )
-                                                continue
-
-                                            if not (
-                                                combined_data.startswith(b"II\x2A\x00")
-                                                or combined_data.startswith(b"MM\x00\x2A")
-                                            ):
-                                                task_log.error(
-                                                    f"Region {region['id']} has invalid TIFF header"
-                                                )
-                                                task_log.error(
-                                                    f"First 16 bytes: {combined_data[:16].hex()}"
-                                                )
-                                                continue
-
-                                            task_log.info(
-                                                f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB"
-                                            )
-                                            task_log.info(
-                                                f"Region {region['id']} TIFF header: {combined_data[:4]}"
-                                            )
-                                            task_log.info(
-                                                f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}"
-                                            )
-                                            encoded_data = base64.b64encode(combined_data)
-                                            task_log.info(
-                                                f"Base64 first 16 chars: {encoded_data[:16]}"
-                                            )
-
-                                            task_data = {
-                                                "region_id": region["id"],
-                                                "combined_data": encoded_data.decode("ascii"),
-                                                "sentinel_bounds": region["sentinel_bounds"],
-                                                "sentinel_crs": region["sentinel_crs"],
-                                                "target_time": target_smap_time.isoformat(),
-                                            }
-
-                                            payload = {"nonce": str(uuid4()), "data": task_data}
-
-                                            task_log.info(
-                                                f"Sending region {region['id']} to miners..."
-                                            )
-                                            responses = await validator.query_miners(
-                                                payload=payload, endpoint="/soilmoisture-request"
-                                            )
-
-                                            if responses:
-                                                metadata = {
-                                                    "region_id": region["id"],
-                                                    "target_time": target_smap_time,
-                                                    "data_collection_time": current_time,
-                                                    "ifs_forecast_time": ifs_forecast_time,
-                                                }
-                                                await self.add_task_to_queue(responses, metadata)
-
-                                                await self.db_manager.execute(
-                                                    """
-                                                    UPDATE soil_moisture_regions 
-                                                    SET status = 'sent_to_miners'
-                                                    WHERE id = :region_id
-                                                    """,
-                                                    {"region_id": region["id"]},
-                                                )
-
-                                        except Exception as e:
-                                            task_log.error(f"Error preparing region: {str(e)}")
-                                            continue
-
-                            task_log.info("Test mode execution complete. Disabling test mode.")
-                            self.test_mode = False
-                            continue
-
-                    async with task_wrapper.activity() as task_log:
-                        windows = self.get_validator_windows()
-                        current_window = next(
-                            (w for w in windows if self.is_in_window(current_time, w)), None
-                        )
-
-                        if not current_window:
-                            task_log.info(
-                                f"Not in any preparation or execution window: {current_time}"
-                            )
-                            task_log.info(
-                                f"Next soil task time: {self.get_next_preparation_time(current_time)}"
-                            )
-                            task_log.info(f"Sleeping for 60 seconds")
-                            # Use timeout override for regular sleep
-                            async with task_wrapper.activity(timeout_override=120):
-                                await asyncio.sleep(60)
-                            continue
-
-                        is_prep = current_window[1] == 30  # If minutes = 30, it's a prep window
-
-                        target_smap_time = self.get_smap_time_for_validator(current_time)
-                        ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
-
-                    if is_prep:
-                        async with task_wrapper.activity() as task_log:
-                            await self.validator_preprocessing.get_daily_regions(
-                                target_time=target_smap_time,
-                                ifs_forecast_time=ifs_forecast_time,
-                            )
-                    else:
-                        # Execution window logic
-                        async with task_wrapper.activity() as task_log:
-                            regions = await self.db_manager.fetch_many(
-                                """
-                                SELECT * FROM soil_moisture_regions 
-                                WHERE status = 'pending'
-                                AND target_time = :target_time
-                                """,
-                                {"target_time": target_smap_time},
-                            )
-
-                            if regions:
-                                for region in regions:
-                                    async with task_wrapper.activity() as task_log:
-                                        try:
-                                            task_log.info(f"Processing region {region['id']}")
-
-                                            if "combined_data" not in region:
-                                                task_log.error(
-                                                    f"Region {region['id']} missing combined_data field"
-                                                )
-                                                continue
-
-                                            if not region["combined_data"]:
-                                                task_log.error(
-                                                    f"Region {region['id']} has null combined_data"
-                                                )
-                                                continue
-
-                                            # Validate TIFF data retrieved from database
-                                            combined_data = region["combined_data"]
-                                            if not isinstance(combined_data, bytes):
-                                                task_log.error(
-                                                    f"Region {region['id']} has invalid data type: {type(combined_data)}"
-                                                )
-                                                continue
-
-                                            if not (
-                                                combined_data.startswith(b"II\x2A\x00")
-                                                or combined_data.startswith(b"MM\x00\x2A")
-                                            ):
-                                                task_log.error(
-                                                    f"Region {region['id']} has invalid TIFF header"
-                                                )
-                                                task_log.error(
-                                                    f"First 16 bytes: {combined_data[:16].hex()}"
-                                                )
-                                                continue
-
-                                            task_log.info(
-                                                f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB"
-                                            )
-                                            task_log.info(
-                                                f"Region {region['id']} TIFF header: {combined_data[:4]}"
-                                            )
-                                            task_log.info(
-                                                f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}"
-                                            )
-                                            encoded_data = base64.b64encode(combined_data)
-                                            task_log.info(
-                                                f"Base64 first 16 chars: {encoded_data[:16]}"
-                                            )
-
-                                            task_data = {
-                                                "region_id": region["id"],
-                                                "combined_data": encoded_data.decode("ascii"),
-                                                "sentinel_bounds": region["sentinel_bounds"],
-                                                "sentinel_crs": region["sentinel_crs"],
-                                                "target_time": target_smap_time.isoformat(),
-                                            }
-
-                                            payload = {
-                                                "nonce": str(uuid4()),
-                                                "data": {
-                                                    "region_id": task_data["region_id"],
-                                                    "combined_data": task_data["combined_data"],
-                                                    "sentinel_bounds": task_data["sentinel_bounds"],
-                                                    "sentinel_crs": task_data["sentinel_crs"],
-                                                    "target_time": task_data["target_time"],
-                                                },
-                                            }
-
-                                            task_log.info(
-                                                f"Sending payload to miners with region_id: {task_data['region_id']}"
-                                            )
-                                            try:
-                                                responses = await validator.query_miners(
-                                                    payload=payload,
-                                                    endpoint="/soilmoisture-request",
-                                                )
-
-                                                if not responses:
-                                                    task_log.error(
-                                                        "No responses received from miners"
-                                                    )
-                                                    return
-
-                                                task_log.info(
-                                                    f"Received {len(responses)} responses from miners"
-                                                )
-                                                first_hotkey = (
-                                                    next(iter(responses)) if responses else None
-                                                )
-                                                task_log.debug(
-                                                    f"First response structure: {responses[first_hotkey].keys() if first_hotkey else 'No responses'}"
-                                                )
-
-                                            except Exception as e:
-                                                task_log.error(f"Error querying miners: {str(e)}")
-                                                task_log.error(traceback.format_exc())
-                                                return
-
-                                            if responses:
-                                                metadata = {
-                                                    "region_id": region["id"],
-                                                    "target_time": target_smap_time,
-                                                    "data_collection_time": current_time,
-                                                    "ifs_forecast_time": ifs_forecast_time,
-                                                }
-                                                await self.add_task_to_queue(responses, metadata)
-
-                                                await self.db_manager.execute(
-                                                    """
-                                                    UPDATE soil_moisture_regions 
-                                                    SET status = 'sent_to_miners'
-                                                    WHERE id = :region_id
-                                                    """,
-                                                    {"region_id": region["id"]},
-                                                )
-
-                                        except Exception as e:
-                                            task_log.error(f"Error preparing region: {str(e)}")
-                                            task_log.error(traceback.format_exc())
-                                            continue
-
-                    async with task_wrapper.activity() as task_log:
-                        # Get all prep windows
-                        prep_windows = [w for w in self.get_validator_windows() if w[1] == 0]
-                        in_any_prep = any(
-                            self.is_in_window(current_time, w) for w in prep_windows
-                        )
-
-                        if not in_any_prep:
-                            next_prep_time = self.get_next_preparation_time(current_time)
-                            sleep_seconds = (
-                                next_prep_time - datetime.now(timezone.utc)
-                            ).total_seconds()
-                            if sleep_seconds > 0:
-                                task_log.info(
-                                    f"Sleeping until next soil task window: {next_prep_time}"
-                                )
-                                # Use timeout override for long window sleep
-                                async with task_wrapper.activity(timeout_override=int(sleep_seconds + 60)):
-                                    await asyncio.sleep(sleep_seconds)
-                else:
-                    # Non-task wrapper mode - use regular logger
-                    current_time = datetime.now(timezone.utc)
-                    if current_time.minute % 1 == 0:
-                        await self.validator_score()
-
-                    if self.test_mode:
-                        logger.info("Running in test mode - bypassing window checks")
-                        # ... rest of test mode logic with regular logger ...
-                        continue
-
-                    windows = self.get_validator_windows()
-                    current_window = next(
-                        (w for w in windows if self.is_in_window(current_time, w)), None
+                    await self.validator_preprocessing.get_daily_regions(
+                        target_time=target_smap_time,
+                        ifs_forecast_time=ifs_forecast_time,
                     )
 
-                    if not current_window:
-                        logger.info(f"Not in any preparation or execution window: {current_time}")
-                        logger.info(f"Next soil task time: {self.get_next_preparation_time(current_time)}")
-                        logger.info(f"Sleeping for 60 seconds")
-                        await asyncio.sleep(60)
-                        continue
+                    regions = await self.db_manager.fetch_many(
+                        """
+                        SELECT * FROM soil_moisture_regions 
+                        WHERE status = 'pending'
+                        AND target_time = :target_time
+                        """,
+                        {"target_time": target_smap_time},
+                    )
 
-                    # ... rest of regular execution logic with regular logger ...
+                    if regions:
+                        for region in regions:
+                            try:
+                                logger.info(f"Processing region {region['id']}")
+
+                                if "combined_data" not in region:
+                                    logger.error(
+                                        f"Region {region['id']} missing combined_data field"
+                                    )
+                                    continue
+
+                                if not region["combined_data"]:
+                                    logger.error(
+                                        f"Region {region['id']} has null combined_data"
+                                    )
+                                    continue
+
+                                combined_data = region["combined_data"]
+                                if not isinstance(combined_data, bytes):
+                                    logger.error(
+                                        f"Region {region['id']} has invalid data type: {type(combined_data)}"
+                                    )
+                                    continue
+
+                                if not (
+                                    combined_data.startswith(b"II\x2A\x00")
+                                    or combined_data.startswith(b"MM\x00\x2A")
+                                ):
+                                    logger.error(
+                                        f"Region {region['id']} has invalid TIFF header"
+                                    )
+                                    logger.error(
+                                        f"First 16 bytes: {combined_data[:16].hex()}"
+                                    )
+                                    continue
+
+                                logger.info(
+                                    f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB"
+                                )
+                                logger.info(
+                                    f"Region {region['id']} TIFF header: {combined_data[:4]}"
+                                )
+                                logger.info(
+                                    f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}"
+                                )
+                                encoded_data = base64.b64encode(combined_data)
+                                logger.info(
+                                    f"Base64 first 16 chars: {encoded_data[:16]}"
+                                )
+
+                                task_data = {
+                                    "region_id": region["id"],
+                                    "combined_data": encoded_data.decode("ascii"),
+                                    "sentinel_bounds": region["sentinel_bounds"],
+                                    "sentinel_crs": region["sentinel_crs"],
+                                    "target_time": target_smap_time.isoformat(),
+                                }
+
+                                payload = {"nonce": str(uuid4()), "data": task_data}
+
+                                logger.info(
+                                    f"Sending region {region['id']} to miners..."
+                                )
+                                responses = await validator.query_miners(
+                                    payload=payload, endpoint="/soilmoisture-request"
+                                )
+
+                                if responses:
+                                    metadata = {
+                                        "region_id": region["id"],
+                                        "target_time": target_smap_time,
+                                        "data_collection_time": current_time,
+                                        "ifs_forecast_time": ifs_forecast_time,
+                                    }
+                                    await self.add_task_to_queue(responses, metadata)
+
+                                    await self.db_manager.execute(
+                                        """
+                                        UPDATE soil_moisture_regions 
+                                        SET status = 'sent_to_miners'
+                                        WHERE id = :region_id
+                                        """,
+                                        {"region_id": region["id"]},
+                                    )
+
+                            except Exception as e:
+                                logger.error(f"Error preparing region: {str(e)}")
+                                continue
+
+                    logger.info("Test mode execution complete. Disabling test mode.")
+                    self.test_mode = False
+                    continue
+
+                windows = self.get_validator_windows()
+                current_window = next(
+                    (w for w in windows if self.is_in_window(current_time, w)), None
+                )
+
+                if not current_window:
+                    logger.info(
+                        f"Not in any preparation or execution window: {current_time}"
+                    )
+                    logger.info(
+                        f"Next soil task time: {self.get_next_preparation_time(current_time)}"
+                    )
+                    logger.info(f"Sleeping for 60 seconds")
+                    await asyncio.sleep(60)
+                    continue
+
+                is_prep = current_window[1] == 30  # If minutes = 30, it's a prep window
+
+                target_smap_time = self.get_smap_time_for_validator(current_time)
+                ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
+
+                if is_prep:
+                    await self.validator_preprocessing.get_daily_regions(
+                        target_time=target_smap_time,
+                        ifs_forecast_time=ifs_forecast_time,
+                    )
+                else:
+                    # Execution window logic
+                    regions = await self.db_manager.fetch_many(
+                        """
+                        SELECT * FROM soil_moisture_regions 
+                        WHERE status = 'pending'
+                        AND target_time = :target_time
+                        """,
+                        {"target_time": target_smap_time},
+                    )
+
+                    if regions:
+                        for region in regions:
+                            try:
+                                logger.info(f"Processing region {region['id']}")
+
+                                if "combined_data" not in region:
+                                    logger.error(
+                                        f"Region {region['id']} missing combined_data field"
+                                    )
+                                    continue
+
+                                if not region["combined_data"]:
+                                    logger.error(
+                                        f"Region {region['id']} has null combined_data"
+                                    )
+                                    continue
+
+                                # Validate TIFF data retrieved from database
+                                combined_data = region["combined_data"]
+                                if not isinstance(combined_data, bytes):
+                                    logger.error(
+                                        f"Region {region['id']} has invalid data type: {type(combined_data)}"
+                                    )
+                                    continue
+
+                                if not (
+                                    combined_data.startswith(b"II\x2A\x00")
+                                    or combined_data.startswith(b"MM\x00\x2A")
+                                ):
+                                    logger.error(
+                                        f"Region {region['id']} has invalid TIFF header"
+                                    )
+                                    logger.error(
+                                        f"First 16 bytes: {combined_data[:16].hex()}"
+                                    )
+                                    continue
+
+                                logger.info(
+                                    f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB"
+                                )
+                                logger.info(
+                                    f"Region {region['id']} TIFF header: {combined_data[:4]}"
+                                )
+                                logger.info(
+                                    f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}"
+                                )
+                                encoded_data = base64.b64encode(combined_data)
+                                logger.info(
+                                    f"Base64 first 16 chars: {encoded_data[:16]}"
+                                )
+
+                                task_data = {
+                                    "region_id": region["id"],
+                                    "combined_data": encoded_data.decode("ascii"),
+                                    "sentinel_bounds": region["sentinel_bounds"],
+                                    "sentinel_crs": region["sentinel_crs"],
+                                    "target_time": target_smap_time.isoformat(),
+                                }
+
+                                payload = {
+                                    "nonce": str(uuid4()),
+                                    "data": {
+                                        "region_id": task_data["region_id"],
+                                        "combined_data": task_data["combined_data"],
+                                        "sentinel_bounds": task_data["sentinel_bounds"],
+                                        "sentinel_crs": task_data["sentinel_crs"],
+                                        "target_time": task_data["target_time"],
+                                    },
+                                }
+
+                                logger.info(
+                                    f"Sending payload to miners with region_id: {task_data['region_id']}"
+                                )
+                                try:
+                                    responses = await validator.query_miners(
+                                        payload=payload,
+                                        endpoint="/soilmoisture-request",
+                                    )
+
+                                    if not responses:
+                                        logger.error(
+                                            "No responses received from miners"
+                                        )
+                                        return
+
+                                    logger.info(
+                                        f"Received {len(responses)} responses from miners"
+                                    )
+                                    first_hotkey = (
+                                        next(iter(responses)) if responses else None
+                                    )
+                                    logger.debug(
+                                        f"First response structure: {responses[first_hotkey].keys() if first_hotkey else 'No responses'}"
+                                    )
+
+                                except Exception as e:
+                                    logger.error(f"Error querying miners: {str(e)}")
+                                    logger.error(traceback.format_exc())
+                                    return
+
+                                if responses:
+                                    metadata = {
+                                        "region_id": region["id"],
+                                        "target_time": target_smap_time,
+                                        "data_collection_time": current_time,
+                                        "ifs_forecast_time": ifs_forecast_time,
+                                    }
+                                    await self.add_task_to_queue(responses, metadata)
+
+                                    await self.db_manager.execute(
+                                        """
+                                        UPDATE soil_moisture_regions 
+                                        SET status = 'sent_to_miners'
+                                        WHERE id = :region_id
+                                        """,
+                                        {"region_id": region["id"]},
+                                    )
+
+                            except Exception as e:
+                                logger.error(f"Error preparing region: {str(e)}")
+                                logger.error(traceback.format_exc())
+                                continue
+
+                # Get all prep windows
+                prep_windows = [w for w in self.get_validator_windows() if w[1] == 0]
+                in_any_prep = any(
+                    self.is_in_window(current_time, w) for w in prep_windows
+                )
+
+                if not in_any_prep:
+                    next_prep_time = self.get_next_preparation_time(current_time)
+                    sleep_seconds = (
+                        next_prep_time - datetime.now(timezone.utc)
+                    ).total_seconds()
+                    if sleep_seconds > 0:
+                        logger.info(
+                            f"Sleeping until next soil task window: {next_prep_time}"
+                        )
+                        await asyncio.sleep(sleep_seconds)
 
             except Exception as e:
-                if task_wrapper:
-                    async with task_wrapper.activity() as task_log:
-                        task_log.error(f"Error in validator_execute: {e}")
-                        task_log.error(traceback.format_exc())
-                    # Use timeout override for error recovery sleep
-                    async with task_wrapper.activity(timeout_override=120):
-                        await asyncio.sleep(60)
-                else:
-                    logger.error(f"Error in validator_execute: {e}")
-                    logger.error(traceback.format_exc())
-                    await asyncio.sleep(60)
+                logger.error(f"Error in validator_execute: {e}")
+                logger.error(traceback.format_exc())
+                await asyncio.sleep(60)
 
     async def get_todays_regions(self, target_time: datetime) -> List[Dict]:
         """Get regions already selected for today."""

@@ -167,7 +167,7 @@ class GeomagneticTask(Task):
     # Validator execution method
     ############################################################
 
-    async def validator_execute(self, validator, task_wrapper=None):
+    async def validator_execute(self, validator):
         """
         Executes the validator workflow:
         - Aligns execution to start at the top of each UTC hour.
@@ -177,103 +177,48 @@ class GeomagneticTask(Task):
         - Archives scored predictions in the history table or file.
         - Runs in a continuous loop.
         """
-        # Use task logger if available, otherwise use default logger
-        task_log = logger
-        if task_wrapper:
-            while True:
-                try:
-                    # Step 1: Calculate sleep duration
-                    current_time = datetime.datetime.now(datetime.timezone.utc)
-                    next_hour = current_time.replace(
-                        minute=0, second=0, microsecond=0
-                    ) + datetime.timedelta(hours=1)
-                    sleep_duration = (next_hour - current_time).total_seconds()
+        while True:
+            try:
+                # Step 1: Align to the top of the next hour
+                current_time = datetime.datetime.now(datetime.timezone.utc)
+                next_hour = current_time.replace(
+                    minute=0, second=0, microsecond=0
+                ) + datetime.timedelta(hours=1)
+                sleep_duration = (next_hour - current_time).total_seconds()
 
-                    async with task_wrapper.activity() as task_log:
-                        task_log.info(
-                            f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
-                        )
+                logger.info(
+                    f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
+                )
+                await asyncio.sleep(sleep_duration)
 
-                    # Use explicit timeout for sleep period
-                    async with task_wrapper.activity(timeout_override=int(sleep_duration + 60)):
-                        await asyncio.sleep(sleep_duration)
+                logger.info("Starting GeomagneticTask execution...")
 
-                    # Main task execution with activity tracking
-                    async with task_wrapper.activity() as task_log:
-                        task_log.info("Starting GeomagneticTask execution...")
+                # Step 2: Fetch Latest Geomagnetic Data
+                timestamp, dst_value, historical_data = await self._fetch_geomag_data()
 
-                        # Step 2: Fetch Latest Geomagnetic Data
-                        task_log.info("Fetching latest geomagnetic data...")
-                        timestamp, dst_value, historical_data = await self._fetch_geomag_data()
-                        task_log.info(
-                            f"Fetched latest geomagnetic data: timestamp={timestamp}, value={dst_value}"
-                        )
+                # Step 3: Query Miners
+                current_hour_start = next_hour - datetime.timedelta(hours=1)
+                await self._query_miners(
+                    validator, timestamp, dst_value, historical_data, current_hour_start
+                )
 
-                        # Step 3: Query Miners
-                        current_hour_start = next_hour - datetime.timedelta(hours=1)
-                        task_log.info("Querying miners with current data...")
-                        await self._query_miners(
-                            validator, timestamp, dst_value, historical_data, current_hour_start
-                        )
+                # Step 4: Process Scores
+                await self._process_scores(validator, current_hour_start, next_hour)
 
-                        # Step 4: Process Scores
-                        task_log.info("Processing scores...")
-                        await self._process_scores(validator, current_hour_start, next_hour)
-                        task_log.info("Score processing complete")
+            except Exception as e:
+                logger.error(f"Unexpected error in validator_execute loop: {e}")
+                logger.error(traceback.format_exc())
 
-                except Exception as e:
-                    if task_wrapper:
-                        async with task_wrapper.activity() as task_log:
-                            task_log.error(f"Unexpected error in validator_execute loop: {e}")
-                            task_log.error(traceback.format_exc())
-                        
-                        # Use explicit timeout for error recovery sleep
-                        async with task_wrapper.activity(timeout_override=3660):
-                            await asyncio.sleep(3600)
-                    else:
-                        logger.error(f"Unexpected error in validator_execute loop: {e}")
-                        logger.error(traceback.format_exc())
-                        await asyncio.sleep(3600)
-        else:
-            # Run without activity tracking
-            while True:
-                try:
-                    # Step 1: Calculate sleep duration
-                    current_time = datetime.datetime.now(datetime.timezone.utc)
-                    next_hour = current_time.replace(
-                        minute=0, second=0, microsecond=0
-                    ) + datetime.timedelta(hours=1)
-                    sleep_duration = (next_hour - current_time).total_seconds()
-
-                    logger.info(
-                        f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
-                    )
-
-                    await asyncio.sleep(sleep_duration)
-
-                    logger.info("Starting GeomagneticTask execution...")
-
-                    # Step 2: Fetch Latest Geomagnetic Data
-                    timestamp, dst_value, historical_data = await self._fetch_geomag_data()
-
-                    # Step 3: Query Miners
-                    current_hour_start = next_hour - datetime.timedelta(hours=1)
-                    await self._query_miners(
-                        validator, timestamp, dst_value, historical_data, current_hour_start
-                    )
-
-                    # Step 4: Process Scores
-                    await self._process_scores(validator, current_hour_start, next_hour)
-
-                except Exception as e:
-                    logger.error(f"Unexpected error in validator_execute loop: {e}")
-                    logger.error(traceback.format_exc())
-                    await asyncio.sleep(3600)  # Error recovery sleep
+                await asyncio.sleep(3600)
 
     async def _fetch_geomag_data(self):
         """Fetch latest geomagnetic data."""
+        logger.info("Fetching latest geomagnetic data...")
         timestamp, dst_value, historical_data = await get_latest_geomag_data(
             include_historical=True
+        )
+        logger.info(
+            f"Fetched latest geomagnetic data: timestamp={timestamp}, value={dst_value}"
         )
         if historical_data is not None:
             logger.info(
@@ -309,6 +254,7 @@ class GeomagneticTask(Task):
         }
         endpoint = "/geomagnetic-request"
 
+        logger.info(f"Querying miners for geomagnetic predictions")
         responses = await validator.query_miners(payload_template, endpoint)
         logger.info(f"Collected responses from miners: {len(responses)}")
 
@@ -326,7 +272,7 @@ class GeomagneticTask(Task):
         # Score Predictions and Archive Results
         last_hour_start = current_hour_start
         last_hour_end = next_hour.replace(minute=0, second=0, microsecond=0)
-        current_time = datetime.datetime.now(datetime.timezone.utc)
+        current_time = datetime.datetime.now(datetime.timezone.utc)  # Add this line
 
         logger.info(
             f"Fetching predictions between {last_hour_start} and {last_hour_end}"
