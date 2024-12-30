@@ -41,7 +41,7 @@ class MinerScoreSender:
                 FROM geomagnetic_history
                 WHERE miner_hotkey = :miner_hotkey
                 ORDER BY scored_at DESC
-                LIMIT 10
+                LIMIT 40
             """)
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
@@ -59,20 +59,18 @@ class MinerScoreSender:
             ]
 
     async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
-        """
-        Fetch soil moisture prediction history.
-        """
         async with await self.database_manager.get_connection() as session:
             query = text("""
-                SELECT id, target_time AS prediction_datetime, region_id, sentinel_bounds, sentinel_crs,
-                       target_time, surface_rmse, rootzone_rmse, surface_sm_pred AS surface_predicted_values,
-                       rootzone_sm_pred AS rootzone_predicted_values, surface_sm_truth AS surface_ground_truth_values,
-                       rootzone_sm_truth AS rootzone_ground_truth_values, surface_structure_score,
-                       rootzone_structure_score, scored_at
-                FROM soil_moisture_history
-                WHERE miner_hotkey = :miner_hotkey
-                ORDER BY scored_at DESC
-                LIMIT 10
+                SELECT smh.id, smh.target_time AS prediction_datetime, smh.region_id, smp.sentinel_bounds, smh.sentinel_crs,
+                       smh.target_time, smh.surface_rmse, smh.rootzone_rmse, smh.surface_sm_pred AS surface_predicted_values,
+                       smh.rootzone_sm_pred AS rootzone_predicted_values, smh.surface_sm_truth AS surface_ground_truth_values,
+                       smh.rootzone_sm_truth AS rootzone_ground_truth_values, smh.surface_structure_score,
+                       smh.rootzone_structure_score, smh.scored_at
+                FROM soil_moisture_history smh
+                LEFT JOIN soil_moisture_predictions smp ON smh.region_id = smp.region_id
+                WHERE smh.miner_hotkey = :miner_hotkey
+                ORDER BY smh.scored_at DESC
+                LIMIT 40
             """)
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
@@ -81,17 +79,16 @@ class MinerScoreSender:
                     "predictionDate": row[1].isoformat(),
                     "soilPredictionRegionId": row[2],
                     "sentinelRegionBounds": row[3],
-                    "sentinelRegionCrs": row[4],
-                    "soilPredictionTargetDate": row[5].isoformat(),
-                    "soilSurfaceRmse": row[6],
-                    "soilRootzoneRmse": row[7],
-                    "soilSurfacePredictedValues": row[8],
-                    "soilRootzonePredictedValues": row[9],
-                    "soilSurfaceGroundTruthValues": row[10],
-                    "soilRootzoneGroundTruthValues": row[11],
-                    "soilSurfaceStructureScore": row[12],
-                    "soilRootzoneStructureScore": row[13],
-                    "scoreGenerationDate": row[14].isoformat()
+                    "soilPredictionTargetDate": row[4].isoformat(),
+                    "soilSurfaceRmse": row[5],
+                    "soilRootzoneRmse": row[6],
+                    "soilSurfacePredictedValues": row[7],
+                    "soilRootzonePredictedValues": row[8],
+                    "soilSurfaceGroundTruthValues": row[9],
+                    "soilRootzoneGroundTruthValues": row[10],
+                    "soilSurfaceStructureScore": row[11],
+                    "soilRootzoneStructureScore": row[12],
+                    "scoreGenerationDate": row[13].isoformat()
                 }
                 for row in result.fetchall()
             ]
