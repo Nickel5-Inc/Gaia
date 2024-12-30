@@ -61,17 +61,29 @@ class MinerScoreSender:
     async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
         async with await self.database_manager.get_connection() as session:
             query = text("""
-                SELECT smh.id, smh.target_time AS prediction_datetime, smh.region_id, smp.sentinel_bounds, smh.sentinel_crs,
-                       smh.target_time, smh.surface_rmse, smh.rootzone_rmse, smh.surface_sm_pred AS surface_predicted_values,
-                       smh.rootzone_sm_pred AS rootzone_predicted_values, smh.surface_sm_truth AS surface_ground_truth_values,
-                       smh.rootzone_sm_truth AS rootzone_ground_truth_values, smh.surface_structure_score,
-                       smh.rootzone_structure_score, smh.scored_at
-                FROM soil_moisture_history smh
-                LEFT JOIN soil_moisture_predictions smp ON smh.region_id = smp.region_id
-                WHERE smh.miner_hotkey = :miner_hotkey
-                ORDER BY smh.scored_at DESC
+                SELECT soil_moisture_history.id, 
+                       soil_moisture_history.target_time AS prediction_datetime, 
+                       soil_moisture_history.region_id, 
+                       soil_moisture_predictions.sentinel_bounds, 
+                       soil_moisture_predictions.sentinel_crs,
+                       soil_moisture_history.target_time, 
+                       soil_moisture_history.surface_rmse, 
+                       soil_moisture_history.rootzone_rmse, 
+                       soil_moisture_history.surface_sm_pred AS surface_predicted_values,
+                       soil_moisture_history.rootzone_sm_pred AS rootzone_predicted_values, 
+                       soil_moisture_history.surface_sm_truth AS surface_ground_truth_values,
+                       soil_moisture_history.rootzone_sm_truth AS rootzone_ground_truth_values, 
+                       soil_moisture_history.surface_structure_score,
+                       soil_moisture_history.rootzone_structure_score, 
+                       soil_moisture_history.scored_at
+                FROM soil_moisture_history
+                LEFT JOIN soil_moisture_predictions 
+                ON soil_moisture_history.region_id = soil_moisture_predictions.region_id
+                WHERE soil_moisture_history.miner_hotkey = :miner_hotkey
+                ORDER BY soil_moisture_history.scored_at DESC
                 LIMIT 40
             """)
+
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
                 {
