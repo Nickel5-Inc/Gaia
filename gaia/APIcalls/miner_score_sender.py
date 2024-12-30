@@ -2,6 +2,7 @@ import asyncio
 import threading
 from datetime import timezone, datetime
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import text
 import bittensor as bt
 
 from gaia.APIcalls.website_api import GaiaCommunicator
@@ -26,28 +27,19 @@ class MinerScoreSender:
             List of dictionaries with miner details.
         """
         async with await self.database_manager.get_connection() as session:
-            query = "SELECT uid, hotkey, coldkey FROM node_table WHERE hotkey IS NOT NULL"
+            query = text("SELECT uid, hotkey, coldkey FROM node_table WHERE hotkey IS NOT NULL")
             result = await session.execute(query)
             return [{"uid": row[0], "hotkey": row[1], "coldkey": row[2]} for row in result.fetchall()]
 
     async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
-        """
-        Fetch geomagnetic prediction history.
-
-        Args:
-            miner_hotkey: Hotkey of the miner.
-
-        Returns:
-            List of dictionaries containing geomagnetic prediction details.
-        """
         async with await self.database_manager.get_connection() as session:
-            query = """
+            query = text("""
                 SELECT id, prediction_datetime, predicted_value, ground_truth_value, score, scored_at
                 FROM geomagnetic_history
                 WHERE miner_hotkey = :miner_hotkey
                 ORDER BY scored_at DESC
                 LIMIT 10
-            """
+            """)
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
                 {
@@ -64,17 +56,8 @@ class MinerScoreSender:
             ]
 
     async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
-        """
-        Fetch soil moisture prediction history.
-
-        Args:
-            miner_hotkey: Hotkey of the miner.
-
-        Returns:
-            List of dictionaries containing soil moisture prediction details.
-        """
         async with await self.database_manager.get_connection() as session:
-            query = """
+            query = text("""
                 SELECT id, prediction_datetime, region_id, sentinel_bounds, sentinel_crs,
                        target_date, surface_rmse, rootzone_rmse, surface_predicted_values,
                        rootzone_predicted_values, surface_ground_truth_values,
@@ -84,7 +67,7 @@ class MinerScoreSender:
                 WHERE miner_hotkey = :miner_hotkey
                 ORDER BY scored_at DESC
                 LIMIT 10
-            """
+            """)
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
                 {
