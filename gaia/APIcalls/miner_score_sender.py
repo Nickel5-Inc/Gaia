@@ -32,9 +32,12 @@ class MinerScoreSender:
             return [{"uid": row[0], "hotkey": row[1], "coldkey": row[2]} for row in result.fetchall()]
 
     async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
+        """
+        Fetch geomagnetic prediction history.
+        """
         async with await self.database_manager.get_connection() as session:
             query = text("""
-                SELECT id, prediction_datetime, predicted_value, ground_truth_value, score, scored_at
+                SELECT id, query_time AS prediction_datetime, predicted_value, ground_truth_value, score, scored_at
                 FROM geomagnetic_history
                 WHERE miner_hotkey = :miner_hotkey
                 ORDER BY scored_at DESC
@@ -56,12 +59,15 @@ class MinerScoreSender:
             ]
 
     async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
+        """
+        Fetch soil moisture prediction history.
+        """
         async with await self.database_manager.get_connection() as session:
             query = text("""
-                SELECT id, prediction_datetime, region_id, sentinel_bounds, sentinel_crs,
-                       target_date, surface_rmse, rootzone_rmse, surface_predicted_values,
-                       rootzone_predicted_values, surface_ground_truth_values,
-                       rootzone_ground_truth_values, surface_structure_score,
+                SELECT id, target_time AS prediction_datetime, region_id, sentinel_bounds, sentinel_crs,
+                       target_time, surface_rmse, rootzone_rmse, surface_sm_pred AS surface_predicted_values,
+                       rootzone_sm_pred AS rootzone_predicted_values, surface_sm_truth AS surface_ground_truth_values,
+                       rootzone_sm_truth AS rootzone_ground_truth_values, surface_structure_score,
                        rootzone_structure_score, scored_at
                 FROM soil_moisture_history
                 WHERE miner_hotkey = :miner_hotkey
