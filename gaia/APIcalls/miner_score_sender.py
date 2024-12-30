@@ -25,7 +25,7 @@ class MinerScoreSender:
         Returns:
             List of dictionaries with miner details.
         """
-        async with self.database_manager.get_connection() as session:
+        async with await self.database_manager.get_connection() as session:
             query = "SELECT uid, hotkey, coldkey FROM node_table WHERE hotkey IS NOT NULL"
             result = await session.execute(query)
             return [{"uid": row[0], "hotkey": row[1], "coldkey": row[2]} for row in result.fetchall()]
@@ -40,7 +40,7 @@ class MinerScoreSender:
         Returns:
             List of dictionaries containing geomagnetic prediction details.
         """
-        async with self.database_manager.get_connection() as session:
+        async with await self.database_manager.get_connection() as session:
             query = """
                 SELECT id, prediction_datetime, predicted_value, ground_truth_value, score, scored_at
                 FROM geomagnetic_history
@@ -73,7 +73,7 @@ class MinerScoreSender:
         Returns:
             List of dictionaries containing soil moisture prediction details.
         """
-        async with self.database_manager.get_connection() as session:
+        async with await self.database_manager.get_connection() as session:
             query = """
                 SELECT id, prediction_datetime, region_id, sentinel_bounds, sentinel_crs,
                        target_date, surface_rmse, rootzone_rmse, surface_predicted_values,
