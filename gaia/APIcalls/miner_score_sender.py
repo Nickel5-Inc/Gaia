@@ -41,7 +41,7 @@ class MinerScoreSender:
                 FROM geomagnetic_history
                 WHERE miner_hotkey = :miner_hotkey
                 ORDER BY scored_at DESC
-                LIMIT 40
+                LIMIT 20
             """)
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
@@ -81,26 +81,28 @@ class MinerScoreSender:
                 ON soil_moisture_history.region_id = soil_moisture_predictions.region_id
                 WHERE soil_moisture_history.miner_hotkey = :miner_hotkey
                 ORDER BY soil_moisture_history.scored_at DESC
-                LIMIT 40
+                LIMIT 20
             """)
 
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
                 {
                     "predictionId": row[0],
-                    "predictionDate": row[1].isoformat(),
+                    "predictionDate": datetime.fromtimestamp(row[1]).isoformat() if isinstance(row[1], int) else row[
+                        1].isoformat(),
                     "soilPredictionRegionId": row[2],
                     "sentinelRegionBounds": row[3],
-                    "soilPredictionTargetDate": row[4].isoformat(),
-                    "soilSurfaceRmse": row[5],
-                    "soilRootzoneRmse": row[6],
-                    "soilSurfacePredictedValues": row[7],
-                    "soilRootzonePredictedValues": row[8],
-                    "soilSurfaceGroundTruthValues": row[9],
-                    "soilRootzoneGroundTruthValues": row[10],
-                    "soilSurfaceStructureScore": row[11],
-                    "soilRootzoneStructureScore": row[12],
-                    "scoreGenerationDate": row[13].isoformat()
+                    "sentinelRegionCrs": row[4],
+                    "soilPredictionTargetDate": datetime.fromtimestamp(row[5]).isoformat() if isinstance(row[5], int) else row[5].isoformat(),
+                    "soilSurfaceRmse": row[6],
+                    "soilRootzoneRmse": row[7],
+                    "soilSurfacePredictedValues": row[8],
+                    "soilRootzonePredictedValues": row[9],
+                    "soilSurfaceGroundTruthValues": row[10],
+                    "soilRootzoneGroundTruthValues": row[11],
+                    "soilSurfaceStructureScore": row[12],
+                    "soilRootzoneStructureScore": row[13],
+                    "scoreGenerationDate": datetime.fromtimestamp(row[14]).isoformat() if isinstance(row[14], int) else row[14].isoformat(),
                 }
                 for row in result.fetchall()
             ]
