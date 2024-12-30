@@ -107,53 +107,111 @@ class MinerScoreSender:
                 for row in result.fetchall()
             ]
 
-    async def send_miner_scores_to_gaia(self) -> None:
+    async def send_geomagnetic_scores_to_gaia(self) -> None:
         """
-        Fetch miner data, scores, and raw predictions, then send to Gaia API.
+        Fetch geomagnetic scores and predictions for miners, then send to Gaia API.
         """
         current_thread = threading.current_thread().name
 
         # Step 1: Fetch active miners
         active_miners = await self.fetch_active_miners()
         if not active_miners:
-            bt.logging.warning(f"| {current_thread} | ❗ No active miners found.")
+            bt.logging.warning(f"| {current_thread} | ❗ No active miners found for geomagnetic scores.")
             return
 
         data_to_send = []
 
-        # Step 2: Fetch geomagnetic and soil moisture data for each miner
+        # Step 2: Fetch geomagnetic data for each miner
         for miner in active_miners:
             uid, hotkey, coldkey = miner["uid"], miner["hotkey"], miner["coldkey"]
 
-            # Fetch predictions
+            # Fetch geomagnetic predictions
             geomagnetic_predictions = await self.fetch_geomagnetic_history(hotkey)
-            soil_moisture_predictions = await self.fetch_soil_moisture_history(hotkey)
-
-            # Get the most recent weight (placeholder logic)
-            most_recent_weight = 0.5  # Replace with actual weight logic
 
             # Prepare the payload
-            data_to_send.append({
-                "minerHotKey": hotkey,
-                "minerColdKey": coldkey,
-                "geomagneticPredictions": geomagnetic_predictions,
-                "soilMoisturePredictions": soil_moisture_predictions
-            })
+            if geomagnetic_predictions:
+                data_to_send.append({
+                    "minerHotKey": hotkey,
+                    "minerColdKey": coldkey,
+                    "geomagneticPredictions": geomagnetic_predictions
+                })
 
-        bt.logging.info(f"| {current_thread} | ⛵ Sending {len(data_to_send)} miner scores to Gaia.")
+        bt.logging.info(f"| {current_thread} | ⛵ Sending {len(data_to_send)} geomagnetic scores to Gaia.")
 
         # Step 3: Send data to Gaia
         gaia_communicator = GaiaCommunicator("/Predictions")
         for miner_data in data_to_send:
-            gaia_communicator.send_data(data=miner_data)
+            try:
+                gaia_communicator.send_data(data=miner_data)
+            except Exception as e:
+                bt.logging.error(
+                    f"| {current_thread} | ❗ Failed to send geomagnetic data for miner {miner_data['minerHotKey']}: {e}")
+
+    async def send_soil_scores_to_gaia(self) -> None:
+        """
+        Fetch soil moisture scores and predictions for miners, then send to Gaia API.
+        """
+        current_thread = threading.current_thread().name
+
+        # Step 1: Fetch active miners
+        active_miners = await self.fetch_active_miners()
+        if not active_miners:
+            bt.logging.warning(f"| {current_thread} | ❗ No active miners found for soil scores.")
+            return
+
+        data_to_send = []
+
+        # Step 2: Fetch soil moisture data for each miner
+        for miner in active_miners:
+            uid, hotkey, coldkey = miner["uid"], miner["hotkey"], miner["coldkey"]
+
+            # Fetch soil moisture predictions
+            soil_moisture_predictions = await self.fetch_soil_moisture_history(hotkey)
+
+            # Prepare the payload
+            if soil_moisture_predictions:
+                data_to_send.append({
+                    "minerHotKey": hotkey,
+                    "minerColdKey": coldkey,
+                    "soilMoisturePredictions": soil_moisture_predictions
+                })
+
+        bt.logging.info(f"| {current_thread} | ⛵ Sending {len(data_to_send)} soil moisture scores to Gaia.")
+
+        # Step 3: Send data to Gaia
+        gaia_communicator = GaiaCommunicator("/Predictions")
+        for miner_data in data_to_send:
+            try:
+                gaia_communicator.send_data(data=miner_data)
+            except Exception as e:
+                bt.logging.error(
+                    f"| {current_thread} | ❗ Failed to send soil moisture data for miner {miner_data['minerHotKey']}: {e}")
 
     def run(self):
         """
-        Run the send miner scores process in a new event loop.
+        Run the process to send geomagnetic and soil moisture scores in separate event loops.
         """
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(self.send_miner_scores_to_gaia())
+
+        try:
+            bt.logging.info("| MainThread | Starting the process to send scores to Gaia API...")
+
+            tasks = [
+                self.send_geomagnetic_scores_to_gaia(),
+                self.send_soil_scores_to_gaia()
+            ]
+
+            bt.logging.info("| MainThread | Initiating geomagnetic and soil moisture score sending tasks...")
+
+            loop.run_until_complete(asyncio.gather(*tasks))
+
+            bt.logging.info("| MainThread | Successfully completed sending scores to Gaia API.")
+        except Exception as e:
+            bt.logging.error(f"| MainThread | ❗ An error occurred in the run method: {e}")
+        finally:
+            bt.logging.info("| MainThread | Closing the event loop.")
+            loop.close()
 
 
 if __name__ == "__main__":
