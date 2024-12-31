@@ -110,7 +110,7 @@ class FiberWeightSetter:
                     netuid=self.netuid,
                     validator_node_id=validator_uid,
                     version_key=version_key,
-                    wait_for_inclusion=False,
+                    wait_for_inclusion=True,
                     wait_for_finalization=False,
                 )
                 logger.info("Weight commit initiated, continuing...")
