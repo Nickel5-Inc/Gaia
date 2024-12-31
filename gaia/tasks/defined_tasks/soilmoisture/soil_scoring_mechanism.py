@@ -257,9 +257,26 @@ class SoilScoringMechanism(ScoringMechanism):
             if not smap_data:
                 return None
 
-            if model_predictions.shape[2] == 0 or model_predictions.shape[3] == 0:
+            if model_predictions.size(2) == 0 or model_predictions.size(3) == 0:
                 logger.error(f"Empty model predictions detected with shape: {model_predictions.shape}")
-                return None
+      
+                await self.db_manager.execute(
+                    """
+                    DELETE FROM soil_moisture_predictions 
+                    WHERE miner_uid = :miner_id 
+                    AND target_time = :target_time
+                    """,
+                    {
+                        "miner_id": miner_id,
+                        "target_time": target_date
+                    }
+                )
+                logger.info(f"Deleted invalid prediction for miner {miner_id} at {target_date}")
+                
+                return {
+                    "status": "invalid_prediction",
+                    "error": "Empty prediction tensor"
+                }
 
             if model_predictions.shape[-2:] != (11, 11):
                 logger.error(f"Invalid model prediction shape: {model_predictions.shape}, expected last dimensions to be (11, 11)")
