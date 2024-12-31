@@ -2,7 +2,9 @@ from gaia.tasks.base.components.scoring_mechanism import ScoringMechanism
 from fiber.logging_utils import get_logger
 import math
 import asyncio
-from datetime import timezone
+from datetime import timezone, datetime
+from pydantic import Field
+from typing import Any
 
 logger = get_logger(__name__)
 
@@ -15,12 +17,17 @@ class GeomagneticScoringMechanism(ScoringMechanism):
     Includes functionality to capture and save miner predictions and scores.
     """
 
+    db_manager: Any = Field(
+        None, 
+        description="Database manager for the scoring mechanism"
+    )
+
     def __init__(self, db_manager):
         super().__init__(
             name="Geomagnetic Scoring",
             description="Updated scoring mechanism for geomagnetic tasks with improved normalization.",
+            db_manager=db_manager
         )
-        self.db_manager = db_manager
 
     def calculate_score(self, predicted_value, actual_value):
         """
@@ -34,10 +41,9 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             float: A higher score indicates a better prediction.
         """
         if not isinstance(predicted_value, (int, float)) or not isinstance(actual_value, (int, float)):
-            return float("nan")  # Invalid predictions are marked as NaN
+            return float("nan")
 
         try:
-            # Higher score for smaller deviation
             return 1 / (1 + abs(predicted_value - actual_value))
         except Exception as e:
             logger.error(f"Error calculating score: {e}")
@@ -63,7 +69,7 @@ class GeomagneticScoringMechanism(ScoringMechanism):
         max_score = max(valid_scores)
 
         if max_score == min_score:
-            return [1.0 for _ in scores]  # All valid scores are the same
+            return [1.0 for _ in scores]
 
         return [(score - min_score) / (max_score - min_score) if not math.isnan(score) else 0.0 for score in scores]
 
@@ -156,10 +162,8 @@ class GeomagneticScoringMechanism(ScoringMechanism):
                     "score": score_value
                 })
 
-            # Save predictions to the database
             await self.save_predictions(predictions)
 
-            # Save scores to the database
             await self.save_scores(miner_scores)
 
             return miner_scores

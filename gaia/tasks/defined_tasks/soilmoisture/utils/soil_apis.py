@@ -176,18 +176,22 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
     if result:
         return result
 
-    print("No data found for current month, trying previous month...")
-    if datetime_obj.month == 1:
-        prev_month_date = datetime_obj.replace(year=datetime_obj.year - 1, month=12)
-    else:
-        prev_month_date = datetime_obj.replace(month=datetime_obj.month - 1)
-
-    result = await try_month(prev_month_date)
-    if result:
-        return result
-
-    print("No suitable Sentinel-2 data found in current or previous month")
-    return None
+    try:
+        print("No data found for current month, trying previous month...")
+        if datetime_obj.month == 1:
+            prev_month_date = datetime_obj.replace(year=datetime_obj.year - 1, month=12, day=1)
+        else:
+            first_of_month = datetime_obj.replace(day=1)
+            prev_month_date = first_of_month - timedelta(days=1)
+            try:
+                prev_month_date = prev_month_date.replace(day=min(datetime_obj.day, prev_month_date.day))
+            except ValueError:
+                pass
+        
+        return await try_month(prev_month_date)
+    except Exception as e:
+        print(f"Error fetching previous month's data: {str(e)}")
+        return None
 
 
 async def download_srtm_tile(lat, lon, download_dir=None):

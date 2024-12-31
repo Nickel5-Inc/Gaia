@@ -9,7 +9,10 @@ from typing import Any, Optional, List, Dict
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import httpx
-from fiber.chain import chain_utils
+from fiber.chain import chain_utils, interface
+from fiber.chain import weights as w
+from fiber.chain.fetch_nodes import get_nodes_for_netuid
+from fiber.chain.chain_utils import query_substrate
 from fiber.logging_utils import get_logger
 from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
@@ -273,212 +276,59 @@ class GaiaValidator:
             await asyncio.sleep(300)
 
     async def main_scoring(self):
-        """
-        Run scoring every 300 blocks, with weight setting 50 blocks after scoring.
-        """
+        """Run scoring every subnet tempo blocks."""
+        weight_setter = FiberWeightSetter(
+            netuid=self.netuid,
+            wallet_name=self.wallet_name,
+            hotkey_name=self.hotkey_name,
+            network=self.subtensor_network,
+        )
+
         while True:
             try:
-                self.metagraph.sync_nodes()
-                block = self.substrate.get_block()
-                self.current_block = block["header"]["number"]
+
+                validator_uid = self.substrate.query(
+                    "SubtensorModule", 
+                    "Uids", 
+                    [self.netuid, self.keypair.ss58_address]
+                ).value
                 
-                next_weight_block = ((self.current_block // 300) * 300) + 50
-                blocks_until_weights = next_weight_block - self.current_block
-                
-                logger.info(f"Fetched current block: {self.current_block}")
-                logger.info(f"Next weight setting at block: {next_weight_block}")
-                
-                await asyncio.sleep(30)
+                if validator_uid is None:
+                    logger.error("Validator not found on chain")
+                    await asyncio.sleep(12)
+                    continue
 
-                if self.current_block >= next_weight_block:
-                    logger.info("Syncing metagraph nodes...")
-                    self.metagraph.sync_nodes()
-                    logger.info("Metagraph synced. Fetching recent scores...")
+                blocks_since_update = w.blocks_since_last_update(
+                    self.substrate, 
+                    self.netuid, 
+                    validator_uid
+                )
+                min_interval = w.min_interval_to_set_weights(
+                    self.substrate, 
+                    self.netuid
+                )
 
-                    three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
-                    
-                    query = """
-                    SELECT score 
-                    FROM score_table 
-                    WHERE task_name = :task_name
-                    AND created_at >= :start_time
-                    ORDER BY created_at DESC 
-                    LIMIT 1
-                    """
-                    
-                    geomagnetic_result = await self.database_manager.fetch_one(
-                        query, 
-                        {"task_name": "geomagnetic", "start_time": three_days_ago}
-                    )
-                    soil_result = await self.database_manager.fetch_one(
-                        query,
-                        {"task_name": "soil_moisture", "start_time": three_days_ago}
-                    )
-
-                    geomagnetic_scores = geomagnetic_result["score"] if geomagnetic_result else [float("nan")] * 256
-                    soil_scores = soil_result["score"] if soil_result else [float("nan")] * 256
-
-                    logger.info("Recent scores fetched. Calculating aggregate scores...")
-
-                    weights = [0.0] * 256
-                    for idx in range(256):
-                        geomagnetic_score = geomagnetic_scores[idx]
-                        soil_score = soil_scores[idx]
-
-                        if math.isnan(geomagnetic_score) and math.isnan(soil_score):
-                            weights[idx] = 0.0
-                            logger.debug(f"Both scores nan - setting weight to 0")
-                        elif math.isnan(geomagnetic_score):
-                            weights[idx] = 0.5 * soil_score
-                            logger.debug(
-                                f"Geo score nan - using soil score: {weights[idx]}"
-                            )
-                        elif math.isnan(soil_score):
-                            geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
-                            weights[idx] = 0.5 * geo_normalized
-                            logger.debug(
-                                f"UID {idx}: Soil score nan - normalized geo score: {geo_normalized} -> weight: {weights[idx]}"
-                            )
-                        else:
-                            geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
-                            weights[idx] = (0.5 * geo_normalized) + (0.5 * soil_score)
-                            logger.debug(
-                                f"UID {idx}: Both scores valid - geo_norm: {geo_normalized}, soil: {soil_score} -> weight: {weights[idx]}"
-                            )
-
-                        logger.info(
-                            f"UID {idx}: geo={geomagnetic_score} (norm={geo_normalized if 'geo_normalized' in locals() else 'nan'}), soil={soil_score}, weight={weights[idx]}"
-                        )
-
-                    logger.info(f"Weights before normalization: {weights}")
-
-                    non_zero_weights = [w for w in weights if w != 0.0]
-                    if non_zero_weights:
-                        # Sort indices by weight for ranking (negative scores = higher error = lower rank)
-                        sorted_indices = sorted(
-                            range(len(weights)),
-                            key=lambda k: (
-                                weights[k] if weights[k] != 0.0 else float("-inf")
-                            ),
-                        )
-
-                        new_weights = [0.0] * len(weights)
-                        for rank, idx in enumerate(sorted_indices):
-                            if weights[idx] != 0.0:
-                                try:
-                                    normalized_rank = 1.0 - (rank / len(non_zero_weights))
-                                    exponent = max(
-                                        min(-20 * (normalized_rank - 0.5), 709), -709
-                                    )
-                                    new_weights[idx] = 1 / (1 + math.exp(exponent))
-                                except OverflowError:
-                                    logger.warning(
-                                        f"Overflow prevented for rank {rank}, idx {idx}"
-                                    )
-
-                                    if normalized_rank > 0.5:
-                                        new_weights[idx] = 1.0
-                                    else:
-                                        new_weights[idx] = 0.0
-
-
-                        total = sum(new_weights)
-                        if total > 0:
-                            self.weights = [w / total for w in new_weights]
-
-                            top_20_weight = sum(
-                                sorted(self.weights, reverse=True)[
-                                    : int(len(weights) * 0.2)
-                                ]
-                            )
-                            logger.info(
-                                f"Weight distribution: top 20% of nodes hold {top_20_weight*100:.1f}% of total weight"
-                            )
-
-                            logger.info("Attempting to set weights...")
-                            success = await self.set_weights(self.weights)
+                if (min_interval is None or 
+                    (blocks_since_update is not None and blocks_since_update >= min_interval)):
+                    if w.can_set_weights(self.substrate, self.netuid, validator_uid):
+                        normalized_weights = await self._calc_task_weights()
+                        if normalized_weights:
+                            success = await weight_setter.set_weights(normalized_weights)
                             if success:
-                                if self.current_block == self.last_set_weights_block:
-                                    logger.info(f"Successfully set weights at block {self.current_block}")
-                                else:
-                                    logger.info("Waiting for next weight setting interval")
-                            else:
-                                logger.error(f"Error setting weights at block {self.current_block}")
-                        else:
-                            logger.warning("No positive weights after normalization")
-                    else:
-                        logger.warning(
-                            "All weights are zero or nan, skipping weight setting"
-                        )
+                                await self.update_last_weights_block()
+                                logger.info("✅ Successfully set weights")
+                                await asyncio.sleep(30)
+                else:
+                    logger.info(
+                        f"Waiting for weight setting: {blocks_since_update}/{min_interval} blocks"
+                    )
+
+                await asyncio.sleep(12)
 
             except Exception as e:
                 logger.error(f"Error in main_scoring: {e}")
                 logger.error(traceback.format_exc())
-                await asyncio.sleep(60)
-
-    async def set_weights(self, weights: List[float], timeout: int = 30, max_retries: int = 3) -> bool:
-        """
-        Set weights on the chain with timeout and retry logic.
-
-        Args:
-            weights (List[float]): List of weights aligned with UIDs.
-            timeout (int): Maximum time to wait for the operation (in seconds).
-            max_retries (int): Maximum number of retries if the operation fails.
-
-        Returns:
-            bool: True if weights were set successfully, False otherwise.
-        """
-        try:
-            block = self.substrate.get_block()
-            self.current_block = block["header"]["number"]
-
-            if self.last_set_weights_block:
-                blocks_since_last = self.current_block - self.last_set_weights_block
-                if blocks_since_last < 300:
-                    blocks_remaining = 300 - blocks_since_last
-                    next_block = self.last_set_weights_block + 300
-                    logger.info(f"Waiting for block interval - {blocks_remaining} blocks remaining")
-                    logger.info(f"Last set: block {self.last_set_weights_block}")
-                    logger.info(f"Next possible: block {next_block} (current: {self.current_block})")
-                    return True
-
-            weight_setter = FiberWeightSetter(
-                netuid=self.netuid,
-                wallet_name=self.wallet_name,
-                hotkey_name=self.hotkey_name,
-                network=self.subtensor_network,
-                last_set_block=self.last_set_weights_block,
-                current_block=self.current_block
-            )
-
-            attempt = 0
-            delay = 1
-            while attempt < max_retries:
-                try:
-                    success = await asyncio.wait_for(weight_setter.set_weights(weights), timeout=timeout)
-                    if success:
-                        self.last_set_weights_block = self.current_block
-                        logger.info(f"✅ Successfully set weights at block {self.current_block}")
-                        logger.info(f"Next weight set possible at block {self.current_block + 300}")
-                        return True
-                    else:
-                        logger.warning("❌ Failed to set weights, retrying...")
-                except asyncio.TimeoutError:
-                    logger.debug(f"⏳ Timeout occurred while setting weights (attempt {attempt + 1}/{max_retries})")
-                except Exception as e:
-                    logger.error(f"❌ Error during weight setting (attempt {attempt + 1}/{max_retries}): {e}")
-                    logger.error(traceback.format_exc())
-
-                attempt += 1
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 10)
-
-            return False
-
-        except Exception as e:
-            logger.error(f"Unexpected error in set_weights: {e}")
-            logger.error(traceback.format_exc())
-            return False
+                await asyncio.sleep(12)
 
     async def status_logger(self):
         """Log the status of the validator periodically."""
@@ -611,6 +461,97 @@ class GaiaValidator:
                 logger.error(traceback.format_exc())
             finally:
                 await asyncio.sleep(60)
+
+    async def _calc_task_weights(self) -> Optional[List[float]]:
+        """Calculate and normalize weights from task scores."""
+        logger.info("Syncing metagraph nodes...")
+        self.metagraph.sync_nodes()
+        logger.info("Metagraph synced. Fetching recent scores...")
+
+        three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+        
+        query = """
+        SELECT score 
+        FROM score_table 
+        WHERE task_name = :task_name
+        AND created_at >= :start_time
+        ORDER BY created_at DESC 
+        LIMIT 1
+        """
+        
+        geomagnetic_result = await self.database_manager.fetch_one(
+            query, {"task_name": "geomagnetic", "start_time": three_days_ago}
+        )
+        soil_result = await self.database_manager.fetch_one(
+            query, {"task_name": "soil_moisture", "start_time": three_days_ago}
+        )
+
+        geomagnetic_scores = geomagnetic_result["score"] if geomagnetic_result else [float("nan")] * 256
+        soil_scores = soil_result["score"] if soil_result else [float("nan")] * 256
+
+        logger.info("Recent scores fetched. Calculating aggregate scores...")
+
+        weights = [0.0] * 256
+        for idx in range(256):
+            geomagnetic_score = geomagnetic_scores[idx]
+            soil_score = soil_scores[idx]
+
+            if math.isnan(geomagnetic_score) and math.isnan(soil_score):
+                weights[idx] = 0.0
+                logger.debug(f"Both scores nan - setting weight to 0")
+            elif math.isnan(geomagnetic_score):
+                weights[idx] = 0.5 * soil_score
+                logger.debug(f"Geo score nan - using soil score: {weights[idx]}")
+            elif math.isnan(soil_score):
+                geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
+                weights[idx] = 0.5 * geo_normalized
+                logger.debug(f"UID {idx}: Soil score nan - normalized geo score: {geo_normalized} -> weight: {weights[idx]}")
+            else:
+                geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
+                weights[idx] = (0.5 * geo_normalized) + (0.5 * soil_score)
+                logger.debug(f"UID {idx}: Both scores valid - geo_norm: {geo_normalized}, soil: {soil_score} -> weight: {weights[idx]}")
+
+            logger.info(f"UID {idx}: geo={geomagnetic_score} (norm={geo_normalized if 'geo_normalized' in locals() else 'nan'}), soil={soil_score}, weight={weights[idx]}")
+
+        logger.info(f"Weights before normalization: {weights}")
+
+        non_zero_weights = [w for w in weights if w != 0.0]
+        if non_zero_weights:
+            sorted_indices = sorted(
+                range(len(weights)),
+                key=lambda k: (weights[k] if weights[k] != 0.0 else float("-inf")),
+            )
+
+            new_weights = [0.0] * len(weights)
+            for rank, idx in enumerate(sorted_indices):
+                if weights[idx] != 0.0:
+                    try:
+                        normalized_rank = 1.0 - (rank / len(non_zero_weights))
+                        exponent = max(min(-20 * (normalized_rank - 0.5), 709), -709)
+                        new_weights[idx] = 1 / (1 + math.exp(exponent))
+                    except OverflowError:
+                        logger.warning(f"Overflow prevented for rank {rank}, idx {idx}")
+                        if normalized_rank > 0.5:
+                            new_weights[idx] = 1.0
+                        else:
+                            new_weights[idx] = 0.0
+
+            total = sum(new_weights)
+            if total > 0:
+                return [w / total for w in new_weights]
+            else:
+                logger.warning("No positive weights after normalization")
+                return None
+        else:
+            logger.warning("All weights are zero or nan, skipping weight setting")
+            return None
+
+    async def update_last_weights_block(self):
+        try:
+            block = self.substrate.get_block()
+            self.last_set_weights_block = block["header"]["number"]
+        except Exception as e:
+            logger.error(f"Error updating last weights block: {e}")
 
 
 if __name__ == "__main__":

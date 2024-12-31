@@ -22,6 +22,7 @@ import traceback
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.sql import text
 from datetime import timezone
+from datetime import timedelta
 
 logger = get_logger(__name__)
 
@@ -137,6 +138,35 @@ class SoilScoringMechanism(ScoringMechanism):
             if not await self.validate_predictions(predictions):
                 logger.error("Invalid predictions")
                 return None
+
+            pred_info = await self.db_manager.fetch_one(
+                """
+                SELECT retry_count, next_retry_time, status, target_time
+                FROM soil_moisture_predictions 
+                WHERE miner_uid = :miner_id
+                AND (
+                    (status = 'retry_scheduled' AND next_retry_time IS NOT NULL)
+                    OR 
+                    (status = 'sent_to_miner' AND target_time = :target_time)
+                )
+                ORDER BY next_retry_time DESC NULLS LAST
+                LIMIT 1
+                """,
+                {
+                    "miner_id": predictions["miner_id"],
+                    "target_time": predictions["target_time"]
+                }
+            )
+            
+            if pred_info and pred_info.get("status") == "retry_scheduled":
+                current_time = datetime.datetime.now(timezone.utc)
+                if current_time < pred_info["next_retry_time"]:
+                    logger.info(f"Skipping scoring for timestamp {predictions['target_time']} - in retry wait period until {pred_info['next_retry_time']}")
+                    return None
+
+            if not pred_info or pred_info.get("status") == "sent_to_miner":
+                logger.info(f"Processing new prediction for timestamp {predictions['target_time']}")
+
             metrics = await self.compute_smap_score_metrics(
                 bounds=predictions["bounds"],
                 crs=predictions["crs"],
@@ -145,12 +175,17 @@ class SoilScoringMechanism(ScoringMechanism):
                 miner_id=predictions["miner_id"]
             )
 
+            if isinstance(metrics, dict) and metrics.get("status") == "retry_scheduled":
+                logger.info(f"SMAP data unavailable, retry scheduled: {metrics.get('message')}")
+                return None
+
             if not metrics:
                 return None
 
             if not await self.validate_metrics(metrics):
                 logger.error("Invalid metrics computed")
                 return None
+
             total_score = self.compute_final_score(metrics)
 
             if not 0 <= total_score <= 1:
@@ -192,16 +227,22 @@ class SoilScoringMechanism(ScoringMechanism):
             miner_id: miner's unique identifier
         """
         device = model_predictions.device
-
         left, bottom, right, top = bounds
         sentinel_bounds = BoundingBox(left=left, bottom=bottom, right=right, top=top)
         sentinel_crs = CRS.from_epsg(int(crs))
-
-        smap_url = construct_smap_url(target_date)
-        temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
+        temp_file = None
         try:
+            logger.info(f"Attempting SMAP download for date: {target_date}")
+            smap_url = construct_smap_url(target_date)
+            logger.info(f"Constructed SMAP URL: {smap_url}")
+            
+            temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
+
             if not download_smap_data(smap_url, temp_file.name):
-                return None
+                retry_result = await self.handle_smap_retry(miner_id)
+                logger.info(f"SMAP download failed, retry status: {retry_result}")
+                return retry_result
+
             smap_data = get_smap_data_for_sentinel_bounds(
                 temp_file.name,
                 (
@@ -341,9 +382,9 @@ class SoilScoringMechanism(ScoringMechanism):
             if temp_file:
                 try:
                     temp_file.close()
-
-                except:
-                    pass
+                    os.unlink(temp_file.name)
+                except Exception as e:
+                    logger.error(f"Error cleaning up temp file: {e}")
 
     async def cleanup_invalid_prediction(self, bounds, target_time: datetime, miner_id: str, conn=None):
         """Clean up predictions for a specific miner and timestamp."""
@@ -403,3 +444,52 @@ class SoilScoringMechanism(ScoringMechanism):
         finally:
             if conn and not isinstance(conn, AsyncSession):
                 await conn.close()
+
+    async def handle_smap_retry(self, miner_id: str) -> Dict:
+        """Handle SMAP data retry logic."""
+        try:
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            
+            retry_info = await self.db_manager.fetch_one(
+                """
+                SELECT retry_count, next_retry_time, status
+                FROM soil_moisture_predictions 
+                WHERE miner_uid = :miner_id
+                """,
+                {"miner_id": miner_id}
+            )
+
+            # If already in retry state, just return status
+            if retry_info and retry_info["status"] == "retry_scheduled":
+                return {
+                    "status": "waiting",
+                    "next_retry": retry_info["next_retry_time"]
+                }
+
+            # Set up first retry
+            next_retry = current_time + timedelta(days=1)
+            await self.db_manager.execute(
+                """
+                UPDATE soil_moisture_predictions 
+                SET retry_count = 1,
+                    next_retry_time = :next_retry_time,
+                    last_retry_at = :current_time,
+                    status = 'retry_scheduled'
+                WHERE miner_uid = :miner_id
+                """,
+                {
+                    "next_retry_time": next_retry,
+                    "current_time": current_time,
+                    "miner_id": miner_id
+                }
+            )
+            
+            return {
+                "status": "retry_scheduled",
+                "next_retry": next_retry,
+                "message": f"SMAP data unavailable, retry scheduled for {next_retry}"
+            }
+
+        except Exception as e:
+            logger.error(f"Error handling SMAP retry: {e}")
+            return {"status": "error", "message": str(e)}

@@ -10,7 +10,7 @@ Gaia is a platform for research and development of geospatial machine learning m
 Read more about the long-term vision in our [whitepaper](https://www.gaiaresearch.ai/whitepaper).
 
 >[!NOTE]
-> BETA VERSION = 1.0.0
+> BETA VERSION = 1.0.2
 >
 > The beta version of Gaia launches with limited functionality. Many of the planned features are not yet available, however we are still accepting miners and validators for the initial tasks. 
 
@@ -54,7 +54,7 @@ source ../.gaia/bin/activate
 
 ----
 ```bash
-pip install "git+https://github.com/rayonlabs/fiber.git@1.0.0#egg=fiber[full]"
+pip install "git+https://github.com/rayonlabs/fiber.git@production#egg=fiber[full]"
 ```
 
 

@@ -126,6 +126,8 @@ class SoilMoistureTask(Task):
         if not hasattr(self, "db_manager") or self.db_manager is None:
             self.db_manager = validator.db_manager
 
+        await self.ensure_retry_columns_exist()
+        
         while True:
             try:
                 current_time = datetime.now(timezone.utc)
@@ -616,9 +618,8 @@ class SoilMoistureTask(Task):
                 GROUP BY p.status
                 """
             )
-            logger.debug("Current prediction status counts:")
             for row in debug_result:
-                logger.debug(f"Status: {row['status']}, Count: {row['count']}, Time Range: {row['earliest']} to {row['latest']}")
+                logger.info(f"Status: {row['status']}, Count: {row['count']}, Time Range: {row['earliest']} to {row['latest']}")
 
             result = await self.db_manager.fetch_many(
                 """
@@ -634,12 +635,28 @@ class SoilMoistureTask(Task):
                     )) as predictions
                 FROM soil_moisture_regions r
                 JOIN soil_moisture_predictions p ON p.region_id = r.id
-                WHERE r.target_time <= :scoring_time
-                AND p.status = 'sent_to_miner'
+                WHERE p.status = 'sent_to_miner'
+                AND (
+                    -- Normal case: Past scoring delay and no retry
+                    (
+                        r.target_time <= :scoring_time 
+                        AND p.next_retry_time IS NULL
+                    )
+                    OR 
+                    -- Retry case: Has retry time and it's in the past
+                    (
+                        p.next_retry_time IS NOT NULL 
+                        AND p.next_retry_time <= :current_time
+                        AND p.retry_count < 5
+                    )
+                )
                 GROUP BY r.id, r.target_time, r.sentinel_bounds, r.sentinel_crs, r.status
                 ORDER BY r.target_time ASC
                 """,
-                {"scoring_time": scoring_time}
+                {
+                    "scoring_time": scoring_time,
+                    "current_time": datetime.now(timezone.utc)
+                }
             )
             logger.debug(f"Found {len(result) if result else 0} pending tasks")
             return result
@@ -1147,4 +1164,30 @@ class SoilMoistureTask(Task):
 
         except Exception as e:
             logger.error(f"Failed to cleanup predictions: {str(e)}")
+            logger.error(traceback.format_exc())
+
+    async def ensure_retry_columns_exist(self):
+        """Ensure retry-related columns exist in soil_moisture_predictions table."""
+        try:
+            columns_check = await self.db_manager.fetch_one("""
+                SELECT EXISTS (
+                    SELECT 1 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'soil_moisture_predictions' 
+                    AND column_name = 'retry_count'
+                );
+            """)
+            
+            if not columns_check or not columns_check['exists']:
+                logger.info("Adding retry columns to soil_moisture_predictions table")
+                await self.db_manager.execute("""
+                    ALTER TABLE soil_moisture_predictions 
+                    ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS next_retry_time TIMESTAMP WITH TIME ZONE,
+                    ADD COLUMN IF NOT EXISTS last_retry_at TIMESTAMP WITH TIME ZONE;
+                """)
+                logger.info("Successfully added retry columns")
+            
+        except Exception as e:
+            logger.error(f"Error ensuring retry columns exist: {e}")
             logger.error(traceback.format_exc())
