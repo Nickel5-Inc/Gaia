@@ -49,6 +49,7 @@ def construct_smap_url(datetime_obj):
     Construct URL for SMAP L4 Global Product data
     Example: SMAP_L4_SM_gph_20241111T013000_Vv7031_001.h5
     """
+    #datetime_obj = datetime_obj - timedelta(days=7) #this is for testing
     valid_time = get_valid_smap_time(datetime_obj)
     date_dir = valid_time.strftime("%Y.%m.%d")
     file_date = valid_time.strftime("%Y%m%d")
