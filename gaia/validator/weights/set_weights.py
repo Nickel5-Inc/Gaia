@@ -13,12 +13,12 @@ logger = get_logger(__name__)
 
 class FiberWeightSetter:
     def __init__(
-        self,
-        netuid: int,
-        wallet_name: str = "default",
-        hotkey_name: str = "default",
-        network: str = "finney",
-        timeout: int = 30,
+            self,
+            netuid: int,
+            wallet_name: str = "default",
+            hotkey_name: str = "default",
+            network: str = "finney",
+            timeout: int = 30,
     ):
         """Initialize the weight setter with fiber"""
         self.netuid = netuid
@@ -76,23 +76,23 @@ class FiberWeightSetter:
                 return False
 
             logger.info(f"\nSetting weights for subnet {self.netuid}...")
-            
+
             self.substrate = interface.get_substrate(subtensor_network=self.network)
             nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
             logger.info(f"Found {len(nodes)} nodes in subnet")
 
             validator_uid = self.substrate.query(
-                "SubtensorModule", 
-                "Uids", 
+                "SubtensorModule",
+                "Uids",
                 [self.netuid, self.keypair.ss58_address]
             ).value
-            
+
             version_key = self.substrate.query(
-                "SubtensorModule", 
-                "WeightsVersionKey", 
+                "SubtensorModule",
+                "WeightsVersionKey",
                 [self.netuid]
             ).value
-            
+
             if validator_uid is None:
                 logger.error("❗Validator not found in nodes list")
                 return False
@@ -129,6 +129,7 @@ class FiberWeightSetter:
         """Async wrapper for the synchronous set_node_weights function"""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, lambda: w.set_node_weights(**kwargs))
+
 
 async def main():
     try:
