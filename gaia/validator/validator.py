@@ -260,9 +260,6 @@ class GaiaValidator:
         await self.update_miner_table()
         logger.info("Miner table updated.")
 
-        logger.info("Sending validator version to Gaia API...")
-        await self.get_and_send_version()
-
         while True:
             try:
                 workers = [
@@ -271,13 +268,7 @@ class GaiaValidator:
                     asyncio.create_task(self.status_logger()),
                     asyncio.create_task(self.main_scoring()),
                     asyncio.create_task(self.handle_miner_deregistration_loop()),
-<<<<<<< HEAD
                     asyncio.create_task(self.check_for_updates()),
-                    asyncio.create_task(self.send_geomagnetic_scores()),
-                    asyncio.create_task(self.send_soil_scores()),
-=======
-                   # asyncio.create_task(self.check_for_updates()),
->>>>>>> df2b3c0 (fiber 2.0 migration)
                 ]
 
                 await asyncio.gather(*workers, return_exceptions=True)
