@@ -83,11 +83,10 @@ class GeomagneticTask(Task):
             metadata=GeomagneticMetadata(),
             inputs=GeomagneticInputs(),
             outputs=GeomagneticOutputs(),
-            scoring_mechanism=GeomagneticScoringMechanism(),
+            db_manager=db_manager,
+            scoring_mechanism=GeomagneticScoringMechanism(db_manager=db_manager),
             **data,
         )
-        if db_manager:
-            self.db_manager = db_manager
 
         # Try to load custom model first
         try:
@@ -232,6 +231,10 @@ class GeomagneticTask(Task):
         self, validator, timestamp, dst_value, historical_data, current_hour_start
     ):
         """Query miners with current data and process responses."""
+        if timestamp == "N/A" or dst_value == "N/A":
+            logger.warning("Invalid geomagnetic data. Skipping miner queries.")
+            return
+
         # Construct Payload for Miners
         nonce = str(uuid4())
 

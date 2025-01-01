@@ -1,10 +1,10 @@
-from functools import partial  # Add this line at the top of your file
+from functools import partial
 from fastapi import Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRouter
 from pydantic import BaseModel
-from fiber.miner.dependencies import blacklist_low_stake, verify_request
-from fiber.miner.security.encryption import decrypt_general_payload
+from fiber.encrypted.miner.dependencies import blacklist_low_stake, verify_request
+from fiber.encrypted.miner.security.encryption import decrypt_general_payload
 from fiber.logging_utils import get_logger
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
 import numpy as np
@@ -60,18 +60,14 @@ def factory_router(miner_instance) -> APIRouter:
 
         try:
             if decrypted_payload.data:
-                # Extract data and initialize task
                 response_data = decrypted_payload.model_dump()
                 geomagnetic_task = GeomagneticTask()
                 logger.info(f"Miner executing geomagnetic prediction ...")
 
-                # Run the miner execution
                 result = geomagnetic_task.miner_execute(response_data, miner_instance)
                 logger.info(f"Miner execution completed: {result}")
 
-                # Validate prediction result
                 if result:
-                    # Ensure predicted_values is valid
                     if "predicted_values" in result:
                         pred_value = result["predicted_values"]
                         if np.isnan(pred_value) or np.isinf(pred_value):
@@ -81,7 +77,6 @@ def factory_router(miner_instance) -> APIRouter:
                         logger.error("Missing 'predicted_values' in result. Setting to default 0.0")
                         result["predicted_values"] = float(0.0)
 
-                    # Ensure timestamp is present
                     if "timestamp" not in result:
                         logger.warning("Missing timestamp in result, using fallback timestamp")
                         result["timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -109,7 +104,6 @@ def factory_router(miner_instance) -> APIRouter:
         ),
     ):
         try:
-            # Initialize database manager
             db_manager = MinerDatabaseManager()
             soil_task = SoilMoistureTask(db_manager=db_manager, node_type="miner")
 

@@ -37,7 +37,9 @@
             "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
             "sentinel_bounds": "FLOAT[]",
             "sentinel_crs": "INTEGER",
-            "status": "TEXT NOT NULL DEFAULT 'pending'"
+            "status": "TEXT NOT NULL DEFAULT 'sent_to_miner'",
+            "retry_count": "INTEGER DEFAULT 0",
+            "next_retry_time": "TIMESTAMP WITH TIME ZONE"
         },
         "indexes": [
             {"column": "region_id", "unique": false},
