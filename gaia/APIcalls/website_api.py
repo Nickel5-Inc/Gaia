@@ -22,8 +22,6 @@ class GaiaCommunicator:
         Args:
             data: Dictionary containing payload to be sent.
 
-        Returns:
-            None
         """
         current_thread = threading.current_thread().name
 
@@ -38,16 +36,23 @@ class GaiaCommunicator:
             )
             response.raise_for_status()
             bt.logging.info(f"| {current_thread} | ✅ Data sent to Gaia successfully: {data}")
-            bt.logging.info(f"| {current_thread} | Response: {response.status_code}, {response.text}")
+            bt.logging.info(f"| {current_thread} | Response: {response.status_code}, {response.json()}")
 
         except requests.exceptions.HTTPError as e:
-            bt.logging.warning(f"| {current_thread} | ❗ HTTP error occurred: {e}. Payload: {data}.")
-            if e.response is not None:
-                bt.logging.warning(
-                    f"| {current_thread} | ❗ Response content: {e.response.text}")
+            # Improved logging for HTTP errors
+            error_details = e.response.json() if e.response and e.response.headers.get(
+                'Content-Type') == 'application/json' else e.response.text
+            bt.logging.warning(
+                f"| {current_thread} | ❗ HTTP error occurred: {e}. Payload: {data}. Response: {error_details}")
+
         except requests.exceptions.RequestException as e:
+            # Handle general request errors
             bt.logging.warning(
                 f"| {current_thread} | ❗ Error sending data to Gaia API. Error: {e}. Payload: {data}.")
+
+        except Exception as e:
+            # Catch-all for unexpected errors
+            bt.logging.error(f"| {current_thread} | ❗ Unexpected error: {e}. Payload: {data}.")
 
 
 if __name__ == "__main__":
