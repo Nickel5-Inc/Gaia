@@ -28,16 +28,13 @@ class MinerScoreSender:
             return [{"uid": row[0], "hotkey": row[1], "coldkey": row[2]} for row in result.fetchall()]
 
     async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
-        """
-        Fetch geomagnetic prediction history for a given miner.
-        """
         async with await self.database_manager.get_connection() as session:
             query = text("""
                 SELECT id, query_time AS prediction_datetime, predicted_value, ground_truth_value, score, scored_at
                 FROM geomagnetic_history
                 WHERE miner_hotkey = :miner_hotkey
                 ORDER BY scored_at DESC
-                LIMIT 20
+                LIMIT 10
             """)
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
@@ -55,9 +52,6 @@ class MinerScoreSender:
             ]
 
     async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
-        """
-        Fetch soil moisture prediction history for a given miner.
-        """
         async with await self.database_manager.get_connection() as session:
             query = text("""
                 SELECT soil_moisture_history.id, 
@@ -80,7 +74,7 @@ class MinerScoreSender:
                 ON soil_moisture_history.region_id = soil_moisture_predictions.region_id
                 WHERE soil_moisture_history.miner_hotkey = :miner_hotkey
                 ORDER BY soil_moisture_history.scored_at DESC
-                LIMIT 20
+                LIMIT 10
             """)
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
@@ -99,15 +93,12 @@ class MinerScoreSender:
                     "soilRootzoneGroundTruthValues": row[11],
                     "soilSurfaceStructureScore": row[12],
                     "soilRootzoneStructureScore": row[13],
-                    "scoreGenerationDate": row[14].isoformat(),
+                    "scoreGenerationDate": row[14].isoformat()
                 }
                 for row in result.fetchall()
             ]
 
-    async def send_geomagnetic_scores_to_gaia(self):
-        """
-        Fetch geomagnetic scores and predictions for miners, then send to Gaia API.
-        """
+    async def send_to_gaia(self):
         active_miners = await self.fetch_active_miners()
         if not active_miners:
             bt.logging.warning("| MinerScoreSender | No active miners found.")
@@ -116,47 +107,30 @@ class MinerScoreSender:
         data_to_send = []
         for miner in active_miners:
             hotkey = miner["hotkey"]
+            coldkey = miner["coldkey"]
+
+            # Fetch geomagnetic predictions
             geomagnetic_predictions = await self.fetch_geomagnetic_history(hotkey)
-            if geomagnetic_predictions:
-                data_to_send.append({
-                    "minerHotKey": hotkey,
-                    "minerColdKey": miner["coldkey"],
-                    "geomagneticPredictions": geomagnetic_predictions,
-                })
 
-        gaia_communicator = GaiaCommunicator("/Predictions")
-        for miner_data in data_to_send:
-            try:
-                gaia_communicator.send_data(data=miner_data)
-            except Exception as e:
-                bt.logging.error(f"| MinerScoreSender | Failed to send geomagnetic data for {miner_data['minerHotKey']}: {e}")
-
-    async def send_soil_scores_to_gaia(self):
-        """
-        Fetch soil moisture scores and predictions for miners, then send to Gaia API.
-        """
-        active_miners = await self.fetch_active_miners()
-        if not active_miners:
-            bt.logging.warning("| MinerScoreSender | No active miners found.")
-            return
-
-        data_to_send = []
-        for miner in active_miners:
-            hotkey = miner["hotkey"]
+            # Fetch soil moisture predictions
             soil_moisture_predictions = await self.fetch_soil_moisture_history(hotkey)
-            if soil_moisture_predictions:
-                data_to_send.append({
-                    "minerHotKey": hotkey,
-                    "minerColdKey": miner["coldkey"],
-                    "soilMoisturePredictions": soil_moisture_predictions,
-                })
+
+            # Prepare payload
+            payload = {
+                "minerHotKey": hotkey,
+                "minerColdKey": coldkey,
+                "geomagneticPredictions": geomagnetic_predictions or [],  # Include empty array if no data
+                "soilMoisturePredictions": soil_moisture_predictions or []  # Include empty array if no data
+            }
+
+            data_to_send.append(payload)
 
         gaia_communicator = GaiaCommunicator("/Predictions")
         for miner_data in data_to_send:
             try:
                 gaia_communicator.send_data(data=miner_data)
             except Exception as e:
-                bt.logging.error(f"| MinerScoreSender | Failed to send soil moisture data for {miner_data['minerHotKey']}: {e}")
+                bt.logging.error(f"| MinerScoreSender | Failed to send data for {miner_data['minerHotKey']}: {e}")
 
     async def run_async(self):
         """
