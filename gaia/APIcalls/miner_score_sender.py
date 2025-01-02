@@ -19,6 +19,19 @@ class MinerScoreSender:
         """
         self.database_manager = database_manager
 
+    async def fetch_active_miners(self) -> list:
+        """
+        Fetch all active miners with their hotkeys, coldkeys, and UIDs.
+
+        Returns:
+            List of dictionaries with miner details.
+        """
+        bt.logging.debug("| MinerScoreSender | Fetching active miners...")
+        async with await self.database_manager.get_connection() as session:
+            query = text("SELECT uid, hotkey, coldkey FROM node_table WHERE hotkey IS NOT NULL")
+            result = await session.execute(query)
+            return [{"uid": row[0], "hotkey": row[1], "coldkey": row[2]} for row in result.fetchall()]
+
     async def send_geomagnetic_scores_to_gaia(self):
         """
         Fetch geomagnetic scores and predictions for miners, then send to Gaia API.
@@ -104,14 +117,14 @@ class MinerScoreSender:
         Run the process to send geomagnetic and soil moisture scores as asyncio tasks.
         """
         try:
-            bt.logging.info("| MainThread | Starting the process to send scores to Gaia API...")
+            bt.logging.info("| MinerScoreSender | Starting the process to send scores to Gaia API...")
             await asyncio.gather(
                 self.send_geomagnetic_scores_to_gaia(),
                 self.send_soil_scores_to_gaia(),
             )
-            bt.logging.info("| MainThread | Successfully completed sending scores to Gaia API.")
+            bt.logging.info("| MinerScoreSender | Successfully completed sending scores to Gaia API.")
         except Exception as e:
-            bt.logging.error(f"| MainThread | ❗ An error occurred in the run_async method: {e}")
+            bt.logging.error(f"| MinerScoreSender | ❗ An error occurred in the run_async method: {e}")
 
     def run(self):
         """
