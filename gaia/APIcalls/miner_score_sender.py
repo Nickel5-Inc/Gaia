@@ -137,9 +137,8 @@ class MinerScoreSender:
         Run the process to send geomagnetic and soil moisture scores as asyncio tasks.
         """
         try:
-            bt.logging.info("| MinerScoreSender | Starting score sending tasks...")
-            await self.send_geomagnetic_scores_to_gaia()
-            await self.send_soil_scores_to_gaia()
+            bt.logging.info("| MinerScoreSender | Starting the process to send scores to Gaia API...")
+            await self.send_to_gaia()  # Call the consolidated method
             bt.logging.info("| MinerScoreSender | Successfully completed sending scores to Gaia API.")
         except Exception as e:
             bt.logging.error(f"| MinerScoreSender | ❗ Error in run_async: {e}")
