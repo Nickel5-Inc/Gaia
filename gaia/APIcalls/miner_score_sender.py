@@ -7,17 +7,30 @@ from gaia.validator.database.validator_database_manager import ValidatorDatabase
 
 
 class MinerScoreSender:
-    def __init__(self, database_manager: ValidatorDatabaseManager):
+    def __init__(self, database_manager: ValidatorDatabaseManager, loop: asyncio.AbstractEventLoop):
+        """
+        Initialize the MinerScoreSender class.
+
+        Args:
+            database_manager: An instance of ValidatorDatabaseManager.
+            loop: The asyncio event loop to use for running tasks.
+        """
         self.database_manager = database_manager
+        self.loop = loop  # Use the passed event loop
 
     async def fetch_active_miners(self) -> list:
+        """
+        Fetch all active miners with their hotkeys, coldkeys, and UIDs.
+        """
         async with await self.database_manager.get_connection() as session:
             query = text("SELECT uid, hotkey, coldkey FROM node_table WHERE hotkey IS NOT NULL")
-            bt.logging.debug("| MinerScoreSender | Fetching active miners...")
             result = await session.execute(query)
             return [{"uid": row[0], "hotkey": row[1], "coldkey": row[2]} for row in result.fetchall()]
 
     async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
+        """
+        Fetch geomagnetic prediction history for a given miner.
+        """
         async with await self.database_manager.get_connection() as session:
             query = text("""
                 SELECT id, query_time AS prediction_datetime, predicted_value, ground_truth_value, score, scored_at
@@ -26,7 +39,6 @@ class MinerScoreSender:
                 ORDER BY scored_at DESC
                 LIMIT 20
             """)
-            bt.logging.debug(f"| MinerScoreSender | Fetching geomagnetic history for {miner_hotkey}...")
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
                 {
@@ -45,12 +57,6 @@ class MinerScoreSender:
     async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
         """
         Fetch soil moisture prediction history for a given miner.
-
-        Args:
-            miner_hotkey (str): The hotkey of the miner to fetch soil moisture predictions for.
-
-        Returns:
-            list: A list of soil moisture prediction data.
         """
         async with await self.database_manager.get_connection() as session:
             query = text("""
@@ -76,7 +82,6 @@ class MinerScoreSender:
                 ORDER BY soil_moisture_history.scored_at DESC
                 LIMIT 20
             """)
-            bt.logging.debug(f"| MinerScoreSender | Fetching soil moisture history for miner {miner_hotkey}...")
             result = await session.execute(query, {"miner_hotkey": miner_hotkey})
             return [
                 {
@@ -100,6 +105,9 @@ class MinerScoreSender:
             ]
 
     async def send_geomagnetic_scores_to_gaia(self):
+        """
+        Fetch geomagnetic scores and predictions for miners, then send to Gaia API.
+        """
         active_miners = await self.fetch_active_miners()
         if not active_miners:
             bt.logging.warning("| MinerScoreSender | No active miners found.")
@@ -124,6 +132,9 @@ class MinerScoreSender:
                 bt.logging.error(f"| MinerScoreSender | Failed to send geomagnetic data for {miner_data['minerHotKey']}: {e}")
 
     async def send_soil_scores_to_gaia(self):
+        """
+        Fetch soil moisture scores and predictions for miners, then send to Gaia API.
+        """
         active_miners = await self.fetch_active_miners()
         if not active_miners:
             bt.logging.warning("| MinerScoreSender | No active miners found.")
@@ -163,13 +174,4 @@ class MinerScoreSender:
         """
         Entry point for running the MinerScoreSender in a thread-safe manner.
         """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        if loop.is_running():
-            asyncio.run_coroutine_threadsafe(self.run_async(), loop)
-        else:
-            asyncio.run(self.run_async())
+        asyncio.run_coroutine_threadsafe(self.run_async(), self.loop)

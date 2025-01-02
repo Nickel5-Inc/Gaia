@@ -53,7 +53,8 @@ class GaiaValidator:
         self.nodes = {}  # Initialize the in-memory node table state
 
         # Initialize MinerScoreSender
-        self.miner_score_sender = MinerScoreSender(database_manager=self.database_manager)
+        self.miner_score_sender = MinerScoreSender(database_manager=self.database_manager,
+                                                   loop=asyncio.get_event_loop())
 
         self.httpx_client = httpx.AsyncClient(
             timeout=30.0,
