@@ -19,95 +19,7 @@ class MinerScoreSender:
         """
         self.database_manager = database_manager
 
-    async def fetch_active_miners(self) -> list:
-        """
-        Fetch all active miners with their hotkeys, coldkeys, and UIDs.
-
-        Returns:
-            List of dictionaries with miner details.
-        """
-        async with await self.database_manager.get_connection() as session:
-            query = text("SELECT uid, hotkey, coldkey FROM node_table WHERE hotkey IS NOT NULL")
-            result = await session.execute(query)
-            return [{"uid": row[0], "hotkey": row[1], "coldkey": row[2]} for row in result.fetchall()]
-
-    async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
-        """
-        Fetch geomagnetic prediction history.
-        """
-        async with await self.database_manager.get_connection() as session:
-            query = text("""
-                SELECT id, query_time AS prediction_datetime, predicted_value, ground_truth_value, score, scored_at
-                FROM geomagnetic_history
-                WHERE miner_hotkey = :miner_hotkey
-                ORDER BY scored_at DESC
-                LIMIT 20
-            """)
-            result = await session.execute(query, {"miner_hotkey": miner_hotkey})
-            return [
-                {
-                    "predictionId": row[0],
-                    "predictionDate": row[1].isoformat(),
-                    "geomagneticPredictionTargetDate": row[1].isoformat(),
-                    "geomagneticPredictionInputDate": row[1].isoformat(),
-                    "geomagneticPredictedValue": row[2],
-                    "geomagneticGroundTruthValue": row[3],
-                    "geomagneticScore": row[4],
-                    "scoreGenerationDate": row[5].isoformat()
-                }
-                for row in result.fetchall()
-            ]
-
-    async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
-        async with await self.database_manager.get_connection() as session:
-            query = text("""
-                SELECT soil_moisture_history.id, 
-                       soil_moisture_history.target_time AS prediction_datetime, 
-                       soil_moisture_history.region_id, 
-                       soil_moisture_predictions.sentinel_bounds, 
-                       soil_moisture_predictions.sentinel_crs,
-                       soil_moisture_history.target_time, 
-                       soil_moisture_history.surface_rmse, 
-                       soil_moisture_history.rootzone_rmse, 
-                       soil_moisture_history.surface_sm_pred AS surface_predicted_values,
-                       soil_moisture_history.rootzone_sm_pred AS rootzone_predicted_values, 
-                       soil_moisture_history.surface_sm_truth AS surface_ground_truth_values,
-                       soil_moisture_history.rootzone_sm_truth AS rootzone_ground_truth_values, 
-                       soil_moisture_history.surface_structure_score,
-                       soil_moisture_history.rootzone_structure_score, 
-                       soil_moisture_history.scored_at
-                FROM soil_moisture_history
-                LEFT JOIN soil_moisture_predictions 
-                ON soil_moisture_history.region_id = soil_moisture_predictions.region_id
-                WHERE soil_moisture_history.miner_hotkey = :miner_hotkey
-                ORDER BY soil_moisture_history.scored_at DESC
-                LIMIT 20
-            """)
-
-            result = await session.execute(query, {"miner_hotkey": miner_hotkey})
-            return [
-                {
-                    "predictionId": row[0],
-                    "predictionDate": datetime.fromtimestamp(row[1]).isoformat() if isinstance(row[1], int) else row[
-                        1].isoformat(),
-                    "soilPredictionRegionId": row[2],
-                    "sentinelRegionBounds": row[3],
-                    "sentinelRegionCrs": row[4],
-                    "soilPredictionTargetDate": datetime.fromtimestamp(row[5]).isoformat() if isinstance(row[5], int) else row[5].isoformat(),
-                    "soilSurfaceRmse": row[6],
-                    "soilRootzoneRmse": row[7],
-                    "soilSurfacePredictedValues": row[8],
-                    "soilRootzonePredictedValues": row[9],
-                    "soilSurfaceGroundTruthValues": row[10],
-                    "soilRootzoneGroundTruthValues": row[11],
-                    "soilSurfaceStructureScore": row[12],
-                    "soilRootzoneStructureScore": row[13],
-                    "scoreGenerationDate": datetime.fromtimestamp(row[14]).isoformat() if isinstance(row[14], int) else row[14].isoformat(),
-                }
-                for row in result.fetchall()
-            ]
-
-    async def send_geomagnetic_scores_to_gaia(self) -> None:
+    async def send_geomagnetic_scores_to_gaia(self):
         """
         Fetch geomagnetic scores and predictions for miners, then send to Gaia API.
         """
@@ -147,7 +59,7 @@ class MinerScoreSender:
                 bt.logging.error(
                     f"| {current_thread} | ❗ Failed to send geomagnetic data for miner {miner_data['minerHotKey']}: {e}")
 
-    async def send_soil_scores_to_gaia(self) -> None:
+    async def send_soil_scores_to_gaia(self):
         """
         Fetch soil moisture scores and predictions for miners, then send to Gaia API.
         """
@@ -187,41 +99,28 @@ class MinerScoreSender:
                 bt.logging.error(
                     f"| {current_thread} | ❗ Failed to send soil moisture data for miner {miner_data['minerHotKey']}: {e}")
 
-    def run(self):
+    async def run_async(self):
         """
-        Run the process to send geomagnetic and soil moisture scores in separate event loops.
+        Run the process to send geomagnetic and soil moisture scores as asyncio tasks.
         """
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
         try:
             bt.logging.info("| MainThread | Starting the process to send scores to Gaia API...")
-
-            tasks = [
+            await asyncio.gather(
                 self.send_geomagnetic_scores_to_gaia(),
-                self.send_soil_scores_to_gaia()
-            ]
-
-            bt.logging.info("| MainThread | Initiating geomagnetic and soil moisture score sending tasks...")
-
-            loop.run_until_complete(asyncio.gather(*tasks))
-
+                self.send_soil_scores_to_gaia(),
+            )
             bt.logging.info("| MainThread | Successfully completed sending scores to Gaia API.")
         except Exception as e:
-            bt.logging.error(f"| MainThread | ❗ An error occurred in the run method: {e}")
-        finally:
-            bt.logging.info("| MainThread | Closing the event loop.")
-            loop.close()
+            bt.logging.error(f"| MainThread | ❗ An error occurred in the run_async method: {e}")
 
-
-if __name__ == "__main__":
-    db_manager = ValidatorDatabaseManager(
-        database="validator_db",
-        host="localhost",
-        port=5432,
-        user="postgres",
-        password="postgres"
-    )
-
-    sender = MinerScoreSender(database_manager=db_manager)
-    sender.run()
+    def run(self):
+        """
+        Entry point for running the MinerScoreSender in a thread-safe manner.
+        """
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If the event loop is already running, schedule run_async
+            asyncio.run_coroutine_threadsafe(self.run_async(), loop)
+        else:
+            # Otherwise, start a new event loop
+            asyncio.run(self.run_async())
