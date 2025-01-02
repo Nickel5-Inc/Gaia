@@ -272,7 +272,7 @@ class GaiaValidator:
                     asyncio.create_task(self.main_scoring()),
                     asyncio.create_task(self.handle_miner_deregistration_loop()),
                     asyncio.create_task(self.check_for_updates()),
-                    asyncio.to_thread(self.miner_score_sender.run),
+                    asyncio.create_task(self.miner_score_sender.run_async()),
                 ]
 
                 await asyncio.gather(*workers, return_exceptions=True)

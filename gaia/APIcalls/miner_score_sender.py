@@ -1,10 +1,11 @@
 import asyncio
 from sqlalchemy import text
-import bittensor as bt
+from fiber.logging_utils import get_logger
 
 from gaia.APIcalls.website_api import GaiaCommunicator
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 
+logger = get_logger(__name__)
 
 class MinerScoreSender:
     def __init__(self, database_manager: ValidatorDatabaseManager, loop: asyncio.AbstractEventLoop):
@@ -101,7 +102,7 @@ class MinerScoreSender:
     async def send_to_gaia(self):
         active_miners = await self.fetch_active_miners()
         if not active_miners:
-            bt.logging.warning("| MinerScoreSender | No active miners found.")
+            logger.warning("| MinerScoreSender | No active miners found.")
             return
 
         data_to_send = []
@@ -130,18 +131,18 @@ class MinerScoreSender:
             try:
                 gaia_communicator.send_data(data=miner_data)
             except Exception as e:
-                bt.logging.error(f"| MinerScoreSender | Failed to send data for {miner_data['minerHotKey']}: {e}")
+                logger.error(f"| MinerScoreSender | Failed to send data for {miner_data['minerHotKey']}: {e}")
 
     async def run_async(self):
         """
         Run the process to send geomagnetic and soil moisture scores as asyncio tasks.
         """
         try:
-            bt.logging.info("| MinerScoreSender | Starting the process to send scores to Gaia API...")
+            logger.info("| MinerScoreSender | Starting the process to send scores to Gaia API...")
             await self.send_to_gaia()  # Call the consolidated method
-            bt.logging.info("| MinerScoreSender | Successfully completed sending scores to Gaia API.")
+            logger.info("| MinerScoreSender | Successfully completed sending scores to Gaia API.")
         except Exception as e:
-            bt.logging.error(f"| MinerScoreSender | ❗ Error in run_async: {e}")
+            logger.error(f"| MinerScoreSender | ❗ Error in run_async: {e}")
 
     def run(self):
         """

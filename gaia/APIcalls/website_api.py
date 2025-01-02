@@ -1,7 +1,9 @@
 import threading
 from typing import Any, Dict
 import requests
-import bittensor as bt
+from fiber.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class GaiaCommunicator:
@@ -26,11 +28,20 @@ class GaiaCommunicator:
 
         # Validate payload structure
         if not self._validate_payload(data):
-            bt.logging.error(f"| {current_thread} | ❗ Invalid payload structure: {data}")
+            logger.error(f"| {current_thread} | ❗ Invalid payload structure: {data}")
             return
 
+        data["request"] = "predictions"
+        if data.get("soilMoisturePredictions"):
+            for prediction in data["soilMoisturePredictions"]:
+                if isinstance(prediction.get("sentinelRegionBounds"), str):
+                    try:
+                        bounds_str = prediction["sentinelRegionBounds"].strip('[]')
+                        prediction["sentinelRegionBounds"] = [float(x) for x in bounds_str.split(',')]
+                    except Exception as e:
+                        logger.error(f"Error converting bounds to array: {e}")
+
         try:
-            # Send the request
             response = requests.post(
                 self.endpoint,
                 json=data,
@@ -40,24 +51,24 @@ class GaiaCommunicator:
                 }
             )
             response.raise_for_status()  # Raise error for HTTP status codes 4xx/5xx
-            bt.logging.info(f"| {current_thread} | ✅ Data sent to Gaia successfully: {data}")
-            bt.logging.info(f"| {current_thread} | Response: {response.status_code}, {response.json()}")
+            logger.info(f"| {current_thread} | ✅ Data sent to Gaia successfully: {data}")
+            logger.info(f"| {current_thread} | Response: {response.status_code}, {response.json()}")
 
         except requests.exceptions.HTTPError as e:
             # Improved logging for HTTP errors
             error_details = e.response.json() if e.response and e.response.headers.get(
                 'Content-Type') == 'application/json' else e.response.text
-            bt.logging.warning(
+            logger.warning(
                 f"| {current_thread} | ❗ HTTP error occurred: {e}. Payload: {data}. Response: {error_details}")
 
         except requests.exceptions.RequestException as e:
             # Handle general request errors
-            bt.logging.warning(
+            logger.warning(
                 f"| {current_thread} | ❗ Error sending data to Gaia API. Error: {e}. Payload: {data}.")
 
         except Exception as e:
             # Catch-all for unexpected errors
-            bt.logging.error(f"| {current_thread} | ❗ Unexpected error: {e}. Payload: {data}.")
+            logger.error(f"| {current_thread} | ❗ Unexpected error: {e}. Payload: {data}.")
 
     def _validate_payload(self, data: Dict[str, Any]) -> bool:
         """
@@ -72,15 +83,15 @@ class GaiaCommunicator:
         required_fields = ["minerHotKey", "minerColdKey", "geomagneticPredictions", "soilMoisturePredictions"]
         for field in required_fields:
             if field not in data:
-                bt.logging.error(f"Missing required field: {field}")
+                logger.error(f"Missing required field: {field}")
                 return False
 
         # Ensure geomagneticPredictions and soilMoisturePredictions are lists
         if not isinstance(data.get("geomagneticPredictions", []), list):
-            bt.logging.error("Invalid data type for geomagneticPredictions: Must be a list")
+            logger.error("Invalid data type for geomagneticPredictions: Must be a list")
             return False
         if not isinstance(data.get("soilMoisturePredictions", []), list):
-            bt.logging.error("Invalid data type for soilMoisturePredictions: Must be a list")
+            logger.error("Invalid data type for soilMoisturePredictions: Must be a list")
             return False
 
         return True
