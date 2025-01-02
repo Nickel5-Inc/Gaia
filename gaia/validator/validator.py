@@ -19,6 +19,7 @@ from fiber.chain.metagraph import Metagraph
 from substrateinterface import SubstrateInterface
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
 from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
+from gaia.APIcalls.miner_score_sender import MinerScoreSender
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from argparse import ArgumentParser
 import pandas as pd
@@ -50,6 +51,9 @@ class GaiaValidator:
         self.last_set_weights_block = 0
         self.current_block = 0
         self.nodes = {}  # Initialize the in-memory node table state
+
+        # Initialize MinerScoreSender
+        self.miner_score_sender = MinerScoreSender(database_manager=self.database_manager)
 
         self.httpx_client = httpx.AsyncClient(
             timeout=30.0,
@@ -267,6 +271,7 @@ class GaiaValidator:
                     asyncio.create_task(self.main_scoring()),
                     asyncio.create_task(self.handle_miner_deregistration_loop()),
                     asyncio.create_task(self.check_for_updates()),
+                    asyncio.to_thread(self.miner_score_sender.run),
                 ]
 
                 await asyncio.gather(*workers, return_exceptions=True)
