@@ -100,38 +100,40 @@ class MinerScoreSender:
             ]
 
     async def send_to_gaia(self):
-        active_miners = await self.fetch_active_miners()
-        if not active_miners:
-            logger.warning("| MinerScoreSender | No active miners found.")
-            return
+        async with GaiaCommunicator("/Predictions") as gaia_communicator:
+            active_miners = await self.fetch_active_miners()
+            if not active_miners:
+                logger.warning("| MinerScoreSender | No active miners found.")
+                return
 
-        data_to_send = []
-        for miner in active_miners:
-            hotkey = miner["hotkey"]
-            coldkey = miner["coldkey"]
+            batch_size = 3
+            for i in range(0, len(active_miners), batch_size):
+                batch = active_miners[i:i + batch_size]
+                tasks = []
+                
+                for miner in batch:
+                    hotkey = miner["hotkey"]
+                    coldkey = miner["coldkey"]
 
-            # Fetch geomagnetic predictions
-            geomagnetic_predictions = await self.fetch_geomagnetic_history(hotkey)
+                    geomagnetic_predictions = await self.fetch_geomagnetic_history(hotkey)
+                    soil_moisture_predictions = await self.fetch_soil_moisture_history(hotkey)
 
-            # Fetch soil moisture predictions
-            soil_moisture_predictions = await self.fetch_soil_moisture_history(hotkey)
+                    payload = {
+                        "minerHotKey": hotkey,
+                        "minerColdKey": coldkey,
+                        "geomagneticPredictions": geomagnetic_predictions or [],
+                        "soilMoisturePredictions": soil_moisture_predictions or []
+                    }
 
-            # Prepare payload
-            payload = {
-                "minerHotKey": hotkey,
-                "minerColdKey": coldkey,
-                "geomagneticPredictions": geomagnetic_predictions or [],  # Include empty array if no data
-                "soilMoisturePredictions": soil_moisture_predictions or []  # Include empty array if no data
-            }
+                    tasks.append(gaia_communicator.send_data(data=payload))
 
-            data_to_send.append(payload)
-
-        gaia_communicator = GaiaCommunicator("/Predictions")
-        for miner_data in data_to_send:
-            try:
-                gaia_communicator.send_data(data=miner_data)
-            except Exception as e:
-                logger.error(f"| MinerScoreSender | Failed to send data for {miner_data['minerHotKey']}: {e}")
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for miner, result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        logger.error(f"| MinerScoreSender | Failed to send data for {miner['hotkey']}: {result}")
+                
+                await asyncio.sleep(1)
 
     async def run_async(self):
         """

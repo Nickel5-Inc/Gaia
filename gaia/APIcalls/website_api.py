@@ -1,7 +1,9 @@
 import threading
 from typing import Any, Dict
-import requests
+import httpx
 from fiber.logging_utils import get_logger
+import numpy as np
+import asyncio
 
 logger = get_logger(__name__)
 
@@ -16,8 +18,22 @@ class GaiaCommunicator:
         """
         api_base = "https://dev-gaia-api.azurewebsites.net"
         self.endpoint = f"{api_base}{endpoint}"
+        self.client = httpx.AsyncClient(
+            timeout=30.0,
+            headers={
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'User-Agent': 'GaiaValidator/1.0'
+            }
+        )
 
-    def send_data(self, data: Dict[str, Any]) -> None:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.client.aclose()
+
+    async def send_data(self, data: Dict[str, Any]) -> None:
         """
         Send detailed data to the Gaia server.
 
@@ -25,50 +41,72 @@ class GaiaCommunicator:
             data: Dictionary containing payload to be sent.
         """
         current_thread = threading.current_thread().name
+        max_retries = 3
+        base_delay = 1  # Base delay in seconds
 
-        # Validate payload structure
         if not self._validate_payload(data):
             logger.error(f"| {current_thread} | ❗ Invalid payload structure: {data}")
             return
 
-        data["request"] = "predictions"
         if data.get("soilMoisturePredictions"):
             for prediction in data["soilMoisturePredictions"]:
-                if isinstance(prediction.get("sentinelRegionBounds"), str):
-                    try:
-                        bounds_str = prediction["sentinelRegionBounds"].strip('[]')
-                        prediction["sentinelRegionBounds"] = [float(x) for x in bounds_str.split(',')]
-                    except Exception as e:
-                        logger.error(f"Error converting bounds to array: {e}")
+                bounds = prediction.get("sentinelRegionBounds")
+                if isinstance(bounds, list) and len(bounds) == 4:
+                    prediction["sentinelRegionBounds"] = f"[{','.join(map(str, bounds))}]"
+                elif not isinstance(bounds, str) or not bounds:
+                    prediction["sentinelRegionBounds"] = "[]"
+                
+                crs = prediction.get("sentinelRegionCrs")
+                if not isinstance(crs, int):
+                    prediction["sentinelRegionCrs"] = 4326
 
-        try:
-            response = requests.post(
-                self.endpoint,
-                json=data,
-                headers={
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json'
-                }
-            )
-            response.raise_for_status()  # Raise error for HTTP status codes 4xx/5xx
-            logger.info(f"| {current_thread} | ✅ Data sent to Gaia successfully: {data}")
-            logger.info(f"| {current_thread} | Response: {response.status_code}, {response.json()}")
+                array_fields = [
+                    "soilSurfacePredictedValues",
+                    "soilRootzonePredictedValues",
+                    "soilSurfaceGroundTruthValues",
+                    "soilRootzoneGroundTruthValues"
+                ]
+                
+                for field in array_fields:
+                    value = prediction.get(field)
+                    if isinstance(value, (list, np.ndarray)):
+                        prediction[field] = str(value).replace('array(', '').replace(')', '')
+                    elif not isinstance(value, str):
+                        prediction[field] = "[]"
 
-        except requests.exceptions.HTTPError as e:
-            # Improved logging for HTTP errors
-            error_details = e.response.json() if e.response and e.response.headers.get(
-                'Content-Type') == 'application/json' else e.response.text
-            logger.warning(
-                f"| {current_thread} | ❗ HTTP error occurred: {e}. Payload: {data}. Response: {error_details}")
+                if "soilPredictionInput" not in prediction:
+                    prediction["soilPredictionInput"] = "input.tif"
+                if "soilPredictionOutput" not in prediction:
+                    prediction["soilPredictionOutput"] = "output.tif"
 
-        except requests.exceptions.RequestException as e:
-            # Handle general request errors
-            logger.warning(
-                f"| {current_thread} | ❗ Error sending data to Gaia API. Error: {e}. Payload: {data}.")
-
-        except Exception as e:
-            # Catch-all for unexpected errors
-            logger.error(f"| {current_thread} | ❗ Unexpected error: {e}. Payload: {data}.")
+        for attempt in range(max_retries):
+            try:
+                response = await self.client.post(self.endpoint, json=data)
+                
+                if response.is_success:
+                    logger.info(f"| {current_thread} | ✅ Data sent to Gaia successfully")
+                    return
+                
+                if response.status_code == 429:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"| {current_thread} | Rate limit hit, retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                
+                try:
+                    error_details = response.json()
+                except ValueError:
+                    error_details = response.text
+                
+                logger.warning(f"| {current_thread} | ❗ HTTP error {response.status_code}: {error_details}")
+                
+            except httpx.RequestError as e:
+                logger.warning(f"| {current_thread} | ❗ Error sending data to Gaia API: {str(e)}")
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                    continue
+                raise
 
     def _validate_payload(self, data: Dict[str, Any]) -> bool:
         """
