@@ -126,9 +126,19 @@ class FiberWeightSetter:
             return False
 
     async def _async_set_node_weights(self, **kwargs):
-        """Async wrapper for the synchronous set_node_weights function"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: w.set_node_weights(**kwargs))
+        """Async wrapper for the synchronous set_node_weights function with timeout"""
+        try:
+            loop = asyncio.get_event_loop()
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: w.set_node_weights(**kwargs)),
+                timeout=120
+            )
+        except asyncio.TimeoutError:
+            logger.error("Weight setting timed out after 120 seconds")
+            raise
+        except Exception as e:
+            logger.error(f"Error in weight setting: {str(e)}")
+            raise
 
 
 async def main():

@@ -68,58 +68,48 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
     @BaseDatabaseManager.with_transaction
     async def initialize_database(self, session):
-        """
-        Initialize database tables and schemas for validator tasks.
-        """
-        # Create process queue table
-        await session.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS process_queue (
-                    id SERIAL PRIMARY KEY,
-                    process_type VARCHAR(50) NOT NULL,
-                    process_name VARCHAR(100) NOT NULL,
-                    task_id INTEGER,
-                    task_name VARCHAR(100),
-                    priority INTEGER DEFAULT 0,
-                    status VARCHAR(50) DEFAULT 'pending',
-                    payload BYTEA,
-                    start_processing_time TIMESTAMP WITH TIME ZONE,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    started_at TIMESTAMP WITH TIME ZONE,
-                    completed_at TIMESTAMP WITH TIME ZONE,
-                    complete_by TIMESTAMP WITH TIME ZONE,
-                    expected_execution_time INTEGER,
-                    execution_time INTEGER,
-                    error TEXT,
-                    retries INTEGER DEFAULT 0,
-                    max_retries INTEGER DEFAULT 3
-                )
-                """
+        """Initialize database tables and schemas for validator tasks."""
+        try:
+            await self._create_node_table()
+            await self._create_trigger_function()
+            await self._create_trigger()
+            await self._initialize_rows()
+            await self.create_score_table()
+
+            await session.execute(
+                text("""
+                    CREATE TABLE IF NOT EXISTS process_queue (
+                        id SERIAL PRIMARY KEY,
+                        process_type VARCHAR(50) NOT NULL,
+                        process_name VARCHAR(100) NOT NULL,
+                        task_id INTEGER,
+                        task_name VARCHAR(100),
+                        priority INTEGER DEFAULT 0,
+                        status VARCHAR(50) DEFAULT 'pending',
+                        payload BYTEA,
+                        start_processing_time TIMESTAMP WITH TIME ZONE,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                        started_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        complete_by TIMESTAMP WITH TIME ZONE,
+                        expected_execution_time INTEGER,
+                        execution_time INTEGER,
+                        error TEXT,
+                        retries INTEGER DEFAULT 0,
+                        max_retries INTEGER DEFAULT 3
+                    )
+                """)
             )
-        )
 
-        # Add indexes
-        await session.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS idx_process_queue_status ON process_queue(status)"
-            )
-        )
-        await session.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS idx_process_queue_priority ON process_queue(priority)"
-            )
-        )
-
-        # Create miner table
-        await self.create_miner_table()
-
-        # Create score table
-        await self.create_score_table()
-
-        # Load schemas and initialize task tables
-        task_schemas = await self.load_task_schemas()
-        await self.initialize_task_tables(task_schemas)
+            task_schemas = await self.load_task_schemas()
+            await self.initialize_task_tables(task_schemas)
+            
+            logger.info("Successfully initialized all database tables")
+            
+        except Exception as e:
+            logger.error(f"Error during database initialization: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
     async def _create_task_table(self, schema: Dict[str, Any], table_name: str = None):
         """
@@ -130,7 +120,6 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             table_name (str, optional): Override table name for multi-table schemas
         """
         try:
-            # If this is a multi-table schema, use the passed table_name
             if table_name:
                 table_schema = schema[table_name]
             else:
@@ -156,7 +145,6 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                         f"Table {table_schema['table_name']} created or already exists."
                     )
 
-            # Separate connection for index creation
             async with self.engine.connect() as conn:
                 async with conn.begin():
                     # Create any specified indexes

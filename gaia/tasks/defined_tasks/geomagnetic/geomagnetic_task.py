@@ -865,7 +865,9 @@ class GeomagneticTask(Task):
             DELETE FROM geomagnetic_predictions
             WHERE miner_uid = ANY(:uids)
             """
-            await self.db_manager.execute(delete_query, {"uids": uids})
+            # Convert integer UIDs to strings
+            str_uids = [str(uid) for uid in uids]
+            await self.db_manager.execute(delete_query, {"uids": str_uids})
             logger.info(f"Deleted predictions for UIDs: {uids}")
 
             # Step 2: Set up time window (3 days)

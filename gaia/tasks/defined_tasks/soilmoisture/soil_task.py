@@ -1003,7 +1003,8 @@ class SoilMoistureTask(Task):
             DELETE FROM soil_moisture_predictions
             WHERE miner_uid = ANY(:uids)
             """
-            await self.db_manager.execute(delete_query, {"uids": uids})
+            str_uids = [str(uid) for uid in uids]
+            await self.db_manager.execute(delete_query, {"uids": str_uids})
             logger.info(f"Deleted predictions for UIDs: {uids}")
 
             current_time = datetime.now(timezone.utc)

@@ -115,6 +115,7 @@ class GaiaValidator:
             self.current_block = self.substrate.get_block()["header"]["number"]
             self.last_set_weights_block = self.current_block - 300
 
+
             return True
         except Exception as e:
             logger.error(f"Error setting up neuron: {e}")
@@ -271,7 +272,7 @@ class GaiaValidator:
                     asyncio.create_task(self.status_logger()),
                     asyncio.create_task(self.main_scoring()),
                     asyncio.create_task(self.handle_miner_deregistration_loop()),
-                    asyncio.create_task(self.check_for_updates()),
+                   # asyncio.create_task(self.check_for_updates()),
                     asyncio.create_task(self.miner_score_sender.run_async()),
                 ]
 
@@ -291,45 +292,99 @@ class GaiaValidator:
 
         while True:
             try:
+                async def scoring_cycle():
+                    validator_uid = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: self.substrate.query(
+                                "SubtensorModule", 
+                                "Uids", 
+                                [self.netuid, self.keypair.ss58_address]
+                            ).value
+                        ),
+                        timeout=30
+                    )
+                    
+                    if validator_uid is None:
+                        logger.error("Validator not found on chain")
+                        await asyncio.sleep(12)
+                        return False
 
-                validator_uid = self.substrate.query(
-                    "SubtensorModule",
-                    "Uids",
-                    [self.netuid, self.keypair.ss58_address]
-                ).value
 
-                if validator_uid is None:
-                    logger.error("Validator not found on chain")
-                    await asyncio.sleep(12)
-                    continue
-
-                blocks_since_update = w.blocks_since_last_update(
-                    self.substrate,
-                    self.netuid,
-                    validator_uid
-                )
-                min_interval = w.min_interval_to_set_weights(
-                    self.substrate,
-                    self.netuid
-                )
-
-                if (min_interval is None or
-                        (blocks_since_update is not None and blocks_since_update >= min_interval)):
-                    if w.can_set_weights(self.substrate, self.netuid, validator_uid):
-                        normalized_weights = await self._calc_task_weights()
-                        if normalized_weights:
-                            success = await weight_setter.set_weights(normalized_weights)
-                            if success:
-                                await self.update_last_weights_block()
-                                logger.info("✅ Successfully set weights")
-                                await asyncio.sleep(30)
-                else:
-                    logger.info(
-                        f"Waiting for weight setting: {blocks_since_update}/{min_interval} blocks"
+                    blocks_since_update = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: w.blocks_since_last_update(
+                                self.substrate, 
+                                self.netuid, 
+                                validator_uid
+                            )
+                        ),
+                        timeout=30
                     )
 
-                await asyncio.sleep(12)
+                    min_interval = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: w.min_interval_to_set_weights(
+                                self.substrate, 
+                                self.netuid
+                            )
+                        ),
+                        timeout=30
+                    )
 
+                    # Add check for recent successful weight set
+                    current_block = self.substrate.get_block()["header"]["number"]
+                    if current_block - self.last_set_weights_block < min_interval:
+                        logger.info(f"Recently set weights {current_block - self.last_set_weights_block} blocks ago")
+                        await asyncio.sleep(12)
+                        return True
+
+                    if (min_interval is None or 
+                        (blocks_since_update is not None and blocks_since_update >= min_interval)):
+                        
+                        can_set = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: w.can_set_weights(
+                                    self.substrate, 
+                                    self.netuid, 
+                                    validator_uid
+                                )
+                            ),
+                            timeout=30
+                        )
+                        
+                        if can_set:
+                            normalized_weights = await self._calc_task_weights()
+                            if normalized_weights:
+                                success = await asyncio.wait_for(
+                                    weight_setter.set_weights(normalized_weights),
+                                    timeout=180
+                                )
+                                if success:
+                                    self.last_set_weights_block = current_block
+                                    logger.info("✅ Successfully set weights")
+                                    await asyncio.sleep(30)
+                    else:
+                        logger.info(
+                            f"Waiting for weight setting: {blocks_since_update}/{min_interval} blocks"
+                        )
+
+                    await asyncio.sleep(12)
+                    return True
+
+                await asyncio.wait_for(scoring_cycle(), timeout=600)
+
+            except asyncio.TimeoutError:
+                logger.error("Weight setting operation timed out - restarting cycle")
+                try:
+                    self.substrate = interface.get_substrate(subtensor_network=self.subtensor_network)
+                except Exception as e:
+                    logger.error(f"Failed to reconnect to substrate: {e}")
+                await asyncio.sleep(12)
+                continue
             except Exception as e:
                 logger.error(f"Error in main_scoring: {e}")
                 logger.error(traceback.format_exc())
@@ -474,7 +529,7 @@ class GaiaValidator:
         logger.info("Metagraph synced. Fetching recent scores...")
 
         three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
-
+        
         query = """
         SELECT score 
         FROM score_table 
@@ -483,7 +538,7 @@ class GaiaValidator:
         ORDER BY created_at DESC 
         LIMIT 1
         """
-
+        
         geomagnetic_result = await self.database_manager.fetch_one(
             query, {"task_name": "geomagnetic", "start_time": three_days_ago}
         )
@@ -510,16 +565,13 @@ class GaiaValidator:
             elif math.isnan(soil_score):
                 geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
                 weights[idx] = 0.5 * geo_normalized
-                logger.debug(
-                    f"UID {idx}: Soil score nan - normalized geo score: {geo_normalized} -> weight: {weights[idx]}")
+                logger.debug(f"UID {idx}: Soil score nan - normalized geo score: {geo_normalized} -> weight: {weights[idx]}")
             else:
                 geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
                 weights[idx] = (0.5 * geo_normalized) + (0.5 * soil_score)
-                logger.debug(
-                    f"UID {idx}: Both scores valid - geo_norm: {geo_normalized}, soil: {soil_score} -> weight: {weights[idx]}")
+                logger.debug(f"UID {idx}: Both scores valid - geo_norm: {geo_normalized}, soil: {soil_score} -> weight: {weights[idx]}")
 
-            logger.info(
-                f"UID {idx}: geo={geomagnetic_score} (norm={geo_normalized if 'geo_normalized' in locals() else 'nan'}), soil={soil_score}, weight={weights[idx]}")
+            logger.info(f"UID {idx}: geo={geomagnetic_score} (norm={geo_normalized if 'geo_normalized' in locals() else 'nan'}), soil={soil_score}, weight={weights[idx]}")
 
         logger.info(f"Weights before normalization: {weights}")
 
