@@ -241,7 +241,7 @@ class GaiaValidator:
             try:
                 current_time = time.time()
                 
-                # Check weight setting health
+                # weight setting health
                 if current_time - self.last_successful_weight_set > self.watchdog_timeout:
                     logger.warning("Validator appears frozen - forcing restart of scoring cycle")
                     self.substrate = interface.get_substrate(subtensor_network=self.subtensor_network)
@@ -254,10 +254,10 @@ class GaiaValidator:
                         network=self.subtensor_network
                     )
                 
-                # Check deregistration loop health
+                # Deregistration loop health
                 if hasattr(self, 'last_dereg_check_start'):
                     dereg_duration = current_time - self.last_dereg_check_start
-                    if dereg_duration > 600:  # 10 minutes
+                    if dereg_duration > 600:
                         logger.warning("Deregistration loop appears stuck - forcing reset")
                         await self.database_manager.reset_pool()
                         self.metagraph.sync_nodes()
@@ -310,7 +310,7 @@ class GaiaValidator:
                     asyncio.create_task(self.main_scoring()),
                     asyncio.create_task(self.handle_miner_deregistration_loop()),
                    # asyncio.create_task(self.check_for_updates()),
-                    #asyncio.create_task(self.miner_score_sender.run_async()),
+                    asyncio.create_task(self.miner_score_sender.run_async()),
                 ]
 
                 await asyncio.gather(*workers, return_exceptions=True)
@@ -505,7 +505,8 @@ class GaiaValidator:
         """Run miner deregistration checks every 60 seconds."""
         while True:
             try:
-                async with asyncio.timeout(300):
+                # Replace asyncio.timeout with a task + wait_for pattern
+                async def check_deregistration():
                     self.last_dereg_check_start = time.time()
                     
                     self.metagraph.sync_nodes()
@@ -516,16 +517,18 @@ class GaiaValidator:
 
                     if not self.nodes:
                         try:
-                            async with asyncio.timeout(60):
-                                query = "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL"
-                                rows = await self.database_manager.fetch_many(query)
-                                self.nodes = {
-                                    row["uid"]: {"hotkey": row["hotkey"], "uid": row["uid"]}
-                                    for row in rows
-                                }
+                            query = "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL"
+                            rows = await asyncio.wait_for(
+                                self.database_manager.fetch_many(query),
+                                timeout=60
+                            )
+                            self.nodes = {
+                                row["uid"]: {"hotkey": row["hotkey"], "uid": row["uid"]}
+                                for row in rows
+                            }
                         except asyncio.TimeoutError:
                             logger.error("Database query timed out")
-                            continue
+                            return
 
                     deregistered_miners = []
                     for uid, registered in self.nodes.items():
@@ -542,18 +545,22 @@ class GaiaValidator:
                         
                         for idx in uids:
                             self.weights[idx] = 0.0
-                        try:
-                            async with asyncio.timeout(300):
-                                await self.soil_task.recalculate_recent_scores(uids)
-                                await self.geomagnetic_task.recalculate_recent_scores(uids)
-                                logger.info(f"Successfully recalculated scores for {len(uids)} miners")
-                                self.last_successful_recalc = time.time()
-                        except asyncio.TimeoutError:
-                            logger.error("Score recalculation timed out")
-                            continue
+                        
+                        await asyncio.wait_for(
+                            self.soil_task.recalculate_recent_scores(uids),
+                            timeout=300
+                        )
+                        await asyncio.wait_for(
+                            self.geomagnetic_task.recalculate_recent_scores(uids),
+                            timeout=300
+                        )
+                        logger.info(f"Successfully recalculated scores for {len(uids)} miners")
+                        self.last_successful_recalc = time.time()
                     
                     self.last_successful_dereg_check = time.time()
-                    
+
+                await asyncio.wait_for(check_deregistration(), timeout=300)
+
             except asyncio.TimeoutError:
                 logger.error("Deregistration loop timed out - restarting loop")
                 continue
