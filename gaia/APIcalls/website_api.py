@@ -42,7 +42,7 @@ class GaiaCommunicator:
         """
         current_thread = threading.current_thread().name
         max_retries = 3
-        base_delay = 1  # Base delay in seconds
+        base_delay = 1
 
         if not self._validate_payload(data):
             logger.error(f"| {current_thread} | ❗ Invalid payload structure: {data}")
@@ -74,10 +74,6 @@ class GaiaCommunicator:
                     elif not isinstance(value, str):
                         prediction[field] = "[]"
 
-                if "soilPredictionInput" not in prediction:
-                    prediction["soilPredictionInput"] = "input.tif"
-                if "soilPredictionOutput" not in prediction:
-                    prediction["soilPredictionOutput"] = "output.tif"
 
         for attempt in range(max_retries):
             try:
@@ -124,7 +120,6 @@ class GaiaCommunicator:
                 logger.error(f"Missing required field: {field}")
                 return False
 
-        # Ensure geomagneticPredictions and soilMoisturePredictions are lists
         if not isinstance(data.get("geomagneticPredictions", []), list):
             logger.error("Invalid data type for geomagneticPredictions: Must be a list")
             return False
