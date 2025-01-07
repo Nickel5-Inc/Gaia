@@ -309,7 +309,7 @@ class GaiaValidator:
                     asyncio.create_task(self.status_logger()),
                     asyncio.create_task(self.main_scoring()),
                     asyncio.create_task(self.handle_miner_deregistration_loop()),
-                   # asyncio.create_task(self.check_for_updates()),
+                    asyncio.create_task(self.check_for_updates()),
                     asyncio.create_task(self.miner_score_sender.run_async()),
                 ]
 
@@ -405,6 +405,7 @@ class GaiaValidator:
                                     self.last_successful_weight_set = time.time()
                                     logger.info("✅ Successfully set weights")
                                     await asyncio.sleep(30)
+                                    await self.update_last_weights_block()
                     else:
                         logger.info(
                             f"Waiting for weight setting: {blocks_since_update}/{min_interval} blocks"
