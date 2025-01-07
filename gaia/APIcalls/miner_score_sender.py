@@ -1,6 +1,7 @@
 import asyncio
 from sqlalchemy import text
 from fiber.logging_utils import get_logger
+import pprint
 
 from gaia.APIcalls.website_api import GaiaCommunicator
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
@@ -120,9 +121,12 @@ class MinerScoreSender:
                     return
 
                 batch_size = 3
+                total_batches = (len(active_miners) + batch_size - 1) // batch_size
+                
                 for i in range(0, len(active_miners), batch_size):
                     batch = active_miners[i:i + batch_size]
-                    logger.info(f"Processing batch {i//batch_size + 1} of {(len(active_miners) + batch_size - 1)//batch_size}")
+                    current_batch = (i // batch_size) + 1
+                    logger.info(f"Processing batch {current_batch} of {total_batches}")
 
                     tasks = []
                     for miner in batch:
@@ -133,25 +137,23 @@ class MinerScoreSender:
                     
                     for j in range(0, len(results), 2):
                         miner = batch[j//2]
-                        geomagnetic_predictions = results[j]
-                        soil_moisture_predictions = results[j+1]
-
+                        hotkey = miner["hotkey"]
+                        
                         payload = {
-                            "minerHotKey": miner["hotkey"],
+                            "minerHotKey": hotkey,
                             "minerColdKey": miner["coldkey"],
-                            "geomagneticPredictions": geomagnetic_predictions or [],
-                            "soilMoisturePredictions": soil_moisture_predictions or []
+                            "geomagneticPredictions": results[j] or [],
+                            "soilMoisturePredictions": results[j+1] or []
                         }
 
-                        success = await gaia_communicator.send_data(data=payload)
-                        if not success:
-                            logger.warning(f"Failed to send data for miner {miner['hotkey']}")
+                        logger.debug(f"Sending data for miner {hotkey} (batch {current_batch}/{total_batches})")
+                        logger.debug(f"Payload:\n{pprint.pformat(payload, indent=2)}")
+                        if await gaia_communicator.send_data(data=payload):
+                            logger.debug(f"Successfully processed miner {hotkey}")
                         
-                        await asyncio.sleep(1)
-                    
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(0.5)
 
-                logger.info("Completed sending all miner data to Gaia API")
+                logger.info("Completed processing all miners")
 
     async def run_async(self):
         """
