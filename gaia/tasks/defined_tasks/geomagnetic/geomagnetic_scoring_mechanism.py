@@ -44,6 +44,10 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             return float("nan")
 
         try:
+            # Normalize the actual value to the same scale as the prediction
+            actual_value = actual_value / 100.0
+
+            # Calculate the score
             return 1 / (1 + abs(predicted_value - actual_value))
         except Exception as e:
             logger.error(f"Error calculating score: {e}")

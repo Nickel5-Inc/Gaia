@@ -5,6 +5,18 @@ from fiber.logging_utils import get_logger
 from gaia.APIcalls.website_api import GaiaCommunicator
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 
+def prepare_prediction_field(data_list):
+    """
+    Convert a list of values into a comma-separated string.
+
+    Args:
+        data_list (list): List of prediction values.
+
+    Returns:
+        str: Comma-separated string of values.
+    """
+    return ",".join(map(str, data_list)) if data_list else ""
+
 logger = get_logger(__name__)
 
 class MinerScoreSender:
@@ -122,7 +134,18 @@ class MinerScoreSender:
                         "minerHotKey": hotkey,
                         "minerColdKey": coldkey,
                         "geomagneticPredictions": geomagnetic_predictions or [],
-                        "soilMoisturePredictions": soil_moisture_predictions or []
+                        "soilSurfacePredictedValues": prepare_prediction_field(
+                            [prediction["soilSurfacePredictedValues"] for prediction in soil_moisture_predictions]
+                        ),
+                        "soilRootzonePredictedValues": prepare_prediction_field(
+                            [prediction["soilRootzonePredictedValues"] for prediction in soil_moisture_predictions]
+                        ),
+                        "soilSurfaceGroundTruthValues": prepare_prediction_field(
+                            [prediction["soilSurfaceGroundTruthValues"] for prediction in soil_moisture_predictions]
+                        ),
+                        "soilRootzoneGroundTruthValues": prepare_prediction_field(
+                            [prediction["soilRootzoneGroundTruthValues"] for prediction in soil_moisture_predictions]
+                        ),
                     }
 
                     tasks.append(gaia_communicator.send_data(data=payload))
