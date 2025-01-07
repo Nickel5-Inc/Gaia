@@ -19,6 +19,10 @@ Read more about the long-term vision in our [whitepaper](https://www.gaiaresearc
 git clone https://github.com/Nickel5-Inc/Gaia.git
 cd Gaia
 ```
+## **Build the Repository Modules**
+```bash
+pip install -e .
+```
 
 ## Miners
 [Quicklink](docs/MINER.md)
