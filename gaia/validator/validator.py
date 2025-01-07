@@ -1,5 +1,6 @@
 from datetime import datetime, timezone, timedelta
 import os
+import time
 
 os.environ["NODE_TYPE"] = "validator"
 import asyncio
@@ -67,6 +68,9 @@ class GaiaValidator:
             ),
             transport=httpx.AsyncHTTPTransport(retries=3),
         )
+
+        self.last_successful_weight_set = time.time()
+        self.watchdog_timeout = 1800  # 30 minutes
 
     def setup_neuron(self) -> bool:
         """
@@ -229,7 +233,39 @@ class GaiaValidator:
                 logger.error(f"Error in update checker: {e}")
                 logger.error(traceback.format_exc())
 
-            await asyncio.sleep(120)  # Wait 2 minutes before next check
+            await asyncio.sleep(120)
+
+    async def watchdog(self):
+        """Monitor validator health and force restart if frozen for any reason"""
+        while True:
+            try:
+                current_time = time.time()
+                
+                # Check weight setting health
+                if current_time - self.last_successful_weight_set > self.watchdog_timeout:
+                    logger.warning("Validator appears frozen - forcing restart of scoring cycle")
+                    self.substrate = interface.get_substrate(subtensor_network=self.subtensor_network)
+                    await self.database_manager.reset_pool()
+                    self.metagraph.sync_nodes()
+                    self.weight_setter = FiberWeightSetter(
+                        netuid=self.netuid,
+                        wallet_name=self.wallet_name,
+                        hotkey_name=self.hotkey_name,
+                        network=self.subtensor_network
+                    )
+                
+                # Check deregistration loop health
+                if hasattr(self, 'last_dereg_check_start'):
+                    dereg_duration = current_time - self.last_dereg_check_start
+                    if dereg_duration > 600:  # 10 minutes
+                        logger.warning("Deregistration loop appears stuck - forcing reset")
+                        await self.database_manager.reset_pool()
+                        self.metagraph.sync_nodes()
+                
+                await asyncio.sleep(300)
+            except Exception as e:
+                logger.error(f"Error in watchdog: {e}")
+                await asyncio.sleep(60)
 
     async def main(self):
         """
@@ -263,6 +299,7 @@ class GaiaValidator:
         logger.info("Updating miner table...")
         await self.update_miner_table()
         logger.info("Miner table updated.")
+        asyncio.create_task(self.watchdog())
 
         while True:
             try:
@@ -273,7 +310,7 @@ class GaiaValidator:
                     asyncio.create_task(self.main_scoring()),
                     asyncio.create_task(self.handle_miner_deregistration_loop()),
                    # asyncio.create_task(self.check_for_updates()),
-                    asyncio.create_task(self.miner_score_sender.run_async()),
+                    #asyncio.create_task(self.miner_score_sender.run_async()),
                 ]
 
                 await asyncio.gather(*workers, return_exceptions=True)
@@ -365,6 +402,7 @@ class GaiaValidator:
                                 )
                                 if success:
                                     self.last_set_weights_block = current_block
+                                    self.last_successful_weight_set = time.time()
                                     logger.info("✅ Successfully set weights")
                                     await asyncio.sleep(30)
                     else:
@@ -467,55 +505,58 @@ class GaiaValidator:
         """Run miner deregistration checks every 60 seconds."""
         while True:
             try:
-                self.metagraph.sync_nodes()
-                active_miners = {
-                    idx: {"hotkey": hotkey, "uid": idx}
-                    for idx, (hotkey, _) in enumerate(self.metagraph.nodes.items())
-                }
-
-                if not self.nodes:
-                    query = (
-                        "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL"
-                    )
-                    rows = await self.database_manager.fetch_many(query)
-                    self.nodes = {
-                        row["uid"]: {"hotkey": row["hotkey"], "uid": row["uid"]}
-                        for row in rows
+                async with asyncio.timeout(300):
+                    self.last_dereg_check_start = time.time()
+                    
+                    self.metagraph.sync_nodes()
+                    active_miners = {
+                        idx: {"hotkey": hotkey, "uid": idx}
+                        for idx, (hotkey, _) in enumerate(self.metagraph.nodes.items())
                     }
 
-                deregistered_miners = []
-                for uid, registered in self.nodes.items():
-                    if active_miners[uid]["hotkey"] != registered["hotkey"]:
-                        deregistered_miners.append(registered)
+                    if not self.nodes:
+                        try:
+                            async with asyncio.timeout(60):
+                                query = "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL"
+                                rows = await self.database_manager.fetch_many(query)
+                                self.nodes = {
+                                    row["uid"]: {"hotkey": row["hotkey"], "uid": row["uid"]}
+                                    for row in rows
+                                }
+                        except asyncio.TimeoutError:
+                            logger.error("Database query timed out")
+                            continue
 
-                if deregistered_miners:
-                    logger.info(
-                        f"Found {len(deregistered_miners)} deregistered miners:"
-                    )
-                    for miner in deregistered_miners:
-                        logger.info(
-                            f"UID {miner['uid']}: {miner['hotkey']} -> {active_miners[miner['uid']]['hotkey']}"
-                        )
+                    deregistered_miners = []
+                    for uid, registered in self.nodes.items():
+                        if active_miners[uid]["hotkey"] != registered["hotkey"]:
+                            deregistered_miners.append(registered)
 
-                    for miner in deregistered_miners:
-                        self.nodes[miner["uid"]]["hotkey"] = active_miners[
-                            miner["uid"]
-                        ]["hotkey"]
+                    if deregistered_miners:
+                        logger.info(f"Found {len(deregistered_miners)} deregistered miners")
+                        
+                        for miner in deregistered_miners:
+                            self.nodes[miner["uid"]]["hotkey"] = active_miners[miner["uid"]]["hotkey"]
 
-                    uids = [int(miner["uid"]) for miner in deregistered_miners]
-
-                    for idx in uids:
-                        self.weights[idx] = 0.0
-
-                    await self.soil_task.recalculate_recent_scores(uids)
-                    await self.geomagnetic_task.recalculate_recent_scores(uids)
-
-                    logger.info(
-                        f"Processed {len(deregistered_miners)} deregistered miners"
-                    )
-                else:
-                    logger.debug("No deregistered miners found")
-
+                        uids = [int(miner["uid"]) for miner in deregistered_miners]
+                        
+                        for idx in uids:
+                            self.weights[idx] = 0.0
+                        try:
+                            async with asyncio.timeout(300):
+                                await self.soil_task.recalculate_recent_scores(uids)
+                                await self.geomagnetic_task.recalculate_recent_scores(uids)
+                                logger.info(f"Successfully recalculated scores for {len(uids)} miners")
+                                self.last_successful_recalc = time.time()
+                        except asyncio.TimeoutError:
+                            logger.error("Score recalculation timed out")
+                            continue
+                    
+                    self.last_successful_dereg_check = time.time()
+                    
+            except asyncio.TimeoutError:
+                logger.error("Deregistration loop timed out - restarting loop")
+                continue
             except Exception as e:
                 logger.error(f"Error in deregistration loop: {e}")
                 logger.error(traceback.format_exc())
