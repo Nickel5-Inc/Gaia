@@ -4,6 +4,7 @@ from huggingface_hub import hf_hub_download
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.defined_tasks.soilmoisture.utils.region_selection import (
     select_random_region,
+    get_deterministic_seed,
 )
 from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import get_soil_data, get_data_dir
 import json
@@ -12,6 +13,7 @@ import os
 import shutil
 from sqlalchemy import text
 from fiber.logging_utils import get_logger
+import random
 
 logger = get_logger(__name__)
 
@@ -172,7 +174,6 @@ class SoilValidatorPreprocessing(Preprocessing):
     ) -> List[Dict]:
         """Get regions for today, selecting new ones if needed."""
         try:
-            # First check if we already have enough regions for this timestep
             has_existing_regions = await self._check_existing_regions(target_time)
             if has_existing_regions:
                 if target_time not in self._logged_timestamps:
@@ -183,14 +184,24 @@ class SoilValidatorPreprocessing(Preprocessing):
                     self._cleanup_logged_timestamps()
                 return []
 
+            today = target_time.date()
+            hour = target_time.hour
+            seed = get_deterministic_seed(today, hour)
+            random.seed(seed)
+            logger.info(f"Set random seed to {seed} for target_time {target_time}")
+            
             regions = []
-            while self._can_select_region(target_time):
-                try:
-                    bbox = select_random_region(
-                        base_cells=self._base_cells,
-                        urban_cells_set=self._urban_cells,
-                        lakes_cells_set=self._lakes_cells,
-                    )
+            used_bounds = set()
+            
+            while len(regions) < self.regions_per_timestep:
+                bbox = select_random_region(
+                    base_cells=self._base_cells,
+                    urban_cells_set=self._urban_cells,
+                    lakes_cells_set=self._lakes_cells,
+                    timestamp=target_time,
+                    used_bounds=used_bounds
+                )
+                if bbox:
                     soil_data = await self.get_soil_data(bbox, ifs_forecast_time)
 
                     if soil_data is not None:
@@ -224,10 +235,8 @@ class SoilValidatorPreprocessing(Preprocessing):
                                 except Exception as e:
                                     logger.error(f"Failed to remove tif file {filepath}: {e}")
 
-                except Exception as e:
-                    logger.error(f"Error processing region: {str(e)}")
-                    continue
-
+            random.seed()
+            
             return regions
 
         except Exception as e:
