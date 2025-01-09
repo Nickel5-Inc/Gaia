@@ -61,7 +61,8 @@ def factory_router(miner_instance) -> APIRouter:
         try:
             if decrypted_payload.data:
                 response_data = decrypted_payload.model_dump()
-                geomagnetic_task = GeomagneticTask()
+                db_manager = MinerDatabaseManager()
+                geomagnetic_task = GeomagneticTask(db_manager=db_manager)
                 logger.info(f"Miner executing geomagnetic prediction ...")
 
                 result = geomagnetic_task.miner_execute(response_data, miner_instance)
