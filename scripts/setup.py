@@ -4,6 +4,19 @@ import subprocess
 from pathlib import Path
 import getpass
 
+def check_system_requirements():
+    """Ensure we're running on Ubuntu 22.04"""
+    try:
+        # Check OS
+        with open("/etc/os-release") as f:
+            os_info = dict(line.strip().split('=', 1) for line in f if '=' in line)
+        
+        if os_info.get('ID') != 'ubuntu' or os_info.get('VERSION_ID', '').strip('"') != '22.04':
+            sys.exit("This script requires Ubuntu 22.04")
+            
+    except Exception as e:
+        sys.exit(f"Unable to determine OS version: {e}")
+
 def check_python_version():
     """Ensure Python version is 3.10 or higher"""
     if sys.version_info < (3, 10):
@@ -21,16 +34,10 @@ def setup_python_environment():
         if not venv_path.exists():
             subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True)
         
-        # Get paths
-        if sys.platform == "win32":
-            python_path = str(venv_path / "Scripts" / "python.exe")
-            pip_path = str(venv_path / "Scripts" / "pip.exe")
-            activate_script = str(venv_path / "Scripts" / "activate.bat")
-        else:
-            python_path = str(venv_path / "bin" / "python")
-            pip_path = str(venv_path / "bin" / "pip")
-            activate_script = str(venv_path / "bin" / "activate")
-
+        # Get paths for Ubuntu
+        python_path = str(venv_path / "bin" / "python")
+        pip_path = str(venv_path / "bin" / "pip")
+        
         # Activate virtual environment by modifying PATH and VIRTUAL_ENV
         venv_env = os.environ.copy()
         venv_env["VIRTUAL_ENV"] = str(venv_path)
@@ -116,7 +123,7 @@ def install_python_dependencies(python_path, pip_path, project_root, venv_env):
         print(f"Error installing Python dependencies: {e}")
         sys.exit(1)
 
-def setup_postgresql(python_path, default_user="postgres", default_password="postgres", venv_env=None):
+def setup_postgresql(python_path, default_user="postgres", default_password="postgres", venv_env=None, test_mode=False):
     """Configure PostgreSQL for the project by running setup through the virtual environment"""
     try:
         print("Setting up PostgreSQL...")
@@ -127,7 +134,7 @@ import os
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
-def setup_db():
+def setup_db(test_mode=False):
     try:
         # Get credentials from env or use defaults
         postgres_user = os.getenv("POSTGRES_USER", "{default_user}")
@@ -149,20 +156,30 @@ def setup_db():
         if not role_exists:
             cur.execute("CREATE USER gaia WITH PASSWORD 'postgres';")
 
-        # Drop existing databases if they exist
-        databases = ["validator_db", "miner_db"]
+        # Set up databases based on mode
+        if test_mode:
+            databases = ["test_validator_db", "test_miner_db"]
+            env_prefix = "TEST_"
+            print("Setting up test databases...")
+        else:
+            databases = ["validator_db", "miner_db"]
+            env_prefix = ""
+            print("Setting up production databases...")
+
         for db in databases:
             cur.execute(f"DROP DATABASE IF EXISTS {{db}};")
             cur.execute(f"CREATE DATABASE {{db}};")
             cur.execute(f"GRANT ALL PRIVILEGES ON DATABASE {{db}} TO gaia;")
 
-        with open(".env", "w") as f:
-            f.write(f"DB_USER={{postgres_user}}\\n")
-            f.write(f"DB_PASSWORD={{postgres_password}}\\n")
-            f.write("DB_HOST=localhost\\n")
-            f.write("DB_PORT=5432\\n")
+        # Write appropriate .env file
+        env_file = ".env.test" if test_mode else ".env"
+        with open(env_file, "w") as f:
+            f.write(f"{{env_prefix}}DB_USER={{postgres_user}}\\n")
+            f.write(f"{{env_prefix}}DB_PASSWORD={{postgres_password}}\\n")
+            f.write(f"{{env_prefix}}DB_HOST=localhost\\n")
+            f.write(f"{{env_prefix}}DB_PORT=5432\\n")
 
-        print("PostgreSQL configuration completed successfully")
+        print(f"PostgreSQL configuration completed successfully. Environment written to {env_file}")
         
     except Exception as e:
         print(f"Error in database setup: {{e}}")
@@ -172,7 +189,9 @@ def setup_db():
             conn.close()
 
 if __name__ == "__main__":
-    setup_db()
+    import sys
+    test_mode = "--test" in sys.argv
+    setup_db(test_mode)
 """
         
         # Write the setup script
@@ -186,7 +205,10 @@ if __name__ == "__main__":
         
         try:
             # Run the script using the virtual environment's Python
-            subprocess.run([python_path, script_path], env=venv_env, check=True)
+            cmd = [python_path, script_path]
+            if test_mode:
+                cmd.append("--test")
+            subprocess.run(cmd, env=venv_env, check=True)
         finally:
             # Clean up the temporary script
             os.remove(script_path)
@@ -200,9 +222,13 @@ def main():
     if os.geteuid() != 0:
         print("This script must be run as root (sudo)")
         sys.exit(1)
+    
+    # Check for test mode
+    test_mode = "--test" in sys.argv
         
     print("Starting project setup...")
-
+    
+    check_system_requirements()
     check_python_version()
 
     print("\nSetting up Python virtual environment...")
@@ -215,14 +241,18 @@ def main():
     install_python_dependencies(python_path, pip_path, project_root, venv_env)
 
     print("\nSetting up PostgreSQL...")
-    setup_postgresql(python_path, venv_env=venv_env)
+    setup_postgresql(python_path, venv_env=venv_env, test_mode=test_mode)
 
     print("\nSetup completed successfully!")
     print("\nNext steps:")
     print("1. Activate virtual environment:")
     print(f"   source {venv_path}/bin/activate")
-    print("2. Configure your .env file with any additional environment variables")
-    print("3. Run database migrations")
+    if test_mode:
+        print("2. Configure your .env.test file with any additional environment variables")
+        print("3. Run test database migrations")
+    else:
+        print("2. Configure your .env file with any additional environment variables")
+        print("3. Run database migrations")
 
 if __name__ == "__main__":
     main()
