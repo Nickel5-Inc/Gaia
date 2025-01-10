@@ -97,34 +97,17 @@ def install_python_dependencies(python_path, pip_path, project_root, venv_env):
     """Install required Python packages in virtual environment"""
     try:
         print("Installing required Python packages...")
-        packages = [
-            "psycopg2-binary",
-            "python-dotenv",
-            "bittensor",
-            "fastapi",
-            "uvicorn",
-            "pandas",
-            "numpy",
-            "scipy",
-            "rasterio",
-            "geopandas",
-            "earthengine-api",
-            "httpx",
-            "pytest",
-            "pytest-asyncio"
-        ]
         
-        for package in packages:
-            print(f"Installing {package}...")
-            subprocess.run([pip_path, "install", package], env=venv_env, check=True)
-            
-        # Get GDAL version from system and install matching version
+        # Get GDAL version from system
         gdal_version = (
             subprocess.check_output(["gdal-config", "--version"]).decode().strip()
         )
+        
+        # Install GDAL first since it needs to match system version
+        print(f"Installing GDAL=={gdal_version}...")
         subprocess.run([pip_path, "install", f"GDAL=={gdal_version}"], env=venv_env, check=True)
 
-        # Install project in editable mode using absolute path
+        # Install project in editable mode - this will handle all other dependencies
         print(f"Installing project from {project_root}")
         subprocess.run([pip_path, "install", "-e", str(project_root)], env=venv_env, check=True)
             
