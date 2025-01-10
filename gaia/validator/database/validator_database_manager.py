@@ -49,7 +49,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 user=user,
                 password=password,
             )
-            # Initialize SQLAlchemy engine
+
             self.engine = create_async_engine(
                 f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
             )
@@ -60,11 +60,59 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             )
             self._initialized = True
 
+    async def _ensure_pool(self):
+        """Ensure database pool exists and is healthy."""
+        try:
+            # Test the connection with a simple query
+            async with self.async_session() as session:
+                await session.execute(text("SELECT 1"))
+                await session.commit()
+            logger.info("Database connection verified")
+            return True
+        except Exception as e:
+            logger.error(f"Error ensuring pool: {e}")
+            return False
+
+    async def reset_pool(self):
+        """Reset the database engine and session maker."""
+        try:
+            if hasattr(self, 'engine'):
+                await self.engine.dispose()
+            
+            self.engine = create_async_engine(
+                f"postgresql+asyncpg://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+            )
+            self.async_session = sessionmaker(
+                bind=self.engine,
+                class_=AsyncSession,
+                expire_on_commit=False,
+            )
+            logger.info("Successfully reset database connection")
+            return True
+        except Exception as e:
+            logger.error(f"Error resetting pool: {e}")
+            return False
+
     async def get_connection(self):
-        """
-        Provide a database session/connection.
-        """
-        return self.async_session()
+        """Get a database session with retry logic."""
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                if not await self._ensure_pool():
+                    raise Exception("Failed to ensure pool exists")
+                    
+                return self.async_session()
+                
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Failed to get connection after {max_retries} attempts")
+                    raise
+                    
+                logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(retry_delay * (2 ** attempt))
+                await self.reset_pool()
 
     @BaseDatabaseManager.with_transaction
     async def initialize_database(self, session):

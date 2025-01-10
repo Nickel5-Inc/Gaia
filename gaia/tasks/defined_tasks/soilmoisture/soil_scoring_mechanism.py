@@ -1,5 +1,4 @@
-import datetime
-from distutils import core
+from datetime import datetime, timezone
 import tempfile
 from gaia.tasks.base.components.scoring_mechanism import ScoringMechanism
 from gaia.tasks.base.decorators import task_timer
@@ -21,7 +20,8 @@ import os
 import traceback
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.sql import text
-from datetime import timezone
+import glob
+import asyncio
 
 logger = get_logger(__name__)
 
@@ -183,25 +183,25 @@ class SoilScoringMechanism(ScoringMechanism):
     ) -> dict:
         """
         Compute RMSE and SSIM between model predictions and SMAP data for valid pixels only.
-
-        Args:
-            bounds: (left, bottom, right, top) coordinates
-            crs: EPSG code as float
-            model_predictions: tensor of shape [1, 2, 11, 11] for surface and rootzone
-            target_date: datetime for SMAP data
-            miner_id: miner's unique identifier
         """
         device = model_predictions.device
+        loop = asyncio.get_event_loop()
 
         left, bottom, right, top = bounds
         sentinel_bounds = BoundingBox(left=left, bottom=bottom, right=right, top=top)
         sentinel_crs = CRS.from_epsg(int(crs))
 
         smap_url = construct_smap_url(target_date)
-        temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
+        temp_file = None
+        temp_path = None
         try:
+            temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
+            temp_path = temp_file.name
+            temp_file.close()
+
             if not download_smap_data(smap_url, temp_file.name):
                 return None
+
             smap_data = get_smap_data_for_sentinel_bounds(
                 temp_file.name,
                 (
@@ -212,13 +212,11 @@ class SoilScoringMechanism(ScoringMechanism):
                 ),
                 sentinel_crs.to_string(),
             )
-            temp_file.close()
             if not smap_data:
                 return None
 
             if model_predictions.size(2) == 0 or model_predictions.size(3) == 0:
                 logger.error(f"Empty model predictions detected with shape: {model_predictions.shape}")
-      
                 await self.db_manager.execute(
                     """
                     DELETE FROM soil_moisture_predictions 
@@ -231,11 +229,7 @@ class SoilScoringMechanism(ScoringMechanism):
                     }
                 )
                 logger.info(f"Deleted invalid prediction for miner {miner_id} at {target_date}")
-                
-                return {
-                    "status": "invalid_prediction",
-                    "error": "Empty prediction tensor"
-                }
+                return None
 
             if model_predictions.shape[-2:] != (11, 11):
                 logger.error(f"Invalid model prediction shape: {model_predictions.shape}, expected last dimensions to be (11, 11)")
@@ -260,16 +254,15 @@ class SoilScoringMechanism(ScoringMechanism):
                 logger.error(f"Model predictions should have 2 channels, got shape: {model_predictions.shape}")
                 return None
 
-            surface_sm_11x11 = F.interpolate(
-                surface_sm, size=(11, 11), mode="bilinear", align_corners=False
-            )
-            rootzone_sm_11x11 = F.interpolate(
-                rootzone_sm, size=(11, 11), mode="bilinear", align_corners=False
-            )
+            # Run interpolation in thread pool
+            surface_sm_11x11 = await loop.run_in_executor(None, 
+                lambda: F.interpolate(surface_sm, size=(11, 11), mode="bilinear", align_corners=False))
+            rootzone_sm_11x11 = await loop.run_in_executor(None,
+                lambda: F.interpolate(rootzone_sm, size=(11, 11), mode="bilinear", align_corners=False))
+
             surface_mask_11x11 = ~torch.isnan(surface_sm_11x11[0, 0])
             rootzone_mask_11x11 = ~torch.isnan(rootzone_sm_11x11[0, 0])
 
-            # early return if no valid pixels (.i.e no valid smap data)
             if not (surface_mask_11x11.any() or rootzone_mask_11x11.any()):
                 logger.warning(f"No valid SMAP data found for bounds {bounds}")
                 cleanup_success = await self.cleanup_invalid_prediction(bounds, target_date, miner_id)
@@ -281,72 +274,58 @@ class SoilScoringMechanism(ScoringMechanism):
             if surface_mask_11x11.any():
                 valid_surface_pred = model_predictions[0, 0][surface_mask_11x11]
                 valid_surface_truth = surface_sm_11x11[0, 0][surface_mask_11x11]
-                surface_rmse = torch.sqrt(
-                    F.mse_loss(valid_surface_pred, valid_surface_truth)
-                )
+                
+                # Run RMSE calculation in thread pool
+                surface_rmse = await loop.run_in_executor(None, 
+                    lambda: torch.sqrt(F.mse_loss(valid_surface_pred, valid_surface_truth)))
                 results["validation_metrics"]["surface_rmse"] = surface_rmse.item()
 
                 surface_pred_masked = torch.zeros_like(model_predictions[0:1, 0:1])
                 surface_truth_masked = torch.zeros_like(surface_sm_11x11)
-                surface_pred_masked[0, 0][surface_mask_11x11] = model_predictions[0, 0][
-                    surface_mask_11x11
-                ]
-                surface_truth_masked[0, 0][surface_mask_11x11] = surface_sm_11x11[0, 0][
-                    surface_mask_11x11
-                ]
+                surface_pred_masked[0, 0][surface_mask_11x11] = model_predictions[0, 0][surface_mask_11x11]
+                surface_truth_masked[0, 0][surface_mask_11x11] = surface_sm_11x11[0, 0][surface_mask_11x11]
 
-                valid_min = torch.min(
-                    valid_surface_pred.min(), valid_surface_truth.min()
-                )
-                valid_max = torch.max(
-                    valid_surface_pred.max(), valid_surface_truth.max()
-                )
+                valid_min = torch.min(valid_surface_pred.min(), valid_surface_truth.min())
+                valid_max = torch.max(valid_surface_pred.max(), valid_surface_truth.max())
                 data_range = valid_max - valid_min
 
                 if data_range > 0:
-                    surface_ssim = ssim(
+                    # Run SSIM calculation in thread pool
+                    surface_ssim = await loop.run_in_executor(None, lambda: ssim(
                         surface_pred_masked,
                         surface_truth_masked,
                         data_range=data_range,
                         kernel_size=3,
-                    )
+                    ))
                     results["validation_metrics"]["surface_ssim"] = surface_ssim.item()
 
             if rootzone_mask_11x11.any():
                 valid_rootzone_pred = model_predictions[0, 1][rootzone_mask_11x11]
                 valid_rootzone_truth = rootzone_sm_11x11[0, 0][rootzone_mask_11x11]
-                rootzone_rmse = torch.sqrt(
-                    F.mse_loss(valid_rootzone_pred, valid_rootzone_truth)
-                )
+                
+                # Run RMSE calculation in thread pool
+                rootzone_rmse = await loop.run_in_executor(None,
+                    lambda: torch.sqrt(F.mse_loss(valid_rootzone_pred, valid_rootzone_truth)))
                 results["validation_metrics"]["rootzone_rmse"] = rootzone_rmse.item()
 
                 rootzone_pred_masked = torch.zeros_like(model_predictions[0:1, 1:2])
                 rootzone_truth_masked = torch.zeros_like(rootzone_sm_11x11)
-                rootzone_pred_masked[0, 0][rootzone_mask_11x11] = model_predictions[
-                    0, 1
-                ][rootzone_mask_11x11]
-                rootzone_truth_masked[0, 0][rootzone_mask_11x11] = rootzone_sm_11x11[
-                    0, 0
-                ][rootzone_mask_11x11]
+                rootzone_pred_masked[0, 0][rootzone_mask_11x11] = model_predictions[0, 1][rootzone_mask_11x11]
+                rootzone_truth_masked[0, 0][rootzone_mask_11x11] = rootzone_sm_11x11[0, 0][rootzone_mask_11x11]
 
-                valid_min = torch.min(
-                    valid_rootzone_pred.min(), valid_rootzone_truth.min()
-                )
-                valid_max = torch.max(
-                    valid_rootzone_pred.max(), valid_rootzone_truth.max()
-                )
+                valid_min = torch.min(valid_rootzone_pred.min(), valid_rootzone_truth.min())
+                valid_max = torch.max(valid_rootzone_pred.max(), valid_rootzone_truth.max())
                 data_range = valid_max - valid_min
 
                 if data_range > 0:
-                    rootzone_ssim = ssim(
+                    # Run SSIM calculation in thread pool
+                    rootzone_ssim = await loop.run_in_executor(None, lambda: ssim(
                         rootzone_pred_masked,
                         rootzone_truth_masked,
                         data_range=data_range,
                         kernel_size=3,
-                    )
-                    results["validation_metrics"][
-                        "rootzone_ssim"
-                    ] = rootzone_ssim.item()
+                    ))
+                    results["validation_metrics"]["rootzone_ssim"] = rootzone_ssim.item()
 
             return results
 
@@ -355,12 +334,30 @@ class SoilScoringMechanism(ScoringMechanism):
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
         finally:
+            # Clean up temp file
             if temp_file:
                 try:
                     temp_file.close()
-
                 except:
                     pass
+            
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                    logger.debug(f"Removed temporary file: {temp_path}")
+                except Exception as e:
+                    logger.error(f"Failed to remove temporary file {temp_path}: {e}")
+            
+            # Clean up any other .h5 files in /tmp
+            try:
+                for f in glob.glob("/tmp/*.h5"):
+                    try:
+                        os.unlink(f)
+                        logger.debug(f"Cleaned up additional temp file: {f}")
+                    except Exception as e:
+                        logger.error(f"Failed to remove temp file {f}: {e}")
+            except Exception as e:
+                logger.error(f"Error during temp file cleanup: {e}")
 
     async def cleanup_invalid_prediction(self, bounds, target_time: datetime, miner_id: str, conn=None):
         """Clean up predictions for a specific miner and timestamp."""
@@ -462,4 +459,3 @@ class SoilScoringMechanism(ScoringMechanism):
         except Exception as e:
             logger.error(f"Error preparing soil history record: {str(e)}")
             return None
-

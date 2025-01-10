@@ -178,6 +178,8 @@ class GeomagneticTask(Task):
         """
         while True:
             try:
+                await validator.update_task_status('geomagnetic', 'active')
+                
                 # Step 1: Align to the top of the next hour
                 current_time = datetime.datetime.now(datetime.timezone.utc)
                 next_hour = current_time.replace(
@@ -188,26 +190,32 @@ class GeomagneticTask(Task):
                 logger.info(
                     f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
                 )
+                await validator.update_task_status('geomagnetic', 'idle')
                 await asyncio.sleep(sleep_duration)
 
                 logger.info("Starting GeomagneticTask execution...")
 
                 # Step 2: Fetch Latest Geomagnetic Data
+                await validator.update_task_status('geomagnetic', 'processing', 'data_fetch')
                 timestamp, dst_value, historical_data = await self._fetch_geomag_data()
 
                 # Step 3: Query Miners
                 current_hour_start = next_hour - datetime.timedelta(hours=1)
+                await validator.update_task_status('geomagnetic', 'processing', 'miner_query')
                 await self._query_miners(
                     validator, timestamp, dst_value, historical_data, current_hour_start
                 )
 
                 # Step 4: Process Scores
+                await validator.update_task_status('geomagnetic', 'processing', 'scoring')
                 await self._process_scores(validator, current_hour_start, next_hour)
+                
+                await validator.update_task_status('geomagnetic', 'idle')
 
             except Exception as e:
                 logger.error(f"Unexpected error in validator_execute loop: {e}")
                 logger.error(traceback.format_exc())
-
+                await validator.update_task_status('geomagnetic', 'error')
                 await asyncio.sleep(3600)
 
     async def _fetch_geomag_data(self):
@@ -957,3 +965,39 @@ class GeomagneticTask(Task):
         except Exception as e:
             logger.error(f"Error recalculating recent scores: {e}")
             logger.error(traceback.format_exc())
+
+    async def cleanup_resources(self):
+        """Clean up any resources used by the task during recovery."""
+        try:
+            # Reset any in-progress database operations
+            try:
+                # Reset any pending predictions to allow reprocessing
+                await self.db_manager.execute(
+                    """
+                    UPDATE geomagnetic_predictions 
+                    SET status = 'pending'
+                    WHERE status = 'processing'
+                    """
+                )
+                logger.info("Reset in-progress prediction statuses")
+                
+                # Clean up any incomplete scoring operations
+                await self.db_manager.execute(
+                    """
+                    DELETE FROM score_table 
+                    WHERE task_name = 'geomagnetic' 
+                    AND status = 'processing'
+                    """
+                )
+                logger.info("Cleaned up incomplete scoring operations")
+                
+            except Exception as e:
+                logger.error(f"Failed to reset database states: {e}")
+                logger.error(traceback.format_exc())
+
+            logger.info("Completed geomagnetic task cleanup")
+            
+        except Exception as e:
+            logger.error(f"Error during geomagnetic task cleanup: {e}")
+            logger.error(traceback.format_exc())
+            raise

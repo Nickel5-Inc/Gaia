@@ -29,6 +29,9 @@ from gaia.validator.weights.set_weights import FiberWeightSetter
 import base64
 import math
 from gaia.validator.utils.auto_updater import perform_update
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import text
 
 logger = get_logger(__name__)
 
@@ -53,10 +56,71 @@ class GaiaValidator:
         self.current_block = 0
         self.nodes = {}  # Initialize the in-memory node table state
 
-        # Initialize MinerScoreSender
         self.miner_score_sender = MinerScoreSender(database_manager=self.database_manager,
                                                    loop=asyncio.get_event_loop())
 
+        self.last_successful_weight_set = time.time()
+        self.last_successful_dereg_check = time.time()
+        self.last_successful_db_check = time.time()
+        self.last_metagraph_sync = time.time()
+        
+        # Enhanced task health tracking
+        self.task_health = {
+            'scoring': {
+                'last_success': time.time(),
+                'errors': 0,
+                'status': 'idle',
+                'current_operation': None,
+                'operation_start': None,
+                'timeouts': {
+                    'default': 1800,  # 30 minutes
+                    'weight_setting': 300,  # 5 minutes
+                }
+            },
+            'deregistration': {
+                'last_success': time.time(),
+                'errors': 0,
+                'status': 'idle',
+                'current_operation': None,
+                'operation_start': None,
+                'timeouts': {
+                    'default': 1800,  # 30 minutes
+                    'db_check': 300,  # 5 minutes
+                }
+            },
+            'geomagnetic': {
+                'last_success': time.time(),
+                'errors': 0,
+                'status': 'idle',
+                'current_operation': None,
+                'operation_start': None,
+                'timeouts': {
+                    'default': 1800,  # 30 minutes
+                    'data_fetch': 300,  # 5 minutes
+                    'miner_query': 600,  # 10 minutes
+                }
+            },
+            'soil': {
+                'last_success': time.time(),
+                'errors': 0,
+                'status': 'idle',
+                'current_operation': None,
+                'operation_start': None,
+                'timeouts': {
+                    'default': 3600,  # 1 hour
+                    'data_download': 1800,  # 30 minutes
+                    'miner_query': 1800,  # 30 minutes
+                    'region_processing': 900,  # 15 minutes
+                }
+            }
+        }
+        
+        self.watchdog_timeout = 3600  # 1 hour default timeout
+        self.db_check_interval = 300  # 5 minutes
+        self.metagraph_sync_interval = 300  # 5 minutes
+        self.max_consecutive_errors = 3
+        
+        # Connection settings
         self.httpx_client = httpx.AsyncClient(
             timeout=30.0,
             follow_redirects=True,
@@ -68,9 +132,6 @@ class GaiaValidator:
             ),
             transport=httpx.AsyncHTTPTransport(retries=3),
         )
-
-        self.last_successful_weight_set = time.time()
-        self.watchdog_timeout = 1800  # 30 minutes
 
     def setup_neuron(self) -> bool:
         """
@@ -235,37 +296,110 @@ class GaiaValidator:
 
             await asyncio.sleep(120)
 
+    async def update_task_status(self, task_name: str, status: str, operation: Optional[str] = None):
+        """Update task status and operation tracking."""
+        if task_name in self.task_health:
+            health = self.task_health[task_name]
+            health['status'] = status
+            
+            if operation:
+                if operation != health.get('current_operation'):
+                    health['current_operation'] = operation
+                    health['operation_start'] = time.time()
+                    logger.info(f"Task {task_name} started operation: {operation}")
+            elif status == 'idle':
+                health['current_operation'] = None
+                health['operation_start'] = None
+                health['last_success'] = time.time()
+
     async def watchdog(self):
-        """Monitor validator health and force restart if frozen for any reason"""
+        """Enhanced watchdog to monitor validator health and recover from freezes."""
         while True:
             try:
                 current_time = time.time()
                 
-                # weight setting health
-                if current_time - self.last_successful_weight_set > self.watchdog_timeout:
-                    logger.warning("Validator appears frozen - forcing restart of scoring cycle")
-                    self.substrate = interface.get_substrate(subtensor_network=self.subtensor_network)
-                    await self.database_manager.reset_pool()
-                    self.metagraph.sync_nodes()
-                    self.weight_setter = FiberWeightSetter(
-                        netuid=self.netuid,
-                        wallet_name=self.wallet_name,
-                        hotkey_name=self.hotkey_name,
-                        network=self.subtensor_network
+                for task_name, health in self.task_health.items():
+                    if health['status'] == 'idle':
+                        continue
+                        
+                    timeout = health['timeouts'].get(
+                        health.get('current_operation'),
+                        health['timeouts']['default']
                     )
+                    
+                    if (health['operation_start'] and 
+                        current_time - health['operation_start'] > timeout):
+                        logger.warning(
+                            f"Task {task_name} operation '{health.get('current_operation')}' "
+                            f"exceeded timeout of {timeout} seconds"
+                        )
+                        
+                        if health['status'] != 'processing':
+                            logger.error(f"Task {task_name} appears frozen - triggering recovery")
+                            try:
+                                await self.recover_task(task_name)
+                                health['errors'] = 0
+                            except Exception as e:
+                                logger.error(f"Failed to recover task {task_name}: {e}")
+                                health['errors'] += 1
+                        else:
+                            logger.info(f"Task {task_name} is still processing - monitoring")
                 
-                # Deregistration loop health
-                if hasattr(self, 'last_dereg_check_start'):
-                    dereg_duration = current_time - self.last_dereg_check_start
-                    if dereg_duration > 600:
-                        logger.warning("Deregistration loop appears stuck - forcing reset")
-                        await self.database_manager.reset_pool()
+                # Check database health
+                if current_time - self.last_successful_db_check > self.db_check_interval:
+                    try:
+                        async with self.database_manager.async_session() as session:
+                            await session.execute(text("SELECT 1"))
+                        self.last_successful_db_check = time.time()
+                    except Exception as e:
+                        logger.error(f"Database health check failed: {e}")
+                        try:
+                            await self.database_manager.reset_pool()
+                        except Exception as reset_error:
+                            logger.error(f"Failed to reset database pool: {reset_error}")
+
+                # Check metagraph sync health
+                if current_time - self.last_metagraph_sync > self.metagraph_sync_interval:
+                    try:
                         self.metagraph.sync_nodes()
-                
-                await asyncio.sleep(300)
+                        self.last_metagraph_sync = time.time()
+                    except Exception as e:
+                        logger.error(f"Metagraph sync failed: {e}")
+
             except Exception as e:
                 logger.error(f"Error in watchdog: {e}")
+            finally:
                 await asyncio.sleep(60)
+
+    async def recover_task(self, task_name: str):
+        """Enhanced task recovery with specific handling for each task type."""
+        logger.warning(f"Attempting to recover {task_name}")
+        try:
+            if task_name == "soil":
+                await self.soil_task.cleanup_resources()
+                await self.database_manager.reset_pool()
+            elif task_name == "geomagnetic":
+                await self.geomagnetic_task.cleanup_resources()
+                await self.database_manager.reset_pool()
+            elif task_name == "scoring":
+                self.substrate = interface.get_substrate(subtensor_network=self.subtensor_network)
+                self.metagraph.sync_nodes()
+                await self.database_manager.reset_pool()
+            elif task_name == "deregistration":
+                self.metagraph.sync_nodes()
+                await self.database_manager.reset_pool()
+                self.nodes = {}
+            
+            health = self.task_health[task_name]
+            health['errors'] = 0
+            health['last_success'] = time.time()
+            health['status'] = 'idle'
+            health['current_operation'] = None
+            health['operation_start'] = None
+            
+        except Exception as e:
+            logger.error(f"Failed to recover {task_name}: {e}")
+            logger.error(traceback.format_exc())
 
     async def main(self):
         """
@@ -299,24 +433,65 @@ class GaiaValidator:
         logger.info("Updating miner table...")
         await self.update_miner_table()
         logger.info("Miner table updated.")
-        asyncio.create_task(self.watchdog())
 
+        watchdog_task = asyncio.create_task(self.watchdog())
+        
+        tasks = {
+            'geomagnetic': asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
+            'soil': asyncio.create_task(self.soil_task.validator_execute(self)),
+            'status_logger': asyncio.create_task(self.status_logger()),
+            'scoring': asyncio.create_task(self.main_scoring()),
+            'deregistration': asyncio.create_task(self.handle_miner_deregistration_loop()),
+            'updates': asyncio.create_task(self.check_for_updates())
+        }
+        
         while True:
             try:
-                workers = [
-                    asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
-                    asyncio.create_task(self.soil_task.validator_execute(self)),
-                    asyncio.create_task(self.status_logger()),
-                    asyncio.create_task(self.main_scoring()),
-                    asyncio.create_task(self.handle_miner_deregistration_loop()),
-                    asyncio.create_task(self.check_for_updates()),
-                    asyncio.create_task(self.miner_score_sender.run_async()),
-                ]
+                done, pending = await asyncio.wait(
+                    tasks.values(),
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=300
+                )
 
-                await asyncio.gather(*workers, return_exceptions=True)
+                for task in done:
+                    task_name = next(name for name, t in tasks.items() if t == task)
+                    try:
+                        await task
+                        logger.info(f"Task {task_name} completed normally")
+                    except Exception as e:
+                        logger.error(f"Task {task_name} failed with error: {e}")
+                        logger.error(traceback.format_exc())
+                    
+                    # Restart the completed/failed task
+                    if task_name == 'geomagnetic':
+                        tasks[task_name] = asyncio.create_task(self.geomagnetic_task.validator_execute(self))
+                    elif task_name == 'soil':
+                        tasks[task_name] = asyncio.create_task(self.soil_task.validator_execute(self))
+                    elif task_name == 'status_logger':
+                        tasks[task_name] = asyncio.create_task(self.status_logger())
+                    elif task_name == 'scoring':
+                        tasks[task_name] = asyncio.create_task(self.main_scoring())
+                    elif task_name == 'deregistration':
+                        tasks[task_name] = asyncio.create_task(self.handle_miner_deregistration_loop())
+                    elif task_name == 'updates':
+                        tasks[task_name] = asyncio.create_task(self.check_for_updates())
+                    
+                    logger.info(f"Restarted task {task_name}")
+
+                # Check health of pending tasks
+                for task in pending:
+                    if task.done():
+                        task_name = next(name for name, t in tasks.items() if t == task)
+                        try:
+                            await task
+                        except Exception as e:
+                            logger.error(f"Pending task {task_name} failed with error: {e}")
+                
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
-            await asyncio.sleep(300)
+                logger.error(traceback.format_exc())
+            
+            await asyncio.sleep(5)
 
     async def main_scoring(self):
         """Run scoring every subnet tempo blocks."""
@@ -329,7 +504,10 @@ class GaiaValidator:
 
         while True:
             try:
+                await self.update_task_status('scoring', 'active')
+                
                 async def scoring_cycle():
+                    await self.update_task_status('scoring', 'processing', 'weight_setting')
                     validator_uid = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
                             None,
@@ -344,9 +522,9 @@ class GaiaValidator:
                     
                     if validator_uid is None:
                         logger.error("Validator not found on chain")
+                        await self.update_task_status('scoring', 'error')
                         await asyncio.sleep(12)
                         return False
-
 
                     blocks_since_update = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
@@ -375,6 +553,7 @@ class GaiaValidator:
                     current_block = self.substrate.get_block()["header"]["number"]
                     if current_block - self.last_set_weights_block < min_interval:
                         logger.info(f"Recently set weights {current_block - self.last_set_weights_block} blocks ago")
+                        await self.update_task_status('scoring', 'idle')
                         await asyncio.sleep(12)
                         return True
 
@@ -404,6 +583,7 @@ class GaiaValidator:
                                     self.last_set_weights_block = current_block
                                     self.last_successful_weight_set = time.time()
                                     logger.info("✅ Successfully set weights")
+                                    await self.update_task_status('scoring', 'idle')
                                     await asyncio.sleep(30)
                                     await self.update_last_weights_block()
                     else:
@@ -418,6 +598,7 @@ class GaiaValidator:
 
             except asyncio.TimeoutError:
                 logger.error("Weight setting operation timed out - restarting cycle")
+                await self.update_task_status('scoring', 'error')
                 try:
                     self.substrate = interface.get_substrate(subtensor_network=self.subtensor_network)
                 except Exception as e:
@@ -427,6 +608,7 @@ class GaiaValidator:
             except Exception as e:
                 logger.error(f"Error in main_scoring: {e}")
                 logger.error(traceback.format_exc())
+                await self.update_task_status('scoring', 'error')
                 await asyncio.sleep(12)
 
     async def status_logger(self):
@@ -506,10 +688,13 @@ class GaiaValidator:
         """Run miner deregistration checks every 60 seconds."""
         while True:
             try:
+                await self.update_task_status('deregistration', 'active')
+                
                 # Replace asyncio.timeout with a task + wait_for pattern
                 async def check_deregistration():
                     self.last_dereg_check_start = time.time()
                     
+                    await self.update_task_status('deregistration', 'processing', 'db_check')
                     self.metagraph.sync_nodes()
                     active_miners = {
                         idx: {"hotkey": hotkey, "uid": idx}
@@ -529,6 +714,7 @@ class GaiaValidator:
                             }
                         except asyncio.TimeoutError:
                             logger.error("Database query timed out")
+                            await self.update_task_status('deregistration', 'error')
                             return
 
                     deregistered_miners = []
@@ -547,6 +733,7 @@ class GaiaValidator:
                         for idx in uids:
                             self.weights[idx] = 0.0
                         
+                        await self.update_task_status('deregistration', 'processing', 'recalculating_scores')
                         await asyncio.wait_for(
                             self.soil_task.recalculate_recent_scores(uids),
                             timeout=300
@@ -559,15 +746,18 @@ class GaiaValidator:
                         self.last_successful_recalc = time.time()
                     
                     self.last_successful_dereg_check = time.time()
+                    await self.update_task_status('deregistration', 'idle')
 
                 await asyncio.wait_for(check_deregistration(), timeout=300)
 
             except asyncio.TimeoutError:
                 logger.error("Deregistration loop timed out - restarting loop")
+                await self.update_task_status('deregistration', 'error')
                 continue
             except Exception as e:
                 logger.error(f"Error in deregistration loop: {e}")
                 logger.error(traceback.format_exc())
+                await self.update_task_status('deregistration', 'error')
             finally:
                 await asyncio.sleep(60)
 

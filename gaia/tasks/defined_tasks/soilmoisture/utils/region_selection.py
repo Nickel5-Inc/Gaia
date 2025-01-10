@@ -3,6 +3,8 @@ import h3
 import json
 from shapely.geometry import Polygon, box
 from datetime import datetime, timezone, date
+import hashlib
+import struct
 
 
 def h3_cell_to_polygon(h3_address):
@@ -140,25 +142,31 @@ def select_random_region(
 
 
 def get_deterministic_seed(date: date, hour: int) -> int:
-    """Generate deterministic seed from date and hour.
+    """Generate deterministic seed from date and hour using SHA-256.
     
     Args:
         date: The target date
         hour: The target hour (1, 7, 13, or 19 for SMAP times)
+        
+    Returns:
+        A deterministic integer seed that will be the same for all validators
     """
-    BASE_SEED = 57
-    
-    smap_hours = {
-        1: 0,   # 1:30 window
-        7: 1,   # 7:30 window
-        13: 2,  # 13:30 window
-        19: 3,  # 19:30 window
-    }
-    
-    if hour not in smap_hours:
+
+    if hour not in {1, 7, 13, 19}:
         raise ValueError(f"Hour {hour} is not a valid SMAP time window")
     
-    smap_time_index = smap_hours[hour]
-    seed = BASE_SEED * (date.year * 372 + date.month * 31 + date.day) + smap_time_index
+    time_obj = datetime(
+        year=date.year,
+        month=date.month,
+        day=date.day,
+        hour=hour,
+        minute=30,
+        tzinfo=timezone.utc
+    )
+
+    time_str = time_obj.strftime("%Y%m%d%H")
+    hash_input = f"{time_str}".encode('utf-8')
+    hash_output = hashlib.sha256(hash_input).digest()
+    seed = struct.unpack('>Q', hash_output[:8])[0]
     
     return seed
