@@ -9,34 +9,33 @@ def check_python_version():
     if sys.version_info < (3, 10):
         sys.exit("Python 3.10 or higher is required")
 
-def install_python_dependencies():
-    """Install required Python packages"""
+def setup_python_environment():
+    """Set up Python virtual environment"""
     try:
-        print("Installing required Python packages...")
-        packages = [
-            "psycopg2-binary",
-            "python-dotenv",
-            "bittensor",
-            "fastapi",
-            "uvicorn",
-            "pandas",
-            "numpy",
-            "scipy",
-            "rasterio",
-            "geopandas",
-            "earthengine-api",
-            "httpx",
-            "pytest",
-            "pytest-asyncio"
-        ]
+        print("Setting up Python virtual environment...")
+        venv_path = Path("../.gaia")
         
-        for package in packages:
-            print(f"Installing {package}...")
-            subprocess.run([sys.executable, "-m", "pip", "install", package], check=True)
-            
-        print("Python dependencies installed successfully")
+        if not venv_path.exists():
+            subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True)
+        
+        # Get paths
+        if sys.platform == "win32":
+            python_path = str(venv_path / "Scripts" / "python.exe")
+            pip_path = str(venv_path / "Scripts" / "pip.exe")
+        else:
+            python_path = str(venv_path / "bin" / "python")
+            pip_path = str(venv_path / "bin" / "pip")
+
+        # Upgrade pip
+        subprocess.run(
+            [python_path, "-m", "pip", "install", "--upgrade", "pip"], check=True
+        )
+        
+        print("Python virtual environment setup completed successfully")
+        return python_path, pip_path
+
     except Exception as e:
-        print(f"Error installing Python dependencies: {e}")
+        print(f"Error setting up Python environment: {e}")
         sys.exit(1)
 
 def install_system_dependencies():
@@ -80,6 +79,45 @@ def install_system_dependencies():
         print("System dependencies installed successfully")
     except Exception as e:
         print(f"Error installing system dependencies: {e}")
+        sys.exit(1)
+
+def install_python_dependencies(python_path, pip_path):
+    """Install required Python packages in virtual environment"""
+    try:
+        print("Installing required Python packages...")
+        packages = [
+            "psycopg2-binary",
+            "python-dotenv",
+            "bittensor",
+            "fastapi",
+            "uvicorn",
+            "pandas",
+            "numpy",
+            "scipy",
+            "rasterio",
+            "geopandas",
+            "earthengine-api",
+            "httpx",
+            "pytest",
+            "pytest-asyncio"
+        ]
+        
+        for package in packages:
+            print(f"Installing {package}...")
+            subprocess.run([pip_path, "install", package], check=True)
+            
+        # Get GDAL version from system and install matching version
+        gdal_version = (
+            subprocess.check_output(["gdal-config", "--version"]).decode().strip()
+        )
+        subprocess.run([pip_path, "install", f"GDAL=={gdal_version}"], check=True)
+
+        # Install project in editable mode
+        subprocess.run([pip_path, "install", "-e", ".."], check=True)
+            
+        print("Python dependencies installed successfully")
+    except Exception as e:
+        print(f"Error installing Python dependencies: {e}")
         sys.exit(1)
 
 def setup_postgresql(default_user="postgres", default_password="postgres"):
@@ -129,37 +167,6 @@ def setup_postgresql(default_user="postgres", default_password="postgres"):
         if "conn" in locals():
             conn.close()
 
-def setup_python_environment():
-    """Set up Python virtual environment and install dependencies"""
-    try:
-        print("Setting up Python virtual environment...")
-        venv_path = Path("../.gaia")
-        
-        if not venv_path.exists():
-            subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True)
-        
-        python_path = str(venv_path / "bin" / "python")
-        pip_path = str(venv_path / "bin" / "pip")
-
-        subprocess.run(
-            [python_path, "-m", "pip", "install", "--upgrade", "pip"], check=True
-        )
-
-        # Get GDAL version from system
-        gdal_version = (
-            subprocess.check_output(["gdal-config", "--version"]).decode().strip()
-        )
-        subprocess.run([pip_path, "install", f"GDAL=={gdal_version}"], check=True)
-
-        # Install project in editable mode
-        subprocess.run([pip_path, "install", "-e", ".."], check=True)
-
-        print("Python environment setup completed successfully")
-
-    except Exception as e:
-        print(f"Error setting up Python environment: {e}")
-        sys.exit(1)
-
 def main():
     """Main setup function"""
     if os.geteuid() != 0:
@@ -170,17 +177,17 @@ def main():
 
     check_python_version()
 
-    print("\nInstalling Python dependencies...")
-    install_python_dependencies()
+    print("\nSetting up Python virtual environment...")
+    python_path, pip_path = setup_python_environment()
 
     print("\nInstalling system dependencies...")
     install_system_dependencies()
 
+    print("\nInstalling Python dependencies in virtual environment...")
+    install_python_dependencies(python_path, pip_path)
+
     print("\nSetting up PostgreSQL...")
     setup_postgresql()
-
-    print("\nSetting up Python environment...")
-    setup_python_environment()
 
     print("\nSetup completed successfully!")
     print("\nNext steps:")
