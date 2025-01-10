@@ -116,20 +116,28 @@ def install_python_dependencies(python_path, pip_path, project_root, venv_env):
         print(f"Error installing Python dependencies: {e}")
         sys.exit(1)
 
-def setup_postgresql(default_user="postgres", default_password="postgres", venv_env=None):
-    """Configure PostgreSQL for the project"""
+def setup_postgresql(python_path, default_user="postgres", default_password="postgres", venv_env=None):
+    """Configure PostgreSQL for the project by running setup through the virtual environment"""
     try:
         print("Setting up PostgreSQL...")
-        # First import psycopg2 here after it's installed
-        import psycopg2
-        from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
         
-        # Allow overriding the default user and password with environment variables
-        postgres_user = os.getenv("POSTGRES_USER", default_user)
-        postgres_password = os.getenv("POSTGRES_PASSWORD", default_password)
+        # Create a temporary script with the PostgreSQL setup code
+        setup_script = """
+import os
+import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+
+def setup_db():
+    try:
+        # Get credentials from env or use defaults
+        postgres_user = os.getenv("POSTGRES_USER", "{default_user}")
+        postgres_password = os.getenv("POSTGRES_PASSWORD", "{default_password}")
 
         conn = psycopg2.connect(
-            dbname="postgres", user=postgres_user, password=postgres_password, host="localhost"
+            dbname="postgres",
+            user=postgres_user,
+            password=postgres_password,
+            host="localhost"
         )
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cur = conn.cursor()
@@ -144,24 +152,48 @@ def setup_postgresql(default_user="postgres", default_password="postgres", venv_
         # Drop existing databases if they exist
         databases = ["validator_db", "miner_db"]
         for db in databases:
-            cur.execute(f"DROP DATABASE IF EXISTS {db};")
-            cur.execute(f"CREATE DATABASE {db};")
-            cur.execute(f"GRANT ALL PRIVILEGES ON DATABASE {db} TO gaia;")
+            cur.execute(f"DROP DATABASE IF EXISTS {{db}};")
+            cur.execute(f"CREATE DATABASE {{db}};")
+            cur.execute(f"GRANT ALL PRIVILEGES ON DATABASE {{db}} TO gaia;")
 
         with open(".env", "w") as f:
-            f.write(f"DB_USER={postgres_user}\n")
-            f.write(f"DB_PASSWORD={postgres_password}\n")
-            f.write(f"DB_HOST=localhost\n")
-            f.write(f"DB_PORT=5432\n")
+            f.write(f"DB_USER={{postgres_user}}\\n")
+            f.write(f"DB_PASSWORD={{postgres_password}}\\n")
+            f.write("DB_HOST=localhost\\n")
+            f.write("DB_PORT=5432\\n")
 
         print("PostgreSQL configuration completed successfully")
+        
+    except Exception as e:
+        print(f"Error in database setup: {{e}}")
+        raise
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+if __name__ == "__main__":
+    setup_db()
+"""
+        
+        # Write the setup script
+        script_path = "scripts/db_setup_temp.py"
+        os.makedirs("scripts", exist_ok=True)
+        with open(script_path, "w") as f:
+            f.write(setup_script.format(
+                default_user=default_user,
+                default_password=default_password
+            ))
+        
+        try:
+            # Run the script using the virtual environment's Python
+            subprocess.run([python_path, script_path], env=venv_env, check=True)
+        finally:
+            # Clean up the temporary script
+            os.remove(script_path)
 
     except Exception as e:
         print(f"Error setting up PostgreSQL: {e}")
         sys.exit(1)
-    finally:
-        if "conn" in locals():
-            conn.close()
 
 def main():
     """Main setup function"""
@@ -183,7 +215,7 @@ def main():
     install_python_dependencies(python_path, pip_path, project_root, venv_env)
 
     print("\nSetting up PostgreSQL...")
-    setup_postgresql(venv_env=venv_env)
+    setup_postgresql(python_path, venv_env=venv_env)
 
     print("\nSetup completed successfully!")
     print("\nNext steps:")
