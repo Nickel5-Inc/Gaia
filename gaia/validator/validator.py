@@ -54,7 +54,7 @@ class GaiaValidator:
         self.weights = [0.0] * 256
         self.last_set_weights_block = 0
         self.current_block = 0
-        self.nodes = {}  # Initialize the in-memory node table state
+        self.nodes = {}
 
         self.miner_score_sender = MinerScoreSender(database_manager=self.database_manager,
                                                    loop=asyncio.get_event_loop())
@@ -64,7 +64,7 @@ class GaiaValidator:
         self.last_successful_db_check = time.time()
         self.last_metagraph_sync = time.time()
         
-        # Enhanced task health tracking
+        # task health tracking
         self.task_health = {
             'scoring': {
                 'last_success': time.time(),
@@ -119,8 +119,6 @@ class GaiaValidator:
         self.db_check_interval = 300  # 5 minutes
         self.metagraph_sync_interval = 300  # 5 minutes
         self.max_consecutive_errors = 3
-        
-        # Connection settings
         self.httpx_client = httpx.AsyncClient(
             timeout=30.0,
             follow_redirects=True,
@@ -443,6 +441,7 @@ class GaiaValidator:
             'scoring': asyncio.create_task(self.main_scoring()),
             'deregistration': asyncio.create_task(self.handle_miner_deregistration_loop()),
             'updates': asyncio.create_task(self.check_for_updates())
+            #TODO: add api sender back in here
         }
         
         while True:
@@ -507,7 +506,7 @@ class GaiaValidator:
                 await self.update_task_status('scoring', 'active')
                 
                 async def scoring_cycle():
-                    await self.update_task_status('scoring', 'processing', 'weight_setting')
+                    # Check conditions first
                     validator_uid = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
                             None,
@@ -549,14 +548,15 @@ class GaiaValidator:
                         timeout=30
                     )
 
-                    # Add check for recent successful weight set
+                    # Check if we recently set weights
                     current_block = self.substrate.get_block()["header"]["number"]
                     if current_block - self.last_set_weights_block < min_interval:
                         logger.info(f"Recently set weights {current_block - self.last_set_weights_block} blocks ago")
-                        await self.update_task_status('scoring', 'idle')
+                        await self.update_task_status('scoring', 'idle', 'waiting')
                         await asyncio.sleep(12)
                         return True
 
+                    # Only enter weight_setting state when actually setting weights
                     if (min_interval is None or 
                         (blocks_since_update is not None and blocks_since_update >= min_interval)):
                         
@@ -573,6 +573,7 @@ class GaiaValidator:
                         )
                         
                         if can_set:
+                            await self.update_task_status('scoring', 'processing', 'weight_setting')
                             normalized_weights = await self._calc_task_weights()
                             if normalized_weights:
                                 success = await asyncio.wait_for(
@@ -590,6 +591,7 @@ class GaiaValidator:
                         logger.info(
                             f"Waiting for weight setting: {blocks_since_update}/{min_interval} blocks"
                         )
+                        await self.update_task_status('scoring', 'idle', 'waiting')
 
                     await asyncio.sleep(12)
                     return True
