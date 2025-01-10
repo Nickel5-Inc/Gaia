@@ -1,24 +1,16 @@
+"""Gaia Validator Package.
+
+This package implements the Gaia subnet for Bittensor, providing
+validator and miner functionality for geospatial data validation.
+"""
+
 import configparser
-from os import path, environ
-from dotenv import load_dotenv
+from pathlib import Path
 
-
-load_dotenv()
-
-# Read version
+# Read version from setup.cfg
 config = configparser.ConfigParser()
-setup_file = path.dirname(path.dirname(path.abspath(__file__))) + "/setup.cfg"
-
-if not path.exists(setup_file):
-    raise FileNotFoundError(f"setup.cfg not found at {setup_file}")
-
-config.read(setup_file)
+setup_cfg = Path(__file__).parent.parent / "setup.cfg"
+config.read(setup_cfg)
 
 __version__ = config["metadata"]["version"]
 __database_version__ = config["metadata"]["database_version"]
-version_split = __version__.split(".")
-__spec_version__ = (
-    (1000 * int(version_split[0]))
-    + (10 * int(version_split[1]))
-    + (1 * int(version_split[2]))
-)

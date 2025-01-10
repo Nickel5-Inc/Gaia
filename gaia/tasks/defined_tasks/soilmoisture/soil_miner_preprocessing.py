@@ -4,10 +4,12 @@ from gaia.tasks.defined_tasks.soilmoisture.utils.inference_class import (
     SoilMoistureInferencePreprocessor,
 )
 from gaia.models.soil_moisture_basemodel import SoilModel
+from gaia.tasks.base.components.inputs import Inputs
+from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import SoilMoistureInputs
 from huggingface_hub import hf_hub_download
 import torch
 import io
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union
 import safetensors.torch
 import rasterio
 import os
@@ -63,22 +65,50 @@ class SoilMinerPreprocessing(Preprocessing):
             logger.error(traceback.format_exc())
             raise RuntimeError(f"Failed to load model weights: {str(e)}")
 
-    async def process_miner_data(self, data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """Process combined tiff data for model input."""
+    async def process_miner_data(self, data: Union[Dict[str, Any], Inputs]) -> Optional[Inputs]:
+        """Process combined tiff data for model input.
+        
+        Args:
+            data: Input data containing combined TIFF data and metadata, either as a dictionary or Inputs object
+            
+        Returns:
+            Optional[Inputs]: Processed model inputs or None if processing fails
+        """
         try:
-            combined_data = data["combined_data"]
+            # Convert dictionary input to Inputs type if needed
+            if isinstance(data, dict):
+                inputs = SoilMoistureInputs()
+                inputs.inputs = data
+                data = inputs
+            
+            if not isinstance(data, Inputs):
+                logger.error(f"Input data must be of type Inputs or Dict, got {type(data)}")
+                return None
+
+            data_dict = data.inputs
+            if not isinstance(data_dict, dict):
+                logger.error("Input data.inputs must be a dictionary")
+                return None
+
+            combined_data = data_dict.get("combined_data")
+            if combined_data is None:
+                logger.error("Missing combined_data in input")
+                return None
+
             logger.info(f"Received data type: {type(combined_data)}")
-            logger.info(f"Received data: {combined_data[:100]}")
+            logger.info(f"Received data: {str(combined_data)[:100]}")
 
             try:
-                tiff_bytes = base64.b64decode(combined_data)
+                if isinstance(combined_data, str):
+                    tiff_bytes = base64.b64decode(combined_data)
+                elif isinstance(combined_data, bytes):
+                    tiff_bytes = combined_data
+                else:
+                    logger.error(f"Invalid combined_data type: {type(combined_data)}")
+                    return None
             except Exception as e:
                 logger.error(f"Failed to decode base64: {str(e)}")
-                tiff_bytes = (
-                    combined_data
-                    if isinstance(combined_data, bytes)
-                    else combined_data.encode("utf-8")
-                )
+                return None
 
             logger.info(f"Decoded data size: {len(tiff_bytes)} bytes")
             logger.info(f"First 16 bytes hex: {tiff_bytes[:16].hex()}")
@@ -117,15 +147,26 @@ class SoilMinerPreprocessing(Preprocessing):
                         f"Band order: {dataset.tags().get('band_order', 'Not found')}"
                     )
 
-                    if self.task.use_raw_preprocessing:
+                    if self.task and hasattr(self.task, 'use_raw_preprocessing'):
                         model_inputs = self.preprocessor.preprocess_raw(temp_file_path) # Base model
                     else:
                         model_inputs = self.preprocessor.preprocess(temp_file_path) # Custom model
-                        for key in model_inputs:
-                            if isinstance(model_inputs[key], torch.Tensor):
-                                model_inputs[key] = model_inputs[key].to(self.device)
 
-                    return model_inputs
+                    if model_inputs:
+                        # Convert numpy arrays to PyTorch tensors and move to device
+                        processed_dict = {}
+                        for key, value in model_inputs.items():
+                            if isinstance(value, np.ndarray):
+                                processed_dict[key] = torch.from_numpy(value).to(self.device)
+                            elif isinstance(value, torch.Tensor):
+                                processed_dict[key] = value.to(self.device)
+                            else:
+                                processed_dict[key] = value
+
+                        # Convert model inputs to Inputs type
+                        processed_inputs = SoilMoistureInputs()
+                        processed_inputs.inputs = processed_dict
+                        return processed_inputs
 
             finally:
                 if temp_file_path and os.path.exists(temp_file_path):
@@ -138,6 +179,8 @@ class SoilMinerPreprocessing(Preprocessing):
             logger.error(f"Error processing TIFF data: {str(e)}")
             logger.error(f"Error trace: {traceback.format_exc()}")
             raise RuntimeError(f"Error processing miner data: {str(e)}")
+            
+        return None
 
     def predict_smap(
         self, model_inputs: Dict[str, torch.Tensor], model: torch.nn.Module

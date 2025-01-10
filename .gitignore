@@ -1,22 +1,54 @@
-# Virtual Environment
-venv/
-env/
-.env
-.venv/
-dev.env
-
-# Python cache files
-__pycache__/
+# Python build artifacts
 *.py[cod]
-*$py.class
-*.encrypted
-nodes.json
+__pycache__/
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# Editor/IDE settings
-.vscode/
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+.gaia/
+
+# IDE
 .idea/
+.vscode/
+*.swp
+*.swo
 
-# Miscellaneous
-data/
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
 
-gaia.egg-info/
+# Logs
+*.log
+logs/
+log/
+
+# Database
+*.db
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,12 +1,17 @@
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Optional, Any, List, Dict
+from typing import (
+    Optional, Any, List, Dict, TypeVar, Callable, Coroutine,
+    AsyncGenerator, AsyncContextManager, cast
+)
 from contextlib import asynccontextmanager
 from functools import wraps
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.engine.result import ScalarResult
 
+T = TypeVar('T')
 
 class BaseDatabaseManager(ABC):
     """
@@ -62,15 +67,24 @@ class BaseDatabaseManager(ABC):
                 echo=False,  # Set to True for SQL query logging
             )
 
+            # Initialize session factory
             self._session_factory = async_sessionmaker(
-                self._engine, expire_on_commit=False, class_=AsyncSession
+                bind=self._engine,
+                class_=AsyncSession,
+                expire_on_commit=False,
             )
 
     @asynccontextmanager
-    async def get_session(self):
+    async def get_session(self) -> AsyncGenerator[AsyncSession, None]:
         """
         Async context manager for getting a database session.
+        
+        Yields:
+            AsyncSession: Database session
         """
+        if not self._session_factory:
+            raise RuntimeError("Session factory not initialized")
+            
         async with self._session_factory() as session:
             try:
                 yield session
@@ -84,7 +98,8 @@ class BaseDatabaseManager(ABC):
             result = await session.execute(
                 text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": lock_id}
             )
-            return (await result.scalar()) is True
+            row = result.first()
+            return bool(row[0]) if row else False
 
     async def release_lock(self, lock_id: int) -> bool:
         """Release a PostgreSQL advisory lock."""
@@ -92,23 +107,26 @@ class BaseDatabaseManager(ABC):
             result = await session.execute(
                 text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id}
             )
-            return (await result.scalar()) is True
+            row = result.first()
+            return bool(row[0]) if row else False
 
-    def with_session(func):
+    @staticmethod
+    def with_session(func: Callable[..., Coroutine[Any, Any, T]]) -> Callable[..., Coroutine[Any, Any, T]]:
         """Decorator that provides a database session to the wrapped function."""
 
         @wraps(func)
-        async def wrapper(self, *args, **kwargs):
+        async def wrapper(self: 'BaseDatabaseManager', *args, **kwargs) -> T:
             async with self.get_session() as session:
                 return await func(self, session, *args, **kwargs)
 
         return wrapper
 
-    def with_transaction(func):
+    @staticmethod
+    def with_transaction(func: Callable[..., Coroutine[Any, Any, T]]) -> Callable[..., Coroutine[Any, Any, T]]:
         """Decorator that wraps the function in a database transaction."""
 
         @wraps(func)
-        async def wrapper(self, *args, **kwargs):
+        async def wrapper(self: 'BaseDatabaseManager', *args, **kwargs) -> T:
             async with self.get_session() as session:
                 async with session.begin():
                     return await func(self, session, *args, **kwargs)
@@ -116,7 +134,7 @@ class BaseDatabaseManager(ABC):
         return wrapper
 
     @with_session
-    async def execute(self, session, query: str, params: dict = None) -> Any:
+    async def execute(self, session: AsyncSession, query: str, params: Optional[Dict[str, Any]] = None) -> Any:
         """Execute a single SQL query."""
         result = await session.execute(text(query), params or {})
         await session.commit()
@@ -124,33 +142,35 @@ class BaseDatabaseManager(ABC):
 
     @with_transaction
     async def execute_many(
-        self, session, query: str, data: List[Dict[str, Any]]
+        self, session: AsyncSession, query: str, data: List[Dict[str, Any]]
     ) -> None:
         """Execute the same query with multiple sets of parameters."""
         await session.execute(text(query), data)
 
     @with_session
     async def fetch_one(
-        self, session, query: str, params: dict = None
-    ) -> Optional[Dict]:
+        self, session: AsyncSession, query: str, params: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
         """Fetch a single row from the database."""
         result = await session.execute(text(query), params or {})
         row = result.first()
         return dict(row._mapping) if row else None
 
     @with_session
-    async def fetch_many(self, session, query: str, params: dict = None) -> List[Dict]:
+    async def fetch_many(
+        self, session: AsyncSession, query: str, params: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         """Fetch multiple rows from the database."""
         result = await session.execute(text(query), params or {})
         return [dict(row._mapping) for row in result]
 
-    async def close(self):
+    async def close(self) -> None:
         """Close the database engine."""
         if self._engine:
             await self._engine.dispose()
 
     @with_session
-    async def table_exists(self, session, table_name: str) -> bool:
+    async def table_exists(self, session: AsyncSession, table_name: str) -> bool:
         """Check if a table exists in the database."""
         result = await session.execute(
             text(
@@ -164,4 +184,5 @@ class BaseDatabaseManager(ABC):
             ),
             {"table_name": table_name},
         )
-        return (await result.scalar()) is True
+        row = result.first()
+        return bool(row[0]) if row else False

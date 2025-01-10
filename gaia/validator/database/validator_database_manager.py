@@ -1,18 +1,15 @@
+from typing import Any, Dict, List, Optional, Union
+from datetime import datetime, timezone, timedelta
 import traceback
 import numpy as np
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import text
-import asyncio
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, List
-from datetime import datetime, timedelta, timezone
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 from gaia.database.database_manager import BaseDatabaseManager
 from fiber.logging_utils import get_logger
 
 logger = get_logger(__name__)
-
 
 class ValidatorDatabaseManager(BaseDatabaseManager):
     """
@@ -37,9 +34,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         user: str = "postgres",
         password: str = "postgres",
     ):
-        """
-        Initialize the validator database manager (only once).
-        """
+        """Initialize the validator database manager (only once)."""
         if not self._initialized:
             super().__init__(
                 "validator",
@@ -49,33 +44,19 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 user=user,
                 password=password,
             )
-            # Initialize SQLAlchemy engine
-            self.engine = create_async_engine(
-                f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
-            )
-            self.async_session = sessionmaker(
-                bind=self.engine,
-                class_=AsyncSession,
-                expire_on_commit=False,
-            )
             self._initialized = True
 
-    async def get_connection(self):
-        """
-        Provide a database session/connection.
-        """
-        return self.async_session()
-
     @BaseDatabaseManager.with_transaction
-    async def initialize_database(self, session):
+    async def initialize_database(self, session: AsyncSession) -> None:
         """Initialize database tables and schemas for validator tasks."""
         try:
-            await self._create_node_table()
-            await self._create_trigger_function()
-            await self._create_trigger()
-            await self._initialize_rows()
-            await self.create_score_table()
+            await self._create_node_table(session)
+            await self._create_trigger_function(session)
+            await self._create_trigger(session)
+            await self._initialize_rows(session)
+            await self.create_score_table(session)
 
+            # Create process queue table
             await session.execute(
                 text("""
                     CREATE TABLE IF NOT EXISTS process_queue (
@@ -101,8 +82,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 """)
             )
 
+            # Initialize task tables
             task_schemas = await self.load_task_schemas()
-            await self.initialize_task_tables(task_schemas)
+            await self.initialize_task_tables(session, task_schemas)
             
             logger.info("Successfully initialized all database tables")
             
@@ -111,14 +93,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             logger.error(traceback.format_exc())
             raise
 
-    async def _create_task_table(self, schema: Dict[str, Any], table_name: str = None):
-        """
-        Create a database table for a task based on its schema definition.
-
-        Args:
-            schema (Dict[str, Any]): The schema definition for the task
-            table_name (str, optional): Override table name for multi-table schemas
-        """
+    @BaseDatabaseManager.with_transaction
+    async def _create_task_table(self, session: AsyncSession, schema: Dict[str, Any], table_name: Optional[str] = None) -> None:
+        """Create a database table for a task based on its schema definition."""
         try:
             if table_name:
                 table_schema = schema[table_name]
@@ -137,31 +114,26 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 )
             """
 
-            async with self.engine.connect() as conn:
-                async with conn.begin():
-                    # Create the table
-                    await conn.execute(text(create_table_query))
-                    logger.debug(
-                        f"Table {table_schema['table_name']} created or already exists."
-                    )
+            await session.execute(text(create_table_query))
+            logger.debug(f"Table {table_schema['table_name']} created or already exists.")
 
-            async with self.engine.connect() as conn:
-                async with conn.begin():
-                    # Create any specified indexes
-                    if "indexes" in table_schema:
-                        for index in table_schema["indexes"]:
-                            await self.create_index(
-                                table_schema["table_name"],
-                                index["column"],
-                                unique=index.get("unique", False),
-                            )
+            # Create any specified indexes
+            if "indexes" in table_schema:
+                for index in table_schema["indexes"]:
+                    await self.create_index(
+                        session,
+                        table_schema["table_name"],
+                        index["column"],
+                        unique=index.get("unique", False),
+                    )
 
         except Exception as e:
             table_id = table_name or table_schema.get("table_name", "unknown")
-            print(f"Error creating table {table_id}: {e}")
+            logger.error(f"Error creating table {table_id}: {e}")
             raise
 
-    async def initialize_task_tables(self, task_schemas: Dict[str, Dict[str, Any]]):
+    @BaseDatabaseManager.with_transaction
+    async def initialize_task_tables(self, session: AsyncSession, task_schemas: Dict[str, Dict[str, Any]]) -> None:
         """Initialize validator-specific task tables."""
         for schema in task_schemas.values():
             # Check if this is a multi-table schema
@@ -171,20 +143,14 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 # Handle multi-table schema
                 for table_name, table_schema in schema.items():
                     if table_schema.get("database_type") in ["validator", "both"]:
-                        await self._create_task_table(schema, table_name)
+                        await self._create_task_table(session, schema, table_name)
             else:
                 # Handle single-table schema
                 if schema.get("database_type") in ["validator", "both"]:
-                    await self._create_task_table(schema)
+                    await self._create_task_table(session, schema)
 
     async def load_task_schemas(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Load database schemas for all tasks from their respective schema.json files.
-        Searches through the defined_tasks directory for schema definitions.
-
-        Returns:
-            Dict[str, Dict[str, Any]]: Dictionary mapping task names to their schema definitions
-        """
+        """Load database schemas for all tasks from their respective schema.json files."""
         # Get the absolute path to the defined_tasks directory
         base_dir = Path(__file__).parent.parent.parent
         tasks_dir = base_dir / "tasks" / "defined_tasks"
@@ -234,23 +200,15 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     schemas[task_dir.name] = schema
 
                 except json.JSONDecodeError as e:
-                    print(f"Error parsing schema.json in {task_dir.name}: {e}")
+                    logger.error(f"Error parsing schema.json in {task_dir.name}: {e}")
                 except Exception as e:
-                    print(f"Error processing schema for {task_dir.name}: {e}")
+                    logger.error(f"Error processing schema for {task_dir.name}: {e}")
 
         return schemas
 
-    async def create_index(
-        self, table_name: str, column_name: str, unique: bool = False
-    ):
-        """
-        Create an index on a specific column in a table.
-
-        Args:
-            table_name (str): Name of the table.
-            column_name (str): Name of the column to create the index on.
-            unique (bool): Whether the index should enforce uniqueness.
-        """
+    @BaseDatabaseManager.with_transaction
+    async def create_index(self, session: AsyncSession, table_name: str, column_name: str, unique: bool = False) -> None:
+        """Create an index on a specific column in a table."""
         index_name = f"idx_{table_name}_{column_name}"
         unique_str = "UNIQUE" if unique else ""
 
@@ -259,31 +217,24 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             ON {table_name} ({column_name});
         """
 
-        async with self.engine.connect() as conn:
-            async with conn.begin():
-                await conn.execute(text(create_index_query))
+        await session.execute(text(create_index_query))
 
-    async def create_score_table(self):
-        """
-        Create a table for storing miner scores for all tasks.
-        Schema:
-        - task_name: name of the task
-        - task_id: id of the task (uuid)
-        - score: scores of the miners - list of floats, 256 length
-        - created_at: timestamp of when the score was created
-        """
+    @BaseDatabaseManager.with_transaction
+    async def create_score_table(self, session: AsyncSession) -> None:
+        """Create a table for storing miner scores for all tasks."""
         query = """
         CREATE TABLE IF NOT EXISTS score_table (
             task_name VARCHAR(100) NOT NULL,
             task_id TEXT NOT NULL,
             score FLOAT[] NOT NULL,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-            status VARCHAR(50) DEFAULT 'pending' -- pending, completed
+            status VARCHAR(50) DEFAULT 'pending'
         )
         """
-        await self.execute(query)
+        await session.execute(text(query))
 
-    async def _create_node_table(self):
+    @BaseDatabaseManager.with_transaction
+    async def _create_node_table(self, session: AsyncSession) -> None:
         """Create the base node table."""
         sql = """
         CREATE TABLE IF NOT EXISTS node_table (
@@ -302,9 +253,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             CHECK (uid >= 0 AND uid < 256)
         );
         """
-        await self.execute(sql)
+        await session.execute(text(sql))
 
-    async def _create_trigger_function(self):
+    @BaseDatabaseManager.with_transaction
+    async def _create_trigger_function(self, session: AsyncSession) -> None:
         """Create the trigger function for size checking."""
         sql = """
         CREATE OR REPLACE FUNCTION check_node_table_size()
@@ -317,15 +269,16 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         END;
         $$ LANGUAGE plpgsql;
         """
-        await self.execute(sql)
+        await session.execute(text(sql))
 
-    async def _create_trigger(self):
+    @BaseDatabaseManager.with_transaction
+    async def _create_trigger(self, session: AsyncSession) -> None:
         """Create the trigger for enforcing table size."""
         # First drop the existing trigger if it exists
         drop_trigger = """
         DROP TRIGGER IF EXISTS enforce_node_table_size ON node_table;
         """
-        await self.execute(drop_trigger)
+        await session.execute(text(drop_trigger))
 
         # Then create the new trigger
         create_trigger = """
@@ -333,63 +286,49 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         BEFORE INSERT ON node_table
         EXECUTE FUNCTION check_node_table_size();
         """
-        await self.execute(create_trigger)
+        await session.execute(text(create_trigger))
 
-    async def _initialize_rows(self):
+    @BaseDatabaseManager.with_transaction
+    async def _initialize_rows(self, session: AsyncSession) -> None:
         """Initialize the table with 256 empty rows."""
         sql = """
         INSERT INTO node_table (uid)
         SELECT generate_series(0, 255) as uid
         WHERE NOT EXISTS (SELECT 1 FROM node_table LIMIT 1);
         """
-        await self.execute(sql)
+        await session.execute(text(sql))
 
-    async def create_miner_table(self):
-        """
-        Create a table for storing miner information with exactly 256 rows.
-        Initially all rows are null except for an ID column that serves as the index.
-        """
+    @BaseDatabaseManager.with_transaction
+    async def create_miner_table(self, session: AsyncSession) -> None:
+        """Create a table for storing miner information with exactly 256 rows."""
         try:
-            await self._create_node_table()
-            await self._create_trigger_function()
-            await self._create_trigger()
-            await self._initialize_rows()
+            await self._create_node_table(session)
+            await self._create_trigger_function(session)
+            await self._create_trigger(session)
+            await self._initialize_rows(session)
 
         except Exception as e:
             logger.error(f"Error creating miner table: {str(e)}")
             logger.error(traceback.format_exc())
             raise
 
+    @BaseDatabaseManager.with_transaction
     async def update_miner_info(
         self,
+        session: AsyncSession,
         index: int,
         hotkey: str,
         coldkey: str,
-        ip: str = None,
-        ip_type: str = None,
-        port: int = None,
-        incentive: float = None,
-        stake: float = None,
-        trust: float = None,
-        vtrust: float = None,
-        protocol: str = None,
-    ):
-        """
-        Update miner information at a specific index.
-
-        Args:
-            index (int): Index in the table (0-255)
-            hotkey (str): Miner's hotkey
-            coldkey (str): Miner's coldkey
-            ip (str, optional): Miner's IP address
-            ip_type (str, optional): Type of IP address
-            port (int, optional): Port number
-            incentive (float, optional): Miner's incentive
-            stake (float, optional): Miner's stake
-            trust (float, optional): Miner's trust score
-            vtrust (float, optional): Miner's vtrust score
-            protocol (str, optional): Protocol used
-        """
+        ip: Optional[str] = None,
+        ip_type: Optional[str] = None,
+        port: Optional[int] = None,
+        incentive: Optional[float] = None,
+        stake: Optional[float] = None,
+        trust: Optional[float] = None,
+        vtrust: Optional[float] = None,
+        protocol: Optional[str] = None,
+    ) -> None:
+        """Update miner information at a specific index."""
         query = """
         UPDATE node_table 
         SET 
@@ -419,15 +358,11 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             "vtrust": vtrust,
             "protocol": protocol,
         }
-        await self.execute(query, params)
+        await session.execute(text(query), params)
 
-    async def clear_miner_info(self, index: int):
-        """
-        Clear miner information at a specific index, setting values back to NULL.
-
-        Args:
-            index (int): Index in the table (0-255)
-        """
+    @BaseDatabaseManager.with_transaction
+    async def clear_miner_info(self, session: AsyncSession, index: int) -> None:
+        """Clear miner information at a specific index, setting values back to NULL."""
         query = """
         UPDATE node_table 
         SET 
@@ -444,44 +379,33 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             last_updated = CURRENT_TIMESTAMP
         WHERE uid = :index
         """
-        await self.execute(query, {"index": index})
+        await session.execute(text(query), {"index": index})
 
-    async def get_miner_info(self, index: int):
-        """
-        Get miner information for a specific index.
-
-        Args:
-            index (int): Index in the table (0-255)
-
-        Returns:
-            dict: Miner information or None if not found
-        """
+    @BaseDatabaseManager.with_session
+    async def get_miner_info(self, session: AsyncSession, index: int) -> Optional[Dict[str, Any]]:
+        """Get miner information for a specific index."""
         query = """
         SELECT * FROM node_table 
         WHERE uid = :index
         """
-        result = await self.fetch_one(query, {"index": index})
-        return dict(result) if result else None
+        result = await session.execute(text(query), {"index": index})
+        row = result.first()
+        return dict(row._mapping) if row else None
 
-    async def get_all_active_miners(self):
-        """
-        Get information for all miners with non-null hotkeys.
-
-        Returns:
-            list[dict]: List of active miner information
-        """
+    @BaseDatabaseManager.with_session
+    async def get_all_active_miners(self, session: AsyncSession) -> List[Dict[str, Any]]:
+        """Get information for all miners with non-null hotkeys."""
         query = """
         SELECT * FROM node_table 
         WHERE hotkey IS NOT NULL
         ORDER BY uid
         """
-        results = await self.fetch_many(query)
-        return [dict(row) for row in results]
+        result = await session.execute(text(query))
+        return [dict(row._mapping) for row in result]
 
-    async def get_recent_scores(self, task_type: str) -> List[float]:
-        """
-        Fetch and average scores for the given task type over the last 3 days.
-        """
+    @BaseDatabaseManager.with_session
+    async def get_recent_scores(self, session: AsyncSession, task_type: str) -> List[float]:
+        """Fetch and average scores for the given task type over the last 3 days."""
         try:
             three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
 
@@ -502,14 +426,16 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 ORDER BY created_at DESC
                 """
 
-            rows = await self.fetch_many(
-                query, {"task_type": task_type, "three_days_ago": three_days_ago}
+            result = await session.execute(
+                text(query),
+                {"task_type": task_type, "three_days_ago": three_days_ago}
             )
+            rows = result.fetchall()
 
             final_scores = [float("nan")] * 256
 
             for row in rows:
-                score_array = row["score"]
+                score_array = row.score
                 for uid, score in enumerate(score_array):
                     if not np.isnan(score) and np.isnan(final_scores[uid]):
                         final_scores[uid] = score
