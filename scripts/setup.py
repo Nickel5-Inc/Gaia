@@ -13,7 +13,10 @@ def setup_python_environment():
     """Set up Python virtual environment"""
     try:
         print("Setting up Python virtual environment...")
-        venv_path = Path("../.gaia")
+        # Get absolute path to project root and one level up
+        project_root = Path(__file__).resolve().parent.parent
+        parent_dir = project_root.parent
+        venv_path = parent_dir / ".gaia"
         
         if not venv_path.exists():
             subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True)
@@ -22,17 +25,26 @@ def setup_python_environment():
         if sys.platform == "win32":
             python_path = str(venv_path / "Scripts" / "python.exe")
             pip_path = str(venv_path / "Scripts" / "pip.exe")
+            activate_script = str(venv_path / "Scripts" / "activate.bat")
         else:
             python_path = str(venv_path / "bin" / "python")
             pip_path = str(venv_path / "bin" / "pip")
+            activate_script = str(venv_path / "bin" / "activate")
 
-        # Upgrade pip
+        # Activate virtual environment by modifying PATH and VIRTUAL_ENV
+        venv_env = os.environ.copy()
+        venv_env["VIRTUAL_ENV"] = str(venv_path)
+        venv_env["PATH"] = str(venv_path / "bin") + os.pathsep + venv_env["PATH"]
+        
+        # Upgrade pip using the virtual environment
         subprocess.run(
-            [python_path, "-m", "pip", "install", "--upgrade", "pip"], check=True
+            [python_path, "-m", "pip", "install", "--upgrade", "pip"],
+            env=venv_env,
+            check=True
         )
         
         print("Python virtual environment setup completed successfully")
-        return python_path, pip_path
+        return python_path, pip_path, project_root, venv_path, venv_env
 
     except Exception as e:
         print(f"Error setting up Python environment: {e}")
@@ -81,7 +93,7 @@ def install_system_dependencies():
         print(f"Error installing system dependencies: {e}")
         sys.exit(1)
 
-def install_python_dependencies(python_path, pip_path):
+def install_python_dependencies(python_path, pip_path, project_root, venv_env):
     """Install required Python packages in virtual environment"""
     try:
         print("Installing required Python packages...")
@@ -104,23 +116,24 @@ def install_python_dependencies(python_path, pip_path):
         
         for package in packages:
             print(f"Installing {package}...")
-            subprocess.run([pip_path, "install", package], check=True)
+            subprocess.run([pip_path, "install", package], env=venv_env, check=True)
             
         # Get GDAL version from system and install matching version
         gdal_version = (
             subprocess.check_output(["gdal-config", "--version"]).decode().strip()
         )
-        subprocess.run([pip_path, "install", f"GDAL=={gdal_version}"], check=True)
+        subprocess.run([pip_path, "install", f"GDAL=={gdal_version}"], env=venv_env, check=True)
 
-        # Install project in editable mode
-        subprocess.run([pip_path, "install", "-e", ".."], check=True)
+        # Install project in editable mode using absolute path
+        print(f"Installing project from {project_root}")
+        subprocess.run([pip_path, "install", "-e", str(project_root)], env=venv_env, check=True)
             
         print("Python dependencies installed successfully")
     except Exception as e:
         print(f"Error installing Python dependencies: {e}")
         sys.exit(1)
 
-def setup_postgresql(default_user="postgres", default_password="postgres"):
+def setup_postgresql(default_user="postgres", default_password="postgres", venv_env=None):
     """Configure PostgreSQL for the project"""
     try:
         print("Setting up PostgreSQL...")
@@ -178,21 +191,21 @@ def main():
     check_python_version()
 
     print("\nSetting up Python virtual environment...")
-    python_path, pip_path = setup_python_environment()
+    python_path, pip_path, project_root, venv_path, venv_env = setup_python_environment()
 
     print("\nInstalling system dependencies...")
     install_system_dependencies()
 
     print("\nInstalling Python dependencies in virtual environment...")
-    install_python_dependencies(python_path, pip_path)
+    install_python_dependencies(python_path, pip_path, project_root, venv_env)
 
     print("\nSetting up PostgreSQL...")
-    setup_postgresql()
+    setup_postgresql(venv_env=venv_env)
 
     print("\nSetup completed successfully!")
     print("\nNext steps:")
     print("1. Activate virtual environment:")
-    print("   source ../.gaia/bin/activate")
+    print(f"   source {venv_path}/bin/activate")
     print("2. Configure your .env file with any additional environment variables")
     print("3. Run database migrations")
 
