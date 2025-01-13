@@ -172,8 +172,6 @@ class GaiaValidator:
         self.watchdog_running = False
         self.watchdog_task = None
 
-        self.task_manager = None
-
     def setup_neuron(self) -> bool:
         """
         Set up the neuron with necessary configurations and connections.
@@ -217,6 +215,8 @@ class GaiaValidator:
 
             self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
             self.metagraph = Metagraph(substrate=self.substrate, netuid=self.netuid)
+            self.metagraph.sync_nodes()  # Sync nodes after initialization
+            logger.info(f"Synced {len(self.metagraph.nodes)} nodes from the network")
 
             self.current_block = self.substrate.get_block()["header"]["number"]
             self.last_set_weights_block = self.current_block - 300
@@ -255,15 +255,7 @@ class GaiaValidator:
             responses = {}
             self.metagraph.sync_nodes()
             
-            # Circuit breaker pattern
-            consecutive_failures = 0
-            MAX_CONSECUTIVE_FAILURES = 5
-            
             for miner_hotkey, node in self.metagraph.nodes.items():
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    logger.error(f"Circuit breaker triggered after {MAX_CONSECUTIVE_FAILURES} consecutive failures")
-                    break
-                    
                 base_url = f"https://{node.ip}:{node.port}"
 
                 try:
@@ -310,30 +302,24 @@ class GaiaValidator:
                         }
                         responses[miner_hotkey] = response_data
                         logger.info(f"Successfully completed request to {miner_hotkey}")
-                        consecutive_failures = 0  # Reset on success
                     else:
                         logger.warning(f"Failed handshake with miner {miner_hotkey}")
-                        consecutive_failures += 1
 
                 except asyncio.TimeoutError as e:
                     logger.warning(f"Timeout for miner {miner_hotkey}: {str(e)}")
-                    consecutive_failures += 1
                     continue
 
                 except httpx.HTTPStatusError as e:
                     logger.warning(f"HTTP error from miner {miner_hotkey}: {e}")
-                    consecutive_failures += 1
                     continue
 
                 except httpx.RequestError as e:
                     logger.warning(f"Request error from miner {miner_hotkey}: {e}")
-                    consecutive_failures += 1
                     continue
 
                 except Exception as e:
                     logger.error(f"Error with miner {miner_hotkey}: {e}")
                     logger.error(f"Error details: {traceback.format_exc()}")
-                    consecutive_failures += 1
                     continue
 
             if not responses:
@@ -740,76 +726,30 @@ class GaiaValidator:
             await self.start_watchdog()
             logger.info("Watchdog started.")
             
-            tasks = {
-                'geomagnetic': asyncio.create_task(self.geomagnetic_task.validator_execute(self)),
-                'soil': asyncio.create_task(self.soil_task.validator_execute(self)),
-                'status_logger': asyncio.create_task(self.status_logger()),
-                'scoring': asyncio.create_task(self.main_scoring()),
-                'deregistration': asyncio.create_task(self.handle_miner_deregistration_loop()),
-                'updates': asyncio.create_task(self.check_for_updates())
-            }
+            # Create all tasks in the same event loop
+            tasks = [
+                self.geomagnetic_task.validator_execute(self),
+                self.soil_task.validator_execute(self),
+                self.status_logger(),
+                self.main_scoring(),
+                self.handle_miner_deregistration_loop(),
+                self.check_for_updates()
+            ]
             
             try:
-                while True:
-                    try:
-                        done, pending = await asyncio.wait(
-                            tasks.values(),
-                            return_when=asyncio.FIRST_COMPLETED,
-                            timeout=300
-                        )
-
-                        for task in done:
-                            task_name = next(name for name, t in tasks.items() if t == task)
-                            try:
-                                await task
-                                logger.info(f"Task {task_name} completed normally")
-                            except Exception as e:
-                                logger.error(f"Task {task_name} failed with error: {e}")
-                                logger.error(traceback.format_exc())
-                                # Clean up resources before restarting task
-                                await self.cleanup_resources()
-                            
-                            # Restart the completed/failed task
-                            if task_name == 'geomagnetic':
-                                tasks[task_name] = asyncio.create_task(self.geomagnetic_task.validator_execute(self))
-                            elif task_name == 'soil':
-                                tasks[task_name] = asyncio.create_task(self.soil_task.validator_execute(self))
-                            elif task_name == 'status_logger':
-                                tasks[task_name] = asyncio.create_task(self.status_logger())
-                            elif task_name == 'scoring':
-                                tasks[task_name] = asyncio.create_task(self.main_scoring())
-                            elif task_name == 'deregistration':
-                                tasks[task_name] = asyncio.create_task(self.handle_miner_deregistration_loop())
-                            elif task_name == 'updates':
-                                tasks[task_name] = asyncio.create_task(self.check_for_updates())
-                            
-                            logger.info(f"Restarted task {task_name}")
-
-                        # Check health of pending tasks
-                        for task in pending:
-                            if task.done():
-                                task_name = next(name for name, t in tasks.items() if t == task)
-                                try:
-                                    await task
-                                except Exception as e:
-                                    logger.error(f"Pending task {task_name} failed with error: {e}")
-                                    # Clean up resources for failed pending tasks
-                                    await self.cleanup_resources()
-                        
-                    except Exception as e:
-                        logger.error(f"Main loop error: {e}")
-                        logger.error(traceback.format_exc())
-                        # Clean up resources on main loop error
-                        await self.cleanup_resources()
-                    
-                    await asyncio.sleep(5)
-            finally:
-                # Clean up resources when exiting main loop
+                # Run all tasks concurrently in the same event loop
+                await asyncio.gather(*tasks)
+            except Exception as e:
+                logger.error(f"Error in main task loop: {e}")
+                logger.error(traceback.format_exc())
                 await self.cleanup_resources()
-                await self.stop_watchdog()
+            
+        except Exception as e:
+            logger.error(f"Error in main: {e}")
+            logger.error(traceback.format_exc())
         finally:
-            # Final cleanup when main exits
             await self.cleanup_resources()
+            await self.stop_watchdog()
 
     async def main_scoring(self):
         """Run scoring every subnet tempo blocks."""
@@ -1216,308 +1156,6 @@ class GaiaValidator:
             self.last_set_weights_block = block["header"]["number"]
         except Exception as e:
             logger.error(f"Error updating last weights block: {e}")
-
-
-class TaskManager:
-    """Manages task execution in separate threads with proper synchronization."""
-    
-    def __init__(self, validator: GaiaValidator):
-        self.validator = validator
-        self.thread_pool = ThreadPoolExecutor(max_workers=4)
-        self.task_locks = defaultdict(asyncio.Lock)
-        self.stop_event = threading.Event()
-        self._cleanup_lock = asyncio.Lock()
-        
-        # Map task names to their implementations
-        self.tasks = {
-            'soil': self.validator.soil_task,
-            'geomagnetic': self.validator.geomagnetic_task
-        }
-        
-        # Thread metrics
-        self.thread_metrics = {
-            'soil': {
-                'starts': 0,
-                'completions': 0,
-                'errors': 0,
-                'last_start': None,
-                'last_completion': None,
-                'last_error': None,
-                'total_runtime': 0,
-                'avg_runtime': 0,
-                'current_runtime': 0,
-                'peak_memory': 0,
-                'thread_id': None,
-                'lock_wait_time': 0,
-                'cleanup_count': 0
-            },
-            'geomagnetic': {
-                'starts': 0,
-                'completions': 0,
-                'errors': 0,
-                'last_start': None,
-                'last_completion': None,
-                'last_error': None,
-                'total_runtime': 0,
-                'avg_runtime': 0,
-                'current_runtime': 0,
-                'peak_memory': 0,
-                'thread_id': None,
-                'lock_wait_time': 0,
-                'cleanup_count': 0
-            },
-            'scoring': {
-                'starts': 0,
-                'completions': 0,
-                'errors': 0,
-                'last_start': None,
-                'last_completion': None,
-                'last_error': None,
-                'total_runtime': 0,
-                'avg_runtime': 0,
-                'current_runtime': 0,
-                'peak_memory': 0,
-                'thread_id': None,
-                'lock_wait_time': 0,
-                'cleanup_count': 0
-            }
-        }
-
-    async def _update_thread_metrics(self, task_name: str, metric_type: str, value: Any = None):
-        """Update thread metrics with timing information."""
-        try:
-            metrics = self.thread_metrics[task_name]
-            current_time = time.time()
-            
-            if metric_type == 'start':
-                metrics['starts'] += 1
-                metrics['last_start'] = current_time
-                metrics['thread_id'] = threading.get_ident()
-                metrics['current_runtime'] = 0
-                
-                # Track initial memory
-                try:
-                    import psutil
-                    process = psutil.Process()
-                    metrics['start_memory'] = process.memory_info().rss
-                except ImportError:
-                    pass
-                
-            elif metric_type == 'completion':
-                metrics['completions'] += 1
-                metrics['last_completion'] = current_time
-                
-                if metrics['last_start']:
-                    runtime = current_time - metrics['last_start']
-                    metrics['total_runtime'] += runtime
-                    metrics['avg_runtime'] = metrics['total_runtime'] / metrics['completions']
-                    metrics['current_runtime'] = runtime
-                
-            elif metric_type == 'error':
-                metrics['errors'] += 1
-                metrics['last_error'] = current_time
-                
-            elif metric_type == 'lock_wait':
-                metrics['lock_wait_time'] += value if value else 0
-                
-            elif metric_type == 'cleanup':
-                metrics['cleanup_count'] += 1
-            
-            # Update peak memory
-            try:
-                import psutil
-                process = psutil.Process()
-                current_memory = process.memory_info().rss
-                metrics['peak_memory'] = max(metrics['peak_memory'], current_memory)
-                
-                # Log significant memory increases
-                if 'start_memory' in metrics and current_memory > metrics['start_memory'] * 1.5:
-                    logger.warning(
-                        f"Task {task_name} memory increased by "
-                        f"{(current_memory - metrics['start_memory']) / (1024*1024):.2f}MB"
-                    )
-            except ImportError:
-                pass
-            
-            # Log metrics periodically
-            if metric_type in ['completion', 'error']:
-                logger.info(
-                    f"Thread Metrics for {task_name}:\n"
-                    f"  Starts/Completions/Errors: {metrics['starts']}/{metrics['completions']}/{metrics['errors']}\n"
-                    f"  Current Runtime: {metrics['current_runtime']:.2f}s\n"
-                    f"  Average Runtime: {metrics['avg_runtime']:.2f}s\n"
-                    f"  Lock Wait Time: {metrics['lock_wait_time']:.2f}s\n"
-                    f"  Cleanup Count: {metrics['cleanup_count']}\n"
-                    f"  Peak Memory: {metrics['peak_memory'] / (1024*1024):.2f}MB"
-                )
-                
-        except Exception as e:
-            logger.error(f"Error updating thread metrics: {e}")
-
-    async def start_tasks(self):
-        """Start all tasks in separate threads."""
-        try:
-            # Start watchdog first
-            await self.validator.start_watchdog()
-            
-            # Start main tasks
-            soil_future = self.thread_pool.submit(
-                self._run_task_wrapper, 'soil', self.validator.soil_task.validator_execute
-            )
-            geo_future = self.thread_pool.submit(
-                self._run_task_wrapper, 'geomagnetic', self.validator.geomagnetic_task.validator_execute
-            )
-            scoring_future = self.thread_pool.submit(
-                self._run_task_wrapper, 'scoring', self.validator.main_scoring
-            )
-            
-            # Monitor futures
-            asyncio.create_task(self._monitor_future('soil', soil_future))
-            asyncio.create_task(self._monitor_future('geomagnetic', geo_future))
-            asyncio.create_task(self._monitor_future('scoring', scoring_future))
-            
-        except Exception as e:
-            logger.error(f"Error starting tasks: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
-
-    def _run_task_wrapper(self, task_name: str, task_func):
-        """Wrapper to run task with proper async event loop."""
-        try:
-            # Use existing event loop if possible
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            # Create new loop only if necessary
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        try:
-            return loop.run_until_complete(self._run_task(task_name, task_func))
-        finally:
-            if loop != asyncio.get_event_loop():
-                loop.close()
-
-    async def _run_task(self, task_name: str, task_func):
-        """Run task with proper error handling and state management."""
-        while not self.stop_event.is_set():
-            try:
-                await self._update_thread_metrics(task_name, 'start')
-                
-                lock_wait_start = time.time()
-                async with self.task_locks[task_name]:
-                    lock_wait_time = time.time() - lock_wait_start
-                    await self._update_thread_metrics(task_name, 'lock_wait', lock_wait_time)
-                    
-                    # Use existing task health tracking
-                    await self.validator.update_task_status(task_name, 'active')
-                    
-                    # Execute task
-                    await task_func(self.validator)
-                    
-                    await self._update_thread_metrics(task_name, 'completion')
-                    
-            except Exception as e:
-                logger.error(f"Error in {task_name} task: {str(e)}")
-                logger.error(traceback.format_exc())
-                await self.validator.update_task_status(task_name, 'error')
-                await self._update_thread_metrics(task_name, 'error')
-                
-                # Perform cleanup if task fails
-                async with self._cleanup_lock:
-                    await self._cleanup_task(task_name)
-                    await self._update_thread_metrics(task_name, 'cleanup')
-                
-                # Wait before retrying
-                await asyncio.sleep(60)
-            finally:
-                await self.validator.update_task_status(task_name, 'idle')
-
-    async def _monitor_future(self, task_name: str, future):
-        """Monitor task futures and handle completion/errors."""
-        try:
-            await asyncio.get_event_loop().run_in_executor(None, future.result)
-        except Exception as e:
-            logger.error(f"Task {task_name} failed: {str(e)}")
-            logger.error(traceback.format_exc())
-            await self.validator.update_task_status(task_name, 'failed')
-
-    async def _cleanup_task(self, task_name: str):
-        """Clean up resources for a failed task."""
-        try:
-            if task_name == 'soil':
-                await self.validator.soil_task.cleanup_resources()
-            elif task_name == 'geomagnetic':
-                if hasattr(self.validator.geomagnetic_task, 'cleanup_resources'):
-                    await self.validator.geomagnetic_task.cleanup_resources()
-            
-            # Reset task status using existing mechanism
-            await self.validator.update_task_status(task_name, 'idle')
-            
-        except Exception as e:
-            logger.error(f"Error cleaning up task {task_name}: {str(e)}")
-            logger.error(traceback.format_exc())
-
-    async def stop_tasks(self):
-        """Stop all tasks gracefully."""
-        try:
-            self.stop_event.set()
-            await self.validator.stop_watchdog()
-            self.thread_pool.shutdown(wait=True)
-            
-            # Final cleanup
-            async with self._cleanup_lock:
-                for task_name in self.tasks:
-                    await self._cleanup_task(task_name)
-            
-        except Exception as e:
-            logger.error(f"Error stopping tasks: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
-
-    async def get_thread_metrics(self) -> Dict[str, Dict[str, Any]]:
-        """Get current thread metrics for all tasks."""
-        return {
-            task_name: {
-                'status': self.validator.task_health[task_name]['status'],
-                'operation': self.validator.task_health[task_name]['current_operation'],
-                'metrics': metrics
-            }
-            for task_name, metrics in self.thread_metrics.items()
-        }
-
-
-class Validator:
-    def __init__(self, args):
-        # ... existing init code ...
-        self.task_manager = None
-
-    async def start(self):
-        """Start the validator with the new task manager."""
-        try:
-            # Initialize task manager
-            self.task_manager = TaskManager(self)
-            
-            # Start tasks
-            await self.task_manager.start_tasks()
-            
-            logger.info("Validator started successfully with task manager")
-            
-        except Exception as e:
-            logger.error(f"Error starting validator: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
-
-    async def stop(self):
-        """Stop the validator gracefully."""
-        try:
-            if self.task_manager:
-                await self.task_manager.stop_tasks()
-            logger.info("Validator stopped successfully")
-            
-        except Exception as e:
-            logger.error(f"Error stopping validator: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
 
 
 if __name__ == "__main__":
