@@ -139,8 +139,8 @@ def main():
     print("\nNext steps:")
     print("1. Activate virtual environment:")
     print("   source ../.gaia/bin/activate")
-    print("2. Configure your .env file with any additional environment variables")
-    print("3. Run database migrations")
+    print("2. Configure your .env file with any additional environment variables (Miner OR Validator)")
+
 
 
 if __name__ == "__main__":
