@@ -1015,103 +1015,55 @@ class GaiaValidator:
             raise
 
     async def handle_miner_deregistration_loop(self):
-        """Run miner deregistration checks every 60 seconds."""
+        """Continuously monitor for deregistered miners and handle cleanup of their data."""
+        logger.info("Starting deregistration loop")
+        
         while True:
             try:
-                await self.update_task_status('deregistration', 'active')
-                
-                # Replace asyncio.timeout with a task + wait_for pattern
-                async def check_deregistration():
-                    self.last_dereg_check_start = time.time()
-                    
-                    await self.update_task_status('deregistration', 'processing', 'db_check')
+                # Ensure metagraph is synced before accessing
+                if not hasattr(self.metagraph, 'nodes'):
+                    logger.info("Metagraph not ready, syncing nodes...")
                     self.metagraph.sync_nodes()
-                    active_miners = {
-                        idx: {"hotkey": hotkey, "uid": idx}
-                        for idx, (hotkey, _) in enumerate(self.metagraph.nodes.items())
-                    }
-
-                    if not self.nodes:
-                        try:
-                            query = "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL"
-                            rows = await asyncio.wait_for(
-                                self.database_manager.fetch_many(query),
-                                timeout=60
-                            )
-                            self.nodes = {
-                                row["uid"]: {"hotkey": row["hotkey"], "uid": row["uid"]}
-                                for row in rows
-                            }
-                        except asyncio.TimeoutError:
-                            logger.error("Database query timed out")
-                            await self.update_task_status('deregistration', 'error')
-                            return
-
-                    deregistered_miners = []
-                    for uid, registered in self.nodes.items():
-                        if active_miners[uid]["hotkey"] != registered["hotkey"]:
-                            deregistered_miners.append(registered)
-
-                    if deregistered_miners:
-                        logger.info(f"Found {len(deregistered_miners)} deregistered miners")
-                        
-                        for miner in deregistered_miners:
-                            self.nodes[miner["uid"]]["hotkey"] = active_miners[miner["uid"]]["hotkey"]
-
-                        uids = [int(miner["uid"]) for miner in deregistered_miners]
-                        
-                        for idx in uids:
-                            self.weights[idx] = 0.0
-                        
-                        # Process UIDs in chunks of 10 to prevent memory bloat
-                        chunk_size = 10
-                        for i in range(0, len(uids), chunk_size):
-                            uid_chunk = uids[i:i + chunk_size]
-                            logger.info(f"Processing score recalculation for UIDs {uid_chunk}")
-                            
-                            await self.update_task_status('deregistration', 'processing', f'recalculating_scores_{i}-{i+len(uid_chunk)}')
-                            try:
-                                await asyncio.wait_for(
-                                    self.soil_task.recalculate_recent_scores(uid_chunk),
-                                    timeout=300
-                                )
-                                await asyncio.wait_for(
-                                    self.geomagnetic_task.recalculate_recent_scores(uid_chunk),
-                                    timeout=300
-                                )
-                                logger.info(f"Successfully recalculated scores for UIDs {uid_chunk}")
-                                
-                                # Small delay between chunks
-                                await asyncio.sleep(1)
-                                
-                                # Force garbage collection after each chunk
-                                import gc
-                                gc.collect()
-                                
-                            except asyncio.TimeoutError:
-                                logger.error(f"Timeout recalculating scores for UIDs {uid_chunk}")
-                                continue
-                            except Exception as e:
-                                logger.error(f"Error recalculating scores for UIDs {uid_chunk}: {e}")
-                                continue
-                        
-                        logger.info(f"Successfully recalculated all scores for {len(uids)} miners")
-                        self.last_successful_recalc = time.time()
+                    logger.info(f"Synced {len(self.metagraph.nodes)} nodes from the network")
+                
+                # Get current set of active miners
+                current_active_miners = set(range(len(self.metagraph.nodes)))
+                
+                # Compare with previously active miners to find deregistered ones
+                if not hasattr(self, '_previously_active_miners'):
+                    self._previously_active_miners = current_active_miners
+                    continue
+                
+                deregistered_miners = self._previously_active_miners - current_active_miners
+                if deregistered_miners:
+                    logger.info(f"Found {len(deregistered_miners)} deregistered miners: {deregistered_miners}")
                     
-                    self.last_successful_dereg_check = time.time()
-                    await self.update_task_status('deregistration', 'idle')
-
-                await asyncio.wait_for(check_deregistration(), timeout=300)
-
-            except asyncio.TimeoutError:
-                logger.error("Deregistration loop timed out - restarting loop")
-                await self.update_task_status('deregistration', 'error')
-                continue
+                    # Process deregistered miners in chunks to prevent memory bloat
+                    chunk_size = 10
+                    for i in range(0, len(deregistered_miners), chunk_size):
+                        chunk = list(deregistered_miners)[i:i + chunk_size]
+                        logger.info(f"Processing deregistered miners chunk: {chunk}")
+                        
+                        try:
+                            # Recalculate scores for deregistered miners
+                            await self.soil_task.recalculate_recent_scores(chunk)
+                            await self.geomagnetic_task.recalculate_recent_scores(chunk)
+                            logger.info(f"Successfully processed deregistered miners: {chunk}")
+                        except Exception as e:
+                            logger.error(f"Error processing deregistered miners chunk {chunk}: {str(e)}")
+                            logger.error(traceback.format_exc())
+                            continue
+                
+                # Update previously active miners
+                self._previously_active_miners = current_active_miners
+                
+                # Sleep for 5 minutes before checking again
+                await asyncio.sleep(300)
+                
             except Exception as e:
-                logger.error(f"Error in deregistration loop: {e}")
+                logger.error(f"Error in deregistration loop: {str(e)}")
                 logger.error(traceback.format_exc())
-                await self.update_task_status('deregistration', 'error')
-            finally:
+                # Sleep for 1 minute on error before retrying
                 await asyncio.sleep(60)
 
     async def _calc_task_weights(self) -> Optional[List[float]]:

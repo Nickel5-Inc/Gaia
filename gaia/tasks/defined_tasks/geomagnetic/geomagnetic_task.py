@@ -30,6 +30,7 @@ import json
 from pydantic import Field
 import os
 import importlib.util
+from sqlalchemy.sql import text
 
 logger = get_logger(__name__)
 
@@ -868,39 +869,16 @@ class GeomagneticTask(Task):
             uids (list): List of UIDs to recalculate scores for.
         """
         try:
-            # Step 1: Delete predictions for the given UIDs
-            delete_query = """
-            DELETE FROM geomagnetic_predictions
-            WHERE miner_uid = ANY(:uids)
-            """
-            # Convert integer UIDs to strings
-            str_uids = [str(uid) for uid in uids]
-            await self.db_manager.execute(delete_query, {"uids": str_uids})
-            logger.info(f"Deleted predictions for UIDs: {uids}")
+            # Validate UIDs
+            if not all(isinstance(uid, int) and 0 <= uid < 256 for uid in uids):
+                logger.error("Invalid UIDs provided for recalculation")
+                return
 
-            # Step 2: Set up time window (3 days)
+            # Set up time window (3 days)
             current_time = datetime.datetime.now(datetime.timezone.utc)
             history_window = current_time - datetime.timedelta(days=3)
 
-            # Delete existing score rows for the period
-            delete_scores_query = """
-            DELETE FROM score_table 
-            WHERE task_name = 'geomagnetic'
-            AND task_id::float >= :start_timestamp
-            AND task_id::float <= :end_timestamp
-            """
-            await self.db_manager.execute(
-                delete_scores_query,
-                {
-                    "start_timestamp": history_window.timestamp(),
-                    "end_timestamp": current_time.timestamp(),
-                },
-            )
-            logger.info(
-                f"Deleted score rows for period {history_window} to {current_time}"
-            )
-
-            # Get historical data
+            # Get historical data first to ensure it's available
             history_query = """
             SELECT 
                 miner_hotkey,
@@ -908,11 +886,47 @@ class GeomagneticTask(Task):
                 query_time
             FROM geomagnetic_history
             WHERE query_time >= :history_window
+            AND miner_uid = ANY(:uids)
             ORDER BY query_time ASC
             """
             history_results = await self.db_manager.fetch_many(
-                history_query, {"history_window": history_window}
+                history_query, 
+                {
+                    "history_window": history_window,
+                    "uids": [str(uid) for uid in uids]
+                }
             )
+
+            if not history_results:
+                logger.warning(f"No historical data found for UIDs {uids} in window {history_window} to {current_time}")
+                return
+
+            # Start transaction for deletion operations
+            async with self.db_manager.get_connection() as conn:
+                async with conn.begin():
+                    # Delete predictions
+                    delete_query = """
+                    DELETE FROM geomagnetic_predictions
+                    WHERE miner_uid = ANY(:uids)
+                    """
+                    str_uids = [str(uid) for uid in uids]
+                    await conn.execute(text(delete_query), {"uids": str_uids})
+                    
+                    # Delete scores
+                    delete_scores_query = """
+                    DELETE FROM score_table 
+                    WHERE task_name = 'geomagnetic'
+                    AND task_id::float >= :start_timestamp
+                    AND task_id::float <= :end_timestamp
+                    """
+                    await conn.execute(
+                        text(delete_scores_query),
+                        {
+                            "start_timestamp": history_window.timestamp(),
+                            "end_timestamp": current_time.timestamp(),
+                        },
+                    )
+                    logger.info(f"Successfully deleted predictions and scores for UIDs: {uids}")
 
             # Get mapping of hotkeys to UIDs
             query = """
@@ -934,37 +948,49 @@ class GeomagneticTask(Task):
 
             # Process each hour
             for hour, records in hourly_records.items():
-                scores = [float("nan")] * 256
+                try:
+                    scores = [float("nan")] * 256
 
-                # Calculate scores for this hour
-                for record in records:
-                    miner_hotkey = record["miner_hotkey"]
-                    if miner_hotkey in hotkey_to_uid:
-                        uid = hotkey_to_uid[miner_hotkey]
-                        scores[uid] = record["score"]
+                    # Calculate scores for this hour
+                    for record in records:
+                        try:
+                            miner_hotkey = record["miner_hotkey"]
+                            if miner_hotkey in hotkey_to_uid:
+                                uid = hotkey_to_uid[miner_hotkey]
+                                if record["score"] is not None:
+                                    scores[uid] = record["score"]
+                        except (ValueError, TypeError) as e:
+                            logger.error(f"Error processing record for miner {record.get('miner_hotkey')}: {e}")
+                            continue
 
-                # Create and insert score row for this hour
-                score_row = {
-                    "task_name": "geomagnetic",
-                    "task_id": str(hour.timestamp()),
-                    "score": scores,
-                    "status": "completed",
-                }
+                    # Insert new score row within a transaction
+                    async with self.db_manager.get_connection() as conn:
+                        async with conn.begin():
+                            score_row = {
+                                "task_name": "geomagnetic",
+                                "task_id": str(hour.timestamp()),
+                                "score": scores,
+                                "status": "completed",
+                            }
 
-                insert_query = """
-                INSERT INTO score_table (task_name, task_id, score, status)
-                VALUES (:task_name, :task_id, :score, :status)
-                """
-                await self.db_manager.execute(insert_query, score_row)
-                logger.info(f"Recalculated and inserted score row for hour {hour}")
+                            insert_query = """
+                            INSERT INTO score_table (task_name, task_id, score, status)
+                            VALUES (:task_name, :task_id, :score, :status)
+                            """
+                            await conn.execute(text(insert_query), score_row)
+                            logger.info(f"Recalculated and inserted score row for hour {hour}")
 
-            logger.info(
-                f"Completed recalculation of scores for UIDs: {uids} over 3-day window"
-            )
+                except Exception as e:
+                    logger.error(f"Error processing hour {hour}: {e}")
+                    logger.error(traceback.format_exc())
+                    continue
+
+            logger.info(f"Completed recalculation of scores for UIDs: {uids} over 3-day window")
 
         except Exception as e:
             logger.error(f"Error recalculating recent scores: {e}")
             logger.error(traceback.format_exc())
+            raise  # Re-raise to trigger error handling in deregistration loop
 
     async def cleanup_resources(self):
         """Clean up any resources used by the task during recovery."""

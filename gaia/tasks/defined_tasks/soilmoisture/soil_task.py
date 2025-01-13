@@ -14,7 +14,7 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_scoring_mechanism import (
 from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import (
     construct_smap_url,
     download_smap_data,
-    get_smap_data_for_sentinel_bounds,
+    
 )
 from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import (
     SoilMoistureInputs,
@@ -41,6 +41,8 @@ import math
 import glob
 from collections import defaultdict
 import psutil
+import shutil
+from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import get_data_dir
 
 logger = get_logger(__name__)
 
@@ -992,34 +994,14 @@ class SoilMoistureTask(Task):
             uids (list): List of UIDs to recalculate scores for.
         """
         try:
+            # Validate UIDs
+            if not all(isinstance(uid, int) and 0 <= uid < 256 for uid in uids):
+                logger.error("Invalid UIDs provided for recalculation")
+                return
 
-            delete_query = """
-            DELETE FROM soil_moisture_predictions
-            WHERE miner_uid = ANY(:uids)
-            """
-            str_uids = [str(uid) for uid in uids]
-            await self.db_manager.execute(delete_query, {"uids": str_uids})
-            logger.info(f"Deleted predictions for UIDs: {uids}")
-
+            # First fetch historical data to ensure it's available
             current_time = datetime.now(timezone.utc)
             history_window = current_time - self.scoring_delay  # 3 days
-
-            delete_scores_query = """
-            DELETE FROM score_table 
-            WHERE task_name = 'soil_moisture'
-            AND task_id::float >= :start_timestamp
-            AND task_id::float <= :end_timestamp
-            """
-            await self.db_manager.execute(
-                delete_scores_query,
-                {
-                    "start_timestamp": history_window.timestamp(),
-                    "end_timestamp": current_time.timestamp(),
-                },
-            )
-            logger.info(
-                f"Deleted score rows for period {history_window} to {current_time}"
-            )
 
             history_query = """
             SELECT 
@@ -1032,13 +1014,50 @@ class SoilMoistureTask(Task):
                 target_time
             FROM soil_moisture_history
             WHERE target_time >= :history_window
+            AND miner_uid = ANY(:uids)
             ORDER BY target_time ASC
             """
 
             history_results = await self.db_manager.fetch_many(
-                history_query, {"history_window": history_window}
+                history_query, 
+                {
+                    "history_window": history_window,
+                    "uids": [str(uid) for uid in uids]
+                }
             )
 
+            if not history_results:
+                logger.warning(f"No historical data found for UIDs {uids} in window {history_window} to {current_time}")
+                return
+
+            # Start transaction for deletion operations
+            async with self.db_manager.get_connection() as conn:
+                async with conn.begin():
+                    # Delete predictions
+                    delete_query = """
+                    DELETE FROM soil_moisture_predictions
+                    WHERE miner_uid = ANY(:uids)
+                    """
+                    str_uids = [str(uid) for uid in uids]
+                    await conn.execute(text(delete_query), {"uids": str_uids})
+                    
+                    # Delete scores
+                    delete_scores_query = """
+                    DELETE FROM score_table 
+                    WHERE task_name = 'soil_moisture'
+                    AND task_id::float >= :start_timestamp
+                    AND task_id::float <= :end_timestamp
+                    """
+                    await conn.execute(
+                        text(delete_scores_query),
+                        {
+                            "start_timestamp": history_window.timestamp(),
+                            "end_timestamp": current_time.timestamp(),
+                        },
+                    )
+                    logger.info(f"Successfully deleted predictions and scores for UIDs: {uids}")
+
+            # Group records by day
             daily_records = {}
             for record in history_results:
                 day_key = record["target_time"].replace(
@@ -1048,80 +1067,94 @@ class SoilMoistureTask(Task):
                     daily_records[day_key] = []
                 daily_records[day_key].append(record)
 
+            # Process each day's records
             for day, records in daily_records.items():
                 miner_scores = {}
                 for record in records:
-                    miner_uid = int(record["miner_uid"])
-                    if miner_uid not in miner_scores:
-                        miner_scores[miner_uid] = {
-                            "surface_rmse": [],
-                            "rootzone_rmse": [],
-                            "surface_ssim": [],
-                            "rootzone_ssim": [],
-                        }
+                    try:
+                        miner_uid = int(record["miner_uid"])
+                        if miner_uid not in miner_scores:
+                            miner_scores[miner_uid] = {
+                                "surface_rmse": [],
+                                "rootzone_rmse": [],
+                                "surface_ssim": [],
+                                "rootzone_ssim": [],
+                            }
 
-                    miner_scores[miner_uid]["surface_rmse"].append(
-                        record["surface_rmse"]
-                    )
-                    miner_scores[miner_uid]["rootzone_rmse"].append(
-                        record["rootzone_rmse"]
-                    )
-                    miner_scores[miner_uid]["surface_ssim"].append(
-                        record["surface_structure_score"]
-                    )
-                    miner_scores[miner_uid]["rootzone_ssim"].append(
-                        record["rootzone_structure_score"]
-                    )
+                        # Safely append non-None values
+                        if record["surface_rmse"] is not None:
+                            miner_scores[miner_uid]["surface_rmse"].append(record["surface_rmse"])
+                        if record["rootzone_rmse"] is not None:
+                            miner_scores[miner_uid]["rootzone_rmse"].append(record["rootzone_rmse"])
+                        if record["surface_structure_score"] is not None:
+                            miner_scores[miner_uid]["surface_ssim"].append(record["surface_structure_score"])
+                        if record["rootzone_structure_score"] is not None:
+                            miner_scores[miner_uid]["rootzone_ssim"].append(record["rootzone_structure_score"])
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"Error processing record for miner {record.get('miner_uid')}: {e}")
+                        continue
 
                 scores = [float("nan")] * 256
                 for miner_uid, score_lists in miner_scores.items():
-                    if score_lists["surface_rmse"] and score_lists["rootzone_rmse"]:
-                        avg_surface_rmse = sum(score_lists["surface_rmse"]) / len(
-                            score_lists["surface_rmse"]
-                        )
-                        avg_rootzone_rmse = sum(score_lists["rootzone_rmse"]) / len(
-                            score_lists["rootzone_rmse"]
-                        )
-                        avg_surface_ssim = sum(score_lists["surface_ssim"]) / len(
-                            score_lists["surface_ssim"]
-                        )
-                        avg_rootzone_ssim = sum(score_lists["rootzone_ssim"]) / len(
-                            score_lists["rootzone_ssim"]
-                        )
+                    try:
+                        # Calculate averages only if we have valid data
+                        if score_lists["surface_rmse"] and score_lists["rootzone_rmse"]:
+                            avg_surface_rmse = sum(score_lists["surface_rmse"]) / len(score_lists["surface_rmse"])
+                            avg_rootzone_rmse = sum(score_lists["rootzone_rmse"]) / len(score_lists["rootzone_rmse"])
+                            
+                            # Handle optional SSIM scores
+                            avg_surface_ssim = (
+                                sum(score_lists["surface_ssim"]) / len(score_lists["surface_ssim"])
+                                if score_lists["surface_ssim"] else 0.0
+                            )
+                            avg_rootzone_ssim = (
+                                sum(score_lists["rootzone_ssim"]) / len(score_lists["rootzone_ssim"])
+                                if score_lists["rootzone_ssim"] else 0.0
+                            )
 
-                        surface_score = math.exp(-abs(avg_surface_rmse) / 10)
-                        rootzone_score = math.exp(-abs(avg_rootzone_rmse) / 10)
+                            surface_score = math.exp(-abs(avg_surface_rmse) / 10)
+                            rootzone_score = math.exp(-abs(avg_rootzone_rmse) / 10)
 
-                        total_score = (
-                            0.25 * surface_score
-                            + 0.25 * rootzone_score
-                            + 0.25 * avg_surface_ssim
-                            + 0.25 * avg_rootzone_ssim
-                        )
+                            total_score = (
+                                0.25 * surface_score
+                                + 0.25 * rootzone_score
+                                + 0.25 * avg_surface_ssim
+                                + 0.25 * avg_rootzone_ssim
+                            )
 
-                        scores[miner_uid] = total_score
+                            scores[miner_uid] = total_score
+                            logger.debug(
+                                f"Calculated score for miner {miner_uid}: {total_score:.4f} "
+                                f"(surface: {surface_score:.4f}, rootzone: {rootzone_score:.4f}, "
+                                f"surface_ssim: {avg_surface_ssim:.4f}, rootzone_ssim: {avg_rootzone_ssim:.4f})"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error calculating scores for miner {miner_uid}: {e}")
+                        continue
 
-                score_row = {
-                    "task_name": "soil_moisture",
-                    "task_id": str(day.timestamp()),
-                    "score": scores,
-                    "status": "completed",
-                }
+                # Insert new score row within a transaction
+                async with self.db_manager.get_connection() as conn:
+                    async with conn.begin():
+                        score_row = {
+                            "task_name": "soil_moisture",
+                            "task_id": str(day.timestamp()),
+                            "score": scores,
+                            "status": "completed",
+                        }
 
-                insert_query = """
-                INSERT INTO score_table (task_name, task_id, score, status)
-                VALUES (:task_name, :task_id, :score, :status)
-                """
-                await self.db_manager.execute(insert_query, score_row)
-                logger.info(f"Recalculated and inserted score row for day {day}")
+                        insert_query = """
+                        INSERT INTO score_table (task_name, task_id, score, status)
+                        VALUES (:task_name, :task_id, :score, :status)
+                        """
+                        await conn.execute(text(insert_query), score_row)
+                        logger.info(f"Recalculated and inserted score row for day {day}")
 
-            logger.info(
-                f"Completed recalculation of scores for UIDs: {uids} over 3-day window"
-            )
+            logger.info(f"Completed recalculation of scores for UIDs: {uids} over 3-day window")
 
         except Exception as e:
             logger.error(f"Error recalculating recent scores: {e}")
             logger.error(traceback.format_exc())
+            raise  # Re-raise to trigger error handling in deregistration loop
 
     async def cleanup_predictions(self, bounds, target_time=None, miner_uid=None):
         """Clean up predictions after they've been processed and moved to history."""
@@ -1187,35 +1220,93 @@ class SoilMoistureTask(Task):
             logger.error(f"Error ensuring retry columns exist: {e}")
             logger.error(traceback.format_exc())
 
-    async def cleanup_resources(self):
-        """Clean up any resources used by the task during recovery."""
+    async def _cleanup_processing_rows(self):
+        """Clean up any rows that might still have 'processing' status."""
         try:
+            async with self.db_manager.get_connection() as conn:
+                async with conn.begin():
+                    result = await conn.execute(
+                        text("""
+                        UPDATE soil_moisture_regions 
+                        SET status = 'pending',
+                            updated_at = NOW()
+                        WHERE status = 'processing'
+                        RETURNING id
+                        """)
+                    )
+                    cleaned_rows = await result.fetchall()
+                    if cleaned_rows:
+                        logger.warning(f"Reset {len(cleaned_rows)} regions from 'processing' to 'pending' status")
+                        logger.warning(f"Region IDs: {[row[0] for row in cleaned_rows]}")
+        except Exception as e:
+            logger.error(f"Error cleaning up processing rows: {e}")
+            logger.error(traceback.format_exc())
+
+    async def cleanup_resources(self):
+        """Clean up any resources used by the task during recovery or shutdown."""
+        try:
+            # Clean up any rows with 'processing' status
+            await self._cleanup_processing_rows()
+
+            # 1. Clean up temporary files with better error handling
             temp_dir = "/tmp"
             patterns = ["*.h5", "*.tif", "*.tiff"]
             for pattern in patterns:
                 try:
                     for f in glob.glob(os.path.join(temp_dir, pattern)):
                         try:
-                            os.unlink(f)
-                            logger.debug(f"Cleaned up temp file: {f}")
+                            if os.path.exists(f):
+                                os.unlink(f)
+                                logger.debug(f"Cleaned up temp file: {f}")
                         except Exception as e:
                             logger.error(f"Failed to remove temp file {f}: {e}")
                 except Exception as e:
                     logger.error(f"Error cleaning up {pattern} files: {e}")
 
+            # 2. Clean up any orphaned 'sent_to_miners' regions that haven't been scored
             try:
-                await self.db_manager.execute(
-                    """
-                    UPDATE soil_moisture_regions 
-                    SET status = 'pending'
-                    WHERE status = 'processing'
-                    """
-                )
-                logger.info("Reset in-progress region statuses")
-            except Exception as e:
-                logger.error(f"Failed to reset region statuses: {e}")
+                async with self.db_manager.get_connection() as conn:
+                    async with conn.begin():
+                        await conn.execute(
+                            text("""
+                            UPDATE soil_moisture_regions 
+                            SET status = 'pending',
+                                updated_at = NOW()
+                            WHERE status = 'sent_to_miners'
+                            AND updated_at < NOW() - INTERVAL '1 hour'
+                            AND NOT EXISTS (
+                                SELECT 1 FROM soil_moisture_predictions 
+                                WHERE soil_moisture_predictions.region_id = soil_moisture_regions.id
+                            )
+                            """)
+                        )
 
+                logger.info("Cleaned up orphaned regions")
+
+            except Exception as e:
+                logger.error(f"Failed to cleanup orphaned regions: {e}")
+                logger.error(traceback.format_exc())
+
+            # 3. Clear in-memory caches
             self._daily_regions = {}
+            
+            # 4. Clean up any temporary data directories
+            data_dir = get_data_dir()
+            if os.path.exists(data_dir):
+                try:
+                    for item in os.listdir(data_dir):
+                        item_path = os.path.join(data_dir, item)
+                        try:
+                            if os.path.isdir(item_path) and item.startswith('tmp'):
+                                shutil.rmtree(item_path)
+                                logger.debug(f"Removed temp directory: {item_path}")
+                            elif item.endswith(('.tif', '.h5')):
+                                os.unlink(item_path)
+                                logger.debug(f"Removed temp file: {item_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to remove {item_path}: {e}")
+                except Exception as e:
+                    logger.error(f"Error cleaning up data directory: {e}")
             
             logger.info("Completed soil task cleanup")
             
@@ -1249,6 +1340,22 @@ class SoilMoistureTask(Task):
     async def _process_single_region(self, region: Dict, validator) -> None:
         """Process a single region with memory management."""
         try:
+            # Check if region is still pending using row-level locking
+            region_status = await self.db_manager.fetch_one(
+                """
+                SELECT status 
+                FROM soil_moisture_regions 
+                WHERE id = :region_id
+                AND status = 'pending'
+                FOR UPDATE SKIP LOCKED
+                """,
+                {"region_id": region["id"]}
+            )
+            
+            if not region_status:
+                logger.info(f"Skipping region {region['id']} as it's no longer pending")
+                return
+
             # Log initial memory state
             memory_info = psutil.Process().memory_info()
             initial_memory = memory_info.rss / (1024 * 1024)
@@ -1288,12 +1395,12 @@ class SoilMoistureTask(Task):
             del task_data
             gc.collect()
 
-            logger.info(f"Sending region {region['id']} to miners...")
+            logger.info(f"Sending payload to miners with region_id: {region['id']}")
             await validator.update_task_status('soil', 'processing', 'miner_query')
             
             responses = await validator.query_miners(
                 payload=payload,
-                endpoint="/soilmoisture-request"
+                endpoint="/soilmoisture-request",
             )
 
             if responses:
@@ -1304,24 +1411,18 @@ class SoilMoistureTask(Task):
                 }
                 await self.add_task_to_queue(responses, metadata)
 
+                # Update status to sent_to_miners only if we got responses
                 await self.db_manager.execute(
                     """
                     UPDATE soil_moisture_regions 
                     SET status = 'sent_to_miners'
                     WHERE id = :region_id
+                    AND status = 'pending'
                     """,
                     {"region_id": region["id"]},
                 )
-
-            # Log final memory state
-            memory_info = psutil.Process().memory_info()
-            final_memory = memory_info.rss / (1024 * 1024)
-            logger.debug(
-                f"Memory after processing region {region['id']}: {final_memory:.2f}MB "
-                f"(Change: {final_memory - initial_memory:.2f}MB)"
-            )
+                logger.info(f"Successfully processed region {region['id']}")
 
         except Exception as e:
             logger.error(f"Error processing region {region['id']}: {str(e)}")
             logger.error(traceback.format_exc())
-            raise

@@ -162,16 +162,39 @@ class SoilValidatorPreprocessing(Preprocessing):
     async def _check_existing_regions(self, target_time: datetime) -> bool:
         """Check if regions already exist for the given target time."""
         try:
-            existing_regions = await self.db.fetch_many(
+            # Get count of regions by status
+            status_counts = await self.db.fetch_many(
                 """
-                SELECT COUNT(*) as count 
+                SELECT status, COUNT(*) as count 
                 FROM soil_moisture_regions 
                 WHERE target_time = :target_time
+                GROUP BY status
                 """,
                 {"target_time": target_time},
             )
-            count = existing_regions[0]["count"] if existing_regions else 0
-            return count >= self.regions_per_timestep
+            
+            # Convert to dict for easier lookup
+            counts_by_status = {row["status"]: row["count"] for row in status_counts}
+            total_regions = sum(counts_by_status.values())
+            
+            # Log the status breakdown
+            if total_regions > 0:
+                logger.info(f"Existing regions for {target_time}:")
+                for status, count in counts_by_status.items():
+                    logger.info(f"  {status}: {count}")
+            
+            # Consider regions complete if we have enough total regions
+            # AND none are in a pending state
+            pending_count = counts_by_status.get('pending', 0)
+            
+            has_enough_regions = total_regions >= self.regions_per_timestep
+            no_pending_regions = pending_count == 0
+            
+            if has_enough_regions and not no_pending_regions:
+                logger.info(f"Have {total_regions} regions but {pending_count} still pending")
+            
+            return has_enough_regions and no_pending_regions
+            
         except Exception as e:
             logger.error(f"Error checking existing regions: {str(e)}")
             return False
