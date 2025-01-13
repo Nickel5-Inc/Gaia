@@ -4,6 +4,8 @@ import time
 import threading
 import concurrent.futures
 import glob
+import signal
+import sys
 
 os.environ["NODE_TYPE"] = "validator"
 import asyncio
@@ -169,6 +171,54 @@ class GaiaValidator:
         )
 
         self.watchdog_running = False
+
+        # Setup signal handlers for graceful shutdown
+        self._cleanup_done = False
+        self._shutdown_event = asyncio.Event()
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully."""
+        signame = signal.Signals(signum).name
+        logger.info(f"Received shutdown signal {signame}")
+        if not self._cleanup_done:
+            # Set shutdown event - will be processed in main loop
+            asyncio.create_task(self._initiate_shutdown())
+            
+    async def _initiate_shutdown(self):
+        """Initiate graceful shutdown sequence."""
+        try:
+            logger.info("Initiating graceful shutdown...")
+            self._shutdown_event.set()
+            
+            # Stop accepting new tasks
+            logger.info("Stopping task acceptance...")
+            await self.update_task_status('all', 'stopping')
+            
+            # Wait briefly for current operations to complete
+            await asyncio.sleep(5)
+            
+            # Cleanup resources
+            await self.cleanup_resources()
+            
+            # Stop the watchdog
+            await self.stop_watchdog()
+            
+            # Close database connections
+            if hasattr(self, 'database_manager'):
+                logger.info("Closing database connections...")
+                await self.database_manager.close_all_connections()
+            
+            self._cleanup_done = True
+            logger.info("Graceful shutdown completed")
+            
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
+            logger.error(traceback.format_exc())
+        finally:
+            # Force exit after cleanup
+            sys.exit(0)
 
     def setup_neuron(self) -> bool:
         """
@@ -727,20 +777,27 @@ class GaiaValidator:
                 self.check_for_updates()
             ]
             
-            try:
-                # Run all tasks concurrently in the same event loop
-                await asyncio.gather(*tasks)
-            except Exception as e:
-                logger.error(f"Error in main task loop: {e}")
-                logger.error(traceback.format_exc())
-                await self.cleanup_resources()
-            
+            while not self._shutdown_event.is_set():
+                try:
+                    # Run all tasks concurrently in the same event loop
+                    await asyncio.gather(*tasks)
+                except Exception as e:
+                    logger.error(f"Error in main task loop: {e}")
+                    logger.error(traceback.format_exc())
+                    await self.cleanup_resources()
+                
+                # Check shutdown event
+                if self._shutdown_event.is_set():
+                    break
+                    
+                await asyncio.sleep(1)
+                
         except Exception as e:
             logger.error(f"Error in main: {e}")
             logger.error(traceback.format_exc())
         finally:
-            await self.cleanup_resources()
-            await self.stop_watchdog()
+            if not self._cleanup_done:
+                await self._initiate_shutdown()
 
     async def main_scoring(self):
         """Run scoring every subnet tempo blocks."""

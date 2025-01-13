@@ -633,3 +633,23 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         except Exception as e:
             logger.error(f"Error fetching recent scores for {task_type}: {str(e)}")
             return [float("nan")] * 256
+
+    async def close_all_connections(self):
+        """Close all database connections gracefully."""
+        try:
+            logger.info("Closing all database connections...")
+            
+            # Close any active sessions
+            if hasattr(self, 'async_session'):
+                await self.async_session.close()
+            
+            # Close connection pool
+            if hasattr(self, 'engine'):
+                logger.info("Closing database engine...")
+                await self.engine.dispose()
+                
+            logger.info("All database connections closed")
+            
+        except Exception as e:
+            logger.error(f"Error closing database connections: {e}")
+            logger.error(traceback.format_exc())
