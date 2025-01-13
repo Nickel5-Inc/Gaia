@@ -31,6 +31,7 @@ from uuid import uuid4
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from sqlalchemy import text
 from gaia.models.soil_moisture_basemodel import SoilModel
+import gc
 import traceback
 import base64
 import json
@@ -39,6 +40,7 @@ import tempfile
 import math
 import glob
 from collections import defaultdict
+import psutil
 
 logger = get_logger(__name__)
 
@@ -64,8 +66,8 @@ class SoilMoistureTask(Task):
         description="Delay before scoring due to SMAP data latency",
     )
 
-    validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None
-    miner_preprocessing: Optional["SoilMinerPreprocessing"] = None
+    validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None # type: ignore
+    miner_preprocessing: Optional["SoilMinerPreprocessing"] = None # type: ignore
     model: Optional[SoilModel] = None
     db_manager: Any = Field(default=None)
     node_type: str = Field(default="miner")
@@ -155,105 +157,54 @@ class SoilMoistureTask(Task):
                         ifs_forecast_time=ifs_forecast_time,
                     )
 
-                    regions = await self.db_manager.fetch_many(
-                        """
-                        SELECT * FROM soil_moisture_regions 
-                        WHERE status = 'pending'
-                        AND target_time = :target_time
-                        """,
-                        {"target_time": target_smap_time},
-                    )
-
-                    if regions:
+                    # Process regions in chunks with memory management
+                    chunk_size = 5
+                    offset = 0
+                    
+                    while True:
+                        # Use a memory-efficient query that only fetches necessary columns
+                        regions = await self.db_manager.fetch_many(
+                            """
+                            SELECT id, combined_data, sentinel_bounds, sentinel_crs, target_time 
+                            FROM soil_moisture_regions 
+                            WHERE status = 'pending'
+                            AND target_time = :target_time
+                            LIMIT :chunk_size OFFSET :offset
+                            """,
+                            {
+                                "target_time": target_smap_time,
+                                "chunk_size": chunk_size,
+                                "offset": offset
+                            }
+                        )
+                        
+                        if not regions:
+                            break
+                            
                         for region in regions:
                             try:
                                 await validator.update_task_status('soil', 'processing', 'region_processing')
-                                logger.info(f"Processing region {region['id']}")
+                                logger.info(f"Processing region {region['id']} (chunk offset: {offset})")
 
-                                if "combined_data" not in region:
-                                    logger.error(
-                                        f"Region {region['id']} missing combined_data field"
-                                    )
+                                if not self._validate_region_data(region):
                                     continue
 
-                                if not region["combined_data"]:
-                                    logger.error(
-                                        f"Region {region['id']} has null combined_data"
-                                    )
-                                    continue
-
-                                combined_data = region["combined_data"]
-                                if not isinstance(combined_data, bytes):
-                                    logger.error(
-                                        f"Region {region['id']} has invalid data type: {type(combined_data)}"
-                                    )
-                                    continue
-
-                                if not (
-                                    combined_data.startswith(b"II\x2A\x00")
-                                    or combined_data.startswith(b"MM\x00\x2A")
-                                ):
-                                    logger.error(
-                                        f"Region {region['id']} has invalid TIFF header"
-                                    )
-                                    logger.error(
-                                        f"First 16 bytes: {combined_data[:16].hex()}"
-                                    )
-                                    continue
-
-                                logger.info(
-                                    f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB"
-                                )
-                                logger.info(
-                                    f"Region {region['id']} TIFF header: {combined_data[:4]}"
-                                )
-                                logger.info(
-                                    f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}"
-                                )
-                                encoded_data = base64.b64encode(combined_data)
-                                logger.info(
-                                    f"Base64 first 16 chars: {encoded_data[:16]}"
-                                )
-
-                                task_data = {
-                                    "region_id": region["id"],
-                                    "combined_data": encoded_data.decode("ascii"),
-                                    "sentinel_bounds": region["sentinel_bounds"],
-                                    "sentinel_crs": region["sentinel_crs"],
-                                    "target_time": target_smap_time.isoformat(),
-                                }
-
-                                payload = {"nonce": str(uuid4()), "data": task_data}
-
-                                logger.info(
-                                    f"Sending region {region['id']} to miners..."
-                                )
-                                await validator.update_task_status('soil', 'processing', 'miner_query')
-                                responses = await validator.query_miners(
-                                    payload=payload, endpoint="/soilmoisture-request"
-                                )
-
-                                if responses:
-                                    metadata = {
-                                        "region_id": region["id"],
-                                        "target_time": target_smap_time,
-                                        "data_collection_time": current_time,
-                                        "ifs_forecast_time": ifs_forecast_time,
-                                    }
-                                    await self.add_task_to_queue(responses, metadata)
-
-                                    await self.db_manager.execute(
-                                        """
-                                        UPDATE soil_moisture_regions 
-                                        SET status = 'sent_to_miners'
-                                        WHERE id = :region_id
-                                        """,
-                                        {"region_id": region["id"]},
-                                    )
-
+                                # Process region data in a separate function to allow better garbage collection
+                                await self._process_single_region(region, validator)
+                                
+                                # Force garbage collection after each region
+                                import gc
+                                gc.collect()
+                                
                             except Exception as e:
                                 logger.error(f"Error preparing region: {str(e)}")
+                                logger.error(traceback.format_exc())
                                 continue
+                        
+                        offset += chunk_size
+                        # Small delay between chunks and cleanup
+                        await asyncio.sleep(1)
+                        gc.collect()
 
                     logger.info("Test mode execution complete. Disabling test mode.")
                     self.test_mode = False
@@ -290,40 +241,47 @@ class SoilMoistureTask(Task):
                     )
                 else:
                     # Execution window logic
-                    regions = await self.db_manager.fetch_many(
-                        """
-                        SELECT * FROM soil_moisture_regions 
-                        WHERE status = 'pending'
-                        AND target_time = :target_time
-                        """,
-                        {"target_time": target_smap_time},
-                    )
-
-                    if regions:
+                    query = """
+                    SELECT * FROM soil_moisture_regions 
+                    WHERE status = 'pending'
+                    AND target_time = :target_time
+                    """
+                    
+                    # Process regions in chunks of 5 to prevent memory bloat
+                    chunk_size = 5
+                    offset = 0
+                    
+                    while True:
+                        chunked_query = f"{query} LIMIT {chunk_size} OFFSET {offset}"
+                        regions = await self.db_manager.fetch_many(
+                            chunked_query,
+                            {"target_time": target_smap_time},
+                        )
+                        
+                        if not regions:
+                            break
+                            
                         for region in regions:
                             try:
                                 await validator.update_task_status('soil', 'processing', 'region_processing')
-                                logger.info(f"Processing region {region['id']}")
-
+                                logger.info(f"Processing region {region['id']} (chunk offset: {offset})")
+                                
                                 if "combined_data" not in region:
-                                    logger.error(
-                                        f"Region {region['id']} missing combined_data field"
-                                    )
+                                    logger.error(f"Region {region['id']} missing combined_data field")
                                     continue
-
+                                    
                                 if not region["combined_data"]:
-                                    logger.error(
-                                        f"Region {region['id']} has null combined_data"
-                                    )
+                                    logger.error(f"Region {region['id']} has null combined_data")
                                     continue
-
+                                    
                                 combined_data = region["combined_data"]
                                 if not isinstance(combined_data, bytes):
                                     logger.error(
                                         f"Region {region['id']} has invalid data type: {type(combined_data)}"
                                     )
                                     continue
-
+                                    
+                                # Process the region data
                                 if not (
                                     combined_data.startswith(b"II\x2A\x00")
                                     or combined_data.startswith(b"MM\x00\x2A")
@@ -394,6 +352,14 @@ class SoilMoistureTask(Task):
                                 logger.error(f"Error preparing region: {str(e)}")
                                 logger.error(traceback.format_exc())
                                 continue
+
+                        offset += chunk_size
+                        # Small delay between chunks to prevent overwhelming the system
+                        await asyncio.sleep(1)
+                        
+                        # Force garbage collection after each chunk
+                        import gc
+                        gc.collect()
 
                 # Get all prep windows
                 prep_windows = [w for w in self.get_validator_windows() if w[1] == 0]
@@ -509,85 +475,95 @@ class SoilMoistureTask(Task):
     async def add_task_to_queue(
         self, responses: Dict[str, Any], metadata: Dict[str, Any]
     ):
+        """Add task to queue with memory-efficient processing."""
         try:
             if not self.db_manager:
                 raise RuntimeError("Database manager not initialized")
 
-            region_update = """
-            UPDATE soil_moisture_regions 
-            SET status = 'sent_to_miners' 
-            WHERE id = :region_id
-            """
-            await self.db_manager.execute(region_update, {"region_id": metadata["region_id"]})
+            # Update region status first
+            await self.db_manager.execute(
+                """
+                UPDATE soil_moisture_regions 
+                SET status = 'sent_to_miners' 
+                WHERE id = :region_id
+                """,
+                {"region_id": metadata["region_id"]}
+            )
 
-            for miner_hotkey, response_data in responses.items():
-                try:
-                    # Get miner UID from hotkey
-                    query = "SELECT uid FROM node_table WHERE hotkey = :miner_hotkey"
-                    result = await self.db_manager.fetch_one(
-                        query, {"miner_hotkey": miner_hotkey}
-                    )
+            # Process responses in chunks to manage memory
+            chunk_size = 10
+            response_items = list(responses.items())
+            
+            for i in range(0, len(response_items), chunk_size):
+                chunk = response_items[i:i + chunk_size]
+                
+                for miner_hotkey, response_data in chunk:
+                    try:
+                        # Get miner UID
+                        result = await self.db_manager.fetch_one(
+                            "SELECT uid FROM node_table WHERE hotkey = :miner_hotkey",
+                            {"miner_hotkey": miner_hotkey}
+                        )
 
-                    if not result:
-                        logger.warning(f"No UID found for hotkey {miner_hotkey}")
-                        continue
-
-                    miner_uid = str(result["uid"])
-
-                    if isinstance(response_data, dict) and "text" in response_data:
-                        try:
-                            response_data = json.loads(response_data["text"])
-                        except json.JSONDecodeError as e:
-                            logger.error(
-                                f"Failed to parse response text for {miner_hotkey}: {e}"
-                            )
+                        if not result:
+                            logger.warning(f"No UID found for hotkey {miner_hotkey}")
                             continue
 
-                    prediction_data = {
-                        "region_id": metadata["region_id"],
-                        "miner_uid": miner_uid,  # Now a string
-                        "miner_hotkey": miner_hotkey,
-                        "target_time": metadata["target_time"],
-                        "surface_sm": response_data.get("surface_sm", []),
-                        "rootzone_sm": response_data.get("rootzone_sm", []),
-                        "uncertainty_surface": response_data.get("uncertainty_surface"),
-                        "uncertainty_rootzone": response_data.get(
-                            "uncertainty_rootzone"
-                        ),
-                        "sentinel_bounds": response_data.get(
-                            "sentinel_bounds", metadata.get("sentinel_bounds")
-                        ),
-                        "sentinel_crs": response_data.get(
-                            "sentinel_crs", metadata.get("sentinel_crs")
-                        ),
-                        "status": "sent_to_miner",
-                    }
+                        miner_uid = str(result["uid"])
 
-                    await self.db_manager.execute(
-                        """
-                        INSERT INTO soil_moisture_predictions 
-                        (region_id, miner_uid, miner_hotkey, target_time, surface_sm, rootzone_sm, 
-                        uncertainty_surface, uncertainty_rootzone, sentinel_bounds, 
-                        sentinel_crs, status)
-                        VALUES 
-                        (:region_id, :miner_uid, :miner_hotkey, :target_time, 
-                        :surface_sm, :rootzone_sm,
-                        :uncertainty_surface, :uncertainty_rootzone, :sentinel_bounds,
-                        :sentinel_crs, :status)
-                        """,
-                        prediction_data,
-                    )
+                        # Process response data
+                        if isinstance(response_data, dict) and "text" in response_data:
+                            try:
+                                response_data = json.loads(response_data["text"])
+                            except json.JSONDecodeError as e:
+                                logger.error(f"Failed to parse response text for {miner_hotkey}: {e}")
+                                continue
 
-                    logger.info(
-                        f"Stored predictions from miner {miner_hotkey} (UID: {miner_uid}) for region {metadata['region_id']}"
-                    )
+                        # Create prediction data with minimal memory footprint
+                        prediction_data = {
+                            "region_id": metadata["region_id"],
+                            "miner_uid": miner_uid,
+                            "miner_hotkey": miner_hotkey,
+                            "target_time": metadata["target_time"],
+                            "surface_sm": response_data.get("surface_sm", []),
+                            "rootzone_sm": response_data.get("rootzone_sm", []),
+                            "uncertainty_surface": response_data.get("uncertainty_surface"),
+                            "uncertainty_rootzone": response_data.get("uncertainty_rootzone"),
+                            "sentinel_bounds": response_data.get("sentinel_bounds", metadata.get("sentinel_bounds")),
+                            "sentinel_crs": response_data.get("sentinel_crs", metadata.get("sentinel_crs")),
+                            "status": "sent_to_miner",
+                        }
 
-                except Exception as e:
-                    logger.error(
-                        f"Error processing response from miner {miner_hotkey}: {str(e)}"
-                    )
-                    logger.error(traceback.format_exc())
-                    continue
+                        # Insert prediction
+                        await self.db_manager.execute(
+                            """
+                            INSERT INTO soil_moisture_predictions 
+                            (region_id, miner_uid, miner_hotkey, target_time, surface_sm, rootzone_sm, 
+                            uncertainty_surface, uncertainty_rootzone, sentinel_bounds, 
+                            sentinel_crs, status)
+                            VALUES 
+                            (:region_id, :miner_uid, :miner_hotkey, :target_time, 
+                            :surface_sm, :rootzone_sm,
+                            :uncertainty_surface, :uncertainty_rootzone, :sentinel_bounds,
+                            :sentinel_crs, :status)
+                            """,
+                            prediction_data,
+                        )
+
+                        logger.debug(f"Stored predictions from miner {miner_hotkey} (UID: {miner_uid})")
+                        
+                        # Clear data to free memory
+                        del prediction_data
+                        del response_data
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing response from miner {miner_hotkey}: {str(e)}")
+                        logger.error(traceback.format_exc())
+                        continue
+                
+                # Cleanup after each chunk
+                gc.collect()
+                await asyncio.sleep(0.1)
 
         except Exception as e:
             logger.error(f"Error storing predictions: {str(e)}")
@@ -1208,5 +1184,107 @@ class SoilMoistureTask(Task):
             
         except Exception as e:
             logger.error(f"Error during soil task cleanup: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+    def _validate_region_data(self, region: Dict) -> bool:
+        """Validate region data before processing."""
+        if "combined_data" not in region:
+            logger.error(f"Region {region['id']} missing combined_data field")
+            return False
+
+        if not region["combined_data"]:
+            logger.error(f"Region {region['id']} has null combined_data")
+            return False
+
+        combined_data = region["combined_data"]
+        if not isinstance(combined_data, bytes):
+            logger.error(f"Region {region['id']} has invalid data type: {type(combined_data)}")
+            return False
+
+        if not (combined_data.startswith(b"II\x2A\x00") or combined_data.startswith(b"MM\x00\x2A")):
+            logger.error(f"Region {region['id']} has invalid TIFF header")
+            logger.error(f"First 16 bytes: {combined_data[:16].hex()}")
+            return False
+
+        return True
+
+    async def _process_single_region(self, region: Dict, validator) -> None:
+        """Process a single region with memory management."""
+        try:
+            # Log initial memory state
+            memory_info = psutil.Process().memory_info()
+            initial_memory = memory_info.rss / (1024 * 1024)
+            logger.debug(f"Initial memory before processing region {region['id']}: {initial_memory:.2f}MB")
+
+            # Process TIFF data in chunks if possible
+            combined_data = region["combined_data"]
+            logger.info(f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB")
+            
+            # Encode data in chunks to reduce memory usage
+            chunk_size = 1024 * 1024  # 1MB chunks
+            encoded_chunks = []
+            for i in range(0, len(combined_data), chunk_size):
+                chunk = combined_data[i:i + chunk_size]
+                encoded_chunks.append(base64.b64encode(chunk).decode("ascii"))
+            encoded_data = "".join(encoded_chunks)
+            
+            # Clear the original data to free memory
+            del combined_data
+            gc.collect()
+
+            task_data = {
+                "region_id": region["id"],
+                "combined_data": encoded_data,
+                "sentinel_bounds": region["sentinel_bounds"],
+                "sentinel_crs": region["sentinel_crs"],
+                "target_time": region["target_time"].isoformat(),
+            }
+
+            # Clear encoded chunks to free memory
+            del encoded_chunks
+            gc.collect()
+
+            payload = {"nonce": str(uuid4()), "data": task_data}
+            
+            # Clear task data to free memory
+            del task_data
+            gc.collect()
+
+            logger.info(f"Sending region {region['id']} to miners...")
+            await validator.update_task_status('soil', 'processing', 'miner_query')
+            
+            responses = await validator.query_miners(
+                payload=payload,
+                endpoint="/soilmoisture-request"
+            )
+
+            if responses:
+                metadata = {
+                    "region_id": region["id"],
+                    "target_time": region["target_time"],
+                    "data_collection_time": datetime.now(timezone.utc),
+                }
+                await self.add_task_to_queue(responses, metadata)
+
+                await self.db_manager.execute(
+                    """
+                    UPDATE soil_moisture_regions 
+                    SET status = 'sent_to_miners'
+                    WHERE id = :region_id
+                    """,
+                    {"region_id": region["id"]},
+                )
+
+            # Log final memory state
+            memory_info = psutil.Process().memory_info()
+            final_memory = memory_info.rss / (1024 * 1024)
+            logger.debug(
+                f"Memory after processing region {region['id']}: {final_memory:.2f}MB "
+                f"(Change: {final_memory - initial_memory:.2f}MB)"
+            )
+
+        except Exception as e:
+            logger.error(f"Error processing region {region['id']}: {str(e)}")
             logger.error(traceback.format_exc())
             raise

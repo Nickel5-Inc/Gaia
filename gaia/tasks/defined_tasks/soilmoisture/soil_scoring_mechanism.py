@@ -3,7 +3,7 @@ import tempfile
 from gaia.tasks.base.components.scoring_mechanism import ScoringMechanism
 from gaia.tasks.base.decorators import task_timer
 import numpy as np
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 from rasterio.coords import BoundingBox
 from rasterio.crs import CRS
 import torch
@@ -22,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sess
 from sqlalchemy.sql import text
 import glob
 import asyncio
+import psutil
+import gc
 
 logger = get_logger(__name__)
 
@@ -33,6 +35,8 @@ class SoilScoringMechanism(ScoringMechanism):
     beta: float = Field(default=0.1, description="Sigmoid midpoint parameter")
     baseline_rmse: float = Field(default=50, description="Baseline RMSE value")
     db_manager: Any = Field(default=None)
+    chunk_size: int = Field(default=32, description="Process predictions in chunks")
+    memory_threshold: int = Field(default=1024 * 1024 * 1024, description="1GB threshold for memory cleanup")
 
     def __init__(self, baseline_rmse: float = 50, alpha: float = 10, beta: float = 0.1, db_manager=None):
         super().__init__(
@@ -45,6 +49,8 @@ class SoilScoringMechanism(ScoringMechanism):
         self.beta = beta
         self.baseline_rmse = baseline_rmse
         self.db_manager = db_manager
+        self.chunk_size = 32  # Process predictions in chunks
+        self.memory_threshold = 1024 * 1024 * 1024  # 1GB threshold for memory cleanup
 
     def sigmoid_rmse(self, rmse: float) -> float:
         """Convert RMSE to score using sigmoid function. (higher is better)"""
@@ -459,3 +465,134 @@ class SoilScoringMechanism(ScoringMechanism):
         except Exception as e:
             logger.error(f"Error preparing soil history record: {str(e)}")
             return None
+
+    async def score_predictions(self, predictions: List[Dict], ground_truth: Dict) -> List[Dict]:
+        """Score predictions with memory-efficient processing."""
+        try:
+            scores = []
+            total_predictions = len(predictions)
+            logger.info(f"Scoring {total_predictions} predictions")
+
+            # Track initial memory usage
+            initial_memory = psutil.Process().memory_info().rss
+            logger.debug(f"Initial memory usage: {initial_memory / (1024 * 1024):.2f}MB")
+
+            # Process predictions in chunks
+            for i in range(0, total_predictions, self.chunk_size):
+                chunk = predictions[i:i + self.chunk_size]
+                logger.debug(f"Processing prediction chunk {i//self.chunk_size + 1}/{(total_predictions + self.chunk_size - 1)//self.chunk_size}")
+                
+                chunk_scores = []
+                for prediction in chunk:
+                    try:
+                        # Score individual prediction
+                        score = await self._score_single_prediction(prediction, ground_truth)
+                        if score:
+                            chunk_scores.append(score)
+                    except Exception as e:
+                        logger.error(f"Error scoring prediction from miner {prediction.get('miner_hotkey')}: {str(e)}")
+                        logger.error(traceback.format_exc())
+                        continue
+
+                # Extend scores list with chunk results
+                scores.extend(chunk_scores)
+                
+                # Check memory usage and cleanup if needed
+                current_memory = psutil.Process().memory_info().rss
+                if current_memory - initial_memory > self.memory_threshold:
+                    logger.warning(f"Memory usage exceeded threshold. Forcing cleanup.")
+                    gc.collect()
+                    await asyncio.sleep(0.1)  # Allow event loop to process other tasks
+
+                logger.debug(f"Current memory usage: {current_memory / (1024 * 1024):.2f}MB")
+
+            return scores
+
+        except Exception as e:
+            logger.error(f"Error in score_predictions: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+    async def _score_single_prediction(self, prediction: Dict, ground_truth: Dict) -> Optional[Dict]:
+        """Score a single prediction with memory management."""
+        try:
+            # Validate prediction data
+            if not self._validate_prediction(prediction):
+                return None
+
+            # Convert data to numpy arrays efficiently
+            try:
+                surface_sm = np.array(prediction["surface_sm"], dtype=np.float32)
+                rootzone_sm = np.array(prediction["rootzone_sm"], dtype=np.float32)
+                
+                gt_surface = np.array(ground_truth["surface_sm"], dtype=np.float32)
+                gt_rootzone = np.array(ground_truth["rootzone_sm"], dtype=np.float32)
+            except Exception as e:
+                logger.error(f"Error converting data to numpy arrays: {str(e)}")
+                return None
+
+            # Calculate scores efficiently
+            surface_rmse = self._calculate_rmse(surface_sm, gt_surface)
+            rootzone_rmse = self._calculate_rmse(rootzone_sm, gt_rootzone)
+            
+            # Clear arrays to free memory
+            del surface_sm, rootzone_sm, gt_surface, gt_rootzone
+            
+            # Calculate combined score
+            combined_score = (surface_rmse + rootzone_rmse) / 2.0
+
+            return {
+                "miner_hotkey": prediction["miner_hotkey"],
+                "miner_uid": prediction["miner_uid"],
+                "region_id": prediction["region_id"],
+                "target_time": prediction["target_time"],
+                "surface_rmse": float(surface_rmse),
+                "rootzone_rmse": float(rootzone_rmse),
+                "combined_score": float(combined_score)
+            }
+
+        except Exception as e:
+            logger.error(f"Error in _score_single_prediction: {str(e)}")
+            logger.error(traceback.format_exc())
+            return None
+
+    def _validate_prediction(self, prediction: Dict) -> bool:
+        """Validate prediction data."""
+        required_fields = ["surface_sm", "rootzone_sm", "miner_hotkey", "miner_uid", "region_id", "target_time"]
+        
+        for field in required_fields:
+            if field not in prediction:
+                logger.error(f"Missing required field: {field}")
+                return False
+            
+            if field in ["surface_sm", "rootzone_sm"]:
+                if not isinstance(prediction[field], (list, np.ndarray)):
+                    logger.error(f"Invalid data type for {field}: {type(prediction[field])}")
+                    return False
+                
+                if len(prediction[field]) == 0:
+                    logger.error(f"Empty data for {field}")
+                    return False
+
+        return True
+
+    def _calculate_rmse(self, prediction: np.ndarray, ground_truth: np.ndarray) -> float:
+        """Calculate RMSE efficiently."""
+        try:
+            # Ensure arrays have same shape
+            if prediction.shape != ground_truth.shape:
+                raise ValueError(f"Shape mismatch: prediction {prediction.shape} != ground_truth {ground_truth.shape}")
+
+            # Calculate RMSE efficiently using numpy operations
+            squared_diff = np.square(prediction - ground_truth)
+            mean_squared_diff = np.mean(squared_diff)
+            rmse = np.sqrt(mean_squared_diff)
+
+            # Clear intermediate arrays
+            del squared_diff
+            
+            return float(rmse)
+
+        except Exception as e:
+            logger.error(f"Error calculating RMSE: {str(e)}")
+            raise
