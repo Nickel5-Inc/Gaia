@@ -168,9 +168,7 @@ class GaiaValidator:
             transport=httpx.AsyncHTTPTransport(retries=3),
         )
 
-        self.watchdog_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="watchdog")
         self.watchdog_running = False
-        self.watchdog_task = None
 
     def setup_neuron(self) -> bool:
         """
@@ -402,31 +400,24 @@ class GaiaValidator:
         """Start the watchdog in a separate thread."""
         if not self.watchdog_running:
             self.watchdog_running = True
-            loop = asyncio.get_event_loop()
-            self.watchdog_task = loop.run_in_executor(self.watchdog_executor, self.watchdog_thread)
-            logger.info("Started watchdog in separate thread")
+            logger.info("Started watchdog")
+            asyncio.create_task(self._watchdog_loop())
 
-    def watchdog_thread(self):
-        """Run the watchdog monitoring in a separate thread."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
+    async def _watchdog_loop(self):
+        """Run the watchdog monitoring in the main event loop."""
         while self.watchdog_running:
             try:
-                loop.run_until_complete(self._watchdog_check())
+                await self._watchdog_check()
             except Exception as e:
-                logger.error(f"Error in watchdog thread: {e}")
+                logger.error(f"Error in watchdog loop: {e}")
                 logger.error(traceback.format_exc())
-            time.sleep(60)  # Check every minute
+            await asyncio.sleep(60)  # Check every minute
 
     async def stop_watchdog(self):
-        """Stop the watchdog thread gracefully."""
+        """Stop the watchdog."""
         if self.watchdog_running:
             self.watchdog_running = False
-            if self.watchdog_task:
-                await self.watchdog_task
-            self.watchdog_executor.shutdown(wait=True)
-            logger.info("Stopped watchdog thread")
+            logger.info("Stopped watchdog")
 
     async def _watchdog_check(self):
         """Perform a single watchdog check iteration."""

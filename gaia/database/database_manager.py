@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from fiber.logging_utils import get_logger
+import random
 
 logger = get_logger(__name__)
 
@@ -88,6 +89,66 @@ class BaseDatabaseManager(ABC):
             self.last_successful_connection = 0
             self.consecutive_failures = 0
             self.MAX_CONSECUTIVE_FAILURES = 3
+
+    def _get_or_create_loop(self):
+        """Get the current event loop or create a new one for this thread."""
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("No running event loop found - this should not happen in production")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+
+    async def _ensure_pool(self):
+        """Ensure database pool exists and is healthy."""
+        try:
+            session = await self._engine.connect()
+            try:
+                await asyncio.wait_for(
+                    session.execute(text("SELECT 1")),
+                    timeout=10
+                )
+                logger.info("Database connection verified")
+                return True
+            finally:
+                await session.close()
+            
+        except Exception as e:
+            logger.error(f"Error ensuring pool: {e}")
+            return False
+
+    async def get_connection(self):
+        """Get a database session with retry logic and timeouts."""
+        max_retries = 3
+        base_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                session = AsyncSession(self._engine)
+                await asyncio.wait_for(
+                    session.execute(text("SELECT 1")),
+                    timeout=30
+                )
+                return session
+                    
+            except asyncio.TimeoutError:
+                logger.error(f"Connection attempt {attempt + 1} timed out")
+                if attempt == max_retries - 1:
+                    raise
+                
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Failed to get connection after {max_retries} attempts: {e}")
+                    raise
+                
+                logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+            
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.1)
+            logger.info(f"Retrying connection in {delay:.1f} seconds")
+            await asyncio.sleep(delay)
+            
+            await self.reset_pool()
 
     @asynccontextmanager
     async def get_session(self):
