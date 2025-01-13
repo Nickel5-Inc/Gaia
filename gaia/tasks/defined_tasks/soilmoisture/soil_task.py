@@ -247,6 +247,20 @@ class SoilMoistureTask(Task):
                     AND target_time = :target_time
                     """
                     
+                    # Get total count of pending regions before processing
+                    total_regions = await self.db_manager.fetch_one(
+                        """
+                        SELECT COUNT(*) as count 
+                        FROM soil_moisture_regions 
+                        WHERE status = 'pending'
+                        AND target_time = :target_time
+                        """,
+                        {"target_time": target_smap_time}
+                    )
+                    total_count = total_regions["count"] if total_regions else 0
+                    processed_count = 0
+                    logger.info(f"Starting processing of {total_count} pending regions for target time {target_smap_time}")
+                    
                     # Process regions in chunks of 5 to prevent memory bloat
                     chunk_size = 5
                     offset = 0
@@ -264,8 +278,9 @@ class SoilMoistureTask(Task):
                         for region in regions:
                             try:
                                 await validator.update_task_status('soil', 'processing', 'region_processing')
-                                logger.info(f"Processing region {region['id']} (chunk offset: {offset})")
-                                
+                                processed_count += 1
+                                logger.info(f"Processing region {region['id']} (progress: {processed_count}/{total_count}, chunk offset: {offset})")
+
                                 if "combined_data" not in region:
                                     logger.error(f"Region {region['id']} missing combined_data field")
                                     continue
@@ -360,6 +375,28 @@ class SoilMoistureTask(Task):
                         # Force garbage collection after each chunk
                         import gc
                         gc.collect()
+                        
+                        # Log progress after each chunk
+                        logger.info(f"Processed {processed_count}/{total_count} regions ({(processed_count/total_count*100):.1f}% complete)")
+
+                    # Log final statistics
+                    success_count = await self.db_manager.fetch_one(
+                        """
+                        SELECT COUNT(*) as count 
+                        FROM soil_moisture_regions 
+                        WHERE status = 'sent_to_miners'
+                        AND target_time = :target_time
+                        """,
+                        {"target_time": target_smap_time}
+                    )
+                    success_count = success_count["count"] if success_count else 0
+                    
+                    error_count = total_count - success_count
+                    logger.info(f"Region processing complete for {target_smap_time}:")
+                    logger.info(f"Total regions: {total_count}")
+                    logger.info(f"Successfully processed: {success_count}")
+                    logger.info(f"Failed to process: {error_count}")
+                    logger.info(f"Success rate: {(success_count/total_count*100):.1f}%" + (" if total_count > 0 else 'N/A'"))
 
                 # Get all prep windows
                 prep_windows = [w for w in self.get_validator_windows() if w[1] == 0]
