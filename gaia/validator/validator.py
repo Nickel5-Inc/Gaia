@@ -368,18 +368,32 @@ class GaiaValidator:
         while True:
             try:
                 logger.info("Checking for updates...")
-                update_successful = await perform_update(self)
+                # Add timeout to prevent hanging
+                try:
+                    update_successful = await asyncio.wait_for(
+                        perform_update(self),
+                        timeout=30  # 30 second timeout
+                    )
 
-                if update_successful:
-                    logger.info("Update completed successfully")
-                else:
-                    logger.debug("No updates available or update failed")
+                    if update_successful:
+                        logger.info("Update completed successfully")
+                    else:
+                        logger.debug("No updates available or update failed")
 
-            except Exception as e:
-                logger.error(f"Error in update checker: {e}")
+                except asyncio.TimeoutError:
+                    logger.warning("Update check timed out after 30 seconds")
+                except Exception as e:
+                    if "500" in str(e):
+                        logger.warning(f"GitHub temporarily unavailable (500 error): {e}")
+                    else:
+                        logger.error(f"Error in update checker: {e}")
+                        logger.error(traceback.format_exc())
+
+            except Exception as outer_e:
+                logger.error(f"Outer error in update checker: {outer_e}")
                 logger.error(traceback.format_exc())
 
-            await asyncio.sleep(120)
+            await asyncio.sleep(120)  # Check every 2 minutes
 
     async def update_task_status(self, task_name: str, status: str, operation: Optional[str] = None):
         """Update task status and operation tracking."""
@@ -438,9 +452,19 @@ class GaiaValidator:
         """Run the watchdog monitoring in the main event loop."""
         while self.watchdog_running:
             try:
-                await self._watchdog_check()
-            except Exception as e:
-                logger.error(f"Error in watchdog loop: {e}")
+                # Add timeout to prevent long execution
+                try:
+                    await asyncio.wait_for(
+                        self._watchdog_check(),
+                        timeout=30  # 30 second timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Watchdog check timed out after 30 seconds")
+                except Exception as e:
+                    logger.error(f"Error in watchdog loop: {e}")
+                    logger.error(traceback.format_exc())
+            except Exception as outer_e:
+                logger.error(f"Outer error in watchdog: {outer_e}")
                 logger.error(traceback.format_exc())
             await asyncio.sleep(60)  # Check every minute
 
@@ -457,95 +481,40 @@ class GaiaValidator:
             
             # Update resource usage for all active tasks
             try:
-                import psutil
-                process = psutil.Process()
-                for task_name, health in self.task_health.items():
-                    if health['status'] != 'idle':
-                        current_memory = process.memory_info().rss
-                        health['resources']['memory_peak'] = max(
-                            current_memory,
-                            health['resources'].get('memory_peak', 0)
-                        )
-                        health['resources']['cpu_percent'] = process.cpu_percent()
-                        health['resources']['open_files'] = len(process.open_files())
-                        health['resources']['threads'] = process.num_threads()
-                        health['resources']['last_update'] = current_time
-                        
-                        # Log if memory usage has increased significantly
-                        if current_memory > health['resources']['memory_peak'] * 1.5:  # 50% increase
-                            logger.warning(
-                                f"High memory usage in task {task_name} | "
-                                f"Current: {current_memory / (1024*1024):.2f}MB | "
-                                f"Previous Peak: {health['resources']['memory_peak'] / (1024*1024):.2f}MB"
-                            )
-            except ImportError:
-                pass
-
-            for task_name, health in self.task_health.items():
-                if health['status'] == 'idle':
-                    continue
-                    
-                timeout = health['timeouts'].get(
-                    health.get('current_operation'),
-                    health['timeouts']['default']
+                await asyncio.wait_for(
+                    self._check_resource_usage(current_time),
+                    timeout=10  # 10 second timeout
                 )
-                
-                if health['operation_start'] and current_time - health['operation_start'] > timeout:
-                    # Enhanced logging for timeout detection
-                    operation_duration = current_time - health['operation_start']
-                    logger.warning(
-                        f"TIMEOUT_ALERT - Task: {task_name} | "
-                        f"Operation: {health.get('current_operation')} | "
-                        f"Duration: {operation_duration:.2f}s | "
-                        f"Timeout: {timeout}s | "
-                        f"Status: {health['status']} | "
-                        f"Errors: {health['errors']}"
-                    )
-                    
-                    # Log memory usage when timeout occurs
-                    try:
-                        import psutil
-                        process = psutil.Process()
-                        memory_info = process.memory_info()
-                        logger.warning(
-                            f"Memory Usage at Timeout - "
-                            f"RSS: {memory_info.rss / 1024 / 1024:.2f}MB | "
-                            f"VMS: {memory_info.vms / 1024 / 1024:.2f}MB"
-                        )
-                    except ImportError:
-                        logger.warning("psutil not available for memory tracking")
-                    
-                    if health['status'] != 'processing':
-                        logger.error(
-                            f"FREEZE_DETECTED - Task {task_name} appears frozen - "
-                            f"Last Operation: {health.get('current_operation')} - "
-                            f"Starting recovery"
-                        )
-                        try:
-                            await self.recover_task(task_name)
-                            health['errors'] = 0
-                            logger.info(f"Successfully recovered task {task_name}")
-                        except Exception as e:
-                            logger.error(f"Failed to recover task {task_name}: {e}")
-                            logger.error(traceback.format_exc())
-                            health['errors'] += 1
-                    else:
-                        logger.info(
-                            f"Task {task_name} is still processing - "
-                            f"Operation: {health.get('current_operation')} - "
-                            f"Duration: {operation_duration:.2f}s"
-                        )
+            except asyncio.TimeoutError:
+                logger.error("Resource usage check timed out")
+            except Exception as e:
+                logger.error(f"Error checking resource usage: {e}")
+
+            # Check task health with timeout
+            try:
+                await asyncio.wait_for(
+                    self._check_task_health(current_time),
+                    timeout=10  # 10 second timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error("Task health check timed out")
+            except Exception as e:
+                logger.error(f"Error checking task health: {e}")
             
-            # Check database health
+            # Check database health with timeout
             if current_time - self.last_successful_db_check > self.db_check_interval:
                 try:
-                    db_check_start = time.time()
-                    async with self.database_manager.async_session() as session:
-                        await session.execute(text("SELECT 1"))
-                    db_check_duration = time.time() - db_check_start
-                    self.last_successful_db_check = time.time()
-                    if db_check_duration > 5:  # Log slow DB checks
-                        logger.warning(f"Slow DB health check: {db_check_duration:.2f}s")
+                    await asyncio.wait_for(
+                        self._check_database_health(),
+                        timeout=5  # 5 second timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Database health check timed out")
+                    try:
+                        await self.database_manager.reset_pool()
+                        logger.info("Successfully reset database pool")
+                    except Exception as reset_error:
+                        logger.error(f"Failed to reset database pool: {reset_error}")
                 except Exception as e:
                     logger.error(f"Database health check failed: {e}")
                     try:
@@ -554,21 +523,101 @@ class GaiaValidator:
                     except Exception as reset_error:
                         logger.error(f"Failed to reset database pool: {reset_error}")
 
-            # Check metagraph sync health
+            # Check metagraph sync health with timeout
             if current_time - self.last_metagraph_sync > self.metagraph_sync_interval:
                 try:
-                    sync_start = time.time()
-                    self.metagraph.sync_nodes()
-                    sync_duration = time.time() - sync_start
-                    self.last_metagraph_sync = time.time()
-                    if sync_duration > 30:  # Log slow syncs
-                        logger.warning(f"Slow metagraph sync: {sync_duration:.2f}s")
+                    await asyncio.wait_for(
+                        self._sync_metagraph(),
+                        timeout=10  # 10 second timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Metagraph sync timed out")
                 except Exception as e:
                     logger.error(f"Metagraph sync failed: {e}")
 
         except Exception as e:
             logger.error(f"Error in watchdog check: {e}")
             logger.error(traceback.format_exc())
+
+    async def _check_resource_usage(self, current_time):
+        """Check resource usage for active tasks."""
+        import psutil
+        process = psutil.Process()
+        for task_name, health in self.task_health.items():
+            if health['status'] != 'idle':
+                current_memory = process.memory_info().rss
+                health['resources']['memory_peak'] = max(
+                    current_memory,
+                    health['resources'].get('memory_peak', 0)
+                )
+                health['resources']['cpu_percent'] = process.cpu_percent()
+                health['resources']['open_files'] = len(process.open_files())
+                health['resources']['threads'] = process.num_threads()
+                health['resources']['last_update'] = current_time
+                
+                # Log if memory usage has increased significantly
+                if current_memory > health['resources']['memory_peak'] * 1.5:  # 50% increase
+                    logger.warning(
+                        f"High memory usage in task {task_name} | "
+                        f"Current: {current_memory / (1024*1024):.2f}MB | "
+                        f"Previous Peak: {health['resources']['memory_peak'] / (1024*1024):.2f}MB"
+                    )
+
+    async def _check_task_health(self, current_time):
+        """Check health of all tasks."""
+        for task_name, health in self.task_health.items():
+            if health['status'] == 'idle':
+                continue
+                
+            timeout = health['timeouts'].get(
+                health.get('current_operation'),
+                health['timeouts']['default']
+            )
+            
+            if health['operation_start'] and current_time - health['operation_start'] > timeout:
+                operation_duration = current_time - health['operation_start']
+                logger.warning(
+                    f"TIMEOUT_ALERT - Task: {task_name} | "
+                    f"Operation: {health.get('current_operation')} | "
+                    f"Duration: {operation_duration:.2f}s | "
+                    f"Timeout: {timeout}s | "
+                    f"Status: {health['status']} | "
+                    f"Errors: {health['errors']}"
+                )
+                
+                if health['status'] != 'processing':
+                    logger.error(
+                        f"FREEZE_DETECTED - Task {task_name} appears frozen - "
+                        f"Last Operation: {health.get('current_operation')} - "
+                        f"Starting recovery"
+                    )
+                    try:
+                        await self.recover_task(task_name)
+                        health['errors'] = 0
+                        logger.info(f"Successfully recovered task {task_name}")
+                    except Exception as e:
+                        logger.error(f"Failed to recover task {task_name}: {e}")
+                        logger.error(traceback.format_exc())
+                        health['errors'] += 1
+
+    async def _check_database_health(self):
+        """Check database health."""
+        db_check_start = time.time()
+        async with self.database_manager.async_session() as session:
+            await session.execute(text("SELECT 1"))
+        db_check_duration = time.time() - db_check_start
+        self.last_successful_db_check = time.time()
+        if db_check_duration > 5:  # Log slow DB checks
+            logger.warning(f"Slow DB health check: {db_check_duration:.2f}s")
+
+    async def _sync_metagraph(self):
+        """Sync the metagraph."""
+        sync_start = time.time()
+        self.metagraph.sync_nodes()
+        sync_duration = time.time() - sync_start
+        self.last_metagraph_sync = time.time()
+        if sync_duration > 30:  # Log slow syncs
+            logger.warning(f"Slow metagraph sync: {sync_duration:.2f}s")
 
     async def cleanup_resources(self):
         """Clean up resources used by the validator."""
