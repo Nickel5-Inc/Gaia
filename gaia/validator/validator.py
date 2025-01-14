@@ -292,41 +292,31 @@ class GaiaValidator:
         try:
             logger.info(f"Querying miners with payload size: {len(str(payload))} bytes")
             if "data" in payload and "combined_data" in payload["data"]:
-                logger.debug(
-                    f"TIFF data size before serialization: {len(payload['data']['combined_data'])} bytes"
-                )
+                logger.debug(f"TIFF data size before serialization: {len(payload['data']['combined_data'])} bytes")
                 if isinstance(payload["data"]["combined_data"], bytes):
-                    logger.debug(
-                        f"TIFF header before serialization: {payload['data']['combined_data'][:4]}"
-                    )
+                    logger.debug(f"TIFF header before serialization: {payload['data']['combined_data'][:4]}")
 
             responses = {}
             self.metagraph.sync_nodes()
-            
+
             for miner_hotkey, node in self.metagraph.nodes.items():
                 base_url = f"https://{node.ip}:{node.port}"
 
                 try:
-                    # Handshake with timeout
-                    handshake_timeout = 30  # 30 seconds for handshake
-                    handshake_result = await asyncio.wait_for(
+                    symmetric_key_str, symmetric_key_uuid = await asyncio.wait_for(
                         handshake.perform_handshake(
                             keypair=self.keypair,
                             httpx_client=self.httpx_client,
                             server_address=base_url,
                             miner_hotkey_ss58_address=miner_hotkey,
                         ),
-                        timeout=handshake_timeout
+                        timeout=30.0
                     )
-                    
-                    symmetric_key_str, symmetric_key_uuid = handshake_result
 
                     if symmetric_key_str and symmetric_key_uuid:
                         logger.info(f"Handshake successful with miner {miner_hotkey}")
                         fernet = Fernet(symmetric_key_str)
 
-                        # Query with timeout
-                        query_timeout = 180  # 3 minutes for actual query
                         resp = await asyncio.wait_for(
                             vali_client.make_non_streamed_post(
                                 httpx_client=self.httpx_client,
@@ -339,7 +329,7 @@ class GaiaValidator:
                                 payload=payload,
                                 endpoint=endpoint,
                             ),
-                            timeout=query_timeout
+                            timeout=180.0
                         )
 
                         response_data = {
@@ -349,37 +339,28 @@ class GaiaValidator:
                             "ip": node.ip,
                         }
                         responses[miner_hotkey] = response_data
-                        logger.info(f"Successfully completed request to {miner_hotkey}")
+                        logger.info(f"Completed request to {miner_hotkey}")
                     else:
                         logger.warning(f"Failed handshake with miner {miner_hotkey}")
 
                 except asyncio.TimeoutError as e:
-                    logger.warning(f"Timeout for miner {miner_hotkey}: {str(e)}")
+                    logger.warning(f"Timeout for miner {miner_hotkey}: {e}")
                     continue
-
                 except httpx.HTTPStatusError as e:
                     logger.warning(f"HTTP error from miner {miner_hotkey}: {e}")
                     continue
-
                 except httpx.RequestError as e:
                     logger.warning(f"Request error from miner {miner_hotkey}: {e}")
                     continue
-
                 except Exception as e:
                     logger.error(f"Error with miner {miner_hotkey}: {e}")
                     logger.error(f"Error details: {traceback.format_exc()}")
                     continue
 
-            if not responses:
-                logger.warning("No successful responses from any miners")
-            else:
-                logger.info(f"Successfully queried {len(responses)} miners")
-
             return responses
 
         except Exception as e:
             logger.error(f"Error in query_miners: {str(e)}")
-            logger.error(traceback.format_exc())
             return {}
 
     async def check_for_updates(self):
@@ -774,7 +755,7 @@ class GaiaValidator:
                 self.status_logger(),
                 self.main_scoring(),
                 self.handle_miner_deregistration_loop(),
-                self.check_for_updates()
+                #self.check_for_updates()
             ]
             
             while not self._shutdown_event.is_set():
