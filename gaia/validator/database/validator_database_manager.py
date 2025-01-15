@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timedelta, timezone
-from gaia.database.database_manager import BaseDatabaseManager, DatabaseTimeout
+from gaia.database.database_manager import BaseDatabaseManager
 from fiber.logging_utils import get_logger
 import random
 import time
@@ -50,7 +50,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             'long_running_queries': []
         }
 
-    @BaseDatabaseManager.with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
+    @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_TRANSACTION_TIMEOUT)
     async def initialize_database(self):
         """Initialize database tables and schemas for validator tasks."""
         async with self.transaction() as session:
@@ -136,7 +136,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             logger.error(f"Error creating table {table_name}: {str(e)}")
             raise
 
-    @BaseDatabaseManager.with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
+    @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_TRANSACTION_TIMEOUT)
     async def initialize_task_tables(self, task_schemas: Dict[str, Dict[str, Any]], session: AsyncSession):
         """Initialize validator-specific task tables."""
         for schema_name, schema in task_schemas.items():
@@ -208,7 +208,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
         return schemas
 
-    @BaseDatabaseManager.with_timeout(DEFAULT_QUERY_TIMEOUT)
+    @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_QUERY_TIMEOUT)
     async def create_index(self, table_name: str, column_name: str, unique: bool = False):
         """
         Create an index on a specific column in a table.
@@ -226,7 +226,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         """
         await self.execute(query)
 
-    @BaseDatabaseManager.with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
+    @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_TRANSACTION_TIMEOUT)
     async def create_score_table(self, session: AsyncSession):
         """Create a table for storing miner scores for all tasks."""
         await session.execute(text("""
@@ -300,7 +300,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             WHERE NOT EXISTS (SELECT 1 FROM node_table LIMIT 1);
         """))
 
-    @BaseDatabaseManager.with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
+    @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_TRANSACTION_TIMEOUT)
     async def create_miner_table(self):
         """
         Create a table for storing miner information with exactly 256 rows.
@@ -317,7 +317,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 logger.error(traceback.format_exc())
                 raise
 
-    @BaseDatabaseManager.with_timeout(DEFAULT_QUERY_TIMEOUT)
+    @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_QUERY_TIMEOUT)
     async def update_miner_info(
         self,
         index: int,
@@ -379,7 +379,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         }
         await self.execute(query, params)
 
-    @BaseDatabaseManager.with_timeout(DEFAULT_QUERY_TIMEOUT)
+    @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_QUERY_TIMEOUT)
     async def clear_miner_info(self, index: int):
         """
         Clear miner information at a specific index, setting values back to NULL.
@@ -405,7 +405,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         """
         await self.execute(query, {"index": index})
 
-    @BaseDatabaseManager.with_timeout(DEFAULT_QUERY_TIMEOUT)
+    @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_QUERY_TIMEOUT)
     async def get_miner_info(self, index: int):
         """
         Get miner information for a specific index.
@@ -423,7 +423,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         result = await self.fetch_one(query, {"index": index})
         return dict(result) if result else None
 
-    @BaseDatabaseManager.with_timeout(DEFAULT_QUERY_TIMEOUT)
+    @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_QUERY_TIMEOUT)
     async def get_all_active_miners(self):
         """
         Get information for all miners with non-null hotkeys.
@@ -439,7 +439,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         results = await self.fetch_many(query)
         return [dict(row) for row in results]
 
-    @BaseDatabaseManager.with_timeout(DEFAULT_QUERY_TIMEOUT)
+    @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_QUERY_TIMEOUT)
     async def get_recent_scores(self, task_type: str) -> List[float]:
         """Fetch scores using session for READ operation"""
 

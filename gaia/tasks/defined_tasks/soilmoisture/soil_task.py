@@ -673,44 +673,44 @@ class SoilMoistureTask(Task):
                         "rootzone_structure_score": scores["metrics"].get("rootzone_ssim", 0),
                     }
 
-                        await session.execute(
-                            text("""
-                            INSERT INTO soil_moisture_history 
-                            (region_id, miner_uid, miner_hotkey, target_time,
-                             surface_sm_pred, rootzone_sm_pred,
-                             surface_sm_truth, rootzone_sm_truth,
-                             surface_rmse, rootzone_rmse,
-                             surface_structure_score, rootzone_structure_score)
-                            VALUES 
-                            (:region_id, :miner_uid, :miner_hotkey, :target_time,
-                             :surface_sm_pred, :rootzone_sm_pred,
-                             :surface_sm_truth, :rootzone_sm_truth,
-                             :surface_rmse, :rootzone_rmse,
-                             :surface_structure_score, :rootzone_structure_score)
-                        """),
-                        params
-                    )
-
-                        await session.execute(
-                            text("""
-                            UPDATE soil_moisture_predictions 
-                            SET status = 'scored'
-                            WHERE region_id = :region_id 
-                            AND miner_uid = :miner_uid
-                            AND status = 'sent_to_miner'
-                        """),
-                        params
-                    )
-
-                    logger.info(f"Moved task to history for miner {miner_id} in region {region['id']}")
-
-                await self.cleanup_predictions(
-                    bounds=region["sentinel_bounds"],
-                    target_time=region["target_time"],
-                    miner_uid=miner_id
+                    await session.execute(
+                        text("""
+                        INSERT INTO soil_moisture_history 
+                        (region_id, miner_uid, miner_hotkey, target_time,
+                            surface_sm_pred, rootzone_sm_pred,
+                            surface_sm_truth, rootzone_sm_truth,
+                            surface_rmse, rootzone_rmse,
+                            surface_structure_score, rootzone_structure_score)
+                        VALUES 
+                        (:region_id, :miner_uid, :miner_hotkey, :target_time,
+                            :surface_sm_pred, :rootzone_sm_pred,
+                            :surface_sm_truth, :rootzone_sm_truth,
+                            :surface_rmse, :rootzone_rmse,
+                            :surface_structure_score, :rootzone_structure_score)
+                    """),
+                    params
                 )
 
-            return True
+                    await session.execute(
+                        text("""
+                        UPDATE soil_moisture_predictions 
+                        SET status = 'scored'
+                        WHERE region_id = :region_id 
+                        AND miner_uid = :miner_uid
+                        AND status = 'sent_to_miner'
+                    """),
+                    params
+                )
+
+                logger.info(f"Moved task to history for miner {miner_id} in region {region['id']}")
+
+            await self.cleanup_predictions(
+                bounds=region["sentinel_bounds"],
+                target_time=region["target_time"],
+                miner_uid=miner_id
+            )
+
+        return True
 
         except Exception as e:
             logger.error(f"Failed to move task to history: {str(e)}")

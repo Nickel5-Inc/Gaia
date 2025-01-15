@@ -826,12 +826,15 @@ class GeomagneticTask(Task):
                 "status": "completed",
             }
 
-            # Insert into score_table
-            query = """
-            INSERT INTO score_table (task_name, task_id, score, status)
-            VALUES (:task_name, :task_id, :score, :status)
-            """
-            await self.db_manager.execute(query, score_row)
+            # WRITE operation - use transaction for inserting score
+            async with self.db_manager.transaction() as session:
+                await session.execute(
+                    text("""
+                        INSERT INTO score_table (task_name, task_id, score, status)
+                        VALUES (:task_name, :task_id, :score, :status)
+                    """),
+                    score_row
+                )
 
             logger.info(
                 f"Built score row for hour {current_datetime} with {len([s for s in scores if not np.isnan(s)])} scores"

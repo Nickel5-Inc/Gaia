@@ -28,8 +28,16 @@ class BaseDatabaseManager(ABC):
     _session_factory = None
 
     DEFAULT_QUERY_TIMEOUT = 30  # 30 seconds
-    DEFAULT_TRANSACTION_TIMEOUT = 180  # 3 minutes
+    DEFAULT_TRANSACTION_TIMEOUT = 30
     DEFAULT_CONNECTION_TIMEOUT = 10  # 10 seconds
+
+    MAX_RETRIES = 3
+    DEFAULT_BATCH_SIZE = 1000
+    STATUS_PENDING = 'pending'
+    STATUS_PROCESSING = 'processing'
+    STATUS_COMPLETED = 'completed'
+    STATUS_ERROR = 'error'
+    STATUS_TIMEOUT = 'timeout'
 
     @staticmethod
     def with_timeout(timeout: Optional[float] = None):
