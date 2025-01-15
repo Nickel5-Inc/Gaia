@@ -688,8 +688,8 @@ class SoilMoistureTask(Task):
                             :surface_rmse, :rootzone_rmse,
                             :surface_structure_score, :rootzone_structure_score)
                     """),
-                    params
-                )
+                        params
+                    )
 
                     await session.execute(
                         text("""
@@ -699,8 +699,8 @@ class SoilMoistureTask(Task):
                         AND miner_uid = :miner_uid
                         AND status = 'sent_to_miner'
                     """),
-                    params
-                )
+                        params
+                    )
 
                 logger.info(f"Moved task to history for miner {miner_id} in region {region['id']}")
 
@@ -710,7 +710,7 @@ class SoilMoistureTask(Task):
                 miner_uid=miner_id
             )
 
-        return True
+            return True
 
         except Exception as e:
             logger.error(f"Failed to move task to history: {str(e)}")
