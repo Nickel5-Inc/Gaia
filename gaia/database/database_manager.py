@@ -31,6 +31,7 @@ class BaseDatabaseManager(ABC):
     DEFAULT_TRANSACTION_TIMEOUT = 180  # 3 minutes
     DEFAULT_CONNECTION_TIMEOUT = 10  # 10 seconds
 
+    @staticmethod
     def with_timeout(timeout: Optional[float] = None):
         """Decorator that adds timeout to database operations."""
         def decorator(func):
@@ -353,3 +354,21 @@ class BaseDatabaseManager(ABC):
     async def _release_transaction_lock(self):
         """Release transaction lock"""
         self._transaction_lock.release()
+
+    @staticmethod
+    def with_session(func):
+        """Decorator that wraps a function in a database session."""
+        @wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            async with self.session() as session:
+                return await func(self, session, *args, **kwargs)
+        return wrapper
+
+    @staticmethod
+    def with_transaction(func):
+        """Decorator that wraps a function in a database transaction."""
+        @wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            async with self.transaction() as session:
+                return await func(self, session, *args, **kwargs)
+        return wrapper
