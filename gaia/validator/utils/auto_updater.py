@@ -270,33 +270,52 @@ async def restart_pm2_process(process_name):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            result = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    "pm2",
-                    "restart",
-                    process_name,
-                    "--update-env",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                ),
-                timeout=30,
+            # First send SIGTERM to allow graceful shutdown
+            logger.info("Sending SIGTERM for graceful shutdown...")
+            term_proc = await asyncio.create_subprocess_exec(
+                "pm2", "sendSignal", "SIGTERM", process_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-
-            stdout, stderr = await result.communicate()
-
-            if result.returncode == 0:
+            
+            # Wait for SIGTERM to be processed
+            await asyncio.sleep(15)  # Increased wait time for cleanup
+            
+            # Check if process is still running
+            status_proc = await asyncio.create_subprocess_exec(
+                "pm2", "show", process_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await status_proc.communicate()
+            
+            # Then do the restart
+            logger.info(f"Restarting process {process_name}...")
+            restart_proc = await asyncio.create_subprocess_exec(
+                "pm2", "restart", process_name, "--update-env",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await restart_proc.communicate()
+            
+            if restart_proc.returncode == 0:
                 logger.info(f"PM2 restart successful on attempt {attempt + 1}")
                 return True
-
-            logger.warning(f"PM2 restart failed on attempt {attempt + 1}")
+            
+            logger.warning(f"PM2 restart failed on attempt {attempt + 1}: {stderr.decode()}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 * (attempt + 1))
-
+                
         except asyncio.TimeoutError:
             logger.error(f"PM2 restart timed out on attempt {attempt + 1}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 * (attempt + 1))
-
+        except Exception as e:
+            logger.error(f"Error during PM2 restart attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5 * (attempt + 1))
+    
     return False
 
 

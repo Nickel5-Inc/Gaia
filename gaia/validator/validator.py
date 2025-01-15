@@ -183,11 +183,27 @@ class GaiaValidator:
         signame = signal.Signals(signum).name
         logger.info(f"Received shutdown signal {signame}")
         if not self._cleanup_done:
-            # Set shutdown event - will be processed in main loop
-            asyncio.create_task(self._initiate_shutdown())
-            
+            # Set shutdown event
+            if asyncio.get_event_loop().is_running():
+                # If in event loop, just set the event
+                logger.info("Setting shutdown event in running loop")
+                self._shutdown_event.set()
+            else:
+                # If not in event loop (e.g. direct signal), run cleanup
+                logger.info("Creating new loop for shutdown")
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                loop.run_until_complete(self._initiate_shutdown())
+
     async def _initiate_shutdown(self):
         """Initiate graceful shutdown sequence."""
+        if self._cleanup_done:
+            logger.info("Cleanup already done, skipping")
+            return
+            
         try:
             logger.info("Initiating graceful shutdown...")
             self._shutdown_event.set()
@@ -208,7 +224,7 @@ class GaiaValidator:
             # Close database connections
             if hasattr(self, 'database_manager'):
                 logger.info("Closing database connections...")
-                await self.database_manager.close_all_connections()
+                await self.database_manager.close()
             
             self._cleanup_done = True
             logger.info("Graceful shutdown completed")
@@ -217,8 +233,9 @@ class GaiaValidator:
             logger.error(f"Error during shutdown: {e}")
             logger.error(traceback.format_exc())
         finally:
-            # Force exit after cleanup
-            sys.exit(0)
+            # Only exit if not in a running event loop
+            if not asyncio.get_event_loop().is_running():
+                sys.exit(0)
 
     def setup_neuron(self) -> bool:
         """
@@ -603,12 +620,15 @@ class GaiaValidator:
     async def _check_database_health(self):
         """Check database health."""
         db_check_start = time.time()
-        async with self.database_manager.async_session() as session:
-            await session.execute(text("SELECT 1"))
-        db_check_duration = time.time() - db_check_start
-        self.last_successful_db_check = time.time()
-        if db_check_duration > 5:  # Log slow DB checks
-            logger.warning(f"Slow DB health check: {db_check_duration:.2f}s")
+        try:
+            await self.database_manager.execute("SELECT 1")
+            self.last_successful_db_check = time.time()
+            db_check_duration = time.time() - db_check_start
+            if db_check_duration > 5:  # Log slow DB checks
+                logger.warning(f"Slow DB health check: {db_check_duration:.2f}s")
+        except Exception as e:
+            logger.error(f"Database health check failed: {e}")
+            raise
 
     async def _sync_metagraph(self):
         """Sync the metagraph."""
@@ -650,25 +670,16 @@ class GaiaValidator:
 
             # 3. Clean up database resources
             try:
-                # Reset any hanging operations
-                async with self.database_manager.async_session() as session:
-                    # Reset processing predictions
-                    await session.execute(text("""
-                        UPDATE soil_moisture_predictions 
-                        SET status = 'pending'
-                        WHERE status = 'processing'
-                    """))
-                    await session.execute(text("""
-                        UPDATE geomagnetic_predictions 
-                        SET status = 'pending'
-                        WHERE status = 'processing'
-                    """))
-                    # Clean up incomplete scoring operations
-                    await session.execute(text("""
-                        DELETE FROM score_table 
-                        WHERE status = 'processing'
-                    """))
-                    await session.commit()
+                # Reset any hanging operations using database manager methods
+                update_queries = [
+                    ("UPDATE soil_moisture_predictions SET status = 'pending' WHERE status = 'processing'",),
+                    ("UPDATE geomagnetic_predictions SET status = 'pending' WHERE status = 'processing'",),
+                    ("UPDATE score_table SET status = 'pending' WHERE status = 'processing'",)
+                ]
+                
+                for query in update_queries:
+                    await self.database_manager.execute(query)
+                
                 logger.info("Reset hanging database operations")
                 
                 # Reset connection pool
@@ -677,6 +688,7 @@ class GaiaValidator:
                 
             except Exception as e:
                 logger.error(f"Error cleaning up database resources: {e}")
+                logger.error(traceback.format_exc())
 
             # 4. Clean up task states
             for task_name, health in self.task_health.items():
@@ -807,20 +819,41 @@ class GaiaValidator:
                 #self.check_for_updates()
             ]
             
-            while not self._shutdown_event.is_set():
-                try:
-                    # Run all tasks concurrently in the same event loop
-                    await asyncio.gather(*tasks)
-                except Exception as e:
-                    logger.error(f"Error in main task loop: {e}")
-                    logger.error(traceback.format_exc())
-                    await self.cleanup_resources()
-                
-                # Check shutdown event
-                if self._shutdown_event.is_set():
-                    break
+            try:
+                running_tasks = []
+                while not self._shutdown_event.is_set():
+                    # Start all tasks
+                    running_tasks = [asyncio.create_task(t) for t in tasks]
                     
-                await asyncio.sleep(1)
+                    # Wait for either shutdown event or task completion
+                    done, pending = await asyncio.wait(
+                        running_tasks + [asyncio.create_task(self._shutdown_event.wait())],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    
+                    # If shutdown event is set, cancel remaining tasks
+                    if self._shutdown_event.is_set():
+                        logger.info("Shutdown event detected in main loop")
+                        for task in running_tasks:
+                            if not task.done():
+                                task.cancel()
+                        # Wait for tasks to cancel
+                        await asyncio.gather(*running_tasks, return_exceptions=True)
+                        break
+                
+                # Cleanup after loop exit
+                logger.info("Main loop exited, initiating cleanup")
+                await self._initiate_shutdown()
+                
+            except asyncio.CancelledError:
+                logger.info("Tasks cancelled, proceeding with cleanup")
+                if not self._cleanup_done:
+                    await self._initiate_shutdown()
+            except Exception as e:
+                logger.error(f"Error in main task loop: {e}")
+                logger.error(traceback.format_exc())
+                if not self._cleanup_done:
+                    await self._initiate_shutdown()
                 
         except Exception as e:
             logger.error(f"Error in main: {e}")
@@ -844,67 +877,45 @@ class GaiaValidator:
                 
                 async def scoring_cycle():
                     try:
-                        validator_uid = await asyncio.wait_for(
-                            self.substrate.async_query(
-                                "SubtensorModule", 
-                                "Uids", 
-                                [self.netuid, self.keypair.ss58_address]
-                            ),
-                            timeout=30
-                        )
-                        validator_uid = validator_uid.value
+                        validator_uid = self.substrate.query(
+                            "SubtensorModule", 
+                            "Uids", 
+                            [self.netuid, self.keypair.ss58_address]
+                        ).value
                         
                         if validator_uid is None:
                             logger.error("Validator not found on chain")
                             await self.update_task_status('scoring', 'error')
                             return False
 
-                        blocks_since_update = await asyncio.wait_for(
-                            w.async_blocks_since_last_update(
-                                self.substrate, 
-                                self.netuid, 
-                                validator_uid
-                            ),
-                            timeout=30
+                        blocks_since_update = w.blocks_since_last_update(
+                            self.substrate, 
+                            self.netuid, 
+                            validator_uid
                         )
 
-                        min_interval = await asyncio.wait_for(
-                            w.async_min_interval_to_set_weights(
-                                self.substrate, 
-                                self.netuid
-                            ),
-                            timeout=30
+                        min_interval = w.min_interval_to_set_weights(
+                            self.substrate, 
+                            self.netuid
                         )
 
-                        async with self.database_manager.session() as session:
-                            result = await session.execute(
-                                text("""
-                                    SELECT value::integer as block 
-                                    FROM validator_state 
-                                    WHERE key = 'last_weights_block'
-                                """)
-                            )
-                            row = result.first()
-                            last_weights_block = row["block"] if row else 0
                             
-                            current_block = await self.substrate.async_get_block_number()
-                            
-                            if current_block - last_weights_block < min_interval:
-                                logger.info(f"Recently set weights {current_block - last_weights_block} blocks ago")
-                                await self.update_task_status('scoring', 'idle', 'waiting')
-                                return True
+                        # Get current block number synchronously
+                        current_block = self.substrate.get_block()["header"]["number"]
+                        
+                        if current_block - self.last_set_weights_block < min_interval:
+                            logger.info(f"Recently set weights {current_block - self.last_set_weights_block} blocks ago")
+                            await self.update_task_status('scoring', 'idle', 'waiting')
+                            return True
 
                         # Only enter weight_setting state when actually setting weights
                         if (min_interval is None or 
                             (blocks_since_update is not None and blocks_since_update >= min_interval)):
                             
-                            can_set = await asyncio.wait_for(
-                                w.async_can_set_weights(
-                                    self.substrate, 
-                                    self.netuid, 
-                                    validator_uid
-                                ),
-                                timeout=30
+                            can_set = w.can_set_weights(
+                                self.substrate, 
+                                self.netuid, 
+                                validator_uid
                             )
                             
                             if can_set:
@@ -919,7 +930,7 @@ class GaiaValidator:
                                 if normalized_weights:
                                     # Set weights with timeout
                                     success = await asyncio.wait_for(
-                                        weight_setter.async_set_weights(normalized_weights),
+                                        weight_setter.set_weights(normalized_weights),
                                         timeout=180
                                     )
                                     
