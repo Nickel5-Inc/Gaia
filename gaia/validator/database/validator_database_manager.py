@@ -53,54 +53,51 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
     @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_TRANSACTION_TIMEOUT)
     async def initialize_database(self):
         """Initialize database tables and schemas for validator tasks."""
-        async with self.transaction() as session:
-            try:
-                await self._create_node_table(session)
-                await self._create_trigger_function(session)
-                await self._create_trigger(session)
-                await self._initialize_rows(session)
-                await self.create_score_table(session)
-                
-                await session.execute(
-                    text("""
-                        CREATE TABLE IF NOT EXISTS process_queue (
-                            id SERIAL PRIMARY KEY,
-                            process_type VARCHAR(50) NOT NULL,
-                            process_name VARCHAR(100) NOT NULL,
-                            task_id INTEGER,
-                            task_name VARCHAR(100),
-                            priority INTEGER DEFAULT 0,
-                            status VARCHAR(50) DEFAULT 'pending',
-                            payload BYTEA,
-                            start_processing_time TIMESTAMP WITH TIME ZONE,
-                            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                            started_at TIMESTAMP WITH TIME ZONE,
-                            completed_at TIMESTAMP WITH TIME ZONE,
-                            complete_by TIMESTAMP WITH TIME ZONE,
-                            expected_execution_time INTEGER,
-                            execution_time INTEGER,
-                            error TEXT,
-                            retries INTEGER DEFAULT 0,
-                            max_retries INTEGER DEFAULT 3
-                        )
-                    """)
-                )
-                logger.info("Successfully created core tables")
-            except Exception as e:
-                logger.error(f"Error creating core tables: {str(e)}")
-                raise
+        try:
+            await self._create_node_table()
+            await self._create_trigger_function()
+            await self._create_trigger()
+            await self._initialize_rows()
+            await self.create_score_table()
+            
+            await self.execute(
+                """
+                    CREATE TABLE IF NOT EXISTS process_queue (
+                        id SERIAL PRIMARY KEY,
+                        process_type VARCHAR(50) NOT NULL,
+                        process_name VARCHAR(100) NOT NULL,
+                        task_id INTEGER,
+                        task_name VARCHAR(100),
+                        priority INTEGER DEFAULT 0,
+                        status VARCHAR(50) DEFAULT 'pending',
+                        payload BYTEA,
+                        start_processing_time TIMESTAMP WITH TIME ZONE,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                        started_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        complete_by TIMESTAMP WITH TIME ZONE,
+                        expected_execution_time INTEGER,
+                        execution_time INTEGER,
+                        error TEXT,
+                        retries INTEGER DEFAULT 0,
+                        max_retries INTEGER DEFAULT 3
+                    )
+                """
+            )
+            logger.info("Successfully created core tables")
+        except Exception as e:
+            logger.error(f"Error creating core tables: {str(e)}")
+            raise
 
-        # Second transaction: Initialize task tables
         try:
             task_schemas = await self.load_task_schemas()
-            async with self.transaction() as session:
-                await self.initialize_task_tables(task_schemas, session)
-                logger.info("Successfully initialized task tables")
+            await self.initialize_task_tables(task_schemas)
+            logger.info("Successfully initialized task tables")
         except Exception as e:
             logger.error(f"Error initializing task tables: {str(e)}")
             raise
 
-    async def _create_task_table(self, schema: Dict[str, Any], table_name: str, session: AsyncSession) -> None:
+    async def _create_task_table(self, schema: Dict[str, Any], table_name: str) -> None:
         """Create a table for a specific task using the provided schema."""
         try:
             table_schema = schema.get(table_name, schema)
@@ -117,7 +114,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     {', '.join(columns)}
                 );
             """
-            await session.execute(text(create_table_sql))
+            await self.execute(create_table_sql)
 
             if 'indexes' in table_schema:
                 for index in table_schema['indexes']:
@@ -128,7 +125,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                         ON {table_schema['table_name']} ({index['column']})
                         {unique};
                     """
-                    await session.execute(text(create_index_sql))
+                    await self.execute(create_index_sql)
 
             logger.info(f"Successfully created table {table_schema['table_name']} with indexes")
 
@@ -137,17 +134,17 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             raise
 
     @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_TRANSACTION_TIMEOUT)
-    async def initialize_task_tables(self, task_schemas: Dict[str, Dict[str, Any]], session: AsyncSession):
+    async def initialize_task_tables(self, task_schemas: Dict[str, Dict[str, Any]]):
         """Initialize validator-specific task tables."""
         for schema_name, schema in task_schemas.items():
             try:
                 if isinstance(schema, dict) and 'table_name' not in schema:
                     for table_name, table_schema in schema.items():
                         if isinstance(table_schema, dict) and table_schema.get("database_type") in ["validator", "both"]:
-                            await self._create_task_table(schema, table_name, session)
+                            await self._create_task_table(schema, table_name)
                 else:
                     if schema.get("database_type") in ["validator", "both"]:
-                        await self._create_task_table({schema_name: schema}, schema_name, session)
+                        await self._create_task_table({schema_name: schema}, schema_name)
             except Exception as e:
                 logger.error(f"Error initializing table for schema {schema_name}: {e}")
                 raise
@@ -227,9 +224,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         await self.execute(query)
 
     @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_TRANSACTION_TIMEOUT)
-    async def create_score_table(self, session: AsyncSession):
+    async def create_score_table(self):
         """Create a table for storing miner scores for all tasks."""
-        await session.execute(text("""
+        await self.execute("""
             CREATE TABLE IF NOT EXISTS score_table (
                 task_name VARCHAR(100) NOT NULL,
                 task_id TEXT NOT NULL,
@@ -237,11 +234,11 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 status VARCHAR(50) DEFAULT 'pending'
             )
-        """))
+        """)
 
-    async def _create_node_table(self, session: AsyncSession):
+    async def _create_node_table(self):
         """Create the base node table."""
-        await session.execute(text("""
+        await self.execute("""
             CREATE TABLE IF NOT EXISTS node_table (
                 uid INTEGER PRIMARY KEY,
                 hotkey TEXT,
@@ -257,11 +254,11 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 CHECK (uid >= 0 AND uid < 256)
             )
-        """))
+        """)
 
-    async def _create_trigger_function(self, session):
+    async def _create_trigger_function(self):
         """Create the trigger function for size checking."""
-        await session.execute(text("""
+        await self.execute("""
             CREATE OR REPLACE FUNCTION check_node_table_size()
             RETURNS TRIGGER AS $$
             BEGIN
@@ -271,34 +268,22 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 RETURN NEW;
             END;
             $$ LANGUAGE plpgsql
-        """))
+        """)
 
-    async def _create_trigger(self, session):
-        """Create trigger to enforce node table size limit."""
-        result = await session.execute(text("""
-            SELECT EXISTS (
-                SELECT 1 
-                FROM pg_trigger 
-                WHERE tgname = 'enforce_node_table_size'
-            )
-        """))
-        trigger_exists = await result.scalar()
-        
-        if not trigger_exists:
-            await session.execute(text("""
-                CREATE TRIGGER enforce_node_table_size
-                BEFORE INSERT ON node_table
-                FOR EACH ROW
-                EXECUTE FUNCTION check_node_table_size()
-            """))
+    async def _create_trigger(self):
+        """Create trigger for updating task status."""
+        # This trigger is no longer needed as task status is tracked directly in validator_state
+        # and individual task tables
+        logger.info("Task status trigger not needed - skipping creation")
+        pass
 
-    async def _initialize_rows(self, session):
+    async def _initialize_rows(self):
         """Initialize the node table with 256 empty rows."""
-        await session.execute(text("""
+        await self.execute("""
             INSERT INTO node_table (uid)
             SELECT generate_series(0, 255) as uid
             WHERE NOT EXISTS (SELECT 1 FROM node_table LIMIT 1);
-        """))
+        """)
 
     @BaseDatabaseManager.with_timeout(BaseDatabaseManager.DEFAULT_TRANSACTION_TIMEOUT)
     async def create_miner_table(self):

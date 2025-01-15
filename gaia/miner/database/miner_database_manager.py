@@ -43,14 +43,13 @@ class MinerDatabaseManager(BaseDatabaseManager):
             )
             self._initialized = True
 
-    @BaseDatabaseManager.with_transaction
-    async def initialize_database(self, session):
+    async def initialize_database(self):
         """
         Initialize the miner database with queue and task-specific tables.
         """
-        # Create miner task queue table
-        await session.execute(
-            text(
+        try:
+            # Create miner task queue table
+            await self.execute(
                 """
                 CREATE TABLE IF NOT EXISTS task_queue (
                     id SERIAL PRIMARY KEY,
@@ -64,23 +63,21 @@ class MinerDatabaseManager(BaseDatabaseManager):
                 )
                 """
             )
-        )
 
-        # Create indexes for faster queries
-        await session.execute(
-            text(
+            # Create indexes for faster queries
+            await self.execute(
                 "CREATE INDEX IF NOT EXISTS idx_task_queue_status ON task_queue(status)"
             )
-        )
-        await session.execute(
-            text(
+            await self.execute(
                 "CREATE INDEX IF NOT EXISTS idx_task_queue_query_time ON task_queue(query_time)"
             )
-        )
 
-        # Load and initialize task schemas
-        task_schemas = await self.load_task_schemas()
-        await self.initialize_task_tables(task_schemas)
+            # Load and initialize task schemas
+            task_schemas = await self.load_task_schemas()
+            await self.initialize_task_tables(task_schemas)
+        except Exception as e:
+            logger.error(f"Error initializing database: {e}")
+            raise
 
     async def add_to_queue(
         self,
@@ -115,8 +112,7 @@ class MinerDatabaseManager(BaseDatabaseManager):
             "status": status,
         }
 
-        async with self.get_connection() as conn:
-            await conn.execute(text(query), params)
+        await self.execute(query, params)
 
     async def get_next_task(self, status: str = "pending") -> Optional[Dict[str, Any]]:
         """
@@ -136,10 +132,7 @@ class MinerDatabaseManager(BaseDatabaseManager):
         """
         params = {"status": status}
 
-        async with self.get_connection() as conn:
-            result = await conn.execute(text(query), params)
-            row = await result.fetchone()
-            return dict(row._mapping) if row else None
+        return await self.fetch_one(query, params)
 
     async def update_task_status(self, task_id: int, status: str, retries: int = 0):
         """
@@ -157,8 +150,7 @@ class MinerDatabaseManager(BaseDatabaseManager):
         """
         params = {"status": status, "retries": retries, "task_id": task_id}
 
-        async with self.get_connection() as conn:
-            await conn.execute(text(query), params)
+        await self.execute(query, params)
 
     async def load_task_schemas(self) -> Dict[str, Dict[str, Any]]:
         """
@@ -196,5 +188,4 @@ class MinerDatabaseManager(BaseDatabaseManager):
             {', '.join(columns)}
         )
         """
-        async with self.get_connection() as conn:
-            await conn.execute(text(query))
+        await self.execute(query)

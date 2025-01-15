@@ -40,19 +40,19 @@ class BaseDatabaseManager(ABC):
     STATUS_TIMEOUT = 'timeout'
 
     @staticmethod
-    def with_timeout(timeout: Optional[float] = None):
-        """Decorator that adds timeout to database operations."""
+    def with_timeout(timeout: float):
+        """Decorator that adds timeout to a database operation"""
         def decorator(func):
             @wraps(func)
             async def wrapper(self, *args, **kwargs):
                 try:
                     return await asyncio.wait_for(
                         func(self, *args, **kwargs),
-                        timeout=timeout or self.DEFAULT_QUERY_TIMEOUT
+                        timeout=timeout
                     )
                 except asyncio.TimeoutError:
-                    logger.error(f"Database operation timed out: {func.__name__}")
-                    raise DatabaseTimeout(f"Operation {func.__name__} timed out")
+                    logger.error(f"Operation timed out after {timeout}s")
+                    raise DatabaseTimeout(f"Operation timed out after {timeout}s")
             return wrapper
         return decorator
 
@@ -155,16 +155,13 @@ class BaseDatabaseManager(ABC):
 
     @asynccontextmanager
     async def session(self):
-        """Safe session context manager with connection limiting"""
+        """Internal session context manager. Not part of public API.
+        Handles connection pooling, timeouts, and cleanup."""
         try:
             async with self._pool_semaphore:
                 session = None
                 try:
-                    async with self._session_lock:
-                        session = self._session_factory()
-                        self._active_sessions.add(session)
-                        async with self._operation_lock:
-                            self._active_operations += 1
+                    session = self._session_factory()
                     await asyncio.wait_for(
                         self._test_connection(session),
                         timeout=self._operation_timeouts['connection']
@@ -175,49 +172,10 @@ class BaseDatabaseManager(ABC):
                     raise DatabaseTimeout("Session creation timed out")
                 finally:
                     if session:
-                        async with self._session_lock:
-                            self._active_sessions.remove(session)
-                            async with self._operation_lock:
-                                self._active_operations -= 1
-                            await session.close()
+                        await session.close()
         except asyncio.TimeoutError:
             logger.error("Connection pool exhausted")
             raise DatabaseTimeout("No connections available in pool")
-
-    @asynccontextmanager
-    async def transaction(self):
-        """Safe transaction context manager with deadlock prevention"""
-        async with self.session() as session:
-            try:
-                async with session.begin() as transaction:
-                    try:
-                        await asyncio.wait_for(
-                            self._acquire_transaction_lock(),
-                            timeout=self._operation_timeouts['transaction']
-                        )
-                        yield session
-                    finally:
-                        await self._release_transaction_lock()
-            except asyncio.TimeoutError:
-                logger.error("Transaction timed out")
-                await transaction.rollback()
-                raise DatabaseTimeout("Transaction timed out")
-            except Exception as e:
-                logger.error(f"Transaction failed: {e}")
-                await transaction.rollback()
-                raise
-
-    @with_timeout(DEFAULT_QUERY_TIMEOUT)
-    async def execute_query(self, query: str, params: Optional[Dict] = None):
-        """Safe query execution with timeout"""
-        async with self.session() as session:
-            result = await session.execute(text(query), params)
-            return result
-
-    @with_timeout(DEFAULT_QUERY_TIMEOUT)
-    async def _test_connection(self, session):
-        """Test database connection"""
-        await session.execute(text("SELECT 1"))
 
     @with_timeout(DEFAULT_QUERY_TIMEOUT)
     async def fetch_one(self, query: str, params: Optional[Dict] = None):
@@ -233,6 +191,45 @@ class BaseDatabaseManager(ABC):
         async with self.session() as session:
             result = await session.execute(text(query), params)
             return [dict(row._mapping) for row in result]
+
+    @with_timeout(DEFAULT_QUERY_TIMEOUT)
+    async def fetch_all(self, query: str, params: Optional[Dict] = None):
+        """Fetch all rows at once. Use when result set size is known and manageable."""
+        async with self.session() as session:
+            result = await session.execute(text(query), params)
+            return [dict(row._mapping) for row in result.all()]
+
+    @with_timeout(DEFAULT_QUERY_TIMEOUT)
+    async def execute(self, query: str, params: Optional[Dict] = None) -> Any:
+        """Execute a write operation"""
+        async with self.session() as session:
+            result = await session.execute(text(query), params or {})
+            await session.commit()
+            return result
+
+    @with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
+    async def execute_many(self, query: str, data: List[Dict[str, Any]]) -> None:
+        """Execute multiple write operations in a transaction"""
+        async with self.session() as session:
+            async with session.begin():
+                try:
+                    await session.execute(text(query), data)
+                except SQLAlchemyError as e:
+                    logger.error(f"Database error in execute_many: {str(e)}")
+                    raise
+
+    @with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
+    async def execute_all(self, queries: List[str], params: Optional[List[Dict]] = None) -> None:
+        """Execute multiple different queries in a single transaction."""
+        async with self.session() as session:
+            async with session.begin():
+                try:
+                    for i, query in enumerate(queries):
+                        query_params = params[i] if params and i < len(params) else None
+                        await session.execute(text(query), query_params or {})
+                except SQLAlchemyError as e:
+                    logger.error(f"Database error in execute_all: {e}")
+                    raise
 
     @with_timeout(DEFAULT_CONNECTION_TIMEOUT)
     async def reset_pool(self):
@@ -262,49 +259,9 @@ class BaseDatabaseManager(ABC):
             return (await result.scalar()) is True
 
     @with_timeout(DEFAULT_QUERY_TIMEOUT)
-    async def execute(self, query: str, params: Optional[Dict] = None) -> Any:
-        """Execute a single SQL query with transaction handling"""
-        async with self.transaction() as session:
-            result = await session.execute(text(query), params or {})
-            return result
-
-    @with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
-    async def execute_many(self, query: str, data: List[Dict[str, Any]]) -> None:
-        """Execute multiple queries in a transaction"""
-        async with self.transaction() as session:
-            try:
-                await session.execute(text(query), data)
-            except SQLAlchemyError as e:
-                logger.error(f"Database error in execute_many: {str(e)}")
-                raise
-
-    @with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
-    async def cleanup_stale_operations(self, table_name: str, status_column: str = 'status', timeout_minutes: int = 60):
-        """
-        Cleanup stale operations in any table.
-        
-        Args:
-            table_name (str): Name of the table to cleanup
-            status_column (str): Name of the status column
-            timeout_minutes (int): Number of minutes after which to consider an operation stale
-        """
-        async with self.transaction() as session:
-            try:
-                await session.execute(text(f"""
-                    UPDATE {table_name}
-                    SET {status_column} = 'error'
-                    WHERE {status_column} = 'processing'
-                    AND created_at < NOW() - INTERVAL '{timeout_minutes} minutes'
-                """))
-                logger.info(f"Cleaned up stale operations in {table_name}")
-            except SQLAlchemyError as e:
-                logger.error(f"Error cleaning up stale operations in {table_name}: {e}")
-                raise
-
-    async def close(self):
-        """Close the database engine."""
-        if self._engine:
-            await self._engine.dispose()
+    async def _test_connection(self, session):
+        """Test database connection"""
+        await session.execute(text("SELECT 1"))
 
     @with_timeout(DEFAULT_QUERY_TIMEOUT)
     async def table_exists(self, table_name: str) -> bool:
@@ -362,21 +319,3 @@ class BaseDatabaseManager(ABC):
     async def _release_transaction_lock(self):
         """Release transaction lock"""
         self._transaction_lock.release()
-
-    @staticmethod
-    def with_session(func):
-        """Decorator that wraps a function in a database session."""
-        @wraps(func)
-        async def wrapper(self, *args, **kwargs):
-            async with self.session() as session:
-                return await func(self, session, *args, **kwargs)
-        return wrapper
-
-    @staticmethod
-    def with_transaction(func):
-        """Decorator that wraps a function in a database transaction."""
-        @wraps(func)
-        async def wrapper(self, *args, **kwargs):
-            async with self.transaction() as session:
-                return await func(self, session, *args, **kwargs)
-        return wrapper
