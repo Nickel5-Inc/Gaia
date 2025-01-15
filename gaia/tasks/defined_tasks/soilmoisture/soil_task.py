@@ -617,56 +617,55 @@ class SoilMoistureTask(Task):
             logger.info(f"Rootzone SSIM: {scores['metrics'].get('rootzone_ssim', 0):.4f}")
             logger.info(f"Total Score: {scores.get('total_score', 0):.4f}")
 
-            history_params = []
-            update_params = []
             for prediction in predictions:
-                miner_id = prediction["miner_id"]
-                params = {
-                    "region_id": region["id"],
-                    "miner_uid": miner_id,
-                    "miner_hotkey": prediction.get("miner_hotkey", ""),
-                    "target_time": region["target_time"],
-                    "surface_sm_pred": prediction["surface_sm"],
-                    "rootzone_sm_pred": prediction["rootzone_sm"],
-                    "surface_sm_truth": ground_truth["surface_sm"] if ground_truth else None,
-                    "rootzone_sm_truth": ground_truth["rootzone_sm"] if ground_truth else None,
-                    "surface_rmse": scores["metrics"].get("surface_rmse"),
-                    "rootzone_rmse": scores["metrics"].get("rootzone_rmse"),
-                    "surface_structure_score": scores["metrics"].get("surface_ssim", 0),
-                    "rootzone_structure_score": scores["metrics"].get("rootzone_ssim", 0),
-                }
-                history_params.append(params)
-                update_params.append({
-                    "region_id": region["id"],
-                    "miner_uid": miner_id
-                })
+                try:
+                    miner_id = prediction["miner_id"]
+                    params = {
+                        "region_id": region["id"],
+                        "miner_uid": miner_id,
+                        "miner_hotkey": prediction.get("miner_hotkey", ""),
+                        "target_time": region["target_time"],
+                        "surface_sm_pred": prediction["surface_sm"],
+                        "rootzone_sm_pred": prediction["rootzone_sm"],
+                        "surface_sm_truth": ground_truth["surface_sm"] if ground_truth else None,
+                        "rootzone_sm_truth": ground_truth["rootzone_sm"] if ground_truth else None,
+                        "surface_rmse": scores["metrics"].get("surface_rmse"),
+                        "rootzone_rmse": scores["metrics"].get("rootzone_rmse"),
+                        "surface_structure_score": scores["metrics"].get("surface_ssim", 0),
+                        "rootzone_structure_score": scores["metrics"].get("rootzone_ssim", 0),
+                    }
 
-            # Batch insert into history table
-            insert_query = """
-                INSERT INTO soil_moisture_history 
-                (region_id, miner_uid, miner_hotkey, target_time,
-                    surface_sm_pred, rootzone_sm_pred,
-                    surface_sm_truth, rootzone_sm_truth,
-                    surface_rmse, rootzone_rmse,
-                    surface_structure_score, rootzone_structure_score)
-                VALUES 
-                (:region_id, :miner_uid, :miner_hotkey, :target_time,
-                    :surface_sm_pred, :rootzone_sm_pred,
-                    :surface_sm_truth, :rootzone_sm_truth,
-                    :surface_rmse, :rootzone_rmse,
-                    :surface_structure_score, :rootzone_structure_score)
-            """
-            await self.db_manager.execute_many(insert_query, history_params)
+                    insert_query = """
+                        INSERT INTO soil_moisture_history 
+                        (region_id, miner_uid, miner_hotkey, target_time,
+                            surface_sm_pred, rootzone_sm_pred,
+                            surface_sm_truth, rootzone_sm_truth,
+                            surface_rmse, rootzone_rmse,
+                            surface_structure_score, rootzone_structure_score)
+                        VALUES 
+                        (:region_id, :miner_uid, :miner_hotkey, :target_time,
+                            :surface_sm_pred, :rootzone_sm_pred,
+                            :surface_sm_truth, :rootzone_sm_truth,
+                            :surface_rmse, :rootzone_rmse,
+                            :surface_structure_score, :rootzone_structure_score)
+                    """
+                    await self.db_manager.execute(insert_query, params)
 
-            # Batch update prediction status
-            update_query = """
-                UPDATE soil_moisture_predictions 
-                SET status = 'scored'
-                WHERE region_id = :region_id 
-                AND miner_uid = :miner_uid
-                AND status = 'sent_to_miner'
-            """
-            await self.db_manager.execute_many(update_query, update_params)
+                    update_query = """
+                        UPDATE soil_moisture_predictions 
+                        SET status = 'scored'
+                        WHERE region_id = :region_id 
+                        AND miner_uid = :miner_uid
+                        AND status = 'sent_to_miner'
+                    """
+                    await self.db_manager.execute(update_query, {
+                        "region_id": region["id"],
+                        "miner_uid": miner_id
+                    })
+
+                except Exception as e:
+                    logger.error(f"Error processing prediction for miner {miner_id}: {str(e)}")
+                    continue
 
             logger.info(f"Moved {len(predictions)} tasks to history for region {region['id']}")
 
@@ -787,7 +786,8 @@ class SoilMoistureTask(Task):
                             VALUES 
                             (:task_name, :task_id, :score, :status)
                         """
-                        await self.db_manager.execute_many(insert_query, score_rows)
+                        for score_row in score_rows:
+                            await self.db_manager.execute(insert_query, score_row)
                         logger.info(f"Stored global scores for timestamp {target_time}")
 
                 finally:

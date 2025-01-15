@@ -133,21 +133,20 @@ class SoilValidatorPreprocessing(Preprocessing):
                 "status": "pending",
             }
 
-            # WRITE operation - use transaction for storing region
-            async with self.db.transaction() as session:
-                result = await session.execute(
-                    text("""
-                        INSERT INTO soil_moisture_regions 
-                        (region_date, target_time, bbox, combined_data, 
-                         sentinel_bounds, sentinel_crs, array_shape, status)
-                        VALUES (:region_date, :target_time, :bbox, :combined_data, 
-                                :sentinel_bounds, :sentinel_crs, :array_shape, :status)
-                        RETURNING id
-                    """),
-                    data
-                )
-                region_id = result.scalar_one()
-                return region_id
+            # WRITE operation - use execute for storing region
+            result = await self.db.execute(
+                """
+                INSERT INTO soil_moisture_regions 
+                (region_date, target_time, bbox, combined_data, 
+                 sentinel_bounds, sentinel_crs, array_shape, status)
+                VALUES (:region_date, :target_time, :bbox, :combined_data, 
+                        :sentinel_bounds, :sentinel_crs, :array_shape, :status)
+                RETURNING id
+                """,
+                data
+            )
+            region_id = result.scalar_one()
+            return region_id
 
         except Exception as e:
             logger.error(f"Error storing region: {str(e)}")
@@ -156,19 +155,17 @@ class SoilValidatorPreprocessing(Preprocessing):
     async def _check_existing_regions(self, target_time: datetime) -> bool:
         """Check if regions already exist for the given target time."""
         try:
-            # READ operation - use session for checking existing regions
-            async with self.db.session() as session:
-                result = await session.execute(
-                    text("""
-                        SELECT COUNT(*) as count 
-                        FROM soil_moisture_regions 
-                        WHERE target_time = :target_time
-                    """),
-                    {"target_time": target_time}
-                )
-                row = result.first()
-                count = row["count"] if row else 0
-                return count >= self.regions_per_timestep
+            # READ operation - use fetch_one for checking existing regions
+            result = await self.db.fetch_one(
+                """
+                SELECT COUNT(*) as count 
+                FROM soil_moisture_regions 
+                WHERE target_time = :target_time
+                """,
+                {"target_time": target_time}
+            )
+            count = result['count'] if result else 0
+            return count >= self.regions_per_timestep
         except Exception as e:
             logger.error(f"Error checking existing regions: {str(e)}")
             return False

@@ -64,8 +64,13 @@ class Miner:
         )
 
         self.database_manager = MinerDatabaseManager()
+        self.geomagnetic_task = GeomagneticTask(
+            node_type="miner",
+            db_manager=self.database_manager
+        )
         self.soil_task = SoilMoistureTask(
-            db_manager=self.database_manager, node_type="miner"
+            db_manager=self.database_manager,
+            node_type="miner"
         )
 
     def setup_neuron(self) -> bool:

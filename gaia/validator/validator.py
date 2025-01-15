@@ -57,7 +57,10 @@ class GaiaValidator:
             node_type="validator",
             test_mode=args.test_soil,
         )
-        self.geomagnetic_task = GeomagneticTask(db_manager=self.database_manager)
+        self.geomagnetic_task = GeomagneticTask(
+            node_type="validator",
+            db_manager=self.database_manager
+        )
         self.weights = [0.0] * 256
         self.last_set_weights_block = 0
         self.current_block = 0

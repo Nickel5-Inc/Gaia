@@ -120,25 +120,27 @@ class GeomagneticScoringMechanism(ScoringMechanism):
                 - score
         """
         try:
-            # WRITE operation - use transaction for saving scores
-            async with self.db_manager.transaction() as session:
-                for score in miner_scores:
-                    await session.execute(
-                        text("""
-                            INSERT INTO geomagnetic_history 
-                            (miner_uid, miner_hotkey, query_time, predicted_value, ground_truth_value, score, scored_at)
-                            VALUES (:miner_uid, :miner_hotkey, :query_time, :predicted_value, :ground_truth_value, :score, CURRENT_TIMESTAMP)
-                        """),
-                        {
-                            "miner_uid": score["miner_uid"],
-                            "miner_hotkey": score["miner_hotkey"],
-                            "query_time": score["query_time"],
-                            "predicted_value": score["predicted_value"],
-                            "ground_truth_value": score["ground_truth_value"],
-                            "score": score["score"]
-                        }
-                    )
-                logger.info(f"Successfully saved {len(miner_scores)} scores.")
+            # Save each score individually for better error handling and connection management
+            for score in miner_scores:
+                await self.db_manager.execute(
+                    """
+                    INSERT INTO geomagnetic_history 
+                    (miner_uid, miner_hotkey, query_time, predicted_value, ground_truth_value, score, scored_at)
+                    VALUES (:miner_uid, :miner_hotkey, :query_time, :predicted_value, :ground_truth_value, :score, CURRENT_TIMESTAMP)
+                    """,
+                    {
+                        "miner_uid": score["miner_uid"],
+                        "miner_hotkey": score["miner_hotkey"],
+                        "query_time": score["query_time"],
+                        "predicted_value": score["predicted_value"],
+                        "ground_truth_value": score["ground_truth_value"],
+                        "score": score["score"]
+                    }
+                )
+                logger.debug(f"Saved score for miner {score['miner_hotkey']}")
+            
+            logger.info(f"Successfully saved {len(miner_scores)} scores.")
+            
         except Exception as e:
             logger.error(f"Error saving scores to the database: {e}")
             raise

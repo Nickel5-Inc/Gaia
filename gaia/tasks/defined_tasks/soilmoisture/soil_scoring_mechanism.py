@@ -364,50 +364,37 @@ class SoilScoringMechanism(ScoringMechanism):
                 logger.error(f"Error during temp file cleanup: {e}")
 
     async def cleanup_invalid_prediction(self, bounds, target_time: datetime, miner_id: str):
-        """Clean up predictions for a specific miner and timestamp."""
         try:
-            # READ operation - use session for finding prediction
-            async with self.db_manager.session() as session:
-                debug_result = await session.execute(
-                    text("""
-                        SELECT 
-                            p.id as pred_id,
-                            p.miner_uid,
-                            r.target_time,
-                            r.region_date,
-                            r.sentinel_bounds
-                        FROM soil_moisture_predictions p
-                        JOIN soil_moisture_regions r ON p.region_id = r.id
-                        WHERE p.miner_uid = :miner_id 
-                        AND p.status = 'sent_to_miner'
-                        AND r.sentinel_bounds = ARRAY[:b1, :b2, :b3, :b4]::float[]
-                    """),
-                    {
-                        "miner_id": miner_id,
-                        "b1": bounds[0],
-                        "b2": bounds[1],
-                        "b3": bounds[2],
-                        "b4": bounds[3]
-                    }
+            result = await self.db_manager.fetch_one(
+                """
+                SELECT p.id as pred_id
+                FROM soil_moisture_predictions p
+                JOIN soil_moisture_regions r ON p.region_id = r.id
+                WHERE p.miner_uid = :miner_id 
+                AND p.status = 'sent_to_miner'
+                AND r.sentinel_bounds = ARRAY[:b1, :b2, :b3, :b4]::float[]
+                """,
+                {
+                    "miner_id": miner_id,
+                    "b1": bounds[0],
+                    "b2": bounds[1], 
+                    "b3": bounds[2],
+                    "b4": bounds[3]
+                }
+            )
+            
+            if result:
+                logger.info(f"Found prediction - ID: {result['pred_id']}")
+                await self.db_manager.execute(
+                    """
+                    DELETE FROM soil_moisture_predictions 
+                    WHERE id = :pred_id
+                    RETURNING id
+                    """,
+                    {"pred_id": result['pred_id']}
                 )
-                row = debug_result.first()
-                
-                if row:
-                    logger.info(f"Found prediction - ID: {row.pred_id}")
-                    # WRITE operation - use transaction for deleting prediction
-                    async with self.db_manager.transaction() as session:
-                        result = await session.execute(
-                            text("""
-                                DELETE FROM soil_moisture_predictions p
-                                WHERE p.id = :pred_id
-                                RETURNING p.id
-                            """),
-                            {"pred_id": row.pred_id}
-                        )
-                        deleted = result.first()
-                        if deleted:
-                            logger.info(f"Removed prediction {deleted.id}")
-                            return True
+                logger.info(f"Removed prediction {result['pred_id']}")
+                return True
             return False
 
         except Exception as e:
