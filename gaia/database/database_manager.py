@@ -787,12 +787,12 @@ class BaseDatabaseManager(ABC):
             UPDATE {table_name}
             SET {status_column} = :error_status
             WHERE {status_column} = :processing_status
-            AND created_at < NOW() - INTERVAL ':timeout minutes'::interval
+            AND created_at < NOW() - INTERVAL ':timeout'
         """
         params = {
             "error_status": self.STATUS_ERROR,
             "processing_status": self.STATUS_PROCESSING,
-            "timeout": str(timeout_minutes)
+            "timeout": f"{timeout_minutes} minutes"
         }
         await self.execute(query, params)
 
