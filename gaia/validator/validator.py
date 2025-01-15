@@ -843,103 +843,120 @@ class GaiaValidator:
                 await self.update_task_status('scoring', 'active')
                 
                 async def scoring_cycle():
-                    # Check conditions first
-                    validator_uid = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda: self.substrate.query(
+                    try:
+                        validator_uid = await asyncio.wait_for(
+                            self.substrate.async_query(
                                 "SubtensorModule", 
                                 "Uids", 
                                 [self.netuid, self.keypair.ss58_address]
-                            ).value
-                        ),
-                        timeout=30
-                    )
-                    
-                    if validator_uid is None:
-                        logger.error("Validator not found on chain")
-                        await self.update_task_status('scoring', 'error')
-                        await asyncio.sleep(12)
-                        return False
-
-                    blocks_since_update = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda: w.blocks_since_last_update(
-                                self.substrate, 
-                                self.netuid, 
-                                validator_uid
-                            )
-                        ),
-                        timeout=30
-                    )
-
-                    min_interval = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda: w.min_interval_to_set_weights(
-                                self.substrate, 
-                                self.netuid
-                            )
-                        ),
-                        timeout=30
-                    )
-
-                    # Check if we recently set weights
-                    current_block = self.substrate.get_block()["header"]["number"]
-                    if current_block - self.last_set_weights_block < min_interval:
-                        logger.info(f"Recently set weights {current_block - self.last_set_weights_block} blocks ago")
-                        await self.update_task_status('scoring', 'idle', 'waiting')
-                        await asyncio.sleep(12)
-                        return True
-
-                    # Only enter weight_setting state when actually setting weights
-                    if (min_interval is None or 
-                        (blocks_since_update is not None and blocks_since_update >= min_interval)):
-                        
-                        can_set = await asyncio.wait_for(
-                            asyncio.get_event_loop().run_in_executor(
-                                None,
-                                lambda: w.can_set_weights(
-                                    self.substrate, 
-                                    self.netuid, 
-                                    validator_uid
-                                )
                             ),
                             timeout=30
                         )
+                        validator_uid = validator_uid.value
                         
-                        if can_set:
-                            await self.update_task_status('scoring', 'processing', 'weight_setting')
-                            normalized_weights = await self._calc_task_weights()
-                            if normalized_weights:
-                                success = await asyncio.wait_for(
-                                    weight_setter.set_weights(normalized_weights),
-                                    timeout=180
-                                )
-                                if success:
-                                    self.last_set_weights_block = current_block
-                                    self.last_successful_weight_set = time.time()
-                                    logger.info("✅ Successfully set weights")
-                                    await self.update_task_status('scoring', 'idle')
-                                    await asyncio.sleep(30)
-                                    await self.update_last_weights_block()
-                    else:
-                        logger.info(
-                            f"Waiting for weight setting: {blocks_since_update}/{min_interval} blocks"
+                        if validator_uid is None:
+                            logger.error("Validator not found on chain")
+                            await self.update_task_status('scoring', 'error')
+                            return False
+
+                        blocks_since_update = await asyncio.wait_for(
+                            w.async_blocks_since_last_update(
+                                self.substrate, 
+                                self.netuid, 
+                                validator_uid
+                            ),
+                            timeout=30
                         )
-                        await self.update_task_status('scoring', 'idle', 'waiting')
 
-                    await asyncio.sleep(12)
-                    return True
+                        min_interval = await asyncio.wait_for(
+                            w.async_min_interval_to_set_weights(
+                                self.substrate, 
+                                self.netuid
+                            ),
+                            timeout=30
+                        )
 
+                        async with self.database_manager.session() as session:
+                            result = await session.execute(
+                                text("""
+                                    SELECT value::integer as block 
+                                    FROM validator_state 
+                                    WHERE key = 'last_weights_block'
+                                """)
+                            )
+                            row = result.first()
+                            last_weights_block = row["block"] if row else 0
+                            
+                            current_block = await self.substrate.async_get_block_number()
+                            
+                            if current_block - last_weights_block < min_interval:
+                                logger.info(f"Recently set weights {current_block - last_weights_block} blocks ago")
+                                await self.update_task_status('scoring', 'idle', 'waiting')
+                                return True
+
+                        # Only enter weight_setting state when actually setting weights
+                        if (min_interval is None or 
+                            (blocks_since_update is not None and blocks_since_update >= min_interval)):
+                            
+                            can_set = await asyncio.wait_for(
+                                w.async_can_set_weights(
+                                    self.substrate, 
+                                    self.netuid, 
+                                    validator_uid
+                                ),
+                                timeout=30
+                            )
+                            
+                            if can_set:
+                                await self.update_task_status('scoring', 'processing', 'weight_setting')
+                                
+                                # Calculate weights with timeout
+                                normalized_weights = await asyncio.wait_for(
+                                    self._calc_task_weights(),
+                                    timeout=60
+                                )
+                                
+                                if normalized_weights:
+                                    # Set weights with timeout
+                                    success = await asyncio.wait_for(
+                                        weight_setter.async_set_weights(normalized_weights),
+                                        timeout=180
+                                    )
+                                    
+                                    if success:
+                                        await self.update_last_weights_block()
+                                        self.last_successful_weight_set = time.time()
+                                        logger.info("✅ Successfully set weights")
+                                        await self.update_task_status('scoring', 'idle')
+                                        
+                                        # Clean up any stale operations
+                                        await self.database_manager.cleanup_stale_operations('score_table')
+                        else:
+                            logger.info(
+                                f"Waiting for weight setting: {blocks_since_update}/{min_interval} blocks"
+                            )
+                            await self.update_task_status('scoring', 'idle', 'waiting')
+
+                        return True
+                        
+                    except asyncio.TimeoutError as e:
+                        logger.error(f"Timeout in scoring cycle: {str(e)}")
+                        return False
+                    except Exception as e:
+                        logger.error(f"Error in scoring cycle: {str(e)}")
+                        logger.error(traceback.format_exc())
+                        return False
+                    finally:
+                        await asyncio.sleep(12)
+
+                # Run scoring cycle with overall timeout
                 await asyncio.wait_for(scoring_cycle(), timeout=600)
 
             except asyncio.TimeoutError:
                 logger.error("Weight setting operation timed out - restarting cycle")
                 await self.update_task_status('scoring', 'error')
                 try:
-                    self.substrate = interface.get_substrate(subtensor_network=self.subtensor_network)
+                    self.substrate = await interface.async_get_substrate(subtensor_network=self.subtensor_network)
                 except Exception as e:
                     logger.error(f"Failed to reconnect to substrate: {e}")
                 await asyncio.sleep(12)
