@@ -32,19 +32,19 @@ class SoilMinerPreprocessing(Preprocessing):
     def _load_model(self) -> SoilModel:
         """Load model weights from local path or HuggingFace."""
         try:
-            local_path = "tasks/defined_tasks/soilmoisture/SoilModel.ckpt"
+            model_dir = os.path.join("gaia", "models", "checkpoints", "soil_moisture")
+            os.makedirs(model_dir, exist_ok=True)
+            local_path = os.path.join(model_dir, "SoilModel.ckpt")
 
             if os.path.exists(local_path):
                 logger.info(f"Loading model from local path: {local_path}")
                 model = SoilModel.load_from_checkpoint(local_path)
             else:
-                logger.info(
-                    "Local checkpoint not found, downloading from HuggingFace..."
-                )
+                logger.info("Local checkpoint not found, downloading from HuggingFace...")
                 checkpoint_path = hf_hub_download(
                     repo_id="Nickel5HF/soil-moisture-model",
                     filename="SoilModel.ckpt",
-                    local_dir="tasks/defined_tasks/soilmoisture/",
+                    local_dir=model_dir,
                 )
                 logger.info(f"Loading model from HuggingFace: {checkpoint_path}")
                 model = SoilModel.load_from_checkpoint(checkpoint_path)
