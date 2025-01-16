@@ -819,6 +819,7 @@ class GaiaValidator:
                 self.status_logger(),
                 self.main_scoring(),
                 self.handle_miner_deregistration_loop(),
+                self.miner_score_sender.run_async(),
                 #self.check_for_updates()
             ]
             
