@@ -1,5 +1,5 @@
 import traceback
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, List
 import uuid
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from gaia.tasks.base.task import Task
@@ -849,45 +849,40 @@ class GeomagneticTask(Task):
             logger.error(traceback.format_exc())
             return None
 
-    async def recalculate_recent_scores(self, uids: list):
-        """Recalculate scores for specified miners over the last 3 days."""
+    async def recalculate_recent_scores(self, uids: List[int]) -> None:
+        """
+        Recalculate scores for specified miners over the last 3 days.
+        
+        Args:
+            uids (List[int]): List of miner UIDs to recalculate scores for
+            
+        Raises:
+            ValueError: If UIDs are invalid
+            DatabaseError: If there is an error accessing the database
+        """
         try:
+            # Validate UIDs
+            if not all(isinstance(uid, int) and 0 <= uid < 256 for uid in uids):
+                raise ValueError("All UIDs must be integers between 0 and 255")
+
             current_time = datetime.datetime.now(datetime.timezone.utc)
             history_window = current_time - datetime.timedelta(days=3)
             logger.info(f"Recalculating scores for UIDs {uids} from {history_window} to {current_time}")
 
-            history_results = await self.db_manager.fetch_all(
-                """
-                SELECT 
-                    miner_hotkey,
-                    query_time,
-                    score
-                FROM geomagnetic_history
-                WHERE query_time >= :history_window
-                AND query_time <= :current_time
-                AND miner_uid = ANY(:uids)
-                ORDER BY query_time ASC
-                """,
-                {
-                    "history_window": history_window,
-                    "current_time": current_time,
-                    "uids": [str(uid) for uid in uids]
-                }
-            )
+            # Convert UIDs to strings for database query
+            str_uids = [str(uid) for uid in uids]
 
-            if not history_results:
-                logger.warning(f"No historical data found for UIDs {uids} in window {history_window} to {current_time}")
-                return
-
+            # Delete existing predictions
             await self.db_manager.execute(
                 """
                 DELETE FROM geomagnetic_predictions
                 WHERE miner_uid = ANY(:uids)
                 """,
-                {"uids": [str(uid) for uid in uids]}
+                {"uids": str_uids}
             )
             logger.info(f"Successfully deleted predictions for UIDs: {uids}")
 
+            # Delete affected score rows
             await self.db_manager.execute(
                 """
                 DELETE FROM score_table 
@@ -902,16 +897,43 @@ class GeomagneticTask(Task):
             )
             logger.info(f"Successfully deleted scores for time window")
 
+            # Get history data
+            history_results = await self.db_manager.fetch_all(
+                """
+                SELECT 
+                    miner_hotkey,
+                    miner_uid,
+                    query_time,
+                    score
+                FROM geomagnetic_history
+                WHERE query_time >= :history_window
+                AND query_time <= :current_time
+                AND miner_uid = ANY(:uids)
+                ORDER BY query_time ASC
+                """,
+                {
+                    "history_window": history_window,
+                    "current_time": current_time,
+                    "uids": str_uids
+                }
+            )
+
+            if not history_results:
+                logger.warning(f"No historical data found for UIDs {uids} in window {history_window} to {current_time}")
+                return
+
+            # Get current miner mappings
             miner_mappings = await self.db_manager.fetch_all(
                 """
-                SELECT uid, hotkey FROM node_table 
+                SELECT uid, hotkey 
+                FROM node_table 
                 WHERE hotkey IS NOT NULL
                 """
             )
-            hotkey_to_uid = {row["hotkey"]: row["uid"] for row in miner_mappings}
+            hotkey_to_uid: Dict[str, int] = {row["hotkey"]: row["uid"] for row in miner_mappings}
 
             # Group records by hour
-            hourly_records = {}
+            hourly_records: Dict[datetime.datetime, List[Dict[str, Any]]] = {}
             for record in history_results:
                 hour_key = record["query_time"].replace(
                     minute=0, second=0, microsecond=0
@@ -923,7 +945,7 @@ class GeomagneticTask(Task):
             # Process each hour
             for hour, records in hourly_records.items():
                 try:
-                    scores = [float("nan")] * 256
+                    scores: List[float] = [float("nan")] * 256
 
                     # Calculate scores for this hour
                     for record in records:
@@ -932,12 +954,12 @@ class GeomagneticTask(Task):
                             if miner_hotkey in hotkey_to_uid:
                                 uid = hotkey_to_uid[miner_hotkey]
                                 if record["score"] is not None:
-                                    scores[uid] = record["score"]
+                                    scores[uid] = float(record["score"])
                         except (ValueError, TypeError) as e:
                             logger.error(f"Error processing record for miner {record.get('miner_hotkey')}: {e}")
                             continue
 
-                    # WRITE operation - use execute for inserting score row
+                    # Insert score row
                     score_row = {
                         "task_name": "geomagnetic",
                         "task_id": str(hour.timestamp()),
@@ -961,6 +983,9 @@ class GeomagneticTask(Task):
 
             logger.info(f"Completed recalculation of scores for UIDs: {uids} over 3-day window")
 
+        except ValueError as e:
+            logger.error(f"Invalid UIDs in recalculate_recent_scores: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error in recalculate_recent_scores: {e}")
             logger.error(traceback.format_exc())

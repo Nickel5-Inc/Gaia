@@ -952,17 +952,26 @@ class SoilMoistureTask(Task):
             logger.error(traceback.format_exc())
             return []
 
-    async def recalculate_recent_scores(self, uids: list):
+    async def recalculate_recent_scores(self, uids: List[int]) -> None:
         """
-        Recalculate recent scores for the given UIDs across the 3-day scoring window
-        and update all affected score_table rows.
-
+        Recalculate scores for specified miners over the last 3 days.
+        
         Args:
-            uids (list): List of UIDs to recalculate scores for.
+            uids (List[int]): List of miner UIDs to recalculate scores for
+            
+        Raises:
+            ValueError: If UIDs are invalid
+            DatabaseError: If there is an error accessing the database
         """
         try:
-            # Delete predictions for UIDs
+            # Validate UIDs
+            if not all(isinstance(uid, int) and 0 <= uid < 256 for uid in uids):
+                raise ValueError("All UIDs must be integers between 0 and 255")
+
+            # Convert UIDs to strings for database query
             str_uids = [str(uid) for uid in uids]
+
+            # Delete predictions for UIDs
             delete_query = """
                 DELETE FROM soil_moisture_predictions
                 WHERE miner_uid = ANY(:uids)
@@ -999,11 +1008,22 @@ class SoilMoistureTask(Task):
                     target_time
                 FROM soil_moisture_history
                 WHERE target_time >= :history_window
+                AND miner_uid = ANY(:uids)
                 ORDER BY target_time ASC
             """
-            history_results = await self.db_manager.fetch_all(history_query, {"history_window": history_window})
+            history_results = await self.db_manager.fetch_all(
+                history_query, 
+                {
+                    "history_window": history_window,
+                    "uids": str_uids
+                }
+            )
 
-            daily_records = {}
+            if not history_results:
+                logger.warning(f"No historical data found for UIDs {uids} in window {history_window} to {current_time}")
+                return
+
+            daily_records: Dict[datetime, List[Dict[str, Any]]] = {}
             for record in history_results:
                 day_key = record["target_time"].replace(
                     hour=0, minute=0, second=0, microsecond=0
@@ -1013,41 +1033,63 @@ class SoilMoistureTask(Task):
                 daily_records[day_key].append(record)
 
             for day, records in daily_records.items():
-                miner_scores = {}
+                miner_scores: Dict[int, Dict[str, List[float]]] = {}
                 for record in records:
-                    miner_uid = int(record["miner_uid"])
-                    if miner_uid not in miner_scores:
-                        miner_scores[miner_uid] = {
-                            "surface_rmse": [],
-                            "rootzone_rmse": [],
-                            "surface_ssim": [],
-                            "rootzone_ssim": [],
-                        }
+                    try:
+                        miner_uid = int(record["miner_uid"])
+                        if not (0 <= miner_uid < 256):
+                            logger.warning(f"Invalid miner_uid {miner_uid} in history, skipping")
+                            continue
 
-                    miner_scores[miner_uid]["surface_rmse"].append(record["surface_rmse"])
-                    miner_scores[miner_uid]["rootzone_rmse"].append(record["rootzone_rmse"])
-                    miner_scores[miner_uid]["surface_ssim"].append(record["surface_structure_score"])
-                    miner_scores[miner_uid]["rootzone_ssim"].append(record["rootzone_structure_score"])
+                        if miner_uid not in miner_scores:
+                            miner_scores[miner_uid] = {
+                                "surface_rmse": [],
+                                "rootzone_rmse": [],
+                                "surface_ssim": [],
+                                "rootzone_ssim": [],
+                            }
 
-                scores = [float("nan")] * 256
+                        # Validate and convert numeric fields
+                        for field, value in [
+                            ("surface_rmse", record["surface_rmse"]),
+                            ("rootzone_rmse", record["rootzone_rmse"]),
+                            ("surface_ssim", record["surface_structure_score"]),
+                            ("rootzone_ssim", record["rootzone_structure_score"])
+                        ]:
+                            try:
+                                if value is not None:
+                                    miner_scores[miner_uid][field].append(float(value))
+                            except (ValueError, TypeError) as e:
+                                logger.warning(f"Invalid {field} value for miner {miner_uid}: {value}")
+                                continue
+
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"Error processing record for miner: {e}")
+                        continue
+
+                scores: List[float] = [float("nan")] * 256
                 for miner_uid, score_lists in miner_scores.items():
-                    if score_lists["surface_rmse"] and score_lists["rootzone_rmse"]:
-                        avg_surface_rmse = sum(score_lists["surface_rmse"]) / len(score_lists["surface_rmse"])
-                        avg_rootzone_rmse = sum(score_lists["rootzone_rmse"]) / len(score_lists["rootzone_rmse"])
-                        avg_surface_ssim = sum(score_lists["surface_ssim"]) / len(score_lists["surface_ssim"])
-                        avg_rootzone_ssim = sum(score_lists["rootzone_ssim"]) / len(score_lists["rootzone_ssim"])
+                    try:
+                        if score_lists["surface_rmse"] and score_lists["rootzone_rmse"]:
+                            avg_surface_rmse = sum(score_lists["surface_rmse"]) / len(score_lists["surface_rmse"])
+                            avg_rootzone_rmse = sum(score_lists["rootzone_rmse"]) / len(score_lists["rootzone_rmse"])
+                            avg_surface_ssim = sum(score_lists["surface_ssim"]) / len(score_lists["surface_ssim"])
+                            avg_rootzone_ssim = sum(score_lists["rootzone_ssim"]) / len(score_lists["rootzone_ssim"])
 
-                        surface_score = math.exp(-abs(avg_surface_rmse) / 10)
-                        rootzone_score = math.exp(-abs(avg_rootzone_rmse) / 10)
+                            surface_score = math.exp(-abs(avg_surface_rmse) / 10)
+                            rootzone_score = math.exp(-abs(avg_rootzone_rmse) / 10)
 
-                        total_score = (
-                            0.25 * surface_score
-                            + 0.25 * rootzone_score
-                            + 0.25 * avg_surface_ssim
-                            + 0.25 * avg_rootzone_ssim
-                        )
+                            total_score = (
+                                0.25 * surface_score
+                                + 0.25 * rootzone_score
+                                + 0.25 * avg_surface_ssim
+                                + 0.25 * avg_rootzone_ssim
+                            )
 
-                        scores[miner_uid] = total_score
+                            scores[miner_uid] = total_score
+                    except Exception as e:
+                        logger.error(f"Error calculating score for miner {miner_uid}: {e}")
+                        continue
 
                 score_row = {
                     "task_name": "soil_moisture",
@@ -1068,9 +1110,13 @@ class SoilMoistureTask(Task):
 
             logger.info(f"Completed recalculation of scores for UIDs: {uids} over 3-day window")
 
+        except ValueError as e:
+            logger.error(f"Invalid UIDs in recalculate_recent_scores: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error recalculating recent scores: {e}")
             logger.error(traceback.format_exc())
+            raise  # Re-raise to trigger error handling in deregistration loop
 
     async def cleanup_predictions(self, bounds, target_time=None, miner_uid=None):
         """Clean up predictions after they've been processed and moved to history."""
