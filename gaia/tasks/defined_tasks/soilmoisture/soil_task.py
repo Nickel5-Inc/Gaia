@@ -64,7 +64,7 @@ class SoilMoistureTask(Task):
         description="Delay before scoring due to SMAP data latency",
     )
 
-    validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None
+    validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None #type: ignore 
     miner_preprocessing: Optional["SoilMinerPreprocessing"] = None
     model: Optional[SoilModel] = None
     db_manager: Any = Field(default=None)
@@ -263,6 +263,7 @@ class SoilMoistureTask(Task):
                         target_time=target_smap_time,
                         ifs_forecast_time=ifs_forecast_time,
                     )
+                    regions = None  # No regions to process during prep window
                 else:
                     # Get pending regions for this target time
                     query = """
@@ -687,6 +688,8 @@ class SoilMoistureTask(Task):
         try:
             pending_tasks = await self.get_pending_tasks()
             if not pending_tasks:
+                logger.debug("No pending tasks found, sleeping for 60 seconds")
+                await asyncio.sleep(600)  # Add delay to prevent continuous querying
                 return {"status": "no_pending_tasks"}
 
             scoring_results = {}

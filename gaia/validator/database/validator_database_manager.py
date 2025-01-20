@@ -114,22 +114,54 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         password: str = "postgres",
     ) -> None:
         """Initialize the validator database manager."""
-        # Call base class init first to set up necessary attributes
-        super().__init__(
-            node_type="validator",
-            database=database,
-            host=host,
-            port=port,
-            user=user,
-            password=password,
-        )
-        
-        # Set database URL
-        self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
-        
-        # Custom timeouts for validator operations
-        self.VALIDATOR_QUERY_TIMEOUT = 60  # 1 minute
-        self.VALIDATOR_TRANSACTION_TIMEOUT = 300  # 5 minutes
+        if not hasattr(self, '_initialized') or not self._initialized:
+            # Call base class init first to set up necessary attributes
+            super().__init__(
+                node_type="validator",
+                database=database,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+            )
+            
+            # Set database URL
+            self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
+            
+            # Custom timeouts for validator operations
+            self.VALIDATOR_QUERY_TIMEOUT = 60  # 1 minute
+            self.VALIDATOR_TRANSACTION_TIMEOUT = 300  # 5 minutes
+            
+            self._initialized = True
+
+    async def _initialize_validator_database(self) -> None:
+        """Initialize validator-specific database schema and columns."""
+        try:
+            # Add last_error column to soil_moisture_predictions
+            add_last_error_column = """
+                DO $$ 
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 
+                        FROM information_schema.columns 
+                        WHERE table_name = 'soil_moisture_predictions' 
+                        AND column_name = 'last_error'
+                    ) THEN
+                        ALTER TABLE soil_moisture_predictions 
+                        ADD COLUMN last_error TEXT;
+                    END IF;
+                END $$;
+            """
+            await self.execute(add_last_error_column)
+            logger.info("Added last_error column to soil_moisture_predictions table")
+            
+            # Add any other validator-specific initialization here
+            logger.info("Validator database initialization completed")
+            
+        except Exception as e:
+            logger.error(f"Error initializing validator database: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise DatabaseError(f"Failed to initialize validator database: {str(e)}")
 
     async def get_operation_stats(self) -> Dict[str, Any]:
         """Get current operation statistics."""
