@@ -39,7 +39,8 @@
             "sentinel_crs": "INTEGER",
             "status": "TEXT NOT NULL DEFAULT 'sent_to_miner'",
             "retry_count": "INTEGER DEFAULT 0",
-            "next_retry_time": "TIMESTAMP WITH TIME ZONE"
+            "next_retry_time": "TIMESTAMP WITH TIME ZONE",
+            "last_error": "TEXT"
         },
         "indexes": [
             {"column": "region_id", "unique": false},

@@ -137,25 +137,79 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
     async def _initialize_validator_database(self) -> None:
         """Initialize validator-specific database schema and columns."""
         try:
-            # Add last_error column to soil_moisture_predictions
-            add_last_error_column = """
-                DO $$ 
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 
-                        FROM information_schema.columns 
-                        WHERE table_name = 'soil_moisture_predictions' 
-                        AND column_name = 'last_error'
-                    ) THEN
-                        ALTER TABLE soil_moisture_predictions 
-                        ADD COLUMN last_error TEXT;
-                    END IF;
-                END $$;
-            """
-            await self.execute(add_last_error_column)
-            logger.info("Added last_error column to soil_moisture_predictions table")
-            
-            # Add any other validator-specific initialization here
+            schema_path = Path(__file__).parent.parent.parent / "tasks" / "defined_tasks" / "soilmoisture" / "schema.json"
+            with open(schema_path) as f:
+                schema = json.load(f)
+
+            for table_name, table_schema in schema.items():
+                if table_schema.get("database_type") != "validator":
+                    continue
+
+                exists_query = """
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = 'public' 
+                        AND table_name = :table_name
+                    )
+                """
+                result = await self.fetch_one(exists_query, {"table_name": table_name})
+                table_exists = result["exists"] if result else False
+
+                if not table_exists:
+                    columns = []
+                    for col_name, col_type in table_schema["columns"].items():
+                        columns.append(f"{col_name} {col_type}")
+
+                    if "foreign_keys" in table_schema:
+                        for fk in table_schema["foreign_keys"]:
+                            fk_def = f"FOREIGN KEY ({fk['column']}) REFERENCES {fk['references']}"
+                            if "on_delete" in fk:
+                                fk_def += f" ON DELETE {fk['on_delete']}"
+                            columns.append(fk_def)
+
+                    create_table_sql = f"""
+                        CREATE TABLE IF NOT EXISTS {table_schema['table_name']} (
+                            {', '.join(columns)}
+                        );
+                    """
+                    await self.execute(create_table_sql)
+                    logger.info(f"Created table {table_name}")
+
+                    if "indexes" in table_schema:
+                        for index in table_schema["indexes"]:
+                            index_name = f"{table_name}_{index['column']}_idx"
+                            unique = "UNIQUE" if index.get("unique", False) else ""
+                            create_index_sql = f"""
+                                CREATE INDEX IF NOT EXISTS {index_name}
+                                ON {table_name} ({index['column']})
+                                {unique};
+                            """
+                            await self.execute(create_index_sql)
+                        logger.info(f"Created indexes for {table_name}")
+                else:
+                    for col_name, col_type in table_schema["columns"].items():
+                        check_column_sql = """
+                            SELECT EXISTS (
+                                SELECT 1 
+                                FROM information_schema.columns 
+                                WHERE table_name = :table_name 
+                                AND column_name = :column_name
+                            )
+                        """
+                        result = await self.fetch_one(
+                            check_column_sql, 
+                            {"table_name": table_name, "column_name": col_name}
+                        )
+                        column_exists = result["exists"] if result else False
+
+                        if not column_exists:
+                            add_column_sql = f"""
+                                ALTER TABLE {table_name} 
+                                ADD COLUMN {col_name} {col_type};
+                            """
+                            await self.execute(add_column_sql)
+                            logger.info(f"Added column {col_name} to {table_name}")
+
             logger.info("Validator database initialization completed")
             
         except Exception as e:
