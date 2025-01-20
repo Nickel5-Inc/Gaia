@@ -1008,3 +1008,28 @@ class BaseDatabaseManager(ABC):
                     return await func(self, session, *args, **kwargs)
             return wrapper
         return decorator
+
+    async def initialize_database(self) -> None:
+        """Initialize database tables and add any missing columns."""
+        try:
+            add_last_error_column = """
+                DO $$ 
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 
+                        FROM information_schema.columns 
+                        WHERE table_name = 'soil_moisture_predictions' 
+                        AND column_name = 'last_error'
+                    ) THEN
+                        ALTER TABLE soil_moisture_predictions 
+                        ADD COLUMN last_error TEXT;
+                    END IF;
+                END $$;
+            """
+            await self.execute(add_last_error_column)
+            logger.info("Database initialization completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Error initializing database: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise DatabaseError(f"Failed to initialize database: {str(e)}")
