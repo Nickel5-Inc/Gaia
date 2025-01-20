@@ -1,5 +1,5 @@
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 import uuid
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from gaia.tasks.base.task import Task
@@ -64,7 +64,7 @@ class GeomagneticTask(Task):
     """
 
     # Declare Pydantic fields
-    db_manager: ValidatorDatabaseManager = Field(
+    db_manager: Union[ValidatorDatabaseManager, MinerDatabaseManager] = Field(
         default_factory=ValidatorDatabaseManager,
         description="Database manager for the task",
     )
@@ -81,7 +81,7 @@ class GeomagneticTask(Task):
     )
 
 
-    def __init__(self, node_type="validator", db_manager=None, **data):
+    def __init__(self, node_type: str, db_manager, **data):
         """Initialize the task."""
         super().__init__(
             name="GeomagneticTask",
@@ -100,6 +100,7 @@ class GeomagneticTask(Task):
         
         if self.node_type == "miner":
             try:
+                logger.info("Running as miner - loading model...")
                 # Try to load custom model first
                 custom_model_path = "gaia/models/custom_models/custom_geomagnetic_model.py"
                 if os.path.exists(custom_model_path):

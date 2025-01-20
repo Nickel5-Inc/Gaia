@@ -81,8 +81,8 @@ class MinerDatabaseManager(BaseDatabaseManager):
             self.MINER_QUERY_TIMEOUT = 60  # 1 minute
             self.MINER_TRANSACTION_TIMEOUT = 300  # 5 minutes
             
-            # Initialize engine
-            self._initialize_engine()
+            self._engine = None
+            self._engine_initialized = False
             self._initialized = True
 
     async def get_operation_stats(self) -> Dict[str, Any]:
