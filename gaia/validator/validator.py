@@ -521,28 +521,6 @@ class GaiaValidator:
             except Exception as e:
                 logger.error(f"Error checking task health: {e}")
             
-            # Check database health with timeout
-            if current_time - self.last_successful_db_check > self.db_check_interval:
-                try:
-                    await asyncio.wait_for(
-                        self._check_database_health(),
-                        timeout=5  # 5 second timeout
-                    )
-                except asyncio.TimeoutError:
-                    logger.error("Database health check timed out")
-                    try:
-                        await self.database_manager.reset_pool()
-                        logger.info("Successfully reset database pool")
-                    except Exception as reset_error:
-                        logger.error(f"Failed to reset database pool: {reset_error}")
-                except Exception as e:
-                    logger.error(f"Database health check failed: {e}")
-                    try:
-                        await self.database_manager.reset_pool()
-                        logger.info("Successfully reset database pool")
-                    except Exception as reset_error:
-                        logger.error(f"Failed to reset database pool: {reset_error}")
-
             # Check metagraph sync health with timeout
             if current_time - self.last_metagraph_sync > self.metagraph_sync_interval:
                 try:
@@ -619,23 +597,6 @@ class GaiaValidator:
                         logger.error(f"Failed to recover task {task_name}: {e}")
                         logger.error(traceback.format_exc())
                         health['errors'] += 1
-
-    async def _check_database_health(self):
-        """Check database health."""
-        db_check_start = time.time()
-        try:
-            await self.database_manager.execute("SELECT 1")
-            self.last_successful_db_check = time.time()
-            db_check_duration = time.time() - db_check_start
-            if db_check_duration > 5:  # Log slow DB checks
-                logger.warning(f"Slow DB health check: {db_check_duration:.2f}s")
-            
-            # Add periodic connection cleanup
-            await self.database_manager.cleanup_stale_connections()
-            
-        except Exception as e:
-            logger.error(f"Database health check failed: {e}")
-            raise
 
     async def _sync_metagraph(self):
         """Sync the metagraph."""
