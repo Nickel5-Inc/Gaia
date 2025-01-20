@@ -7,6 +7,9 @@ import traceback
 from datetime import datetime, timedelta
 import json
 import glob
+from fiber.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 #This monitor is designed to detect if the validator is frozen by checking if the log file has been updated recently.
 #If the log file has not been updated recently, it will dump the process state and create a detailed dump of the process state.
@@ -17,9 +20,10 @@ class ValidatorMonitor:
         self.validator_pid = None
         self.dump_dir = "/var/log/gaia/freezes"
         self.log_dir = "/root/.pm2/logs"
-        self.log_prefix = "vali-out"
+        self.log_prefix = "gaia-validator-out-0"
         self.freeze_threshold = 300
         os.makedirs(self.dump_dir, exist_ok=True)
+        logger.info("Initialized ValidatorMonitor with freeze threshold: %d seconds", self.freeze_threshold)
 
     def get_validator_pid(self):
         """Get validator PID from PM2"""
@@ -27,26 +31,27 @@ class ValidatorMonitor:
             pm2_output = os.popen('pm2 jlist').read()
             processes = json.loads(pm2_output)
             for proc in processes:
-                if proc['name'] == 'vali':
+                if proc['name'] == 'gaia_validator':
+                    logger.info("Found validator process with PID: %d", proc['pid'])
                     return proc['pid']
+            logger.warning("No validator process found in PM2 list")
         except Exception as e:
-            print(f"Error getting PID: {e}")
+            logger.error("Error getting PID: %s", str(e))
         return None
 
     def get_latest_log_file(self):
         """Get the most recent log file"""
         try:
-            log_files = glob.glob(f"{self.log_dir}/{self.log_prefix}-*.log")
-            if not log_files:
-                print("No log files found")
+            log_file = f"{self.log_dir}/{self.log_prefix}.log"
+            if not os.path.exists(log_file):
+                logger.warning("No log files found in %s", self.log_dir)
                 return None
             
-            latest_log = max(log_files, key=os.path.getmtime)
-            print(f"Using log file: {latest_log}")
-            return latest_log
+            logger.info("Using log file: %s", log_file)
+            return log_file
             
         except Exception as e:
-            print(f"Error finding latest log: {e}")
+            logger.error("Error finding latest log: %s", str(e))
             return None
 
     def check_log_activity(self):
@@ -59,16 +64,16 @@ class ValidatorMonitor:
             last_modified = os.path.getmtime(latest_log)
             time_since_update = time.time() - last_modified
 
-            print(f"Time since last log update: {time_since_update:.1f} seconds")
+            logger.info("Time since last log update: %.1f seconds", time_since_update)
 
             if time_since_update > self.freeze_threshold:
-                print(f"Potential freeze detected - no log updates for {time_since_update:.1f} seconds")
+                logger.warning("Potential freeze detected - no log updates for %.1f seconds", time_since_update)
                 return True
 
             return False
 
         except Exception as e:
-            print(f"Error checking log activity: {e}")
+            logger.error("Error checking log activity: %s", str(e))
             return False
 
     def _get_stack_trace(self, pid):
@@ -77,11 +82,13 @@ class ValidatorMonitor:
             gdb_cmd = f"""gdb -p {pid} -batch -ex "thread apply all bt" 2>/dev/null"""
             return os.popen(gdb_cmd).read()
         except Exception as e:
+            logger.error("Error getting stack trace: %s", str(e))
             return f"Error getting stack trace: {e}"
 
     def dump_process_state(self):
         """Create detailed dump of process state"""
         if not self.validator_pid:
+            logger.warning("Cannot dump process state - no validator PID")
             return
         
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -90,6 +97,8 @@ class ValidatorMonitor:
         try:
             process = psutil.Process(self.validator_pid)
             latest_log = self.get_latest_log_file()
+            
+            logger.info("Creating process state dump at: %s", dump_file)
             
             with open(dump_file, 'w') as f:
                 f.write(f"=== Validator Freeze Detected ===\n")
@@ -105,7 +114,9 @@ class ValidatorMonitor:
                             last_lines = log_file.readlines()[-50:]
                             f.write(''.join(last_lines))
                     except Exception as e:
-                        f.write(f"Error reading logs: {e}\n")
+                        error_msg = f"Error reading logs: {e}"
+                        logger.error(error_msg)
+                        f.write(f"{error_msg}\n")
                 else:
                     f.write("No log file found\n")
 
@@ -121,28 +132,43 @@ class ValidatorMonitor:
                 for conn in process.connections():
                     f.write(f"{conn}\n")
 
-            print(f"Freeze dump created: {dump_file}")
+            logger.info("Freeze dump created successfully at: %s", dump_file)
             return dump_file
-
+             
         except Exception as e:
-            print(f"Error creating dump: {e}")
+            logger.error("Error creating dump: %s", str(e))
+
+    def restart_validator(self):
+        """Restart the validator process using PM2"""
+        try:
+            logger.warning("Attempting to restart validator process")
+            os.system('pm2 restart validator')
+            logger.info("Validator restart command issued")
+            return True
+        except Exception as e:
+            logger.error("Error restarting validator: %s", str(e))
+            return False
 
     def run(self):
+        logger.info("Starting ValidatorMonitor")
         while True:
             try:
                 self.validator_pid = self.get_validator_pid()
                 if not self.validator_pid:
-                    print("Validator not running")
+                    logger.warning("Validator not running")
                     time.sleep(5)
                     continue
 
                 if self.check_log_activity():
+                    logger.warning("Detected validator freeze, creating process dump")
                     self.dump_process_state()
+                    logger.warning("Restarting frozen validator process")
+                    self.restart_validator()
                 
                 time.sleep(10)
 
             except Exception as e:
-                print(f"Monitor error: {e}")
+                logger.error("Monitor error: %s", str(e))
                 time.sleep(5)
 
 if __name__ == "__main__":

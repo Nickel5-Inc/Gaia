@@ -251,44 +251,112 @@ class BaseDatabaseManager(ABC):
 
         async with self._pool_recovery_lock:
             try:
+                # First check if engine exists and is initialized
+                if not self._engine or not self._engine_initialized:
+                    logger.error("Database engine not initialized")
+                    self._pool_health_status = False
+                    return False
+
+                # Test basic connectivity
                 healthy = await self._ensure_pool()
-                if not healthy and self._pool_health_status:
+                
+                if not healthy:
                     logger.warning("Pool health check failed - attempting recovery")
+                    recovery_successful = False
+                    
                     for attempt in range(self.POOL_RECOVERY_ATTEMPTS):
-                        await self.reset_pool()
-                        if await self._ensure_pool():
-                            logger.info("Pool recovery successful")
-                            healthy = True
-                            break
-                        await asyncio.sleep(2 ** attempt)
+                        try:
+                            logger.info(f"Recovery attempt {attempt + 1}/{self.POOL_RECOVERY_ATTEMPTS}")
+                            
+                            # Close all active sessions first
+                            async with self._session_lock:
+                                for session in self._active_sessions.copy():
+                                    try:
+                                        await session.close()
+                                    except Exception as e:
+                                        logger.error(f"Error closing session: {e}")
+                                self._active_sessions.clear()
+                                self._active_operations = 0
+
+                            # Dispose of the engine
+                            if self._engine:
+                                await self._engine.dispose()
+                            
+                            # Reinitialize engine
+                            await self._initialize_engine()
+                            
+                            # Verify the new pool
+                            if await self._ensure_pool():
+                                logger.info("Pool recovery successful")
+                                recovery_successful = True
+                                break
+                                
+                        except Exception as e:
+                            logger.error(f"Recovery attempt {attempt + 1} failed: {e}")
+                            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                            continue
+                    
+                    if not recovery_successful:
+                        logger.error("All recovery attempts failed")
+                        self._pool_health_status = False
+                        return False
+                    
+                    healthy = True
+
                 self._pool_health_status = healthy
                 self._last_pool_check = current_time
                 return healthy
+                
             except Exception as e:
                 logger.error(f"Pool health check failed: {e}")
+                logger.error(f"Stack trace: {traceback.format_exc()}")
                 self._pool_health_status = False
                 return False
 
-    async def _initialize_engine(self) -> None:
-        """Initialize database engine and session factory."""
-        self._engine = create_async_engine(
-            self.db_url,
-            pool_pre_ping=True,
-            pool_size=5,
-            max_overflow=10,
-            echo=False,
-            connect_args={
-                "command_timeout": self.DEFAULT_QUERY_TIMEOUT,
-                "timeout": self.DEFAULT_CONNECTION_TIMEOUT,
-            }
-        )
+    async def _initialize_engine(self) -> bool:
+        """Initialize the database engine."""
+        if not self.db_url:
+            raise DatabaseError("Database URL not initialized")
 
-        self._session_factory = async_sessionmaker(
-            self._engine, 
-            expire_on_commit=False,
-            class_=AsyncSession,
-            autobegin=False  # Prevent automatic transaction creation
-        )
+        try:
+            # Log initialization with masked credentials
+            masked_url = str(self.db_url).replace(self.db_url.split('@')[0], '***')
+            logger.info(f"Initializing database engine with URL: {masked_url}")
+
+            # Configure engine with connection pooling settings
+            self._engine = create_async_engine(
+                self.db_url,
+                pool_pre_ping=True,
+                pool_size=5,
+                max_overflow=10,
+                pool_timeout=self.DEFAULT_CONNECTION_TIMEOUT,
+                pool_recycle=300,  # Recycle connections every 5 minutes
+                pool_use_lifo=True,  # Use LIFO to better reuse connections
+                echo=False,
+                connect_args={
+                    "command_timeout": self.DEFAULT_QUERY_TIMEOUT,
+                    "timeout": self.DEFAULT_CONNECTION_TIMEOUT,
+                },
+            )
+
+            # Test connection immediately
+            async with self._engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+
+            # Initialize session factory
+            self._session_factory = async_sessionmaker(
+                self._engine, class_=AsyncSession, expire_on_commit=False
+            )
+
+            logger.info("Database engine initialized successfully")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to initialize database engine: {e}")
+            logger.error(traceback.format_exc())
+            self._engine = None
+            self._session_factory = None
+            return False
 
     async def _ensure_pool(self) -> bool:
         """
@@ -297,16 +365,68 @@ class BaseDatabaseManager(ABC):
         Returns:
             bool: True if pool is healthy, False otherwise
         """
+        if not self._engine:
+            logger.error("Cannot ensure pool - engine not initialized")
+            return False
+
+        conn = None
         try:
-            async with self._engine.connect() as conn:
-                await asyncio.wait_for(
-                    conn.execute(text("SELECT 1")),
-                    timeout=self.DEFAULT_CONNECTION_TIMEOUT
-                )
-                return True
+            conn = await self._engine.connect()
+            await asyncio.wait_for(
+                conn.execute(text("SELECT 1")),
+                timeout=self.DEFAULT_CONNECTION_TIMEOUT
+            )
+            return True
         except Exception as e:
             logger.error(f"Error ensuring pool: {e}")
             return False
+        finally:
+            if conn:
+                try:
+                    await conn.close()
+                except Exception as e:
+                    logger.error(f"Error closing connection in _ensure_pool: {e}")
+
+    @asynccontextmanager
+    async def get_connection(self):
+        """Get a raw database connection with proper cleanup."""
+        conn = None
+        try:
+            conn = await self._engine.connect()
+            yield conn
+        finally:
+            if conn:
+                try:
+                    await conn.close()
+                except Exception as e:
+                    logger.error(f"Error closing connection: {e}")
+
+    async def cleanup_stale_connections(self):
+        """Clean up stale connections in the pool."""
+        if not self._engine:
+            return
+
+        try:
+            pool = self._engine.pool
+            if pool:
+                # Get pool statistics
+                size = pool.size()
+                checkedin = pool.checkedin()
+                overflow = pool.overflow()
+                
+                if overflow > 0 or checkedin > size * 0.8:  # If pool is getting full
+                    logger.info(f"Cleaning up connection pool. Size: {size}, "
+                              f"Checked-in: {checkedin}, Overflow: {overflow}")
+                    
+                    # Force a few connections to close and be recreated
+                    async with self.get_connection() as conn:
+                        await conn.execute(text("SELECT 1"))
+                    
+                    # Let SQLAlchemy know it can dispose of overflow connections
+                    await self._engine.dispose()
+        except Exception as e:
+            logger.error(f"Error cleaning up stale connections: {e}")
+            # Don't raise - this is a background cleanup task
 
     def with_timeout(timeout: float):
         """
@@ -787,41 +907,71 @@ class BaseDatabaseManager(ABC):
             UPDATE {table_name}
             SET {status_column} = :error_status
             WHERE {status_column} = :processing_status
-            AND created_at < NOW() - INTERVAL ':timeout'
+            AND created_at < NOW() - :timeout * INTERVAL '1 minute'
         """
         params = {
             "error_status": self.STATUS_ERROR,
             "processing_status": self.STATUS_PROCESSING,
-            "timeout": f"{timeout_minutes} minutes"
+            "timeout": timeout_minutes
         }
         await self.execute(query, params)
 
     async def reset_pool(self) -> None:
         """Reset the connection pool and recreate engine."""
         try:
-            if self._engine:
-                # Close all active sessions
-                async with self._session_lock:
-                    for session in self._active_sessions.copy():
-                        try:
-                            await session.close()
-                        except Exception as e:
-                            logger.error(f"Error closing session during pool reset: {e}")
-                    self._active_sessions.clear()
-                    self._active_operations = 0
+            logger.info("Starting database pool reset")
+            
+            # First close all active sessions
+            async with self._session_lock:
+                active_session_count = len(self._active_sessions)
+                if active_session_count > 0:
+                    logger.warning(f"Closing {active_session_count} active sessions")
+                    
+                for session in self._active_sessions.copy():
+                    try:
+                        await session.close()
+                    except Exception as e:
+                        logger.error(f"Error closing session during pool reset: {e}")
+                self._active_sessions.clear()
+                self._active_operations = 0
 
-                # Dispose of the engine
-                await self._engine.dispose()
+            # Dispose of the engine if it exists
+            if self._engine:
+                try:
+                    logger.info("Disposing of existing engine")
+                    await self._engine.dispose()
+                except Exception as e:
+                    logger.error(f"Error disposing engine: {e}")
             
-            # Reinitialize the engine
+            # Reset state
+            self._engine = None
+            self._engine_initialized = False
+            self._session_factory = None
+            
+            # Reinitialize the engine with fresh settings
+            logger.info("Reinitializing database engine")
             await self._initialize_engine()
+            self._engine_initialized = True
             
-            # Verify new pool
+            # Verify the new pool
+            logger.info("Verifying new connection pool")
             if not await self._ensure_pool():
                 raise DatabaseError("Failed to verify new connection pool")
+            
+            # Reset monitoring stats
+            self._last_pool_check = time.time()
+            self._pool_health_status = True
+            self._circuit_breaker['failures'] = 0
+            self._circuit_breaker['status'] = 'closed'
+            
+            logger.info("Database pool reset completed successfully")
                 
         except Exception as e:
             logger.error(f"Error resetting connection pool: {e}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
+            # Ensure we're in a known bad state
+            self._pool_health_status = False
+            self._engine_initialized = False
             raise DatabaseError(f"Failed to reset connection pool: {str(e)}")
 
     async def close(self) -> None:

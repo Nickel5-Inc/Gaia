@@ -629,6 +629,10 @@ class GaiaValidator:
             db_check_duration = time.time() - db_check_start
             if db_check_duration > 5:  # Log slow DB checks
                 logger.warning(f"Slow DB health check: {db_check_duration:.2f}s")
+            
+            # Add periodic connection cleanup
+            await self.database_manager.cleanup_stale_connections()
+            
         except Exception as e:
             logger.error(f"Database health check failed: {e}")
             raise
