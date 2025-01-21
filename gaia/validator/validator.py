@@ -640,9 +640,9 @@ class GaiaValidator:
             try:
                 # Reset any hanging operations using database manager methods
                 update_queries = [
-                    ("UPDATE soil_moisture_predictions SET status = 'pending' WHERE status = 'processing'",),
-                    ("UPDATE geomagnetic_predictions SET status = 'pending' WHERE status = 'processing'",),
-                    ("UPDATE score_table SET status = 'pending' WHERE status = 'processing'",)
+                    "UPDATE soil_moisture_predictions SET status = 'pending' WHERE status = 'processing'",
+                    "UPDATE geomagnetic_predictions SET status = 'pending' WHERE status = 'processing'",
+                    "UPDATE score_table SET status = 'pending' WHERE status = 'processing'"
                 ]
                 
                 for query in update_queries:
