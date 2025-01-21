@@ -479,10 +479,10 @@ class BaseDatabaseManager(ABC):
                 async with self._session_lock:
                     session = self._session_factory()
                     session_id = id(session)
-                    logger.debug(
-                        f"Creating new session {session_id} from "
-                        f"{caller.filename}:{caller.lineno} ({caller.name})"
-                    )
+                    # logger.debug(
+                    #     f"Creating new session {session_id} from "
+                    #     f"{caller.filename}:{caller.lineno} ({caller.name})"
+                    # )
                     self._active_sessions.add(session)
                     self._active_operations += 1
                 
@@ -508,10 +508,10 @@ class BaseDatabaseManager(ABC):
                         self._active_sessions.remove(session)
                         self._active_operations -= 1
                     await session.close()
-                    logger.debug(
-                        f"Closed session {session_id} from "
-                        f"{caller.filename}:{caller.lineno}"
-                    )
+                    # logger.debug(
+                    #     f"Closed session {session_id} from "
+                    #     f"{caller.filename}:{caller.lineno}"
+                    # )
                     
                     # Log long-running sessions
                     duration = time.time() - start_time
