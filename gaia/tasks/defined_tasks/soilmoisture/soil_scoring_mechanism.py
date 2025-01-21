@@ -35,8 +35,9 @@ class SoilScoringMechanism(ScoringMechanism):
     beta: float = Field(default=0.1, description="Sigmoid midpoint parameter")
     baseline_rmse: float = Field(default=50, description="Baseline RMSE value")
     db_manager: Any = Field(default=None)
+    task: Any = Field(default=None, description="Reference to the parent task")
 
-    def __init__(self, baseline_rmse: float = 50, alpha: float = 10, beta: float = 0.1, db_manager=None):
+    def __init__(self, baseline_rmse: float = 50, alpha: float = 10, beta: float = 0.1, db_manager=None, task=None):
         super().__init__(
             name="SoilMoistureScoringMechanism",
             description="Evaluates soil moisture predictions using RMSE and SSIM",
@@ -47,6 +48,7 @@ class SoilScoringMechanism(ScoringMechanism):
         self.beta = beta
         self.baseline_rmse = baseline_rmse
         self.db_manager = db_manager
+        self.task = task
 
     def sigmoid_rmse(self, rmse: float) -> float:
         """Convert RMSE to score using sigmoid function. (higher is better)"""

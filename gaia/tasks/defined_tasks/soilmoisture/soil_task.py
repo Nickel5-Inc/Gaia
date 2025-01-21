@@ -80,12 +80,19 @@ class SoilMoistureTask(Task):
             metadata=SoilMoistureMetadata(),
             inputs=SoilMoistureInputs(),
             outputs=SoilMoistureOutputs(),
-            scoring_mechanism=SoilScoringMechanism(db_manager=db_manager),
+            scoring_mechanism=SoilScoringMechanism(
+                db_manager=db_manager,
+                baseline_rmse=50,
+                alpha=10,
+                beta=0.1,
+                task=None
+            ),
         )
 
         self.db_manager = db_manager
         self.node_type = node_type
         self.test_mode = test_mode
+        self.scoring_mechanism.task = self
 
         if node_type == "validator":
             self.validator_preprocessing = SoilValidatorPreprocessing()
@@ -153,11 +160,17 @@ class SoilMoistureTask(Task):
                     ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
 
                     clear_query = """
-                        DELETE FROM soil_moisture_regions 
-                        WHERE target_time = :target_time
+                        DELETE FROM soil_moisture_regions r
+                        USING soil_moisture_predictions p
+                        WHERE r.id = p.region_id
+                        AND (
+                            p.status = 'scored'
+                            OR r.target_time < :cutoff_time
+                        )
                     """
-                    await self.db_manager.execute(clear_query, {"target_time": target_smap_time})
-                    logger.info(f"Cleared existing regions for target time {target_smap_time}")
+                    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+                    await self.db_manager.execute(clear_query, {"cutoff_time": cutoff_time})
+                    logger.info("Cleared old/scored regions in test mode")
 
                     await validator.update_task_status('soil', 'processing', 'data_download')
                     await self.validator_preprocessing.get_daily_regions(
@@ -235,6 +248,10 @@ class SoilMoistureTask(Task):
                                         WHERE id = :region_id
                                     """
                                     await self.db_manager.execute(update_query, {"region_id": region["id"]})
+
+                                    # In test mode, attempt to score immediately
+                                    logger.info("Test mode: Attempting immediate scoring")
+                                    await self.validator_score()
 
                             except Exception as e:
                                 logger.error(f"Error preparing region: {str(e)}")
