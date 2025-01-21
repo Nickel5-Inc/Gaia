@@ -219,19 +219,18 @@ class SoilScoringMechanism(ScoringMechanism):
 
             if model_predictions.size(2) == 0 or model_predictions.size(3) == 0:
                 logger.error(f"Empty model predictions detected with shape: {model_predictions.shape}")
-                # WRITE operation - use transaction for deleting invalid prediction
-                async with self.db_manager.transaction() as session:
-                    await session.execute(
-                        text("""
-                            DELETE FROM soil_moisture_predictions 
-                            WHERE miner_uid = :miner_id 
-                            AND target_time = :target_time
-                        """),
-                        {
-                            "miner_id": miner_id,
-                            "target_time": target_date
-                        }
-                    )
+                # WRITE operation - use session for deleting invalid prediction
+                await self.db_manager.execute(
+                    text("""
+                        DELETE FROM soil_moisture_predictions 
+                        WHERE miner_uid = :miner_id 
+                        AND target_time = :target_time
+                    """),
+                    {
+                        "miner_id": miner_id,
+                        "target_time": target_date
+                    }
+                )
                 logger.info(f"Deleted invalid prediction for miner {miner_id} at {target_date}")
                 return None
 
