@@ -815,7 +815,7 @@ class GaiaValidator:
                 self.status_logger(),
                 self.main_scoring(),
                 self.handle_miner_deregistration_loop(),
-                #self.miner_score_sender.run_async(), TODO: add back in
+                self.miner_score_sender.run_async(),
                 self.check_for_updates()
             ]
             
@@ -1278,8 +1278,10 @@ class GaiaValidator:
                 if weight != 0.0:
                     # Normalize to [0,1]
                     normalized_weight = weight / max_weight
-                    # Center around 0.5 and apply steep sigmoid
-                    exponent = max(min(-20 * (normalized_weight - 0.5), 709), -709)
+                    # Apply power law to amplify differences
+                    powered_weight = normalized_weight ** 3
+                    # Center around 0.7 and apply very steep sigmoid
+                    exponent = max(min(-50 * (powered_weight - 0.7), 709), -709)
                     new_weights[idx] = 1 / (1 + math.exp(exponent))
             
             # Normalize final weights to sum to 1
