@@ -60,13 +60,13 @@ class SoilScoringMechanism(ScoringMechanism):
         rootzone_rmse = metrics["validation_metrics"].get("rootzone_rmse", self.beta)
         surface_ssim = metrics["validation_metrics"].get("surface_ssim", 0)
         rootzone_ssim = metrics["validation_metrics"].get("rootzone_ssim", 0)
-        surface_score = 0.6 * self.sigmoid_rmse(torch.tensor(surface_rmse)) + 0.4 * (
+        surface_score = 0.8 * self.sigmoid_rmse(torch.tensor(surface_rmse)) + 0.2 * (
             (surface_ssim + 1) / 2
         )
-        rootzone_score = 0.6 * self.sigmoid_rmse(torch.tensor(rootzone_rmse)) + 0.4 * (
+        rootzone_score = 0.8 * self.sigmoid_rmse(torch.tensor(rootzone_rmse)) + 0.2 * (
             (rootzone_ssim + 1) / 2
         )
-        final_score = 0.5 * surface_score + 0.5 * rootzone_score
+        final_score = 0.6 * surface_score + 0.4 * rootzone_score
 
         return final_score.item()
 
@@ -302,7 +302,7 @@ class SoilScoringMechanism(ScoringMechanism):
                         surface_pred_masked,
                         surface_truth_masked,
                         data_range=data_range,
-                        kernel_size=3,
+                        kernel_size=9,
                     ))
                     results["validation_metrics"]["surface_ssim"] = surface_ssim.item()
 
@@ -330,7 +330,7 @@ class SoilScoringMechanism(ScoringMechanism):
                         rootzone_pred_masked,
                         rootzone_truth_masked,
                         data_range=data_range,
-                        kernel_size=3,
+                        kernel_size=9,
                     ))
                     results["validation_metrics"]["rootzone_ssim"] = rootzone_ssim.item()
 
