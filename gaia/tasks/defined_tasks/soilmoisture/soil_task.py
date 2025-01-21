@@ -503,22 +503,34 @@ class SoilMoistureTask(Task):
                             continue
 
                     prediction_data = {
-                        "region_id": metadata["region_id"],
-                        "miner_uid": miner_uid,
-                        "miner_hotkey": miner_hotkey,
-                        "target_time": metadata["target_time"],
                         "surface_sm": response_data.get("surface_sm", []),
                         "rootzone_sm": response_data.get("rootzone_sm", []),
                         "uncertainty_surface": response_data.get("uncertainty_surface"),
                         "uncertainty_rootzone": response_data.get("uncertainty_rootzone"),
                         "sentinel_bounds": response_data.get("sentinel_bounds", metadata.get("sentinel_bounds")),
                         "sentinel_crs": response_data.get("sentinel_crs", metadata.get("sentinel_crs")),
+                        "target_time": metadata["target_time"]
+                    }
+                    if not SoilMoisturePrediction.validate_prediction(prediction_data):
+                        logger.warning(f"Skipping invalid prediction from miner {miner_hotkey}")
+                        continue
+
+                    db_prediction_data = {
+                        "region_id": metadata["region_id"],
+                        "miner_uid": miner_uid,
+                        "miner_hotkey": miner_hotkey,
+                        "target_time": metadata["target_time"],
+                        "surface_sm": prediction_data["surface_sm"],
+                        "rootzone_sm": prediction_data["rootzone_sm"],
+                        "uncertainty_surface": prediction_data["uncertainty_surface"],
+                        "uncertainty_rootzone": prediction_data["uncertainty_rootzone"],
+                        "sentinel_bounds": prediction_data["sentinel_bounds"],
+                        "sentinel_crs": prediction_data["sentinel_crs"],
                         "status": "sent_to_miner",
                     }
 
-                    logger.info(f"About to insert prediction_data for miner {miner_hotkey}: {prediction_data}")
+                    logger.info(f"About to insert prediction_data for miner {miner_hotkey}: {db_prediction_data}")
 
-                    # Insert prediction
                     insert_query = """
                         INSERT INTO soil_moisture_predictions 
                         (region_id, miner_uid, miner_hotkey, target_time, surface_sm, rootzone_sm, 
@@ -530,7 +542,7 @@ class SoilMoistureTask(Task):
                         :uncertainty_surface, :uncertainty_rootzone, :sentinel_bounds,
                         :sentinel_crs, :status)
                     """
-                    await self.db_manager.execute(insert_query, prediction_data)
+                    await self.db_manager.execute(insert_query, db_prediction_data)
 
                     # Verify insertion
                     verify_query = """
@@ -540,8 +552,8 @@ class SoilMoistureTask(Task):
                         AND target_time = :target_time
                     """
                     verify_params = {
-                        "hotkey": prediction_data["miner_hotkey"], 
-                        "target_time": prediction_data["target_time"]
+                        "hotkey": db_prediction_data["miner_hotkey"], 
+                        "target_time": db_prediction_data["target_time"]
                     }
                     result = await self.db_manager.fetch_one(verify_query, verify_params)
                     logger.info(f"Verification found {result['count']} matching records")

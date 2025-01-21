@@ -692,38 +692,62 @@ class GeomagneticTask(Task):
 
             for hotkey, response in responses.items():
                 try:
-                    predicted_value = float(
-                        response.get("predicted_values", "nan")
-                    )  # Ensure numeric
-                    miner_hotkey = hotkey  # Use the key from responses dict
+                    if isinstance(response, dict) and "text" in response:
+                        try:
+                            response = json.loads(response["text"])
+                            logger.info(f"Parsed text response: {response}")
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse response text from {hotkey}: {e}")
+                            continue
+
+                    logger.info(f"Raw response from miner {hotkey}: {response}")
+
+                    predicted_value = None
+                    if "predicted_values" in response:
+                        predicted_value = response["predicted_values"]
+                        logger.info(f"Found prediction using predicted_values key: {predicted_value}")
+                    if "predicted_value" in response:
+                        predicted_value = response["predicted_value"]
+                        logger.info(f"Found prediction using predicted_value key: {predicted_value}")
+                    
+                    if predicted_value is None:
+                        logger.error(f"No valid prediction found in response from {hotkey} - needs either predicted_value or predicted_values")
+                        continue
+
+                    try:
+                        predicted_value = float(predicted_value)
+                    except (TypeError, ValueError) as e:
+                        logger.error(f"Invalid prediction from {hotkey}: {predicted_value}")
+                        continue
+
+                    logger.info("=" * 50)
+                    logger.info(f"Received prediction from miner:")
+                    logger.info(f"Miner Hotkey: {hotkey}")
+                    logger.info(f"Predicted Value: {predicted_value}")
+                    logger.info(f"Timestamp: {current_hour_start}")
+                    logger.info("=" * 50)
 
                     result = await self.db_manager.fetch_one(
                         """
                         SELECT uid FROM node_table 
                         WHERE hotkey = :miner_hotkey
                         """,
-                        {"miner_hotkey": miner_hotkey}
+                        {"miner_hotkey": hotkey}
                     )
                     
                     if not result:
-                        logger.warning(f"No UID found for hotkey {miner_hotkey}")
+                        logger.warning(f"No UID found for hotkey {hotkey}")
                         continue
                     miner_uid = str(result["uid"])
-                    logger.info(f"Found miner UID {miner_uid} for hotkey {miner_hotkey}")
+                    logger.info(f"Found miner UID {miner_uid} for hotkey {hotkey}")
 
-                    # Validate response
-                    if predicted_value is None:
-                        logger.warning(f"Missing predicted value in response: {response}")
-                        continue
-
-                    # Add to queue with proper timestamp handling
-                    logger.info(f"Adding prediction to queue for {miner_hotkey} with value {predicted_value}")
+                    logger.info(f"Adding prediction to queue for {hotkey} with value {predicted_value}")
                     await self.add_prediction_to_queue(
                         miner_uid=miner_uid,
-                        miner_hotkey=miner_hotkey,
+                        miner_hotkey=hotkey,
                         predicted_value=predicted_value,
                         query_time=current_hour_start,
-                        status="pending",  # Explicitly set status
+                        status="pending",
                     )
 
                 except Exception as e:
