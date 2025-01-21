@@ -215,7 +215,18 @@ class GaiaValidator:
             logger.info("Stopping task acceptance...")
             await self.update_task_status('all', 'stopping')
             
-            # Wait briefly for current operations to complete
+            # Cancel any running tasks in the main loop
+            for task in asyncio.all_tasks():
+                if task != asyncio.current_task():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logger.error(f"Error cancelling task: {e}")
+            
+            # Wait briefly for operations to complete
             await asyncio.sleep(5)
             
             # Cleanup resources
@@ -230,6 +241,16 @@ class GaiaValidator:
                 await self.database_manager.close()
             
             self._cleanup_done = True
+            
+            # Create cleanup completion flag file
+            cleanup_file = "/tmp/validator_cleanup_done"
+            try:
+                with open(cleanup_file, 'w') as f:
+                    f.write(str(time.time()))
+                logger.info("Created cleanup completion flag")
+            except Exception as e:
+                logger.error(f"Failed to create cleanup flag file: {e}")
+            
             logger.info("Graceful shutdown completed")
             
         except Exception as e:

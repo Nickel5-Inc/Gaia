@@ -278,16 +278,21 @@ async def restart_pm2_process(process_name):
                 stderr=asyncio.subprocess.PIPE
             )
             
-            # Wait for SIGTERM to be processed
-            await asyncio.sleep(15)  # Increased wait time for cleanup
-            
-            # Check if process is still running
-            status_proc = await asyncio.create_subprocess_exec(
-                "pm2", "show", process_name,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await status_proc.communicate()
+            # Wait for process to indicate cleanup is done via its status file
+            cleanup_file = "/tmp/validator_cleanup_done"
+            max_wait = 60  # Maximum seconds to wait for cleanup
+            wait_interval = 1
+            for _ in range(max_wait // wait_interval):
+                if os.path.exists(cleanup_file):
+                    logger.info("Detected cleanup completion flag, proceeding with restart")
+                    try:
+                        os.remove(cleanup_file)  # Clean up the file
+                    except Exception as e:
+                        logger.warning(f"Could not remove cleanup file: {e}")
+                    break
+                await asyncio.sleep(wait_interval)
+            else:
+                logger.warning("Cleanup completion not detected after timeout, proceeding with restart")
             
             # Then do the restart
             logger.info(f"Restarting process {process_name}...")
@@ -306,15 +311,12 @@ async def restart_pm2_process(process_name):
             logger.warning(f"PM2 restart failed on attempt {attempt + 1}: {stderr.decode()}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 * (attempt + 1))
-                
-        except asyncio.TimeoutError:
-            logger.error(f"PM2 restart timed out on attempt {attempt + 1}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(5 * (attempt + 1))
+            
         except Exception as e:
-            logger.error(f"Error during PM2 restart attempt {attempt + 1}: {e}")
+            logger.error(f"Error during PM2 restart attempt {attempt + 1}: {str(e)}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 * (attempt + 1))
+            continue
     
     return False
 
