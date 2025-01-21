@@ -11,6 +11,7 @@ os.environ["NODE_TYPE"] = "validator"
 import asyncio
 import ssl
 import traceback
+import random
 from typing import Any, Optional, List, Dict, Set
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
@@ -55,11 +56,12 @@ class GaiaValidator:
         self.soil_task = SoilMoistureTask(
             db_manager=self.database_manager,
             node_type="validator",
-            test_mode=args.test_soil,
+            test_mode=args.test,
         )
         self.geomagnetic_task = GeomagneticTask(
             node_type="validator",
-            db_manager=self.database_manager
+            db_manager=self.database_manager,
+            test_mode=args.test
         )
         self.weights = [0.0] * 256
         self.last_set_weights_block = 0
@@ -314,6 +316,7 @@ class GaiaValidator:
             return True
         except Exception as e:
             logger.error(f"Error setting up neuron: {e}")
+            logger.error(traceback.format_exc())
             return False
 
     def custom_serializer(self, obj):
@@ -340,7 +343,14 @@ class GaiaValidator:
             responses = {}
             self.metagraph.sync_nodes()
 
-            for miner_hotkey, node in self.metagraph.nodes.items():
+            # In test mode, select 10 random miners
+            miners_to_query = self.metagraph.nodes
+            if self.args.test and len(miners_to_query) > 10:
+                hotkeys = random.sample(list(miners_to_query.keys()), 10)
+                miners_to_query = {k: miners_to_query[k] for k in hotkeys}
+                logger.info(f"Test mode: Selected {len(miners_to_query)} random miners to query")
+
+            for miner_hotkey, node in miners_to_query.items():
                 base_url = f"https://{node.ip}:{node.port}"
 
                 try:
@@ -805,7 +815,7 @@ class GaiaValidator:
                 self.status_logger(),
                 self.main_scoring(),
                 self.handle_miner_deregistration_loop(),
-                self.miner_score_sender.run_async(),
+                #self.miner_score_sender.run_async(), TODO: add back in
                 self.check_for_updates()
             ]
             
@@ -1273,9 +1283,9 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--test-soil",
+        "--test",
         action="store_true",
-        help="Run soil moisture task immediately without waiting for windows",
+        help="Run tasks in test mode - runs immediately and with limited scope",
     )
 
     args = parser.parse_args()

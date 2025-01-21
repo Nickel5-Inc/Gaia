@@ -79,9 +79,13 @@ class GeomagneticTask(Task):
         default="validator",
         description="Type of node running the task (validator or miner)"
     )
+    test_mode: bool = Field(
+        default=False,
+        description="Whether to run in test mode (immediate execution, limited scope)"
+    )
 
 
-    def __init__(self, node_type: str, db_manager, **data):
+    def __init__(self, node_type: str, db_manager, test_mode: bool = False, **data):
         """Initialize the task."""
         super().__init__(
             name="GeomagneticTask",
@@ -96,6 +100,7 @@ class GeomagneticTask(Task):
         )
         
         self.node_type = node_type
+        self.test_mode = test_mode
         self.model = None
         
         if self.node_type == "miner":
@@ -196,18 +201,22 @@ class GeomagneticTask(Task):
             try:
                 await validator.update_task_status('geomagnetic', 'active')
                 
-                # Step 1: Align to the top of the next hour
+                # Step 1: Align to the top of the next hour (or wait 5 min in test mode)
                 current_time = datetime.datetime.now(datetime.timezone.utc)
-                next_hour = current_time.replace(
-                    minute=0, second=0, microsecond=0
-                ) + datetime.timedelta(hours=1)
-                sleep_duration = (next_hour - current_time).total_seconds()
+                if not self.test_mode:
+                    next_hour = current_time.replace(
+                        minute=0, second=0, microsecond=0
+                    ) + datetime.timedelta(hours=1)
+                    sleep_duration = (next_hour - current_time).total_seconds()
 
-                logger.info(
-                    f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
-                )
-                await validator.update_task_status('geomagnetic', 'idle')
-                await asyncio.sleep(sleep_duration)
+                    logger.info(
+                        f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
+                    )
+                    await validator.update_task_status('geomagnetic', 'idle')
+                    await asyncio.sleep(sleep_duration)
+                else:
+                    next_hour = current_time
+                    logger.info("Test mode: Running immediately, will sleep for 5 minutes after completion")
 
                 logger.info("Starting GeomagneticTask execution...")
 
@@ -227,6 +236,11 @@ class GeomagneticTask(Task):
                 await self._process_scores(validator, current_hour_start, next_hour)
                 
                 await validator.update_task_status('geomagnetic', 'idle')
+
+                # In test mode, sleep for 5 minutes before next iteration
+                if self.test_mode:
+                    logger.info("Test mode: Sleeping for 5 minutes before next execution")
+                    await asyncio.sleep(300)
 
             except Exception as e:
                 logger.error(f"Unexpected error in validator_execute loop: {e}")
@@ -678,6 +692,23 @@ class GeomagneticTask(Task):
             logger.error(f"{traceback.format_exc()}")
             raise
 
+    def extract_prediction(self, response):
+        """Recursively extract prediction from response, handling various formats."""
+        if isinstance(response, dict):
+            # Direct access to predicted values
+            if "predicted_values" in response:
+                return response["predicted_values"]
+            if "predicted_value" in response:
+                return response["predicted_value"]
+            # If response has text field that might be JSON
+            if "text" in response:
+                try:
+                    parsed = json.loads(response["text"])
+                    return self.extract_prediction(parsed)
+                except json.JSONDecodeError:
+                    return None
+        return None
+
     async def process_miner_responses(
         self,
         responses: Dict[str, Any],
@@ -692,26 +723,11 @@ class GeomagneticTask(Task):
 
             for hotkey, response in responses.items():
                 try:
-                    if isinstance(response, dict) and "text" in response:
-                        try:
-                            response = json.loads(response["text"])
-                            logger.info(f"Parsed text response: {response}")
-                        except json.JSONDecodeError as e:
-                            logger.error(f"Failed to parse response text from {hotkey}: {e}")
-                            continue
-
                     logger.info(f"Raw response from miner {hotkey}: {response}")
-
-                    predicted_value = None
-                    if "predicted_values" in response:
-                        predicted_value = response["predicted_values"]
-                        logger.info(f"Found prediction using predicted_values key: {predicted_value}")
-                    if "predicted_value" in response:
-                        predicted_value = response["predicted_value"]
-                        logger.info(f"Found prediction using predicted_value key: {predicted_value}")
                     
+                    predicted_value = self.extract_prediction(response)
                     if predicted_value is None:
-                        logger.error(f"No valid prediction found in response from {hotkey} - needs either predicted_value or predicted_values")
+                        logger.error(f"No valid prediction found in response from {hotkey}")
                         continue
 
                     try:
