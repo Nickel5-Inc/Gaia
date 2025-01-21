@@ -1179,33 +1179,71 @@ class GaiaValidator:
                 continue
 
     async def _calc_task_weights(self) -> Optional[List[float]]:
-        """Calculate and normalize weights from task scores."""
+        """Calculate and normalize weights from task scores using decaying 3-day average."""
         logger.info("Syncing metagraph nodes...")
         self.metagraph.sync_nodes()
         logger.info("Metagraph synced. Fetching recent scores...")
 
-        three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+        now = datetime.now(timezone.utc)
+        three_days_ago = now - timedelta(days=3)
         
         query = """
-        SELECT score 
+        SELECT score, created_at 
         FROM score_table 
         WHERE task_name = :task_name
         AND created_at >= :start_time
-        ORDER BY created_at DESC 
-        LIMIT 1
+        ORDER BY created_at DESC
         """
         
-        geomagnetic_result = await self.database_manager.fetch_one(
+        geomagnetic_results = await self.database_manager.fetch_all(
             query, {"task_name": "geomagnetic", "start_time": three_days_ago}
         )
-        soil_result = await self.database_manager.fetch_one(
+        soil_results = await self.database_manager.fetch_all(
             query, {"task_name": "soil_moisture", "start_time": three_days_ago}
         )
 
-        geomagnetic_scores = geomagnetic_result["score"] if geomagnetic_result else [float("nan")] * 256
-        soil_scores = soil_result["score"] if soil_result else [float("nan")] * 256
+        # Initialize score arrays
+        geomagnetic_scores = [float("nan")] * 256
+        soil_scores = [float("nan")] * 256
 
-        logger.info("Recent scores fetched. Calculating aggregate scores...")
+        # Process scores with time decay
+        if geomagnetic_results:
+            geo_scores_by_uid = [[] for _ in range(256)]
+            for result in geomagnetic_results:
+                age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                decay = math.exp(-age_days * math.log(2))  # Decay by half each day
+                scores = result['score']
+                for uid in range(256):
+                    if not math.isnan(scores[uid]):
+                        geo_scores_by_uid[uid].append((scores[uid], decay))
+            
+            # Calculate weighted averages
+            for uid in range(256):
+                if geo_scores_by_uid[uid]:
+                    weighted_sum = sum(score * weight for score, weight in geo_scores_by_uid[uid])
+                    weight_sum = sum(weight for _, weight in geo_scores_by_uid[uid])
+                    if weight_sum > 0:
+                        geomagnetic_scores[uid] = weighted_sum / weight_sum
+
+        if soil_results:
+            soil_scores_by_uid = [[] for _ in range(256)]
+            for result in soil_results:
+                age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                decay = math.exp(-age_days * math.log(2))  # Decay by half each day
+                scores = result['score']
+                for uid in range(256):
+                    if not math.isnan(scores[uid]):
+                        soil_scores_by_uid[uid].append((scores[uid], decay))
+            
+            # Calculate weighted averages
+            for uid in range(256):
+                if soil_scores_by_uid[uid]:
+                    weighted_sum = sum(score * weight for score, weight in soil_scores_by_uid[uid])
+                    weight_sum = sum(weight for _, weight in soil_scores_by_uid[uid])
+                    if weight_sum > 0:
+                        soil_scores[uid] = weighted_sum / weight_sum
+
+        logger.info("Recent scores fetched and decay-weighted. Calculating aggregate scores...")
 
         weights = [0.0] * 256
         for idx in range(256):
@@ -1231,36 +1269,28 @@ class GaiaValidator:
 
         logger.info(f"Weights before normalization: {weights}")
 
-        non_zero_weights = [w for w in weights if w != 0.0]
-        if non_zero_weights:
-            sorted_indices = sorted(
-                range(len(weights)),
-                key=lambda k: (weights[k] if weights[k] != 0.0 else float("-inf")),
-            )
-
+        # Get max weight for normalization
+        max_weight = max(w for w in weights if w != 0.0)
+        if max_weight > 0:
+            # Normalize weights to [0,1] and apply sigmoid
             new_weights = [0.0] * len(weights)
-            for rank, idx in enumerate(sorted_indices):
-                if weights[idx] != 0.0:
-                    try:
-                        normalized_rank = 1.0 - (rank / len(non_zero_weights))
-                        exponent = max(min(-20 * (normalized_rank - 0.5), 709), -709)
-                        new_weights[idx] = 1 / (1 + math.exp(exponent))
-                    except OverflowError:
-                        logger.warning(f"Overflow prevented for rank {rank}, idx {idx}")
-                        if normalized_rank > 0.5:
-                            new_weights[idx] = 1.0
-                        else:
-                            new_weights[idx] = 0.0
-
-            total = sum(new_weights)
-            if total > 0:
-                return [w / total for w in new_weights]
-            else:
-                logger.warning("No positive weights after normalization")
-                return None
-        else:
-            logger.warning("All weights are zero or nan, skipping weight setting")
-            return None
+            for idx, weight in enumerate(weights):
+                if weight != 0.0:
+                    # Normalize to [0,1]
+                    normalized_weight = weight / max_weight
+                    # Center around 0.5 and apply steep sigmoid
+                    exponent = max(min(-20 * (normalized_weight - 0.5), 709), -709)
+                    new_weights[idx] = 1 / (1 + math.exp(exponent))
+            
+            # Normalize final weights to sum to 1
+            weight_sum = sum(new_weights)
+            if weight_sum > 0:
+                new_weights = [w / weight_sum for w in new_weights]
+                logger.info(f"Final normalized weights: {new_weights}")
+                return new_weights
+            
+        logger.warning("No valid weights calculated")
+        return None
 
     async def update_last_weights_block(self):
         try:
