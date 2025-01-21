@@ -140,9 +140,13 @@ class SoilMoistureTask(Task):
                 await validator.update_task_status('soil', 'active')
                 current_time = datetime.now(timezone.utc)
 
-                if current_time.minute % 1 == 0:
+                # Only check for scoring every 5 minutes instead of every minute
+                if current_time.minute % 5 == 0:
                     await validator.update_task_status('soil', 'processing', 'scoring')
                     await self.validator_score()
+                    # Sleep for 60 seconds after scoring to prevent immediate rechecking
+                    await asyncio.sleep(60)
+                    continue
 
                 if self.test_mode:
                     logger.info("Running in test mode - bypassing window checks")
@@ -241,15 +245,20 @@ class SoilMoistureTask(Task):
                 )
 
                 if not current_window:
+                    next_time = self.get_next_preparation_time(current_time)
+                    sleep_seconds = min(
+                        300,  # Cap at 5 minutes
+                        (next_time - current_time).total_seconds()
+                    )
                     logger.info(
                         f"Not in any preparation or execution window: {current_time}"
                     )
                     logger.info(
-                        f"Next soil task time: {self.get_next_preparation_time(current_time)}"
+                        f"Next soil task time: {next_time}"
                     )
-                    logger.info(f"Sleeping for 60 seconds")
+                    logger.info(f"Sleeping for {sleep_seconds} seconds")
                     await validator.update_task_status('soil', 'idle')
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(sleep_seconds)
                     continue
 
                 is_prep = current_window[1] == 30  # If minutes = 30, it's a prep window
@@ -358,6 +367,10 @@ class SoilMoistureTask(Task):
                         )
                         await validator.update_task_status('soil', 'idle')
                         await asyncio.sleep(sleep_seconds)
+
+                # Add sleep at the end of each loop iteration when not in test mode
+                if not self.test_mode:
+                    await asyncio.sleep(60)  # Sleep for 60 seconds between checks
 
             except Exception as e:
                 logger.error(f"Error in validator_execute: {e}")
@@ -599,8 +612,7 @@ class SoilMoistureTask(Task):
             }
             result = await self.db_manager.fetch_all(pending_query, params)
             if not result:
-                await asyncio.sleep(60)
-            logger.debug(f"Found {len(result) if result else 0} pending tasks")
+                await asyncio.sleep(60)  # Sleep for 60 seconds when no tasks are found
             return result
 
         except Exception as e:
