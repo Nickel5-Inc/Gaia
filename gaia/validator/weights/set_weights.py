@@ -24,6 +24,7 @@ class FiberWeightSetter:
         self.netuid = netuid
         self.network = network
         self.substrate = interface.get_substrate(subtensor_network=network)
+        self.nodes = None
         self.keypair = chain_utils.load_hotkey_keypair(
             wallet_name=wallet_name, hotkey_name=hotkey_name
         )
@@ -35,7 +36,7 @@ class FiberWeightSetter:
             logger.warning("No weights provided")
             return None
 
-        nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
+        nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid) if self.nodes is None else self.nodes
         node_ids = [node.node_id for node in nodes]
 
         aligned_weights = [
@@ -78,8 +79,8 @@ class FiberWeightSetter:
             logger.info(f"\nSetting weights for subnet {self.netuid}...")
 
             self.substrate = interface.get_substrate(subtensor_network=self.network)
-            nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
-            logger.info(f"Found {len(nodes)} nodes in subnet")
+            self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
+            logger.info(f"Found {len(self.nodes)} nodes in subnet")
 
             validator_uid = self.substrate.query(
                 "SubtensorModule",
@@ -102,10 +103,11 @@ class FiberWeightSetter:
                 return False
 
             try:
+                logger.info(f"Setting weights for {len(self.nodes)} nodes")
                 await self._async_set_node_weights(
                     substrate=self.substrate,
                     keypair=self.keypair,
-                    node_ids=[node.node_id for node in nodes],
+                    node_ids=[node.node_id for node in self.nodes],
                     node_weights=calculated_weights.tolist(),
                     netuid=self.netuid,
                     validator_node_id=validator_uid,
@@ -131,7 +133,7 @@ class FiberWeightSetter:
             loop = asyncio.get_event_loop()
             return await asyncio.wait_for(
                 loop.run_in_executor(None, lambda: w.set_node_weights(**kwargs)),
-                timeout=120
+                timeout=340
             )
         except asyncio.TimeoutError:
             logger.error("Weight setting timed out after 120 seconds")

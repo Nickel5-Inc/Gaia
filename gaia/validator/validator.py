@@ -900,7 +900,7 @@ class GaiaValidator:
                                     # Set weights with timeout
                                     success = await asyncio.wait_for(
                                         weight_setter.set_weights(normalized_weights),
-                                        timeout=180
+                                        timeout=340
                                     )
                                     
                                     if success:
