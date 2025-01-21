@@ -191,10 +191,9 @@ class GeomagneticTask(Task):
         """
         Executes the validator workflow:
         - Aligns execution to start at the top of each UTC hour.
-        - Fetches predictions for the last UTC hour.
-        - Fetches ground truth data for the current UTC hour.
-        - Scores predictions against the ground truth.
-        - Archives scored predictions in the history table or file.
+        - At hour N:
+            - Query miners for new predictions
+            - Score predictions collected during hour N-1
         - Runs in a continuous loop.
         """
         while True:
@@ -224,16 +223,17 @@ class GeomagneticTask(Task):
                 await validator.update_task_status('geomagnetic', 'processing', 'data_fetch')
                 timestamp, dst_value, historical_data = await self._fetch_geomag_data()
 
-                # Step 3: Query Miners
-                current_hour_start = next_hour - datetime.timedelta(hours=1)
+                # Step 3: Query Miners for predictions
                 await validator.update_task_status('geomagnetic', 'processing', 'miner_query')
                 await self._query_miners(
-                    validator, timestamp, dst_value, historical_data, current_hour_start
+                    validator, timestamp, dst_value, historical_data, next_hour
                 )
+                logger.info(f"Collected predictions at hour {next_hour}")
 
-                # Step 4: Process Scores
+                # Step 4: Score predictions from previous hour
+                previous_hour = next_hour - datetime.timedelta(hours=1)
                 await validator.update_task_status('geomagnetic', 'processing', 'scoring')
-                await self._process_scores(validator, current_hour_start, next_hour)
+                await self._process_scores(validator, previous_hour)
                 
                 await validator.update_task_status('geomagnetic', 'idle')
 
@@ -302,24 +302,36 @@ class GeomagneticTask(Task):
         await self.process_miner_responses(responses, current_hour_start, validator)
         logger.info(f"Added {len(responses)} predictions to the database")
 
-    async def _process_scores(self, validator, current_hour_start, next_hour):
-        """Process and archive scores for the previous hour."""
+    async def _process_scores(self, validator, query_hour):
+        """
+        Process and archive scores for predictions collected during the specified hour.
+        
+        Args:
+            validator: The validator instance
+            query_hour: The hour during which predictions were collected
+        """
         # Fetch Ground Truth
         ground_truth_value = await self.fetch_ground_truth()
         if ground_truth_value is None:
             logger.warning("Ground truth data not available. Skipping scoring.")
             return
 
-        # Score Predictions and Archive Results
-        last_hour_start = current_hour_start
-        last_hour_end = next_hour.replace(minute=0, second=0, microsecond=0)
-        current_time = datetime.datetime.now(datetime.timezone.utc)  # Add this line
+        # Get predictions collected during the specified hour
+        hour_start = query_hour
+        hour_end = query_hour + datetime.timedelta(hours=1)
 
         logger.info(
-            f"Fetching predictions between {last_hour_start} and {last_hour_end}"
+            f"Scoring predictions collected between {hour_start} and {hour_end}"
         )
-        tasks = await self.get_tasks_for_hour(last_hour_start, last_hour_end, validator)
+        
+        tasks = await self.get_tasks_for_hour(hour_start, hour_end, validator)
+        if not tasks:
+            logger.info(f"No predictions found for collection hour {query_hour}")
+            return
+
+        current_time = datetime.datetime.now(datetime.timezone.utc)
         await self.score_tasks(tasks, ground_truth_value, current_time)
+        logger.info(f"Completed scoring {len(tasks)} predictions from hour {query_hour}")
 
     async def get_tasks_for_hour(self, start_time, end_time, validator=None):
         """
