@@ -272,6 +272,7 @@ class SoilMoistureTask(Task):
                         target_time=target_smap_time,
                         ifs_forecast_time=ifs_forecast_time,
                     )
+                    regions = None # take this out if it's a problem, but then we need another solution for L285
                 else:
                     # Get pending regions for this target time
                     query = """
