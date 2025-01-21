@@ -140,11 +140,10 @@ class SoilMoistureTask(Task):
                 await validator.update_task_status('soil', 'active')
                 current_time = datetime.now(timezone.utc)
 
-                # Only check for scoring every 5 minutes instead of every minute
+                # Check for scoring every 5 minutes
                 if current_time.minute % 5 == 0:
                     await validator.update_task_status('soil', 'processing', 'scoring')
                     await self.validator_score()
-                    # Sleep for 60 seconds after scoring to prevent immediate rechecking
                     await asyncio.sleep(60)
                     continue
 
@@ -152,6 +151,13 @@ class SoilMoistureTask(Task):
                     logger.info("Running in test mode - bypassing window checks")
                     target_smap_time = self.get_smap_time_for_validator(current_time)
                     ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
+
+                    clear_query = """
+                        DELETE FROM soil_moisture_regions 
+                        WHERE target_time = :target_time
+                    """
+                    await self.db_manager.execute(clear_query, {"target_time": target_smap_time})
+                    logger.info(f"Cleared existing regions for target time {target_smap_time}")
 
                     await validator.update_task_status('soil', 'processing', 'data_download')
                     await self.validator_preprocessing.get_daily_regions(
@@ -234,9 +240,9 @@ class SoilMoistureTask(Task):
                                 logger.error(f"Error preparing region: {str(e)}")
                                 continue
 
-                    logger.info("Test mode execution complete. Disabling test mode.")
-                    self.test_mode = False
+                    logger.info("Test mode execution complete. Re-running in 10 mins")
                     await validator.update_task_status('soil', 'idle')
+                    await asyncio.sleep(600)
                     continue
 
                 windows = self.get_validator_windows()
@@ -369,9 +375,8 @@ class SoilMoistureTask(Task):
                         await validator.update_task_status('soil', 'idle')
                         await asyncio.sleep(sleep_seconds)
 
-                # Add sleep at the end of each loop iteration when not in test mode
                 if not self.test_mode:
-                    await asyncio.sleep(60)  # Sleep for 60 seconds between checks
+                    await asyncio.sleep(60)
 
             except Exception as e:
                 logger.error(f"Error in validator_execute: {e}")
@@ -572,8 +577,12 @@ class SoilMoistureTask(Task):
 
     async def get_pending_tasks(self):
         """Get tasks that are ready for scoring and haven't been scored yet."""
-        scoring_time = datetime.now(timezone.utc)# - self.scoring_delay
-        scoring_time = scoring_time.replace(hour=19, minute=30, second=0, microsecond=0) # this is for testing
+
+        if self.test_mode: # Force scoring to use old data in test mode
+            scoring_time = datetime.now(timezone.utc)
+            scoring_time = scoring_time.replace(hour=19, minute=30, second=0, microsecond=0)
+        else:
+            scoring_time = datetime.now(timezone.utc) - self.scoring_delay
         
         try:
             # Get task status counts for debugging
@@ -727,7 +736,7 @@ class SoilMoistureTask(Task):
             for target_time, tasks in tasks_by_time.items():
                 logger.info(f"Processing {len(tasks)} predictions for timestamp {target_time}")
                 
-                smap_url = construct_smap_url(target_time)
+                smap_url = construct_smap_url(target_time, test_mode=self.test_mode)
                 temp_file = None
                 temp_path = None
                 try:

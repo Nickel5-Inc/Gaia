@@ -50,9 +50,15 @@ class SoilMoisturePrediction(BaseModel):
             if isinstance(data.get("rootzone_sm"), list):
                 data["rootzone_sm"] = np.array(data["rootzone_sm"], dtype=np.float32)
 
-            expected_shape = (1, 2, 11, 11)
-            if data["surface_sm"].shape != expected_shape or data["rootzone_sm"].shape != expected_shape:
-                logger.warning(f"Invalid prediction shape - expected {expected_shape}")
+            # Check array shapes - must be 11x11
+            surface_shape = data["surface_sm"].shape
+            rootzone_shape = data["rootzone_sm"].shape
+            
+            logger.info(f"Validating prediction shapes - surface: {surface_shape}, rootzone: {rootzone_shape}")
+            
+            if surface_shape != (11, 11) or rootzone_shape != (11, 11):
+                logger.warning(f"Invalid prediction shape - surface: {surface_shape}, rootzone: {rootzone_shape}")
+                logger.warning(f"Expected shape: (11, 11)")
                 return False
 
             if np.isnan(data["surface_sm"]).any() or np.isnan(data["rootzone_sm"]).any():

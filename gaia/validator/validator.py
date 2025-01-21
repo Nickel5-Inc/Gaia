@@ -423,7 +423,7 @@ class GaiaValidator:
                 try:
                     update_successful = await asyncio.wait_for(
                         perform_update(self),
-                        timeout=30  # 30 second timeout
+                        timeout=60  # 60 second timeout
                     )
 
                     if update_successful:

@@ -193,7 +193,8 @@ class SoilScoringMechanism(ScoringMechanism):
         sentinel_bounds = BoundingBox(left=left, bottom=bottom, right=right, top=top)
         sentinel_crs = CRS.from_epsg(int(crs))
 
-        smap_url = construct_smap_url(target_date)
+        test_mode = getattr(self.task, 'test_mode', False)
+        smap_url = construct_smap_url(target_date, test_mode=test_mode)
         temp_file = None
         temp_path = None
         try:
