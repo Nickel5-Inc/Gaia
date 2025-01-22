@@ -1266,16 +1266,22 @@ class GaiaValidator:
             geomagnetic_score = geomagnetic_scores[idx]
             soil_score = soil_scores[idx]
 
+            # Treat 0.0 scores the same as NaN
+            if math.isnan(geomagnetic_score) or geomagnetic_score == 0.0:
+                geomagnetic_score = float('nan')
+            if math.isnan(soil_score) or soil_score == 0.0:
+                soil_score = float('nan')
+
             if math.isnan(geomagnetic_score) and math.isnan(soil_score):
                 weights[idx] = 0.0
-                logger.debug(f"Both scores nan - setting weight to 0")
+                logger.debug(f"Both scores invalid - setting weight to 0")
             elif math.isnan(geomagnetic_score):
                 weights[idx] = 0.5 * soil_score
-                logger.debug(f"Geo score nan - using soil score: {weights[idx]}")
+                logger.debug(f"Geo score invalid - using soil score: {weights[idx]}")
             elif math.isnan(soil_score):
                 geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
                 weights[idx] = 0.5 * geo_normalized
-                logger.debug(f"UID {idx}: Soil score nan - normalized geo score: {geo_normalized} -> weight: {weights[idx]}")
+                logger.debug(f"UID {idx}: Soil score invalid - normalized geo score: {geo_normalized} -> weight: {weights[idx]}")
             else:
                 geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
                 weights[idx] = (0.5 * geo_normalized) + (0.5 * soil_score)
