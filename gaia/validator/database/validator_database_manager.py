@@ -673,15 +673,21 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             raise DatabaseError(f"Failed to update miner info: {str(e)}")
 
     @track_operation('write')
-    async def clear_miner_info(self, index: int):
+    async def clear_miner_info(self, index: int, new_hotkey: Optional[str] = None, new_coldkey: Optional[str] = None):
         """
-        Clear miner information at a specific index, setting values back to NULL.
+        Clear miner information from the node table and history tables.
+        Task-specific cleanup of predictions and scores is handled by the 
+        recalculate_recent_scores methods in each task.
+        If new_hotkey is provided, updates the node table with the new information.
 
         Args:
             index (int): Index in the table (0-255)
+            new_hotkey (str, optional): New hotkey to set after clearing
+            new_coldkey (str, optional): New coldkey to set after clearing
         """
         try:
-            query = """
+            # Clear node table entry
+            node_query = """
             UPDATE node_table 
             SET 
                 hotkey = NULL,
@@ -697,9 +703,35 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 last_updated = CURRENT_TIMESTAMP
             WHERE uid = :index
             """
-            await self.execute(query, {"index": index})
+            await self.execute(node_query, {"index": index})
+
+            # Clear history records
+            geo_history_query = """
+            DELETE FROM geomagnetic_history 
+            WHERE miner_uid = :index
+            """
+            await self.execute(geo_history_query, {"index": index})
+
+            soil_history_query = """
+            DELETE FROM soil_moisture_history 
+            WHERE miner_uid = :index
+            """
+            await self.execute(soil_history_query, {"index": index})
+
+            logger.info(f"Successfully cleared node table entry and history records for miner {index}")
+
+            # Update with new hotkey information if provided
+            if new_hotkey is not None:
+                await self.update_miner_info(
+                    index=index,
+                    hotkey=new_hotkey,
+                    coldkey=new_coldkey or "",  # Default to empty string if not provided
+                )
+                logger.info(f"Updated node table with new hotkey information for index {index}")
+
         except Exception as e:
             logger.error(f"Error clearing miner info for index {index}: {str(e)}")
+            logger.error(traceback.format_exc())
             raise DatabaseError(f"Failed to clear miner info: {str(e)}")
 
     @track_operation('read')

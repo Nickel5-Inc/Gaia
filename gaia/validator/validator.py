@@ -1080,12 +1080,6 @@ class GaiaValidator:
     async def handle_miner_deregistration_loop(self) -> None:
         """
         Continuously monitor for deregistered miners and handle cleanup of their data.
-        
-        This method runs in an infinite loop, checking for miners that have been
-        deregistered from the network and handling the cleanup of their data.
-        
-        The method maintains a set of previously active miners and compares it with
-        the current set of active miners to identify deregistered ones.
         """
         logger.info("Starting deregistration loop")
         
@@ -1100,17 +1094,23 @@ class GaiaValidator:
                     self.metagraph.sync_nodes()
                     logger.info(f"Synced {len(self.metagraph.nodes)} nodes from the network")
                 
-                # Get current set of active miners
+                # Get current set of active miners and track hotkey changes
                 try:
-                    # Validate that indices match UIDs
                     current_active_miners: Set[int] = set()
+                    hotkey_changes: List[int] = []
+                    
                     for idx, (hotkey, node) in enumerate(self.metagraph.nodes.items()):
                         # Verify the node exists in our database with matching hotkey
                         miner_info = await self.database_manager.get_miner_info(idx)
-                        if miner_info and miner_info["hotkey"] == node.hotkey:
-                            current_active_miners.add(idx)
+                        if miner_info:
+                            if miner_info["hotkey"] != node.hotkey:
+                                logger.warning(f"Mismatch for index {idx}: DB hotkey != metagraph hotkey")
+                                hotkey_changes.append(idx)
+                            else:
+                                current_active_miners.add(idx)
                         else:
-                            logger.warning(f"Mismatch for index {idx}: DB hotkey != metagraph hotkey")
+                            current_active_miners.add(idx)  # New miner
+                            
                 except (TypeError, ValueError) as e:
                     logger.error(f"Error getting active miners from metagraph: {e}")
                     await asyncio.sleep(60)
@@ -1124,18 +1124,20 @@ class GaiaValidator:
                 
                 # Find deregistered miners
                 deregistered_miners: Set[int] = self._previously_active_miners - current_active_miners
-                if deregistered_miners:
-                    logger.info(f"Found {len(deregistered_miners)} deregistered miners: {deregistered_miners}")
+                
+                # Process both deregistered miners and hotkey changes
+                miners_to_process = list(deregistered_miners) + hotkey_changes
+                if miners_to_process:
+                    logger.info(f"Processing {len(miners_to_process)} miners: {len(deregistered_miners)} deregistered, {len(hotkey_changes)} hotkey changes")
                     
-                    # Process deregistered miners in chunks to prevent memory bloat
+                    # Process miners in chunks to prevent memory bloat
                     chunk_size = 10
-                    deregistered_list = sorted(list(deregistered_miners))
-                    for i in range(0, len(deregistered_list), chunk_size):
-                        chunk = deregistered_list[i:i + chunk_size]
-                        logger.info(f"Processing deregistered miners chunk: {chunk}")
+                    for i in range(0, len(miners_to_process), chunk_size):
+                        chunk = miners_to_process[i:i + chunk_size]
+                        logger.info(f"Processing miner chunk: {chunk}")
                         
                         try:
-                            # Recalculate scores for deregistered miners
+                            # Recalculate scores for affected miners
                             recalc_tasks = []
                             if hasattr(self, 'soil_task'):
                                 recalc_tasks.append(self.soil_task.recalculate_recent_scores(chunk))
@@ -1148,22 +1150,27 @@ class GaiaValidator:
                             # Clear miner info from database
                             for miner_id in chunk:
                                 try:
-                                    # Verify miner exists before clearing
-                                    miner_info = await self.database_manager.get_miner_info(miner_id)
-                                    if miner_info:
-                                        await self.database_manager.clear_miner_info(miner_id)
-                                        logger.info(f"Cleared info for miner {miner_id}")
+                                    if miner_id in hotkey_changes:
+                                        # For hotkey changes, pass the new hotkey information
+                                        new_node = self.metagraph.nodes[miner_id]
+                                        await self.database_manager.clear_miner_info(
+                                            miner_id,
+                                            new_hotkey=new_node.hotkey,
+                                            new_coldkey=new_node.coldkey
+                                        )
+                                        logger.info(f"Updated hotkey for miner {miner_id}")
                                     else:
-                                        logger.warning(f"No info found for miner {miner_id} to clear")
+                                        # For deregistered miners, just clear everything
+                                        await self.database_manager.clear_miner_info(miner_id)
+                                        logger.info(f"Cleared info for deregistered miner {miner_id}")
                                 except Exception as db_error:
                                     logger.error(f"Error clearing miner {miner_id} info: {db_error}")
-                                    logger.error(traceback.format_exc())
                                     continue
                                     
-                            logger.info(f"Successfully processed deregistered miners: {chunk}")
+                            logger.info(f"Successfully processed miners: {chunk}")
                             
                         except Exception as e:
-                            logger.error(f"Error processing deregistered miners chunk {chunk}: {str(e)}")
+                            logger.error(f"Error processing miner chunk {chunk}: {str(e)}")
                             logger.error(traceback.format_exc())
                             continue
                         
