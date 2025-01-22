@@ -686,6 +686,14 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             new_coldkey (str, optional): New coldkey to set after clearing
         """
         try:
+            # First check if the node exists
+            check_query = "SELECT uid FROM node_table WHERE uid = :index"
+            result = await self.fetch_one(check_query, {"index": index})
+            if not result:
+                logger.warning(f"No node found for index {index}, creating new entry")
+                insert_query = "INSERT INTO node_table (uid) VALUES (:index)"
+                await self.execute(insert_query, {"index": index})
+
             # Clear node table entry
             node_query = """
             UPDATE node_table 
@@ -732,7 +740,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         except Exception as e:
             logger.error(f"Error clearing miner info for index {index}: {str(e)}")
             logger.error(traceback.format_exc())
-            raise DatabaseError(f"Failed to clear miner info: {str(e)}")
+            # Don't raise the error, just log it and continue
+            return False
+        
+        return True
 
     @track_operation('read')
     async def get_miner_info(self, index: int):

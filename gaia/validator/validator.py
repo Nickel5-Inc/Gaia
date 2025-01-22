@@ -821,7 +821,7 @@ class GaiaValidator:
                 self.status_logger(),
                 self.main_scoring(),
                 self.handle_miner_deregistration_loop(),
-                #self.miner_score_sender.run_async(), This sends miner data to the website - right now, data should be mostly identical across all validator nodes, so it is redudant for every validator node to send it until we expand to unique data for each validator.
+                #self.miner_score_sender.run_async(), 
                 self.check_for_updates()
             ]
             
@@ -1151,21 +1151,38 @@ class GaiaValidator:
                             # Clear miner info from database
                             for miner_id in chunk:
                                 try:
+                                    success = False
                                     if miner_id in hotkey_changes:
-                                        # For hotkey changes, pass the new hotkey information
-                                        new_node = self.metagraph.nodes[miner_id]
-                                        await self.database_manager.clear_miner_info(
-                                            miner_id,
-                                            new_hotkey=new_node.hotkey,
-                                            new_coldkey=new_node.coldkey
-                                        )
-                                        logger.info(f"Updated hotkey for miner {miner_id}")
+                                        # For hotkey changes, verify miner still exists in metagraph
+                                        if miner_id not in self.metagraph.nodes:
+                                            logger.warning(f"Miner {miner_id} not found in metagraph, treating as deregistered")
+                                            success = await self.database_manager.clear_miner_info(miner_id)
+                                            if success:
+                                                logger.info(f"Cleared info for deregistered miner {miner_id}")
+                                            else:
+                                                logger.warning(f"Failed to clear info for deregistered miner {miner_id}")
+                                        else:
+                                            # For hotkey changes, pass the new hotkey information
+                                            new_node = self.metagraph.nodes[miner_id]
+                                            success = await self.database_manager.clear_miner_info(
+                                                miner_id,
+                                                new_hotkey=new_node.hotkey,
+                                                new_coldkey=new_node.coldkey
+                                            )
+                                            if success:
+                                                logger.info(f"Updated hotkey for miner {miner_id}")
+                                            else:
+                                                logger.warning(f"Failed to update hotkey for miner {miner_id}")
                                     else:
                                         # For deregistered miners, just clear everything
-                                        await self.database_manager.clear_miner_info(miner_id)
-                                        logger.info(f"Cleared info for deregistered miner {miner_id}")
+                                        success = await self.database_manager.clear_miner_info(miner_id)
+                                        if success:
+                                            logger.info(f"Cleared info for deregistered miner {miner_id}")
+                                        else:
+                                            logger.warning(f"Failed to clear info for deregistered miner {miner_id}")
                                 except Exception as db_error:
-                                    logger.error(f"Error clearing miner {miner_id} info: {db_error}")
+                                    logger.error(f"Unexpected error clearing miner {miner_id} info: {str(db_error)}")
+                                    logger.error(traceback.format_exc())
                                     continue
                                     
                             logger.info(f"Successfully processed miners: {chunk}")
@@ -1314,9 +1331,9 @@ class GaiaValidator:
                 weight_sum = np.sum(new_weights)
                 if weight_sum > 0:
                     new_weights = new_weights / weight_sum
-                    logger.info(f"Final normalized weights calculated")
+                    logger.info("Final normalized weights calculated")
                     return new_weights.tolist()
-            
+
             logger.warning("No valid weights calculated")
             return None
 
