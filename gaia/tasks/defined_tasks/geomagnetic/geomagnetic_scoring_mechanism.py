@@ -13,6 +13,7 @@ logger = get_logger(__name__)
 class GeomagneticScoringMechanism(ScoringMechanism):
     """
     Updated scoring mechanism for geomagnetic tasks.
+    Updated scoring mechanism for geomagnetic tasks.
 
     Scores are now inverted, so higher scores represent better predictions.
     Handles invalid scores (`NaN`) gracefully.
@@ -29,10 +30,13 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             name="Geomagnetic Scoring",
             description="Updated scoring mechanism for geomagnetic tasks with improved normalization.",
             db_manager=db_manager
+            description="Updated scoring mechanism for geomagnetic tasks with improved normalization.",
+            db_manager=db_manager
         )
 
     def calculate_score(self, predicted_value, actual_value):
         """
+        Calculates the score for a miner's prediction based on the deviation from ground truth.
         Calculates the score for a miner's prediction based on the deviation from ground truth.
 
         Args:
@@ -148,6 +152,7 @@ class GeomagneticScoringMechanism(ScoringMechanism):
     async def score(self, predictions, ground_truth):
         """
         Scores multiple predictions against the ground truth and saves both predictions and scores.
+        Scores multiple predictions against the ground truth and saves both predictions and scores.
 
         Args:
             predictions (list[dict]): List of prediction dictionaries containing:
@@ -156,8 +161,15 @@ class GeomagneticScoringMechanism(ScoringMechanism):
                 - miner_hotkey
                 - predicted_value
             ground_truth (float): The ground truth DST value.
+            predictions (list[dict]): List of prediction dictionaries containing:
+                - id
+                - miner_uid
+                - miner_hotkey
+                - predicted_value
+            ground_truth (float): The ground truth DST value.
 
         Returns:
+            list[dict]: List of score dictionaries with scores and additional metadata.
             list[dict]: List of score dictionaries with scores and additional metadata.
         """
         try:

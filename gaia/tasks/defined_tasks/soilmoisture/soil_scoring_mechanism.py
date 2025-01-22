@@ -141,6 +141,35 @@ class SoilScoringMechanism(ScoringMechanism):
             if not await self.validate_predictions(predictions):
                 logger.error("Invalid predictions")
                 return None
+
+            pred_info = await self.db_manager.fetch_one(
+                """
+                SELECT retry_count, next_retry_time, status, target_time
+                FROM soil_moisture_predictions 
+                WHERE miner_uid = :miner_id
+                AND (
+                    (status = 'retry_scheduled' AND next_retry_time IS NOT NULL)
+                    OR 
+                    (status = 'sent_to_miner' AND target_time = :target_time)
+                )
+                ORDER BY next_retry_time DESC NULLS LAST
+                LIMIT 1
+                """,
+                {
+                    "miner_id": predictions["miner_id"],
+                    "target_time": predictions["target_time"]
+                }
+            )
+            
+            if pred_info and pred_info.get("status") == "retry_scheduled":
+                current_time = datetime.datetime.now(timezone.utc)
+                if current_time < pred_info["next_retry_time"]:
+                    logger.info(f"Skipping scoring for timestamp {predictions['target_time']} - in retry wait period until {pred_info['next_retry_time']}")
+                    return None
+
+            if not pred_info or pred_info.get("status") == "sent_to_miner":
+                logger.info(f"Processing new prediction for timestamp {predictions['target_time']}")
+
             metrics = await self.compute_smap_score_metrics(
                 bounds=predictions["bounds"],
                 crs=predictions["crs"],
@@ -149,12 +178,17 @@ class SoilScoringMechanism(ScoringMechanism):
                 miner_id=predictions["miner_id"]
             )
 
+            if isinstance(metrics, dict) and metrics.get("status") == "retry_scheduled":
+                logger.info(f"SMAP data unavailable, retry scheduled: {metrics.get('message')}")
+                return None
+
             if not metrics:
                 return None
 
             if not await self.validate_metrics(metrics):
                 logger.error("Invalid metrics computed")
                 return None
+
             total_score = self.compute_final_score(metrics)
 
             if not 0 <= total_score <= 1:
@@ -220,6 +254,7 @@ class SoilScoringMechanism(ScoringMechanism):
             if not smap_data:
                 return None
 
+            if model_predictions.size(2) == 0 or model_predictions.size(3) == 0:
             if model_predictions.size(2) == 0 or model_predictions.size(3) == 0:
                 logger.error(f"Empty model predictions detected with shape: {model_predictions.shape}")
                 # WRITE operation - use session for deleting invalid prediction

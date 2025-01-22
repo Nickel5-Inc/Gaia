@@ -21,6 +21,7 @@ class FiberWeightSetter:
             timeout: int = 30,
     ):
         """Initialize the weight setter with fiber"""
+        """Initialize the weight setter with fiber"""
         self.netuid = netuid
         self.network = network
         self.substrate = interface.get_substrate(subtensor_network=network)
@@ -32,12 +33,16 @@ class FiberWeightSetter:
 
     def calculate_weights(self, weights: List[float] = None) -> torch.Tensor:
         """Convert input weights to normalized tensor with min/max bounds"""
+
+    def calculate_weights(self, weights: List[float] = None) -> torch.Tensor:
+        """Convert input weights to normalized tensor with min/max bounds"""
         if weights is None:
             logger.warning("No weights provided")
             return None
 
         nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid) if self.nodes is None else self.nodes
         node_ids = [node.node_id for node in nodes]
+
 
         aligned_weights = [
             max(0.0, weights[node_id]) if node_id < len(weights) else 0.0
@@ -58,6 +63,7 @@ class FiberWeightSetter:
         mask = weights_tensor > 0
         weights_tensor[mask] = torch.clamp(weights_tensor[mask], min_weight, max_weight)
         weights_tensor /= weights_tensor.sum()
+        weights_tensor /= weights_tensor.sum()
 
         logger.info(
             f"Weight distribution stats:"
@@ -68,8 +74,10 @@ class FiberWeightSetter:
         )
 
         return weights_tensor, node_ids
+        return weights_tensor, node_ids
 
     async def set_weights(self, weights: List[float] = None) -> bool:
+        """Set weights on chain"""
         """Set weights on chain"""
         try:
             if weights is None:
@@ -96,8 +104,10 @@ class FiberWeightSetter:
 
             if validator_uid is None:
                 logger.error("❗Validator not found in nodes list")
+                logger.error("❗Validator not found in nodes list")
                 return False
 
+            calculated_weights, node_ids = self.calculate_weights(weights)
             calculated_weights, node_ids = self.calculate_weights(weights)
             if calculated_weights is None:
                 return False
@@ -117,12 +127,16 @@ class FiberWeightSetter:
                 )
                 logger.info("Weight commit initiated, continuing...")
                 return True
+                logger.info("Weight commit initiated, continuing...")
+                return True
 
             except Exception as e:
+                logger.error(f"Error initiating weight commit: {str(e)}")
                 logger.error(f"Error initiating weight commit: {str(e)}")
                 return False
 
         except Exception as e:
+            logger.error(f"Error in weight setting: {str(e)}")
             logger.error(f"Error in weight setting: {str(e)}")
             logger.error(traceback.format_exc())
             return False

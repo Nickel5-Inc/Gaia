@@ -612,6 +612,7 @@ class SoilMoistureTask(Task):
             debug_result = await self.db_manager.fetch_all(debug_query)
             for row in debug_result:
                 logger.info(f"Status: {row['status']}, Count: {row['count']}, Time Range: {row['earliest']} to {row['latest']}")
+                logger.info(f"Status: {row['status']}, Count: {row['count']}, Time Range: {row['earliest']} to {row['latest']}")
 
             # Get pending tasks
             pending_query = """
@@ -627,6 +628,21 @@ class SoilMoistureTask(Task):
                     )) as predictions
                 FROM soil_moisture_regions r
                 JOIN soil_moisture_predictions p ON p.region_id = r.id
+                WHERE p.status = 'sent_to_miner'
+                AND (
+                    -- Normal case: Past scoring delay and no retry
+                    (
+                        r.target_time <= :scoring_time 
+                        AND p.next_retry_time IS NULL
+                    )
+                    OR 
+                    -- Retry case: Has retry time and it's in the past
+                    (
+                        p.next_retry_time IS NOT NULL 
+                        AND p.next_retry_time <= :current_time
+                        AND p.retry_count < 5
+                    )
+                )
                 WHERE p.status = 'sent_to_miner'
                 AND (
                     -- Normal case: Past scoring delay and no retry

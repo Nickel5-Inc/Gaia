@@ -96,6 +96,8 @@ class GeomagneticTask(Task):
             outputs=GeomagneticOutputs(),
             db_manager=db_manager,
             scoring_mechanism=GeomagneticScoringMechanism(db_manager=db_manager),
+            db_manager=db_manager,
+            scoring_mechanism=GeomagneticScoringMechanism(db_manager=db_manager),
             **data,
         )
         
@@ -269,6 +271,10 @@ class GeomagneticTask(Task):
         self, validator, timestamp, dst_value, historical_data, current_hour_start
     ):
         """Query miners with current data and process responses."""
+        if timestamp == "N/A" or dst_value == "N/A":
+            logger.warning("Invalid geomagnetic data. Skipping miner queries.")
+            return
+
         if timestamp == "N/A" or dst_value == "N/A":
             logger.warning("Invalid geomagnetic data. Skipping miner queries.")
             return

@@ -20,7 +20,12 @@ from fiber.chain import chain_utils, interface
 from fiber.chain import weights as w
 from fiber.chain.fetch_nodes import get_nodes_for_netuid
 from fiber.chain.chain_utils import query_substrate
+from fiber.chain import chain_utils, interface
+from fiber.chain import weights as w
+from fiber.chain.fetch_nodes import get_nodes_for_netuid
+from fiber.chain.chain_utils import query_substrate
 from fiber.logging_utils import get_logger
+from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
 from substrateinterface import SubstrateInterface
