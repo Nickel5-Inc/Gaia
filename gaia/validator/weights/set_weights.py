@@ -8,6 +8,7 @@ from fiber.chain.fetch_nodes import get_nodes_for_netuid
 import sys
 from fiber.logging_utils import get_logger
 import numpy as np
+from gaia import __spec_version__
 
 logger = get_logger(__name__)
 
@@ -152,11 +153,7 @@ class FiberWeightSetter:
                 [self.netuid, self.keypair.ss58_address]
             ).value
 
-            version_key = self.substrate.query(
-                "SubtensorModule",
-                "WeightsVersionKey",
-                [self.netuid]
-            ).value
+            version_key = __spec_version__
 
             if validator_uid is None:
                 logger.error("❗Validator not found in nodes list")
