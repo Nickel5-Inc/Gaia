@@ -821,7 +821,7 @@ class GaiaValidator:
                 self.status_logger(),
                 self.main_scoring(),
                 self.handle_miner_deregistration_loop(),
-                self.miner_score_sender.run_async(),
+                #self.miner_score_sender.run_async(), This sends miner data to the website - right now, data should be mostly identical across all validator nodes, so it is redudant for every validator node to send it until we expand to unique data for each validator.
                 self.check_for_updates()
             ]
             
