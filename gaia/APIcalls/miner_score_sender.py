@@ -2,6 +2,7 @@ import asyncio
 from sqlalchemy import text
 from fiber.logging_utils import get_logger
 import pprint
+import math
 
 from gaia.APIcalls.website_api import GaiaCommunicator
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
@@ -41,27 +42,64 @@ class MinerScoreSender:
         return [{"uid": row["uid"], "hotkey": row["hotkey"], "coldkey": row["coldkey"]} for row in results]
 
     async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
+        # First clean up NaN values from history
+        cleanup_query = """
+            DELETE FROM geomagnetic_history 
+            WHERE miner_hotkey = :miner_hotkey 
+            AND (
+                predicted_value IS NULL 
+                OR ground_truth_value IS NULL 
+                OR score IS NULL
+                OR predicted_value::text = 'NaN'
+                OR ground_truth_value::text = 'NaN'
+                OR score::text = 'NaN'
+            )
+        """
+        await self.database_manager.execute(cleanup_query, {"miner_hotkey": miner_hotkey})
+        
+        # Then fetch valid records
         query = """
             SELECT id, query_time AS prediction_datetime, predicted_value, ground_truth_value, score, scored_at
             FROM geomagnetic_history
             WHERE miner_hotkey = :miner_hotkey
+            AND predicted_value IS NOT NULL 
+            AND ground_truth_value IS NOT NULL 
+            AND score IS NOT NULL
+            AND predicted_value::text != 'NaN'
+            AND ground_truth_value::text != 'NaN'
+            AND score::text != 'NaN'
             ORDER BY scored_at DESC
             LIMIT 10
         """
         results = await self.database_manager.fetch_all(query, {"miner_hotkey": miner_hotkey})
-        return [
-            {
-                "predictionId": row["id"],
-                "predictionDate": row["prediction_datetime"].isoformat(),
-                "geomagneticPredictionTargetDate": row["prediction_datetime"].isoformat(),
-                "geomagneticPredictionInputDate": row["prediction_datetime"].isoformat(),
-                "geomagneticPredictedValue": row["predicted_value"],
-                "geomagneticGroundTruthValue": row["ground_truth_value"],
-                "geomagneticScore": row["score"],
-                "scoreGenerationDate": row["scored_at"].isoformat()
-            }
-            for row in results
-        ]
+        
+        valid_predictions = []
+        for row in results:
+            try:
+                # Convert to float and check for NaN/Inf
+                pred_value = float(row["predicted_value"])
+                truth_value = float(row["ground_truth_value"])
+                score_value = float(row["score"])
+                
+                if (not math.isnan(pred_value) and not math.isinf(pred_value) and
+                    not math.isnan(truth_value) and not math.isinf(truth_value) and
+                    not math.isnan(score_value) and not math.isinf(score_value)):
+                    
+                    valid_predictions.append({
+                        "predictionId": row["id"],
+                        "predictionDate": row["prediction_datetime"].isoformat(),
+                        "geomagneticPredictionTargetDate": row["prediction_datetime"].isoformat(),
+                        "geomagneticPredictionInputDate": row["prediction_datetime"].isoformat(),
+                        "geomagneticPredictedValue": pred_value,
+                        "geomagneticGroundTruthValue": truth_value,
+                        "geomagneticScore": score_value,
+                        "scoreGenerationDate": row["scored_at"].isoformat()
+                    })
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Invalid numeric value in row {row['id']}, skipping: {e}")
+                continue
+                
+        return valid_predictions
 
     async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
         query = """

@@ -96,8 +96,6 @@ class GeomagneticTask(Task):
             outputs=GeomagneticOutputs(),
             db_manager=db_manager,
             scoring_mechanism=GeomagneticScoringMechanism(db_manager=db_manager),
-            db_manager=db_manager,
-            scoring_mechanism=GeomagneticScoringMechanism(db_manager=db_manager),
             **data,
         )
         
@@ -602,10 +600,10 @@ class GeomagneticTask(Task):
         except Exception as e:
             logger.error(f"Error in miner execution: {str(e)}")
             logger.error(traceback.format_exc())
-            # Fix datetime usage
+            # Return float('nan') instead of "N/A"
             current_time = datetime.datetime.now(datetime.timezone.utc)
             return {
-                "predicted_values": "N/A",
+                "predicted_values": float('nan'),  # Changed from "N/A" to float('nan')
                 "timestamp": current_time.isoformat(),
                 "miner_hotkey": miner.keypair.ss58_address,
             }

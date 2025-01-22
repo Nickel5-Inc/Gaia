@@ -1219,8 +1219,10 @@ class GaiaValidator:
                 decay = math.exp(-age_days * math.log(2))  # Decay by half each day
                 scores = result['score']
                 for uid in range(256):
-                    if not math.isnan(scores[uid]):
-                        geo_scores_by_uid[uid].append((scores[uid], decay))
+                    # Replace NaN with 0 for API compatibility
+                    if isinstance(scores[uid], str) or math.isnan(scores[uid]):
+                        scores[uid] = 0.0
+                    geo_scores_by_uid[uid].append((scores[uid], decay))
             
             # Calculate weighted averages
             for uid in range(256):
@@ -1237,8 +1239,10 @@ class GaiaValidator:
                 decay = math.exp(-age_days * math.log(2))  # Decay by half each day
                 scores = result['score']
                 for uid in range(256):
-                    if not math.isnan(scores[uid]):
-                        soil_scores_by_uid[uid].append((scores[uid], decay))
+                    # Replace NaN with 0 for API compatibility
+                    if isinstance(scores[uid], str) or math.isnan(scores[uid]):
+                        scores[uid] = 0.0
+                    soil_scores_by_uid[uid].append((scores[uid], decay))
             
             # Calculate weighted averages
             for uid in range(256):

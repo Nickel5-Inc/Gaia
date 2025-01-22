@@ -255,7 +255,6 @@ class SoilScoringMechanism(ScoringMechanism):
                 return None
 
             if model_predictions.size(2) == 0 or model_predictions.size(3) == 0:
-            if model_predictions.size(2) == 0 or model_predictions.size(3) == 0:
                 logger.error(f"Empty model predictions detected with shape: {model_predictions.shape}")
                 # WRITE operation - use session for deleting invalid prediction
                 query = """

@@ -30,8 +30,6 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             name="Geomagnetic Scoring",
             description="Updated scoring mechanism for geomagnetic tasks with improved normalization.",
             db_manager=db_manager
-            description="Updated scoring mechanism for geomagnetic tasks with improved normalization.",
-            db_manager=db_manager
         )
 
     def calculate_score(self, predicted_value, actual_value):

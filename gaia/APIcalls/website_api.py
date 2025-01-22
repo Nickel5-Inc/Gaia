@@ -4,6 +4,7 @@ import httpx
 from fiber.logging_utils import get_logger
 import numpy as np
 import asyncio
+import math
 
 logger = get_logger(__name__)
 
@@ -47,6 +48,45 @@ class GaiaCommunicator:
         if not self._validate_payload(data):
             logger.error(f"| {current_thread} | ❗ Invalid payload structure: {data}")
             return
+
+        # Validate and convert numeric values in geomagnetic predictions
+        if data.get("geomagneticPredictions"):
+            valid_predictions = []
+            for prediction in data["geomagneticPredictions"]:
+                try:
+                    # Check all required numeric fields
+                    numeric_fields = [
+                        "geomagneticPredictedValue",
+                        "geomagneticGroundTruthValue",
+                        "geomagneticScore"
+                    ]
+                    
+                    is_valid = True
+                    for field in numeric_fields:
+                        value = prediction.get(field)
+                        try:
+                            float_value = float(value)
+                            if math.isnan(float_value) or math.isinf(float_value):
+                                is_valid = False
+                                logger.warning(f"Invalid {field}: {value} (NaN or Inf)")
+                                break
+                            prediction[field] = float_value
+                        except (ValueError, TypeError):
+                            is_valid = False
+                            logger.warning(f"Invalid {field}: {value} (not convertible to float)")
+                            break
+                    
+                    if is_valid:
+                        valid_predictions.append(prediction)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing prediction: {e}")
+                    continue
+            
+            # Replace original predictions with only valid ones
+            data["geomagneticPredictions"] = valid_predictions
+            if not valid_predictions:
+                logger.warning("No valid geomagnetic predictions after filtering")
 
         if data.get("soilMoisturePredictions"):
             for prediction in data["soilMoisturePredictions"]:
