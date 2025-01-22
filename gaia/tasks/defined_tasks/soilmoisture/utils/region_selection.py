@@ -2,6 +2,9 @@ import random
 import h3
 import json
 from shapely.geometry import Polygon, box
+from datetime import datetime, timezone, date
+import hashlib
+import struct
 
 
 def h3_cell_to_polygon(h3_address):
@@ -13,11 +16,10 @@ def h3_cell_to_polygon(h3_address):
 
 
 def select_random_base_cell(base_cells, resolution=2, min_lat=-56, max_lat=60):
-    """Randomly select a large base cell at the specified resolution within latitude limits."""
+    """Select a base cell from eligible cells - randomization handled by caller."""
     eligible_cells = [
-        cell
-        for cell in base_cells
-        if cell["resolution"] == resolution
+        cell for cell in base_cells
+        if cell["resolution"] == resolution 
         and min_lat <= h3.cell_to_latlng(cell["index"])[0] <= max_lat
     ]
     return random.choice(eligible_cells) if eligible_cells else None
@@ -92,19 +94,38 @@ def select_1x1_degree_box_in_square(square, hex_polygon):
 
 
 def select_random_region(
-    base_cells, urban_cells_set, lakes_cells_set, min_lat=-56, max_lat=60
+    base_cells, 
+    urban_cells_set, 
+    lakes_cells_set,
+    timestamp: datetime,
+    used_bounds=None,
+    min_lat=-56, 
+    max_lat=60
 ):
-    """Randomly select a 1x1 degree box that does not overlap urban or lake cells within given lat/lon bounds."""
+    """Deterministically select a region based on generated seed."""
+    used_bounds = used_bounds or set()
+    
+    # NO seed setting here - using seed from get_daily_regions
     base_cell = select_random_base_cell(
-        base_cells, resolution=2, min_lat=min_lat, max_lat=max_lat
+        base_cells,
+        resolution=2,
+        min_lat=min_lat,
+        max_lat=max_lat
     )
 
     if not base_cell:
         raise ValueError("No eligible base cells found within the specified bounds.")
+        
     filtered_cells = subdivide_if_urban_present(
-        base_cell["index"], urban_cells_set, lakes_cells_set, target_resolution=5
+        base_cell["index"],
+        urban_cells_set,
+        lakes_cells_set,
+        target_resolution=5
     )
 
+    filtered_cells = list(filtered_cells)
+    random.shuffle(filtered_cells)  # Uses the seed from get_daily_regions
+    
     for hex_id in filtered_cells:
         hex_polygon = h3_cell_to_polygon(hex_id)
         inscribed_square = largest_inscribed_square(hex_polygon)
@@ -113,8 +134,39 @@ def select_random_region(
             continue
 
         valid_bbox = select_1x1_degree_box_in_square(inscribed_square, hex_polygon)
-
-        if valid_bbox:
+        
+        if valid_bbox and tuple(valid_bbox) not in used_bounds:
             return valid_bbox
 
-    raise ValueError("No valid 1x1 degree box found in the selected region.")
+    return None
+
+
+def get_deterministic_seed(date: date, hour: int) -> int:
+    """Generate deterministic seed from date and hour using SHA-256.
+    
+    Args:
+        date: The target date
+        hour: The target hour (1, 7, 13, or 19 for SMAP times)
+        
+    Returns:
+        A deterministic integer seed that will be the same for all validators
+    """
+
+    if hour not in {1, 7, 13, 19}:
+        raise ValueError(f"Hour {hour} is not a valid SMAP time window")
+    
+    time_obj = datetime(
+        year=date.year,
+        month=date.month,
+        day=date.day,
+        hour=hour,
+        minute=30,
+        tzinfo=timezone.utc
+    )
+
+    time_str = time_obj.strftime("%Y%m%d%H")
+    hash_input = f"{time_str}".encode('utf-8')
+    hash_output = hashlib.sha256(hash_input).digest()
+    seed = struct.unpack('>Q', hash_output[:8])[0]
+    
+    return seed

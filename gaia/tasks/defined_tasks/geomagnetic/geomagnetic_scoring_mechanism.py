@@ -5,11 +5,14 @@ import asyncio
 from datetime import timezone, datetime
 from pydantic import Field
 from typing import Any
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import text
 
 logger = get_logger(__name__)
 
 class GeomagneticScoringMechanism(ScoringMechanism):
     """
+    Updated scoring mechanism for geomagnetic tasks.
     Updated scoring mechanism for geomagnetic tasks.
 
     Scores are now inverted, so higher scores represent better predictions.
@@ -18,7 +21,7 @@ class GeomagneticScoringMechanism(ScoringMechanism):
     """
 
     db_manager: Any = Field(
-        None, 
+        None,
         description="Database manager for the scoring mechanism"
     )
 
@@ -32,6 +35,7 @@ class GeomagneticScoringMechanism(ScoringMechanism):
     def calculate_score(self, predicted_value, actual_value):
         """
         Calculates the score for a miner's prediction based on the deviation from ground truth.
+        Calculates the score for a miner's prediction based on the deviation from ground truth.
 
         Args:
             predicted_value (float): The predicted DST value from the miner.
@@ -44,6 +48,10 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             return float("nan")
 
         try:
+            # Normalize the actual value to the same scale as the prediction
+            actual_value = actual_value / 100.0
+
+            # Calculate the score
             return 1 / (1 + abs(predicted_value - actual_value))
         except Exception as e:
             logger.error(f"Error calculating score: {e}")
@@ -114,25 +122,34 @@ class GeomagneticScoringMechanism(ScoringMechanism):
                 - score
         """
         try:
-            query = """
-            INSERT INTO geomagnetic_history (miner_uid, miner_hotkey, query_time, predicted_value, ground_truth_value, score, scored_at)
-            VALUES (:miner_uid, :miner_hotkey, :query_time, :predicted_value, :ground_truth_value, :score, CURRENT_TIMESTAMP)
-            """
+            # Save each score individually for better error handling and connection management
             for score in miner_scores:
-                await self.db_manager.execute(query, {
-                    "miner_uid": score["miner_uid"],
-                    "miner_hotkey": score["miner_hotkey"],
-                    "query_time": score["query_time"],
-                    "predicted_value": score["predicted_value"],
-                    "ground_truth_value": score["ground_truth_value"],
-                    "score": score["score"]
-                })
+                await self.db_manager.execute(
+                    """
+                    INSERT INTO geomagnetic_history 
+                    (miner_uid, miner_hotkey, query_time, predicted_value, ground_truth_value, score, scored_at)
+                    VALUES (:miner_uid, :miner_hotkey, :query_time, :predicted_value, :ground_truth_value, :score, CURRENT_TIMESTAMP)
+                    """,
+                    {
+                        "miner_uid": score["miner_uid"],
+                        "miner_hotkey": score["miner_hotkey"],
+                        "query_time": score["query_time"],
+                        "predicted_value": score["predicted_value"],
+                        "ground_truth_value": score["ground_truth_value"],
+                        "score": score["score"]
+                    }
+                )
+                logger.debug(f"Saved score for miner {score['miner_hotkey']}")
+            
             logger.info(f"Successfully saved {len(miner_scores)} scores.")
+            
         except Exception as e:
             logger.error(f"Error saving scores to the database: {e}")
+            raise
 
     async def score(self, predictions, ground_truth):
         """
+        Scores multiple predictions against the ground truth and saves both predictions and scores.
         Scores multiple predictions against the ground truth and saves both predictions and scores.
 
         Args:
@@ -142,8 +159,15 @@ class GeomagneticScoringMechanism(ScoringMechanism):
                 - miner_hotkey
                 - predicted_value
             ground_truth (float): The ground truth DST value.
+            predictions (list[dict]): List of prediction dictionaries containing:
+                - id
+                - miner_uid
+                - miner_hotkey
+                - predicted_value
+            ground_truth (float): The ground truth DST value.
 
         Returns:
+            list[dict]: List of score dictionaries with scores and additional metadata.
             list[dict]: List of score dictionaries with scores and additional metadata.
         """
         try:
@@ -170,4 +194,3 @@ class GeomagneticScoringMechanism(ScoringMechanism):
         except Exception as e:
             logger.error(f"Error in scoring process: {e}")
             return []
-

@@ -61,7 +61,8 @@ def factory_router(miner_instance) -> APIRouter:
         try:
             if decrypted_payload.data:
                 response_data = decrypted_payload.model_dump()
-                geomagnetic_task = GeomagneticTask()
+                db_manager = MinerDatabaseManager()
+                geomagnetic_task = GeomagneticTask(db_manager=db_manager, node_type="miner")
                 logger.info(f"Miner executing geomagnetic prediction ...")
 
                 result = geomagnetic_task.miner_execute(response_data, miner_instance)
@@ -70,8 +71,15 @@ def factory_router(miner_instance) -> APIRouter:
                 if result:
                     if "predicted_values" in result:
                         pred_value = result["predicted_values"]
-                        if np.isnan(pred_value) or np.isinf(pred_value):
-                            logger.warning("Invalid prediction value received, setting to 0.0")
+                        try:
+                            pred_value = np.array(pred_value, dtype=float)
+                            if np.isnan(pred_value).any() or np.isinf(pred_value).any():
+                                logger.warning("Invalid prediction value received, setting to 0.0")
+                                result["predicted_values"] = float(0.0)
+                            else:
+                                result["predicted_values"] = float(pred_value)
+                        except (ValueError, TypeError):
+                            logger.warning("Could not convert prediction to float, setting to 0.0")
                             result["predicted_values"] = float(0.0)
                     else:
                         logger.error("Missing 'predicted_values' in result. Setting to default 0.0")
@@ -83,7 +91,7 @@ def factory_router(miner_instance) -> APIRouter:
                 else:
                     logger.error("Result is empty, returning default response.")
                     result = {
-                        "predicted_values": 0.0,
+                        "predicted_values": float(0.0),
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "miner_hotkey": miner_instance.keypair.ss58_address,
                     }

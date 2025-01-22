@@ -107,7 +107,7 @@ The soil moisture model integrates various datasets to provide comprehensive ins
 ```bash
 WALLET_NAME=<YOUR_WALLET.NAME>
 HOTKEY_NAME=<YOUR_WALLET_HOTKEY>
-NETUID=<NETUID>
+NETUID=<NETUID> # 57 for mainnet, 237 for testnet
 SUBTENSOR_NETWORK=<NETWORK> # finney or test
 MIN_STAKE_THRESHOLD=<INT> # 10000 for mainnet, 5 for testnet
 SUBTENSOR_ADDRESS=<SUBTENSOR_ADDRESS> # wss://test.finney.opentensor.ai:443/ for testnet, wss://finney.opentensor.ai:443/ for mainnet (chain endpoint)

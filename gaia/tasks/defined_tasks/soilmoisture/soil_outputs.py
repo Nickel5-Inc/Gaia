@@ -5,6 +5,9 @@ from numpy.typing import NDArray
 from gaia.tasks.base.components.outputs import Outputs
 from gaia.tasks.base.decorators import handle_validation_error
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class SoilMoisturePrediction(BaseModel):
@@ -37,6 +40,38 @@ class SoilMoisturePrediction(BaseModel):
         if len(v) != 4:
             raise ValueError("Bounds must have 4 values [left, bottom, right, top]")
         return v
+
+    @classmethod
+    def validate_prediction(cls, data: dict) -> bool:
+        """Validate prediction shape and values."""
+        try:
+            if isinstance(data.get("surface_sm"), list):
+                data["surface_sm"] = np.array(data["surface_sm"], dtype=np.float32)
+            if isinstance(data.get("rootzone_sm"), list):
+                data["rootzone_sm"] = np.array(data["rootzone_sm"], dtype=np.float32)
+
+            # Check array shapes - must be 11x11
+            surface_shape = data["surface_sm"].shape
+            rootzone_shape = data["rootzone_sm"].shape
+            
+            logger.info(f"Validating prediction shapes - surface: {surface_shape}, rootzone: {rootzone_shape}")
+            
+            if surface_shape != (11, 11) or rootzone_shape != (11, 11):
+                logger.warning(f"Invalid prediction shape - surface: {surface_shape}, rootzone: {rootzone_shape}")
+                logger.warning(f"Expected shape: (11, 11)")
+                return False
+
+            if np.isnan(data["surface_sm"]).any() or np.isnan(data["rootzone_sm"]).any():
+                logger.warning("Prediction contains NaN values")
+                return False
+            if np.isinf(data["surface_sm"]).any() or np.isinf(data["rootzone_sm"]).any():
+                logger.warning("Prediction contains infinite values")
+                return False
+
+            return True
+        except Exception as e:
+            logger.warning(f"Invalid prediction data: {str(e)}")
+            return False
 
 
 class SoilMoistureOutputs(Outputs):

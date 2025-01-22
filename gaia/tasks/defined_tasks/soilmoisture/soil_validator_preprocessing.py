@@ -4,6 +4,7 @@ from huggingface_hub import hf_hub_download
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.defined_tasks.soilmoisture.utils.region_selection import (
     select_random_region,
+    get_deterministic_seed,
 )
 from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import get_soil_data, get_data_dir
 import json
@@ -12,8 +13,14 @@ import os
 import shutil
 from sqlalchemy import text
 from fiber.logging_utils import get_logger
+import random
 
 logger = get_logger(__name__)
+
+
+class SentinelServerError(Exception):
+    """Raised when Sentinel server returns 500 error"""
+    pass
 
 
 class SoilValidatorPreprocessing(Preprocessing):
@@ -84,8 +91,11 @@ class SoilValidatorPreprocessing(Preprocessing):
             return soil_data
 
         except Exception as e:
-            logger.error(f"Error collecting soil data: {str(e)}")
-            return None
+            if "Failed to fetch data: 500 Server Error" in str(e):
+                logger.warning(f"Sentinel server returned 500 error for region {bbox}")
+                raise SentinelServerError("Sentinel server maintenance")
+            logger.warning(f"Failed to get soil data for region {bbox}")
+            raise
 
     async def store_region(self, region: Dict, target_time: datetime) -> int:
         """Store region data in database."""
@@ -99,7 +109,6 @@ class SoilValidatorPreprocessing(Preprocessing):
                     f"Read TIFF file, size: {len(combined_data_bytes) / (1024 * 1024):.2f} MB"
                 )
 
-                # Check TIFF header (supports both little-endian 'II' and big-endian 'MM' formats)
                 if not (
                     combined_data_bytes.startswith(b"II\x2A\x00")
                     or combined_data_bytes.startswith(b"MM\x00\x2A")
@@ -124,27 +133,20 @@ class SoilValidatorPreprocessing(Preprocessing):
                 "status": "pending",
             }
 
-            conn = await self.db.get_connection()
-            try:
-                result = await conn.execute(
-                    text(
-                        """
-                        INSERT INTO soil_moisture_regions 
-                        (region_date, target_time, bbox, combined_data, 
-                         sentinel_bounds, sentinel_crs, array_shape, status)
-                        VALUES (:region_date, :target_time, :bbox, :combined_data, 
-                                :sentinel_bounds, :sentinel_crs, :array_shape, :status)
-                        RETURNING id
-                    """
-                    ),
-                    data,
-                )
-                region_id = result.scalar_one()
-                await conn.commit()
-                return region_id
-
-            finally:
-                await conn.close()
+            # WRITE operation - use execute for storing region
+            result = await self.db.execute(
+                """
+                INSERT INTO soil_moisture_regions 
+                (region_date, target_time, bbox, combined_data, 
+                 sentinel_bounds, sentinel_crs, array_shape, status)
+                VALUES (:region_date, :target_time, :bbox, :combined_data, 
+                        :sentinel_bounds, :sentinel_crs, :array_shape, :status)
+                RETURNING id
+                """,
+                data
+            )
+            region_id = result.scalar_one()
+            return region_id
 
         except Exception as e:
             logger.error(f"Error storing region: {str(e)}")
@@ -153,15 +155,16 @@ class SoilValidatorPreprocessing(Preprocessing):
     async def _check_existing_regions(self, target_time: datetime) -> bool:
         """Check if regions already exist for the given target time."""
         try:
-            existing_regions = await self.db.fetch_many(
+            # READ operation - use fetch_one for checking existing regions
+            result = await self.db.fetch_one(
                 """
                 SELECT COUNT(*) as count 
                 FROM soil_moisture_regions 
                 WHERE target_time = :target_time
                 """,
-                {"target_time": target_time},
+                {"target_time": target_time}
             )
-            count = existing_regions[0]["count"] if existing_regions else 0
+            count = result['count'] if result else 0
             return count >= self.regions_per_timestep
         except Exception as e:
             logger.error(f"Error checking existing regions: {str(e)}")
@@ -172,7 +175,6 @@ class SoilValidatorPreprocessing(Preprocessing):
     ) -> List[Dict]:
         """Get regions for today, selecting new ones if needed."""
         try:
-            # First check if we already have enough regions for this timestep
             has_existing_regions = await self._check_existing_regions(target_time)
             if has_existing_regions:
                 if target_time not in self._logged_timestamps:
@@ -183,53 +185,72 @@ class SoilValidatorPreprocessing(Preprocessing):
                     self._cleanup_logged_timestamps()
                 return []
 
+            today = target_time.date()
+            hour = target_time.hour
+            seed = get_deterministic_seed(today, hour)
+            random.seed(seed)
+            logger.info(f"Set random seed to {seed} for target_time {target_time}")
+            
             regions = []
-            while self._can_select_region(target_time):
+            used_bounds = set()
+            consecutive_500_errors = 0
+            MAX_500_ERRORS = 3
+            
+            while len(regions) < self.regions_per_timestep:
                 try:
                     bbox = select_random_region(
                         base_cells=self._base_cells,
                         urban_cells_set=self._urban_cells,
                         lakes_cells_set=self._lakes_cells,
+                        timestamp=target_time,
+                        used_bounds=used_bounds
                     )
-                    soil_data = await self.get_soil_data(bbox, ifs_forecast_time)
+                    if bbox:
+                        soil_data = await self.get_soil_data(bbox, ifs_forecast_time)
 
-                    if soil_data is not None:
-                        tiff_path, bounds, crs = soil_data
-                        region_data = {
-                            "datetime": target_time,
-                            "bbox": bbox,
-                            "combined_data": tiff_path,
-                            "sentinel_bounds": bounds,
-                            "sentinel_crs": crs,
-                            "array_shape": (222, 222),
-                        }
-                        region_id = await self.store_region(region_data, target_time)
-                        region_data["id"] = region_id
-                        regions.append(region_data)
-                        self._update_daily_count(target_time)
+                        if soil_data is not None:
+                            tiff_path, bounds, crs = soil_data
+                            region_data = {
+                                "datetime": target_time,
+                                "bbox": bbox,
+                                "combined_data": tiff_path,
+                                "sentinel_bounds": bounds,
+                                "sentinel_crs": crs,
+                                "array_shape": (222, 222),
+                            }
+                            region_id = await self.store_region(region_data, target_time)
+                            region_data["id"] = region_id
+                            regions.append(region_data)
+                            self._update_daily_count(target_time)
 
-                        data_dir = get_data_dir()
-                        for filename in os.listdir(data_dir):
-                            filepath = os.path.join(data_dir, filename)
-                            if os.path.isdir(filepath) and filename.startswith('tmp'):
-                                try:
-                                    shutil.rmtree(filepath)
-                                    logger.info(f"Removed temp directory: {filepath}")
-                                except Exception as e:
-                                    logger.error(f"Failed to remove temp directory {filepath}: {e}")
-                            elif filename.endswith('.tif'):
-                                try:
-                                    os.remove(filepath)
-                                    logger.info(f"Removed tif file: {filepath}")
-                                except Exception as e:
-                                    logger.error(f"Failed to remove tif file {filepath}: {e}")
+                            data_dir = get_data_dir()
+                            for filename in os.listdir(data_dir):
+                                filepath = os.path.join(data_dir, filename)
+                                if os.path.isdir(filepath) and filename.startswith('tmp'):
+                                    try:
+                                        shutil.rmtree(filepath)
+                                        logger.info(f"Removed temp directory: {filepath}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to remove temp directory {filepath}: {e}")
+                                elif filename.endswith('.tif'):
+                                    try:
+                                        os.remove(filepath)
+                                        logger.info(f"Removed tif file: {filepath}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to remove tif file {filepath}: {e}")
 
-                except Exception as e:
-                    logger.error(f"Error processing region: {str(e)}")
+                except SentinelServerError:
+                    consecutive_500_errors += 1
+                    if consecutive_500_errors >= MAX_500_ERRORS:
+                        logger.warning(f"Hit {MAX_500_ERRORS} consecutive 500 errors, stopping region collection")
+                        raise 
                     continue
 
+            random.seed()
             return regions
 
+        except SentinelServerError:
+            raise
         except Exception as e:
             logger.error(f"Error in get_daily_regions: {str(e)}")
             return []

@@ -20,3 +20,7 @@ nodes.json
 data/
 
 gaia.egg-info/
+
+# Cache directories
+**/smap_cache/
+smap_cache/

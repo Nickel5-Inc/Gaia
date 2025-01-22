@@ -120,8 +120,34 @@ The input to `run_inference` is a dictionary containing:
 
 The output must be a dictionary with:
 
-- `surface`: A nested list (11x11) of floats between 0-1 representing surface soil moisture predictions.
-- `rootzone`: A nested list (11x11) of floats between 0-1 representing root zone soil moisture predictions.
+- `surface`: A nested list (11x11) of floats representing surface soil moisture predictions.
+  - Must be exactly 11x11 dimensions
+  - All values must be between 0.0 and 1.0 (inclusive)
+  - Values represent soil moisture content as a fraction
+  - Shape must match SMAP validation data
+
+- `rootzone`: A nested list (11x11) of floats representing root zone soil moisture predictions.
+  - Must be exactly 11x11 dimensions
+  - All values must be between 0.0 and 1.0 (inclusive)
+  - Values represent soil moisture content as a fraction
+  - Shape must match SMAP validation data
+
+- The task will handle adding metadata (bounds, CRS, time, etc.)
+
+Example output format:
+```python
+{
+    "surface": [[0.2, 0.3, ...], [0.25, 0.35, ...], ...],  # 11x11 array of floats between 0-1
+    "rootzone": [[0.4, 0.45, ...], [0.42, 0.47, ...], ...] # 11x11 array of floats between 0-1
+}
+```
+
+**Important Notes:**
+1. Both arrays MUST be exactly 11x11 in size to match SMAP validation data
+2. All values MUST be between 0.0 and 1.0 (inclusive)
+3. NaN or infinite values will be rejected
+4. Arrays must be properly nested lists (not numpy arrays or tensors)
+5. The validator will check these requirements and reject invalid predictions
 
 #### **Weather Data Details**
 
@@ -158,7 +184,6 @@ see soil_apis.py for more information on the data processing, transformations, a
 
 > - The custom model file must be named `custom_geomagnetic_model.py`
 > - **Place it in the following directory:** `Gaia/gaia/models/custom_models/`
-
 2. **Implementing the Custom Model**
 
 > **IMPORTANT: This class must**:
@@ -235,4 +260,3 @@ The output must be a dictionary with the following keys:
 If your custom model requires external libraries (e.g., `pytorch`, `scikit-learn`), ensure they are included in your environment.
 
 You can update your `requirements.txt` file with any additional dependencies.
-

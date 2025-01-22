@@ -270,33 +270,54 @@ async def restart_pm2_process(process_name):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            result = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    "pm2",
-                    "restart",
-                    process_name,
-                    "--update-env",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                ),
-                timeout=30,
+            # First send SIGTERM to allow graceful shutdown
+            logger.info("Sending SIGTERM for graceful shutdown...")
+            term_proc = await asyncio.create_subprocess_exec(
+                "pm2", "sendSignal", "SIGTERM", process_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-
-            stdout, stderr = await result.communicate()
-
-            if result.returncode == 0:
+            
+            # Wait for process to indicate cleanup is done via its status file
+            cleanup_file = "/tmp/validator_cleanup_done"
+            max_wait = 60  # Maximum seconds to wait for cleanup
+            wait_interval = 1
+            for _ in range(max_wait // wait_interval):
+                if os.path.exists(cleanup_file):
+                    logger.info("Detected cleanup completion flag, proceeding with restart")
+                    try:
+                        os.remove(cleanup_file)  # Clean up the file
+                    except Exception as e:
+                        logger.warning(f"Could not remove cleanup file: {e}")
+                    break
+                await asyncio.sleep(wait_interval)
+            else:
+                logger.warning("Cleanup completion not detected after timeout, proceeding with restart")
+            
+            # Then do the restart
+            logger.info(f"Restarting process {process_name}...")
+            restart_proc = await asyncio.create_subprocess_exec(
+                "pm2", "restart", process_name, "--update-env",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await restart_proc.communicate()
+            
+            if restart_proc.returncode == 0:
                 logger.info(f"PM2 restart successful on attempt {attempt + 1}")
                 return True
-
-            logger.warning(f"PM2 restart failed on attempt {attempt + 1}")
+            
+            logger.warning(f"PM2 restart failed on attempt {attempt + 1}: {stderr.decode()}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 * (attempt + 1))
-
-        except asyncio.TimeoutError:
-            logger.error(f"PM2 restart timed out on attempt {attempt + 1}")
+            
+        except Exception as e:
+            logger.error(f"Error during PM2 restart attempt {attempt + 1}: {str(e)}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 * (attempt + 1))
-
+            continue
+    
     return False
 
 

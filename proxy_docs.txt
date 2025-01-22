@@ -1,5 +1,0 @@
-The proxy server still needs work. I need to document the packages it requires, the name needs to not be set to the IP, it currently runs two servers (miner and validator) at a hard coded IP.
-
-But it works by running 
-
-./setup_proxy_server.sh --server_name yourdomain.com --ip 192.168.1.100 --port 33333

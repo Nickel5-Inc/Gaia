@@ -1,5 +1,5 @@
 import traceback
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Union, List
 import uuid
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from gaia.tasks.base.task import Task
@@ -30,6 +30,7 @@ import json
 from pydantic import Field
 import os
 import importlib.util
+from sqlalchemy.sql import text
 
 logger = get_logger(__name__)
 
@@ -63,7 +64,7 @@ class GeomagneticTask(Task):
     """
 
     # Declare Pydantic fields
-    db_manager: ValidatorDatabaseManager = Field(
+    db_manager: Union[ValidatorDatabaseManager, MinerDatabaseManager] = Field(
         default_factory=ValidatorDatabaseManager,
         description="Database manager for the task",
     )
@@ -71,11 +72,21 @@ class GeomagneticTask(Task):
         default_factory=GeomagneticPreprocessing,
         description="Preprocessing component for miner",
     )
-    model: GeoMagBaseModel = Field(
-        default_factory=GeoMagBaseModel, description="The geomagnetic prediction model"
+    model: Optional[GeoMagBaseModel] = Field(
+        default=None, description="The geomagnetic prediction model"
+    )
+    node_type: str = Field(
+        default="validator",
+        description="Type of node running the task (validator or miner)"
+    )
+    test_mode: bool = Field(
+        default=False,
+        description="Whether to run in test mode (immediate execution, limited scope)"
     )
 
-    def __init__(self, db_manager=None, **data):
+
+    def __init__(self, node_type: str, db_manager, test_mode: bool = False, **data):
+        """Initialize the task."""
         super().__init__(
             name="GeomagneticTask",
             description="Geomagnetic prediction task",
@@ -87,25 +98,35 @@ class GeomagneticTask(Task):
             scoring_mechanism=GeomagneticScoringMechanism(db_manager=db_manager),
             **data,
         )
-
-        # Try to load custom model first
-        try:
-            custom_model_path = "gaia/models/custom_models/custom_geomagnetic_model.py"
-            if os.path.exists(custom_model_path):
-                spec = importlib.util.spec_from_file_location(
-                    "custom_geomagnetic_model", custom_model_path
-                )
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                self.model = module.CustomGeomagneticModel()
-                logger.info("Successfully loaded custom geomagnetic model")
-            else:
-                # Fall back to base model
-                self.model = GeoMagBaseModel()
-                logger.info("No custom model found, using base model")
-        except Exception as e:
-            logger.warning(f"Error loading custom model: {e}, falling back to base model")
-            self.model = GeoMagBaseModel()
+        
+        self.node_type = node_type
+        self.test_mode = test_mode
+        self.model = None
+        
+        if self.node_type == "miner":
+            try:
+                logger.info("Running as miner - loading model...")
+                # Try to load custom model first
+                custom_model_path = "gaia/models/custom_models/custom_geomagnetic_model.py"
+                if os.path.exists(custom_model_path):
+                    spec = importlib.util.spec_from_file_location(
+                        "custom_geomagnetic_model", custom_model_path
+                    )
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    self.model = module.CustomGeomagneticModel()
+                    logger.info("Successfully loaded custom geomagnetic model")
+                else:
+                    # Fall back to base model
+                    from gaia.models.geomag_basemodel import GeoMagBaseModel
+                    self.model = GeoMagBaseModel()
+                    logger.info("No custom model found, using base model")
+            except Exception as e:
+                logger.error(f"Error loading model: {e}")
+                logger.error(traceback.format_exc())
+                raise
+        else:
+            logger.info("Running as validator - skipping model loading")
 
     def miner_preprocess(self, raw_data):
         """
@@ -170,44 +191,61 @@ class GeomagneticTask(Task):
         """
         Executes the validator workflow:
         - Aligns execution to start at the top of each UTC hour.
-        - Fetches predictions for the last UTC hour.
-        - Fetches ground truth data for the current UTC hour.
-        - Scores predictions against the ground truth.
-        - Archives scored predictions in the history table or file.
+        - At hour N:
+            - Query miners for new predictions
+            - Score predictions collected during hour N-1
         - Runs in a continuous loop.
         """
         while True:
             try:
-                # Step 1: Align to the top of the next hour
+                await validator.update_task_status('geomagnetic', 'active')
+                
+                # Step 1: Align to the top of the next hour (or wait 5 min in test mode)
                 current_time = datetime.datetime.now(datetime.timezone.utc)
-                next_hour = current_time.replace(
-                    minute=0, second=0, microsecond=0
-                ) + datetime.timedelta(hours=1)
-                sleep_duration = (next_hour - current_time).total_seconds()
+                if not self.test_mode:
+                    next_hour = current_time.replace(
+                        minute=0, second=0, microsecond=0
+                    ) + datetime.timedelta(hours=1)
+                    sleep_duration = (next_hour - current_time).total_seconds()
 
-                logger.info(
-                    f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
-                )
-                await asyncio.sleep(sleep_duration)
+                    logger.info(
+                        f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
+                    )
+                    await validator.update_task_status('geomagnetic', 'idle')
+                    await asyncio.sleep(sleep_duration)
+                else:
+                    next_hour = current_time
+                    logger.info("Test mode: Running immediately, will sleep for 5 minutes after completion")
 
                 logger.info("Starting GeomagneticTask execution...")
 
                 # Step 2: Fetch Latest Geomagnetic Data
+                await validator.update_task_status('geomagnetic', 'processing', 'data_fetch')
                 timestamp, dst_value, historical_data = await self._fetch_geomag_data()
 
-                # Step 3: Query Miners
-                current_hour_start = next_hour - datetime.timedelta(hours=1)
+                # Step 3: Query Miners for predictions
+                await validator.update_task_status('geomagnetic', 'processing', 'miner_query')
                 await self._query_miners(
-                    validator, timestamp, dst_value, historical_data, current_hour_start
+                    validator, timestamp, dst_value, historical_data, next_hour
                 )
+                logger.info(f"Collected predictions at hour {next_hour}")
 
-                # Step 4: Process Scores
-                await self._process_scores(validator, current_hour_start, next_hour)
+                # Step 4: Score predictions from previous hour
+                previous_hour = next_hour - datetime.timedelta(hours=1)
+                await validator.update_task_status('geomagnetic', 'processing', 'scoring')
+                await self._process_scores(validator, previous_hour)
+                
+                await validator.update_task_status('geomagnetic', 'idle')
+
+                # In test mode, sleep for 5 minutes before next iteration
+                if self.test_mode:
+                    logger.info("Test mode: Sleeping for 5 minutes before next execution")
+                    await asyncio.sleep(300)
 
             except Exception as e:
                 logger.error(f"Unexpected error in validator_execute loop: {e}")
                 logger.error(traceback.format_exc())
-
+                await validator.update_task_status('geomagnetic', 'error')
                 await asyncio.sleep(3600)
 
     async def _fetch_geomag_data(self):
@@ -231,6 +269,10 @@ class GeomagneticTask(Task):
         self, validator, timestamp, dst_value, historical_data, current_hour_start
     ):
         """Query miners with current data and process responses."""
+        if timestamp == "N/A" or dst_value == "N/A":
+            logger.warning("Invalid geomagnetic data. Skipping miner queries.")
+            return
+
         if timestamp == "N/A" or dst_value == "N/A":
             logger.warning("Invalid geomagnetic data. Skipping miner queries.")
             return
@@ -264,24 +306,36 @@ class GeomagneticTask(Task):
         await self.process_miner_responses(responses, current_hour_start, validator)
         logger.info(f"Added {len(responses)} predictions to the database")
 
-    async def _process_scores(self, validator, current_hour_start, next_hour):
-        """Process and archive scores for the previous hour."""
+    async def _process_scores(self, validator, query_hour):
+        """
+        Process and archive scores for predictions collected during the specified hour.
+        
+        Args:
+            validator: The validator instance
+            query_hour: The hour during which predictions were collected
+        """
         # Fetch Ground Truth
         ground_truth_value = await self.fetch_ground_truth()
         if ground_truth_value is None:
             logger.warning("Ground truth data not available. Skipping scoring.")
             return
 
-        # Score Predictions and Archive Results
-        last_hour_start = current_hour_start
-        last_hour_end = next_hour.replace(minute=0, second=0, microsecond=0)
-        current_time = datetime.datetime.now(datetime.timezone.utc)  # Add this line
+        # Get predictions collected during the specified hour
+        hour_start = query_hour
+        hour_end = query_hour + datetime.timedelta(hours=1)
 
         logger.info(
-            f"Fetching predictions between {last_hour_start} and {last_hour_end}"
+            f"Scoring predictions collected between {hour_start} and {hour_end}"
         )
-        tasks = await self.get_tasks_for_hour(last_hour_start, last_hour_end, validator)
+        
+        tasks = await self.get_tasks_for_hour(hour_start, hour_end, validator)
+        if not tasks:
+            logger.info(f"No predictions found for collection hour {query_hour}")
+            return
+
+        current_time = datetime.datetime.now(datetime.timezone.utc)
         await self.score_tasks(tasks, ground_truth_value, current_time)
+        logger.info(f"Completed scoring {len(tasks)} predictions from hour {query_hour}")
 
     async def get_tasks_for_hour(self, start_time, end_time, validator=None):
         """
@@ -297,8 +351,18 @@ class GeomagneticTask(Task):
             list: List of task dictionaries containing task details.
         """
         try:
-            # Query the database for most recent tasks per miner in the time range
-            query = """
+            # Convert timestamps to UTC if they aren't already
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=datetime.timezone.utc)
+            if end_time.tzinfo is None:
+                end_time = end_time.replace(tzinfo=datetime.timezone.utc)
+
+            logger.info(f"Querying tasks with:")
+            logger.info(f"  start_time: {start_time} (tzinfo: {start_time.tzinfo})")
+            logger.info(f"  end_time: {end_time} (tzinfo: {end_time.tzinfo})")
+
+            results = await self.db_manager.fetch_all(
+                """
                 WITH RankedTasks AS (
                     SELECT 
                         id,
@@ -322,29 +386,14 @@ class GeomagneticTask(Task):
                     predicted_value,
                     query_time
                 FROM RankedTasks
-                WHERE rn = 1;
-            """
-            # Convert timestamps to UTC if they aren't already
-            if start_time.tzinfo is None:
-                start_time = start_time.replace(tzinfo=datetime.timezone.utc)
-            if end_time.tzinfo is None:
-                end_time = end_time.replace(tzinfo=datetime.timezone.utc)
-
-            logger.info(f"Querying tasks with:")
-            logger.info(f"  start_time: {start_time} (tzinfo: {start_time.tzinfo})")
-            logger.info(f"  end_time: {end_time} (tzinfo: {end_time.tzinfo})")
-
-            params = {"start_time": start_time, "end_time": end_time}
-
-            # Log the query parameters for debugging
-            logger.info(f"Querying with start_time: {start_time}, end_time: {end_time}")
-
-            results = await self.db_manager.fetch_many(query, params)
-
-            # Log raw results for debugging
-            logger.info(f"Raw query results: {results}")
-
-            # Convert results to a list of task dictionaries
+                WHERE rn = 1
+                """,
+                {
+                    "start_time": start_time,
+                    "end_time": end_time
+                }
+            )
+            
             tasks = []
             for row in results:
                 task = {
@@ -356,9 +405,7 @@ class GeomagneticTask(Task):
                 }
                 tasks.append(task)
 
-            logger.info(
-                f"Fetched {len(tasks)} tasks between {start_time} and {end_time}"
-            )
+            logger.info(f"Fetched {len(tasks)} tasks between {start_time} and {end_time}")
 
             # task validation - ensure that miner_hotkey is in the metagraph if validator is provided
             if validator:
@@ -417,32 +464,31 @@ class GeomagneticTask(Task):
             score_time (datetime): When the task was scored
         """
         try:
-            # Insert into history table
-            query = """
+            await self.db_manager.execute(
+                """
                 INSERT INTO geomagnetic_history 
                 (miner_uid, miner_hotkey, query_time, predicted_value, ground_truth_value, score, scored_at)
                 VALUES (:miner_uid, :miner_hotkey, :query_time, :predicted_value, :ground_truth_value, :score, :scored_at)
-            """
-
-            params = {
-                "miner_uid": task["miner_uid"],
-                "miner_hotkey": task["miner_hotkey"],
-                "query_time": task["query_time"],
-                "predicted_value": task["predicted_values"],
-                "ground_truth_value": ground_truth_value,
-                "score": score,
-                "scored_at": score_time,
-            }
-
-            await self.db_manager.execute(query, params)
+                """,
+                {
+                    "miner_uid": task["miner_uid"],
+                    "miner_hotkey": task["miner_hotkey"],
+                    "query_time": task["query_time"],
+                    "predicted_value": task["predicted_values"],
+                    "ground_truth_value": ground_truth_value,
+                    "score": score,
+                    "scored_at": score_time,
+                }
+            )
             logger.info(f"Archived task to history: {task['id']}")
 
-            # Remove from predictions table
-            delete_query = """
+            await self.db_manager.execute(
+                """
                 DELETE FROM geomagnetic_predictions 
                 WHERE id = :task_id
-            """
-            await self.db_manager.execute(delete_query, {"task_id": task["id"]})
+                """,
+                {"task_id": task["id"]}
+            )
             logger.info(f"Removed task from predictions: {task['id']}")
 
         except Exception as e:
@@ -554,10 +600,10 @@ class GeomagneticTask(Task):
         except Exception as e:
             logger.error(f"Error in miner execution: {str(e)}")
             logger.error(traceback.format_exc())
-            # Fix datetime usage
+            # Return float('nan') instead of "N/A"
             current_time = datetime.datetime.now(datetime.timezone.utc)
             return {
-                "predicted_values": "N/A",
+                "predicted_values": float('nan'),  # Changed from "N/A" to float('nan')
                 "timestamp": current_time.isoformat(),
                 "miner_hotkey": miner.keypair.ss58_address,
             }
@@ -577,7 +623,7 @@ class GeomagneticTask(Task):
             print(f"Error querying miners: {str(e)}")
             return None
 
-    def add_task_to_queue(self, predictions, query_time):
+    async def add_task_to_queue(self, predictions, query_time):
         """
         Adds a new task to the task queue.
 
@@ -586,13 +632,6 @@ class GeomagneticTask(Task):
             query_time (datetime): The time the task was added.
         """
         try:
-            # Use MinerDatabaseManager to insert task into the database
-            db_manager = MinerDatabaseManager()
-            task_name = "geomagnetic_prediction"
-            miner_id = (
-                "example_miner_id"  # Replace with the actual miner ID if available
-            )
-
             # Validate predictions
             if predictions is None:
                 logger.warning("Received None predictions, skipping queue addition")
@@ -604,19 +643,24 @@ class GeomagneticTask(Task):
             else:
                 predicted_value = {"predictions": predictions}
 
-            # Add to the queue
-            asyncio.run(
-                db_manager.add_to_queue(
-                    task_name=task_name,
-                    miner_id=miner_id,
-                    predicted_value=predicted_value,
-                    query_time=query_time,
-                )
+            # Add to the queue using execute
+            await self.db_manager.execute(
+                """
+                INSERT INTO task_queue (task_name, miner_id, predicted_value, query_time)
+                VALUES (:task_name, :miner_id, :predicted_value, :query_time)
+                """,
+                {
+                    "task_name": "geomagnetic_prediction",
+                    "miner_id": "example_miner_id",  # Replace with actual miner ID
+                    "predicted_value": json.dumps(predicted_value),
+                    "query_time": query_time
+                }
             )
-            logger.info(f"Task added to queue: {task_name} at {query_time}")
+            logger.info(f"Task added to queue: geomagnetic_prediction at {query_time}")
 
         except Exception as e:
             logger.error(f"Error adding task to queue: {e}")
+            raise
 
     async def add_prediction_to_queue(
         self,
@@ -636,16 +680,6 @@ class GeomagneticTask(Task):
             status (str, optional): Current status of the prediction. Defaults to "pending"
         """
         try:
-            # Initialize the database manager
-            db_manager = ValidatorDatabaseManager()
-
-            # Construct the query based on schema.json
-            query = """
-                INSERT INTO geomagnetic_predictions 
-                (id, miner_uid, miner_hotkey, predicted_value, query_time, status)
-                VALUES (:id, :miner_uid, :miner_hotkey, :predicted_value, :query_time, :status)
-            """
-
             # Prepare parameters
             params = {
                 "id": str(uuid.uuid4()),
@@ -659,7 +693,14 @@ class GeomagneticTask(Task):
             logger.info(f"Adding prediction to queue with params: {params}")
 
             # Execute the query
-            await db_manager.execute(query, params)
+            await self.db_manager.execute(
+                """
+                INSERT INTO geomagnetic_predictions 
+                (id, miner_uid, miner_hotkey, predicted_value, query_time, status)
+                VALUES (:id, :miner_uid, :miner_hotkey, :predicted_value, :query_time, :status)
+                """,
+                params
+            )
             logger.info(f"Added prediction from miner {miner_uid} to queue")
 
         except Exception as e:
@@ -667,77 +708,88 @@ class GeomagneticTask(Task):
             logger.error(f"{traceback.format_exc()}")
             raise
 
+    def extract_prediction(self, response):
+        """Recursively extract prediction from response, handling various formats."""
+        if isinstance(response, dict):
+            # Direct access to predicted values
+            if "predicted_values" in response:
+                return response["predicted_values"]
+            if "predicted_value" in response:
+                return response["predicted_value"]
+            # If response has text field that might be JSON
+            if "text" in response:
+                try:
+                    parsed = json.loads(response["text"])
+                    return self.extract_prediction(parsed)
+                except json.JSONDecodeError:
+                    return None
+        return None
+
     async def process_miner_responses(
         self,
         responses: Dict[str, Any],
         current_hour_start: datetime.datetime,
         validator,
     ) -> None:
-        """Process responses from miners and add valid predictions to the queue."""
-        logger.info(
-            f"Processing responses with current_hour_start: {current_hour_start} (tzinfo: {current_hour_start.tzinfo})"
-        )
+        """Process responses from miners and add to queue."""
+        try:
+            if not responses:
+                logger.warning("No responses received from miners")
+                return
 
-        for hotkey, response_data in responses.items():
-            try:
-                logger.info(f"Processing response for hotkey {hotkey}: {response_data}")
-
-                # Handle response object with 'text' field
-                if isinstance(response_data, dict) and "text" in response_data:
-                    try:
-                        response = json.loads(response_data["text"])
-                        logger.debug(f"Successfully parsed response: {response}")
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Failed to parse response text for {hotkey}: {e}")
+            for hotkey, response in responses.items():
+                try:
+                    logger.info(f"Raw response from miner {hotkey}: {response}")
+                    
+                    predicted_value = self.extract_prediction(response)
+                    if predicted_value is None:
+                        logger.error(f"No valid prediction found in response from {hotkey}")
                         continue
-                else:
-                    logger.warning(
-                        f"Invalid response format for {hotkey}: {response_data}"
+
+                    try:
+                        predicted_value = float(predicted_value)
+                    except (TypeError, ValueError) as e:
+                        logger.error(f"Invalid prediction from {hotkey}: {predicted_value}")
+                        continue
+
+                    logger.info("=" * 50)
+                    logger.info(f"Received prediction from miner:")
+                    logger.info(f"Miner Hotkey: {hotkey}")
+                    logger.info(f"Predicted Value: {predicted_value}")
+                    logger.info(f"Timestamp: {current_hour_start}")
+                    logger.info("=" * 50)
+
+                    result = await self.db_manager.fetch_one(
+                        """
+                        SELECT uid FROM node_table 
+                        WHERE hotkey = :miner_hotkey
+                        """,
+                        {"miner_hotkey": hotkey}
                     )
-                    continue
+                    
+                    if not result:
+                        logger.warning(f"No UID found for hotkey {hotkey}")
+                        continue
+                    miner_uid = str(result["uid"])
+                    logger.info(f"Found miner UID {miner_uid} for hotkey {hotkey}")
 
-                # Extract values from response
-                predicted_value = float(
-                    response.get("predicted_values")
-                )  # Ensure numeric
-                miner_hotkey = hotkey  # Use the key from responses dict
-
-                # Get miner UID from hotkey
-                miner_uid = None
-                query = "SELECT uid FROM node_table WHERE hotkey = :miner_hotkey"
-                result = await self.db_manager.fetch_one(
-                    query, {"miner_hotkey": miner_hotkey}
-                )
-                if result:
-                    miner_uid = result["uid"]
-                    logger.info(
-                        f"Found miner UID {miner_uid} for hotkey {miner_hotkey}"
+                    logger.info(f"Adding prediction to queue for {hotkey} with value {predicted_value}")
+                    await self.add_prediction_to_queue(
+                        miner_uid=miner_uid,
+                        miner_hotkey=hotkey,
+                        predicted_value=predicted_value,
+                        query_time=current_hour_start,
+                        status="pending",
                     )
-                else:
-                    logger.warning(f"No UID found for hotkey {miner_hotkey}")
+
+                except Exception as e:
+                    logger.error(f"Error processing response from {hotkey}: {e}")
+                    logger.error(traceback.format_exc())
                     continue
 
-                # Validate response
-                if predicted_value is None:
-                    logger.warning(f"Missing predicted value in response: {response}")
-                    continue
-
-                # Add to queue with proper timestamp handling
-                logger.info(
-                    f"Adding prediction to queue for {miner_hotkey} with value {predicted_value}"
-                )
-                await self.add_prediction_to_queue(
-                    miner_uid=str(miner_uid),
-                    miner_hotkey=miner_hotkey,
-                    predicted_value=predicted_value,
-                    query_time=current_hour_start,
-                    status="pending",  # Explicitly set status
-                )
-
-            except Exception as e:
-                logger.error(f"Error processing miner response for {hotkey}: {e}")
-                logger.error(f"{traceback.format_exc()}")
-                continue
+        except Exception as e:
+            logger.error(f"Error processing miner responses: {e}")
+            logger.error(traceback.format_exc())
 
     async def score_tasks(self, tasks, ground_truth_value, current_time):
         if tasks:
@@ -796,7 +848,7 @@ class GeomagneticTask(Task):
             SELECT uid, hotkey FROM node_table 
             WHERE hotkey IS NOT NULL
             """
-            miner_mappings = await self.db_manager.fetch_many(query)
+            miner_mappings = await self.db_manager.fetch_all(query)
             hotkey_to_uid = {row["hotkey"]: row["uid"] for row in miner_mappings}
 
             # Check historical table for any tasks in this time period
@@ -806,7 +858,7 @@ class GeomagneticTask(Task):
             WHERE query_time >= :start_time 
             AND query_time < :end_time
             """
-            historical_tasks = await self.db_manager.fetch_many(
+            historical_tasks = await self.db_manager.fetch_all(
                 historical_query,
                 {"start_time": previous_datetime, "end_time": current_datetime},
             )
@@ -834,12 +886,14 @@ class GeomagneticTask(Task):
                 "status": "completed",
             }
 
-            # Insert into score_table
-            query = """
-            INSERT INTO score_table (task_name, task_id, score, status)
-            VALUES (:task_name, :task_id, :score, :status)
-            """
-            await self.db_manager.execute(query, score_row)
+            # WRITE operation - use execute for inserting score
+            await self.db_manager.execute(
+                """
+                INSERT INTO score_table (task_name, task_id, score, status)
+                VALUES (:task_name, :task_id, :score, :status)
+                """,
+                score_row
+            )
 
             logger.info(
                 f"Built score row for hour {current_datetime} with {len([s for s in scores if not np.isnan(s)])} scores"
@@ -851,69 +905,91 @@ class GeomagneticTask(Task):
             logger.error(traceback.format_exc())
             return None
 
-    async def recalculate_recent_scores(self, uids: list):
+    async def recalculate_recent_scores(self, uids: List[int]) -> None:
         """
-        Recalculate recent scores for the given UIDs across the 3-day scoring window
-        and update all affected score_table rows.
-
+        Recalculate scores for specified miners over the last 3 days.
+        
         Args:
-            uids (list): List of UIDs to recalculate scores for.
+            uids (List[int]): List of miner UIDs to recalculate scores for
+            
+        Raises:
+            ValueError: If UIDs are invalid
+            DatabaseError: If there is an error accessing the database
         """
         try:
-            # Step 1: Delete predictions for the given UIDs
-            delete_query = """
-            DELETE FROM geomagnetic_predictions
-            WHERE miner_uid = ANY(:uids)
-            """
-            await self.db_manager.execute(delete_query, {"uids": uids})
-            logger.info(f"Deleted predictions for UIDs: {uids}")
+            # Validate UIDs
+            if not all(isinstance(uid, int) and 0 <= uid < 256 for uid in uids):
+                raise ValueError("All UIDs must be integers between 0 and 255")
 
-            # Step 2: Set up time window (3 days)
             current_time = datetime.datetime.now(datetime.timezone.utc)
             history_window = current_time - datetime.timedelta(days=3)
+            logger.info(f"Recalculating scores for UIDs {uids} from {history_window} to {current_time}")
 
-            # Delete existing score rows for the period
-            delete_scores_query = """
-            DELETE FROM score_table 
-            WHERE task_name = 'geomagnetic'
-            AND task_id::float >= :start_timestamp
-            AND task_id::float <= :end_timestamp
-            """
+            # Convert UIDs to strings for database query
+            str_uids = [str(uid) for uid in uids]
+
+            # Delete existing predictions
             await self.db_manager.execute(
-                delete_scores_query,
+                """
+                DELETE FROM geomagnetic_predictions
+                WHERE miner_uid = ANY(:uids)
+                """,
+                {"uids": str_uids}
+            )
+            logger.info(f"Successfully deleted predictions for UIDs: {uids}")
+
+            # Delete affected score rows
+            await self.db_manager.execute(
+                """
+                DELETE FROM score_table 
+                WHERE task_name = 'geomagnetic'
+                AND task_id::float >= :start_timestamp
+                AND task_id::float <= :end_timestamp
+                """,
                 {
                     "start_timestamp": history_window.timestamp(),
                     "end_timestamp": current_time.timestamp(),
-                },
+                }
             )
-            logger.info(
-                f"Deleted score rows for period {history_window} to {current_time}"
+            logger.info(f"Successfully deleted scores for time window")
+
+            # Get history data
+            history_results = await self.db_manager.fetch_all(
+                """
+                SELECT 
+                    miner_hotkey,
+                    miner_uid,
+                    query_time,
+                    score
+                FROM geomagnetic_history
+                WHERE query_time >= :history_window
+                AND query_time <= :current_time
+                AND miner_uid = ANY(:uids)
+                ORDER BY query_time ASC
+                """,
+                {
+                    "history_window": history_window,
+                    "current_time": current_time,
+                    "uids": str_uids
+                }
             )
 
-            # Get historical data
-            history_query = """
-            SELECT 
-                miner_hotkey,
-                score,
-                query_time
-            FROM geomagnetic_history
-            WHERE query_time >= :history_window
-            ORDER BY query_time ASC
-            """
-            history_results = await self.db_manager.fetch_many(
-                history_query, {"history_window": history_window}
-            )
+            if not history_results:
+                logger.warning(f"No historical data found for UIDs {uids} in window {history_window} to {current_time}")
+                return
 
-            # Get mapping of hotkeys to UIDs
-            query = """
-            SELECT uid, hotkey FROM node_table 
-            WHERE hotkey IS NOT NULL
-            """
-            miner_mappings = await self.db_manager.fetch_many(query)
-            hotkey_to_uid = {row["hotkey"]: row["uid"] for row in miner_mappings}
+            # Get current miner mappings
+            miner_mappings = await self.db_manager.fetch_all(
+                """
+                SELECT uid, hotkey 
+                FROM node_table 
+                WHERE hotkey IS NOT NULL
+                """
+            )
+            hotkey_to_uid: Dict[str, int] = {row["hotkey"]: row["uid"] for row in miner_mappings}
 
             # Group records by hour
-            hourly_records = {}
+            hourly_records: Dict[datetime.datetime, List[Dict[str, Any]]] = {}
             for record in history_results:
                 hour_key = record["query_time"].replace(
                     minute=0, second=0, microsecond=0
@@ -924,34 +1000,77 @@ class GeomagneticTask(Task):
 
             # Process each hour
             for hour, records in hourly_records.items():
-                scores = [float("nan")] * 256
+                try:
+                    scores: List[float] = [float("nan")] * 256
 
-                # Calculate scores for this hour
-                for record in records:
-                    miner_hotkey = record["miner_hotkey"]
-                    if miner_hotkey in hotkey_to_uid:
-                        uid = hotkey_to_uid[miner_hotkey]
-                        scores[uid] = record["score"]
+                    # Calculate scores for this hour
+                    for record in records:
+                        try:
+                            miner_hotkey = record["miner_hotkey"]
+                            if miner_hotkey in hotkey_to_uid:
+                                uid = hotkey_to_uid[miner_hotkey]
+                                if record["score"] is not None:
+                                    scores[uid] = float(record["score"])
+                        except (ValueError, TypeError) as e:
+                            logger.error(f"Error processing record for miner {record.get('miner_hotkey')}: {e}")
+                            continue
 
-                # Create and insert score row for this hour
-                score_row = {
-                    "task_name": "geomagnetic",
-                    "task_id": str(hour.timestamp()),
-                    "score": scores,
-                    "status": "completed",
-                }
+                    # Insert score row
+                    score_row = {
+                        "task_name": "geomagnetic",
+                        "task_id": str(hour.timestamp()),
+                        "score": scores,
+                        "status": "completed",
+                    }
 
-                insert_query = """
-                INSERT INTO score_table (task_name, task_id, score, status)
-                VALUES (:task_name, :task_id, :score, :status)
-                """
-                await self.db_manager.execute(insert_query, score_row)
-                logger.info(f"Recalculated and inserted score row for hour {hour}")
+                    await self.db_manager.execute(
+                        """
+                        INSERT INTO score_table (task_name, task_id, score, status)
+                        VALUES (:task_name, :task_id, :score, :status)
+                        """,
+                        score_row
+                    )
+                    logger.info(f"Recalculated and inserted score row for hour {hour}")
 
-            logger.info(
-                f"Completed recalculation of scores for UIDs: {uids} over 3-day window"
-            )
+                except Exception as e:
+                    logger.error(f"Error processing hour {hour}: {e}")
+                    logger.error(traceback.format_exc())
+                    continue
 
+            logger.info(f"Completed recalculation of scores for UIDs: {uids} over 3-day window")
+
+        except ValueError as e:
+            logger.error(f"Invalid UIDs in recalculate_recent_scores: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Error recalculating recent scores: {e}")
+            logger.error(f"Error in recalculate_recent_scores: {e}")
             logger.error(traceback.format_exc())
+            raise  # Re-raise to trigger error handling in deregistration loop
+
+    async def cleanup_resources(self):
+        """Clean up any resources used by the task during recovery."""
+        try:
+            await self.db_manager.execute(
+                """
+                UPDATE geomagnetic_predictions 
+                SET status = 'pending'
+                WHERE status = 'processing'
+                """
+            )
+            logger.info("Reset in-progress prediction statuses")
+            
+            await self.db_manager.execute(
+                """
+                DELETE FROM score_table 
+                WHERE task_name = 'geomagnetic' 
+                AND status = 'processing'
+                """
+            )
+            logger.info("Cleaned up incomplete scoring operations")
+            logger.info("Completed geomagnetic task cleanup")
+            
+        except Exception as e:
+            logger.error(f"Error during geomagnetic task cleanup: {e}")
+            logger.error(traceback.format_exc())
+            raise
+            raise

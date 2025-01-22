@@ -11,14 +11,15 @@ from fiber.encrypted.miner.middleware import configure_extra_logging_middleware
 from fiber.chain import chain_utils
 from gaia.miner.utils.subnet import factory_router
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
+from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
 import ssl
 import logging
 from fiber import logging_utils
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
+import asyncio
 
-# Define max request size (5MB in bytes)
 MAX_REQUEST_SIZE = 5 * 1024 * 1024  # 5MB
 
 
@@ -64,8 +65,19 @@ class Miner:
         )
 
         self.database_manager = MinerDatabaseManager()
+        async def init_db():
+            await self.database_manager.ensure_engine_initialized()
+            
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(init_db())
+        
+        self.geomagnetic_task = GeomagneticTask(
+            node_type="miner",
+            db_manager=self.database_manager
+        )
         self.soil_task = SoilMoistureTask(
-            db_manager=self.database_manager, node_type="miner"
+            db_manager=self.database_manager,
+            node_type="miner"
         )
 
     def setup_neuron(self) -> bool:
@@ -218,3 +230,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     miner = Miner(args)
     miner.run()
+
