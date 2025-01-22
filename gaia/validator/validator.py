@@ -45,6 +45,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import text
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 
 logger = get_logger(__name__)
 
@@ -1190,131 +1191,139 @@ class GaiaValidator:
                 await asyncio.sleep(60)
                 continue
 
-    async def _calc_task_weights(self) -> Optional[List[float]]:
-        """Calculate and normalize weights from task scores using decaying 3-day average."""
-        logger.info("Syncing metagraph nodes...")
-        self.metagraph.sync_nodes()
-        logger.info("Metagraph synced. Fetching recent scores...")
+    async def _calc_task_weights(self):
+        """Calculate weights based on recent task scores."""
+        try:
+            now = datetime.now(timezone.utc)
+            three_days_ago = now - timedelta(days=3)
+            
+            query = """
+            SELECT score, created_at 
+            FROM score_table 
+            WHERE task_name = :task_name
+            AND created_at >= :start_time
+            ORDER BY created_at DESC
+            """
+            
+            geomagnetic_results = await self.database_manager.fetch_all(
+                query, {"task_name": "geomagnetic", "start_time": three_days_ago}
+            )
+            soil_results = await self.database_manager.fetch_all(
+                query, {"task_name": "soil_moisture", "start_time": three_days_ago}
+            )
 
-        now = datetime.now(timezone.utc)
-        three_days_ago = now - timedelta(days=3)
-        
-        query = """
-        SELECT score, created_at 
-        FROM score_table 
-        WHERE task_name = :task_name
-        AND created_at >= :start_time
-        ORDER BY created_at DESC
-        """
-        
-        geomagnetic_results = await self.database_manager.fetch_all(
-            query, {"task_name": "geomagnetic", "start_time": three_days_ago}
-        )
-        soil_results = await self.database_manager.fetch_all(
-            query, {"task_name": "soil_moisture", "start_time": three_days_ago}
-        )
+            # Initialize score arrays
+            geomagnetic_scores = np.full(256, np.nan)
+            soil_scores = np.full(256, np.nan)
 
-        # Initialize score arrays
-        geomagnetic_scores = [float("nan")] * 256
-        soil_scores = [float("nan")] * 256
-
-        # Process scores with time decay
-        if geomagnetic_results:
-            geo_scores_by_uid = [[] for _ in range(256)]
-            for result in geomagnetic_results:
-                age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                decay = math.exp(-age_days * math.log(2))  # Decay by half each day
-                scores = result['score']
+            if geomagnetic_results:
+                geo_scores_by_uid = [[] for _ in range(256)]
+                for result in geomagnetic_results:
+                    age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                    decay = np.exp(-age_days * np.log(2))  # Decay by half each day
+                    scores = result['score']
+                    for uid in range(256):
+                        # Replace NaN with 0 for API compatibility
+                        if isinstance(scores[uid], str) or np.isnan(scores[uid]):
+                            scores[uid] = 0.0
+                        geo_scores_by_uid[uid].append((scores[uid], decay))
+                
+                # Calculate weighted averages
                 for uid in range(256):
-                    # Replace NaN with 0 for API compatibility
-                    if isinstance(scores[uid], str) or math.isnan(scores[uid]):
-                        scores[uid] = 0.0
-                    geo_scores_by_uid[uid].append((scores[uid], decay))
-            
-            # Calculate weighted averages
-            for uid in range(256):
-                if geo_scores_by_uid[uid]:
-                    weighted_sum = sum(score * weight for score, weight in geo_scores_by_uid[uid])
-                    weight_sum = sum(weight for _, weight in geo_scores_by_uid[uid])
-                    if weight_sum > 0:
-                        geomagnetic_scores[uid] = weighted_sum / weight_sum
+                    if geo_scores_by_uid[uid]:
+                        scores, weights = zip(*geo_scores_by_uid[uid])
+                        scores = np.array(scores)
+                        weights = np.array(weights)
+                        weight_sum = np.sum(weights)
+                        if weight_sum > 0:
+                            geomagnetic_scores[uid] = np.sum(scores * weights) / weight_sum
 
-        if soil_results:
-            soil_scores_by_uid = [[] for _ in range(256)]
-            for result in soil_results:
-                age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                decay = math.exp(-age_days * math.log(2))  # Decay by half each day
-                scores = result['score']
+            if soil_results:
+                soil_scores_by_uid = [[] for _ in range(256)]
+                for result in soil_results:
+                    age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                    decay = np.exp(-age_days * np.log(2))
+                    scores = result['score']
+                    for uid in range(256):
+                        if isinstance(scores[uid], str) or np.isnan(scores[uid]):
+                            scores[uid] = 0.0
+                        soil_scores_by_uid[uid].append((scores[uid], decay))
+                
+                # Calculate weighted averages
                 for uid in range(256):
-                    # Replace NaN with 0 for API compatibility
-                    if isinstance(scores[uid], str) or math.isnan(scores[uid]):
-                        scores[uid] = 0.0
-                    soil_scores_by_uid[uid].append((scores[uid], decay))
+                    if soil_scores_by_uid[uid]:
+                        scores, weights = zip(*soil_scores_by_uid[uid])
+                        scores = np.array(scores)
+                        weights = np.array(weights)
+                        weight_sum = np.sum(weights)
+                        if weight_sum > 0:
+                            soil_scores[uid] = np.sum(scores * weights) / weight_sum
+
+            logger.info("Recent scores fetched and decay-weighted. Calculating aggregate scores...")
+
+            weights = np.zeros(256)
+            for idx in range(256):
+                geomagnetic_score = geomagnetic_scores[idx]
+                soil_score = soil_scores[idx]
+
+                # Treat 0.0 scores the same as NaN
+                if np.isnan(geomagnetic_score) or geomagnetic_score == 0.0:
+                    geomagnetic_score = np.nan
+                if np.isnan(soil_score) or soil_score == 0.0:
+                    soil_score = np.nan
+
+                if np.isnan(geomagnetic_score) and np.isnan(soil_score):
+                    weights[idx] = 0.0
+                    logger.debug(f"Both scores invalid - setting weight to 0")
+                elif np.isnan(geomagnetic_score):
+                    weights[idx] = 0.5 * soil_score
+                    logger.debug(f"Geo score invalid - using soil score: {weights[idx]}")
+                elif np.isnan(soil_score):
+                    weights[idx] = 0.5 * geomagnetic_score
+                    logger.debug(f"UID {idx}: Soil score invalid - geo score: {geomagnetic_score} -> weight: {weights[idx]}")
+                else:
+                    weights[idx] = (0.5 * geomagnetic_score) + (0.5 * soil_score)
+                    logger.debug(f"UID {idx}: Both scores valid - geo: {geomagnetic_score}, soil: {soil_score} -> weight: {weights[idx]}")
+
+                logger.info(f"UID {idx}: geo={geomagnetic_score}, soil={soil_score}, weight={weights[idx]}")
+
+            logger.info(f"Weights before normalization: {weights}")
+
+            # generalized logistic curve
+            non_zero_mask = weights != 0.0
+            if np.any(non_zero_mask):
+                max_weight = np.max(weights[non_zero_mask])
+                normalized_weights = np.where(non_zero_mask, weights/max_weight, 0.0)
+                M = np.percentile(normalized_weights[normalized_weights > 0], 90)
+                b = 25    # Growth rate
+                Q = 4     # Initial value parameter
+                v = 0.6   # Asymmetry
+                k = 0.90  # Upper asymptote
+                a = 0     # Lower asymptote
+                slope = 0.029  # Tilt
+
+                new_weights = np.zeros_like(weights)
+                non_zero_indices = np.where(weights != 0.0)[0]
+                for idx in non_zero_indices:
+                    normalized_weight = weights[idx] / max_weight
+                    sigmoid_part = a + (k - a) / np.power(1 + Q * np.exp(-b * (normalized_weight - M)), 1/v)
+                    linear_part = slope * normalized_weight
+                    new_weights[idx] = sigmoid_part + linear_part
+
+                # Normalize final weights to sum to 1
+                weight_sum = np.sum(new_weights)
+                if weight_sum > 0:
+                    new_weights = new_weights / weight_sum
+                    logger.info(f"Final normalized weights calculated")
+                    return new_weights.tolist()
             
-            # Calculate weighted averages
-            for uid in range(256):
-                if soil_scores_by_uid[uid]:
-                    weighted_sum = sum(score * weight for score, weight in soil_scores_by_uid[uid])
-                    weight_sum = sum(weight for _, weight in soil_scores_by_uid[uid])
-                    if weight_sum > 0:
-                        soil_scores[uid] = weighted_sum / weight_sum
+            logger.warning("No valid weights calculated")
+            return None
 
-        logger.info("Recent scores fetched and decay-weighted. Calculating aggregate scores...")
-
-        weights = [0.0] * 256
-        for idx in range(256):
-            geomagnetic_score = geomagnetic_scores[idx]
-            soil_score = soil_scores[idx]
-
-            # Treat 0.0 scores the same as NaN
-            if math.isnan(geomagnetic_score) or geomagnetic_score == 0.0:
-                geomagnetic_score = float('nan')
-            if math.isnan(soil_score) or soil_score == 0.0:
-                soil_score = float('nan')
-
-            if math.isnan(geomagnetic_score) and math.isnan(soil_score):
-                weights[idx] = 0.0
-                logger.debug(f"Both scores invalid - setting weight to 0")
-            elif math.isnan(geomagnetic_score):
-                weights[idx] = 0.5 * soil_score
-                logger.debug(f"Geo score invalid - using soil score: {weights[idx]}")
-            elif math.isnan(soil_score):
-                geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
-                weights[idx] = 0.5 * geo_normalized
-                logger.debug(f"UID {idx}: Soil score invalid - normalized geo score: {geo_normalized} -> weight: {weights[idx]}")
-            else:
-                geo_normalized = math.exp(-abs(geomagnetic_score) / 10)
-                weights[idx] = (0.5 * geo_normalized) + (0.5 * soil_score)
-                logger.debug(f"UID {idx}: Both scores valid - geo_norm: {geo_normalized}, soil: {soil_score} -> weight: {weights[idx]}")
-
-            logger.info(f"UID {idx}: geo={geomagnetic_score} (norm={geo_normalized if 'geo_normalized' in locals() else 'nan'}), soil={soil_score}, weight={weights[idx]}")
-
-        logger.info(f"Weights before normalization: {weights}")
-
-        # Get max weight for normalization
-        max_weight = max(w for w in weights if w != 0.0)
-        if max_weight > 0:
-            # Normalize weights to [0,1] and apply sigmoid
-            new_weights = [0.0] * len(weights)
-            for idx, weight in enumerate(weights):
-                if weight != 0.0:
-                    # Normalize to [0,1]
-                    normalized_weight = weight / max_weight
-                    # Apply power law to amplify differences
-                    powered_weight = normalized_weight ** 3
-                    # Center around 0.7 and apply very steep sigmoid
-                    exponent = max(min(-50 * (powered_weight - 0.7), 709), -709)
-                    new_weights[idx] = 1 / (1 + math.exp(exponent))
-            
-            # Normalize final weights to sum to 1
-            weight_sum = sum(new_weights)
-            if weight_sum > 0:
-                new_weights = [w / weight_sum for w in new_weights]
-                logger.info(f"Final normalized weights: {new_weights}")
-                return new_weights
-            
-        logger.warning("No valid weights calculated")
-        return None
+        except Exception as e:
+            logger.error(f"Error calculating weights: {e}")
+            logger.error(traceback.format_exc())
+            return None
 
     async def update_last_weights_block(self):
         try:
