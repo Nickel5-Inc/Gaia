@@ -673,77 +673,48 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             raise DatabaseError(f"Failed to update miner info: {str(e)}")
 
     @track_operation('write')
-    async def clear_miner_info(self, index: int, new_hotkey: Optional[str] = None, new_coldkey: Optional[str] = None):
-        """
-        Clear miner information from the node table and history tables.
-        Task-specific cleanup of predictions and scores is handled by the 
-        recalculate_recent_scores methods in each task.
-        If new_hotkey is provided, updates the node table with the new information.
-
-        Args:
-            index (int): Index in the table (0-255)
-            new_hotkey (str, optional): New hotkey to set after clearing
-            new_coldkey (str, optional): New coldkey to set after clearing
-        """
+    async def clear_miner_info(self, index: int, new_hotkey: str = None, new_coldkey: str = None) -> bool:
+        """Clear all information for a miner from the database."""
         try:
-            # First check if the node exists
-            check_query = "SELECT uid FROM node_table WHERE uid = :index"
-            result = await self.fetch_one(check_query, {"index": index})
-            if not result:
-                logger.warning(f"No node found for index {index}, creating new entry")
-                insert_query = "INSERT INTO node_table (uid) VALUES (:index)"
-                await self.execute(insert_query, {"index": index})
-
             # Clear node table entry
             node_query = """
             UPDATE node_table 
-            SET 
-                hotkey = NULL,
-                coldkey = NULL,
-                ip = NULL,
-                ip_type = NULL,
-                port = NULL,
-                incentive = NULL,
-                stake = NULL,
-                trust = NULL,
-                vtrust = NULL,
-                protocol = NULL,
-                last_updated = CURRENT_TIMESTAMP
+            SET hotkey = NULL, coldkey = NULL, ip = NULL, ip_type = NULL, port = NULL,
+                incentive = NULL, stake = NULL, trust = NULL, vtrust = NULL, protocol = NULL
             WHERE uid = :index
             """
             await self.execute(node_query, {"index": index})
 
-            # Clear history records
+            # Delete from geomagnetic history
             geo_history_query = """
             DELETE FROM geomagnetic_history 
-            WHERE miner_uid = :index
+            WHERE miner_hotkey = (SELECT hotkey FROM node_table WHERE uid = :index)
             """
             await self.execute(geo_history_query, {"index": index})
 
+            # Delete from soil moisture history
             soil_history_query = """
             DELETE FROM soil_moisture_history 
-            WHERE miner_uid = :index
+            WHERE miner_hotkey = (SELECT hotkey FROM node_table WHERE uid = :index)
             """
             await self.execute(soil_history_query, {"index": index})
 
-            logger.info(f"Successfully cleared node table entry and history records for miner {index}")
-
-            # Update with new hotkey information if provided
-            if new_hotkey is not None:
+            # If new hotkey info provided, update the node table
+            if new_hotkey:
                 await self.update_miner_info(
                     index=index,
                     hotkey=new_hotkey,
-                    coldkey=new_coldkey or "",  # Default to empty string if not provided
+                    coldkey=new_coldkey or None
                 )
-                logger.info(f"Updated node table with new hotkey information for index {index}")
+                logger.info(f"Updated node table with new hotkey for index {index}")
+            
+            logger.info(f"Successfully cleared miner info for index {index}")
+            return True
 
         except Exception as e:
             logger.error(f"Error clearing miner info for index {index}: {str(e)}")
             logger.error(traceback.format_exc())
-            # Don't raise the error, just log it and continue
             return False
-        
-        return True
 
     @track_operation('read')
     async def get_miner_info(self, index: int):
