@@ -1153,7 +1153,7 @@ class GaiaValidator:
         """Calculate weights based on recent task scores."""
         try:
             now = datetime.now(timezone.utc)
-            three_days_ago = now - timedelta(days=3)
+            one_day_ago = now - timedelta(days=1)
             
             query = """
             SELECT score, created_at 
@@ -1165,13 +1165,13 @@ class GaiaValidator:
             
             # Fetch and analyze geomagnetic scores
             geomagnetic_results = await self.database_manager.fetch_all(
-                query, {"task_name": "geomagnetic", "start_time": three_days_ago}
+                query, {"task_name": "geomagnetic", "start_time": one_day_ago}
             )
             logger.info(f"Found {len(geomagnetic_results)} geomagnetic score rows")
             
             # Fetch soil moisture scores
             soil_results = await self.database_manager.fetch_all(
-                query, {"task_name": "soil_moisture", "start_time": three_days_ago}
+                query, {"task_name": "soil_moisture", "start_time": one_day_ago}
             )
             logger.info(f"Found {len(soil_results)} soil moisture score rows")
             
