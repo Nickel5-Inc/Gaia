@@ -1163,12 +1163,40 @@ class GaiaValidator:
             ORDER BY created_at DESC
             """
             
+            # Fetch and analyze geomagnetic scores
             geomagnetic_results = await self.database_manager.fetch_all(
                 query, {"task_name": "geomagnetic", "start_time": three_days_ago}
             )
+            logger.info(f"Found {len(geomagnetic_results)} geomagnetic score rows")
+            
+            # Fetch soil moisture scores
             soil_results = await self.database_manager.fetch_all(
                 query, {"task_name": "soil_moisture", "start_time": three_days_ago}
             )
+            logger.info(f"Found {len(soil_results)} soil moisture score rows")
+            
+            # If no scores exist yet, return equal weights for all active nodes
+            if not geomagnetic_results and not soil_results:
+                logger.info("No scores found in database - initializing equal weights for active nodes")
+                try:
+                    # Get active nodes from metagraph
+                    active_nodes = len(self.metagraph.nodes) if self.metagraph and self.metagraph.nodes else 0
+                    if active_nodes == 0:
+                        logger.warning("No active nodes found in metagraph")
+                        return None
+                        
+                    # Create equal weights for active nodes
+                    weights = np.zeros(256)
+                    weight_value = 1.0 / active_nodes
+                    for hotkey, node in self.metagraph.nodes.items():
+                        weights[node.uid] = weight_value
+                    
+                    logger.info(f"Initialized equal weights ({weight_value:.4f}) for {active_nodes} active nodes")
+                    return weights.tolist()
+                except Exception as e:
+                    logger.error(f"Error initializing equal weights: {e}")
+                    logger.error(traceback.format_exc())
+                    return None
 
             # Initialize score arrays
             geomagnetic_scores = np.full(256, np.nan)
