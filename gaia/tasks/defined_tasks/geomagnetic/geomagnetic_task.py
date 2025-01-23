@@ -819,10 +819,11 @@ class GeomagneticTask(Task):
 
     async def build_score_row(self, current_hour, recent_tasks=None):
         """
-        Build a score row from recent tasks and historical data
+        Build a score row from recent tasks and historical data.
+        The task_id should be the verification time (when we can score the predictions).
 
         Args:
-            current_hour (datetime): Current hour timestamp
+            current_hour (datetime): Current hour timestamp (when predictions were made)
             recent_tasks (list, optional): List of recently scored tasks
 
         Returns:
@@ -832,13 +833,14 @@ class GeomagneticTask(Task):
             # Convert current_hour to datetime if it's an integer
             if isinstance(current_hour, int):
                 current_time = datetime.datetime.now(datetime.timezone.utc)
-                current_datetime = current_time.replace(
+                prediction_time = current_time.replace(
                     hour=current_hour, minute=0, second=0, microsecond=0
                 )
-                previous_datetime = current_datetime - datetime.timedelta(hours=1)
             else:
-                current_datetime = current_hour
-                previous_datetime = current_datetime - datetime.timedelta(hours=1)
+                prediction_time = current_hour
+
+            # Verification time is 1 hour after prediction time
+            verification_time = prediction_time + datetime.timedelta(hours=1)
 
             # Initialize scores array with NaN values
             scores = [float("nan")] * 256
@@ -855,12 +857,11 @@ class GeomagneticTask(Task):
             historical_query = """
             SELECT miner_hotkey, score
             FROM geomagnetic_history
-            WHERE query_time >= :start_time 
-            AND query_time < :end_time
+            WHERE query_time = :prediction_time
             """
             historical_tasks = await self.db_manager.fetch_all(
                 historical_query,
-                {"start_time": previous_datetime, "end_time": current_datetime},
+                {"prediction_time": prediction_time},
             )
 
             # Process historical tasks
@@ -878,10 +879,10 @@ class GeomagneticTask(Task):
                         uid = hotkey_to_uid[miner_hotkey]
                         scores[uid] = task.get("score", float("nan"))
 
-            # Create score row
+            # Create score row using verification time as task_id
             score_row = {
                 "task_name": "geomagnetic",
-                "task_id": str(current_datetime.timestamp()),
+                "task_id": str(verification_time.timestamp()),
                 "score": scores,
                 "status": "completed",
             }
@@ -896,7 +897,7 @@ class GeomagneticTask(Task):
             )
 
             logger.info(
-                f"Built score row for hour {current_datetime} with {len([s for s in scores if not np.isnan(s)])} scores"
+                f"Built score row for predictions at {prediction_time} (verification time {verification_time}) with {len([s for s in scores if not np.isnan(s)])} scores"
             )
             return score_row
 
