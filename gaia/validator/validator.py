@@ -933,14 +933,14 @@ class GaiaValidator:
                                 # Calculate weights with timeout
                                 normalized_weights = await asyncio.wait_for(
                                     self._calc_task_weights(),
-                                    timeout=60
+                                    timeout=120
                                 )
                                 
                                 if normalized_weights:
                                     # Set weights with timeout
                                     success = await asyncio.wait_for(
                                         weight_setter.set_weights(normalized_weights),
-                                        timeout=340
+                                        timeout=480
                                     )
                                     
                                     if success:
@@ -970,7 +970,7 @@ class GaiaValidator:
                         await asyncio.sleep(12)
 
                 # Run scoring cycle with overall timeout
-                await asyncio.wait_for(scoring_cycle(), timeout=600)
+                await asyncio.wait_for(scoring_cycle(), timeout=900)
 
             except asyncio.TimeoutError:
                 logger.error("Weight setting operation timed out - restarting cycle")
@@ -1137,6 +1137,26 @@ class GaiaValidator:
                                     # Update in-memory state to reflect removal
                                     if uid in self.nodes:
                                         del self.nodes[uid]
+                                
+                                # Update with chain's truth for this index
+                                node = self.metagraph.nodes.get(uid)
+                                if node:
+                                    await self.database_manager.update_miner_info(
+                                        index=uid,
+                                        hotkey=node.hotkey,
+                                        coldkey=node.coldkey,
+                                        ip=node.ip,
+                                        ip_type=str(node.ip_type),
+                                        port=node.port,
+                                        incentive=float(node.incentive),
+                                        stake=float(node.stake),
+                                        trust=float(node.trust),
+                                        vtrust=float(node.vtrust),
+                                        protocol=str(node.protocol),
+                                    )
+                                    if node.hotkey in chain_hotkeys:
+                                        self.nodes[uid] = {"hotkey": node.hotkey, "uid": uid}
+                                        logger.info(f"Updated index {uid} with new chain info")
                             except Exception as e:
                                 logger.error(f"Error clearing miner {uid}: {str(e)}")
                                 logger.error(traceback.format_exc())
@@ -1205,6 +1225,24 @@ class GaiaValidator:
             geomagnetic_scores = np.full(256, np.nan)
             soil_scores = np.full(256, np.nan)
 
+            # Count raw scores per UID
+            geo_counts = [0] * 256
+            soil_counts = [0] * 256
+            
+            if geomagnetic_results:
+                for result in geomagnetic_results:
+                    scores = result['score']
+                    for uid in range(256):
+                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                            geo_counts[uid] += 1
+
+            if soil_results:
+                for result in soil_results:
+                    scores = result['score']
+                    for uid in range(256):
+                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                            soil_counts[uid] += 1
+
             if geomagnetic_results:
                 geo_scores_by_uid = [[] for _ in range(256)]
                 for result in geomagnetic_results:
@@ -1263,18 +1301,14 @@ class GaiaValidator:
 
                 if np.isnan(geomagnetic_score) and np.isnan(soil_score):
                     weights[idx] = 0.0
-                    logger.debug(f"Both scores invalid - setting weight to 0")
                 elif np.isnan(geomagnetic_score):
                     weights[idx] = 0.5 * soil_score
-                    logger.debug(f"Geo score invalid - using soil score: {weights[idx]}")
                 elif np.isnan(soil_score):
                     weights[idx] = 0.5 * geomagnetic_score
-                    logger.debug(f"UID {idx}: Soil score invalid - geo score: {geomagnetic_score} -> weight: {weights[idx]}")
                 else:
                     weights[idx] = (0.5 * geomagnetic_score) + (0.5 * soil_score)
-                    logger.debug(f"UID {idx}: Both scores valid - geo: {geomagnetic_score}, soil: {soil_score} -> weight: {weights[idx]}")
 
-                logger.info(f"UID {idx}: geo={geomagnetic_score}, soil={soil_score}, weight={weights[idx]}")
+                logger.info(f"UID {idx}: geo={geomagnetic_score} ({geo_counts[idx]} scores), soil={soil_score} ({soil_counts[idx]} scores), weight={weights[idx]}")
 
             logger.info(f"Weights before normalization: {weights}")
 

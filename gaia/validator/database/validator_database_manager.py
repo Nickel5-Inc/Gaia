@@ -737,7 +737,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             await self.remove_miner_from_score_tables(
                 uids=[index],
                 task_names=["soil_moisture", "geomagnetic"],
-                window_days=3  # Adjust the window as needed
+                window_days=1  # Adjust the window as needed
             )
             logger.info(f"Partially removed UID {index} from existing daily score rows for all tasks")
 
@@ -796,7 +796,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         self,
         uids: List[int],
         task_names: List[str],
-        window_days: int = 3
+        window_days: int = 1
     ) -> None:
         """
         Partially remove specified miners from daily 'score_table' rows for given task types,
@@ -813,7 +813,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         str_uids = [str(uid) for uid in uids]
         current_time = datetime.now(timezone.utc)
         history_window = current_time - timedelta(days=window_days)
+        logger.info(f"Removing scores for UIDs {uids} from {history_window} to {current_time}")
 
+        total_rows_updated = 0
         for task_name in task_names:
             try:
                 # 1) Select daily score rows in the specified time window
@@ -835,6 +837,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     logger.info(f"No '{task_name}' score rows found to update.")
                     continue
 
+                logger.info(f"Found {len(rows)} {task_name} score rows in time window")
+                rows_updated = 0
+                scores_updated = 0
+
                 for row in rows:
                     try:
                         # 2) Parse the score array JSON (or however it's stored)
@@ -844,11 +850,16 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                             continue
 
                         changed = False
+                        changes_in_row = 0
                         for uid in uids:
                             if 0 <= uid < len(all_scores):
-                                if not math.isnan(all_scores[uid]):
+                                current_score = all_scores[uid]
+                                is_nan = isinstance(current_score, str) or (isinstance(current_score, float) and math.isnan(current_score))
+                                logger.debug(f"Score for UID {uid} in row {row['task_id']}: {current_score} (is_nan: {is_nan})")
+                                if not is_nan:
                                     all_scores[uid] = float("nan")
                                     changed = True
+                                    changes_in_row += 1
 
                         if changed:
                             # 3) Update the score array in place using task_id
@@ -866,8 +877,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                                     "task_id": row["task_id"]
                                 },
                             )
-                            logger.info(
-                                f"Zeroed out UIDs {uids} in '{task_name}' score row with task_id {row['task_id']}"
+                            rows_updated += 1
+                            scores_updated += changes_in_row
+                            logger.debug(
+                                f"Updated {changes_in_row} scores in {task_name} row with task_id {row['task_id']}"
                             )
 
                     except Exception as e:
@@ -876,6 +889,13 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                         )
                         logger.error(traceback.format_exc())
 
+                total_rows_updated += rows_updated
+                logger.info(
+                    f"Task {task_name}: Updated {scores_updated} scores across {rows_updated} rows"
+                )
+
             except Exception as e:
                 logger.error(f"Error in remove_miner_from_score_tables for task '{task_name}': {e}")
                 logger.error(traceback.format_exc())
+
+        logger.info(f"Score removal complete. Total rows updated: {total_rows_updated}")
