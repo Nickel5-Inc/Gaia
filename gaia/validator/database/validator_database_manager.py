@@ -1,3 +1,4 @@
+import math
 import traceback
 import gc
 import numpy as np
@@ -13,6 +14,8 @@ import random
 import time
 from functools import wraps
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+
 
 logger = get_logger(__name__)
 
@@ -636,8 +639,22 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             trust (float, optional): Miner's trust score
             vtrust (float, optional): Miner's vtrust score
             protocol (str, optional): Protocol used
+
+        Raises:
+            ValueError: If index is not between 0 and 255
+            DatabaseError: If database operation fails
         """
         try:
+            # Validate index is within bounds
+            if not (0 <= index < 256):
+                raise ValueError(f"Invalid index {index}. Must be between 0 and 255")
+
+            # Check if row exists
+            exists_query = "SELECT 1 FROM node_table WHERE uid = :index"
+            result = await self.fetch_one(exists_query, {"index": index})
+            if not result:
+                raise ValueError(f"No row exists for index {index}. The node table must be properly initialized with 256 rows.")
+
             query = """
             UPDATE node_table 
             SET 
@@ -673,10 +690,27 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             raise DatabaseError(f"Failed to update miner info: {str(e)}")
 
     @track_operation('write')
-    async def clear_miner_info(self, index: int, new_hotkey: str = None, new_coldkey: str = None) -> bool:
-        """Clear all information for a miner from the database."""
+    async def clear_miner_info(
+        self,
+        index: int
+    ) -> bool:
+        """
+        Clear all information for a miner from the database, treating every change as a
+        full deregistration. Delete the node's hotkey/coldkey/metadata, remove historical
+        geomagnetic and soil moisture data, and update scores in the score tables.
+
+        Args:
+            index (int): The miner UID (0–255).
+
+        Returns:
+            bool: True on success, False on failure.
+        """
         try:
-            # Clear node table entry
+            # First, read the current hotkey for logging purposes
+            original_info = await self.get_miner_info(index)
+            original_hotkey = original_info["hotkey"] if original_info else None
+
+            # Clear node_table entry
             node_query = """
             UPDATE node_table 
             SET hotkey = NULL, coldkey = NULL, ip = NULL, ip_type = NULL, port = NULL,
@@ -685,34 +719,33 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             """
             await self.execute(node_query, {"index": index})
 
-            # Delete from geomagnetic history
-            geo_history_query = """
-            DELETE FROM geomagnetic_history 
-            WHERE miner_hotkey = (SELECT hotkey FROM node_table WHERE uid = :index)
-            """
-            await self.execute(geo_history_query, {"index": index})
+            # Delete geomagnetic and soil moisture history if the miner had a hotkey
+            if original_hotkey:
+                geo_history_query = """
+                DELETE FROM geomagnetic_history 
+                WHERE miner_hotkey = :old_hotkey
+                """
+                await self.execute(geo_history_query, {"old_hotkey": original_hotkey})
 
-            # Delete from soil moisture history
-            soil_history_query = """
-            DELETE FROM soil_moisture_history 
-            WHERE miner_hotkey = (SELECT hotkey FROM node_table WHERE uid = :index)
-            """
-            await self.execute(soil_history_query, {"index": index})
+                soil_history_query = """
+                DELETE FROM soil_moisture_history 
+                WHERE miner_hotkey = :old_hotkey
+                """
+                await self.execute(soil_history_query, {"old_hotkey": original_hotkey})
 
-            # If new hotkey info provided, update the node table
-            if new_hotkey:
-                await self.update_miner_info(
-                    index=index,
-                    hotkey=new_hotkey,
-                    coldkey=new_coldkey or None
-                )
-                logger.info(f"Updated node table with new hotkey for index {index}")
-            
-            logger.info(f"Successfully cleared miner info for index {index}")
+            # After clearing, treat as a full deregistration and update score tables
+            await self.remove_miner_from_score_tables(
+                uids=[index],
+                task_names=["soil_moisture", "geomagnetic"],
+                window_days=1  # Adjust the window as needed
+            )
+            logger.info(f"Partially removed UID {index} from existing daily score rows for all tasks")
+
+            logger.info(f"Successfully cleared miner info for UID {index}")
             return True
 
         except Exception as e:
-            logger.error(f"Error clearing miner info for index {index}: {str(e)}")
+            logger.error(f"Error clearing miner info for UID {index}: {str(e)}")
             logger.error(traceback.format_exc())
             return False
 
@@ -757,3 +790,112 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         except Exception as e:
             logger.error(f"Error getting active miners: {str(e)}")
             raise DatabaseError(f"Failed to get active miners: {str(e)}")
+
+    @track_operation('write')
+    async def remove_miner_from_score_tables(
+        self,
+        uids: List[int],
+        task_names: List[str],
+        window_days: int = 1
+    ) -> None:
+        """
+        Partially remove specified miners from daily 'score_table' rows for given task types,
+        preserving data for all other miners. Sets the departing miners' array values to NaN.
+    
+        Args:
+            uids (List[int]): List of miner UIDs to be zeroed out.
+            task_names (List[str]): List of task names to apply the removal.
+            window_days (int): Number of days to look back for score rows.
+        """
+        if not uids:
+            return
+
+        str_uids = [str(uid) for uid in uids]
+        current_time = datetime.now(timezone.utc)
+        history_window = current_time - timedelta(days=window_days)
+        logger.info(f"Removing scores for UIDs {uids} from {history_window} to {current_time}")
+
+        total_rows_updated = 0
+        for task_name in task_names:
+            try:
+                # 1) Select daily score rows in the specified time window
+                query = """
+                    SELECT task_id, score
+                    FROM score_table
+                    WHERE task_name = :task_name
+                      AND task_id::float >= :start_timestamp
+                      AND task_id::float <= :end_timestamp
+                """
+                params = {
+                    "task_name": task_name,
+                    "start_timestamp": history_window.timestamp(),
+                    "end_timestamp": current_time.timestamp(),
+                }
+                rows = await self.fetch_all(query, params)
+
+                if not rows:
+                    logger.info(f"No '{task_name}' score rows found to update.")
+                    continue
+
+                logger.info(f"Found {len(rows)} {task_name} score rows in time window")
+                rows_updated = 0
+                scores_updated = 0
+
+                for row in rows:
+                    try:
+                        # 2) Parse the score array JSON (or however it's stored)
+                        all_scores = row["score"]
+                        if not isinstance(all_scores, list):
+                            logger.warning(f"Score field is not a list for score_row with task_id {row['task_id']}")
+                            continue
+
+                        changed = False
+                        changes_in_row = 0
+                        for uid in uids:
+                            if 0 <= uid < len(all_scores):
+                                current_score = all_scores[uid]
+                                is_nan = isinstance(current_score, str) or (isinstance(current_score, float) and math.isnan(current_score))
+                                logger.debug(f"Score for UID {uid} in row {row['task_id']}: {current_score} (is_nan: {is_nan})")
+                                if not is_nan:
+                                    all_scores[uid] = float("nan")
+                                    changed = True
+                                    changes_in_row += 1
+
+                        if changed:
+                            # 3) Update the score array in place using task_id
+                            update_sql = """
+                                UPDATE score_table
+                                SET score = :score
+                                WHERE task_name = :task_name
+                                  AND task_id = :task_id
+                            """
+                            await self.execute(
+                                update_sql,
+                                {
+                                    "score": all_scores,
+                                    "task_name": task_name,
+                                    "task_id": row["task_id"]
+                                },
+                            )
+                            rows_updated += 1
+                            scores_updated += changes_in_row
+                            logger.debug(
+                                f"Updated {changes_in_row} scores in {task_name} row with task_id {row['task_id']}"
+                            )
+
+                    except Exception as e:
+                        logger.error(
+                            f"Error removing miner from '{task_name}' score row with task_id {row['task_id']}: {e}"
+                        )
+                        logger.error(traceback.format_exc())
+
+                total_rows_updated += rows_updated
+                logger.info(
+                    f"Task {task_name}: Updated {scores_updated} scores across {rows_updated} rows"
+                )
+
+            except Exception as e:
+                logger.error(f"Error in remove_miner_from_score_tables for task '{task_name}': {e}")
+                logger.error(traceback.format_exc())
+
+        logger.info(f"Score removal complete. Total rows updated: {total_rows_updated}")

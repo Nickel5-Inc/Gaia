@@ -189,6 +189,9 @@ class GaiaValidator:
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, self._signal_handler)
 
+        # Add lock for miner table operations
+        self.miner_table_lock = asyncio.Lock()
+
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
         signame = signal.Signals(signum).name
@@ -930,14 +933,14 @@ class GaiaValidator:
                                 # Calculate weights with timeout
                                 normalized_weights = await asyncio.wait_for(
                                     self._calc_task_weights(),
-                                    timeout=60
+                                    timeout=120
                                 )
                                 
                                 if normalized_weights:
                                     # Set weights with timeout
                                     success = await asyncio.wait_for(
                                         weight_setter.set_weights(normalized_weights),
-                                        timeout=340
+                                        timeout=480
                                     )
                                     
                                     if success:
@@ -967,7 +970,7 @@ class GaiaValidator:
                         await asyncio.sleep(12)
 
                 # Run scoring cycle with overall timeout
-                await asyncio.wait_for(scoring_cycle(), timeout=600)
+                await asyncio.wait_for(scoring_cycle(), timeout=900)
 
             except asyncio.TimeoutError:
                 logger.error("Weight setting operation timed out - restarting cycle")
@@ -1030,48 +1033,49 @@ class GaiaValidator:
                 logger.error("Metagraph not initialized")
                 return
 
-            self.metagraph.sync_nodes()
-            total_nodes = len(self.metagraph.nodes)
-            logger.info(f"Synced {total_nodes} nodes from the network")
+            async with self.miner_table_lock:
+                self.metagraph.sync_nodes()
+                total_nodes = len(self.metagraph.nodes)
+                logger.info(f"Synced {total_nodes} nodes from the network")
 
-            # Process miners in chunks of 32 to prevent memory bloat
-            chunk_size = 32
-            nodes_items = list(self.metagraph.nodes.items())
+                # Process miners in chunks of 32 to prevent memory bloat
+                chunk_size = 32
+                nodes_items = list(self.metagraph.nodes.items())
 
-            for chunk_start in range(0, total_nodes, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, total_nodes)
-                chunk = nodes_items[chunk_start:chunk_end]
-                
-                try:
-                    for index, (hotkey, node) in enumerate(chunk, start=chunk_start):
-                        await self.database_manager.update_miner_info(
-                            index=index,
-                            hotkey=node.hotkey,
-                            coldkey=node.coldkey,
-                            ip=node.ip,
-                            ip_type=str(node.ip_type),
-                            port=node.port,
-                            incentive=float(node.incentive),
-                            stake=float(node.stake),
-                            trust=float(node.trust),
-                            vtrust=float(node.vtrust),
-                            protocol=str(node.protocol),
-                        )
-                        self.nodes[index] = {"hotkey": node.hotkey, "uid": index}
-                        logger.debug(f"Updated information for node {index}")
+                for chunk_start in range(0, total_nodes, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, total_nodes)
+                    chunk = nodes_items[chunk_start:chunk_end]
                     
-                    logger.info(f"Processed nodes {chunk_start} to {chunk_end-1}")
-                    
-                    # Small delay between chunks to prevent overwhelming the database
-                    await asyncio.sleep(0.1)
-                    
-                except Exception as chunk_error:
-                    logger.error(f"Error processing chunk {chunk_start}-{chunk_end}: {str(chunk_error)}")
-                    logger.error(traceback.format_exc())
-                    # Continue with next chunk instead of failing completely
-                    continue
+                    try:
+                        for index, (hotkey, node) in enumerate(chunk, start=chunk_start):
+                            await self.database_manager.update_miner_info(
+                                index=index,
+                                hotkey=node.hotkey,
+                                coldkey=node.coldkey,
+                                ip=node.ip,
+                                ip_type=str(node.ip_type),
+                                port=node.port,
+                                incentive=float(node.incentive),
+                                stake=float(node.stake),
+                                trust=float(node.trust),
+                                vtrust=float(node.vtrust),
+                                protocol=str(node.protocol),
+                            )
+                            self.nodes[index] = {"hotkey": node.hotkey, "uid": index}
+                            logger.debug(f"Updated information for node {index}")
+                        
+                        logger.info(f"Processed nodes {chunk_start} to {chunk_end-1}")
+                        
+                        # Small delay between chunks to prevent overwhelming the database
+                        await asyncio.sleep(0.1)
+                        
+                    except Exception as chunk_error:
+                        logger.error(f"Error processing chunk {chunk_start}-{chunk_end}: {str(chunk_error)}")
+                        logger.error(traceback.format_exc())
+                        # Continue with next chunk instead of failing completely
+                        continue
 
-            logger.info("Successfully updated miner table and in-memory state")
+                logger.info("Successfully updated miner table and in-memory state")
 
         except Exception as e:
             logger.error(f"Error updating miner table: {str(e)}")
@@ -1079,140 +1083,97 @@ class GaiaValidator:
             raise
 
     async def handle_miner_deregistration_loop(self) -> None:
-        """
-        Continuously monitor for deregistered miners and handle cleanup of their data.
-        """
         logger.info("Starting deregistration loop")
-        
-        # Initialize set for tracking active miners
-        self._previously_active_miners: Set[int] = set()
         
         while True:
             try:
-                # Ensure metagraph is synced before accessing
-                if not hasattr(self.metagraph, 'nodes') or not self.metagraph.nodes:
+                # Ensure metagraph is up to date
+                if not self.metagraph or not self.metagraph.nodes:
                     logger.info("Metagraph not ready, syncing nodes...")
                     self.metagraph.sync_nodes()
-                    logger.info(f"Synced {len(self.metagraph.nodes)} nodes from the network")
-                
-                # Get current set of active miners and track hotkey changes
-                try:
-                    current_active_miners: Set[int] = set()
-                    hotkey_changes: List[int] = []
+
+                async with self.miner_table_lock:
+                    # Get set of all active hotkeys on chain
+                    chain_hotkeys = {node.hotkey for node in self.metagraph.nodes.values()}
                     
-                    for idx, (hotkey, node) in enumerate(self.metagraph.nodes.items()):
-                        # Verify the node exists in our database with matching hotkey
-                        miner_info = await self.database_manager.get_miner_info(idx)
-                        if miner_info:
-                            if miner_info["hotkey"] != node.hotkey:
-                                logger.warning(f"Mismatch for index {idx}: DB hotkey != metagraph hotkey")
-                                hotkey_changes.append(idx)
-                            else:
-                                current_active_miners.add(idx)
-                        else:
-                            current_active_miners.add(idx)  # New miner
-                            
-                except (TypeError, ValueError) as e:
-                    logger.error(f"Error getting active miners from metagraph: {e}")
-                    await asyncio.sleep(60)
-                    continue
-                
-                # Skip first run to initialize tracking
-                if not self._previously_active_miners:
-                    self._previously_active_miners = current_active_miners
-                    await asyncio.sleep(300)
-                    continue
-                
-                # Find deregistered miners
-                deregistered_miners: Set[int] = self._previously_active_miners - current_active_miners
-                
-                # Process both deregistered miners and hotkey changes
-                miners_to_process = list(deregistered_miners) + hotkey_changes
-                if miners_to_process:
-                    logger.info(f"Processing {len(miners_to_process)} miners: {len(deregistered_miners)} deregistered, {len(hotkey_changes)} hotkey changes")
+                    # Get miners from our local state
+                    query = "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL;"
+                    rows = await self.database_manager.fetch_all(query)
+                    db_hotkeys = {row["hotkey"] for row in rows}
                     
-                    # Process miners in chunks to prevent memory bloat
-                    chunk_size = 10
-                    for i in range(0, len(miners_to_process), chunk_size):
-                        chunk = miners_to_process[i:i + chunk_size]
-                        logger.info(f"Processing miner chunk: {chunk}")
-                        
-                        try:
-                            # Recalculate scores for affected miners
-                            recalc_tasks = []
-                            if hasattr(self, 'soil_task'):
-                                recalc_tasks.append(self.soil_task.recalculate_recent_scores(chunk))
-                            if hasattr(self, 'geomagnetic_task'):
-                                recalc_tasks.append(self.geomagnetic_task.recalculate_recent_scores(chunk))
-                            
-                            if recalc_tasks:
-                                await asyncio.gather(*recalc_tasks)
-                            
-                            # Clear miner info from database
-                            for miner_id in chunk:
-                                try:
-                                    success = False
-                                    if miner_id in hotkey_changes:
-                                        # For hotkey changes, verify miner still exists in metagraph
-                                        if miner_id not in self.metagraph.nodes:
-                                            logger.warning(f"Miner {miner_id} not found in metagraph, treating as deregistered")
-                                            success = await self.database_manager.clear_miner_info(miner_id)
-                                            if success:
-                                                logger.info(f"Cleared info for deregistered miner {miner_id}")
-                                            else:
-                                                logger.warning(f"Failed to clear info for deregistered miner {miner_id}")
-                                        else:
-                                            # For hotkey changes, pass the new hotkey information
-                                            new_node = self.metagraph.nodes[miner_id]
-                                            success = await self.database_manager.clear_miner_info(
-                                                miner_id,
-                                                new_hotkey=new_node.hotkey,
-                                                new_coldkey=new_node.coldkey
-                                            )
-                                            if success:
-                                                logger.info(f"Updated hotkey for miner {miner_id}")
-                                            else:
-                                                logger.warning(f"Failed to update hotkey for miner {miner_id}")
-                                    else:
-                                        # For deregistered miners, just clear everything
-                                        success = await self.database_manager.clear_miner_info(miner_id)
-                                        if success:
-                                            logger.info(f"Cleared info for deregistered miner {miner_id}")
-                                        else:
-                                            logger.warning(f"Failed to clear info for deregistered miner {miner_id}")
-                                except Exception as db_error:
-                                    logger.error(f"Unexpected error clearing miner {miner_id} info: {str(db_error)}")
-                                    logger.error(traceback.format_exc())
-                                    continue
-                                    
-                            logger.info(f"Successfully processed miners: {chunk}")
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing miner chunk {chunk}: {str(e)}")
-                            logger.error(traceback.format_exc())
-                            continue
-                        
-                        # Small delay between chunks
-                        await asyncio.sleep(1)
-                
-                # Update previously active miners
-                self._previously_active_miners = current_active_miners
-                
-                # Sleep for 5 minutes before checking again
+                    # Get in-memory state hotkeys
+                    memory_hotkeys = {data["hotkey"] for data in self.nodes.values() if "hotkey" in data}
+                    
+                    # Check sync status
+                    chain_count = len(chain_hotkeys)
+                    db_count = len(db_hotkeys)
+                    memory_count = len(memory_hotkeys)
+                    
+                    # Find any differences between states
+                    db_not_in_chain = db_hotkeys - chain_hotkeys
+                    memory_not_in_chain = memory_hotkeys - chain_hotkeys
+                    memory_not_in_db = memory_hotkeys - db_hotkeys
+                    
+                    if not any([db_not_in_chain, memory_not_in_chain, memory_not_in_db]):
+                        logger.info(f"All states in sync! Chain: {chain_count}, DB: {db_count}, Memory: {memory_count} miners")
+                    else:
+                        if db_not_in_chain:
+                            logger.info(f"Found {len(db_not_in_chain)} miners in DB not on chain")
+                        if memory_not_in_chain:
+                            logger.info(f"Found {len(memory_not_in_chain)} miners in memory not on chain")
+                        if memory_not_in_db:
+                            logger.info(f"Found {len(memory_not_in_db)} miners in memory not in DB")
+                    
+                    # Find miners in our DB that are no longer on chain
+                    for row in rows:
+                        uid = row["uid"]
+                        hotkey = row["hotkey"]
+                        if hotkey not in chain_hotkeys:
+                            logger.info(f"Detected deregistered miner: UID={uid}, hotkey={hotkey}")
+                            try:
+                                success = await self.database_manager.clear_miner_info(uid)
+                                if success:
+                                    logger.info(f"Cleared info for deregistered miner {uid} (hotkey: {hotkey})")
+                                    # Update in-memory state to reflect removal
+                                    if uid in self.nodes:
+                                        del self.nodes[uid]
+                                
+                                # Update with chain's truth for this index
+                                node = self.metagraph.nodes.get(uid)
+                                if node:
+                                    await self.database_manager.update_miner_info(
+                                        index=uid,
+                                        hotkey=node.hotkey,
+                                        coldkey=node.coldkey,
+                                        ip=node.ip,
+                                        ip_type=str(node.ip_type),
+                                        port=node.port,
+                                        incentive=float(node.incentive),
+                                        stake=float(node.stake),
+                                        trust=float(node.trust),
+                                        vtrust=float(node.vtrust),
+                                        protocol=str(node.protocol),
+                                    )
+                                    if node.hotkey in chain_hotkeys:
+                                        self.nodes[uid] = {"hotkey": node.hotkey, "uid": uid}
+                                        logger.info(f"Updated index {uid} with new chain info")
+                            except Exception as e:
+                                logger.error(f"Error clearing miner {uid}: {str(e)}")
+                                logger.error(traceback.format_exc())
+
+                # Periodic sleep (5 minutes)
                 await asyncio.sleep(300)
-                
+
             except Exception as e:
                 logger.error(f"Error in deregistration loop: {str(e)}")
                 logger.error(traceback.format_exc())
-                # Sleep for 1 minute on error before retrying
                 await asyncio.sleep(60)
-                continue
 
     async def _calc_task_weights(self):
         """Calculate weights based on recent task scores."""
         try:
             now = datetime.now(timezone.utc)
-            three_days_ago = now - timedelta(days=3)
+            one_day_ago = now - timedelta(days=1)
             
             query = """
             SELECT score, created_at 
@@ -1222,16 +1183,65 @@ class GaiaValidator:
             ORDER BY created_at DESC
             """
             
+            # Fetch and analyze geomagnetic scores
             geomagnetic_results = await self.database_manager.fetch_all(
-                query, {"task_name": "geomagnetic", "start_time": three_days_ago}
+                query, {"task_name": "geomagnetic", "start_time": one_day_ago}
             )
+            logger.info(f"Found {len(geomagnetic_results)} geomagnetic score rows")
+            
+            # Fetch soil moisture scores
             soil_results = await self.database_manager.fetch_all(
-                query, {"task_name": "soil_moisture", "start_time": three_days_ago}
+                query, {"task_name": "soil_moisture", "start_time": one_day_ago}
             )
+            logger.info(f"Found {len(soil_results)} soil moisture score rows")
+            
+            # If no scores exist yet, return equal weights for all active nodes
+            if not geomagnetic_results and not soil_results:
+                logger.info("No scores found in database - initializing equal weights for active nodes")
+                try:
+                    # Get active nodes from metagraph
+                    if not self.metagraph or not self.metagraph.nodes:
+                        logger.warning("No active nodes found in metagraph")
+                        return None
+                        
+                    active_nodes = len(self.metagraph.nodes)
+                    # Create equal weights for active nodes
+                    weights = np.zeros(256)
+                    weight_value = 1.0 / active_nodes
+                    
+                    # Use the index in the nodes dictionary as the UID
+                    for uid, (hotkey, node) in enumerate(self.metagraph.nodes.items()):
+                        weights[uid] = weight_value
+                        logger.debug(f"Set weight {weight_value:.4f} for node {hotkey} at index {uid}")
+                    
+                    logger.info(f"Initialized equal weights ({weight_value:.4f}) for {active_nodes} active nodes")
+                    return weights.tolist()
+                except Exception as e:
+                    logger.error(f"Error initializing equal weights: {e}")
+                    logger.error(traceback.format_exc())
+                    return None
 
             # Initialize score arrays
             geomagnetic_scores = np.full(256, np.nan)
             soil_scores = np.full(256, np.nan)
+
+            # Count raw scores per UID
+            geo_counts = [0] * 256
+            soil_counts = [0] * 256
+            
+            if geomagnetic_results:
+                for result in geomagnetic_results:
+                    scores = result['score']
+                    for uid in range(256):
+                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                            geo_counts[uid] += 1
+
+            if soil_results:
+                for result in soil_results:
+                    scores = result['score']
+                    for uid in range(256):
+                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                            soil_counts[uid] += 1
 
             if geomagnetic_results:
                 geo_scores_by_uid = [[] for _ in range(256)]
@@ -1291,18 +1301,14 @@ class GaiaValidator:
 
                 if np.isnan(geomagnetic_score) and np.isnan(soil_score):
                     weights[idx] = 0.0
-                    logger.debug(f"Both scores invalid - setting weight to 0")
                 elif np.isnan(geomagnetic_score):
                     weights[idx] = 0.5 * soil_score
-                    logger.debug(f"Geo score invalid - using soil score: {weights[idx]}")
                 elif np.isnan(soil_score):
                     weights[idx] = 0.5 * geomagnetic_score
-                    logger.debug(f"UID {idx}: Soil score invalid - geo score: {geomagnetic_score} -> weight: {weights[idx]}")
                 else:
                     weights[idx] = (0.5 * geomagnetic_score) + (0.5 * soil_score)
-                    logger.debug(f"UID {idx}: Both scores valid - geo: {geomagnetic_score}, soil: {soil_score} -> weight: {weights[idx]}")
 
-                logger.info(f"UID {idx}: geo={geomagnetic_score}, soil={soil_score}, weight={weights[idx]}")
+                logger.info(f"UID {idx}: geo={geomagnetic_score} ({geo_counts[idx]} scores), soil={soil_score} ({soil_counts[idx]} scores), weight={weights[idx]}")
 
             logger.info(f"Weights before normalization: {weights}")
 
