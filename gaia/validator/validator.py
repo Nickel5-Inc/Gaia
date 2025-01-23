@@ -1180,16 +1180,19 @@ class GaiaValidator:
                 logger.info("No scores found in database - initializing equal weights for active nodes")
                 try:
                     # Get active nodes from metagraph
-                    active_nodes = len(self.metagraph.nodes) if self.metagraph and self.metagraph.nodes else 0
-                    if active_nodes == 0:
+                    if not self.metagraph or not self.metagraph.nodes:
                         logger.warning("No active nodes found in metagraph")
                         return None
                         
+                    active_nodes = len(self.metagraph.nodes)
                     # Create equal weights for active nodes
                     weights = np.zeros(256)
                     weight_value = 1.0 / active_nodes
-                    for hotkey, node in self.metagraph.nodes.items():
-                        weights[node.uid] = weight_value
+                    
+                    # Use the index in the nodes dictionary as the UID
+                    for uid, (hotkey, node) in enumerate(self.metagraph.nodes.items()):
+                        weights[uid] = weight_value
+                        logger.debug(f"Set weight {weight_value:.4f} for node {hotkey} at index {uid}")
                     
                     logger.info(f"Initialized equal weights ({weight_value:.4f}) for {active_nodes} active nodes")
                     return weights.tolist()
