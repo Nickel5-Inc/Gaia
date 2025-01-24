@@ -128,6 +128,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 password=password,
             )
             
+            # Store database name
+            self.database = database
+            
             # Set database URL
             self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
             
@@ -237,6 +240,26 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             if not self.db_url:
                 raise DatabaseError("Database URL not initialized")
             
+            # First create a connection to default postgres database to check/create our database
+            default_url = self.db_url.rsplit('/', 1)[0] + '/postgres'
+            temp_engine = create_async_engine(default_url)
+            
+            try:
+                # Check if our database exists
+                async with temp_engine.connect() as conn:
+                    result = await conn.execute(text(f"SELECT 1 FROM pg_database WHERE datname = '{self.database}'"))
+                    exists = result.scalar() is not None
+                    
+                    if not exists:
+                        logger.info(f"Database {self.database} does not exist, creating...")
+                        # Need to be outside transaction for CREATE DATABASE
+                        await conn.execute(text("COMMIT"))
+                        await conn.execute(text(f"CREATE DATABASE {self.database}"))
+                        logger.info(f"Created database {self.database}")
+            finally:
+                await temp_engine.dispose()
+            
+            # Now create our main engine
             self._engine = create_async_engine(
                 self.db_url,
                 pool_size=self.MAX_CONNECTIONS,
@@ -283,6 +306,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             await self.create_score_table(session)
             
             logger.info("Successfully created core tables")
+            
+            # Initialize validator-specific tables from task schemas
+            await self._initialize_validator_database()
             
             # Initialize task tables
             task_schemas = await self.load_task_schemas()
