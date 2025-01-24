@@ -284,6 +284,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             
             logger.info("Successfully created core tables")
             
+            # Initialize validator-specific tables from task schemas
+            await self._initialize_validator_database()
+            
             # Initialize task tables
             task_schemas = await self.load_task_schemas()
             await self.initialize_task_tables(task_schemas, session)

@@ -799,8 +799,7 @@ class GaiaValidator:
             logger.info("Metagraph initialized.")
 
             logger.info("Initializing database tables...")
-            await self.database_manager._initialize_validator_database()
-
+            await self.database_manager.initialize_database()
             logger.info("Database tables initialized.")
 
             logger.info("Setting up HTTP client...")
