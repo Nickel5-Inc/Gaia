@@ -1,0 +1,140 @@
+Main Flow (Parent)
+├── Data Collection Flow (@flow)
+│    ├── Check Missing Data (@task)
+│    │    └── Returns: List[Regions, Timestamps]
+│    ├── Download Data (@task)
+│    │    ├── SMAP Download
+│    │    ├── Soil Data Download
+│    │    └── Returns: Dict[Region: DataArray]
+│    ├── Process Data (@task)
+│    │    ├── Normalize
+│    │    ├── Combine Sources
+│    │    └── Returns: ProcessedData
+│    └── Store Data (@task)
+│         └── Returns: DatasetID
+│
+├── Query Flow (@flow)
+│    ├── Prepare Miner Payloads (@task)
+│    │    └── Returns: List[PayloadData]
+│    ├── Query Miners (@task)
+│    │    ├── Parallel Map over Regions
+│    │    └── Returns: Dict[MinerID: Predictions]
+│    └── Store Predictions (@task)
+│         └── Returns: PredictionIDs
+│
+└── Scoring Flow (@flow)
+     ├── Get Predictions (@task)
+     │    └── Returns: Dict[MinerID: Predictions]
+     ├── Get Ground Truth (@task)
+     │    └── Returns: GroundTruthData
+     ├── Calculate Scores (@task)
+     │    └── Returns: Dict[MinerID: Score]
+     └── Update DB (@task)
+          └── Returns: Success/Failure
+
+
+
+
+
+Initialization & Setup
+├── init_(self, args)
+│    └── Constructs the GaiaValidator object: sets up tasks, the database manager, the HTTP client, and graceful shutdown hooks.
+├── setup_neuron(self) → bool
+│    └── Loads environment variables, configures the Substrate endpoint, wallet, and hotkeys, syncs metagraph, and confirms successful connection.
+└── main(self)
+     ├── Calls setup methods (e.g., neuron, database).
+     ├── Spawns periodic tasks (geomagnetic, soil, scoring, etc.).
+     └── Waits for shutdown events to gracefully cancel tasks and clean resources.
+
+Event Handling & Graceful Shutdown
+├── _signal_handler(self, signum, frame)
+│    └── Captures system signals (SIGTERM, SIGINT, etc.) and initiates a graceful shutdown.
+├── _initiate_shutdown(self)
+│    └── Cancels active tasks, closes open resources, and ensures cleanup steps are complete before exiting.
+├── cleanup_resources(self)
+│    └── Performs comprehensive cleanup (temp file removal, resetting database operations, cleaning task states, collecting garbage).
+└── recover_task(self, task_name)
+     └── Attempts to recover a hung or timed-out task by forcing cleanup and re-initializing the necessary resources.
+
+Main Loop & Periodic Tasks
+├── main_scoring(self)
+│    └── Periodically calculates and sets on-chain weights from recent task scores, applies decay/normalization, and submits them to the network.
+├── _calc_task_weights(self)
+│    └── Decays historical scores and generates final weights used by main_scoring.
+├── status_logger(self)
+│    └── Logs system and block info periodically, including active node count and time since last weight update.
+├── update_miner_table(self)
+│    └── Fetches updated miner metadata (hotkey, coldkey, IP, etc.) from the metagraph and stores in the database.
+├── handle_miner_deregistration_loop(self)
+│    └── Checks for miners deregistered from the chain, cleans database entries, and recalculates scores.
+├── check_for_updates(self)
+│    └── Periodically checks if code updates should be pulled and applied.
+├── start_watchdog(self) / stop_watchdog(self)
+│    └── Starts or stops the watchdog that monitors tasks for excessive usage or lock-ups.
+├── _watchdog_loop(self) / _watchdog_check(self)
+│    └── Core watchdog logic: checks for timed-out tasks and ensures metagraph sync.
+├── _check_resource_usage(self, current_time) / _check_task_health(self, current_time)
+│    └── Continuously collects CPU/memory usage and verifies task time limits.
+└── update_task_status(self, task_name, status, operation=None)
+     └── Updates the internal health structure to track the state (active, idle, error) of tasks and logs resource changes.
+
+- Prefect integration
+    - Tasks now run as a prefect flow - each have their own timing, can run concurrently, etc
+    - long-running flows should store as much data in files/database as possible
+- Scheduling
+    - The scheduler should initiate new task flows at:
+        - predetermined times for scoring (synthetic request)
+        - On receipt of a task request from a task request api (organic request)
+
+
+# This agent framework is a future feature, not important now, but we should keep it in mind for our prefect integration
+- Agent framework
+    - Validators host local LLM and/or use API to provide users with an interface to interact with the network
+    - Agent generates requests via retrieval and tool-calling
+    - Ray distributed execution framework
+
+
++++++++++++++++++++
+Types of scheduling
++++++++++++++++++++
+
+- IntervalScheduleInterval:
+
+
+* Interval:
+
+Allows you to set a specific time interval between flow runs.
+Can be specified in seconds or using a timedelta object.
+
+Example: interval=600 (runs every 10 minutes)
+
+* Cron:
+
+Uses standard cron syntax for more complex scheduling.
+Allows for schedules based on specific times, days, months, etc.
+
+Example: cron="0 * * * *" (runs every hour)
+
+* RRule (iCal Recurrence Rules):
+
+Provides a flexible way to create repetitive schedules.
+Can handle complex logic like "last weekday of each month" or "every other day of the week".
+
+Example: rrule="FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=20240730T040000Z"
+
+All these schedule types can be combined with additional options like:
+
+* timezone: To specify a particular time zone for the schedule.
+* anchor_date: For interval schedules, to set a starting point for the schedule.
+
+
+
+Task structure
+- Task is a flow that can be scheduled and monitored
+- Each task has its own flow structure and responsibilities
+- ValidatorTask: Orchestration, verification, and scoring
+- MinerTask: Data processing and computation
+
+
+Validator flows: prepare -> execute -> score
+Miner flows: prepare -> execute
