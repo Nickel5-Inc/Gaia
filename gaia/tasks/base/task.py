@@ -1,3 +1,13 @@
+"""
+Base Task Classes
+
+Provides the foundational structure for validator and miner tasks.
+Each task type has its own flow structure and responsibilities:
+- ValidatorTask: Orchestration, verification, and scoring
+- MinerTask: Data processing and computation
+"""
+
+from prefect import flow, task
 from pydantic import BaseModel, Field
 from .components.metadata import Metadata
 from .components.inputs import Inputs
@@ -7,120 +17,178 @@ from .components.preprocessing import Preprocessing
 from .decorators import task_timer
 from abc import ABC, abstractmethod
 import networkx as nx
-from typing import Optional, Any
+from typing import Optional, Any, Dict, Protocol
+from datetime import timedelta
+from prefect.tasks import task_input_hash
 
 
-class Task(BaseModel, ABC):
-    """Base class for all tasks in the system.
-
-    A unified Task class that can represent either:
-    1. A composite task made up of subtasks (when subtasks is provided)
-    2. An atomic task (when subtasks is None)
-
-    For composite tasks:
-    - Orchestrates the execution of subtasks
-    - Manages task dependencies and execution order
-    - Aggregates results and scoring
-
-    For atomic tasks:
-    - Defines a specific workload
-    - Handles direct input/output processing
-    - Manages its own execution and scoring
-    """
-
-    # required fields
-    name: str = Field(..., description="The name of the task")
-    description: str = Field(..., description="Description of what the task does")
-    task_type: str = Field(..., description="Type of task (atomic or composite)")
-    metadata: Metadata = Field(..., description="Task metadata")
-
-    # atomic tasks
-    inputs: Optional[Inputs] = Field(None, description="Task inputs")
-    outputs: Optional[Outputs] = Field(None, description="Task outputs")
-    scoring_mechanism: Optional[ScoringMechanism] = Field(
-        None, description="Scoring mechanism"
-    )
-    preprocessing: Optional[Preprocessing] = Field(
-        None, description="Preprocessing steps"
+class BaseTask(BaseModel, ABC):
+    """Common base for both validator and miner tasks"""
+    
+    name: str = Field(..., description="Task name")
+    description: str = Field(..., description="Task description")
+    schema_path: str = Field(..., description="Path to task schema file")
+    db: Optional[Any] = Field(None, description="Database connection")
+    
+    # Task state tracking
+    state: Dict[str, Any] = Field(
+        default_factory=lambda: {
+            'status': 'idle',
+            'last_execution': None,
+            'errors': [],
+            'metrics': {}
+        }
     )
 
-    # composite tasks
-    subtasks: Optional[nx.Graph] = Field(
-        None, description="Graph of subtasks for composite tasks"
-    )
-
-    db: Optional[Any] = Field(
-        None, description="Database connection, set by validator/miner"
-    )
-    model_config = {"arbitrary_types_allowed": True}
+    class Config:
+        arbitrary_types_allowed = True
 
     async def initialize_database(self):
         """Initialize task-specific database tables"""
         if not self.db:
             raise RuntimeError("Database not initialized")
 
-    ############################################################
-    # Validator methods
-    ############################################################
+    async def _handle_error(self, error: Exception):
+        """Unified error handling"""
+        self.state['errors'].append(str(error))
+        self.state['status'] = 'failed'
+        self.state['metrics']['last_error_time'] = timedelta.now()
+
+
+class ValidatorTask(BaseTask):
+    """
+    Base class for validator tasks.
+    Responsible for:
+    1. Task orchestration
+    2. Miner response verification
+    3. Score calculation and storage
+    """
+    
+    # For composite validator tasks
+    subtasks: Optional[nx.Graph] = Field(None, description="DAG for composite tasks")
+
+    @flow(name="validator_run", retries=3)
+    async def run(self, **kwargs):
+        """Main validator flow"""
+        try:
+            if not self.db:
+                await self.initialize_database()
+            
+            # Prepare validation parameters
+            inputs = await self.prepare_flow(**kwargs)
+            
+            # Execute validation
+            result = await self.execute_flow(inputs)
+            
+            # Score results
+            if result is not None:
+                score = await self.score_flow(result)
+                if score is not None:
+                    await self._store_score(score)
+            
+            return result
+            
+        except Exception as e:
+            await self._handle_error(e)
+            raise
 
     @abstractmethod
-    @task_timer
-    def validator_prepare_subtasks(self):
+    @flow(name="validator_prepare", retries=2)
+    async def prepare_flow(self, **kwargs) -> Dict[str, Any]:
         """
-        Prepare the subtasks for execution. Read the graph structure, determine the order of execution, and prepare the inputs for each subtask.
+        Prepare validation parameters and criteria.
+        Override this flow to implement task-specific preparation logic.
         """
-        pass
+        if self.subtasks:
+            return {
+                'order': list(nx.topological_sort(self.subtasks)),
+                'params': kwargs
+            }
+        # Concrete tasks must override this if not using subtasks
+        raise NotImplementedError("Validator prepare_flow must be implemented")
 
     @abstractmethod
-    @task_timer
-    def validator_execute(self):
+    @flow(name="validator_execute", retries=2)
+    async def execute_flow(self, inputs: Dict[str, Any]) -> Any:
         """
-        Execute the task from the validator neuron. For composite tasks, this orchestrates subtask execution.
-        For atomic tasks, this executes the actual workload. This call should define the order and execution of the subtasks or
-        any preprocessing that needs to be done, as well as calling the scoring method once miners have returned their results.
+        Execute validation logic.
+        Override this flow to implement task-specific validation logic.
         """
-        if self.subtasks is not None:
-            # Composite task execution
-            pass
-        else:
-            # Atomic task execution
-            pass
+        if self.subtasks:
+            results = {}
+            for task_id in inputs['order']:
+                subtask = self.subtasks.nodes[task_id]['task']
+                results[task_id] = await subtask.run(**inputs['params'])
+            return results
+        # Concrete tasks must override this if not using subtasks
+        raise NotImplementedError("Validator execute_flow must be implemented")
 
     @abstractmethod
-    @task_timer
-    def validator_score(self, result=None):
+    @flow(name="validator_score", retries=1)
+    async def score_flow(self, result: Any) -> float:
         """
-        Score the task results. For composite tasks, this may aggregate subtask scores.
-        For atomic tasks, this uses the defined scoring mechanism.
+        Score miner responses.
+        Override this flow to implement task-specific scoring logic.
         """
-        if self.subtasks is not None:
-            # Composite task scoring
-            pass
-        else:
-            # Atomic task scoring using self.scoring_mechanism
-            pass
+        if self.subtasks:
+            scores = []
+            for task_id, res in result.items():
+                subtask = self.subtasks.nodes[task_id]['task']
+                score = await subtask.score_flow(res)
+                if score is not None:
+                    scores.append(score)
+            return sum(scores) / len(scores) if scores else None
+        # Concrete tasks must override this if not using subtasks
+        raise NotImplementedError("Validator score_flow must be implemented")
 
-    ############################################################
-    # Miner methods
-    ############################################################
+    async def _store_score(self, score: float):
+        """Store task score in database"""
+        if self.db:
+            await self.db.store_score(self.name, score)
+
+
+class MinerTask(BaseTask):
+    """
+    Base class for miner tasks.
+    Responsible for:
+    1. Data preprocessing
+    2. Task computation
+    3. Result formatting
+    """
+
+    @flow(name="miner_run", retries=3)
+    async def run(self, **kwargs):
+        """Main miner flow"""
+        try:
+            if not self.db:
+                await self.initialize_database()
+            
+            # Preprocess inputs
+            inputs = await self.prepare_flow(**kwargs)
+            
+            # Execute computation
+            result = await self.execute_flow(inputs)
+            
+            return result
+            
+        except Exception as e:
+            await self._handle_error(e)
+            raise
 
     @abstractmethod
-    @task_timer
-    def miner_preprocess(
-        self,
-        preprocessing: Optional[Preprocessing] = None,
-        inputs: Optional[Inputs] = None,
-    ) -> Optional[Inputs]:
+    @flow(name="miner_prepare", retries=2)
+    async def prepare_flow(self, **kwargs) -> Dict[str, Any]:
         """
-        Preprocess the inputs for the miner neuron. Basically just wraps the defined preprocessing class in the task.
+        Preprocess input data.
+        Override this flow to implement task-specific preprocessing logic.
         """
-        pass
+        raise NotImplementedError("Miner prepare_flow must be implemented")
 
     @abstractmethod
-    @task_timer
-    def miner_execute(self, inputs: Optional[Inputs] = None) -> Optional[Outputs]:
+    @flow(name="miner_execute", retries=2)
+    async def execute_flow(self, inputs: Dict[str, Any]) -> Any:
         """
-        Execute the task from the miner neuron. For composite tasks, this should perform the workload for a specific subtask.
-        For atomic tasks, this executes the actual workload.
+        Execute computation logic.
+        Override this flow to implement task-specific computation logic.
         """
-        pass
+        raise NotImplementedError("Miner execute_flow must be implemented")
