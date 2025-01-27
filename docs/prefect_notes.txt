@@ -138,3 +138,148 @@ Task structure
 
 Validator flows: prepare -> execute -> score
 Miner flows: prepare -> execute
+
+
+## Core Components
+
+### Task Structure
+- Tasks are atomic units of work
+- Can be synchronous or asynchronous
+- Support retries, timeouts, and triggers
+- Can be parallelized using Dask
+
+### Flow Structure
+- Flows organize tasks into workflows
+- Support parallel execution
+- Handle dependencies between tasks
+- Can use different task runners (e.g., DaskTaskRunner)
+
+### Parallel Processing with Dask
+Located in `gaia/parallel/`:
+1. **Configuration** (`config/settings.py`):
+   - Define node types (VALIDATOR, MINER)
+   - Define task types (IO_BOUND, CPU_BOUND, MEMORY_BOUND, MIXED)
+   - Configure resources per task type
+   - Set worker and thread counts
+
+2. **Execution** (`core/executor.py`):
+   - ParallelExecutor class for Dask integration
+   - Handles cluster management
+   - Manages parallel task distribution
+   - Automatic resource cleanup
+
+3. **Utilities** (`utils/helpers.py`):
+   - @parallelize decorator for simple functions
+   - @parallel_flow for Prefect flows
+   - @parallel_task for Prefect tasks
+   - Batch processing helpers
+
+### Usage Examples
+
+1. Parallel Task:
+```python
+@parallel_task(
+    node_type=NodeType.VALIDATOR,
+    task_type=TaskType.CPU_BOUND,
+    retries=3
+)
+async def process_data(data):
+    return analyze(data)
+```
+
+2. Parallel Flow:
+```python
+@parallel_flow(
+    node_type=NodeType.VALIDATOR,
+    task_type=TaskType.IO_BOUND,
+    name="process_batch"
+)
+async def process_batch(items):
+    results = []
+    for item in items:
+        result = await process_data(item)
+        results.append(result)
+    return results
+```
+
+3. Direct Parallel Processing:
+```python
+async with parallel_executor(NodeType.VALIDATOR, TaskType.MIXED) as executor:
+    results = await executor.map(process_func, items, batch_size=10)
+```
+
+## Resource Management
+
+### Task Types and Resources
+1. IO_BOUND Tasks:
+   - More threads per worker (2+)
+   - Good for network/file operations
+   - Example: downloading data, API calls
+
+2. CPU_BOUND Tasks:
+   - Single thread per worker
+   - Good for computations
+   - Example: data processing, scoring
+
+3. MEMORY_BOUND Tasks:
+   - Fewer workers, more memory per worker
+   - Good for large data operations
+   - Example: model inference
+
+4. MIXED Tasks:
+   - Balanced resources
+   - Good for combined operations
+   - Example: preprocessing + inference
+
+### Configuration Example
+```python
+DEFAULT_CONFIGS = {
+    TaskType.IO_BOUND: ResourceConfig(
+        n_workers=4,
+        threads_per_worker=2,
+        memory_limit="4GB"
+    ),
+    TaskType.CPU_BOUND: ResourceConfig(
+        n_workers=4,
+        threads_per_worker=1,
+        memory_limit="4GB"
+    )
+}
+```
+
+### Dask Dashboard (port 8787)
+
+Task Design:
+   - Keep tasks focused and atomic
+   - Use appropriate task type for workload
+   - Set reasonable timeouts and retries
+   - Handle errors gracefully
+
+
+## Query Flow Example
+
+```python
+@parallel_flow(
+    node_type=NodeType.VALIDATOR,
+    task_type=TaskType.IO_BOUND,
+    name="query_miners"
+)
+async def query_miners(regions):
+    """Query miners in parallel for predictions."""
+    results = []
+    for region in regions:
+        result = await process_region(region)
+        results.append(result)
+    return results
+
+@parallel_task(
+    node_type=NodeType.VALIDATOR,
+    task_type=TaskType.CPU_BOUND,
+    name="process_region"
+)
+async def process_region(region):
+    """Process a single region with parallel scoring."""
+    predictions = await get_predictions(region)
+    scores = await calculate_scores(predictions)
+    return {"region": region, "scores": scores}
+```

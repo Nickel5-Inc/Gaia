@@ -1,3 +1,5 @@
+from prefect import flow, task
+from prefect.tasks import task_input_hash
 import asyncio
 import math
 import os
@@ -22,6 +24,7 @@ import requests
 import boto3
 from botocore.config import Config
 from botocore.client import UNSIGNED
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
@@ -50,6 +53,7 @@ class SessionWithHeaderRedirection(requests.Session):
 
 session = SessionWithHeaderRedirection(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
 
+@task(retries=3, retry_delay_seconds=60)
 async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
     """
     Fetch monthly Sentinel-2 B4 and B8 bands asynchronously, falling back to previous month if needed.
@@ -194,6 +198,7 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
         return None
 
 
+@task(retries=3, retry_delay_seconds=60)
 async def download_srtm_tile(lat, lon, download_dir=None):
     if download_dir is None:
         download_dir = get_data_dir()
@@ -292,6 +297,7 @@ async def download_srtm_tile(lat, lon, download_dir=None):
         return None
 
 
+@task(retries=2)
 async def fetch_srtm(bbox, sentinel_bounds=None, sentinel_crs=None, sentinel_shape=None):
     """Fetch and merge SRTM tiles using Sentinel-2 as reference asynchronously."""
     try:
@@ -352,6 +358,7 @@ async def fetch_srtm(bbox, sentinel_bounds=None, sentinel_crs=None, sentinel_sha
         return None, None, None, None
 
 
+@task(retries=2)
 async def fetch_ifs_forecast(
     bbox, datetime_obj, sentinel_bounds=None, sentinel_crs=None, sentinel_shape=None
 ):
@@ -447,6 +454,7 @@ async def fetch_ifs_forecast(
         return None
 
 
+@task
 async def download_ifs_file(url):
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
@@ -461,6 +469,7 @@ async def download_ifs_file(url):
                 return None
 
 
+@task
 async def process_global_ifs(grib_paths, timesteps, output_path):
     """Process multiple GRIB files into a single NetCDF with timesteps asynchronously."""
     try:
@@ -513,6 +522,7 @@ async def process_global_ifs(grib_paths, timesteps, output_path):
         return False
 
 
+@task
 async def extract_ifs_variables(
     ds, bbox, sentinel_bounds=None, sentinel_crs=None, sentinel_shape=None
 ):
@@ -611,6 +621,7 @@ async def extract_ifs_variables(
         return None
 
 
+@flow(name="get_soil_data_flow")
 async def get_soil_data(bbox, datetime_obj=None):
     """Download soil-related datasets and combine them into a single GeoTIFF asynchronously."""
     if datetime_obj is None:
@@ -903,3 +914,9 @@ def get_data_dir():
         os.makedirs(data_dir)
         logger.info(f"Created data directory at: {data_dir}")
     return data_dir
+
+
+@flow(name="get_soil_data_parallel_flow")
+async def get_soil_data_parallel(regions, datetime_obj=None):
+    """Process multiple regions in parallel while respecting API limits."""
+    // ... existing code ...

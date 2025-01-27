@@ -24,6 +24,9 @@ import glob
 import asyncio
 import psutil
 import gc
+from prefect import flow, task
+from prefect.tasks import task_input_hash
+from datetime import timedelta
 
 logger = get_logger(__name__)
 
@@ -50,26 +53,29 @@ class SoilScoringMechanism(ScoringMechanism):
         self.db_manager = db_manager
         self.task = task
 
+    @task
     def sigmoid_rmse(self, rmse: float) -> float:
         """Convert RMSE to score using sigmoid function. (higher is better)"""
         return 1 / (1 + torch.exp(self.alpha * (rmse - self.beta)))
 
+    @task
     def compute_final_score(self, metrics: Dict) -> float:
         """Compute final score combining RMSE and SSIM metrics."""
         surface_rmse = metrics["validation_metrics"].get("surface_rmse", self.beta)
         rootzone_rmse = metrics["validation_metrics"].get("rootzone_rmse", self.beta)
         surface_ssim = metrics["validation_metrics"].get("surface_ssim", 0)
         rootzone_ssim = metrics["validation_metrics"].get("rootzone_ssim", 0)
-        surface_score = 0.8 * self.sigmoid_rmse(torch.tensor(surface_rmse)) + 0.2 * (
+        surface_score = 0.8 * self.sigmoid_rmse.submit(torch.tensor(surface_rmse)).result() + 0.2 * (
             (surface_ssim + 1) / 2
         )
-        rootzone_score = 0.8 * self.sigmoid_rmse(torch.tensor(rootzone_rmse)) + 0.2 * (
+        rootzone_score = 0.8 * self.sigmoid_rmse.submit(torch.tensor(rootzone_rmse)).result() + 0.2 * (
             (rootzone_ssim + 1) / 2
         )
         final_score = 0.6 * surface_score + 0.4 * rootzone_score
 
         return final_score.item()
 
+    @task
     async def validate_predictions(self, predictions: Dict) -> bool:
         """check predictions before scoring."""
         try:
@@ -94,6 +100,7 @@ class SoilScoringMechanism(ScoringMechanism):
             logger.error(f"Error validating predictions: {str(e)}")
             return False
 
+    @task
     async def validate_metrics(self, metrics: Dict) -> bool:
         """Check metrics before final scoring."""
         try:
@@ -134,11 +141,11 @@ class SoilScoringMechanism(ScoringMechanism):
             logger.error(f"Error validating metrics: {str(e)}")
             return False
 
-    @task_timer
+    @flow(name="score_predictions_flow")
     async def score(self, predictions: Dict) -> Dict[str, float]:
         """Score predictions against SMAP ground truth."""
         try:
-            if not await self.validate_predictions(predictions):
+            if not await self.validate_predictions.submit(predictions):
                 logger.error("Invalid predictions")
                 return None
 
@@ -170,7 +177,7 @@ class SoilScoringMechanism(ScoringMechanism):
             if not pred_info or pred_info.get("status") == "sent_to_miner":
                 logger.info(f"Processing new prediction for timestamp {predictions['target_time']}")
 
-            metrics = await self.compute_smap_score_metrics(
+            metrics = await self.compute_smap_score_metrics.submit(
                 bounds=predictions["bounds"],
                 crs=predictions["crs"],
                 model_predictions=predictions["predictions"],
@@ -185,11 +192,11 @@ class SoilScoringMechanism(ScoringMechanism):
             if not metrics:
                 return None
 
-            if not await self.validate_metrics(metrics):
+            if not await self.validate_metrics.submit(metrics):
                 logger.error("Invalid metrics computed")
                 return None
 
-            total_score = self.compute_final_score(metrics)
+            total_score = await self.compute_final_score.submit(metrics)
 
             if not 0 <= total_score <= 1:
                 logger.error(f"Final score {total_score} outside valid range [0,1]")
@@ -211,6 +218,7 @@ class SoilScoringMechanism(ScoringMechanism):
             logger.error(f"Error in scoring: {str(e)}")
             return None
 
+    @task(retries=3, retry_delay_seconds=60)
     async def compute_smap_score_metrics(
         self,
         bounds: tuple[float, float, float, float],
@@ -306,7 +314,7 @@ class SoilScoringMechanism(ScoringMechanism):
 
             if not (surface_mask_11x11.any() or rootzone_mask_11x11.any()):
                 logger.warning(f"No valid SMAP data found for bounds {bounds}")
-                cleanup_success = await self.cleanup_invalid_prediction(bounds, target_date, miner_id)
+                cleanup_success = await self.cleanup_invalid_prediction.submit(bounds, target_date, miner_id)
                 if not cleanup_success:
                     logger.error(f"Failed to cleanup invalid prediction for bounds {bounds}")
                 return None
@@ -400,6 +408,7 @@ class SoilScoringMechanism(ScoringMechanism):
             except Exception as e:
                 logger.error(f"Error during temp file cleanup: {e}")
 
+    @task
     async def cleanup_invalid_prediction(self, bounds, target_time: datetime, miner_id: str):
         try:
             result = await self.db_manager.fetch_one(
@@ -439,6 +448,7 @@ class SoilScoringMechanism(ScoringMechanism):
             logger.error(traceback.format_exc())
             return False
 
+    @task
     def prepare_soil_history_records(self, miner_id: str, miner_hotkey: str, metrics: Dict, target_time: datetime) -> Dict[str, Any]:
         """
         Prepare data for insertion into the soil_moisture_history table.

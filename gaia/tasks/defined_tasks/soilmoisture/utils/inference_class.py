@@ -3,7 +3,11 @@ import torch.nn.functional as F
 import numpy as np
 import rasterio
 from typing import Dict
+from prefect import task
+from datetime import timedelta
+import logging
 
+logger = logging.getLogger(__name__)
 
 class SoilMoistureInferencePreprocessor:
     def __init__(self, patch_size: int = 220):
@@ -23,6 +27,7 @@ class SoilMoistureInferencePreprocessor:
 
         return normalized
 
+    @task(retries=2, retry_delay_seconds=30)
     def preprocess(self, tiff_path: str) -> Dict[str, torch.Tensor]:
         """ Preprocessing for base model with normalization and masking"""
         try:
@@ -57,7 +62,7 @@ class SoilMoistureInferencePreprocessor:
                 }
 
         except Exception as e:
-            print(f"Error preprocessing file {tiff_path}: {str(e)}")
+            logger.error(f"Error preprocessing file {tiff_path}: {str(e)}")
             return None
 
     def _handle_elevation_mask(self, elevation: torch.Tensor) -> torch.Tensor:
@@ -78,6 +83,7 @@ class SoilMoistureInferencePreprocessor:
 
         return F.pad(tensor, padding, mode="constant", value=0)
 
+    @task(retries=2, retry_delay_seconds=30)
     def preprocess_raw(self, tiff_path: str) -> Dict[str, np.ndarray]:
         """
         Lightweight preprocessing for custom models - reads raw data into numpy arrays
@@ -94,10 +100,10 @@ class SoilMoistureInferencePreprocessor:
                 return {
                     "sentinel_ndvi": sentinel_ndvi,  # [3, H, W]
                     "elevation": elevation,          # [1, H, W]
-                    "era5": ifs_data,                    # [17, H, W]
+                    "era5": ifs_data,               # [17, H, W]
                 }
 
         except Exception as e:
-            print(f"Error preprocessing file {tiff_path}: {str(e)}")
+            logger.error(f"Error preprocessing file {tiff_path}: {str(e)}")
             return None
             

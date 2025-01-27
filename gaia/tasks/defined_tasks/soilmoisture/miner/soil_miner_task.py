@@ -1,197 +1,199 @@
-"""
-Soil Moisture Miner Task
+"""Soil Moisture Miner Task Flow.
 
-Implements the miner node logic for the soil moisture task.
-Responsible for:
-1. Data preprocessing and validation
-2. Retrieving soil moisture measurements
-3. Formatting and returning results
+This module implements the miner-side task flow for soil moisture predictions.
 """
 
 from prefect import flow, task
-from typing import Dict, Any, List
+from prefect.tasks import task_input_hash
+from typing import Dict, Any, Optional, List
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
-import tempfile
-import base64
 import logging
-import importlib.util
+import traceback
+from pydantic import Field
 
 from gaia.tasks.base.task import MinerTask
-from ..protocol import SoilRequestData, SoilResponseData, SoilMeasurement
-from ..utils.data_sources import fetch_smap_data, fetch_smos_data
-from ..utils.preprocessing import preprocess_measurements
-from .soil_miner_preprocessing import SoilMinerPreprocessing
-from gaia.models.soil_moisture_basemodel import SoilModel
+from gaia.tasks.defined_tasks.soilmoisture.protocol import (
+    SoilMoisturePayload,
+    SoilMoisturePrediction,
+    SoilResponseData,
+    SoilRequestData,
+    SoilMeasurement
+)
+from gaia.tasks.defined_tasks.soilmoisture.preprocessing import SoilMinerPreprocessing
+from gaia.tasks.defined_tasks.soilmoisture.models import SoilModel
 
 logger = logging.getLogger(__name__)
 
-class SoilMinerTask(MinerTask):
-    """
-    Miner implementation for soil moisture task.
-    Retrieves and processes soil moisture data from multiple sources.
-    """
-    
+class SoilMinerTaskFlow(MinerTask):
+    """Miner task flow for soil moisture prediction using satellite and weather data."""
+
+    prediction_horizon: timedelta = Field(
+        default_factory=lambda: timedelta(hours=6),
+        description="Prediction horizon for the task",
+    )
+    scoring_delay: timedelta = Field(
+        default_factory=lambda: timedelta(days=3),
+        description="Delay before scoring due to SMAP data latency",
+    )
+
+    miner_preprocessing: Optional[SoilMinerPreprocessing] = None
+    model: Optional[SoilModel] = None
+    use_raw_preprocessing: bool = Field(default=False)
+    test_mode: bool = Field(default=False)
+
     def __init__(self, **kwargs):
+        """Initialize the soil miner task flow."""
         super().__init__(
-            name="soil_moisture_miner",
-            description="Retrieves and processes soil moisture measurements",
+            name="SoilMoistureTask",
+            description="Soil moisture prediction task",
             schema_path="gaia/tasks/defined_tasks/soilmoisture/schema.json",
             **kwargs
         )
-        self.preprocessing = SoilMinerPreprocessing(task=self)
-        self.model = self._initialize_model()
-        self.use_raw_preprocessing = False
+        
+        self.test_mode = kwargs.get('test_mode', False)
+        self._initialize_miner_components()
 
-    def _initialize_model(self) -> SoilModel:
-        """Initialize the soil moisture model"""
+    def _initialize_miner_components(self):
+        """Initialize miner-specific components."""
+        self.miner_preprocessing = SoilMinerPreprocessing(task=self)
+
+        # Try loading custom model if available
         custom_model_path = "gaia/models/custom_models/custom_soil_model.py"
         if os.path.exists(custom_model_path):
-            spec = importlib.util.spec_from_file_location(
-                "custom_soil_model",
-                custom_model_path
-            )
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            self.use_raw_preprocessing = True
-            logger.info("Initialized custom soil model")
-            return module.CustomSoilModel()
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("custom_soil_model", custom_model_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                self.model = module.CustomSoilModel()
+                self.use_raw_preprocessing = True
+                logger.info("Initialized custom soil model")
+            except Exception as e:
+                logger.error(f"Failed to load custom model: {str(e)}")
+                self.model = self.miner_preprocessing.model
+                self.use_raw_preprocessing = False
         else:
+            self.model = self.miner_preprocessing.model
+            self.use_raw_preprocessing = False
             logger.info("Initialized base soil model")
-            return self.preprocessing.model
 
-    @flow(name="soil_miner_prepare", retries=2)
-    async def prepare_flow(self, **kwargs) -> Dict[str, Any]:
-        """
-        Prepare and validate input data.
-        Decodes and preprocesses input data for model.
-        """
-        # Extract and validate request data
-        request_data = kwargs.get('data', {})
-        if not request_data:
-            raise ValueError("No request data provided")
-            
-        # Decode combined data
-        combined_data = base64.b64decode(request_data['combined_data'])
-        
-        # Save to temporary file for processing
-        with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
-            tmp.write(combined_data)
-            tmp_path = tmp.name
-            
+        logger.info("Initialized miner components for SoilMoistureTask")
+
+    @task(retries=2)
+    async def process_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Process input data for model inference."""
         try:
-            # Preprocess data
-            if self.use_raw_preprocessing:
-                processed_data = await self._raw_preprocessing(
-                    tmp_path,
-                    request_data['sentinel_bounds'],
-                    request_data['sentinel_crs']
-                )
+            return await self.miner_preprocessing.process_miner_data(data)
+        except Exception as e:
+            logger.error(f"Error processing data: {str(e)}")
+            raise
+
+    @task(retries=2)
+    async def generate_predictions(self, processed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate predictions using the model."""
+        try:
+            if hasattr(self.model, "run_inference"):
+                predictions = self.model.run_inference(processed_data)  # Custom model
             else:
-                processed_data = await self.preprocessing.process(
-                    tmp_path,
-                    request_data['sentinel_bounds'],
-                    request_data['sentinel_crs']
-                )
-                
-            return {
-                'processed_data': processed_data,
-                'region_id': request_data['region_id'],
-                'target_time': request_data['target_time']
-            }
-            
-        finally:
-            # Clean up temporary file
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+                predictions = self.run_model_inference(processed_data)  # Base model
 
-    @flow(name="soil_miner_execute", retries=2)
-    async def execute_flow(self, inputs: Dict[str, Any]) -> Any:
-        """
-        Execute soil moisture prediction.
-        Uses model to generate predictions from processed data.
-        """
-        processed_data = inputs['processed_data']
-        region_id = inputs['region_id']
-        target_time = inputs['target_time']
-        
-        try:
-            # Generate predictions
-            predictions = await self._generate_predictions(processed_data)
-            
-            # Format response
-            response = SoilResponseData(
-                request=SoilRequestData(
-                    region_id=region_id,
-                    target_time=datetime.fromisoformat(target_time)
-                ),
-                measurements=[
-                    SoilMeasurement(
-                        value=float(pred['value']),
-                        uncertainty=float(pred['uncertainty']),
-                        source=pred['source'],
-                        quality_flag=int(pred['quality'])
-                    )
-                    for pred in predictions
-                ],
-                metadata={
-                    'model_version': self.model.version,
-                    'preprocessing_version': self.preprocessing.version,
-                    'prediction_time': datetime.utcnow().isoformat()
-                }
+            # Log prediction statistics
+            logger.info(
+                f"Surface moisture stats - Min: {predictions['surface'].min():.3f}, "
+                f"Max: {predictions['surface'].max():.3f}, "
+                f"Mean: {predictions['surface'].mean():.3f}"
             )
-            
-            return response
-            
+            logger.info(
+                f"Root zone moisture stats - Min: {predictions['rootzone'].min():.3f}, "
+                f"Max: {predictions['rootzone'].max():.3f}, "
+                f"Mean: {predictions['rootzone'].mean():.3f}"
+            )
+
+            return predictions
         except Exception as e:
             logger.error(f"Error generating predictions: {str(e)}")
             raise
 
-    @task
-    async def _raw_preprocessing(
-        self,
-        data_path: str,
-        bounds: Dict,
-        crs: str
-    ) -> Dict[str, Any]:
-        """Raw data preprocessing for custom models"""
-        return await self.model.preprocess(data_path, bounds, crs)
+    @flow(name="miner_prepare", retries=2)
+    async def prepare_flow(self, **kwargs) -> Dict[str, Any]:
+        """
+        Preprocess input data.
+        Implements the abstract method from MinerTask.
+        """
+        try:
+            data = kwargs.get("data", {})
+            if not data:
+                raise ValueError("No data provided for preprocessing")
 
-    @task
-    async def _generate_predictions(
-        self,
-        processed_data: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """Generate predictions using the model"""
-        predictions = await self.model.predict(processed_data)
-        
-        # Add uncertainty and quality estimates
-        for pred in predictions:
-            if 'uncertainty' not in pred:
-                pred['uncertainty'] = self._estimate_uncertainty(pred['value'])
-            if 'quality' not in pred:
-                pred['quality'] = self._estimate_quality(
-                    pred['value'],
-                    pred['uncertainty']
-                )
-                
-        return predictions
+            # Validate input using protocol
+            SoilMoisturePayload(**data)
 
-    def _estimate_uncertainty(self, value: float) -> float:
-        """Estimate prediction uncertainty"""
-        # Simple uncertainty model based on value range
-        base_uncertainty = 0.05  # 5% base uncertainty
-        range_factor = min(abs(value - 0.5), 0.5) / 0.5  # Higher uncertainty at extremes
-        return base_uncertainty * (1 + range_factor)
+            # Process the data
+            processed_data = await self.process_data.submit(data)
+            
+            return {
+                "processed_data": processed_data,
+                "region_id": data.get("region_id"),
+                "target_time": data.get("target_time"),
+                "sentinel_bounds": data.get("sentinel_bounds"),
+                "sentinel_crs": data.get("sentinel_crs")
+            }
+        except Exception as e:
+            logger.error(f"Error in prepare flow: {str(e)}")
+            logger.error(traceback.format_exc())
+            await self._handle_error(e)
+            raise
 
-    def _estimate_quality(self, value: float, uncertainty: float) -> int:
-        """Estimate prediction quality flag"""
-        if uncertainty > 0.2:
-            return 1  # Low quality
-        elif uncertainty > 0.1:
-            return 2  # Medium quality
-        elif 0.0 <= value <= 1.0:
-            return 3  # Good quality
-        else:
-            return 0  # Invalid
+    @flow(name="miner_execute", retries=2)
+    async def execute_flow(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute computation logic.
+        Implements the abstract method from MinerTask.
+        """
+        try:
+            # Generate predictions
+            predictions = await self.generate_predictions.submit(inputs["processed_data"])
+
+            # Format for output
+            target_time = inputs["target_time"]
+            if isinstance(target_time, str):
+                target_time = datetime.fromisoformat(target_time)
+            elif not isinstance(target_time, datetime):
+                raise ValueError(f"Invalid target_time format: {target_time}")
+
+            prediction_time = self.get_next_preparation_time(target_time)
+
+            # Create response using protocol models
+            prediction = SoilMoisturePrediction(
+                surface_sm=predictions["surface"],
+                rootzone_sm=predictions["rootzone"],
+                uncertainty_surface=None,
+                uncertainty_rootzone=None,
+                sentinel_bounds=inputs["sentinel_bounds"],
+                sentinel_crs=inputs["sentinel_crs"],
+                target_time=prediction_time
+            )
+
+            # Validate prediction using protocol
+            if not SoilMoisturePrediction.validate_prediction(prediction.dict()):
+                raise ValueError("Invalid prediction format")
+
+            return prediction.dict()
+
+        except Exception as e:
+            logger.error(f"Error in execute flow: {str(e)}")
+            logger.error(traceback.format_exc())
+            await self._handle_error(e)
+            raise
+
+    def run_model_inference(self, processed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Run model inference on processed data."""
+        if not self.model:
+            raise RuntimeError("Model not initialized. Are you running on a miner node?")
+        return self.model.predict(processed_data)
+
+    def get_next_preparation_time(self, target_time: datetime) -> datetime:
+        """Calculate the next preparation time based on target time."""
+        return target_time + self.prediction_horizon

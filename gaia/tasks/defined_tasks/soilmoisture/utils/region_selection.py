@@ -1,3 +1,6 @@
+from prefect import flow, task
+from prefect.tasks import task_input_hash
+from datetime import timedelta
 import random
 import h3
 import json
@@ -7,6 +10,7 @@ import hashlib
 import struct
 
 
+@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(hours=24))
 def h3_cell_to_polygon(h3_address):
     """Convert H3 cell to Shapely polygon."""
     boundary = h3.cell_to_boundary(h3_address)
@@ -15,6 +19,7 @@ def h3_cell_to_polygon(h3_address):
     return Polygon(coords)
 
 
+@task
 def select_random_base_cell(base_cells, resolution=2, min_lat=-56, max_lat=60):
     """Select a base cell from eligible cells - randomization handled by caller."""
     eligible_cells = [
@@ -25,6 +30,7 @@ def select_random_base_cell(base_cells, resolution=2, min_lat=-56, max_lat=60):
     return random.choice(eligible_cells) if eligible_cells else None
 
 
+@task
 def subdivide_if_urban_present(
     base_hex, urban_cells_set, lakes_cells_set, target_resolution=5, max_resolution=8
 ):
@@ -37,7 +43,7 @@ def subdivide_if_urban_present(
             if hex_id in urban_cells_set or hex_id in lakes_cells_set:
                 continue
 
-            hex_polygon = h3_cell_to_polygon(hex_id)
+            hex_polygon = h3_cell_to_polygon.submit(hex_id).result()
             hex_bounds = hex_polygon.bounds
 
             if (
@@ -45,13 +51,13 @@ def subdivide_if_urban_present(
                 or hex_bounds[3] - hex_bounds[1] < 1.0
             ) and target_resolution < max_resolution:
                 filtered_cells.extend(
-                    subdivide_if_urban_present(
+                    subdivide_if_urban_present.submit(
                         hex_id,
                         urban_cells_set,
                         lakes_cells_set,
                         target_resolution + 1,
                         max_resolution,
-                    )
+                    ).result()
                 )
             else:
                 filtered_cells.append(hex_id)
@@ -61,6 +67,7 @@ def subdivide_if_urban_present(
         return [base_hex]
 
 
+@task
 def largest_inscribed_square(hex_polygon):
     """Calculate the largest inscribed square within a hexagon polygon."""
     bounds = hex_polygon.bounds
@@ -82,6 +89,7 @@ def largest_inscribed_square(hex_polygon):
     return None
 
 
+@task
 def select_1x1_degree_box_in_square(square, hex_polygon):
     """Position a 1x1 degree box within the inscribed square, centered if possible."""
     center_x, center_y = square.centroid.x, square.centroid.y
@@ -93,6 +101,7 @@ def select_1x1_degree_box_in_square(square, hex_polygon):
         return None
 
 
+@flow(name="select_random_region_flow")
 def select_random_region(
     base_cells, 
     urban_cells_set, 
@@ -105,35 +114,34 @@ def select_random_region(
     """Deterministically select a region based on generated seed."""
     used_bounds = used_bounds or set()
     
-    # NO seed setting here - using seed from get_daily_regions
-    base_cell = select_random_base_cell(
+    base_cell = select_random_base_cell.submit(
         base_cells,
         resolution=2,
         min_lat=min_lat,
         max_lat=max_lat
-    )
+    ).result()
 
     if not base_cell:
         raise ValueError("No eligible base cells found within the specified bounds.")
         
-    filtered_cells = subdivide_if_urban_present(
+    filtered_cells = subdivide_if_urban_present.submit(
         base_cell["index"],
         urban_cells_set,
         lakes_cells_set,
         target_resolution=5
-    )
+    ).result()
 
     filtered_cells = list(filtered_cells)
     random.shuffle(filtered_cells)  # Uses the seed from get_daily_regions
     
     for hex_id in filtered_cells:
-        hex_polygon = h3_cell_to_polygon(hex_id)
-        inscribed_square = largest_inscribed_square(hex_polygon)
+        hex_polygon = h3_cell_to_polygon.submit(hex_id).result()
+        inscribed_square = largest_inscribed_square.submit(hex_polygon).result()
 
         if not inscribed_square:
             continue
 
-        valid_bbox = select_1x1_degree_box_in_square(inscribed_square, hex_polygon)
+        valid_bbox = select_1x1_degree_box_in_square.submit(inscribed_square, hex_polygon).result()
         
         if valid_bbox and tuple(valid_bbox) not in used_bounds:
             return valid_bbox
@@ -141,6 +149,7 @@ def select_random_region(
     return None
 
 
+@task(retries=2)
 def get_deterministic_seed(date: date, hour: int) -> int:
     """Generate deterministic seed from date and hour using SHA-256.
     

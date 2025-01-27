@@ -5,9 +5,17 @@ Defines the data structures and formats for communication between validator and 
 This serves as the single source of truth for data formats in the soil moisture task.
 """
 
-from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Any
+from pydantic import BaseModel, Field, validator, ConfigDict
+from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime
+import numpy as np
+from numpy.typing import NDArray
+from gaia.tasks.base.components.inputs import Inputs
+from gaia.tasks.base.components.outputs import Outputs
+from gaia.tasks.base.decorators import handle_validation_error
+import logging
+
+logger = logging.getLogger(__name__)
 
 class SoilRequestData(BaseModel):
     """Data structure for soil moisture task requests"""
@@ -74,33 +82,22 @@ class ValidationResult(BaseModel):
     metrics: Dict[str, float] = Field(
         default_factory=dict,
         description="Validation metrics"
-    ) 
-
+    )
 
 ##########################################
-# inputs py
+# Input Protocol
 ##########################################
-
-from pydantic import BaseModel
-from typing import Dict, List, Optional, Any
-from datetime import datetime
-from gaia.tasks.base.components.inputs import Inputs
-from gaia.tasks.base.decorators import handle_validation_error
-
 
 class SoilMoisturePayload(BaseModel):
     """Schema for soil moisture prediction payload."""
-
     region_id: int
     combined_data: bytes
     sentinel_bounds: list[float]  # [left, bottom, right, top]
     sentinel_crs: int  # EPSG code
     target_time: datetime
 
-
 class SoilMoistureInputs(Inputs):
     """Input schema definitions for soil moisture task."""
-
     inputs: Dict[str, Any] = {
         "validator_input": {"regions": List[Dict[str, Any]], "target_time": datetime},
         "miner_input": SoilMoisturePayload,
@@ -118,25 +115,9 @@ class SoilMoistureInputs(Inputs):
 
         return True
 
-##########################################
-# outputs py
-##########################################
-
-from pydantic import BaseModel, validator, ConfigDict
-from typing import Dict, List, Optional, Any, Tuple
-import numpy as np
-from numpy.typing import NDArray
-from gaia.tasks.base.components.outputs import Outputs
-from gaia.tasks.base.decorators import handle_validation_error
-from datetime import datetime
-import logging
-
-logger = logging.getLogger(__name__)
-
 
 class SoilMoisturePrediction(BaseModel):
     """Schema for soil moisture prediction response."""
-
     surface_sm: NDArray[np.float32]
     rootzone_sm: NDArray[np.float32]
     uncertainty_surface: Optional[NDArray[np.float32]] = None
@@ -147,9 +128,7 @@ class SoilMoisturePrediction(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    @validator(
-        "surface_sm", "rootzone_sm", "uncertainty_surface", "uncertainty_rootzone"
-    )
+    @validator("surface_sm", "rootzone_sm", "uncertainty_surface", "uncertainty_rootzone")
     def validate_array(cls, v):
         if v is None:
             return v
@@ -197,10 +176,8 @@ class SoilMoisturePrediction(BaseModel):
             logger.warning(f"Invalid prediction data: {str(e)}")
             return False
 
-
 class SoilMoistureOutputs(Outputs):
     """Output schema definitions for soil moisture task."""
-
     outputs: Dict[str, Any] = {"prediction": SoilMoisturePrediction}
 
     @handle_validation_error

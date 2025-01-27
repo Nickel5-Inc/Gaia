@@ -1034,48 +1034,48 @@ class GaiaValidator:
                 return
 
             async with self.miner_table_lock:
-                self.metagraph.sync_nodes()
-                total_nodes = len(self.metagraph.nodes)
-                logger.info(f"Synced {total_nodes} nodes from the network")
+            self.metagraph.sync_nodes()
+            total_nodes = len(self.metagraph.nodes)
+            logger.info(f"Synced {total_nodes} nodes from the network")
 
-                # Process miners in chunks of 32 to prevent memory bloat
-                chunk_size = 32
-                nodes_items = list(self.metagraph.nodes.items())
+            # Process miners in chunks of 32 to prevent memory bloat
+            chunk_size = 32
+            nodes_items = list(self.metagraph.nodes.items())
 
-                for chunk_start in range(0, total_nodes, chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, total_nodes)
-                    chunk = nodes_items[chunk_start:chunk_end]
+            for chunk_start in range(0, total_nodes, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, total_nodes)
+                chunk = nodes_items[chunk_start:chunk_end]
+                
+                try:
+                    for index, (hotkey, node) in enumerate(chunk, start=chunk_start):
+                        await self.database_manager.update_miner_info(
+                            index=index,
+                            hotkey=node.hotkey,
+                            coldkey=node.coldkey,
+                            ip=node.ip,
+                            ip_type=str(node.ip_type),
+                            port=node.port,
+                            incentive=float(node.incentive),
+                            stake=float(node.stake),
+                            trust=float(node.trust),
+                            vtrust=float(node.vtrust),
+                            protocol=str(node.protocol),
+                        )
+                        self.nodes[index] = {"hotkey": node.hotkey, "uid": index}
+                        logger.debug(f"Updated information for node {index}")
                     
-                    try:
-                        for index, (hotkey, node) in enumerate(chunk, start=chunk_start):
-                            await self.database_manager.update_miner_info(
-                                index=index,
-                                hotkey=node.hotkey,
-                                coldkey=node.coldkey,
-                                ip=node.ip,
-                                ip_type=str(node.ip_type),
-                                port=node.port,
-                                incentive=float(node.incentive),
-                                stake=float(node.stake),
-                                trust=float(node.trust),
-                                vtrust=float(node.vtrust),
-                                protocol=str(node.protocol),
-                            )
-                            self.nodes[index] = {"hotkey": node.hotkey, "uid": index}
-                            logger.debug(f"Updated information for node {index}")
-                        
-                        logger.info(f"Processed nodes {chunk_start} to {chunk_end-1}")
-                        
-                        # Small delay between chunks to prevent overwhelming the database
-                        await asyncio.sleep(0.1)
-                        
-                    except Exception as chunk_error:
-                        logger.error(f"Error processing chunk {chunk_start}-{chunk_end}: {str(chunk_error)}")
-                        logger.error(traceback.format_exc())
-                        # Continue with next chunk instead of failing completely
-                        continue
+                    logger.info(f"Processed nodes {chunk_start} to {chunk_end-1}")
+                    
+                    # Small delay between chunks to prevent overwhelming the database
+                    await asyncio.sleep(0.1)
+                    
+                except Exception as chunk_error:
+                    logger.error(f"Error processing chunk {chunk_start}-{chunk_end}: {str(chunk_error)}")
+                    logger.error(traceback.format_exc())
+                    # Continue with next chunk instead of failing completely
+                    continue
 
-                logger.info("Successfully updated miner table and in-memory state")
+            logger.info("Successfully updated miner table and in-memory state")
 
         except Exception as e:
             logger.error(f"Error updating miner table: {str(e)}")
@@ -1157,13 +1157,13 @@ class GaiaValidator:
                                     if node.hotkey in chain_hotkeys:
                                         self.nodes[uid] = {"hotkey": node.hotkey, "uid": uid}
                                         logger.info(f"Updated index {uid} with new chain info")
-                            except Exception as e:
+                        except Exception as e:
                                 logger.error(f"Error clearing miner {uid}: {str(e)}")
-                                logger.error(traceback.format_exc())
+                            logger.error(traceback.format_exc())
 
                 # Periodic sleep (5 minutes)
                 await asyncio.sleep(300)
-
+                
             except Exception as e:
                 logger.error(f"Error in deregistration loop: {str(e)}")
                 logger.error(traceback.format_exc())
@@ -1174,13 +1174,13 @@ class GaiaValidator:
         try:
             now = datetime.now(timezone.utc)
             one_day_ago = now - timedelta(days=1)
-            
-            query = """
+        
+        query = """
             SELECT score, created_at 
-            FROM score_table 
-            WHERE task_name = :task_name
-            AND created_at >= :start_time
-            ORDER BY created_at DESC
+        FROM score_table 
+        WHERE task_name = :task_name
+        AND created_at >= :start_time
+        ORDER BY created_at DESC 
             """
             
             # Fetch and analyze geomagnetic scores
@@ -1289,9 +1289,9 @@ class GaiaValidator:
             logger.info("Recent scores fetched and decay-weighted. Calculating aggregate scores...")
 
             weights = np.zeros(256)
-            for idx in range(256):
-                geomagnetic_score = geomagnetic_scores[idx]
-                soil_score = soil_scores[idx]
+        for idx in range(256):
+            geomagnetic_score = geomagnetic_scores[idx]
+            soil_score = soil_scores[idx]
 
                 # Treat 0.0 scores the same as NaN
                 if np.isnan(geomagnetic_score) or geomagnetic_score == 0.0:
@@ -1300,17 +1300,17 @@ class GaiaValidator:
                     soil_score = np.nan
 
                 if np.isnan(geomagnetic_score) and np.isnan(soil_score):
-                    weights[idx] = 0.0
+                weights[idx] = 0.0
                 elif np.isnan(geomagnetic_score):
-                    weights[idx] = 0.5 * soil_score
+                weights[idx] = 0.5 * soil_score
                 elif np.isnan(soil_score):
                     weights[idx] = 0.5 * geomagnetic_score
-                else:
+            else:
                     weights[idx] = (0.5 * geomagnetic_score) + (0.5 * soil_score)
 
                 logger.info(f"UID {idx}: geo={geomagnetic_score} ({geo_counts[idx]} scores), soil={soil_score} ({soil_counts[idx]} scores), weight={weights[idx]}")
 
-            logger.info(f"Weights before normalization: {weights}")
+        logger.info(f"Weights before normalization: {weights}")
 
             # generalized logistic curve
             non_zero_mask = weights != 0.0
@@ -1341,7 +1341,7 @@ class GaiaValidator:
                     return new_weights.tolist()
 
             logger.warning("No valid weights calculated")
-            return None
+                return None
 
         except Exception as e:
             logger.error(f"Error calculating weights: {e}")

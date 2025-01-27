@@ -1,3 +1,6 @@
+from prefect import flow, task
+from prefect.tasks import task_input_hash
+from datetime import timedelta
 import os
 import subprocess
 import tempfile
@@ -44,6 +47,7 @@ class SessionWithHeaderRedirection(requests.Session):
 session = SessionWithHeaderRedirection(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
 
 
+@task(retries=3, retry_delay_seconds=60)
 def construct_smap_url(datetime_obj, test_mode=False):
     """
     Construct URL for SMAP L4 Global Product data
@@ -64,6 +68,7 @@ def construct_smap_url(datetime_obj, test_mode=False):
     return f"{base_url}/{date_dir}/{file_name}"
 
 
+@task(retries=3, retry_delay_seconds=60, cache_key_fn=task_input_hash, cache_expiration=timedelta(hours=12))
 def download_smap_data(url, output_path):
     """
     Download SMAP data with progress bar and caching
@@ -133,6 +138,7 @@ def download_smap_data(url, output_path):
         return False
 
 
+@task
 def process_smap_data(filepath, bbox, target_shape=(220, 220)):
     """
     Process SMAP L4 data for a specified bounding box.
@@ -157,6 +163,7 @@ def process_smap_data(filepath, bbox, target_shape=(220, 220)):
         return {"surface_sm": surface_resampled, "rootzone_sm": rootzone_resampled}
 
 
+@flow(name="get_smap_data_flow")
 def get_smap_data(datetime_obj, regions):
     """
     Get SMAP soil moisture data for multiple regions.
@@ -169,13 +176,13 @@ def get_smap_data(datetime_obj, regions):
         dict: Region-wise SMAP data and metadata
     """
     try:
-        smap_url = construct_smap_url(datetime_obj)
+        smap_url = construct_smap_url.submit(datetime_obj).result()
         cache_dir = Path("smap_cache")
         cache_dir.mkdir(exist_ok=True)
         temp_filename = f"temp_smap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5"
         temp_filepath = cache_dir / temp_filename
         
-        if not download_smap_data(smap_url, str(temp_filepath)):
+        if not download_smap_data.submit(smap_url, str(temp_filepath)).result():
             return None
 
         results = {}
@@ -250,14 +257,8 @@ def get_smap_data(datetime_obj, regions):
         return results
 
     except Exception as e:
-        print(f"Error getting SMAP data: {str(e)}")
+        print(f"Error processing SMAP data: {str(e)}")
         return None
-    finally:
-        if 'temp_filepath' in locals() and temp_filepath.exists():
-            try:
-                temp_filepath.unlink()
-            except Exception as e:
-                print(f"Error cleaning up temp file: {str(e)}")
 
 
 def get_valid_smap_time(datetime_obj):

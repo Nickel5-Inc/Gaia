@@ -14,6 +14,9 @@ import shutil
 from sqlalchemy import text
 from fiber.logging_utils import get_logger
 import random
+from prefect import flow, task
+from prefect.tasks import task_input_hash
+from datetime import timedelta
 
 logger = get_logger(__name__)
 
@@ -44,6 +47,7 @@ class SoilValidatorPreprocessing(Preprocessing):
         self.regions_per_timestep = 5
         self._logged_timestamps = set()
 
+    @task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1))
     def _load_h3_map(self):
         """Load H3 map data, first checking locally then from HuggingFace."""
         local_path = "./data/h3_map/full_h3_map.json"
@@ -80,6 +84,7 @@ class SoilValidatorPreprocessing(Preprocessing):
 
         return self._daily_regions[today][hour] < self.regions_per_timestep
 
+    @task
     async def get_soil_data(self, bbox: Dict, current_time: datetime) -> Optional[Dict]:
         """Collect and prepare data for a given region."""
         try:
@@ -97,6 +102,7 @@ class SoilValidatorPreprocessing(Preprocessing):
             logger.warning(f"Failed to get soil data for region {bbox}")
             raise
 
+    @task
     async def store_region(self, region: Dict, target_time: datetime) -> int:
         """Store region data in database."""
         try:
@@ -152,6 +158,7 @@ class SoilValidatorPreprocessing(Preprocessing):
             logger.error(f"Error storing region: {str(e)}")
             raise RuntimeError(f"Failed to store region: {str(e)}")
 
+    @task
     async def _check_existing_regions(self, target_time: datetime) -> bool:
         """Check if regions already exist for the given target time."""
         try:
@@ -170,6 +177,7 @@ class SoilValidatorPreprocessing(Preprocessing):
             logger.error(f"Error checking existing regions: {str(e)}")
             return False
 
+    @flow(name="get_daily_regions_flow")
     async def get_daily_regions(
         self, target_time: datetime, ifs_forecast_time: datetime
     ) -> List[Dict]:
@@ -206,7 +214,7 @@ class SoilValidatorPreprocessing(Preprocessing):
                         used_bounds=used_bounds
                     )
                     if bbox:
-                        soil_data = await self.get_soil_data(bbox, ifs_forecast_time)
+                        soil_data = await self.get_soil_data.submit(bbox, ifs_forecast_time)
 
                         if soil_data is not None:
                             tiff_path, bounds, crs = soil_data
@@ -218,26 +226,12 @@ class SoilValidatorPreprocessing(Preprocessing):
                                 "sentinel_crs": crs,
                                 "array_shape": (222, 222),
                             }
-                            region_id = await self.store_region(region_data, target_time)
+                            region_id = await self.store_region.submit(region_data, target_time)
                             region_data["id"] = region_id
                             regions.append(region_data)
                             self._update_daily_count(target_time)
 
-                            data_dir = get_data_dir()
-                            for filename in os.listdir(data_dir):
-                                filepath = os.path.join(data_dir, filename)
-                                if os.path.isdir(filepath) and filename.startswith('tmp'):
-                                    try:
-                                        shutil.rmtree(filepath)
-                                        logger.info(f"Removed temp directory: {filepath}")
-                                    except Exception as e:
-                                        logger.error(f"Failed to remove temp directory {filepath}: {e}")
-                                elif filename.endswith('.tif'):
-                                    try:
-                                        os.remove(filepath)
-                                        logger.info(f"Removed tif file: {filepath}")
-                                    except Exception as e:
-                                        logger.error(f"Failed to remove tif file {filepath}: {e}")
+                            await self._cleanup_temp_files.submit()
 
                 except SentinelServerError:
                     consecutive_500_errors += 1
@@ -255,6 +249,26 @@ class SoilValidatorPreprocessing(Preprocessing):
             logger.error(f"Error in get_daily_regions: {str(e)}")
             return []
 
+    @task
+    async def _cleanup_temp_files(self):
+        """Clean up temporary files after processing."""
+        data_dir = get_data_dir()
+        for filename in os.listdir(data_dir):
+            filepath = os.path.join(data_dir, filename)
+            if os.path.isdir(filepath) and filename.startswith('tmp'):
+                try:
+                    shutil.rmtree(filepath)
+                    logger.info(f"Removed temp directory: {filepath}")
+                except Exception as e:
+                    logger.error(f"Failed to remove temp directory {filepath}: {e}")
+            elif filename.endswith('.tif'):
+                try:
+                    os.remove(filepath)
+                    logger.info(f"Removed tif file: {filepath}")
+                except Exception as e:
+                    logger.error(f"Failed to remove tif file {filepath}: {e}")
+
+    @task
     def _update_daily_count(self, target_time: datetime) -> None:
         """Update region count for specific timestep."""
         today = target_time.date()
@@ -267,6 +281,7 @@ class SoilValidatorPreprocessing(Preprocessing):
 
         self._daily_regions[today][hour] += 1
 
+    @task
     def _cleanup_logged_timestamps(self):
         """Clean up old timestamps from the logging cache."""
         current_time = datetime.now(timezone.utc)
