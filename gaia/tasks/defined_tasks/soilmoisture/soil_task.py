@@ -238,6 +238,8 @@ class SoilMoistureTask(Task):
                                         "target_time": target_smap_time,
                                         "data_collection_time": current_time,
                                         "ifs_forecast_time": ifs_forecast_time,
+                                        "sentinel_bounds": region["sentinel_bounds"],
+                                        "sentinel_crs": region["sentinel_crs"]
                                     }
                                     await self.add_task_to_queue(responses, metadata)
 
@@ -358,6 +360,8 @@ class SoilMoistureTask(Task):
                                     "target_time": target_smap_time,
                                     "data_collection_time": current_time,
                                     "ifs_forecast_time": ifs_forecast_time,
+                                    "sentinel_bounds": region["sentinel_bounds"],
+                                    "sentinel_crs": region["sentinel_crs"]
                                 }
                                 await self.add_task_to_queue(responses, metadata)
 
@@ -533,6 +537,25 @@ class SoilMoistureTask(Task):
                         "sentinel_crs": response_data.get("sentinel_crs", metadata.get("sentinel_crs")),
                         "target_time": metadata["target_time"]
                     }
+
+                    # Validate that returned bounds and CRS match the original request
+                    original_bounds = metadata.get("sentinel_bounds")
+                    original_crs = metadata.get("sentinel_crs")
+                    returned_bounds = response_data.get("sentinel_bounds")
+                    returned_crs = response_data.get("sentinel_crs")
+
+                    if returned_bounds != original_bounds:
+                        logger.warning(f"Miner {miner_hotkey} returned different bounds than requested. Rejecting prediction.")
+                        logger.warning(f"Original: {original_bounds}")
+                        logger.warning(f"Returned: {returned_bounds}")
+                        continue
+
+                    if returned_crs != original_crs:
+                        logger.warning(f"Miner {miner_hotkey} returned different CRS than requested. Rejecting prediction.")
+                        logger.warning(f"Original: {original_crs}")
+                        logger.warning(f"Returned: {returned_crs}")
+                        continue
+
                     if not SoilMoisturePrediction.validate_prediction(prediction_data):
                         logger.warning(f"Skipping invalid prediction from miner {miner_hotkey}")
                         continue
