@@ -25,7 +25,8 @@ from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMeta
 from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import SoilMoistureInputs
 from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoistureOutputs, SoilMoisturePrediction
 from fiber.logging_utils import get_logger
-from prefect.engine.task_runner import DaskTaskRunner
+from gaia.parallel.core.executor import get_task_runner
+from gaia.parallel.config.settings import NodeType, TaskType
 
 logger = get_logger(__name__)
 
@@ -117,12 +118,9 @@ class SoilValidatorTask(ValidatorTask):
         retry_delay_seconds=300,
         timeout_seconds=14400,
         description="Execute the validator task",
-        task_runner=DaskTaskRunner(
-            cluster_kwargs={
-                "n_workers": 4,
-                "threads_per_worker": 2,
-                "memory_limit": "4GB"
-            }
+        task_runner=get_task_runner(
+            node_type=NodeType.VALIDATOR,
+            task_type=TaskType.SOIL_MOISTURE
         )
     )
     async def validator_execute(self, validator):
@@ -313,6 +311,8 @@ class SoilValidatorTask(ValidatorTask):
                                         "target_time": target_smap_time,
                                         "data_collection_time": current_time,
                                         "ifs_forecast_time": ifs_forecast_time
+                                        "sentinel_bounds": region["sentinel_bounds"],
+                                        "sentinel_crs": region["sentinel_crs"]
                                     }
                                     await self.add_task_to_queue(responses, metadata)
                                     
@@ -455,6 +455,8 @@ class SoilValidatorTask(ValidatorTask):
                 "target_time": target_time,
                 "data_collection_time": current_time,
                 "ifs_forecast_time": self.get_ifs_time_for_smap(target_time)
+                "sentinel_bounds": region["sentinel_bounds"],
+                "sentinel_crs": region["sentinel_crs"]
             }
             await self.add_task_to_queue(responses, metadata)
             await self._update_region_status(region_id, "sent_to_miners")
@@ -629,6 +631,23 @@ class SoilValidatorTask(ValidatorTask):
                         "sentinel_crs": response_data.get("sentinel_crs", metadata.get("sentinel_crs")),
                         "target_time": metadata["target_time"]
                     }
+
+                    # Validate that returned bounds and CRS match the original request
+                    original_bounds = metadata.get("sentinel_bounds")
+                    original_crs = metadata.get("sentinel_crs")
+                    returned_bounds = response_data.get("sentinel_bounds")
+                    returned_crs = response_data.get("sentinel_crs")
+                    if returned_bounds != original_bounds:
+                        logger.warning(f"Miner {miner_hotkey} returned different bounds than requested. Rejecting prediction.")
+                        logger.warning(f"Original: {original_bounds}")
+                        logger.warning(f"Returned: {returned_bounds}")
+                        continue
+                    if returned_crs != original_crs:
+                        logger.warning(f"Miner {miner_hotkey} returned different CRS than requested. Rejecting prediction.")
+                        logger.warning(f"Original: {original_crs}")
+                        logger.warning(f"Returned: {returned_crs}")
+                        continue
+
                     if not SoilMoisturePrediction.validate_prediction(prediction_data):
                         logger.warning(f"Skipping invalid prediction from miner {miner_hotkey}")
                         continue
@@ -836,12 +855,9 @@ class SoilValidatorTask(ValidatorTask):
         retries=3,
         retry_delay_seconds=300,
         timeout_seconds=7200,
-        task_runner=DaskTaskRunner(
-            cluster_kwargs={
-                "n_workers": 4,
-                "threads_per_worker": 2,
-                "memory_limit": "4GB"
-            }
+        task_runner=get_task_runner(
+            node_type=NodeType.VALIDATOR,
+            task_type=TaskType.SOIL_MOISTURE
         )
     )
     async def validator_score(self, result=None):

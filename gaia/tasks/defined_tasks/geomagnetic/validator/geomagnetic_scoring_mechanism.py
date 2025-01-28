@@ -4,17 +4,14 @@ import math
 import asyncio
 from datetime import timezone, datetime
 from pydantic import Field
-from typing import Any
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql import text
+from typing import Any, List, Dict, Optional
+from prefect import task
 
 logger = get_logger(__name__)
 
 class GeomagneticScoringMechanism(ScoringMechanism):
     """
     Updated scoring mechanism for geomagnetic tasks.
-    Updated scoring mechanism for geomagnetic tasks.
-
     Scores are now inverted, so higher scores represent better predictions.
     Handles invalid scores (`NaN`) gracefully.
     Includes functionality to capture and save miner predictions and scores.
@@ -32,19 +29,28 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             db_manager=db_manager
         )
 
-    def calculate_score(self, predicted_value, actual_value):
+    @task(
+        name="calculate_score",
+        retries=2,
+        retry_delay_seconds=15,
+        description="Calculate score for a single prediction"
+    )
+    def calculate_score(self, predicted_value: float, actual_value: float) -> float:
         """
-        Calculates the score for a miner's prediction based on the deviation from ground truth.
         Calculates the score for a miner's prediction based on the deviation from ground truth.
 
         Args:
-            predicted_value (float): The predicted DST value from the miner.
-            actual_value (float): The ground truth DST value.
+            predicted_value (float): The predicted DST value from the miner
+            actual_value (float): The ground truth DST value
 
         Returns:
-            float: A higher score indicates a better prediction.
+            float: A higher score indicates a better prediction
+            
+        Raises:
+            ValueError: If inputs are not valid numbers
         """
         if not isinstance(predicted_value, (int, float)) or not isinstance(actual_value, (int, float)):
+            logger.error(f"Invalid input types: predicted={type(predicted_value)}, actual={type(actual_value)}")
             return float("nan")
 
         try:
@@ -57,39 +63,61 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             logger.error(f"Error calculating score: {e}")
             return float("nan")
 
-    def normalize_scores(self, scores):
+    @task(
+        name="normalize_scores",
+        retries=2,
+        retry_delay_seconds=15,
+        description="Normalize a batch of scores to [0,1] range"
+    )
+    def normalize_scores(self, scores: List[float]) -> List[float]:
         """
         Normalizes scores to the range [0, 1].
 
         Args:
-            scores (list[float]): List of raw scores.
+            scores (List[float]): List of raw scores
 
         Returns:
-            list[float]: Normalized scores.
+            List[float]: Normalized scores
+            
+        Raises:
+            ValueError: If scores list is empty or invalid
         """
-        valid_scores = [score for score in scores if not math.isnan(score)]
+        try:
+            valid_scores = [score for score in scores if not math.isnan(score)]
 
-        if not valid_scores:
-            logger.warning("All scores are NaN. Returning default normalized scores.")
-            return [0.0 for _ in scores]
+            if not valid_scores:
+                logger.warning("All scores are NaN. Returning default normalized scores.")
+                return [0.0 for _ in scores]
 
-        min_score = min(valid_scores)
-        max_score = max(valid_scores)
+            min_score = min(valid_scores)
+            max_score = max(valid_scores)
 
-        if max_score == min_score:
-            return [1.0 for _ in scores]
+            if max_score == min_score:
+                return [1.0 for _ in scores]
 
-        return [(score - min_score) / (max_score - min_score) if not math.isnan(score) else 0.0 for score in scores]
+            return [(score - min_score) / (max_score - min_score) if not math.isnan(score) else 0.0 for score in scores]
+        except Exception as e:
+            logger.error(f"Error normalizing scores: {e}")
+            raise
 
-    async def save_predictions(self, miner_predictions):
+    @task(
+        name="save_predictions",
+        retries=3,
+        retry_delay_seconds=30,
+        description="Save miner predictions to database"
+    )
+    async def save_predictions(self, miner_predictions: List[Dict[str, Any]]) -> None:
         """
         Save miner predictions to the geomagnetic_predictions table.
 
         Args:
-            miner_predictions (list[dict]): List of miner prediction dictionaries containing:
+            miner_predictions (List[Dict[str, Any]]): List of miner prediction dictionaries containing:
                 - miner_uid
                 - miner_hotkey
                 - predicted_value
+                
+        Raises:
+            Exception: If there's an error saving to database
         """
         try:
             query = """
@@ -107,22 +135,31 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             logger.info(f"Successfully saved {len(miner_predictions)} predictions.")
         except Exception as e:
             logger.error(f"Error saving predictions to the database: {e}")
+            raise
 
-    async def save_scores(self, miner_scores):
+    @task(
+        name="save_scores",
+        retries=3,
+        retry_delay_seconds=30,
+        description="Save calculated scores to database"
+    )
+    async def save_scores(self, miner_scores: List[Dict[str, Any]]) -> None:
         """
         Save miner scores to the geomagnetic_history table.
 
         Args:
-            miner_scores (list[dict]): List of miner score dictionaries containing:
+            miner_scores (List[Dict[str, Any]]): List of miner score dictionaries containing:
                 - miner_uid
                 - miner_hotkey
                 - query_time
                 - predicted_value
                 - ground_truth_value
                 - score
+                
+        Raises:
+            Exception: If there's an error saving to database
         """
         try:
-            # Save each score individually for better error handling and connection management
             for score in miner_scores:
                 await self.db_manager.execute(
                     """
@@ -147,28 +184,30 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             logger.error(f"Error saving scores to the database: {e}")
             raise
 
-    async def score(self, predictions, ground_truth):
+    @task(
+        name="score_batch",
+        retries=2,
+        retry_delay_seconds=30,
+        description="Score a batch of predictions against ground truth"
+    )
+    async def score(self, predictions: List[Dict[str, Any]], ground_truth: float) -> List[Dict[str, Any]]:
         """
-        Scores multiple predictions against the ground truth and saves both predictions and scores.
         Scores multiple predictions against the ground truth and saves both predictions and scores.
 
         Args:
-            predictions (list[dict]): List of prediction dictionaries containing:
+            predictions (List[Dict[str, Any]]): List of prediction dictionaries containing:
                 - id
                 - miner_uid
                 - miner_hotkey
                 - predicted_value
-            ground_truth (float): The ground truth DST value.
-            predictions (list[dict]): List of prediction dictionaries containing:
-                - id
-                - miner_uid
-                - miner_hotkey
-                - predicted_value
-            ground_truth (float): The ground truth DST value.
+            ground_truth (float): The ground truth DST value
 
         Returns:
-            list[dict]: List of score dictionaries with scores and additional metadata.
-            list[dict]: List of score dictionaries with scores and additional metadata.
+            List[Dict[str, Any]]: List of score dictionaries with scores and additional metadata
+            
+        Raises:
+            ValueError: If predictions or ground truth are invalid
+            Exception: If there's an error in scoring process
         """
         try:
             if not isinstance(predictions, list) or not isinstance(ground_truth, (int, float)):
@@ -187,10 +226,9 @@ class GeomagneticScoringMechanism(ScoringMechanism):
                 })
 
             await self.save_predictions(predictions)
-
             await self.save_scores(miner_scores)
 
             return miner_scores
         except Exception as e:
             logger.error(f"Error in scoring process: {e}")
-            return []
+            raise

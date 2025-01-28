@@ -4,11 +4,18 @@ from datetime import datetime
 from fiber.logging_utils import get_logger
 import pytz
 import asyncio
+from typing import Optional
+from prefect import task
 
 logger = get_logger(__name__)
 
-
-async def fetch_data(url=None, max_retries=3):
+@task(
+    name="fetch_geomag_data",
+    retries=3,
+    retry_delay_seconds=60,
+    description="Fetch raw geomagnetic data from Kyoto WDC"
+)
+async def fetch_data(url: Optional[str] = None, max_retries: int = 3) -> str:
     """
     Fetch raw geomagnetic data from the specified or dynamically generated URL.
 
@@ -19,6 +26,11 @@ async def fetch_data(url=None, max_retries=3):
 
     Returns:
         str: The raw data as a text string.
+        
+    Raises:
+        RuntimeError: If max retries are exceeded
+        httpx.HTTPError: If there's an HTTP error
+        Exception: For other errors
     """
     # Generate the default URL based on the current year and month if not provided
     if url is None:
@@ -52,5 +64,5 @@ async def fetch_data(url=None, max_retries=3):
 
         except Exception as e:
             logger.error(f"Error fetching data: {e}")
-            logger.error(f"{traceback.format_exc()}")
-            raise e
+            logger.error(traceback.format_exc())
+            raise

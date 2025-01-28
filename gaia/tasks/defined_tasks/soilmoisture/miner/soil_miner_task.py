@@ -23,6 +23,8 @@ from gaia.tasks.defined_tasks.soilmoisture.protocol import (
 )
 from gaia.tasks.defined_tasks.soilmoisture.preprocessing import SoilMinerPreprocessing
 from gaia.tasks.defined_tasks.soilmoisture.models import SoilModel
+from gaia.parallel.core.executor import get_task_runner
+from gaia.parallel.config.settings import NodeType, TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +118,14 @@ class SoilMinerTaskFlow(MinerTask):
             logger.error(f"Error generating predictions: {str(e)}")
             raise
 
-    @flow(name="miner_prepare", retries=2)
+    @flow(
+        name="miner_prepare",
+        retries=2,
+        task_runner=get_task_runner(
+            node_type=NodeType.MINER,
+            task_type=TaskType.SOIL_MOISTURE
+        )
+    )
     async def prepare_flow(self, **kwargs) -> Dict[str, Any]:
         """
         Preprocess input data.
@@ -146,7 +155,14 @@ class SoilMinerTaskFlow(MinerTask):
             await self._handle_error(e)
             raise
 
-    @flow(name="miner_execute", retries=2)
+    @flow(
+        name="miner_execute",
+        retries=2,
+        task_runner=get_task_runner(
+            node_type=NodeType.MINER,
+            task_type=TaskType.SOIL_MOISTURE
+        )
+    )
     async def execute_flow(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute computation logic.

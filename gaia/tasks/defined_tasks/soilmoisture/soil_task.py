@@ -39,6 +39,8 @@ import tempfile
 import math
 import glob
 from collections import defaultdict
+from prefect import flow, task
+from prefect.tasks import task_input_hash
 
 logger = get_logger(__name__)
 
@@ -135,6 +137,7 @@ class SoilMoistureTask(Task):
             hour=first_window[0], minute=first_window[1], second=0, microsecond=0
         )
 
+    @flow(name="soil_moisture_validator_flow")
     async def validator_execute(self, validator):
         """Execute validator workflow."""
         if not hasattr(self, "db_manager") or self.db_manager is None:
@@ -415,12 +418,11 @@ class SoilMoistureTask(Task):
             logger.error(f"Error getting today's regions: {str(e)}")
             return []
 
+    @flow(name="soil_moisture_miner_flow")
     async def miner_execute(self, data: Dict[str, Any], miner) -> Dict[str, Any]:
         """Execute miner workflow."""
         try:
-            processed_data = await self.miner_preprocessing.process_miner_data(
-                data["data"]
-            )
+            processed_data = await self.process_miner_data(data["data"])
             
             if hasattr(self.model, "run_inference"):
                 predictions = self.model.run_inference(processed_data) # Custom model inference
@@ -485,6 +487,7 @@ class SoilMoistureTask(Task):
             logger.error(traceback.format_exc())
             raise
 
+    @task(retries=2, retry_delay_seconds=30)
     async def add_task_to_queue(
         self, responses: Dict[str, Any], metadata: Dict[str, Any]
     ):
@@ -1102,4 +1105,10 @@ class SoilMoistureTask(Task):
             logger.error(f"Error during soil task cleanup: {e}")
             logger.error(traceback.format_exc())
             raise
+
+    @task(retries=2, retry_delay_seconds=30, 
+          cache_key_fn=task_input_hash,
+          cache_expiration=timedelta(hours=24))
+    async def process_miner_data(self, data):
+        return await self.miner_preprocessing.process_miner_data(data)
 

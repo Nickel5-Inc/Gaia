@@ -1,36 +1,23 @@
-import traceback
-from typing import Any, Dict, Optional, Union, List
-import uuid
-from gaia.miner.database.miner_database_manager import MinerDatabaseManager
-from gaia.tasks.base.task import Task
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_metadata import (
-    GeomagneticMetadata,
-)
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_inputs import GeomagneticInputs
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_preprocessing import (
-    GeomagneticPreprocessing,
-)
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_scoring_mechanism import (
-    GeomagneticScoringMechanism,
-)
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_outputs import GeomagneticOutputs
-from gaia.tasks.defined_tasks.geomagnetic.utils.process_geomag_data import (
-    get_latest_geomag_data,
-)
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.models.geomag_basemodel import GeoMagBaseModel
-import torch
-import datetime
-import numpy as np
-import pandas as pd
 import asyncio
+import datetime
+import traceback
+from typing import Any, Dict, List, Optional, Union
 from uuid import uuid4
-from fiber.logging_utils import get_logger
-import json
+from prefect import flow, task
+from prefect.tasks import task_input_hash
 from pydantic import Field
-import os
-import importlib.util
-from sqlalchemy.sql import text
+from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.tasks.base.task import Task
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_metadata import GeomagneticMetadata
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_inputs import GeomagneticInputs
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_preprocessing import GeomagneticPreprocessing
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_scoring_mechanism import GeomagneticScoringMechanism
+from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_outputs import GeomagneticOutputs
+from gaia.tasks.defined_tasks.geomagnetic.utils.process_geomag_data import get_latest_geomag_data
+from gaia.parallel.core.executor import get_task_runner
+from gaia.parallel.config.settings import NodeType, TaskType
+from gaia.models.geomag_basemodel import GeoMagBaseModel
+from fiber.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -128,25 +115,6 @@ class GeomagneticTask(Task):
         else:
             logger.info("Running as validator - skipping model loading")
 
-    def miner_preprocess(self, raw_data):
-        """
-        Preprocess raw geomagnetic data on the miner's side.
-
-        Args:
-            raw_data (dict): Raw data received by the miner.
-        Returns:
-            dict: Preprocessed data ready for prediction.
-        """
-        try:
-            processed_data = {
-                "timestamp": raw_data["timestamp"],
-                "value": raw_data["value"] / 100.0,  # Normalize values
-            }
-            return processed_data
-        except Exception as e:
-            logger.error(f"Error in miner_preprocess: {e}")
-            return None
-
     def validator_prepare_subtasks(self, data):
         """
         Prepare subtasks for validation.
@@ -183,160 +151,322 @@ class GeomagneticTask(Task):
             print(f"Error in validator_score: {e}")
             return float("inf")
 
-    ############################################################
-    # Validator execution method
-    ############################################################
+    @flow(name="validator_prepare", retries=2)
+    async def prepare_flow(self) -> Dict[str, Any]:
+        """Prepare the validator task by aligning to the next hour."""
+        try:
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            if not self.test_mode:
+                next_hour = current_time.replace(
+                    minute=0, second=0, microsecond=0
+                ) + datetime.timedelta(hours=1)
+                sleep_duration = (next_hour - current_time).total_seconds()
 
-    async def validator_execute(self, validator):
-        """
-        Executes the validator workflow:
-        - Aligns execution to start at the top of each UTC hour.
-        - At hour N:
-            - Query miners for new predictions
-            - Score predictions collected during hour N-1
-        - Runs in a continuous loop.
-        """
-        while True:
-            try:
-                await validator.update_task_status('geomagnetic', 'active')
-                
-                # Step 1: Align to the top of the next hour (or wait 5 min in test mode)
-                current_time = datetime.datetime.now(datetime.timezone.utc)
-                if not self.test_mode:
-                    next_hour = current_time.replace(
-                        minute=0, second=0, microsecond=0
-                    ) + datetime.timedelta(hours=1)
-                    sleep_duration = (next_hour - current_time).total_seconds()
-
-                    logger.info(
-                        f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
-                    )
-                    await validator.update_task_status('geomagnetic', 'idle')
-                    await asyncio.sleep(sleep_duration)
-                else:
-                    next_hour = current_time
-                    logger.info("Test mode: Running immediately, will sleep for 5 minutes after completion")
-
-                logger.info("Starting GeomagneticTask execution...")
-
-                # Step 2: Fetch Latest Geomagnetic Data
-                await validator.update_task_status('geomagnetic', 'processing', 'data_fetch')
-                timestamp, dst_value, historical_data = await self._fetch_geomag_data()
-
-                # Step 3: Query Miners for predictions
-                await validator.update_task_status('geomagnetic', 'processing', 'miner_query')
-                await self._query_miners(
-                    validator, timestamp, dst_value, historical_data, next_hour
+                logger.info(
+                    f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
                 )
-                logger.info(f"Collected predictions at hour {next_hour}")
+                await self.update_task_status('geomagnetic', 'idle')
+                await asyncio.sleep(sleep_duration)
+            else:
+                next_hour = current_time
+                logger.info("Test mode: Running immediately")
 
-                # Step 4: Score predictions from previous hour
-                previous_hour = next_hour - datetime.timedelta(hours=1)
-                await validator.update_task_status('geomagnetic', 'processing', 'scoring')
-                await self._process_scores(validator, previous_hour)
-                
-                await validator.update_task_status('geomagnetic', 'idle')
+            return {
+                "current_time": current_time,
+                "next_hour": next_hour
+            }
+        except Exception as e:
+            logger.error(f"Error in prepare_flow: {e}")
+            logger.error(traceback.format_exc())
+            raise
 
-                # In test mode, sleep for 5 minutes before next iteration
-                if self.test_mode:
-                    logger.info("Test mode: Sleeping for 5 minutes before next execution")
-                    await asyncio.sleep(300)
+    @flow(name="validator_execute", retries=2)
+    async def execute_flow(self, validator: Any) -> None:
+        """Execute the main validator workflow."""
+        try:
+            # Get task runner for parallel processing
+            task_runner = get_task_runner(NodeType.VALIDATOR, TaskType.GEOMAGNETIC)
+            logger.info(f"Initialized task runner with type: {task_runner.__class__.__name__}")
+            
+            # Prepare timing
+            timing = await self.prepare_flow()
+            current_time = timing["current_time"]
+            next_hour = timing["next_hour"]
 
-            except Exception as e:
-                logger.error(f"Unexpected error in validator_execute loop: {e}")
-                logger.error(traceback.format_exc())
-                await validator.update_task_status('geomagnetic', 'error')
-                await asyncio.sleep(3600)
+            await validator.update_task_status('geomagnetic', 'active')
+            logger.info("Starting GeomagneticTask execution...")
 
-    async def _fetch_geomag_data(self):
-        """Fetch latest geomagnetic data."""
-        logger.info("Fetching latest geomagnetic data...")
-        timestamp, dst_value, historical_data = await get_latest_geomag_data(
-            include_historical=True
-        )
-        logger.info(
-            f"Fetched latest geomagnetic data: timestamp={timestamp}, value={dst_value}"
-        )
-        if historical_data is not None:
-            logger.info(
-                f"Fetched historical data for the current month: {len(historical_data)} records"
+            # Step 2: Fetch Latest Geomagnetic Data
+            await validator.update_task_status('geomagnetic', 'processing', 'data_fetch')
+            geomag_data_future = task_runner.submit(
+                self._fetch_geomag_data,
+                pure=True,
+                retries=3
             )
-        else:
-            logger.warning("No historical data available for the current month.")
-        return timestamp, dst_value, historical_data
+            timestamp, dst_value, historical_data = await geomag_data_future
 
+            # Step 3: Query Miners for predictions
+            await validator.update_task_status('geomagnetic', 'processing', 'miner_query')
+            miner_query_future = task_runner.submit(
+                self._query_miners,
+                validator, timestamp, dst_value, historical_data, next_hour,
+                pure=True,
+                retries=3
+            )
+            responses_count = await miner_query_future
+            logger.info(f"Collected {responses_count} predictions at hour {next_hour}")
+
+            # Step 4: Score predictions from previous hour
+            previous_hour = next_hour - datetime.timedelta(hours=1)
+            await validator.update_task_status('geomagnetic', 'processing', 'scoring')
+            
+            # Process scores in parallel
+            score_future = task_runner.submit(
+                self._process_scores,
+                validator, previous_hour,
+                pure=True,
+                retries=2
+            )
+            total_processed, success_count = await score_future
+            logger.info(f"Processed {total_processed} predictions, {success_count} successful")
+            
+            await validator.update_task_status('geomagnetic', 'idle')
+
+            if self.test_mode:
+                logger.info("Test mode: Sleeping for 5 minutes before next execution")
+                await asyncio.sleep(300)
+
+        except Exception as e:
+            logger.error(f"Error in execute_flow: {str(e)}")
+            logger.error(traceback.format_exc())
+            await validator.update_task_status('geomagnetic', 'error')
+            raise
+
+    @flow(name="validator_score", retries=2)
+    async def score_flow(self, validator: Any, query_hour: datetime.datetime) -> None:
+        """Score predictions for a given hour using Dask for parallel processing."""
+        try:
+            # Get task runner for parallel processing
+            task_runner = get_task_runner(NodeType.VALIDATOR, TaskType.GEOMAGNETIC)
+            
+            # Fetch Ground Truth (with Dask)
+            ground_truth_future = task_runner.submit(
+                self.fetch_ground_truth,
+                pure=True,
+                retries=3
+            )
+            ground_truth_value = await ground_truth_future
+            
+            if ground_truth_value is None:
+                logger.warning("Ground truth data not available. Skipping scoring.")
+                return
+
+            # Get predictions collected during the specified hour
+            hour_start = query_hour
+            hour_end = query_hour + datetime.timedelta(hours=1)
+
+            logger.info(
+                f"Scoring predictions collected between {hour_start} and {hour_end}"
+            )
+            
+            # Fetch tasks (with Dask)
+            tasks_future = task_runner.submit(
+                self.get_tasks_for_hour,
+                hour_start, hour_end, validator,
+                pure=True,
+                retries=2
+            )
+            tasks = await tasks_future
+            
+            if not tasks:
+                logger.info(f"No predictions found for collection hour {query_hour}")
+                return
+
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            
+            # Score tasks in parallel (with Dask)
+            score_future = task_runner.submit(
+                self.score_tasks,
+                tasks, ground_truth_value, current_time,
+                pure=True,
+                retries=2
+            )
+            success_count = await score_future
+            
+            logger.info(f"Completed scoring {len(tasks)} predictions from hour {query_hour}")
+
+        except Exception as e:
+            logger.error(f"Error in score_flow: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+    @task(
+        name="fetch_geomag_data",
+        retries=3,
+        retry_delay_seconds=30,
+        cache_key_fn=task_input_hash,
+        cache_expiration=timedelta(minutes=5),
+        description="Fetch latest geomagnetic data including historical records"
+    )
+    async def _fetch_geomag_data(self):
+        """
+        Fetch latest geomagnetic data including historical records.
+        
+        Returns:
+            tuple: (timestamp, dst_value, historical_data)
+                - timestamp (datetime): Timestamp of the latest measurement
+                - dst_value (float): Latest DST value
+                - historical_data (list): Historical DST records for the current month
+        
+        Raises:
+            Exception: If there's an error fetching the data
+        """
+        try:
+            logger.info("Fetching latest geomagnetic data...")
+            timestamp, dst_value, historical_data = await get_latest_geomag_data(
+                include_historical=True
+            )
+            
+            if historical_data is None:
+                logger.warning("No historical data available for the current month.")
+                historical_data = []
+            else:
+                logger.info(f"Fetched {len(historical_data)} historical records")
+            
+            logger.info(f"Latest measurement - timestamp: {timestamp}, DST value: {dst_value}")
+            
+            return timestamp, dst_value, historical_data
+            
+        except Exception as e:
+            logger.error(f"Error fetching geomagnetic data: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+    @task(
+        name="query_miners",
+        retries=3,
+        retry_delay_seconds=60,
+        description="Query miners for geomagnetic predictions and process responses"
+    )
     async def _query_miners(
         self, validator, timestamp, dst_value, historical_data, current_hour_start
     ):
-        """Query miners with current data and process responses."""
-        if timestamp == "N/A" or dst_value == "N/A":
-            logger.warning("Invalid geomagnetic data. Skipping miner queries.")
-            return
+        """
+        Query miners with current data and process responses.
+        
+        Args:
+            validator: The validator instance
+            timestamp (datetime): Timestamp of the latest measurement
+            dst_value (float): Latest DST value
+            historical_data (pd.DataFrame): Historical DST records
+            current_hour_start (datetime): Start of the current hour
+            
+        Returns:
+            int: Number of processed miner responses
+            
+        Raises:
+            Exception: If there's an error querying miners or processing responses
+        """
+        try:
+            if timestamp == "N/A" or dst_value == "N/A":
+                logger.warning("Invalid geomagnetic data. Skipping miner queries.")
+                return 0
 
-        if timestamp == "N/A" or dst_value == "N/A":
-            logger.warning("Invalid geomagnetic data. Skipping miner queries.")
-            return
+            # Construct Payload for Miners
+            nonce = str(uuid4())
 
-        # Construct Payload for Miners
-        nonce = str(uuid4())
+            # Convert historical data to serializable format
+            historical_records = []
+            if historical_data is not None:
+                for _, row in historical_data.iterrows():
+                    historical_records.append(
+                        {"timestamp": row["timestamp"].isoformat(), "Dst": row["Dst"]}
+                    )
 
-        # Convert historical data to serializable format
-        historical_records = []
-        if historical_data is not None:
-            for _, row in historical_data.iterrows():
-                historical_records.append(
-                    {"timestamp": row["timestamp"].isoformat(), "Dst": row["Dst"]}
-                )
+            payload_template = {
+                "nonce": nonce,
+                "data": {
+                    "name": "Geomagnetic Data",
+                    "timestamp": timestamp.isoformat(),
+                    "value": dst_value,
+                    "historical_values": historical_records,
+                },
+            }
+            endpoint = "/geomagnetic-request"
 
-        payload_template = {
-            "nonce": nonce,
-            "data": {
-                "name": "Geomagnetic Data",
-                "timestamp": timestamp.isoformat(),
-                "value": dst_value,
-                "historical_values": historical_records,
-            },
-        }
-        endpoint = "/geomagnetic-request"
+            logger.info("Querying miners for geomagnetic predictions")
+            responses = await validator.query_miners(payload_template, endpoint)
+            logger.info(f"Collected responses from miners: {len(responses)}")
 
-        logger.info(f"Querying miners for geomagnetic predictions")
-        responses = await validator.query_miners(payload_template, endpoint)
-        logger.info(f"Collected responses from miners: {len(responses)}")
+            await self.process_miner_responses(responses, current_hour_start, validator)
+            logger.info(f"Added {len(responses)} predictions to the database")
+            
+            return len(responses)
 
-        await self.process_miner_responses(responses, current_hour_start, validator)
-        logger.info(f"Added {len(responses)} predictions to the database")
+        except Exception as e:
+            logger.error(f"Error querying miners: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
+    @task(
+        name="process_scores",
+        retries=2,
+        retry_delay_seconds=30,
+        description="Process and archive scores for predictions from a specific hour"
+    )
     async def _process_scores(self, validator, query_hour):
         """
         Process and archive scores for predictions collected during the specified hour.
         
         Args:
             validator: The validator instance
-            query_hour: The hour during which predictions were collected
+            query_hour (datetime): The hour during which predictions were collected
+            
+        Returns:
+            tuple: (processed_count, success_count)
+                - processed_count (int): Total number of predictions processed
+                - success_count (int): Number of successfully scored predictions
+                
+        Raises:
+            Exception: If there's an error processing scores
         """
-        # Fetch Ground Truth
-        ground_truth_value = await self.fetch_ground_truth()
-        if ground_truth_value is None:
-            logger.warning("Ground truth data not available. Skipping scoring.")
-            return
+        try:
+            # Fetch Ground Truth
+            ground_truth_value = await self.fetch_ground_truth()
+            if ground_truth_value is None:
+                logger.warning("Ground truth data not available. Skipping scoring.")
+                return (0, 0)
 
-        # Get predictions collected during the specified hour
-        hour_start = query_hour
-        hour_end = query_hour + datetime.timedelta(hours=1)
+            # Get predictions collected during the specified hour
+            hour_start = query_hour
+            hour_end = query_hour + datetime.timedelta(hours=1)
 
-        logger.info(
-            f"Scoring predictions collected between {hour_start} and {hour_end}"
-        )
-        
-        tasks = await self.get_tasks_for_hour(hour_start, hour_end, validator)
-        if not tasks:
-            logger.info(f"No predictions found for collection hour {query_hour}")
-            return
+            logger.info(
+                f"Scoring predictions collected between {hour_start} and {hour_end}"
+            )
+            
+            tasks = await self.get_tasks_for_hour(hour_start, hour_end, validator)
+            if not tasks:
+                logger.info(f"No predictions found for collection hour {query_hour}")
+                return (0, 0)
 
-        current_time = datetime.datetime.now(datetime.timezone.utc)
-        await self.score_tasks(tasks, ground_truth_value, current_time)
-        logger.info(f"Completed scoring {len(tasks)} predictions from hour {query_hour}")
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            success_count = await self.score_tasks(tasks, ground_truth_value, current_time)
+            logger.info(f"Completed scoring {len(tasks)} predictions from hour {query_hour}")
+            
+            return (len(tasks), success_count)
 
+        except Exception as e:
+            logger.error(f"Error processing scores: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+    @task(
+        name="get_tasks_for_hour",
+        retries=2,
+        retry_delay_seconds=15,
+        description="Fetch tasks submitted within a specific UTC time range from the database"
+    )
     async def get_tasks_for_hour(self, start_time, end_time, validator=None):
         """
         Fetches tasks submitted within a specific UTC time range from the database.
@@ -349,6 +479,9 @@ class GeomagneticTask(Task):
 
         Returns:
             list: List of task dictionaries containing task details.
+            
+        Raises:
+            Exception: If there's an error fetching tasks from the database
         """
         try:
             # Convert timestamps to UTC if they aren't already
@@ -395,39 +528,42 @@ class GeomagneticTask(Task):
             )
             
             tasks = []
-            for row in results:
-                task = {
-                    "id": row["id"],
-                    "miner_uid": row["miner_uid"],
-                    "miner_hotkey": row["miner_hotkey"],
-                    "predicted_values": row["predicted_value"],
-                    "query_time": row["query_time"],
-                }
-                tasks.append(task)
-
-            logger.info(f"Fetched {len(tasks)} tasks between {start_time} and {end_time}")
-
-            # task validation - ensure that miner_hotkey is in the metagraph if validator is provided
-            if validator:
-                tasks = [
-                    task
-                    for task in tasks
-                    if task["miner_hotkey"] in validator.metagraph.nodes
-                ]
-
+            if results:
+                for row in results:
+                    task = {
+                        "id": row["id"],
+                        "miner_uid": row["miner_uid"],
+                        "miner_hotkey": row["miner_hotkey"],
+                        "predicted_value": row["predicted_value"],
+                        "query_time": row["query_time"]
+                    }
+                    tasks.append(task)
+                logger.info(f"Found {len(tasks)} tasks for the specified time range")
+            else:
+                logger.info("No tasks found for the specified time range")
+            
             return tasks
 
         except Exception as e:
-            logger.error(f"Error fetching tasks for hour: {e}")
-            logger.error(f"{traceback.format_exc()}")
-            return []
+            logger.error(f"Error fetching tasks for hour: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
+    @task(
+        name="fetch_ground_truth",
+        retries=3,
+        retry_delay_seconds=30,
+        description="Fetch the ground truth DST value for the current UTC hour"
+    )
     async def fetch_ground_truth(self):
         """
         Fetches the ground truth DST value for the current UTC hour.
 
         Returns:
-            int: The real-time DST value, or None if fetching fails.
+            float: The real-time DST value
+            
+        Raises:
+            Exception: If there's an error fetching the ground truth data
         """
         try:
             # Get the current UTC time
@@ -447,21 +583,30 @@ class GeomagneticTask(Task):
             return dst_value
 
         except Exception as e:
-            logger.error(f"Error fetching ground truth: {e}")
-            logger.error(f"{traceback.format_exc()}")
-            return None
+            logger.error(f"Error fetching ground truth: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
+    @task(
+        name="move_task_to_history",
+        retries=2,
+        retry_delay_seconds=15,
+        description="Archive a completed task in the history table"
+    )
     async def move_task_to_history(
-        self, task: dict, ground_truth_value: float, score: float, score_time: datetime
+        self, task: dict, ground_truth_value: float, score: float, score_time: datetime.datetime
     ):
         """
         Archives a completed task in the history table.
 
         Args:
-            task (dict): Task details including predicted_values and query_time
+            task (dict): Task details including predicted_value and query_time
             ground_truth_value (float): The actual observed value
             score (float): The calculated score
             score_time (datetime): When the task was scored
+            
+        Raises:
+            Exception: If there's an error archiving the task
         """
         try:
             await self.db_manager.execute(
@@ -474,7 +619,7 @@ class GeomagneticTask(Task):
                     "miner_uid": task["miner_uid"],
                     "miner_hotkey": task["miner_hotkey"],
                     "query_time": task["query_time"],
-                    "predicted_value": task["predicted_values"],
+                    "predicted_value": task["predicted_value"],
                     "ground_truth_value": ground_truth_value,
                     "score": score,
                     "scored_at": score_time,
@@ -492,136 +637,67 @@ class GeomagneticTask(Task):
             logger.info(f"Removed task from predictions: {task['id']}")
 
         except Exception as e:
-            logger.error(f"Error moving task to history: {e}")
+            logger.error(f"Error moving task to history: {str(e)}")
             logger.error(traceback.format_exc())
             raise
 
-    ############################################################
-    # Miner execution method
-    ############################################################
-
-    def run_model_inference(self, processed_data):
+    @task(
+        name="score_tasks",
+        retries=2,
+        retry_delay_seconds=30,
+        description="Score a batch of prediction tasks against ground truth"
+    )
+    async def score_tasks(self, tasks: List[dict], ground_truth_value: float, current_time: datetime.datetime) -> int:
         """
-        Run the GeoMag model inference.
+        Score a batch of prediction tasks against ground truth and archive them.
 
         Args:
-            processed_data (pd.DataFrame): Preprocessed input data for the model.
-
+            tasks (List[dict]): List of tasks to score
+            ground_truth_value (float): The actual observed value
+            current_time (datetime): Current timestamp for scoring
+            
         Returns:
-            float: Predicted value.
+            int: Number of successfully scored tasks
+            
+        Raises:
+            Exception: If there's an error scoring the tasks
         """
         try:
-            # Perform prediction using the model
-            prediction = self.model.predict(processed_data)
+            if not tasks:
+                logger.info("No predictions to score for the last hour.")
+                return 0
 
-            # Handle NaN or infinite values
-            if np.isnan(prediction) or np.isinf(prediction):
-                logger.warning("Model returned NaN/Inf, using fallback value")
-                return float(
-                    processed_data["value"].iloc[-1]
-                )  # Use input value as fallback
+            success_count = 0
+            scored_tasks = []
+            
+            for task in tasks:
+                try:
+                    predicted_value = task["predicted_value"]
+                    score = self.scoring_mechanism.calculate_score(
+                        predicted_value, ground_truth_value
+                    )
+                    await self.move_task_to_history(
+                        task, ground_truth_value, score, current_time
+                    )
+                    task["score"] = score  # Add score to task dict
+                    scored_tasks.append(task)
+                    success_count += 1
+                    logger.info(
+                        f"Task scored and archived: task_id={task['id']}, score={score}"
+                    )
+                except Exception as e:
+                    logger.error(f"Error processing task {task['id']}: {str(e)}")
+                    logger.error(traceback.format_exc())
 
-            return float(prediction)  # Ensure we return a Python float
+            current_hour = datetime.datetime.now(datetime.timezone.utc).hour
+            await self.build_score_row(current_hour, scored_tasks)
+            
+            return success_count
 
         except Exception as e:
-            logger.error(f"Error during model inference: {e}")
-            return float(
-                processed_data["value"].iloc[-1]
-            )  # Return input value as fallback
-
-    def miner_execute(self, data, miner):
-        """
-        Executes the miner workflow:
-        - Preprocesses the received data along with historical data.
-        - Dynamically determines whether to use a custom or base model for inference.
-        - Returns formatted predictions.
-
-        Args:
-            data: Raw input data received from the request.
-            miner: Miner instance executing the task.
-
-        Returns:
-            dict: Prediction results formatted as per requirements.
-        """
-        try:
-            # Extract and validate data from the request payload
-            if data and data.get("data"):
-                # Process current data
-                input_data = pd.DataFrame(
-                    {
-                        "timestamp": [pd.to_datetime(data["data"]["timestamp"])],
-                        "value": [float(data["data"]["value"])],
-                    }
-                )
-
-                # Check and process historical data if available
-                if data["data"].get("historical_values"):
-                    historical_df = pd.DataFrame(data["data"]["historical_values"])
-                    historical_df = historical_df.rename(
-                        columns={"Dst": "value"}
-                    )  # Rename Dst to value
-                    historical_df["timestamp"] = pd.to_datetime(
-                        historical_df["timestamp"]
-                    )
-                    historical_df = historical_df[
-                        ["timestamp", "value"]
-                    ]  # Ensure correct columns
-                    combined_df = pd.concat(
-                        [historical_df, input_data], ignore_index=True
-                    )
-                else:
-                    combined_df = input_data
-
-                # Preprocess combined data
-                processed_data = self.miner_preprocessing.process_miner_data(combined_df)
-            else:
-                logger.error("No data provided in request")
-                return None
-
-            # Run model inference: Check for custom model first
-            if hasattr(self.model, "run_inference"):
-                logger.info("Using custom geomagnetic model for inference.")
-                predictions = self.model.run_inference(processed_data)
-            else:
-                logger.info("Using base geomagnetic model for inference.")
-                raw_prediction = self.run_model_inference(processed_data)
-                predictions = {
-                    "predicted_value": float(raw_prediction),
-                    "prediction_time": data["data"]["timestamp"]
-                }
-
-            # Format response as per MINER.md requirements
-            return {
-                "predicted_values": float(predictions.get("predicted_value", 0.0)),
-                "timestamp": predictions.get("prediction_time", data["data"]["timestamp"]),
-                "miner_hotkey": miner.keypair.ss58_address,
-            }
-
-        except Exception as e:
-            logger.error(f"Error in miner execution: {str(e)}")
+            logger.error(f"Error scoring tasks batch: {str(e)}")
             logger.error(traceback.format_exc())
-            # Return float('nan') instead of "N/A"
-            current_time = datetime.datetime.now(datetime.timezone.utc)
-            return {
-                "predicted_values": float('nan'),  # Changed from "N/A" to float('nan')
-                "timestamp": current_time.isoformat(),
-                "miner_hotkey": miner.keypair.ss58_address,
-            }
-
-    def query_miners(self):
-        """
-        Simulates querying miners and collecting predictions.
-
-        Returns:
-            dict: Simulated predictions and metadata.
-        """
-        try:
-            # Simulate prediction values
-            predictions = np.random.randint(-100, 100, size=256)  # Example predictions
-            return {"predictions": predictions}
-        except Exception as e:
-            print(f"Error querying miners: {str(e)}")
-            return None
+            raise
 
     async def add_task_to_queue(self, predictions, query_time):
         """
@@ -791,43 +867,26 @@ class GeomagneticTask(Task):
             logger.error(f"Error processing miner responses: {e}")
             logger.error(traceback.format_exc())
 
-    async def score_tasks(self, tasks, ground_truth_value, current_time):
-        if tasks:
-            scored_tasks = []
-            for task in tasks:
-                try:
-                    predicted_value = task["predicted_values"]
-                    score = self.scoring_mechanism.calculate_score(
-                        predicted_value, ground_truth_value
-                    )
-                    await self.move_task_to_history(
-                        task, ground_truth_value, score, current_time
-                    )
-                    task["score"] = score  # Add score to task dict
-                    scored_tasks.append(task)
-                    logger.info(
-                        f"Task scored and archived: task_id={task['id']}, score={score}"
-                    )
-                except Exception as e:
-                    logger.error(f"Error processing task {task['id']}: {e}")
-                    logger.error(traceback.format_exc())
-
-            current_hour = datetime.datetime.now(datetime.timezone.utc).hour
-            await self.build_score_row(current_hour, scored_tasks)
-        else:
-            logger.info("No predictions to score for the last hour.")
-
-    async def build_score_row(self, current_hour, recent_tasks=None):
+    @task(
+        name="build_score_row",
+        retries=2,
+        retry_delay_seconds=15,
+        description="Build a score row from recent tasks and historical data"
+    )
+    async def build_score_row(self, current_hour: Union[int, datetime.datetime], recent_tasks: Optional[List[dict]] = None) -> Dict[str, Any]:
         """
         Build a score row from recent tasks and historical data.
         The task_id should be the verification time (when we can score the predictions).
 
         Args:
-            current_hour (datetime): Current hour timestamp (when predictions were made)
-            recent_tasks (list, optional): List of recently scored tasks
+            current_hour (Union[int, datetime.datetime]): Current hour timestamp or hour integer
+            recent_tasks (List[dict], optional): List of recently scored tasks
 
         Returns:
-            dict: Dictionary containing task_name, task_id, and scores array
+            Dict[str, Any]: Dictionary containing task_name, task_id, and scores array
+            
+        Raises:
+            Exception: If there's an error building the score row
         """
         try:
             # Convert current_hour to datetime if it's an integer
@@ -841,6 +900,7 @@ class GeomagneticTask(Task):
 
             # Verification time is 1 hour after prediction time
             verification_time = prediction_time + datetime.timedelta(hours=1)
+            logger.info(f"Building score row for prediction_time: {prediction_time}, verification_time: {verification_time}")
 
             # Initialize scores array with NaN values
             scores = [float("nan")] * 256
@@ -852,6 +912,7 @@ class GeomagneticTask(Task):
             """
             miner_mappings = await self.db_manager.fetch_all(query)
             hotkey_to_uid = {row["hotkey"]: row["uid"] for row in miner_mappings}
+            logger.info(f"Found {len(hotkey_to_uid)} miner mappings")
 
             # Check historical table for any tasks in this time period
             historical_query = """
@@ -863,28 +924,33 @@ class GeomagneticTask(Task):
                 historical_query,
                 {"prediction_time": prediction_time},
             )
+            logger.info(f"Found {len(historical_tasks)} historical tasks")
 
             # Process historical tasks
+            historical_count = 0
             for task in historical_tasks:
                 miner_hotkey = task["miner_hotkey"]
                 if miner_hotkey in hotkey_to_uid:
                     uid = hotkey_to_uid[miner_hotkey]
                     scores[uid] = task["score"]
+                    historical_count += 1
 
             # Process recent tasks (overwrite historical scores if exists)
+            recent_count = 0
             if recent_tasks:
                 for task in recent_tasks:
                     miner_hotkey = task["miner_hotkey"]
                     if miner_hotkey in hotkey_to_uid:
                         uid = hotkey_to_uid[miner_hotkey]
                         scores[uid] = task.get("score", float("nan"))
+                        recent_count += 1
 
-            # Create score row using verification time as task_id
+            logger.info(f"Processed {historical_count} historical scores and {recent_count} recent scores")
+            
             score_row = {
                 "task_name": "geomagnetic",
-                "task_id": str(verification_time.timestamp()),
-                "score": scores,
-                "status": "completed",
+                "task_id": verification_time.timestamp(),
+                "scores": scores
             }
 
             # WRITE operation - use execute for inserting score
@@ -902,9 +968,9 @@ class GeomagneticTask(Task):
             return score_row
 
         except Exception as e:
-            logger.error(f"Error building score row: {e}")
+            logger.error(f"Error building score row: {str(e)}")
             logger.error(traceback.format_exc())
-            return None
+            raise
 
     async def recalculate_recent_scores(self, uids: List[int]) -> None:
         """
@@ -1073,5 +1139,4 @@ class GeomagneticTask(Task):
         except Exception as e:
             logger.error(f"Error during geomagnetic task cleanup: {e}")
             logger.error(traceback.format_exc())
-            raise
             raise
