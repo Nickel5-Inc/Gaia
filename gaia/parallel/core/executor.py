@@ -1,23 +1,18 @@
 """Parallel Processing Executor.
 
-This module provides the core functionality for parallel task execution.
-It handles cluster management, task distribution, and resource cleanup.
+This module provides the core functionality for parallel task execution
+using Python's built-in concurrent.futures for local execution.
 """
 
 import asyncio
-from typing import TypeVar, List, Callable, Any, Optional, Dict
+from typing import TypeVar, List, Callable, Any, Optional
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from functools import partial
 
-from dask.distributed import Client, LocalCluster
-from prefect import task, flow
-from prefect_dask import DaskTaskRunner
+from prefect import task
 
-from gaia.parallel.config.settings import (
-    NodeType, 
-    TaskType, 
-    ResourceConfig,
-    get_resource_config
-)
+from gaia.parallel.config.settings import TaskType, LocalResourceConfig, get_resource_config
 from fiber.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -25,58 +20,45 @@ logger = get_logger(__name__)
 T = TypeVar('T')  # Type variable for generic input
 R = TypeVar('R')  # Type variable for generic output
 
-class ParallelExecutor:
-    """Manages parallel task execution using Dask."""
+class LocalParallelExecutor:
+    """Manages parallel task execution using concurrent.futures."""
     
     def __init__(
         self,
-        node_type: NodeType,
         task_type: TaskType,
-        config: Optional[ResourceConfig] = None
+        config: Optional[LocalResourceConfig] = None
     ):
         """Initialize the parallel executor.
         
         Args:
-            node_type: Type of node (validator or miner)
             task_type: Type of task to be executed
             config: Optional custom resource configuration
         """
-        self.node_type = node_type
         self.task_type = task_type
-        self.config = config or get_resource_config(node_type, task_type)
-        self._client: Optional[Client] = None
-        self._cluster: Optional[LocalCluster] = None
+        self.config = config or get_resource_config(task_type)
+        self._executor = None
         
-    async def __aenter__(self) -> 'ParallelExecutor':
-        """Set up the Dask cluster and client."""
+    async def __aenter__(self) -> 'LocalParallelExecutor':
+        """Set up the appropriate executor."""
         try:
-            self._cluster = LocalCluster(**self.config.to_dict())
-            self._client = Client(self._cluster)
+            executor_class = ThreadPoolExecutor if self.config.thread_mode else ProcessPoolExecutor
+            self._executor = executor_class(max_workers=self.config.max_workers)
             logger.info(
-                f"Initialized Dask cluster with {self.config.n_workers} workers "
-                f"and {self.config.threads_per_worker} threads per worker"
+                f"Initialized {'thread' if self.config.thread_mode else 'process'} pool "
+                f"with {self.config.max_workers} workers"
             )
             return self
             
         except Exception as e:
-            logger.error(f"Failed to initialize Dask cluster: {str(e)}")
+            logger.error(f"Failed to initialize executor: {str(e)}")
             await self.__aexit__(type(e), e, e.__traceback__)
             raise
             
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Clean up Dask resources."""
-        if self._client:
-            await self._client.close()
-            self._client = None
-            
-        if self._cluster:
-            self._cluster.close()
-            self._cluster = None
-    
-    @property
-    def client(self) -> Optional[Client]:
-        """Get the current Dask client."""
-        return self._client
+        """Clean up executor resources."""
+        if self._executor:
+            self._executor.shutdown(wait=True)
+            self._executor = None
     
     async def map(
         self,
@@ -96,27 +78,27 @@ class ParallelExecutor:
         Returns:
             List of results
         """
-        if not self._client:
-            raise RuntimeError("Dask client not initialized")
+        if not self._executor:
+            raise RuntimeError("Executor not initialized")
             
+        loop = asyncio.get_event_loop()
+        func_with_kwargs = partial(func, **kwargs) if kwargs else func
+        
         if batch_size:
-            # Process in batches
             results = []
             for i in range(0, len(items), batch_size):
                 batch = items[i:i + batch_size]
-                batch_futures = [
-                    self._client.submit(func, item, **kwargs)
-                    for item in batch
-                ]
-                batch_results = await self._client.gather(batch_futures)
+                batch_results = await loop.run_in_executor(
+                    self._executor,
+                    lambda: list(map(func_with_kwargs, batch))
+                )
                 results.extend(batch_results)
             return results
         else:
-            futures = [
-                self._client.submit(func, item, **kwargs)
-                for item in items
-            ]
-            return await self._client.gather(futures)
+            return await loop.run_in_executor(
+                self._executor,
+                lambda: list(map(func_with_kwargs, items))
+            )
             
     async def submit(
         self,
@@ -134,47 +116,46 @@ class ParallelExecutor:
         Returns:
             Function result
         """
-        if not self._client:
-            raise RuntimeError("Dask client not initialized")
+        if not self._executor:
+            raise RuntimeError("Executor not initialized")
             
-        future = self._client.submit(func, *args, **kwargs)
-        return await self._client.gather(future)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: func(*args, **kwargs)
+        )
 
 @asynccontextmanager
 async def parallel_executor(
-    node_type: NodeType,
     task_type: TaskType,
-    config: Optional[ResourceConfig] = None
+    config: Optional[LocalResourceConfig] = None
 ):
     """Context manager for parallel execution.
     
     Args:
-        node_type: Type of node (validator or miner)
         task_type: Type of task to be executed
         config: Optional custom resource configuration
         
     Yields:
-        ParallelExecutor instance
+        LocalParallelExecutor instance
     """
-    async with ParallelExecutor(node_type, task_type, config) as executor:
+    async with LocalParallelExecutor(task_type, config) as executor:
         yield executor
 
-def get_task_runner(
-    node_type: NodeType,
-    task_type: TaskType,
-    config: Optional[ResourceConfig] = None
-) -> DaskTaskRunner:
-    """Get a Prefect task runner configured for Dask.
+def parallel_task(task_type: TaskType, **task_kwargs):
+    """Decorator to run a function as a parallel task.
     
     Args:
-        node_type: Type of node (validator or miner)
         task_type: Type of task to be executed
-        config: Optional custom resource configuration
+        **task_kwargs: Additional kwargs for the Prefect task decorator
         
     Returns:
-        Configured DaskTaskRunner
+        Decorated function that runs in parallel
     """
-    resource_config = config or get_resource_config(node_type, task_type)
-    return DaskTaskRunner(
-        cluster_kwargs=resource_config.to_dict()
-    ) 
+    def decorator(func):
+        @task(**task_kwargs)
+        async def wrapper(*args, **kwargs):
+            async with parallel_executor(task_type) as executor:
+                return await executor.submit(func, *args, **kwargs)
+        return wrapper
+    return decorator 
