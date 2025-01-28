@@ -48,8 +48,6 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             return float("nan")
 
         try:
-            # Normalize the actual value to the same scale as the prediction
-            actual_value = actual_value / 100.0
 
             # Validate that the prediction is within the normalized range (-5, 5)
             if not (-5 <= predicted_value <= 5):
@@ -179,18 +177,16 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             if not isinstance(predictions, list) or not isinstance(ground_truth, (int, float)):
                 raise ValueError("Invalid predictions or ground truth format.")
 
-            # Normalize the ground truth
-            normalized_ground_truth = ground_truth / 100.0
 
             miner_scores = []
             for prediction in predictions:
-                score_value = self.calculate_score(prediction["predicted_value"], normalized_ground_truth)
+                score_value = self.calculate_score(prediction["predicted_value"], ground_truth)
                 miner_scores.append({
                     "miner_uid": prediction["miner_uid"],
                     "miner_hotkey": prediction["miner_hotkey"],
                     "query_time": prediction.get("query_time", datetime.now(timezone.utc)),
                     "predicted_value": prediction["predicted_value"],
-                    "ground_truth_value": normalized_ground_truth,
+                    "ground_truth_value": ground_truth,
                     "score": score_value
                 })
 
