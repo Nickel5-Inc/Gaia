@@ -242,7 +242,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             
             # First create a connection to default postgres database to check/create our database
             default_url = self.db_url.rsplit('/', 1)[0] + '/postgres'
-            temp_engine = create_async_engine(default_url)
+            temp_engine = create_async_engine(
+                default_url,
+                isolation_level='AUTOCOMMIT'  # Required for CREATE DATABASE
+            )
             
             try:
                 # Check if our database exists
@@ -252,10 +255,12 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     
                     if not exists:
                         logger.info(f"Database {self.database} does not exist, creating...")
-                        # Need to be outside transaction for CREATE DATABASE
-                        await conn.execute(text("COMMIT"))
+                        # CREATE DATABASE cannot run inside a transaction block
                         await conn.execute(text(f"CREATE DATABASE {self.database}"))
                         logger.info(f"Created database {self.database}")
+            except Exception as e:
+                logger.error(f"Error checking/creating database: {e}")
+                raise
             finally:
                 await temp_engine.dispose()
             
