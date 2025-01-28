@@ -21,10 +21,10 @@ class LocalResourceConfig:
     thread_mode: bool  # True for threads, False for processes
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert config to dictionary for local parallel execution."""
         return {
-            "max_workers": self.max_workers,
-            "thread_mode": self.thread_mode
+            "n_workers": self.max_workers,
+            "threads_per_worker": 1,
+            "processes": not self.thread_mode
         }
 
 DEFAULT_CONFIGS = {
