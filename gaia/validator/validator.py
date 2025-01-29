@@ -359,10 +359,11 @@ class GaiaValidator:
                 miners_to_query = {k: miners_to_query[k] for k in hotkeys}
                 logger.info(f"Test mode: Selected {len(miners_to_query)} random miners to query")
 
-            for miner_hotkey, node in miners_to_query.items():
-                base_url = f"https://{node.ip}:{node.port}"
-
+            async def query_single_miner(miner_hotkey: str, node):
+                """Query a single miner and return its response."""
                 try:
+                    base_url = f"https://{node.ip}:{node.port}"
+                    
                     symmetric_key_str, symmetric_key_uuid = await asyncio.wait_for(
                         handshake.perform_handshake(
                             keypair=self.keypair,
@@ -398,29 +399,41 @@ class GaiaValidator:
                             "port": node.port,
                             "ip": node.ip,
                         }
-                        responses[miner_hotkey] = response_data
                         logger.info(f"Completed request to {miner_hotkey}")
-                    else:
-                        logger.warning(f"Failed handshake with miner {miner_hotkey}")
+                        return miner_hotkey, response_data
 
                 except asyncio.TimeoutError as e:
                     logger.warning(f"Timeout for miner {miner_hotkey}: {e}")
-                    continue
                 except httpx.HTTPStatusError as e:
                     logger.warning(f"HTTP error from miner {miner_hotkey}: {e}")
-                    continue
                 except httpx.RequestError as e:
                     logger.warning(f"Request error from miner {miner_hotkey}: {e}")
-                    continue
                 except Exception as e:
                     logger.error(f"Error with miner {miner_hotkey}: {e}")
                     logger.error(f"Error details: {traceback.format_exc()}")
-                    continue
+                
+                return None
+
+            # Create tasks for all miners and gather results concurrently
+            tasks = [
+                query_single_miner(miner_hotkey, node) 
+                for miner_hotkey, node in miners_to_query.items()
+            ]
+            results = await asyncio.gather(*tasks)
+
+            # Process results into responses dict
+            responses = {
+                hotkey: response 
+                for result in results 
+                if result is not None 
+                for hotkey, response in [result]
+            }
 
             return responses
 
         except Exception as e:
-            logger.error(f"Error in query_miners: {str(e)}")
+            logger.error(f"Error in query_miners: {e}")
+            logger.error(traceback.format_exc())
             return {}
 
     async def check_for_updates(self):
