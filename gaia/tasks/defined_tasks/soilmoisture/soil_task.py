@@ -161,11 +161,22 @@ class SoilMoistureTask(Task):
 
                     clear_query = """
                         DELETE FROM soil_moisture_regions r
-                        USING soil_moisture_predictions p
-                        WHERE r.id = p.region_id
-                        AND (
-                            p.status = 'scored'
-                            OR r.target_time < :cutoff_time
+                        WHERE r.target_time < :cutoff_time
+                        AND NOT EXISTS (
+                            -- Check for any unscored predictions
+                            SELECT 1 FROM soil_moisture_predictions p
+                            WHERE p.region_id = r.id
+                            AND p.status != 'scored'
+                        )
+                        AND NOT EXISTS (
+                            -- Check for any predictions not moved to history
+                            SELECT 1 FROM soil_moisture_predictions p
+                            WHERE p.region_id = r.id
+                            AND NOT EXISTS (
+                                SELECT 1 FROM soil_moisture_history h
+                                WHERE h.region_id = p.region_id
+                                AND h.miner_uid = p.miner_uid
+                            )
                         )
                     """
                     cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)

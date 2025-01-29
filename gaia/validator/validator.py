@@ -361,23 +361,36 @@ class GaiaValidator:
 
             async def query_single_miner(miner_hotkey: str, node):
                 """Query a single miner and return its response."""
-                try:
-                    base_url = f"https://{node.ip}:{node.port}"
-                    
-                    symmetric_key_str, symmetric_key_uuid = await asyncio.wait_for(
-                        handshake.perform_handshake(
-                            keypair=self.keypair,
-                            httpx_client=self.httpx_client,
-                            server_address=base_url,
-                            miner_hotkey_ss58_address=miner_hotkey,
-                        ),
-                        timeout=30.0
-                    )
+                max_retries = 2
+                retry_delay = 1.0  # seconds
+                base_url = f"https://{node.ip}:{node.port}"
+                start_time = time.time()
+                last_error = None
+                
+                for attempt in range(max_retries + 1):
+                    try:
+                        logger.info(f"Attempt {attempt + 1}/{max_retries + 1} for miner {miner_hotkey} at {base_url}")
+                        logger.debug(f"Starting handshake and request sequence with miner {miner_hotkey}")
+                        
+                        # Combined handshake and request in single atomic operation
+                        symmetric_key_str, symmetric_key_uuid = await asyncio.wait_for(
+                            handshake.perform_handshake(
+                                keypair=self.keypair,
+                                httpx_client=self.httpx_client,
+                                server_address=base_url,
+                                miner_hotkey_ss58_address=miner_hotkey,
+                            ),
+                            timeout=15.0
+                        )
 
-                    if symmetric_key_str and symmetric_key_uuid:
-                        logger.info(f"Handshake successful with miner {miner_hotkey}")
+                        if not symmetric_key_str or not symmetric_key_uuid:
+                            logger.error(f"Invalid handshake response from miner {miner_hotkey} at {base_url}")
+                            last_error = "InvalidHandshake"
+                            continue
+
+                        logger.debug(f"Handshake successful, proceeding with request to miner {miner_hotkey}")
                         fernet = Fernet(symmetric_key_str)
-
+                        
                         resp = await asyncio.wait_for(
                             vali_client.make_non_streamed_post(
                                 httpx_client=self.httpx_client,
@@ -392,27 +405,72 @@ class GaiaValidator:
                             ),
                             timeout=180.0
                         )
-
+                        
+                        response_time = time.time() - start_time
                         response_data = {
                             "text": resp.text,
                             "hotkey": miner_hotkey,
                             "port": node.port,
                             "ip": node.ip,
+                            "response_time": response_time
                         }
-                        logger.info(f"Completed request to {miner_hotkey}")
-                        return miner_hotkey, response_data
+                        logger.info(f"Successfully completed full sequence with miner {miner_hotkey} at {base_url} (attempt {attempt + 1}) in {response_time:.2f}s")
+                        return miner_hotkey, response_data, None  # None for error_type
 
-                except asyncio.TimeoutError as e:
-                    logger.warning(f"Timeout for miner {miner_hotkey}: {e}")
-                except httpx.HTTPStatusError as e:
-                    logger.warning(f"HTTP error from miner {miner_hotkey}: {e}")
-                except httpx.RequestError as e:
-                    logger.warning(f"Request error from miner {miner_hotkey}: {e}")
-                except Exception as e:
-                    logger.error(f"Error with miner {miner_hotkey}: {e}")
-                    logger.error(f"Error details: {traceback.format_exc()}")
-                
-                return None
+                    except asyncio.TimeoutError as e:
+                        error_type = "HandshakeTimeout" if "handshake" in str(e).lower() else "RequestTimeout"
+                        last_error = error_type
+                        if attempt < max_retries:
+                            logger.warning(f"Timeout for miner {miner_hotkey} at {base_url} (attempt {attempt + 1}/{max_retries + 1})")
+                            logger.debug(f"Timeout details: {str(e)}")
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        logger.error(f"Final timeout for miner {miner_hotkey} at {base_url} after {max_retries + 1} attempts")
+                        logger.error(f"Final timeout details: {str(e)}")
+                    except httpx.HTTPStatusError as e:
+                        status_code = e.response.status_code
+                        error_type = f"HTTP{status_code}"
+                        last_error = error_type
+                        if attempt < max_retries and status_code >= 500:
+                            logger.warning(f"HTTP {status_code} error from miner {miner_hotkey} at {base_url} (attempt {attempt + 1}/{max_retries + 1})")
+                            logger.debug(f"Response headers: {dict(e.response.headers)}")
+                            logger.debug(f"Response body: {e.response.text[:500]}...")
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        logger.error(f"HTTP {status_code} error from miner {miner_hotkey} at {base_url}")
+                        logger.error(f"Response headers: {dict(e.response.headers)}")
+                        logger.error(f"Response body: {e.response.text[:500]}...")
+                    except httpx.RequestError as e:
+                        error_msg = str(e)
+                        if not error_msg:
+                            error_msg = f"Empty error message of type {type(e).__name__}"
+                        
+                        error_type = "SSLError" if "SSL" in error_msg else "ConnectionError"
+                        last_error = error_type
+                        
+                        if attempt < max_retries:
+                            logger.warning(f"Request error for miner {miner_hotkey} at {base_url} (attempt {attempt + 1}/{max_retries + 1})")
+                            logger.debug(f"Error type: {type(e).__name__}")
+                            logger.debug(f"Error details: {error_msg}")
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        logger.error(f"Final request error for miner {miner_hotkey} at {base_url}")
+                        logger.error(f"Error type: {type(e).__name__}")
+                        logger.error(f"Error details: {error_msg}")
+                    except Exception as e:
+                        error_msg = str(e)
+                        if not error_msg:
+                            error_msg = f"Empty error message of type {type(e).__name__}"
+                        
+                        error_type = "UnexpectedError"
+                        last_error = error_type
+                            
+                        logger.error(f"Unexpected error with miner {miner_hotkey} at {base_url}")
+                        logger.error(f"Error type: {type(e).__name__}")
+                        logger.error(f"Error details: {error_msg}")
+                        logger.error(f"Full traceback: {traceback.format_exc()}")
+                    
+                return miner_hotkey, None, last_error
 
             # Create tasks for all miners and gather results concurrently
             tasks = [
@@ -421,18 +479,54 @@ class GaiaValidator:
             ]
             results = await asyncio.gather(*tasks)
 
+            # Process results and collect statistics
+            total_miners = len(miners_to_query)
+            successful_queries = 0
+            failed_queries = 0
+            error_types = defaultdict(int)
+            total_response_time = 0.0
+
             # Process results into responses dict
-            responses = {
-                hotkey: response 
-                for result in results 
-                if result is not None 
-                for hotkey, response in [result]
-            }
+            responses = {}
+            for result in results:
+                if result is None:
+                    failed_queries += 1
+                    error_types["UnknownError"] += 1
+                    continue
+                    
+                hotkey, response_data, error_type = result
+                if response_data is not None:
+                    responses[hotkey] = response_data
+                    successful_queries += 1
+                    total_response_time += response_data["response_time"]
+                else:
+                    failed_queries += 1
+                    if error_type:
+                        error_types[error_type] += 1
+                    else:
+                        error_types["UnknownError"] += 1
+
+            # Calculate average response time
+            avg_response_time = total_response_time / successful_queries if successful_queries > 0 else 0
+
+            # Log comprehensive statistics
+            logger.info("Query statistics:")
+            logger.info(f"Total miners queried: {total_miners}")
+            logger.info(f"Successful queries: {successful_queries} ({(successful_queries/total_miners)*100:.1f}%)")
+            logger.info(f"Failed queries: {failed_queries} ({(failed_queries/total_miners)*100:.1f}%)")
+            logger.info(f"Average response time: {avg_response_time:.2f}s")
+            
+            if error_types:
+                logger.info("Error breakdown:")
+                for error_type, count in error_types.items():
+                    percentage = (count/failed_queries)*100 if failed_queries > 0 else 0
+                    logger.info(f"  {error_type}: {count} ({percentage:.1f}% of failures)")
 
             return responses
 
         except Exception as e:
-            logger.error(f"Error in query_miners: {e}")
+            logger.error(f"Error in query_miners: {str(e)}")
+            logger.error(f"Error type: {type(e).__name__}")
             logger.error(traceback.format_exc())
             return {}
 
