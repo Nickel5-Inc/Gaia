@@ -328,25 +328,63 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 logger.error(f"Invalid schema format for table {table_name}")
                 return
 
-            columns = []
-            for col_name, col_type in table_schema['columns'].items():
-                columns.append(f"{col_name} {col_type}")
-
-            # Add foreign key constraints if specified
-            if 'foreign_keys' in table_schema:
-                for fk in table_schema['foreign_keys']:
-                    fk_def = f"FOREIGN KEY ({fk['column']}) REFERENCES {fk['references']}"
-                    if 'on_delete' in fk:
-                        fk_def += f" ON DELETE {fk['on_delete']}"
-                    columns.append(fk_def)
-
-            create_table_sql = f"""
-                CREATE TABLE IF NOT EXISTS {table_schema['table_name']} (
-                    {', '.join(columns)}
-                );
+            # Check if table exists
+            exists_query = """
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = 'public' 
+                    AND table_name = :table_name
+                )
             """
-            await self.execute(create_table_sql, session=session)
+            result = await self.fetch_one(exists_query, {"table_name": table_name})
+            table_exists = result["exists"] if result else False
 
+            # Create table if not exists
+            if not table_exists:
+                columns = []
+                for col_name, col_type in table_schema['columns'].items():
+                    columns.append(f"{col_name} {col_type}")
+
+                if 'foreign_keys' in table_schema:
+                    for fk in table_schema['foreign_keys']:
+                        fk_def = f"FOREIGN KEY ({fk['column']}) REFERENCES {fk['references']}"
+                        if 'on_delete' in fk:
+                            fk_def += f" ON DELETE {fk['on_delete']}"
+                        columns.append(fk_def)
+
+                create_table_sql = f"""
+                    CREATE TABLE {table_schema['table_name']} (
+                        {', '.join(columns)}
+                    );
+                """
+                await self.execute(create_table_sql)
+                logger.info(f"Created table {table_name}")
+
+            # Check and add missing columns for existing tables
+            for col_name, col_type in table_schema['columns'].items():
+                check_column_sql = """
+                    SELECT EXISTS (
+                        SELECT 1 
+                        FROM information_schema.columns 
+                        WHERE table_name = :table_name 
+                        AND column_name = :column_name
+                    )
+                """
+                result = await self.fetch_one(
+                    check_column_sql,
+                    {"table_name": table_name, "column_name": col_name}
+                )
+                column_exists = result["exists"] if result else False
+
+                if not column_exists:
+                    add_column_sql = f"""
+                        ALTER TABLE {table_name} 
+                        ADD COLUMN {col_name} {col_type};
+                    """
+                    await self.execute(add_column_sql)
+                    logger.info(f"Added column {col_name} to {table_name}")
+
+            # Create indexes
             if 'indexes' in table_schema:
                 for index in table_schema['indexes']:
                     index_name = f"{table_schema['table_name']}_{index['column']}_idx"
@@ -356,13 +394,13 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                         ON {table_schema['table_name']} ({index['column']})
                         {unique};
                     """
-                    await self.execute(create_index_sql, session=session)
+                    await self.execute(create_index_sql)
 
-            logger.info(f"Successfully created table {table_schema['table_name']} with indexes")
+            logger.info(f"Table {table_name} schema verified/updated")
 
         except Exception as e:
-            logger.error(f"Error creating table {table_name}: {str(e)}")
-            raise DatabaseError(f"Failed to create table {table_name}: {str(e)}")
+            logger.error(f"Error creating/updating table {table_name}: {str(e)}")
+            raise DatabaseError(f"Failed to create/update table {table_name}: {str(e)}")
 
     @track_operation('ddl')
     async def initialize_task_tables(self, task_schemas: Dict[str, Dict[str, Any]], session: AsyncSession):
@@ -851,7 +889,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     WHERE task_name = :task_name
                       AND task_id::float >= :start_timestamp
                       AND task_id::float <= :end_timestamp
-                """
+                 """
                 params = {
                     "task_name": task_name,
                     "start_timestamp": history_window.timestamp(),

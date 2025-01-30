@@ -74,7 +74,8 @@
             "rootzone_rmse": "FLOAT",
             "surface_structure_score": "FLOAT",
             "rootzone_structure_score": "FLOAT",
-            "scored_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+            "scored_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
+            "sent_to_site": "BOOLEAN NOT NULL DEFAULT FALSE"
         },
         "indexes": [
             {"column": "region_id", "unique": false},

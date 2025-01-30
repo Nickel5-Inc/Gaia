@@ -19,6 +19,7 @@ from rasterio.transform import from_bounds
 from rasterio.warp import transform_bounds, reproject, Resampling
 from skimage.transform import resize
 import requests
+from fiber.logging_utils import get_logger
 import boto3
 from botocore.config import Config
 from botocore.client import UNSIGNED
@@ -28,6 +29,7 @@ EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
 EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 
 EARTHDATA_AUTH = BasicAuth(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
+logger = get_logger(__name__)
 
 class SessionWithHeaderRedirection(requests.Session):
     AUTH_HOST = 'urs.earthdata.nasa.gov'
