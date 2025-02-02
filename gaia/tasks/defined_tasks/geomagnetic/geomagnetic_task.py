@@ -582,11 +582,15 @@ class GeomagneticTask(Task):
             if hasattr(self.model, "run_inference"):
                 logger.info("Using custom geomagnetic model for inference.")
                 predictions = self.model.run_inference(processed_data)
+                predictions = {
+                    "predicted_value": predictions.get('predicted_value', 0.0),
+                    "prediction_time": data["data"]["timestamp"]
+                }
             else:
                 logger.info("Using base geomagnetic model for inference.")
                 raw_prediction = self.run_model_inference(processed_data)
                 predictions = {
-                    "predicted_value": float(raw_prediction),
+                    "predicted_value": float(round(raw_prediction, 2)),
                     "prediction_time": data["data"]["timestamp"]
                 }
 

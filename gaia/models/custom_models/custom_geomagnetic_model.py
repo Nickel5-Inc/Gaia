@@ -135,7 +135,7 @@ class CustomGeomagneticModel:
         if self.model is None:
             raise ValueError("Model has not been trained. Call train() before forecast().")
         
-        future_dates = self.model.make_future_dataframemake_future_dataframe(periods=periods, freq=freq)
+        future_dates = self.model.make_future_dataframe(periods=periods, freq=freq)
         forecast = self.model.predict(future_dates)
         return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
 
@@ -157,40 +157,61 @@ class CustomGeomagneticModel:
         return cross_validation(self.model, initial=initial, period=period, horizon=horizon)
 
     def run_inference(self, data: pd.DataFrame) -> Dict[str, Any]:
-        if isinstance(data, pd.DataFrame):
-            df = data.copy()
-            if "ds" not in df.columns:
-                df = df.rename(columns={"timestamp": "ds", "value": "y"})
-        else:
-            # Convert to DataFrame if it's not already
-            if isinstance(data, (torch.Tensor, np.ndarray)):
-                data = {
-                    "timestamp": datetime.now(pytz.UTC),
-                    "value": float(data.item() if hasattr(data, "item") else data),
-                }
+        try:
+            logger.info(data)
+            if isinstance(data, pd.DataFrame):
+                df = data.copy()
+                if "ds" not in df.columns:
+                    df = df.rename(columns={"timestamp": "ds", "value": "y"})
+            else:
+                # Convert to DataFrame if it's not already
+                if isinstance(data, (torch.Tensor, np.ndarray)):
+                    data = {
+                        "timestamp": datetime.now(pytz.UTC),
+                        "value": float(data.item() if hasattr(data, "item") else data),
+                    }
 
-            # Create DataFrame from dict
-            df = pd.DataFrame(
-                {
-                    "ds": [pd.to_datetime(data.get("timestamp", data.get("ds")))],
-                    "y": [float(data.get("value", data.get("y", 0.0)))],
-                }
-            )
+                # Create DataFrame from dict
+                df = pd.DataFrame(
+                    {
+                        "ds": [pd.to_datetime(data.get("timestamp", data.get("ds")))],
+                        "y": [float(data.get("value", data.get("y", 0.0)))],
+                    }
+                )
 
-        # Ensure timestamps are timezone-naive
-        if df["ds"].dt.tz is not None:
-            df["ds"] = df["ds"].dt.tz_convert("UTC").dt.tz_localize(None)
+            # Ensure timestamps are timezone-naive
+            if df["ds"].dt.tz is not None:
+                df["ds"] = df["ds"].dt.tz_convert("UTC").dt.tz_localize(None)
 
-        self.model.train(df)
-        periods = 1  # Forecasting the next hour
-        freq = "h"  # Hourly frequency
-        # Call forecast with correct parameters
-        forecast = self.model.forecast(periods=periods, freq=freq)
-        # Assuming the forecast method returns a DataFrame similar to Prophet's
-        result = forecast["yhat"].iloc[-1]
-        predictions = {
-            "predicted_value": float(result),
-            "prediction_time": data["data"]["timestamp"]
-        }
+            # Train model
+            self.train(df)
 
-        return predictions
+            # Forecasting parameters
+            periods = 1  # Forecasting the next hour
+            freq = "h"  # Hourly frequency
+
+            # Call forecast with correct parameters
+            forecast = self.forecast(periods=periods, freq=freq)
+            
+            # Check forecast output
+            if "yhat" not in forecast.columns:
+                raise ValueError("Forecast output is missing 'yhat' column.")
+
+            result = forecast["yhat"].iloc[-1]
+            predictions = {
+                "predicted_value": float(result)
+            }
+
+            return predictions
+        
+        except Exception as e:
+            error_message = f"Error in run_inference: {str(e)}"
+            traceback_str = traceback.format_exc()
+            print(error_message)
+            print(traceback_str)
+            logger.error(error_message)
+            logger.error(traceback_str)
+            return {
+                "error": error_message,
+                "traceback": traceback_str
+            }
