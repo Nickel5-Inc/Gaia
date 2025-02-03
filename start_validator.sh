@@ -15,12 +15,13 @@ pkill -9 -f "validator.py" 2>/dev/null || true
 rm -f /tmp/prefect* 2>/dev/null || true
 rm -f /tmp/dask* 2>/dev/null || true
 fuser -k 4200/tcp 2>/dev/null || true
+lsof -t -i:4200 | xargs -r kill -9 2>/dev/null || true
 sleep 2
 
 echo "Setting up Nginx reverse proxy..."
 if [ ! -f /etc/nginx/.htpasswd ]; then
     echo "Checking and installing required packages..."
-    apt update && apt install -y nginx apache2-utils
+    apt install -y nginx apache2-utils
     echo "Creating new authentication credentials..."
     ADMIN_PASS=$(hostname)
     echo "admin:$(openssl passwd -apr1 $ADMIN_PASS)" > /etc/nginx/.htpasswd
@@ -37,7 +38,6 @@ cat > /etc/nginx/sites-available/prefect << EOL
 server {
     listen 80;
     server_name _;
-
     location /api/events/in {
         proxy_pass http://127.0.0.1:4200;
         proxy_http_version 1.1;
@@ -47,8 +47,6 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_read_timeout 86400;  # 24h timeout for long-running connections
     }
-
-    # Regular location for all other paths
     location / {
         proxy_pass http://127.0.0.1:4200;
         proxy_set_header Host \$host;
@@ -59,7 +57,6 @@ server {
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
     }
-
     auth_basic "Restricted Access";
     auth_basic_user_file /etc/nginx/.htpasswd;
 }
@@ -67,7 +64,6 @@ EOL
 
 ln -sf /etc/nginx/sites-available/prefect /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
-
 nginx -t && systemctl restart nginx
 
 PUBLIC_IP=$(curl -s ifconfig.me)
@@ -82,12 +78,23 @@ if [[ "$VIRTUAL_ENV" != "/root/venv" ]]; then
 fi
 
 echo "Initializing validator configuration..."
-export SUBTENSOR_CHAIN_ENDPOINT="ws://test.finney.opentensor.ai:9944"
-export NETUID=237
-export WALLET_NAME="you_wallet_name"
-export HOTKEY_NAME="your_hotkey_name"
+
+if [ -f .env ]; then
+    set -a
+    source .env
+    set +a
+fi
+
+export SUBTENSOR_CHAIN_ENDPOINT="$SUBTENSOR_ADDRESS"
 export PREFECT_API_URL="http://127.0.0.1:4200/api"
 export PREFECT_API_DATABASE_CONNECTION_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/prefect_db"
+
+echo "Using configuration:"
+echo "SUBTENSOR_CHAIN_ENDPOINT: $SUBTENSOR_CHAIN_ENDPOINT"
+echo "NETUID: $NETUID"
+echo "WALLET_NAME: $WALLET_NAME"
+echo "HOTKEY_NAME: $HOTKEY_NAME"
+echo "SUBTENSOR_NETWORK: $SUBTENSOR_NETWORK"
 
 PGPASSWORD=postgres psql -U postgres -h localhost -c "CREATE DATABASE prefect_db;" 2>/dev/null || true
 
@@ -106,14 +113,17 @@ done
 echo " Ready!"
 
 prefect config set PREFECT_API_URL="http://127.0.0.1:4200/api"
-
-# Create or update work pool
 prefect work-pool create default-agent-pool --type process --overwrite || true
 prefect worker start -p default-agent-pool &
 WORKER_PID=$!
 
 echo "Starting validator..."
-python gaia/validator/validator.py --wallet $WALLET_NAME --hotkey $HOTKEY_NAME --netuid $NETUID --test &
+python gaia/validator/validator.py \
+    --wallet $WALLET_NAME \
+    --hotkey $HOTKEY_NAME \
+    --netuid $NETUID \
+    --subtensor.chain_endpoint $SUBTENSOR_CHAIN_ENDPOINT \
+    #--test &
 VALIDATOR_PID=$!
 sleep 5
 
