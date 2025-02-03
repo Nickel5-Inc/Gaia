@@ -84,8 +84,8 @@ fi
 echo "Initializing validator configuration..."
 export SUBTENSOR_CHAIN_ENDPOINT="ws://test.finney.opentensor.ai:9944"
 export NETUID=237
-export WALLET_NAME="test_val"
-export HOTKEY_NAME="test_val_hot"
+export WALLET_NAME="you_wallet_name"
+export HOTKEY_NAME="your_hotkey_name"
 export PREFECT_API_URL="http://127.0.0.1:4200/api"
 export PREFECT_API_DATABASE_CONNECTION_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/prefect_db"
 
