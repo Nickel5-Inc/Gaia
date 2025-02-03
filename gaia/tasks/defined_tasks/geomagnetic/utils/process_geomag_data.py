@@ -78,7 +78,7 @@ def clean_data(df):
     retry_delay_seconds=60,
     description="Fetch latest geomagnetic data from the source"
 )
-async def get_latest_geomag_data(include_historical: bool = False) -> Tuple[datetime.datetime, float, Optional[pd.DataFrame]]:
+async def get_latest_geomag_data(include_historical: bool = False) -> Tuple[datetime, float, Optional[pd.DataFrame]]:
     """
     Fetch the latest geomagnetic data from the source.
 
@@ -86,7 +86,7 @@ async def get_latest_geomag_data(include_historical: bool = False) -> Tuple[date
         include_historical (bool): Whether to include historical data
 
     Returns:
-        Tuple[datetime.datetime, float, Optional[pd.DataFrame]]: 
+        Tuple[datetime, float, Optional[pd.DataFrame]]: 
             - Timestamp of the measurement
             - DST value
             - Historical data if requested, None otherwise
@@ -97,13 +97,13 @@ async def get_latest_geomag_data(include_historical: bool = False) -> Tuple[date
     try:
         # TODO: Implement actual data fetching from source
         # This is a placeholder that returns mock data
-        current_time = datetime.datetime.now(datetime.timezone.utc)
+        current_time = datetime.now(timezone.utc)
         dst_value = -25.0  # Mock DST value
         
         if include_historical:
             # Create mock historical data
             dates = pd.date_range(
-                start=current_time - datetime.timedelta(days=30),
+                start=current_time - timedelta(days=30),
                 end=current_time,
                 freq='H'
             )
@@ -126,7 +126,7 @@ async def get_latest_geomag_data(include_historical: bool = False) -> Tuple[date
     retry_delay_seconds=30,
     description="Process raw geomagnetic response data"
 )
-async def process_geomag_response(response_data: Dict[str, Any]) -> Tuple[datetime.datetime, float, Optional[pd.DataFrame]]:
+async def process_geomag_response(response_data: Dict[str, Any]) -> Tuple[datetime, float, Optional[pd.DataFrame]]:
     """
     Process raw geomagnetic response data into structured format.
 
@@ -134,7 +134,7 @@ async def process_geomag_response(response_data: Dict[str, Any]) -> Tuple[dateti
         response_data (Dict[str, Any]): Raw response data from the source
 
     Returns:
-        Tuple[datetime.datetime, float, Optional[pd.DataFrame]]:
+        Tuple[datetime, float, Optional[pd.DataFrame]]:
             - Timestamp of the measurement
             - Processed DST value
             - Processed historical data if available
@@ -148,7 +148,7 @@ async def process_geomag_response(response_data: Dict[str, Any]) -> Tuple[dateti
             raise ValueError("Invalid response data format")
 
         # Extract timestamp and value
-        timestamp = datetime.datetime.fromisoformat(response_data["timestamp"])
+        timestamp = datetime.fromisoformat(response_data["timestamp"])
         dst_value = float(response_data["value"])
 
         # Process historical data if present
@@ -157,7 +157,7 @@ async def process_geomag_response(response_data: Dict[str, Any]) -> Tuple[dateti
             historical_records = []
             for record in response_data["historical_values"]:
                 historical_records.append({
-                    "timestamp": datetime.datetime.fromisoformat(record["timestamp"]),
+                    "timestamp": datetime.fromisoformat(record["timestamp"]),
                     "Dst": float(record["Dst"])
                 })
             historical_data = pd.DataFrame(historical_records)
@@ -175,12 +175,12 @@ async def process_geomag_response(response_data: Dict[str, Any]) -> Tuple[dateti
     retry_delay_seconds=15,
     description="Validate geomagnetic data values and format"
 )
-def validate_geomag_data(timestamp: datetime.datetime, dst_value: float, historical_data: Optional[pd.DataFrame] = None) -> bool:
+def validate_geomag_data(timestamp: datetime, dst_value: float, historical_data: Optional[pd.DataFrame] = None) -> bool:
     """
     Validate geomagnetic data values and format.
 
     Args:
-        timestamp (datetime.datetime): Timestamp to validate
+        timestamp (datetime): Timestamp to validate
         dst_value (float): DST value to validate
         historical_data (Optional[pd.DataFrame]): Historical data to validate
 
@@ -192,7 +192,7 @@ def validate_geomag_data(timestamp: datetime.datetime, dst_value: float, histori
     """
     try:
         # Validate timestamp
-        if not isinstance(timestamp, datetime.datetime):
+        if not isinstance(timestamp, datetime):
             logger.error(f"Invalid timestamp type: {type(timestamp)}")
             return False
 

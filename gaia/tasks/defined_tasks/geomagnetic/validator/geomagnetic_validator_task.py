@@ -1,28 +1,29 @@
 import asyncio
 import datetime
+from datetime import timedelta
 import traceback
-from typing import Any, Dict, List, Optional, Union
+import os
+import importlib.util
+from typing import Any, Dict, List, Optional, Union, ClassVar
 from uuid import uuid4
 from prefect import flow, task
 from prefect.tasks import task_input_hash
 from pydantic import Field
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.tasks.base.task import Task
+from gaia.miner.database.miner_database_manager import MinerDatabaseManager
+from gaia.tasks.base.task import BaseTask
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_metadata import GeomagneticMetadata
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_inputs import GeomagneticInputs
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_preprocessing import GeomagneticPreprocessing
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_scoring_mechanism import GeomagneticScoringMechanism
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_outputs import GeomagneticOutputs
+from gaia.tasks.defined_tasks.geomagnetic.protocol import GeomagneticInputs, GeomagneticOutputs, GeomagneticPrediction, GeomagneticMeasurement
 from gaia.tasks.defined_tasks.geomagnetic.utils.process_geomag_data import get_latest_geomag_data
-from gaia.parallel.core.executor import get_task_runner
-from gaia.parallel.config.settings import NodeType, TaskType
+from gaia.parallel.core.executor import get_dask_runner, parallel_context
+from gaia.parallel.config.settings import TaskType
 from gaia.models.geomag_basemodel import GeoMagBaseModel
 from fiber.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 
-class GeomagneticTask(Task):
+class GeomagneticValidatorTask(BaseTask):
     """
     A task class for processing and analyzing geomagnetic data, with
     execution methods for both miner and validator workflows.
@@ -40,12 +41,10 @@ class GeomagneticTask(Task):
         task_type (str): Specifies the type of task (e.g., "atomic").
         metadata (GeomagneticMetadata): Metadata associated with the task.
         inputs (GeomagneticInputs): Handles data loading and validation.
-        preprocessing (GeomagneticPreprocessing): Processes raw data.
-        scoring_mechanism (GeomagneticScoringMechanism): Computes scores.
         outputs (GeomagneticOutputs): Manages output formatting and saving.
 
     Example:
-        task = GeomagneticTask()
+        task = GeomagneticValidatorTask()
         task.miner_execute()
         task.validator_execute()
     """
@@ -54,10 +53,6 @@ class GeomagneticTask(Task):
     db_manager: Union[ValidatorDatabaseManager, MinerDatabaseManager] = Field(
         default_factory=ValidatorDatabaseManager,
         description="Database manager for the task",
-    )
-    miner_preprocessing: GeomagneticPreprocessing = Field(
-        default_factory=GeomagneticPreprocessing,
-        description="Preprocessing component for miner",
     )
     model: Optional[GeoMagBaseModel] = Field(
         default=None, description="The geomagnetic prediction model"
@@ -71,18 +66,30 @@ class GeomagneticTask(Task):
         description="Whether to run in test mode (immediate execution, limited scope)"
     )
 
+    prepare_flow: ClassVar[Any]
+    execute_flow: ClassVar[Any]
+    score_flow: ClassVar[Any]
+    
+    get_tasks_for_hour: ClassVar[Any]
+    fetch_ground_truth: ClassVar[Any]
+    score_tasks: ClassVar[Any]
+    _fetch_geomag_data: ClassVar[Any]
+    _query_miners: ClassVar[Any]
+    _process_scores: ClassVar[Any]
+    move_task_to_history: ClassVar[Any]
+    build_score_row: ClassVar[Any]
 
     def __init__(self, node_type: str, db_manager, test_mode: bool = False, **data):
         """Initialize the task."""
+        metadata = GeomagneticMetadata()
         super().__init__(
             name="GeomagneticTask",
             description="Geomagnetic prediction task",
             task_type="atomic",
-            metadata=GeomagneticMetadata(),
+            metadata=metadata.model_dump(),
             inputs=GeomagneticInputs(),
             outputs=GeomagneticOutputs(),
             db_manager=db_manager,
-            scoring_mechanism=GeomagneticScoringMechanism(db_manager=db_manager),
             **data,
         )
         
@@ -152,7 +159,7 @@ class GeomagneticTask(Task):
             return float("inf")
 
     @flow(name="validator_prepare", retries=2)
-    async def prepare_flow(self) -> Dict[str, Any]:
+    async def prepare_flow(self, validator) -> Dict[str, Any]:
         """Prepare the validator task by aligning to the next hour."""
         try:
             current_time = datetime.datetime.now(datetime.timezone.utc)
@@ -165,7 +172,7 @@ class GeomagneticTask(Task):
                 logger.info(
                     f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
                 )
-                await self.update_task_status('geomagnetic', 'idle')
+                await validator.update_task_status('geomagnetic', 'idle')
                 await asyncio.sleep(sleep_duration)
             else:
                 next_hour = current_time
@@ -185,11 +192,11 @@ class GeomagneticTask(Task):
         """Execute the main validator workflow."""
         try:
             # Get task runner for parallel processing
-            task_runner = get_task_runner(NodeType.VALIDATOR, TaskType.GEOMAGNETIC)
+            task_runner = get_dask_runner(TaskType.MIXED)
             logger.info(f"Initialized task runner with type: {task_runner.__class__.__name__}")
             
             # Prepare timing
-            timing = await self.prepare_flow()
+            timing = await self.prepare_flow(validator)
             current_time = timing["current_time"]
             next_hour = timing["next_hour"]
 
@@ -239,7 +246,6 @@ class GeomagneticTask(Task):
         except Exception as e:
             logger.error(f"Error in execute_flow: {str(e)}")
             logger.error(traceback.format_exc())
-            await validator.update_task_status('geomagnetic', 'error')
             raise
 
     @flow(name="validator_score", retries=2)
@@ -247,7 +253,7 @@ class GeomagneticTask(Task):
         """Score predictions for a given hour using Dask for parallel processing."""
         try:
             # Get task runner for parallel processing
-            task_runner = get_task_runner(NodeType.VALIDATOR, TaskType.GEOMAGNETIC)
+            task_runner = get_dask_runner(TaskType.CPU_BOUND)
             
             # Fetch Ground Truth (with Dask)
             ground_truth_future = task_runner.submit(

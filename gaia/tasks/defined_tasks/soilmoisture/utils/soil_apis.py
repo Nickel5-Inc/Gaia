@@ -1,3 +1,8 @@
+"""Soil Moisture APIs.
+
+This module provides utilities for fetching and processing soil moisture data from various sources.
+"""
+
 from prefect import flow, task
 from prefect.tasks import task_input_hash
 import asyncio
@@ -917,6 +922,39 @@ def get_data_dir():
 
 
 @flow(name="get_soil_data_parallel_flow")
-async def get_soil_data_parallel(regions, datetime_obj=None):
-    """Process multiple regions in parallel while respecting API limits."""
-    // ... existing code ...
+async def get_soil_data_parallel_flow(regions, datetime_obj=None):
+    """Process multiple regions in parallel while respecting API limits.
+    
+    Args:
+        regions: List of region bounding boxes to process
+        datetime_obj: Optional datetime to use for all regions
+        
+    Returns:
+        List of tuples containing (output_file, sentinel_bounds, sentinel_crs) for each region
+    """
+    if datetime_obj is None:
+        datetime_obj = datetime.now(timezone.utc)
+        
+    try:
+        print(f"\n=== Starting Parallel Data Collection for {len(regions)} regions ===")
+        
+        chunk_size = 4  # Process 4 regions at a time
+        results = []
+        
+        for i in range(0, len(regions), chunk_size):
+            chunk = regions[i:i + chunk_size]
+            chunk_tasks = [get_soil_data(bbox, datetime_obj) for bbox in chunk]
+            chunk_results = await asyncio.gather(*chunk_tasks)
+            results.extend(chunk_results)
+            
+            if i + chunk_size < len(regions):
+                await asyncio.sleep(30)
+                
+        print(f"\n=== Completed Processing {len(results)} Regions ===")
+        return results
+        
+    except Exception as e:
+        print(f"\n=== Error in Parallel Processing ===")
+        print(f"Error: {str(e)}")
+        traceback.print_exc()
+        return [(None, None, None)] * len(regions)

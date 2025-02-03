@@ -5,7 +5,7 @@ This includes hardware requirements, dependencies, and task-specific settings.
 """
 
 from gaia.tasks.base.components.metadata import Metadata, CoreMetadata
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, ClassVar
 from gaia.tasks.base.decorators import handle_validation_error
 from datetime import timedelta
 from prefect.tasks import task_input_hash
@@ -14,6 +14,9 @@ from prefect import task
 
 class GeomagneticMetadata(Metadata):
     """Metadata for geomagnetic task."""
+    
+    # Mark Prefect task as ClassVar to exclude from Pydantic model fields
+    get_task_config: ClassVar[Any]
 
     def __init__(self):
         """Initialize geomagnetic task metadata."""

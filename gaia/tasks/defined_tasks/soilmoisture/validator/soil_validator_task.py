@@ -7,7 +7,7 @@ This module implements the validator task for soil moisture prediction. It handl
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, ClassVar, Union
 import os
 import base64
 import json
@@ -17,34 +17,75 @@ from uuid import uuid4
 
 from prefect import flow, task
 from pydantic import Field
+from prefect.tasks import task_input_hash
 
-from gaia.tasks.base.task import ValidatorTask
-from gaia.tasks.defined_tasks.soilmoisture.soil_scoring_mechanism import SoilScoringMechanism
-from gaia.tasks.defined_tasks.soilmoisture.soil_validator_preprocessing import SoilValidatorPreprocessing
+from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.miner.database.miner_database_manager import MinerDatabaseManager
+from gaia.tasks.base.task import BaseTask
 from gaia.tasks.defined_tasks.soilmoisture.soil_metadata import SoilMoistureMetadata
-from gaia.tasks.defined_tasks.soilmoisture.soil_inputs import SoilMoistureInputs
-from gaia.tasks.defined_tasks.soilmoisture.soil_outputs import SoilMoistureOutputs, SoilMoisturePrediction
+from gaia.tasks.defined_tasks.soilmoisture.protocol import (
+    SoilMoistureInputs, SoilMoistureOutputs, SoilMoisturePrediction,
+    SoilMoisturePayload, ValidationResult
+)
+from gaia.tasks.defined_tasks.soilmoisture.validator.soil_scoring_mechanism import SoilScoringMechanism
+from gaia.tasks.defined_tasks.soilmoisture.validator.soil_validator_preprocessing import SoilValidatorPreprocessing
+from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import (
+    get_soil_data_parallel_flow
+)
+from gaia.parallel.core.executor import get_dask_runner, parallel_context
+from gaia.parallel.config.settings import TaskType
 from fiber.logging_utils import get_logger
-from gaia.parallel.core.executor import get_task_runner
-from gaia.parallel.config.settings import NodeType, TaskType
 
 logger = get_logger(__name__)
 
 os.environ["PYTHONASYNCIODEBUG"] = "1"
 
-from gaia.tasks.defined_tasks.soilmoisture.soil_validator_preprocessing import (
-    SoilValidatorPreprocessing,
-)
 
-
-class SoilValidatorTask(ValidatorTask):
-    """Validator task for soil moisture prediction using satellite and weather data.
-    
-    This task is responsible for:
-    1. Managing prediction regions and data collection windows
-    2. Validating and scoring miner predictions
-    3. Maintaining prediction history and scores
+class SoilValidatorTask(BaseTask):
     """
+    A task class for processing and analyzing soil moisture data, with
+    execution methods for both miner and validator workflows.
+    """
+
+    # Declare Pydantic fields
+    db_manager: Union[ValidatorDatabaseManager, MinerDatabaseManager] = Field(
+        default_factory=ValidatorDatabaseManager,
+        description="Database manager for the task",
+    )
+    model: Optional[Any] = Field(
+        default=None, description="The soil moisture prediction model"
+    )
+    node_type: str = Field(
+        default="validator",
+        description="Type of node running the task (validator or miner)"
+    )
+    test_mode: bool = Field(
+        default=False,
+        description="Whether to run in test mode (immediate execution, limited scope)"
+    )
+
+    prepare_flow: ClassVar[Any]
+    execute_flow: ClassVar[Any]
+    score_flow: ClassVar[Any]
+    validator_execute: ClassVar[Any]
+    validator_score: ClassVar[Any]
+    
+    get_next_preparation_time: ClassVar[Any]
+    get_tasks_for_hour: ClassVar[Any]
+    fetch_ground_truth: ClassVar[Any]
+    score_tasks: ClassVar[Any]
+    _fetch_soil_data: ClassVar[Any]
+    _query_miners: ClassVar[Any]
+    _process_scores: ClassVar[Any]
+    move_task_to_history: ClassVar[Any]
+    build_score_row: ClassVar[Any]
+    _handle_prep_window: ClassVar[Any]
+    _handle_execution_window: ClassVar[Any]
+    _process_region: ClassVar[Any]
+    _validate_region_data: ClassVar[Any]
+    _prepare_task_data: ClassVar[Any]
+    _update_region_status: ClassVar[Any]
+    _clear_old_regions: ClassVar[Any]
 
     prediction_horizon: timedelta = Field(
         default_factory=lambda: timedelta(hours=6),
@@ -54,9 +95,7 @@ class SoilValidatorTask(ValidatorTask):
         default_factory=lambda: timedelta(days=3),
         description="Delay before scoring due to SMAP data latency",
     )
-    validator_preprocessing: Optional[SoilValidatorPreprocessing] = None
-    db_manager: Any = Field(default=None)
-    test_mode: bool = Field(default=False)
+    validator_preprocessing: Optional[Any] = None
 
     def __init__(self, db_manager=None, test_mode=False, **data):
         """Initialize the soil moisture validator task.
@@ -66,32 +105,35 @@ class SoilValidatorTask(ValidatorTask):
             test_mode: Whether to run in test mode
             **data: Additional task configuration
         """
+        scoring_mechanism = SoilScoringMechanism(
+            db_manager=db_manager,
+            baseline_rmse=50,
+            alpha=10,
+            beta=0.1,
+            task=None
+        )
+        
         super().__init__(
             name="SoilMoistureValidatorTask",
             description="Soil moisture prediction validation task",
-            metadata=SoilMoistureMetadata(),
+            metadata=SoilMoistureMetadata().model_dump(),
             inputs=SoilMoistureInputs(),
             outputs=SoilMoistureOutputs(),
-            scoring_mechanism=SoilScoringMechanism(
-                db_manager=db_manager,
-                baseline_rmse=50,
-                alpha=10,
-                beta=0.1,
-                task=None
-            ),
+            scoring_mechanism=scoring_mechanism,
+            db_manager=db_manager,
+            test_mode=test_mode,
+            **data
         )
-
-        self.db_manager = db_manager
-        self.test_mode = test_mode
-        self.scoring_mechanism.task = self
+        
         self.validator_preprocessing = SoilValidatorPreprocessing()
         self._prepared_regions = {}
+        scoring_mechanism.task = self
 
     @task(
         name="get_next_preparation_time",
-        retries=2,                    # Simple calculation, fewer retries needed
-        retry_delay_seconds=10,       # Quick retry for time calculations
-        timeout_seconds=60,           # 1 minute timeout is sufficient
+        retries=2,                    
+        retry_delay_seconds=10,       
+        timeout_seconds=60,           
         description="Calculate the next preparation window start time"
     )
     def get_next_preparation_time(self, current_time: datetime) -> datetime:
@@ -118,9 +160,8 @@ class SoilValidatorTask(ValidatorTask):
         retry_delay_seconds=300,
         timeout_seconds=14400,
         description="Execute the validator task",
-        task_runner=get_task_runner(
-            node_type=NodeType.VALIDATOR,
-            task_type=TaskType.SOIL_MOISTURE
+        task_runner=get_dask_runner(
+            task_type=TaskType.MIXED
         )
     )
     async def validator_execute(self, validator):
@@ -166,7 +207,7 @@ class SoilValidatorTask(ValidatorTask):
                         logger.info(f"Processing {len(region_bboxes)} regions in parallel")
                         
                         # Use our new parallel processing function
-                        results = await get_soil_data_parallel(region_bboxes, ifs_forecast_time)
+                        results = await get_soil_data_parallel_flow(region_bboxes, ifs_forecast_time)
                         
                         # Process results and update database
                         for region, (output_file, sentinel_bounds, sentinel_crs) in zip(regions, results):
@@ -241,7 +282,7 @@ class SoilValidatorTask(ValidatorTask):
                         logger.info(f"Processing {len(region_bboxes)} regions in parallel")
                         
                         # Use our new parallel processing function
-                        results = await get_soil_data_parallel(region_bboxes, ifs_forecast_time)
+                        results = await get_soil_data_parallel_flow(region_bboxes, ifs_forecast_time)
                         
                         # Process results and update database
                         for region, (output_file, sentinel_bounds, sentinel_crs) in zip(regions, results):
@@ -310,7 +351,7 @@ class SoilValidatorTask(ValidatorTask):
                                         "region_id": region["id"],
                                         "target_time": target_smap_time,
                                         "data_collection_time": current_time,
-                                        "ifs_forecast_time": ifs_forecast_time
+                                        "ifs_forecast_time": ifs_forecast_time,
                                         "sentinel_bounds": region["sentinel_bounds"],
                                         "sentinel_crs": region["sentinel_crs"]
                                     }
@@ -340,22 +381,14 @@ class SoilValidatorTask(ValidatorTask):
                 await validator.update_task_status('soil', 'error')
                 await asyncio.sleep(60)
 
-    @task(
-        name="handle_prep_window",
-        retries=5,                    # More retries for data preparation
-        retry_delay_seconds=120,      # 2 minute delay between retries
-        timeout_seconds=3600,         # 1 hour timeout for preparation
-        description="Handle preparation window tasks"
+    @flow(
+        name="soil_moisture_prep_flow",
+        retries=3,
+        retry_delay_seconds=300,
+        timeout_seconds=1800
     )
     async def _handle_prep_window(self, current_time: datetime):
-        """Handle preparation window tasks.
-        
-        Args:
-            current_time: Current timestamp
-            
-        Raises:
-            RuntimeError: If preparation fails
-        """
+        """Handle preparation window tasks."""
         try:
             target_smap_time = self.get_smap_time_for_validator(current_time)
             ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
@@ -371,22 +404,14 @@ class SoilValidatorTask(ValidatorTask):
             logger.error(traceback.format_exc())
             raise RuntimeError(error_msg) from e
             
-    @task(
-        name="handle_execution_window",
-        retries=3,                    # 3 retries for execution window
-        retry_delay_seconds=180,      # 3 minute delay between retries
-        timeout_seconds=7200,         # 2 hour timeout for execution
-        description="Handle execution window tasks"
-    )        
+    @flow(
+        name="soil_moisture_execute_flow",
+        retries=3,
+        retry_delay_seconds=300,
+        timeout_seconds=1800
+    )
     async def _handle_execution_window(self, current_time: datetime):
-        """Handle execution window tasks.
-        
-        Args:
-            current_time: Current timestamp
-            
-        Raises:
-            RuntimeError: If execution fails
-        """
+        """Handle execution window tasks."""
         try:
             target_smap_time = self.get_smap_time_for_validator(current_time)
             
@@ -454,7 +479,7 @@ class SoilValidatorTask(ValidatorTask):
                 "region_id": region_id,
                 "target_time": target_time,
                 "data_collection_time": current_time,
-                "ifs_forecast_time": self.get_ifs_time_for_smap(target_time)
+                "ifs_forecast_time": self.get_ifs_time_for_smap(target_time),
                 "sentinel_bounds": region["sentinel_bounds"],
                 "sentinel_crs": region["sentinel_crs"]
             }
@@ -851,17 +876,13 @@ class SoilValidatorTask(ValidatorTask):
             return False
             
     @flow(
-        name="validator_score",
+        name="soil_moisture_scoring_flow",
         retries=3,
         retry_delay_seconds=300,
-        timeout_seconds=7200,
-        task_runner=get_task_runner(
-            node_type=NodeType.VALIDATOR,
-            task_type=TaskType.SOIL_MOISTURE
-        )
+        timeout_seconds=7200
     )
-    async def validator_score(self, result=None):
-        """Score task results by timestamp to minimize SMAP data downloads."""
+    async def validator_score(self):
+        """Score predictions after delay."""
         try:
             pending_tasks = await self.get_pending_tasks()
             if not pending_tasks:

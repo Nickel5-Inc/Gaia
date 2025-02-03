@@ -5,6 +5,7 @@ import asyncio
 import os
 from .config import ScheduleConfig, get_schedule_config
 from gaia.tasks.base.task import Task
+from prefect.schedules.clocks import CronSchedule
 
 
 """
@@ -116,4 +117,63 @@ def get_deployment_status(deployment: Deployment) -> Dict:
         'schedule_active': deployment.is_schedule_active,
         'infrastructure': deployment.infrastructure.dict(),
         'work_queue': deployment.work_queue_name
-    } 
+    }
+
+async def create_soil_moisture_deployments(task: Task) -> List[Deployment]:
+    """Create deployments for soil moisture prep and execute windows."""
+    deployments = []
+    
+    prep_config = get_schedule_config('soil_moisture_prep')
+    for window in SOIL_MOISTURE_WINDOWS["prep"]:
+        deployment = Deployment.build_from_flow(
+            flow=task._handle_prep_window,
+            name=f"soil_prep_{window['hour']:02d}{window['minute']:02d}",
+            schedule=CronSchedule(
+                cron=f"{window['minute']} {window['hour']} * * *",
+                timezone="UTC"
+            ),
+            tags=["soil_moisture", "prep"],
+            infrastructure=Process(
+                env={"PYTHONPATH": os.getcwd()},
+                working_dir=os.getcwd(),
+                cpu_limit=prep_config.cpu_limit
+            ),
+            work_queue_name=prep_config.queue_name
+        )
+        deployments.append(deployment)
+    
+    exec_config = get_schedule_config('soil_moisture_execute')
+    for window in SOIL_MOISTURE_WINDOWS["execute"]:
+        deployment = Deployment.build_from_flow(
+            flow=task._handle_execution_window,
+            name=f"soil_execute_{window['hour']:02d}{window['minute']:02d}",
+            schedule=CronSchedule(
+                cron=f"{window['minute']} {window['hour']} * * *",
+                timezone="UTC"
+            ),
+            tags=["soil_moisture", "execute"],
+            infrastructure=Process(
+                env={"PYTHONPATH": os.getcwd()},
+                working_dir=os.getcwd(),
+                cpu_limit=exec_config.cpu_limit
+            ),
+            work_queue_name=exec_config.queue_name
+        )
+        deployments.append(deployment)
+    
+    score_config = get_schedule_config('soil_moisture_scoring')
+    score_deployment = Deployment.build_from_flow(
+        flow=task.validator_score,
+        name="soil_scoring",
+        schedule=CronSchedule(cron="0 * * * *", timezone="UTC"),  # Every hour
+        tags=["soil_moisture", "scoring"],
+        infrastructure=Process(
+            env={"PYTHONPATH": os.getcwd()},
+            working_dir=os.getcwd(),
+            cpu_limit=score_config.cpu_limit
+        ),
+        work_queue_name=score_config.queue_name
+    )
+    deployments.append(score_deployment)
+    
+    return deployments 

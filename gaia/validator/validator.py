@@ -6,7 +6,6 @@ import concurrent.futures
 import glob
 import signal
 import sys
-
 os.environ["NODE_TYPE"] = "validator"
 import asyncio
 import ssl
@@ -26,11 +25,10 @@ from fiber.chain.fetch_nodes import get_nodes_for_netuid
 from fiber.chain.chain_utils import query_substrate
 from fiber.logging_utils import get_logger
 from fiber.encrypted.validator import client as vali_client, handshake
-from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
 from substrateinterface import SubstrateInterface
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
-from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
+from gaia.tasks.defined_tasks.geomagnetic.validator.geomagnetic_validator_task import GeomagneticValidatorTask
+from gaia.tasks.defined_tasks.soilmoisture.validator.soil_validator_task import SoilValidatorTask
 from gaia.APIcalls.miner_score_sender import MinerScoreSender
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from argparse import ArgumentParser
@@ -46,6 +44,11 @@ from sqlalchemy import text
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
+from gaia.validator.flows import ValidatorFlows
+import anyio
+from prefect import flow, task
+from prefect.tasks import task_input_hash
+from pydantic import BaseModel, Field
 
 logger = get_logger(__name__)
 
@@ -59,12 +62,12 @@ class GaiaValidator:
         self.metagraph = None
         self.config = None
         self.database_manager = ValidatorDatabaseManager()
-        self.soil_task = SoilMoistureTask(
+        self.soil_task = SoilValidatorTask(
             db_manager=self.database_manager,
             node_type="validator",
             test_mode=args.test,
         )
-        self.geomagnetic_task = GeomagneticTask(
+        self.geomagnetic_task = GeomagneticValidatorTask(
             node_type="validator",
             db_manager=self.database_manager,
             test_mode=args.test
@@ -191,6 +194,7 @@ class GaiaValidator:
 
         # Add lock for miner table operations
         self.miner_table_lock = asyncio.Lock()
+        self.flows = ValidatorFlows()
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -431,8 +435,9 @@ class GaiaValidator:
                 # Add timeout to prevent hanging
                 try:
                     update_successful = await asyncio.wait_for(
-                        perform_update(self),
-                        timeout=60  # 60 second timeout
+                        # perform_update(self),
+                        asyncio.sleep(0),
+                        timeout=60
                     )
 
                     if update_successful:
@@ -789,81 +794,57 @@ class GaiaValidator:
                 logger.error("Failed to setup neuron, exiting...")
                 return
 
-            logger.info("Neuron setup complete.")
-
             logger.info("Checking metagraph initialization...")
             if self.metagraph is None:
                 logger.error("Metagraph not initialized, exiting...")
                 return
 
-            logger.info("Metagraph initialized.")
-
             logger.info("Initializing database tables...")
             await self.database_manager._initialize_validator_database()
 
-            logger.info("Database tables initialized.")
-
             logger.info("Setting up HTTP client...")
             self.httpx_client = httpx.AsyncClient(
-                timeout=30.0, follow_redirects=True, verify=False
+                timeout=30.0,
+                follow_redirects=True,
+                verify=False,
+                limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=20,
+                    keepalive_expiry=30,
+                ),
+                transport=httpx.AsyncHTTPTransport(retries=3),
             )
-            logger.info("HTTP client setup complete.")
 
             logger.info("Updating miner table...")
             await self.update_miner_table()
-            logger.info("Miner table updated.")
 
             logger.info("Starting watchdog...")
             await self.start_watchdog()
-            logger.info("Watchdog started.")
-            
-            # Create all tasks in the same event loop
-            tasks = [
-                self.geomagnetic_task.validator_execute(self),
-                self.soil_task.validator_execute(self),
-                self.status_logger(),
-                self.main_scoring(),
-                self.handle_miner_deregistration_loop(),
-                #self.miner_score_sender.run_async(), 
-                self.check_for_updates()
-            ]
-            
+
+            logger.info("Initializing validator tasks...")
+            await self.initialize_tasks()
+
+            logger.info("Starting all validator flows...")
+
             try:
-                running_tasks = []
-                while not self._shutdown_event.is_set():
-                    # Start all tasks
-                    running_tasks = [asyncio.create_task(t) for t in tasks]
-                    
-                    # Wait for either shutdown event or task completion
-                    done, pending = await asyncio.wait(
-                        running_tasks + [asyncio.create_task(self._shutdown_event.wait())],
-                        return_when=asyncio.FIRST_COMPLETED
-                    )
-                    
-                    # If shutdown event is set, cancel remaining tasks
-                    if self._shutdown_event.is_set():
-                        logger.info("Shutdown event detected in main loop")
-                        for task in running_tasks:
-                            if not task.done():
-                                task.cancel()
-                        # Wait for tasks to cancel
-                        await asyncio.gather(*running_tasks, return_exceptions=True)
-                        break
-                
-                # Cleanup after loop exit
-                logger.info("Main loop exited, initiating cleanup")
-                await self._initiate_shutdown()
-                
+                await asyncio.gather(
+                    self.flows.core_flow(self),
+                    self.main_scoring(),
+                    # perform_update(self),
+                    self.miner_score_sender.run(),
+                    self.geomagnetic_task.execute_flow(self),
+                    self.soil_task.validator_execute(self)
+                )
             except asyncio.CancelledError:
-                logger.info("Tasks cancelled, proceeding with cleanup")
+                logger.info("Validator flows cancelled, initiating shutdown")
                 if not self._cleanup_done:
                     await self._initiate_shutdown()
             except Exception as e:
-                logger.error(f"Error in main task loop: {e}")
+                logger.error(f"Error in validator flows: {e}")
                 logger.error(traceback.format_exc())
                 if not self._cleanup_done:
                     await self._initiate_shutdown()
-                
+
         except Exception as e:
             logger.error(f"Error in main: {e}")
             logger.error(traceback.format_exc())
@@ -1034,48 +1015,45 @@ class GaiaValidator:
                 return
 
             async with self.miner_table_lock:
-            self.metagraph.sync_nodes()
-            total_nodes = len(self.metagraph.nodes)
-            logger.info(f"Synced {total_nodes} nodes from the network")
+                self.metagraph.sync_nodes()
+                total_nodes = len(self.metagraph.nodes)
+                logger.info(f"Synced {total_nodes} nodes from the network")
 
-            # Process miners in chunks of 32 to prevent memory bloat
-            chunk_size = 32
-            nodes_items = list(self.metagraph.nodes.items())
+                # Process miners in chunks of 32
+                chunk_size = 32
+                nodes_items = list(self.metagraph.nodes.items())
 
-            for chunk_start in range(0, total_nodes, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, total_nodes)
-                chunk = nodes_items[chunk_start:chunk_end]
-                
-                try:
-                    for index, (hotkey, node) in enumerate(chunk, start=chunk_start):
-                        await self.database_manager.update_miner_info(
-                            index=index,
-                            hotkey=node.hotkey,
-                            coldkey=node.coldkey,
-                            ip=node.ip,
-                            ip_type=str(node.ip_type),
-                            port=node.port,
-                            incentive=float(node.incentive),
-                            stake=float(node.stake),
-                            trust=float(node.trust),
-                            vtrust=float(node.vtrust),
-                            protocol=str(node.protocol),
-                        )
-                        self.nodes[index] = {"hotkey": node.hotkey, "uid": index}
-                        logger.debug(f"Updated information for node {index}")
+                for chunk_start in range(0, total_nodes, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, total_nodes)
+                    chunk = nodes_items[chunk_start:chunk_end]
                     
-                    logger.info(f"Processed nodes {chunk_start} to {chunk_end-1}")
-                    
-                    # Small delay between chunks to prevent overwhelming the database
-                    await asyncio.sleep(0.1)
-                    
-                except Exception as chunk_error:
-                    logger.error(f"Error processing chunk {chunk_start}-{chunk_end}: {str(chunk_error)}")
-                    logger.error(traceback.format_exc())
-                    # Continue with next chunk instead of failing completely
-                    continue
+                    try:
+                        for index, (hotkey, node) in enumerate(chunk, start=chunk_start):
+                            await self.database_manager.update_miner_info(
+                                index=index,
+                                hotkey=node.hotkey,
+                                coldkey=node.coldkey,
+                                ip=node.ip,
+                                ip_type=str(node.ip_type),
+                                port=node.port,
+                                incentive=float(node.incentive),
+                                stake=float(node.stake),
+                                trust=float(node.trust),
+                                vtrust=float(node.vtrust),
+                                protocol=str(node.protocol),
+                            )
+                            self.nodes[index] = {"hotkey": node.hotkey, "uid": index}
+                            logger.debug(f"Updated information for node {index}")
+                        
+                        logger.info(f"Processed nodes {chunk_start} to {chunk_end-1}")
+                        await asyncio.sleep(0.1)
+                        
+                    except Exception as chunk_error:
+                        logger.error(f"Error processing chunk {chunk_start}-{chunk_end}: {str(chunk_error)}")
+                        logger.error(traceback.format_exc())
+                        continue
 
-            logger.info("Successfully updated miner table and in-memory state")
+                logger.info("Successfully updated miner table and in-memory state")
 
         except Exception as e:
             logger.error(f"Error updating miner table: {str(e)}")
@@ -1157,9 +1135,9 @@ class GaiaValidator:
                                     if node.hotkey in chain_hotkeys:
                                         self.nodes[uid] = {"hotkey": node.hotkey, "uid": uid}
                                         logger.info(f"Updated index {uid} with new chain info")
-                        except Exception as e:
+                            except Exception as e:
                                 logger.error(f"Error clearing miner {uid}: {str(e)}")
-                            logger.error(traceback.format_exc())
+                                logger.error(traceback.format_exc())
 
                 # Periodic sleep (5 minutes)
                 await asyncio.sleep(300)
@@ -1175,12 +1153,12 @@ class GaiaValidator:
             now = datetime.now(timezone.utc)
             one_day_ago = now - timedelta(days=1)
         
-        query = """
-            SELECT score, created_at 
-        FROM score_table 
-        WHERE task_name = :task_name
-        AND created_at >= :start_time
-        ORDER BY created_at DESC 
+            query = """
+                SELECT score, created_at 
+                FROM score_table 
+                WHERE task_name = :task_name
+                AND created_at >= :start_time
+                ORDER BY created_at DESC 
             """
             
             # Fetch and analyze geomagnetic scores
@@ -1289,9 +1267,9 @@ class GaiaValidator:
             logger.info("Recent scores fetched and decay-weighted. Calculating aggregate scores...")
 
             weights = np.zeros(256)
-        for idx in range(256):
-            geomagnetic_score = geomagnetic_scores[idx]
-            soil_score = soil_scores[idx]
+            for idx in range(256):
+                geomagnetic_score = geomagnetic_scores[idx]
+                soil_score = soil_scores[idx]
 
                 # Treat 0.0 scores the same as NaN
                 if np.isnan(geomagnetic_score) or geomagnetic_score == 0.0:
@@ -1300,17 +1278,17 @@ class GaiaValidator:
                     soil_score = np.nan
 
                 if np.isnan(geomagnetic_score) and np.isnan(soil_score):
-                weights[idx] = 0.0
+                    weights[idx] = 0.0
                 elif np.isnan(geomagnetic_score):
-                weights[idx] = 0.5 * soil_score
+                    weights[idx] = 0.5 * soil_score
                 elif np.isnan(soil_score):
                     weights[idx] = 0.5 * geomagnetic_score
-            else:
+                else:
                     weights[idx] = (0.5 * geomagnetic_score) + (0.5 * soil_score)
 
                 logger.info(f"UID {idx}: geo={geomagnetic_score} ({geo_counts[idx]} scores), soil={soil_score} ({soil_counts[idx]} scores), weight={weights[idx]}")
 
-        logger.info(f"Weights before normalization: {weights}")
+            logger.info(f"Weights before normalization: {weights}")
 
             # generalized logistic curve
             non_zero_mask = weights != 0.0
@@ -1341,7 +1319,7 @@ class GaiaValidator:
                     return new_weights.tolist()
 
             logger.warning("No valid weights calculated")
-                return None
+            return None
 
         except Exception as e:
             logger.error(f"Error calculating weights: {e}")
@@ -1354,6 +1332,30 @@ class GaiaValidator:
             self.last_set_weights_block = block["header"]["number"]
         except Exception as e:
             logger.error(f"Error updating last weights block: {e}")
+
+    @flow(
+        name="initialize_validator_tasks",
+        description="Initialize validator tasks"
+    )
+    async def initialize_tasks(self):
+        """Initialize validator tasks and register them with existing monitoring."""
+        try:
+            logger.info("Initializing validator tasks...")
+            await self.update_task_status('geomagnetic', 'initializing')
+            await self.update_task_status('soil', 'initializing')
+            self.task_health['geomagnetic']['last_success'] = time.time()
+            self.task_health['soil']['last_success'] = time.time()
+            
+            logger.info("Successfully initialized validator tasks")
+            await self.update_task_status('geomagnetic', 'idle')
+            await self.update_task_status('soil', 'idle')
+            
+        except Exception as e:
+            logger.error(f"Error initializing tasks: {e}")
+            logger.error(traceback.format_exc())
+            await self.update_task_status('geomagnetic', 'error')
+            await self.update_task_status('soil', 'error')
+            raise
 
 
 if __name__ == "__main__":

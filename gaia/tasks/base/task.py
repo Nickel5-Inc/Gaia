@@ -8,7 +8,7 @@ Each task type has its own flow structure and responsibilities:
 """
 
 from prefect import flow, task
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from .components.metadata import Metadata
 from .components.inputs import Inputs
 from .components.outputs import Outputs
@@ -17,43 +17,62 @@ from .components.preprocessing import Preprocessing
 from .decorators import task_timer
 from abc import ABC, abstractmethod
 import networkx as nx
-from typing import Optional, Any, Dict, Protocol
-from datetime import timedelta
+from typing import Optional, Any, Dict, Protocol, List, ClassVar
+from datetime import timedelta, datetime, timezone
 from prefect.tasks import task_input_hash
+import json
+import traceback
+from fiber.logging_utils import get_logger
 
+logger = get_logger(__name__)
 
-class BaseTask(BaseModel, ABC):
-    """Common base for both validator and miner tasks"""
+class TaskState(BaseModel):
+    """State model for tasks"""
+    status: str = "idle"
+    last_run: Optional[datetime] = None
+    errors: List[Dict[str, Any]] = Field(default_factory=list)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+
+class ValidatorState(TaskState):
+    """State model for validator tasks"""
+    last_weight_set: Optional[int] = None
+    last_score: Optional[float] = None
+    miner_responses: Dict[str, Any] = Field(default_factory=dict)
+    resource_usage: Dict[str, Any] = Field(default_factory=dict)
+
+class BaseTask(BaseModel):
+    """Base class for all tasks."""
+    name: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    state: TaskState = Field(default_factory=TaskState)
     
-    name: str = Field(..., description="Task name")
-    description: str = Field(..., description="Task description")
-    schema_path: str = Field(..., description="Path to task schema file")
-    db: Optional[Any] = Field(None, description="Database connection")
+    model_config = ConfigDict(arbitrary_types_allowed=True)
     
-    # Task state tracking
-    state: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            'status': 'idle',
-            'last_execution': None,
-            'errors': [],
-            'metrics': {}
-        }
-    )
-
-    class Config:
-        arbitrary_types_allowed = True
-
-    async def initialize_database(self):
-        """Initialize task-specific database tables"""
-        if not self.db:
-            raise RuntimeError("Database not initialized")
-
-    async def _handle_error(self, error: Exception):
-        """Unified error handling"""
-        self.state['errors'].append(str(error))
-        self.state['status'] = 'failed'
-        self.state['metrics']['last_error_time'] = timedelta.now()
-
+    def update_state(self, status: str, error: Optional[str] = None):
+        """Update task state."""
+        self.state.status = status
+        self.state.last_run = datetime.now(timezone.utc)
+        if error:
+            self.state.errors.append({
+                'time': datetime.now(timezone.utc),
+                'error': error
+            })
+    
+    def log_metrics(self, metrics: Dict[str, Any]):
+        """Log task metrics."""
+        self.state.metrics.update(metrics)
+    
+    def get_status(self) -> str:
+        """Get current task status."""
+        return self.state.status
+    
+    def get_errors(self) -> list:
+        """Get task errors."""
+        return self.state.errors
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get task metrics."""
+        return self.state.metrics
 
 class ValidatorTask(BaseTask):
     """
@@ -65,13 +84,56 @@ class ValidatorTask(BaseTask):
     """
     
     # For composite validator tasks
-    subtasks: Optional[nx.Graph] = Field(None, description="DAG for composite tasks")
+    subtasks: Optional[nx.Graph] = None
+    node_type: str = "validator"
+    test_mode: bool = False
+    state: ValidatorState = Field(default_factory=ValidatorState)
+    
+    # Mark flow methods as class variables to exclude them from model fields
+    run: ClassVar[Any]
+    prepare_flow: ClassVar[Any]
+    execute_flow: ClassVar[Any]
+    score_flow: ClassVar[Any]
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        self.initialize_validator_state()
+
+    def initialize_validator_state(self):
+        """Initialize validator-specific state."""
+        self.state.update({
+            'last_weight_set': None,
+            'last_score': None,
+            'miner_responses': {},
+            'resource_usage': {}
+        })
+
+    def update_weight_set(self, block: int):
+        """Update last weight set block."""
+        self.state.last_weight_set = block
+
+    def record_score(self, score: float):
+        """Record task score."""
+        self.state.last_score = score
+
+    def record_miner_response(self, miner_key: str, response: Any):
+        """Record miner response."""
+        self.state.miner_responses[miner_key] = {
+            'time': datetime.now(timezone.utc),
+            'response': response
+        }
+
+    def update_resource_usage(self, usage: Dict[str, Any]):
+        """Update resource usage metrics."""
+        self.state.resource_usage = usage
 
     @flow(name="validator_run", retries=3)
     async def run(self, **kwargs):
         """Main validator flow"""
         try:
-            if not self.db:
+            if not hasattr(self, 'db'):
                 await self.initialize_database()
             
             # Prepare validation parameters
@@ -143,7 +205,7 @@ class ValidatorTask(BaseTask):
 
     async def _store_score(self, score: float):
         """Store task score in database"""
-        if self.db:
+        if hasattr(self, 'db'):
             await self.db.store_score(self.name, score)
 
 
@@ -155,12 +217,20 @@ class MinerTask(BaseTask):
     2. Task computation
     3. Result formatting
     """
+    node_type: str = "miner"
+    test_mode: bool = False
+    
+    run: ClassVar[Any]
+    prepare_flow: ClassVar[Any]
+    execute_flow: ClassVar[Any]
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @flow(name="miner_run", retries=3)
     async def run(self, **kwargs):
         """Main miner flow"""
         try:
-            if not self.db:
+            if not hasattr(self, 'db'):
                 await self.initialize_database()
             
             # Preprocess inputs
