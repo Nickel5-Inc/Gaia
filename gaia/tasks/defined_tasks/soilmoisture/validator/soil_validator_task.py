@@ -134,7 +134,8 @@ class SoilValidatorTask(BaseTask):
         retries=2,                    
         retry_delay_seconds=10,       
         timeout_seconds=60,           
-        description="Calculate the next preparation window start time"
+        description="Calculate the next preparation window start time",
+        cache_policy=None  # I did this to avoid serialization issues with database manager
     )
     def get_next_preparation_time(self, current_time: datetime) -> datetime:
         """Get the next preparation window start time."""

@@ -230,8 +230,8 @@ class MinerScoreSender:
                 logger.error(f"| MinerScoreSender | ❗ Error in run_async: {e}")
                 await asyncio.sleep(30)
 
-    def run(self):
+    async def run(self):
         """
-        Entry point for running the MinerScoreSender in a thread-safe manner.
+        Entry point for running the MinerScoreSender.
         """
-        asyncio.run_coroutine_threadsafe(self.run_async(), self.loop)
+        return await self.run_async()

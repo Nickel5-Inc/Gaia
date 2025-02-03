@@ -825,7 +825,6 @@ class GaiaValidator:
             await self.initialize_tasks()
 
             logger.info("Starting all validator flows...")
-
             try:
                 await asyncio.gather(
                     self.flows.core_flow(self),
