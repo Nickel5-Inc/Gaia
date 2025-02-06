@@ -1,5 +1,5 @@
 import threading
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import httpx
 from fiber.logging_utils import get_logger
 import numpy as np
@@ -10,156 +10,188 @@ logger = get_logger(__name__)
 
 
 class GaiaCommunicator:
-    def __init__(self, endpoint: str = "/Validator/Info"):
+    def __init__(self, endpoint: str = "/Validator/Info", client: httpx.AsyncClient = None):
         """
         Initialize the communicator with Gaia API base URL and endpoint.
 
         Args:
             endpoint: API endpoint path (default is '/Validator/Info').
+            client: Optional existing httpx.AsyncClient to use. If not provided, creates a new one.
         """
         api_base = "https://dev-gaia-api.azurewebsites.net"
         self.endpoint = f"{api_base}{endpoint}"
-        self.client = httpx.AsyncClient(
-            timeout=30.0,
-            headers={
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'User-Agent': 'GaiaValidator/1.0'
-            }
-        )
+        
+        # Configure client with optimized settings for concurrent requests
+        if client:
+            self.client = client
+            self._should_close_client = False
+        else:
+            self.client = httpx.AsyncClient(
+                timeout=30.0,
+                verify=False,
+                limits=httpx.Limits(
+                    max_keepalive_connections=20,
+                    max_connections=30,
+                    keepalive_expiry=30.0
+                ),
+                headers={
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'GaiaValidator/1.0'
+                }
+            )
+            self._should_close_client = True
+            
+        # Concurrency control
+        self._request_semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
+        self._retry_delays = [1, 2, 4, 8, 16]  # Exponential backoff delays
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.client.aclose()
+        if self._should_close_client:
+            await self.client.aclose()
 
     async def send_data(self, data: Dict[str, Any]) -> None:
         """
-        Send detailed data to the Gaia server.
+        Send detailed data to the Gaia server with improved retry logic and concurrency control.
 
         Args:
             data: Dictionary containing payload to be sent.
         """
         current_thread = threading.current_thread().name
-        max_retries = 3
-        base_delay = 1
 
         if not self._validate_payload(data):
             logger.error(f"| {current_thread} | ❗ Invalid payload structure: {data}")
             return
 
-        # Validate and convert numeric values in geomagnetic predictions
-        if data.get("geomagneticPredictions"):
-            valid_predictions = []
-            for prediction in data["geomagneticPredictions"]:
+        # Validate numeric values in predictions
+        data = self._validate_predictions(data)
+        if not data:
+            logger.error(f"| {current_thread} | ❗ No valid predictions after validation")
+            return
+
+        async with self._request_semaphore:  # Control concurrent requests
+            for attempt, delay in enumerate(self._retry_delays):
                 try:
-                    # Check all required numeric fields
-                    numeric_fields = [
-                        "geomagneticPredictedValue",
-                        "geomagneticGroundTruthValue",
-                        "geomagneticScore"
+                    response = await self.client.post(self.endpoint, json=data)
+                    
+                    if response.is_success:
+                        logger.info(f"| {current_thread} | ✅ Data sent to Gaia successfully")
+                        return
+                    
+                    if response.status_code == 429:  # Rate limit
+                        if attempt < len(self._retry_delays) - 1:
+                            logger.warning(f"| {current_thread} | Rate limit hit, retrying in {delay}s...")
+                            await asyncio.sleep(delay)
+                            continue
+                    
+                    # Log error details
+                    try:
+                        error_details = response.json()
+                    except ValueError:
+                        error_details = response.text
+                    
+                    logger.warning(f"| {current_thread} | ❗ HTTP error {response.status_code}: {error_details}")
+                    if attempt < len(self._retry_delays) - 1:
+                        await asyncio.sleep(delay)
+                        continue
+                    break
+                    
+                except httpx.RequestError as e:
+                    logger.warning(f"| {current_thread} | ❗ Request error: {str(e)}")
+                    if attempt < len(self._retry_delays) - 1:
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
+                except Exception as e:
+                    logger.error(f"| {current_thread} | ❗ Unexpected error: {str(e)}")
+                    raise
+
+    def _validate_predictions(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Validate and clean prediction data."""
+        try:
+            # Handle geomagnetic predictions
+            if data.get("geomagneticPredictions"):
+                valid_predictions = []
+                for prediction in data["geomagneticPredictions"]:
+                    try:
+                        numeric_fields = [
+                            "geomagneticPredictedValue",
+                            "geomagneticGroundTruthValue",
+                            "geomagneticScore"
+                        ]
+                        
+                        is_valid = True
+                        for field in numeric_fields:
+                            value = prediction.get(field)
+                            try:
+                                float_value = float(value)
+                                if math.isnan(float_value) or math.isinf(float_value):
+                                    is_valid = False
+                                    break
+                                prediction[field] = float_value
+                            except (ValueError, TypeError):
+                                is_valid = False
+                                break
+                        
+                        if is_valid:
+                            valid_predictions.append(prediction)
+                        
+                    except Exception as e:
+                        logger.error(f"Error validating prediction: {e}")
+                        continue
+                
+                data["geomagneticPredictions"] = valid_predictions
+
+            # Handle soil moisture predictions
+            if data.get("soilMoisturePredictions"):
+                for prediction in data["soilMoisturePredictions"]:
+                    # Validate and format bounds
+                    bounds = prediction.get("sentinelRegionBounds")
+                    if isinstance(bounds, list) and len(bounds) == 4:
+                        prediction["sentinelRegionBounds"] = f"[{','.join(map(str, bounds))}]"
+                    elif not isinstance(bounds, str) or not bounds:
+                        prediction["sentinelRegionBounds"] = "[]"
+                    
+                    # Validate CRS
+                    crs = prediction.get("sentinelRegionCrs")
+                    if not isinstance(crs, int):
+                        prediction["sentinelRegionCrs"] = 4326
+
+                    # Validate array fields
+                    array_fields = [
+                        "soilSurfacePredictedValues",
+                        "soilRootzonePredictedValues",
+                        "soilSurfaceGroundTruthValues",
+                        "soilRootzoneGroundTruthValues"
                     ]
                     
-                    is_valid = True
-                    for field in numeric_fields:
+                    for field in array_fields:
                         value = prediction.get(field)
-                        try:
-                            float_value = float(value)
-                            if math.isnan(float_value) or math.isinf(float_value):
-                                is_valid = False
-                                logger.warning(f"Invalid {field}: {value} (NaN or Inf)")
-                                break
-                            prediction[field] = float_value
-                        except (ValueError, TypeError):
-                            is_valid = False
-                            logger.warning(f"Invalid {field}: {value} (not convertible to float)")
-                            break
-                    
-                    if is_valid:
-                        valid_predictions.append(prediction)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing prediction: {e}")
-                    continue
-            
-            # Replace original predictions with only valid ones
-            data["geomagneticPredictions"] = valid_predictions
-            if not valid_predictions:
-                logger.warning("No valid geomagnetic predictions after filtering")
+                        if isinstance(value, (list, np.ndarray)):
+                            prediction[field] = str(value).replace('array(', '').replace(')', '')
+                        elif not isinstance(value, str):
+                            prediction[field] = "[]"
 
-        if data.get("soilMoisturePredictions"):
-            for prediction in data["soilMoisturePredictions"]:
-                bounds = prediction.get("sentinelRegionBounds")
-                if isinstance(bounds, list) and len(bounds) == 4:
-                    prediction["sentinelRegionBounds"] = f"[{','.join(map(str, bounds))}]"
-                elif not isinstance(bounds, str) or not bounds:
-                    prediction["sentinelRegionBounds"] = "[]"
-                
-                crs = prediction.get("sentinelRegionCrs")
-                if not isinstance(crs, int):
-                    prediction["sentinelRegionCrs"] = 4326
+            return data
 
-                array_fields = [
-                    "soilSurfacePredictedValues",
-                    "soilRootzonePredictedValues",
-                    "soilSurfaceGroundTruthValues",
-                    "soilRootzoneGroundTruthValues"
-                ]
-                
-                for field in array_fields:
-                    value = prediction.get(field)
-                    if isinstance(value, (list, np.ndarray)):
-                        prediction[field] = str(value).replace('array(', '').replace(')', '')
-                    elif not isinstance(value, str):
-                        prediction[field] = "[]"
-
-
-        for attempt in range(max_retries):
-            try:
-                response = await self.client.post(self.endpoint, json=data)
-                
-                if response.is_success:
-                    logger.info(f"| {current_thread} | ✅ Data sent to Gaia successfully")
-                    return
-                
-                if response.status_code == 429:
-                    delay = base_delay * (2 ** attempt)
-                    logger.warning(f"| {current_thread} | Rate limit hit, retrying in {delay}s...")
-                    await asyncio.sleep(delay)
-                    continue
-                
-                try:
-                    error_details = response.json()
-                except ValueError:
-                    error_details = response.text
-                
-                logger.warning(f"| {current_thread} | ❗ HTTP error {response.status_code}: {error_details}")
-                
-            except httpx.RequestError as e:
-                logger.warning(f"| {current_thread} | ❗ Error sending data to Gaia API: {str(e)}")
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
-                    await asyncio.sleep(delay)
-                    continue
-                raise
+        except Exception as e:
+            logger.error(f"Error in prediction validation: {e}")
+            return None
 
     def _validate_payload(self, data: Dict[str, Any]) -> bool:
-        """
-        Validate the payload structure against the API schema.
-
-        Args:
-            data: Payload to validate.
-
-        Returns:
-            bool: True if valid, False otherwise.
-        """
+        """Validate the payload structure."""
         required_fields = ["minerHotKey", "minerColdKey", "geomagneticPredictions", "soilMoisturePredictions"]
+        
+        # Check required fields
         for field in required_fields:
             if field not in data:
                 logger.error(f"Missing required field: {field}")
                 return False
 
+        # Validate prediction arrays
         if not isinstance(data.get("geomagneticPredictions", []), list):
             logger.error("Invalid data type for geomagneticPredictions: Must be a list")
             return False

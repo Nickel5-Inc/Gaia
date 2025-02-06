@@ -22,6 +22,12 @@ class ValidatorMonitor:
         self.log_dir = "/root/.pm2/logs"
         self.log_prefix = "gaia-validator-out-0"
         self.freeze_threshold = 300
+        self.resource_thresholds = {
+            'open_files': 1000,  # Max number of open files
+            'connections': 100,  # Max number of network connections
+            'memory_mb': 1024,   # Max memory usage in MB
+            'cpu_percent': 80    # Max CPU usage percentage
+        }
         os.makedirs(self.dump_dir, exist_ok=True)
         logger.info("Initialized ValidatorMonitor with freeze threshold: %d seconds", self.freeze_threshold)
 
@@ -149,6 +155,79 @@ class ValidatorMonitor:
             logger.error("Error restarting validator: %s", str(e))
             return False
 
+    def check_resource_usage(self):
+        """Check for potential resource leaks and high usage."""
+        try:
+            if not self.validator_pid:
+                return False
+
+            process = psutil.Process(self.validator_pid)
+            
+            # Check open files
+            open_files = process.open_files()
+            if len(open_files) > self.resource_thresholds['open_files']:
+                logger.warning(f"High number of open files: {len(open_files)}")
+                self._log_resource_warning('open_files', open_files)
+                
+            # Check network connections
+            connections = process.connections()
+            if len(connections) > self.resource_thresholds['connections']:
+                logger.warning(f"High number of network connections: {len(connections)}")
+                self._log_resource_warning('connections', connections)
+                
+            # Check memory usage
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / 1024 / 1024
+            if memory_mb > self.resource_thresholds['memory_mb']:
+                logger.warning(f"High memory usage: {memory_mb:.2f} MB")
+                self._log_resource_warning('memory', memory_info)
+                
+            # Check CPU usage
+            cpu_percent = process.cpu_percent()
+            if cpu_percent > self.resource_thresholds['cpu_percent']:
+                logger.warning(f"High CPU usage: {cpu_percent}%")
+                self._log_resource_warning('cpu', cpu_percent)
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error checking resource usage: {e}")
+            return False
+
+    def _log_resource_warning(self, resource_type, details):
+        """Log detailed resource warning information."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        warning_file = f"{self.dump_dir}/resource_warning_{resource_type}_{timestamp}.txt"
+        
+        try:
+            with open(warning_file, 'w') as f:
+                f.write(f"=== Resource Warning: {resource_type} ===\n")
+                f.write(f"Timestamp: {timestamp}\n")
+                f.write(f"Process ID: {self.validator_pid}\n\n")
+                
+                if resource_type == 'open_files':
+                    f.write("Open Files:\n")
+                    for file in details:
+                        f.write(f"  {file.path}\n")
+                        
+                elif resource_type == 'connections':
+                    f.write("Network Connections:\n")
+                    for conn in details:
+                        f.write(f"  {conn}\n")
+                        
+                elif resource_type == 'memory':
+                    f.write("Memory Information:\n")
+                    for key, value in details._asdict().items():
+                        f.write(f"  {key}: {value}\n")
+                        
+                elif resource_type == 'cpu':
+                    f.write(f"CPU Usage: {details}%\n")
+                
+            logger.info(f"Resource warning logged to {warning_file}")
+            
+        except Exception as e:
+            logger.error(f"Error logging resource warning: {e}")
+
     def run(self):
         logger.info("Starting ValidatorMonitor")
         while True:
@@ -164,6 +243,9 @@ class ValidatorMonitor:
                     self.dump_process_state()
                     logger.warning("Restarting frozen validator process")
                     self.restart_validator()
+                
+                # Check resource usage
+                self.check_resource_usage()
                 
                 time.sleep(10)
 

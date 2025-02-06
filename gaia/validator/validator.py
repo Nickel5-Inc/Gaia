@@ -74,8 +74,35 @@ class GaiaValidator:
         self.current_block = 0
         self.nodes = {}
 
+        # Initialize HTTP clients first
+        # Client for miner communication with SSL verification disabled
+        self.miner_client = httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            verify=False,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30,
+            ),
+            transport=httpx.AsyncHTTPTransport(retries=3),
+        )
+        # Client for API communication with SSL verification enabled
+        self.api_client = httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30,
+            ),
+            transport=httpx.AsyncHTTPTransport(retries=3),
+        )
+
+        # Now create MinerScoreSender with the initialized api_client
         self.miner_score_sender = MinerScoreSender(database_manager=self.database_manager,
-                                                   loop=asyncio.get_event_loop())
+                                                   loop=asyncio.get_event_loop(),
+                                                   api_client=self.api_client)
 
         self.last_successful_weight_set = time.time()
         self.last_successful_dereg_check = time.time()
@@ -169,18 +196,6 @@ class GaiaValidator:
         self.db_check_interval = 300  # 5 minutes
         self.metagraph_sync_interval = 300  # 5 minutes
         self.max_consecutive_errors = 3
-        self.httpx_client = httpx.AsyncClient(
-            timeout=30.0,
-            follow_redirects=True,
-            verify=False,
-            limits=httpx.Limits(
-                max_connections=100,
-                max_keepalive_connections=20,
-                keepalive_expiry=30,
-            ),
-            transport=httpx.AsyncHTTPTransport(retries=3),
-        )
-
         self.watchdog_running = False
 
         # Setup signal handlers for graceful shutdown
@@ -213,64 +228,48 @@ class GaiaValidator:
                 loop.run_until_complete(self._initiate_shutdown())
 
     async def _initiate_shutdown(self):
-        """Initiate graceful shutdown sequence."""
+        """Handle graceful shutdown of the validator."""
         if self._cleanup_done:
-            logger.info("Cleanup already done, skipping")
+            logger.info("Cleanup already completed")
             return
-            
+
         try:
             logger.info("Initiating graceful shutdown...")
+            
+            # Set shutdown event first to prevent new operations
             self._shutdown_event.set()
             
-            # Stop accepting new tasks
-            logger.info("Stopping task acceptance...")
-            await self.update_task_status('all', 'stopping')
+            # Stop the watchdog if running
+            if self.watchdog_running:
+                await self.stop_watchdog()
+                logger.info("Stopped watchdog")
             
-            # Cancel any running tasks in the main loop
-            for task in asyncio.all_tasks():
-                if task != asyncio.current_task():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as e:
-                        logger.error(f"Error cancelling task: {e}")
-            
-            # Wait briefly for operations to complete
-            await asyncio.sleep(5)
-            
-            # Cleanup resources
+            # Stop any running tasks
+            for task_name in ['soil', 'geomagnetic']:
+                try:
+                    await self.update_task_status(task_name, 'stopping')
+                except Exception as e:
+                    logger.error(f"Error updating {task_name} task status: {e}")
+
+            # Clean up all resources
             await self.cleanup_resources()
             
-            # Stop the watchdog
-            await self.stop_watchdog()
-            
-            # Close database connections
-            if hasattr(self, 'database_manager'):
-                logger.info("Closing database connections...")
-                await self.database_manager.close()
+            # Final cleanup steps
+            try:
+                # Force final garbage collection
+                import gc
+                gc.collect()
+                logger.info("Completed final garbage collection")
+            except Exception as e:
+                logger.error(f"Error during final garbage collection: {e}")
             
             self._cleanup_done = True
-            
-            # Create cleanup completion flag file
-            cleanup_file = "/tmp/validator_cleanup_done"
-            try:
-                with open(cleanup_file, 'w') as f:
-                    f.write(str(time.time()))
-                logger.info("Created cleanup completion flag")
-            except Exception as e:
-                logger.error(f"Failed to create cleanup flag file: {e}")
-            
             logger.info("Graceful shutdown completed")
             
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
             logger.error(traceback.format_exc())
-        finally:
-            # Only exit if not in a running event loop
-            if not asyncio.get_event_loop().is_running():
-                sys.exit(0)
+            # Don't raise here - we want to complete as much cleanup as possible
 
     def setup_neuron(self) -> bool:
         """
@@ -341,7 +340,7 @@ class GaiaValidator:
         raise TypeError(f"Type {type(obj)} not serializable")
 
     async def query_miners(self, payload: Dict, endpoint: str) -> Dict:
-        """Query miners with the given payload."""
+        """Query miners with the given payload in parallel."""
         try:
             logger.info(f"Querying miners with payload size: {len(str(payload))} bytes")
             if "data" in payload and "combined_data" in payload["data"]:
@@ -359,68 +358,91 @@ class GaiaValidator:
                 miners_to_query = {k: miners_to_query[k] for k in hotkeys}
                 logger.info(f"Test mode: Selected {len(miners_to_query)} random miners to query")
 
-            for miner_hotkey, node in miners_to_query.items():
-                base_url = f"https://{node.ip}:{node.port}"
+            # Create a shared client with optimized connection pooling
+            limits = httpx.Limits(max_keepalive_connections=20, max_connections=30, keepalive_expiry=30.0)
+            async with httpx.AsyncClient(verify=False, timeout=30.0, limits=limits) as client:
+                # Use semaphore to control concurrent requests
+                semaphore = asyncio.Semaphore(10)  # Limit concurrent requests to 10
 
-                try:
-                    symmetric_key_str, symmetric_key_uuid = await asyncio.wait_for(
-                        handshake.perform_handshake(
-                            keypair=self.keypair,
-                            httpx_client=self.httpx_client,
-                            server_address=base_url,
-                            miner_hotkey_ss58_address=miner_hotkey,
-                        ),
-                        timeout=30.0
-                    )
+                async def query_single_miner(miner_hotkey: str, node: Any) -> Optional[Dict]:
+                    """Query a single miner with proper handshake and error handling."""
+                    base_url = f"https://{node.ip}:{node.port}"
+                    try:
+                        async with semaphore:  # Control concurrency
+                            logger.info(f"Initiating handshake with miner {miner_hotkey} at {base_url}")
+                            # Perform handshake with timeout
+                            symmetric_key_str, symmetric_key_uuid = await asyncio.wait_for(
+                                handshake.perform_handshake(
+                                    keypair=self.keypair,
+                                    httpx_client=client,  # Use shared client
+                                    server_address=base_url,
+                                    miner_hotkey_ss58_address=miner_hotkey,
+                                ),
+                                timeout=30.0
+                            )
 
-                    if symmetric_key_str and symmetric_key_uuid:
-                        logger.info(f"Handshake successful with miner {miner_hotkey}")
-                        fernet = Fernet(symmetric_key_str)
+                            if not symmetric_key_str or not symmetric_key_uuid:
+                                logger.warning(f"Failed handshake with miner {miner_hotkey}")
+                                return None
 
-                        resp = await asyncio.wait_for(
-                            vali_client.make_non_streamed_post(
-                                httpx_client=self.httpx_client,
-                                server_address=base_url,
-                                fernet=fernet,
-                                keypair=self.keypair,
-                                symmetric_key_uuid=symmetric_key_uuid,
-                                validator_ss58_address=self.keypair.ss58_address,
-                                miner_ss58_address=miner_hotkey,
-                                payload=payload,
-                                endpoint=endpoint,
-                            ),
-                            timeout=180.0
-                        )
+                            logger.info(f"Handshake successful with miner {miner_hotkey}")
+                            fernet = Fernet(symmetric_key_str)
 
-                        response_data = {
-                            "text": resp.text,
-                            "hotkey": miner_hotkey,
-                            "port": node.port,
-                            "ip": node.ip,
-                        }
-                        responses[miner_hotkey] = response_data
-                        logger.info(f"Completed request to {miner_hotkey}")
+                            # Make request with timeout using vali_client
+                            logger.info(f"Sending request to miner {miner_hotkey} at {base_url}{endpoint}")
+                            resp = await asyncio.wait_for(
+                                vali_client.make_non_streamed_post(
+                                    httpx_client=client,
+                                    server_address=base_url,
+                                    fernet=fernet,
+                                    keypair=self.keypair,
+                                    symmetric_key_uuid=symmetric_key_uuid,
+                                    validator_ss58_address=self.keypair.ss58_address,
+                                    miner_ss58_address=miner_hotkey,
+                                    payload=payload,
+                                    endpoint=endpoint,
+                                ),
+                                timeout=180.0
+                            )
+
+                            response_data = {
+                                "text": resp.text,
+                                "hotkey": miner_hotkey,
+                                "port": node.port,
+                                "ip": node.ip,
+                            }
+                            logger.info(f"Successfully received response from miner {miner_hotkey}")
+                            return response_data
+
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Timeout querying miner {miner_hotkey} at {base_url}")
+                        return None
+                    except Exception as e:
+                        logger.warning(f"Failed request to miner {miner_hotkey} at {base_url}: {str(e)}")
+                        return None
+
+                # Query all miners in parallel with shared client
+                tasks = []
+                for hotkey, node in miners_to_query.items():
+                    if node.ip and node.port:  # Only query miners with valid IP/port
+                        tasks.append(query_single_miner(hotkey, node))
                     else:
-                        logger.warning(f"Failed handshake with miner {miner_hotkey}")
+                        logger.warning(f"Skipping miner {hotkey} - missing IP or port")
 
-                except asyncio.TimeoutError as e:
-                    logger.warning(f"Timeout for miner {miner_hotkey}: {e}")
-                    continue
-                except httpx.HTTPStatusError as e:
-                    logger.warning(f"HTTP error from miner {miner_hotkey}: {e}")
-                    continue
-                except httpx.RequestError as e:
-                    logger.warning(f"Request error from miner {miner_hotkey}: {e}")
-                    continue
-                except Exception as e:
-                    logger.error(f"Error with miner {miner_hotkey}: {e}")
-                    logger.error(f"Error details: {traceback.format_exc()}")
-                    continue
+                # Gather responses with timeout
+                miner_responses = await asyncio.gather(*tasks, return_exceptions=True)
 
+                # Process responses
+                for hotkey, response in zip(miners_to_query.keys(), miner_responses):
+                    if response is not None and not isinstance(response, Exception):
+                        responses[hotkey] = response
+
+            logger.info(f"Received {len(responses)} valid responses from miners")
             return responses
 
         except Exception as e:
-            logger.error(f"Error in query_miners: {str(e)}")
+            logger.error(f"Error querying miners: {e}")
+            logger.error(traceback.format_exc())
             return {}
 
     async def check_for_updates(self):
@@ -648,105 +670,53 @@ class GaiaValidator:
             logger.warning(f"Slow metagraph sync: {sync_duration:.2f}s")
 
     async def cleanup_resources(self):
-        """Clean up resources used by the validator."""
-        logger.info("Starting comprehensive resource cleanup")
-        
+        """Clean up any resources used by the validator during recovery."""
         try:
-            # 1. Clean up temporary files
-            temp_dir = "/tmp"
-            temp_patterns = ["*.h5", "*.tif", "*.tiff", "*.tmp", "*.temp"]
-            for pattern in temp_patterns:
-                try:
-                    for f in glob.glob(os.path.join(temp_dir, pattern)):
-                        try:
-                            os.unlink(f)
-                            logger.debug(f"Cleaned up temp file: {f}")
-                        except Exception as e:
-                            logger.error(f"Failed to remove temp file {f}: {e}")
-                except Exception as e:
-                    logger.error(f"Error cleaning up {pattern} files: {e}")
-
-            # 2. Clean up task resources
-            for task_name in ['soil', 'geomagnetic']:
-                try:
-                    if task_name == 'soil':
-                        await self.soil_task.cleanup_resources()
-                    elif task_name == 'geomagnetic':
-                        await self.geomagnetic_task.cleanup_resources()
-                except Exception as e:
-                    logger.error(f"Error cleaning up {task_name} task resources: {e}")
-
-            # 3. Clean up database resources
-            try:
-                # Reset any hanging operations using database manager methods
-                update_queries = [
-                    "UPDATE soil_moisture_predictions SET status = 'pending' WHERE status = 'processing'",
-                    "UPDATE geomagnetic_predictions SET status = 'pending' WHERE status = 'processing'",
-                    "UPDATE score_table SET status = 'pending' WHERE status = 'processing'"
-                ]
-                
-                for query in update_queries:
-                    await self.database_manager.execute(query)
-                
-                logger.info("Reset hanging database operations")
-                
-                # Reset connection pool
-                await self.database_manager.reset_pool()
-                logger.info("Reset database connection pool")
-                
-            except Exception as e:
-                logger.error(f"Error cleaning up database resources: {e}")
-                logger.error(traceback.format_exc())
-
-            # 4. Clean up task states
-            for task_name, health in self.task_health.items():
-                try:
-                    health['status'] = 'idle'
-                    health['current_operation'] = None
-                    health['operation_start'] = None
-                    health['errors'] = 0
-                    health['resources'] = {
-                        'memory_start': 0,
-                        'memory_peak': 0,
-                        'cpu_percent': 0,
-                        'open_files': 0,
-                        'threads': 0,
-                        'last_update': None
-                    }
-                except Exception as e:
-                    logger.error(f"Error resetting task state for {task_name}: {e}")
-
-            # 5. Force garbage collection
-            try:
-                import gc
-                gc.collect()
-                logger.info("Forced garbage collection")
-            except Exception as e:
-                logger.error(f"Error during garbage collection: {e}")
-
-            # 6. Clean up HTTP client
-            try:
-                await self.httpx_client.aclose()
-                self.httpx_client = httpx.AsyncClient(
-                    timeout=30.0,
-                    follow_redirects=True,
-                    verify=False,
-                    limits=httpx.Limits(
-                        max_connections=100,
-                        max_keepalive_connections=20,
-                        keepalive_expiry=30,
-                    ),
-                    transport=httpx.AsyncHTTPTransport(retries=3),
+            # First clean up database resources
+            if hasattr(self, 'database_manager'):
+                await self.database_manager.execute(
+                    """
+                    UPDATE geomagnetic_predictions 
+                    SET status = 'pending'
+                    WHERE status = 'processing'
+                    """
                 )
-                logger.info("Reset HTTP client")
-            except Exception as e:
-                logger.error(f"Error resetting HTTP client: {e}")
+                logger.info("Reset in-progress prediction statuses")
+                
+                await self.database_manager.execute(
+                    """
+                    DELETE FROM score_table 
+                    WHERE task_name = 'geomagnetic' 
+                    AND status = 'processing'
+                    """
+                )
+                logger.info("Cleaned up incomplete scoring operations")
+                
+                # Close database connections
+                await self.database_manager.close_all_connections()
+                logger.info("Closed database connections")
 
+            # Clean up HTTP clients
+            if hasattr(self, 'miner_client') and self.miner_client and not self.miner_client.is_closed:
+                await self.miner_client.aclose()
+                logger.info("Closed miner HTTP client")
+            
+            if hasattr(self, 'api_client') and self.api_client and not self.api_client.is_closed:
+                await self.api_client.aclose()
+                logger.info("Closed API HTTP client")
+
+            # Clean up task-specific resources
+            if hasattr(self, 'miner_score_sender'):
+                if hasattr(self.miner_score_sender, 'cleanup'):
+                    await self.miner_score_sender.cleanup()
+                logger.info("Cleaned up miner score sender resources")
+            
             logger.info("Completed resource cleanup")
-
+            
         except Exception as e:
             logger.error(f"Error during resource cleanup: {e}")
             logger.error(traceback.format_exc())
+            raise
 
     async def recover_task(self, task_name: str):
         """Enhanced task recovery with specific handling for each task type."""
@@ -802,11 +772,26 @@ class GaiaValidator:
             await self.database_manager.initialize_database()
             logger.info("Database tables initialized.")
 
-            logger.info("Setting up HTTP client...")
-            self.httpx_client = httpx.AsyncClient(
-                timeout=30.0, follow_redirects=True, verify=False
-            )
-            logger.info("HTTP client setup complete.")
+            logger.info("Checking HTTP clients...")
+            # Only create clients if they don't exist or are closed
+            if not hasattr(self, 'miner_client') or self.miner_client.is_closed:
+                self.miner_client = httpx.AsyncClient(
+                    timeout=30.0, follow_redirects=True, verify=False
+                )
+                logger.info("Created new miner client")
+            if not hasattr(self, 'api_client') or self.api_client.is_closed:
+                self.api_client = httpx.AsyncClient(
+                    timeout=30.0,
+                    follow_redirects=True,
+                    limits=httpx.Limits(
+                        max_connections=100,
+                        max_keepalive_connections=20,
+                        keepalive_expiry=30,
+                    ),
+                    transport=httpx.AsyncHTTPTransport(retries=3),
+                )
+                logger.info("Created new API client")
+            logger.info("HTTP clients ready.")
 
             logger.info("Updating miner table...")
             await self.update_miner_table()
