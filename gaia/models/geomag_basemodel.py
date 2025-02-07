@@ -98,9 +98,9 @@ class FallbackGeoMagModel:
             # Handle NaN/Inf values
             if np.isnan(result) or np.isinf(result) or not -1000 < float(result) < 1000:
                 logger.warning(f"Invalid prediction value: {result}, using input value")
-                return float(df["y"].iloc[-1])
+                return float(df["y"].iloc[-1]) / 100 # Normalize the fallback
 
-            return float(result)
+            return float(result) / 100 # Normalize the prediction to (-5, 5)
 
         except Exception as e:
             logger.error(f"Error during prediction: {e}")
@@ -228,9 +228,9 @@ class GeoMagBaseModel:
             # Handle NaN/Inf values
             if np.isnan(result) or np.isinf(result) or not -1000 < float(result) < 1000:
                 logger.warning(f"Invalid prediction value: {result}, using input value")
-                return float(df["y"].iloc[-1])
+                return float(df["y"].iloc[-1]) / 100 # Normalize the fallback
 
-            return float(result)
+            return float(result) / 100 # Normalize the prediction to (-5, 5)
 
         except Exception as e:
             logger.error(f"Error during prediction: {e}")
@@ -241,4 +241,4 @@ class GeoMagBaseModel:
                 else df["y"].iloc[-1] if "df" in locals() else 0.0
             )
             logger.error(f"Using input value as fallback: {fallback_value}")
-            return float(fallback_value)
+            return float(fallback_value) / 100 # Normalize the fallback value

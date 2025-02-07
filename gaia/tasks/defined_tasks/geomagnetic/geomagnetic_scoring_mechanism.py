@@ -48,11 +48,14 @@ class GeomagneticScoringMechanism(ScoringMechanism):
             return float("nan")
 
         try:
-            # Normalize the actual value to the same scale as the prediction
-            actual_value = actual_value / 100.0
+
+            # Validate that the prediction is within the normalized range (-5, 5)
+            if not (-5 <= predicted_value <= 5):
+                logger.warning(f"Out-of-range prediction: {predicted_value}. Expected range: (-5, 5).")
+                return 0.0  # Penalize invalid predictions
 
             # Calculate the score
-            return 1 / (1 + abs(predicted_value - actual_value))
+            return max(0, 1 - abs(predicted_value - actual_value))
         except Exception as e:
             logger.error(f"Error calculating score: {e}")
             return float("nan")
@@ -173,6 +176,7 @@ class GeomagneticScoringMechanism(ScoringMechanism):
         try:
             if not isinstance(predictions, list) or not isinstance(ground_truth, (int, float)):
                 raise ValueError("Invalid predictions or ground truth format.")
+
 
             miner_scores = []
             for prediction in predictions:

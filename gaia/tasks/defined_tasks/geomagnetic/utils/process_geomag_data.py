@@ -66,6 +66,9 @@ def clean_data(df):
     # Exclude future timestamps (ensure strictly less than current time)
     df = df[df["timestamp"] < now]
 
+    # Normalize Dst values to the range (-5, 5)
+    df["Dst"] = df["Dst"] / 100
+
     # Reset index
     return df.reset_index(drop=True)
 

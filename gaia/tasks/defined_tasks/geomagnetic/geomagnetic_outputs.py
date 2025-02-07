@@ -73,6 +73,10 @@ class GeomagneticOutputs(Outputs):
         if not all(isinstance(p, (int, float)) for p in predictions):
             raise ValueError("All predictions must be numeric.")
 
+        # Ensure predictions are within the range (-5, 5)
+        if not all(-5 <= p <= 5 for p in predictions):
+            raise ValueError("All predictions must be in the range (-5, 5).")
+
         # Validate metadata
         metadata = outputs.get("metadata")
         if not isinstance(metadata, dict):
