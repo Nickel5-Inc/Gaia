@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import requests
 import xarray as xr
-from pyproj import Transformer
+from pyproj import Transformer, CRS
 from skimage.transform import resize
 from tqdm import tqdm
 import shutil
@@ -183,42 +183,45 @@ def get_smap_data(datetime_obj, regions):
             surface_data = ds["sm_surface"].values
             rootzone_data = ds["sm_rootzone"].values
 
+            ease2_crs = CRS.from_epsg(6933)
+            smap_y_size, smap_x_size = surface_data.shape
+            smap_y_range = (-7314540.11, 7314540.11)
+            smap_x_range = (-17367530.45, 17367530.45)
+
             for i, region in enumerate(regions):
                 bounds = region["bounds"]
                 crs = region["crs"]
 
                 if crs != "EPSG:4326":
-                    transformer = Transformer.from_crs(
-                        crs, "EPSG:4326", always_xy=True
-                    )
-                    left, bottom = transformer.transform(bounds[0], bounds[1])
-                    right, top = transformer.transform(bounds[2], bounds[3])
+                    to_wgs84 = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+                    left, bottom = to_wgs84.transform(bounds[0], bounds[1])
+                    right, top = to_wgs84.transform(bounds[2], bounds[3])
                 else:
                     left, bottom, right, top = bounds
 
-                smap_y_size, smap_x_size = surface_data.shape
-                smap_lat_range = (-85.0445, 85.0445)
-                smap_lon_range = (-180, 180)
+                to_ease2 = Transformer.from_crs("EPSG:4326", ease2_crs, always_xy=True)
+                ease2_bounds = to_ease2.transform_bounds(left, bottom, right, top)
+                ease2_left, ease2_bottom, ease2_right, ease2_top = ease2_bounds
 
                 y_idx_start = int(
-                    (smap_lat_range[1] - top)
+                    (smap_y_range[1] - ease2_top)
                     * smap_y_size
-                    / (smap_lat_range[1] - smap_lat_range[0])
+                    / (smap_y_range[1] - smap_y_range[0])
                 )
                 y_idx_end = int(
-                    (smap_lat_range[1] - bottom)
+                    (smap_y_range[1] - ease2_bottom)
                     * smap_y_size
-                    / (smap_lat_range[1] - smap_lat_range[0])
+                    / (smap_y_range[1] - smap_y_range[0])
                 )
                 x_idx_start = int(
-                    (left - smap_lon_range[0])
+                    (ease2_left - smap_x_range[0])
                     * smap_x_size
-                    / (smap_lon_range[1] - smap_lon_range[0])
+                    / (smap_x_range[1] - smap_x_range[0])
                 )
                 x_idx_end = int(
-                    (right - smap_lon_range[0])
+                    (ease2_right - smap_x_range[0])
                     * smap_x_size
-                    / (smap_lon_range[1] - smap_lon_range[0])
+                    / (smap_x_range[1] - smap_x_range[0])
                 )
 
                 y_idx_start = max(0, min(y_idx_start, smap_y_size))
@@ -238,14 +241,15 @@ def get_smap_data(datetime_obj, regions):
                     "rootzone_sm": rootzone_roi,
                     "bounds": {
                         "original": bounds,
-                        "transformed": (left, bottom, right, top),
+                        "transformed": ease2_bounds,
                     },
                     "shape": surface_roi.shape,
                 }
 
                 print(f"\nRegion {i}:")
                 print(f"Extracted shape: {surface_roi.shape}")
-                print(f"Bounds: {bounds}")
+                print(f"Original bounds: {bounds}")
+                print(f"EASE2 bounds: {ease2_bounds}")
 
         return results
 
