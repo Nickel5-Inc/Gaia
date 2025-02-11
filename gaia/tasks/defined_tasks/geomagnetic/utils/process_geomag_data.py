@@ -72,7 +72,6 @@ def clean_data(df):
     # Reset index
     return df.reset_index(drop=True)
 
-
 async def get_latest_geomag_data(include_historical=False):
     """
     Fetch, parse, clean, and return the latest valid geomagnetic data point.
@@ -96,11 +95,8 @@ async def get_latest_geomag_data(include_historical=False):
         if not cleaned_df.empty:
             latest_data_point = cleaned_df.iloc[-1]
             timestamp = latest_data_point["timestamp"]
-            dst_value = int(
-                latest_data_point["Dst"]
-            )  # Convert to native int for JSON compatibility
+            dst_value = float(latest_data_point["Dst"])
         else:
-            # If no valid data available
             return "N/A", "N/A", None
 
         # If historical data is requested, filter the DataFrame for the current month
