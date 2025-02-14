@@ -1371,7 +1371,6 @@ class GaiaValidator:
         try:
             block = self.substrate.get_block()
             block_number = int(block["header"]["number"])
-            logger.info(f"Last weights block number type: {type(block_number)}, value: {block_number}")
             self.last_set_weights_block = block_number
         except Exception as e:
             logger.error(f"Error updating last weights block: {e}")
