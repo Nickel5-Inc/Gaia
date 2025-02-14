@@ -929,12 +929,9 @@ class GaiaValidator:
                             self.substrate, 
                             self.netuid
                         )
-                        logger.info(f"min_interval type: {type(min_interval)}, value: {min_interval}")
                         if min_interval is not None:
                             min_interval = int(min_interval)
-                        current_block = int(self.substrate.get_block()["header"]["number"])
-                        logger.info(f"Current block number type: {type(current_block)}, value: {current_block}")
-                        
+                        current_block = int(self.substrate.get_block()["header"]["number"])                        
                         if current_block - self.last_set_weights_block < min_interval:
                             logger.info(f"Recently set weights {current_block - self.last_set_weights_block} blocks ago")
                             await self.update_task_status('scoring', 'idle', 'waiting')
