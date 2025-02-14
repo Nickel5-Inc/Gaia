@@ -910,7 +910,6 @@ class GaiaValidator:
                             return False
 
                         validator_uid = int(validator_uid)
-                        logger.info(f"Validator UID type: {type(validator_uid)}, value: {validator_uid}")
                         last_updated_value = self.substrate.query(
                             "SubtensorModule",
                             "LastUpdate",
