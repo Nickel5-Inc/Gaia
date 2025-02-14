@@ -312,12 +312,40 @@ class GaiaValidator:
                 self.wallet_name, self.hotkey_name
             )
 
+            original_query = SubstrateInterface.query
+            def query_wrapper(self, module, storage_function, params, block_hash=None):
+                result = original_query(self, module, storage_function, params, block_hash)
+                if hasattr(result, 'value'):
+                    if isinstance(result.value, list):
+                        result.value = [int(x) if hasattr(x, '__int__') else x for x in result.value]
+                    elif hasattr(result.value, '__int__'):
+                        result.value = int(result.value)
+                return result
+            
+            SubstrateInterface.query = query_wrapper
+
+            original_blocks_since = w.blocks_since_last_update
+            def blocks_since_wrapper(substrate, netuid, node_id):
+                current_block = int(substrate.get_block()["header"]["number"])
+                last_updated_value = substrate.query(
+                    "SubtensorModule",
+                    "LastUpdate",
+                    [netuid]
+                ).value
+                if last_updated_value is None or node_id >= len(last_updated_value):
+                    return None
+                last_update = int(last_updated_value[node_id])
+                return current_block - last_update
+            
+            w.blocks_since_last_update = blocks_since_wrapper
+
             self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
             self.metagraph = Metagraph(substrate=self.substrate, netuid=self.netuid)
             self.metagraph.sync_nodes()  # Sync nodes after initialization
             logger.info(f"Synced {len(self.metagraph.nodes)} nodes from the network")
 
-            self.current_block = self.substrate.get_block()["header"]["number"]
+            self.current_block = int(self.substrate.get_block()["header"]["number"])
+            logger.info(f"Initial block number type: {type(self.current_block)}, value: {self.current_block}")
             self.last_set_weights_block = self.current_block - 300
 
 
@@ -881,21 +909,28 @@ class GaiaValidator:
                             await self.update_task_status('scoring', 'error')
                             return False
 
-                        blocks_since_update = w.blocks_since_last_update(
-                            self.substrate, 
-                            self.netuid, 
-                            validator_uid
-                        )
+                        validator_uid = int(validator_uid)
+                        last_updated_value = self.substrate.query(
+                            "SubtensorModule",
+                            "LastUpdate",
+                            [self.netuid]
+                        ).value
+                        if last_updated_value is not None and validator_uid < len(last_updated_value):
+                            last_updated = int(last_updated_value[validator_uid])
+                            current_block = int(self.substrate.get_block()["header"]["number"])
+                            blocks_since_update = current_block - last_updated
+                            logger.info(f"Calculated blocks since update: {blocks_since_update} (current: {current_block}, last: {last_updated})")
+                        else:
+                            blocks_since_update = None
+                            logger.warning("Could not determine last update value")
 
                         min_interval = w.min_interval_to_set_weights(
                             self.substrate, 
                             self.netuid
                         )
-
-                            
-                        # Get current block number synchronously
-                        current_block = self.substrate.get_block()["header"]["number"]
-                        
+                        if min_interval is not None:
+                            min_interval = int(min_interval)
+                        current_block = int(self.substrate.get_block()["header"]["number"])                        
                         if current_block - self.last_set_weights_block < min_interval:
                             logger.info(f"Recently set weights {current_block - self.last_set_weights_block} blocks ago")
                             await self.update_task_status('scoring', 'idle', 'waiting')
@@ -1335,7 +1370,8 @@ class GaiaValidator:
     async def update_last_weights_block(self):
         try:
             block = self.substrate.get_block()
-            self.last_set_weights_block = block["header"]["number"]
+            block_number = int(block["header"]["number"])
+            self.last_set_weights_block = block_number
         except Exception as e:
             logger.error(f"Error updating last weights block: {e}")
 
