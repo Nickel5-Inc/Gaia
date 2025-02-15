@@ -36,11 +36,11 @@ class Scoring:
             if math.isnan(geo_score) and math.isnan(soil_score):
                 weights[idx] = 0.0
             elif math.isnan(geo_score):
-                weights[idx] = 0.5 * soil_score
+                weights[idx] = 0.75 * soil_score
             elif math.isnan(soil_score):
-                weights[idx] = 0.5 * math.exp(-abs(geo_score) / 10)
+                weights[idx] = 0.25 * math.exp(-abs(geo_score) / 10)
             else:
                 geo_normalized = math.exp(-abs(geo_score) / 10)
-                weights[idx] = 0.5 * geo_normalized + 0.5 * soil_score
+                weights[idx] = 0.25 * geo_normalized + 0.75 * soil_score
                 
         return weights
