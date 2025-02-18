@@ -57,7 +57,10 @@ async def deploy_all_tasks(tasks: List[Task]) -> Dict[str, Deployment]:
     deployments = {}
     
     async def deploy_task(task: Task):
-        deployment = await create_deployment(task)
+        if task.name == "GeomagneticTask":
+            deployment = await create_geomagnetic_deployment(task)
+        else:
+            deployment = await create_deployment(task)
         await deployment.apply()
         return task.name, deployment
     
@@ -176,4 +179,30 @@ async def create_soil_moisture_deployments(task: Task) -> List[Deployment]:
     )
     deployments.append(score_deployment)
     
-    return deployments 
+    return deployments
+
+async def create_geomagnetic_deployment(task: Task) -> Deployment:
+    """Create deployment for geomagnetic validator task."""
+    config = get_schedule_config('geomagnetic_task')
+    
+    deployment = Deployment.build_from_flow(
+        flow=task.geo_validator_workflow,
+        name="geomagnetic_validator",
+        schedule=CronSchedule(cron=config.cron, timezone="UTC"),
+        tags=["geomagnetic", "validator"],
+        infrastructure=Process(
+            env={
+                "PREFECT_LOGGING_LEVEL": "INFO",
+                "PYTHONPATH": os.getcwd()
+            },
+            working_dir=os.getcwd(),
+            cpu_limit=config.cpu_limit,
+            memory_limit=config.memory_limit
+        ),
+        work_queue_name=config.queue_name,
+        work_pool_name="local-process-pool",
+        retries=config.max_retries,
+        retry_delay_seconds=int(config.retry_delay.total_seconds())
+    )
+    
+    return deployment 

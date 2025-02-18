@@ -58,9 +58,18 @@ class GaiaValidator:
         """
         Initialize the GaiaValidator with provided arguments.
         """
+        # Load environment variables first
+        load_dotenv(".env")
         self.args = args
+        self.netuid = None
+        self.subtensor_chain_endpoint = None
+        self.subtensor_network = None
+        self.substrate = None
         self.metagraph = None
-        self.config = None
+        self.wallet_name = getattr(self.args, "wallet", None) or os.getenv("WALLET_NAME", "default")
+        self.hotkey_name = getattr(self.args, "hotkey", None) or os.getenv("HOTKEY_NAME", "default")
+        self.keypair = None
+
         self.database_manager = ValidatorDatabaseManager()
         self.soil_task = SoilValidatorTask(
             db_manager=self.database_manager,
@@ -281,27 +290,41 @@ class GaiaValidator:
         Set up the neuron with necessary configurations and connections.
         """
         try:
+            # Load environment variables first
             load_dotenv(".env")
+            
+            # Set up network configuration
             self.netuid = (
                 self.args.netuid if self.args.netuid else int(os.getenv("NETUID", 237))
             )
             logger.info(f"Using netuid: {self.netuid}")
 
-            self.subtensor_chain_endpoint = (
-                self.args.subtensor.chain_endpoint
-                if hasattr(self.args, "subtensor")
-                   and hasattr(self.args.subtensor, "chain_endpoint")
-                else os.getenv(
-                    "SUBTENSOR_ADDRESS", "wss://test.finney.opentensor.ai:443/"
+            # In test mode, force test network settings
+            if self.args.test:
+                self.subtensor_network = "test"
+                self.subtensor_chain_endpoint = "wss://test.finney.opentensor.ai:443/"
+                logger.info("Test mode: Using test network settings")
+            else:
+                # For production, use args or env vars with fallbacks
+                self.subtensor_chain_endpoint = (
+                    self.args.subtensor.chain_endpoint
+                    if hasattr(self.args, "subtensor") and hasattr(self.args.subtensor, "chain_endpoint")
+                    else os.getenv("SUBTENSOR_ADDRESS")
                 )
-            )
 
-            self.subtensor_network = (
-                self.args.subtensor.network
-                if hasattr(self.args, "subtensor")
-                   and hasattr(self.args.subtensor, "network")
-                else os.getenv("SUBTENSOR_NETWORK", "test")
-            )
+                self.subtensor_network = (
+                    self.args.subtensor.network
+                    if hasattr(self.args, "subtensor") and hasattr(self.args.subtensor, "network")
+                    else os.getenv("SUBTENSOR_NETWORK")
+                )
+
+                # Validate network settings
+                if not self.subtensor_chain_endpoint or not self.subtensor_network:
+                    logger.error("Missing required network settings. Please set SUBTENSOR_ADDRESS and SUBTENSOR_NETWORK in .env or provide --chain_endpoint and --network arguments")
+                    return False
+
+            logger.info(f"Using network: {self.subtensor_network}")
+            logger.info(f"Using chain endpoint: {self.subtensor_chain_endpoint}")
 
             self.wallet_name = (
                 self.args.wallet
@@ -313,20 +336,70 @@ class GaiaValidator:
                 if self.args.hotkey
                 else os.getenv("HOTKEY_NAME", "default")
             )
+            
+            # Load keypair
             self.keypair = chain_utils.load_hotkey_keypair(
                 self.wallet_name, self.hotkey_name
             )
+            if self.keypair is None:
+                logger.error(f"Failed to load keypair for wallet: {self.wallet_name}, hotkey: {self.hotkey_name}")
+                return False
 
-            self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
-            self.metagraph = Metagraph(substrate=self.substrate, netuid=self.netuid)
-            self.metagraph.sync_nodes()  # Sync nodes after initialization
-            logger.info(f"Synced {len(self.metagraph.nodes)} nodes from the network")
+            try:
+                self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
+                logger.info(f"Connected to substrate at {self.subtensor_chain_endpoint}")
 
-            self.current_block = self.substrate.get_block()["header"]["number"]
-            self.last_set_weights_block = self.current_block - 300
+                original_query = SubstrateInterface.query
+                def query_wrapper(self, module, storage_function, params, block_hash=None):
+                    result = original_query(self, module, storage_function, params, block_hash)
+                    if hasattr(result, 'value'):
+                        if isinstance(result.value, list):
+                            result.value = [int(x) if hasattr(x, '__int__') else x for x in result.value]
+                        elif hasattr(result.value, '__int__'):
+                            result.value = int(result.value)
+                    return result
+                
+                SubstrateInterface.query = query_wrapper
 
+                original_blocks_since = w.blocks_since_last_update
+                def blocks_since_wrapper(substrate, netuid, node_id):
+                    current_block = int(substrate.get_block()["header"]["number"])
+                    last_updated_value = substrate.query(
+                        "SubtensorModule",
+                        "LastUpdate",
+                        [netuid]
+                    ).value
+                    if last_updated_value is None or node_id >= len(last_updated_value):
+                        return None
+                    last_update = int(last_updated_value[node_id])
+                    return current_block - last_update
+                
+                w.blocks_since_last_update = blocks_since_wrapper
+
+            except Exception as e:
+                logger.error(f"Failed to connect to substrate: {e}")
+                return False
+
+            # Set up and sync metagraph
+            try:
+                self.metagraph = Metagraph(substrate=self.substrate, netuid=self.netuid)
+                self.metagraph.sync_nodes()  # Sync nodes after initialization
+                logger.info(f"Synced {len(self.metagraph.nodes)} nodes from the network")
+            except Exception as e:
+                logger.error(f"Failed to initialize metagraph: {e}")
+                return False
+
+            # Set initial block values
+            try:
+                self.current_block = int(self.substrate.get_block()["header"]["number"])
+                self.last_set_weights_block = self.current_block - 300
+                logger.info(f"Initial block number type: {type(self.current_block)}, value: {self.current_block}")
+            except Exception as e:
+                logger.error(f"Failed to get current block: {e}")
+                return False
 
             return True
+
         except Exception as e:
             logger.error(f"Error setting up neuron: {e}")
             logger.error(traceback.format_exc())
@@ -830,8 +903,7 @@ class GaiaValidator:
                     self.flows.core_flow(self),
                     self.main_scoring(),
                     # perform_update(self),
-                    self.miner_score_sender.run(),
-                    self.geomagnetic_task.execute_flow(self),
+                    #self.miner_score_sender.run(),
                     self.soil_task.validator_execute(self)
                 )
             except asyncio.CancelledError:
@@ -866,6 +938,11 @@ class GaiaValidator:
                 
                 async def scoring_cycle():
                     try:
+                        if self.substrate is None or self.keypair is None:
+                            logger.error("Substrate connection or keypair not initialized")
+                            await self.update_task_status('scoring', 'error')
+                            return False
+
                         validator_uid = self.substrate.query(
                             "SubtensorModule", 
                             "Uids", 
@@ -873,31 +950,40 @@ class GaiaValidator:
                         ).value
                         
                         if validator_uid is None:
-                            logger.error("Validator not found on chain")
+                            logger.error(f"Validator not found on chain. Network: {self.subtensor_network}, Netuid: {self.netuid}")
                             await self.update_task_status('scoring', 'error')
                             return False
 
-                        blocks_since_update = w.blocks_since_last_update(
-                            self.substrate, 
-                            self.netuid, 
-                            validator_uid
-                        )
+                        validator_uid = int(validator_uid)
+                        last_updated_value = self.substrate.query(
+                            "SubtensorModule",
+                            "LastUpdate",
+                            [self.netuid]
+                        ).value
+                        if last_updated_value is not None and validator_uid < len(last_updated_value):
+                            last_updated = int(last_updated_value[validator_uid])
+                            current_block = int(self.substrate.get_block()["header"]["number"])
+                            blocks_since_update = current_block - last_updated
+                            logger.info(f"Calculated blocks since update: {blocks_since_update} (current: {current_block}, last: {last_updated})")
+                        else:
+                            blocks_since_update = None
+                            logger.warning("Could not determine last update value")
 
                         min_interval = w.min_interval_to_set_weights(
                             self.substrate, 
                             self.netuid
                         )
 
-                            
-                        # Get current block number synchronously
-                        current_block = self.substrate.get_block()["header"]["number"]
+                        if min_interval is not None:
+                            min_interval = int(min_interval)
+
+                        current_block = int(self.substrate.get_block()["header"]["number"])
                         
                         if current_block - self.last_set_weights_block < min_interval:
                             logger.info(f"Recently set weights {current_block - self.last_set_weights_block} blocks ago")
                             await self.update_task_status('scoring', 'idle', 'waiting')
                             return True
 
-                        # Only enter weight_setting state when actually setting weights
                         if (min_interval is None or 
                             (blocks_since_update is not None and blocks_since_update >= min_interval)):
                             
@@ -910,14 +996,12 @@ class GaiaValidator:
                             if can_set:
                                 await self.update_task_status('scoring', 'processing', 'weight_setting')
                                 
-                                # Calculate weights with timeout
                                 normalized_weights = await asyncio.wait_for(
                                     self._calc_task_weights(),
                                     timeout=120
                                 )
                                 
                                 if normalized_weights:
-                                    # Set weights with timeout
                                     success = await asyncio.wait_for(
                                         weight_setter.set_weights(normalized_weights),
                                         timeout=480
@@ -929,7 +1013,6 @@ class GaiaValidator:
                                         logger.info("✅ Successfully set weights")
                                         await self.update_task_status('scoring', 'idle')
                                         
-                                        # Clean up any stale operations
                                         await self.database_manager.cleanup_stale_operations('score_table')
                         else:
                             logger.info(
@@ -974,18 +1057,15 @@ class GaiaValidator:
                 current_time_utc = datetime.now(timezone.utc)
                 formatted_time = current_time_utc.strftime("%Y-%m-%d %H:%M:%S")
 
+                blocks_since_weights = 0  # Initialize to avoid UnboundLocalError
+
                 try:
                     block = self.substrate.get_block()
                     self.current_block = block["header"]["number"]
-                    blocks_since_weights = (
-                            self.current_block - self.last_set_weights_block
-                    )
+                    blocks_since_weights = self.current_block - self.last_set_weights_block
                 except Exception as block_error:
-
                     try:
-                        self.substrate = SubstrateInterface(
-                            url=self.subtensor_chain_endpoint
-                        )
+                        self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
                     except Exception as e:
                         logger.error(f"Failed to reconnect to substrate: {e}")
 
@@ -1140,6 +1220,7 @@ class GaiaValidator:
 
                 # Periodic sleep (5 minutes)
                 await asyncio.sleep(300)
+                
                 
             except Exception as e:
                 logger.error(f"Error in deregistration loop: {str(e)}")
@@ -1359,23 +1440,43 @@ class GaiaValidator:
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-
     subtensor_group = parser.add_argument_group("subtensor")
 
     parser.add_argument("--wallet", type=str, help="Name of the wallet to use")
     parser.add_argument("--hotkey", type=str, help="Name of the hotkey to use")
     parser.add_argument("--netuid", type=int, help="Netuid to use")
-    subtensor_group.add_argument(
-        "--subtensor.chain_endpoint", type=str, help="Subtensor chain endpoint to use"
-    )
-
     parser.add_argument(
         "--test",
         action="store_true",
         help="Run tasks in test mode - runs immediately and with limited scope",
     )
+    
+    # Add subtensor group arguments
+    subtensor_group.add_argument(
+        "--chain_endpoint", type=str, help="Subtensor chain endpoint to use"
+    )
+    subtensor_group.add_argument(
+        "--network", type=str, help="Subtensor network to connect to"
+    )
 
     args = parser.parse_args()
+    
+    # Create a namespace for subtensor args to maintain compatibility
+    class SubtensorArgs:
+        def __init__(self, chain_endpoint=None, network=None):
+            self.chain_endpoint = chain_endpoint
+            self.network = network
+    
+    args.subtensor = SubtensorArgs(
+        chain_endpoint=args.chain_endpoint if hasattr(args, 'chain_endpoint') else None,
+        network=args.network if hasattr(args, 'network') else None
+    )
+    
+    # Clean up the original attributes to prevent confusion
+    if hasattr(args, 'chain_endpoint'):
+        delattr(args, 'chain_endpoint')
+    if hasattr(args, 'network'):
+        delattr(args, 'network')
 
     validator = GaiaValidator(args)
     asyncio.run(validator.main())

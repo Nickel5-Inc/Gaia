@@ -3,82 +3,137 @@
 This module provides utilities for parallel execution using Prefect's Dask integration.
 """
 
-from typing import Optional
-from contextlib import contextmanager
-from prefect import flow
-from prefect_dask import DaskTaskRunner, get_dask_client
-
-from gaia.parallel.config.settings import TaskType, LocalResourceConfig, get_resource_config
+from typing import Optional, Dict
+from contextlib import asynccontextmanager
+from distributed import LocalCluster, Client
+from prefect_dask import DaskTaskRunner
+from datetime import timedelta
+import asyncio
+import atexit
+import multiprocessing
+from multiprocessing import freeze_support
 from fiber.logging_utils import get_logger
+from gaia.parallel.config.settings import TaskType, LocalResourceConfig
 
 logger = get_logger(__name__)
 
-def get_dask_runner(task_type: TaskType, config: Optional[LocalResourceConfig] = None) -> DaskTaskRunner:
-    """Get a Dask task runner configured for the task type.
+class SharedDaskExecutor:
+    """
+    Manages a shared Dask cluster for all validator tasks.
+    Implements resource pools for different task types.
+    """
+    _instance = None
+    _cluster: Optional[LocalCluster] = None
+    _client: Optional[Client] = None
+    _runners: Dict[TaskType, DaskTaskRunner] = {}
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if not hasattr(self, '_initialized'):
+            self._initialized = True
+            if multiprocessing.get_start_method(allow_none=True) != 'fork':
+                multiprocessing.set_start_method('fork', force=True)
+            self._setup_cluster()
+            atexit.register(self.cleanup)
+
+    def _setup_cluster(self):
+        """Initialize the shared Dask cluster with resource pools."""
+        if self._cluster is None:
+            try:
+                self._cluster = LocalCluster(
+                    n_workers=4,
+                    threads_per_worker=2,
+                    memory_limit='4GB',
+                    dashboard_address=':0',
+                    lifetime=timedelta(hours=1),
+                    lifetime_stagger='5 minutes',
+                    lifetime_restart=True,
+                    processes=True,
+                    protocol='tcp://',
+                    scheduler_port=0,
+                    silence_logs='WARNING',
+                    resources={
+                        'io': 8,
+                        'cpu': 4,
+                        'memory': 4
+                    }
+                )
+                
+                self._client = Client(self._cluster)
+                logger.info(
+                    f"Initialized shared Dask cluster - "
+                    f"Dashboard: {self._cluster.dashboard_link}"
+                )
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize Dask cluster: {e}")
+                raise
+
+    def get_runner(self, task_type: TaskType) -> DaskTaskRunner:
+        """Get a task runner configured for specific task type."""
+        if task_type not in self._runners:
+            config = {
+                TaskType.IO_BOUND: {
+                    'minimum': 1,
+                    'maximum': 8
+                },
+                TaskType.CPU_BOUND: {
+                    'minimum': 1,
+                    'maximum': 4
+                },
+                TaskType.MEMORY_BOUND: {
+                    'minimum': 1,
+                    'maximum': 2
+                },
+                TaskType.MIXED: {
+                    'minimum': 1,
+                    'maximum': 4
+                }
+            }[task_type]
+            
+            self._runners[task_type] = DaskTaskRunner(
+                cluster=self._cluster,
+                adapt_kwargs=config
+            )
+            
+        return self._runners[task_type]
+
+    def cleanup(self):
+        """Clean up cluster resources."""
+        if self._client:
+            self._client.close()
+        if self._cluster:
+            self._cluster.close()
+
+_executor = None
+
+def get_executor() -> SharedDaskExecutor:
+    """Get the global shared executor instance."""
+    global _executor
+    if _executor is None:
+        _executor = SharedDaskExecutor()
+    return _executor
+
+def get_task_runner(task_type: TaskType) -> DaskTaskRunner:
+    """Get a task runner for the specified task type.
     
     Args:
-        task_type: Type of task to be executed
-        config: Optional custom resource configuration
+        task_type: Type of task to get runner for
         
     Returns:
-        Configured DaskTaskRunner with appropriate settings for the task type
+        DaskTaskRunner: Configured task runner instance
     """
-    resource_config = config or get_resource_config(task_type)
-    
-    cluster_kwargs = {
-        "n_workers": resource_config.max_workers,
-        "processes": not resource_config.thread_mode,
-        "threads_per_worker": 2 if resource_config.thread_mode else 1,
-        "memory_limit": "4GB"
-    }
-    
-    return DaskTaskRunner(cluster_kwargs=cluster_kwargs)
+    executor = get_executor()
+    return executor.get_runner(task_type)
 
-@contextmanager
-def parallel_context(task_type: TaskType):
-    """Context manager for parallel execution using Dask.
-    
-    Args:
-        task_type: Type of task to be executed
-        
-    Example:
-        @task
-        def process_data(df):
-            with parallel_context(TaskType.CPU_BOUND):
-                result = df.compute()
-            return result
-    """
-    with get_dask_client() as client:
-        yield client
+def initialize_dask():
+    """Initialize Dask with proper process handling."""
+    freeze_support()
+    return get_executor()
 
-def parallel_flow(task_type: TaskType, **flow_kwargs):
-    """Decorator to create a parallel flow using Dask task runner.
-    
-    Args:
-        task_type: Type of task to be executed
-        **flow_kwargs: Additional kwargs for the Prefect flow decorator
-        
-    Returns:
-        Decorated flow that runs with Dask parallelization
-        
-    Example:
-        @task
-        def read_data(path: str) -> dask.dataframe.DataFrame:
-            return dask.dataframe.read_parquet(path)
-            
-        @task
-        def process_data(df: dask.dataframe.DataFrame):
-            with parallel_context(TaskType.CPU_BOUND):
-                result = df.groupby('column').mean().compute()
-            return result
-            
-        @parallel_flow(TaskType.CPU_BOUND)
-        def analysis_flow():
-            df = read_data.submit("data.parquet")
-            result = process_data.submit(df)
-            return result
-    """
-    def decorator(func):
-        runner = get_dask_runner(task_type)
-        return flow(task_runner=runner, **flow_kwargs)(func)
-    return decorator 
+if __name__ == "__main__":
+    initialize_dask() 

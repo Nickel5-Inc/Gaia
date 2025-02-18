@@ -32,7 +32,7 @@ from gaia.tasks.defined_tasks.soilmoisture.validator.soil_validator_preprocessin
 from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import (
     get_soil_data_parallel_flow
 )
-from gaia.parallel.core.executor import get_dask_runner, parallel_context
+from gaia.parallel.core.executor import get_task_runner
 from gaia.parallel.config.settings import TaskType
 from fiber.logging_utils import get_logger
 
@@ -131,15 +131,24 @@ class SoilValidatorTask(BaseTask):
 
     @task(
         name="get_next_preparation_time",
-        retries=2,                    
-        retry_delay_seconds=10,       
-        timeout_seconds=60,           
+        retries=2,
+        retry_delay_seconds=10,
+        timeout_seconds=60,
         description="Calculate the next preparation window start time",
-        cache_policy=None  # I did this to avoid serialization issues with database manager
+        cache_policy=None  # Disable caching
     )
-    def get_next_preparation_time(self, current_time: datetime) -> datetime:
+    async def get_next_preparation_time(self, current_time: datetime) -> datetime:
         """Get the next preparation window start time."""
-        windows = self.get_validator_windows()
+        windows = [
+            (1, 30, 2, 0),  # Prep window for 1:30 SMAP time
+            (2, 0, 2, 30),  # Execution window for 1:30 SMAP time
+            (9, 30, 10, 0),  # Prep window for 7:30 SMAP time
+            (10, 0, 10, 30),  # Execution window for 7:30 SMAP time
+            (13, 30, 14, 0),  # Prep window for 13:30 SMAP time
+            (14, 0, 14, 30),  # Execution window for 13:30 SMAP time
+            (19, 30, 20, 0),  # Prep window for 19:30 SMAP time
+            (20, 0, 20, 30),  # Execution window for 19:30 SMAP time
+        ]
         current_mins = current_time.hour * 60 + current_time.minute
 
         for start_hr, start_min, _, _ in windows:
@@ -160,227 +169,38 @@ class SoilValidatorTask(BaseTask):
         retries=3,
         retry_delay_seconds=300,
         timeout_seconds=14400,
-        description="Execute the validator task",
-        task_runner=get_dask_runner(
-            task_type=TaskType.MIXED
-        )
+        description="Execute the validator task"
     )
     async def validator_execute(self, validator):
-        """Execute validator workflow."""
-        if not hasattr(self, "db_manager") or self.db_manager is None:
-            self.db_manager = validator.db_manager
-
-        await self.ensure_retry_columns_exist()
-        
-        while True:
-            try:
-                await validator.update_task_status('soil', 'active')
-                current_time = datetime.now(timezone.utc)
-
-                # Check for scoring every 5 minutes
-                if current_time.minute % 5 == 0:
-                    await validator.update_task_status('soil', 'processing', 'scoring')
-                    await self.validator_score()
-                    await asyncio.sleep(60)
-                    continue
-
-                if self.test_mode:
-                    logger.info("Running in test mode - bypassing window checks")
-                    target_smap_time = self.get_smap_time_for_validator(current_time)
-                    ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
-
-                    # Clear old regions in test mode
-                    await self._clear_old_regions()
-                    logger.info("Cleared old/scored regions in test mode")
-
-                    await validator.update_task_status('soil', 'processing', 'data_download')
-                    # Get regions first
-                    query = """
-                        SELECT * FROM soil_moisture_regions 
-                        WHERE status = 'pending'
-                        AND target_time = :target_time
-                    """
-                    regions = await self.db_manager.fetch_all(query, {"target_time": target_smap_time})
+        """Execute the main validator workflow."""
+        try:
+            while not validator._shutdown_event.is_set():
+                try:
+                    await self.ensure_retry_columns_exist()
                     
-                    if regions:
-                        # Process regions in parallel
-                        region_bboxes = [json.loads(region['bbox']) for region in regions]
-                        logger.info(f"Processing {len(region_bboxes)} regions in parallel")
-                        
-                        # Use our new parallel processing function
-                        results = await get_soil_data_parallel_flow(region_bboxes, ifs_forecast_time)
-                        
-                        # Process results and update database
-                        for region, (output_file, sentinel_bounds, sentinel_crs) in zip(regions, results):
-                            if output_file:
-                                try:
-                                    with open(output_file, 'rb') as f:
-                                        combined_data = f.read()
-                                    
-                                    update_query = """
-                                        UPDATE soil_moisture_regions 
-                                        SET combined_data = :combined_data,
-                                            sentinel_bounds = :sentinel_bounds,
-                                            sentinel_crs = :sentinel_crs,
-                                            status = 'processed'
-                                        WHERE id = :region_id
-                                    """
-                                    await self.db_manager.execute(
-                                        update_query,
-                                        {
-                                            "combined_data": combined_data,
-                                            "sentinel_bounds": sentinel_bounds,
-                                            "sentinel_crs": sentinel_crs,
-                                            "region_id": region['id']
-                                        }
-                                    )
-                                    logger.info(f"Successfully processed region {region['id']}")
-                                except Exception as e:
-                                    logger.error(f"Error processing region {region['id']}: {str(e)}")
-                                    continue
-
-                    # In test mode, attempt to score immediately
-                    logger.info("Test mode: Attempting immediate scoring")
-                    await self.validator_score()
+                    current_time = datetime.now(timezone.utc)
                     
-                    logger.info("Test mode execution complete. Re-running in 10 mins")
-                    await validator.update_task_status('soil', 'idle')
-                    await asyncio.sleep(600)
-                    continue
-
-                current_window = self.get_validator_windows(current_time)
-                
-                if not current_window:
-                    next_time = self.get_next_preparation_time(current_time)
-                    sleep_seconds = min(
-                        300,  # Cap at 5 minutes
-                        (next_time - current_time).total_seconds()
-                    )
-                    logger.info(f"Not in any preparation or execution window: {current_time}")
-                    logger.info(f"Next soil task time: {next_time}")
-                    logger.info(f"Sleeping for {sleep_seconds} seconds")
-                    await validator.update_task_status('soil', 'idle')
-                    await asyncio.sleep(sleep_seconds)
-                    continue
-                
-                is_prep = current_window[1] == 30  # If minutes = 30, it's a prep window
-                target_smap_time = self.get_smap_time_for_validator(current_time)
-                ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
-
-                if is_prep:
-                    await validator.update_task_status('soil', 'processing', 'data_download')
-                    # Get regions first
-                    query = """
-                        SELECT * FROM soil_moisture_regions 
-                        WHERE status = 'pending'
-                        AND target_time = :target_time
-                    """
-                    regions = await self.db_manager.fetch_all(query, {"target_time": target_smap_time})
+                    # Handle preparation window
+                    await self._handle_prep_window(current_time)
                     
-                    if regions:
-                        # Process regions in parallel
-                        region_bboxes = [json.loads(region['bbox']) for region in regions]
-                        logger.info(f"Processing {len(region_bboxes)} regions in parallel")
-                        
-                        # Use our new parallel processing function
-                        results = await get_soil_data_parallel_flow(region_bboxes, ifs_forecast_time)
-                        
-                        # Process results and update database
-                        for region, (output_file, sentinel_bounds, sentinel_crs) in zip(regions, results):
-                            if output_file:
-                                try:
-                                    with open(output_file, 'rb') as f:
-                                        combined_data = f.read()
-                                    
-                                    update_query = """
-                                        UPDATE soil_moisture_regions 
-                                        SET combined_data = :combined_data,
-                                            sentinel_bounds = :sentinel_bounds,
-                                            sentinel_crs = :sentinel_crs,
-                                            status = 'processed'
-                                        WHERE id = :region_id
-                                    """
-                                    await self.db_manager.execute(
-                                        update_query,
-                                        {
-                                            "combined_data": combined_data,
-                                            "sentinel_bounds": sentinel_bounds,
-                                            "sentinel_crs": sentinel_crs,
-                                            "region_id": region['id']
-                                        }
-                                    )
-                                    logger.info(f"Successfully processed region {region['id']}")
-                                except Exception as e:
-                                    logger.error(f"Error processing region {region['id']}: {str(e)}")
-                                    continue
-                else:
-                    # Handle execution window - query miners for processed regions
-                    query = """
-                        SELECT * FROM soil_moisture_regions 
-                        WHERE status = 'processed'
-                        AND target_time = :target_time
-                    """
-                    regions = await self.db_manager.fetch_all(query, {"target_time": target_smap_time})
+                    # Handle execution window
+                    await self._handle_execution_window(current_time)
                     
-                    if regions:
-                        for region in regions:
-                            try:
-                                await validator.update_task_status('soil', 'processing', 'miner_query')
-                                combined_data = region["combined_data"]
-                                
-                                if not isinstance(combined_data, bytes):
-                                    logger.error(f"Region {region['id']} has invalid data type")
-                                    continue
-                                    
-                                encoded_data = base64.b64encode(combined_data)
-                                task_data = {
-                                    "region_id": region["id"],
-                                    "combined_data": encoded_data.decode("ascii"),
-                                    "sentinel_bounds": region["sentinel_bounds"],
-                                    "sentinel_crs": region["sentinel_crs"],
-                                    "target_time": target_smap_time.isoformat()
-                                }
-                                
-                                payload = {"nonce": str(uuid4()), "data": task_data}
-                                responses = await validator.query_miners(
-                                    payload=payload,
-                                    endpoint="/soilmoisture-request"
-                                )
-                                
-                                if responses:
-                                    metadata = {
-                                        "region_id": region["id"],
-                                        "target_time": target_smap_time,
-                                        "data_collection_time": current_time,
-                                        "ifs_forecast_time": ifs_forecast_time,
-                                        "sentinel_bounds": region["sentinel_bounds"],
-                                        "sentinel_crs": region["sentinel_crs"]
-                                    }
-                                    await self.add_task_to_queue(responses, metadata)
-                                    
-                                    # Update region status
-                                    update_query = """
-                                        UPDATE soil_moisture_regions 
-                                        SET status = 'sent_to_miners'
-                                        WHERE id = :region_id
-                                    """
-                                    await self.db_manager.execute(update_query, {"region_id": region["id"]})
-                                    
-                            except Exception as e:
-                                logger.error(f"Error processing region {region['id']}: {str(e)}")
-                                continue
+                    if self.test_mode:
+                        await asyncio.sleep(300)
+                    else:
+                        await asyncio.sleep(30)
 
-                # Clean up old regions
-                await self._clear_old_regions()
-                
-                if not self.test_mode:
-                    await asyncio.sleep(60)
-                
-            except Exception as e:
-                logger.error(f"Error in validator_execute: {str(e)}")
-                logger.error(traceback.format_exc())
-                await validator.update_task_status('soil', 'error')
-                await asyncio.sleep(60)
+                except Exception as e:
+                    logger.error(f"Error in execution cycle: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    await validator.update_task_status('soil', 'error')
+                    await asyncio.sleep(30)
+
+        except Exception as e:
+            logger.error(f"Error in validator_execute: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
     @flow(
         name="soil_moisture_prep_flow",
@@ -389,22 +209,38 @@ class SoilValidatorTask(BaseTask):
         timeout_seconds=1800
     )
     async def _handle_prep_window(self, current_time: datetime):
-        """Handle preparation window tasks."""
+        """Handle the preparation window for soil moisture tasks."""
         try:
-            target_smap_time = self.get_smap_time_for_validator(current_time)
-            ifs_forecast_time = self.get_ifs_time_for_smap(target_smap_time)
+            task_runner = get_task_runner(TaskType.IO_BOUND)
             
-            await self.validator_preprocessing.get_daily_regions(
-                target_time=target_smap_time,
-                ifs_forecast_time=ifs_forecast_time
-            )
+            next_prep_time = await self.get_next_preparation_time(current_time)
+            if next_prep_time is None:
+                return
+            
+            regions = await self.get_todays_regions(next_prep_time)
+            if not regions:
+                logger.info("No regions to process in preparation window")
+                return
+            
+            futures = []
+            for region in regions:
+                future = task_runner.submit(
+                    self._process_region,
+                    region,
+                    next_prep_time,
+                    current_time,
+                    key=f"process_region_{region['id']}_{next_prep_time.isoformat()}"
+                )
+                futures.append(future)
+            
+            results = await asyncio.gather(*futures)
+            logger.info(f"Processed {len(results)} regions in preparation window")
             
         except Exception as e:
-            error_msg = f"Error in preparation window: {str(e)}"
-            logger.error(error_msg)
+            logger.error(f"Error in preparation window: {str(e)}")
             logger.error(traceback.format_exc())
-            raise RuntimeError(error_msg) from e
-            
+            raise
+
     @flow(
         name="soil_moisture_execute_flow",
         retries=3,
@@ -412,41 +248,82 @@ class SoilValidatorTask(BaseTask):
         timeout_seconds=1800
     )
     async def _handle_execution_window(self, current_time: datetime):
-        """Handle execution window tasks."""
+        """Handle the execution window for soil moisture tasks."""
         try:
-            target_smap_time = self.get_smap_time_for_validator(current_time)
+            task_runner = get_task_runner(TaskType.CPU_BOUND)
             
-            query = """
-                SELECT * FROM soil_moisture_regions 
-                WHERE status = 'pending'
-                AND target_time = :target_time
-            """
-            regions = await self.db_manager.fetch_all(query, {"target_time": target_smap_time})
-            
-            if not regions:
-                logger.info("No pending regions found")
+            # Get pending tasks
+            tasks = await self.get_pending_tasks()
+            if not tasks:
+                logger.info("No pending tasks to process")
                 return
-                
-            for region in regions:
-                try:
-                    await self._process_region(region, target_smap_time, current_time)
-                except Exception as e:
-                    logger.error(f"Error processing region {region['id']}: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    continue
-                    
-        except Exception as e:
-            error_msg = f"Error in execution window: {str(e)}"
-            logger.error(error_msg)
-            logger.error(traceback.format_exc())
-            raise RuntimeError(error_msg) from e
             
+            futures = []
+            for task in tasks:
+                future = task_runner.submit(
+                    self._process_prediction,
+                    task["prediction"],
+                    task,
+                    task["smap_data"],
+                    key=f"process_prediction_{task['id']}_{current_time.isoformat()}"
+                )
+                futures.append(future)
+            
+            results = await asyncio.gather(*futures)
+            logger.info(f"Processed {len(results)} predictions in execution window")
+            
+        except Exception as e:
+            logger.error(f"Error in execution window: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+    @flow(
+        name="soil_moisture_scoring_flow",
+        retries=3,
+        retry_delay_seconds=300,
+        timeout_seconds=7200
+    )
+    async def validator_score(self):
+        """Score soil moisture predictions."""
+        try:
+            task_runner = get_task_runner(TaskType.CPU_BOUND)
+            
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            scoring_time = current_time - self.scoring_delay
+            
+            # Get tasks ready for scoring
+            tasks = await self.get_tasks_for_scoring(scoring_time)
+            if not tasks:
+                logger.info("No tasks ready for scoring")
+                return
+            
+            futures = []
+            for task in tasks:
+                future = task_runner.submit(
+                    self.score_task,
+                    task,
+                    key=f"score_task_{task['id']}_{current_time.isoformat()}"
+                )
+                futures.append(future)
+            
+            results = await asyncio.gather(*futures)
+            logger.info(f"Scored {len(results)} tasks")
+            
+            # Build score row
+            await self.build_score_row(scoring_time, results)
+            
+        except Exception as e:
+            logger.error(f"Error in scoring flow: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
     @task(
         name="process_region",
         retries=4,                    # 4 retries for individual region processing
         retry_delay_seconds=60,       # 1 minute delay between retries
         timeout_seconds=1800,         # 30 minute timeout per region
-        description="Process a single region"
+        description="Process a single region",
+        cache_policy=None  # Disable caching
     )
     async def _process_region(self, region: Dict, target_time: datetime, current_time: datetime):
         """Process a single region.
@@ -492,7 +369,8 @@ class SoilValidatorTask(BaseTask):
         retries=2,                    # 2 retries for validation
         retry_delay_seconds=15,       # 15 second delay between retries
         timeout_seconds=180,          # 3 minute timeout for validation
-        description="Validate region data format and contents"
+        description="Validate region data format and contents",
+        cache_policy=None  # Disable caching
     )
     async def _validate_region_data(self, region: Dict):
         """Validate region data format and contents.
@@ -519,7 +397,8 @@ class SoilValidatorTask(BaseTask):
         retries=3,                    # 3 retries since encoding rarely fails
         retry_delay_seconds=30,       # 30 second delay is sufficient
         timeout_seconds=300,          # 5 minute timeout should be plenty
-        description="Prepare task data for miners by encoding region data"
+        description="Prepare task data for miners by encoding region data",
+        cache_policy=None  # Disable caching
     )
     async def _prepare_task_data(self, region: Dict, target_time: datetime) -> Dict:
         """Prepare task data for miners.
@@ -547,7 +426,8 @@ class SoilValidatorTask(BaseTask):
         retries=3,                    # 3 retries for database operations
         retry_delay_seconds=20,       # 20 second delay between retries
         timeout_seconds=120,          # 2 minute timeout for status update
-        description="Update the status of a region in the database"
+        description="Update the status of a region in the database",
+        cache_policy=None  # Disable caching
     )
     async def _update_region_status(self, region_id: int, status: str):
         """Update region status in database.
@@ -571,7 +451,8 @@ class SoilValidatorTask(BaseTask):
         retries=3,                    # 3 retries for database cleanup
         retry_delay_seconds=60,       # 1 minute delay between retries
         timeout_seconds=600,          # 10 minute timeout for cleanup
-        description="Clear old or scored regions from the database"
+        description="Clear old or scored regions from the database",
+        cache_policy=None  # Disable caching
     )
     async def _clear_old_regions(self):
         """Clear old or scored regions from the database."""
@@ -876,123 +757,12 @@ class SoilValidatorTask(BaseTask):
             logger.error(traceback.format_exc())
             return False
             
-    @flow(
-        name="soil_moisture_scoring_flow",
-        retries=3,
-        retry_delay_seconds=300,
-        timeout_seconds=7200
-    )
-    async def validator_score(self):
-        """Score predictions after delay."""
-        try:
-            pending_tasks = await self.get_pending_tasks()
-            if not pending_tasks:
-                return {"status": "no_pending_tasks"}
-
-            scoring_results = {}
-            tasks_by_time = {}
-            for task in pending_tasks:
-                target_time = task["target_time"]
-                if target_time not in tasks_by_time:
-                    tasks_by_time[target_time] = []
-                tasks_by_time[target_time].append(task)
-
-            for target_time, tasks in tasks_by_time.items():
-                logger.info(f"Processing {len(tasks)} predictions for timestamp {target_time}")
-                
-                smap_url = construct_smap_url(target_time, test_mode=self.test_mode)
-                temp_file = None
-                temp_path = None
-                try:
-                    temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
-                    temp_path = temp_file.name
-                    temp_file.close()
-
-                    if not download_smap_data(smap_url, temp_file.name):
-                        logger.error(f"Failed to download SMAP data for {target_time}")
-                        # Update retry information for failed tasks
-                        for task in tasks:
-                            for prediction in task["predictions"]:
-                                update_query = """
-                                    UPDATE soil_moisture_predictions
-                                    SET retry_count = COALESCE(retry_count, 0) + 1,
-                                        next_retry_time = :next_retry_time,
-                                        last_error = :error_message
-                                    WHERE region_id = :region_id
-                                    AND miner_uid = :miner_uid
-                                """
-                                params = {
-                                    "region_id": task["id"],
-                                    "miner_uid": prediction["miner_id"],
-                                    "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=1),
-                                    "error_message": "Failed to download SMAP data"
-                                }
-                                await self.db_manager.execute(update_query, params)
-                        continue
-
-                    # Create tasks for parallel execution
-                    prediction_tasks = []
-                    for task in tasks:
-                        for prediction in task["predictions"]:
-                            pred_data = {
-                                "bounds": task["sentinel_bounds"],
-                                "crs": task["sentinel_crs"],
-                                "predictions": prediction,
-                                "target_time": target_time,
-                                "region": {"id": task["id"]},
-                                "miner_id": prediction["miner_id"],
-                                "miner_hotkey": prediction["miner_hotkey"],
-                                "smap_file": temp_path
-                            }
-                            # Submit prediction for parallel processing
-                            prediction_tasks.append(
-                                self._process_prediction.submit(pred_data)
-                            )
-                    
-                    # Gather results from parallel execution
-                    scores = await asyncio.gather(*[task.result() for task in prediction_tasks])
-                    
-                    # Process valid scores and move to history as before
-                    valid_scores = [s for s in scores if s and not isinstance(s, Exception)]
-                    if valid_scores:
-                        for score in valid_scores:
-                            task["score"] = score
-                            await self.move_task_to_history(
-                                region=task,
-                                predictions=task["predictions"],
-                                ground_truth=score.get("ground_truth"),
-                                scores=score
-                            )
-
-                finally:
-                    if temp_path and os.path.exists(temp_path):
-                        try:
-                            os.unlink(temp_path)
-                            logger.debug(f"Removed temporary file: {temp_path}")
-                        except Exception as e:
-                            logger.error(f"Failed to remove temporary file {temp_path}: {e}")
-                    
-                    try:
-                        for f in glob.glob("/tmp/*.h5"):
-                            try:
-                                os.unlink(f)
-                                logger.debug(f"Cleaned up additional temp file: {f}")
-                            except Exception as e:
-                                logger.error(f"Failed to remove temp file {f}: {e}")
-                    except Exception as e:
-                        logger.error(f"Error during temp file cleanup: {e}")
-
-            return {"status": "success", "results": scoring_results}
-
-        except Exception as e:
-            logger.error(f"Error in validator_score: {str(e)}")
-            return {"status": "error", "message": str(e)}
-
     @task(
         name="process_prediction",
         retries=2,
         retry_delay_seconds=30,
-        timeout_seconds=300
+        timeout_seconds=300,
+        cache_policy=None
     )
     async def _process_prediction(self, prediction: Dict, task: Dict, smap_data: str):
         """Process a single prediction using the scoring mechanism.
@@ -1048,9 +818,9 @@ class SoilValidatorTask(BaseTask):
         """Get SMAP time based on validator execution time."""
         if self.test_mode:
             smap_hours = [1, 7, 13, 19]
-            current_hour = currenttime.hour
+            current_hour = current_time.hour
             closest_hour = min(smap_hours, key=lambda x: abs(x - current_hour))
-            return currenttime.replace(
+            return current_time.replace(
                 hour=1, minute=30, second=0, microsecond=0
             )
 
@@ -1064,11 +834,10 @@ class SoilValidatorTask(BaseTask):
             19: 19,  # 19:30 prep → 19:30 SMAP
             20: 19,  # 20:00 execution → 19:30 SMAP
         }
-        smap_hour = validator_to_smap.get(currenttime.hour)
+        smap_hour = validator_to_smap.get(current_time.hour)
         if smap_hour is None:
-            raise ValueError(f"No SMAP time mapping for validator hour {currenttime.hour}")
-
-        return currenttime.replace(hour=smap_hour, minute=30, second=0, microsecond=0)
+            raise ValueError(f"No SMAP time mapping for validator hour {current_time.hour}")
+        return current_time.replace(hour=smap_hour, minute=30, second=0, microsecond=0)
 
     def get_validator_windows(self, current_time: datetime) -> Tuple[int, int, int, int]:
         """Get all validator windows (hour_start, min_start, hour_end, min_end)."""
@@ -1200,49 +969,110 @@ class SoilValidatorTask(BaseTask):
                     ALTER TABLE soil_moisture_predictions 
                     ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0,
                     ADD COLUMN IF NOT EXISTS next_retry_time TIMESTAMP WITH TIME ZONE,
-                    ADD COLUMN IF NOT EXISTS last_retry_at TIMESTAMP WITH TIME ZONE
+                    ADD COLUMN IF NOT EXISTS last_retry_at TIMESTAMP WITH TIME ZONE;
+                    
+                    -- Add index on status for faster cleanup queries
+                    CREATE INDEX IF NOT EXISTS idx_soil_predictions_status 
+                    ON soil_moisture_predictions(status);
+                    
+                    -- Add index on region table status
+                    CREATE INDEX IF NOT EXISTS idx_region_status 
+                    ON region_table(status);
+                    
+                    -- Add index on score table status and task_name
+                    CREATE INDEX IF NOT EXISTS idx_score_status_task 
+                    ON score_table(status, task_name);
                 """
                 await self.db_manager.execute(alter_query)
-                logger.info("Successfully added retry columns")
+                logger.info("Successfully added retry columns and indices")
             
         except Exception as e:
             logger.error(f"Error ensuring retry columns exist: {e}")
             logger.error(traceback.format_exc())
+            raise
 
     async def cleanup_resources(self):
         """Clean up any resources used by the task during recovery."""
         try:
-            # First clean up temporary files
-            temp_dir = "/tmp"
-            patterns = ["*.h5", "*.tif", "*.tiff"]
-            for pattern in patterns:
-                try:
-                    for f in glob.glob(os.path.join(temp_dir, pattern)):
+            current_time = datetime.now(timezone.utc)
+            cutoff_time = current_time - timedelta(hours=1)  # Only clean items older than 1 hour
+            
+            # Use a single transaction for all cleanup operations
+            async with self.db_manager.transaction() as transaction:  # Changed from with_transaction()
+                # Reset predictions status in batch
+                await asyncio.wait_for(
+                    self.db_manager.execute(
+                        """
+                        UPDATE soil_predictions 
+                        SET status = 'pending', retry_count = 0
+                        WHERE status = 'processing'
+                        AND created_at < :cutoff_time
+                        """,
+                        {"cutoff_time": cutoff_time},
+                        transaction=transaction
+                    ),
+                    timeout=10  # 10 second timeout
+                )
+                logger.info("Reset in-progress prediction statuses")
+                
+                # Clean up incomplete scoring operations
+                await asyncio.wait_for(
+                    self.db_manager.execute(
+                        """
+                        DELETE FROM score_table 
+                        WHERE task_name = 'soil_moisture' 
+                        AND status = 'processing'
+                        AND created_at < :cutoff_time
+                        """,
+                        {"cutoff_time": cutoff_time},
+                        transaction=transaction
+                    ),
+                    timeout=10  # 10 second timeout
+                )
+                logger.info("Cleaned up incomplete scoring operations")
+                
+                # Clean up temporary region states
+                await asyncio.wait_for(
+                    self.db_manager.execute(
+                        """
+                        UPDATE region_table 
+                        SET status = 'pending', retry_count = 0
+                        WHERE status IN ('processing', 'failed')
+                        AND updated_at < :cutoff_time
+                        """,
+                        {"cutoff_time": cutoff_time},
+                        transaction=transaction
+                    ),
+                    timeout=10  # 10 second timeout
+                )
+                logger.info("Reset region processing states")
+            
+            # Clean up any temporary files older than 1 hour
+            try:
+                import glob
+                import os
+                from pathlib import Path
+                
+                for pattern in ['*.h5', '*.nc', '*.tif']:
+                    for f in glob.glob(f"/tmp/*{pattern}"):
                         try:
-                            os.unlink(f)
-                            logger.debug(f"Cleaned up temp file: {f}")
+                            path = Path(f)
+                            # Only remove files older than cutoff time
+                            if path.stat().st_mtime < cutoff_time.timestamp():
+                                os.unlink(f)
+                                logger.debug(f"Cleaned up old temp file: {f}")
                         except Exception as e:
                             logger.error(f"Failed to remove temp file {f}: {e}")
-                except Exception as e:
-                    logger.error(f"Error cleaning up {pattern} files: {e}")
-
-            # Reset processing states in database
-            try:
-                update_query = """
-                    UPDATE soil_moisture_regions 
-                    SET status = 'pending'
-                    WHERE status = 'processing'
-                """
-                await self.db_manager.execute(update_query)
-                logger.info("Reset in-progress region statuses")
             except Exception as e:
-                logger.error(f"Failed to reset region statuses: {e}")
-
-            self._daily_regions = {}
+                logger.error(f"Error during temp file cleanup: {e}")
+                # Don't raise here to allow database cleanup to succeed
             
-            logger.info("Completed soil task cleanup")
+            logger.info("Completed soil moisture task cleanup")
             
+        except asyncio.TimeoutError:
+            logger.error("Cleanup operation timed out")
+            # Don't raise here to allow partial cleanup
         except Exception as e:
-            logger.error(f"Error during soil task cleanup: {e}")
+            logger.error(f"Error during soil moisture task cleanup: {e}")
             logger.error(traceback.format_exc())
             raise

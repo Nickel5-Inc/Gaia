@@ -64,15 +64,17 @@ class ValidatorFlows:
     )
     async def task_processing_flow(self, validator) -> None:
         """Manages task execution while providing observability."""
-        try:
-            tasks = [
-                validator.geomagnetic_task.execute_flow(validator),
-                validator.soil_task.validator_execute(validator)
-            ]
-            await asyncio.gather(*tasks)
-        except Exception as e:
-            logger.error(f"Error in task processing: {e}")
-            raise
+        while not validator._shutdown_event.is_set():
+            try:
+                # Create new coroutine objects each time through the loop
+                await asyncio.gather(
+                    validator.geomagnetic_task.geo_validator_workflow(),
+                    validator.soil_task.validator_execute(validator)
+                )
+                await asyncio.sleep(1)  # Small delay to prevent tight loop
+            except Exception as e:
+                logger.error(f"Error in task processing: {e}")
+                await asyncio.sleep(5)  # Longer delay on error
 
     @flow(
         name="monitoring_flow",

@@ -9,7 +9,7 @@ from enum import Enum
 
 from prefect import task, flow
 from gaia.parallel.config.settings import NodeType, TaskType, ResourceConfig
-from gaia.parallel.core.executor import parallel_executor, get_task_runner
+from gaia.parallel.core.executor import get_task_runner
 from fiber.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -37,8 +37,16 @@ def parallelize(
     def decorator(func: Callable[[List[T]], List[R]]) -> Callable[[List[T]], List[R]]:
         @functools.wraps(func)
         async def wrapper(items: List[T], **kwargs) -> List[R]:
-            async with parallel_executor(node_type, task_type, config) as executor:
-                return await executor.map(func, items, batch_size, **kwargs)
+            async with get_task_runner(task_type) as runner:
+                futures = [
+                    runner.submit(
+                        func, 
+                        items[i:i+batch_size] if batch_size else items,
+                        **kwargs
+                    ) 
+                    for i in range(0, len(items), batch_size or len(items))
+                ]
+                return [await f for f in futures]
         return wrapper
     return decorator
 
@@ -66,15 +74,16 @@ def parallel_flow(
         Decorated flow that executes using Dask
     """
     def decorator(func: Callable) -> Callable:
-        task_runner = get_task_runner(node_type, task_type, config)
-        
-        return flow(
+        @flow(
             name=name or func.__name__,
-            task_runner=task_runner,
             retries=retries,
             retry_delay_seconds=retry_delay_seconds,
             **flow_kwargs
-        )(func)
+        )
+        async def wrapper(*args, **kwargs):
+            async with get_task_runner(task_type) as runner:
+                return await runner.submit(func, *args, **kwargs)
+        return wrapper
     return decorator
 
 def parallel_task(
@@ -108,8 +117,8 @@ def parallel_task(
             **task_kwargs
         )
         async def wrapper(*args, **kwargs):
-            async with parallel_executor(node_type, task_type, config) as executor:
-                return await executor.submit(func, *args, **kwargs)
+            async with get_task_runner(task_type) as runner:
+                return await runner.submit(func, *args, **kwargs)
         return wrapper
     return decorator
 
@@ -136,10 +145,13 @@ async def parallel_batch_process(
     Returns:
         List of processed results
     """
-    async with parallel_executor(node_type, task_type, config) as executor:
-        return await executor.map(
-            process_func,
-            items,
-            batch_size=batch_size,
-            **kwargs
-        ) 
+    async with get_task_runner(task_type) as runner:
+        futures = [
+            runner.submit(
+                process_func, 
+                items[i:i+batch_size],
+                **kwargs
+            ) 
+            for i in range(0, len(items), batch_size)
+        ]
+        return [await f for f in futures] 

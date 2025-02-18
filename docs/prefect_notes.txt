@@ -204,8 +204,12 @@ async def process_batch(items):
 
 3. Direct Parallel Processing:
 ```python
-async with parallel_executor(NodeType.VALIDATOR, TaskType.MIXED) as executor:
-    results = await executor.map(process_func, items, batch_size=10)
+async with get_task_runner(TaskType.MIXED) as runner:
+    futures = [
+        runner.submit(process_func, items[i:i+10])
+        for i in range(0, len(items), 10)
+    ]
+    results = [await f for f in futures]
 ```
 
 ## Resource Management
@@ -234,15 +238,13 @@ async with parallel_executor(NodeType.VALIDATOR, TaskType.MIXED) as executor:
 ### Configuration Example
 ```python
 DEFAULT_CONFIGS = {
-    TaskType.IO_BOUND: ResourceConfig(
-        n_workers=4,
-        threads_per_worker=2,
-        memory_limit="4GB"
+    TaskType.IO_BOUND: LocalResourceConfig(
+        resources={'io': 1},
+        adapt_kwargs={'minimum': 1, 'maximum': 8}
     ),
-    TaskType.CPU_BOUND: ResourceConfig(
-        n_workers=4,
-        threads_per_worker=1,
-        memory_limit="4GB"
+    TaskType.CPU_BOUND: LocalResourceConfig(
+        resources={'cpu': 1},
+        adapt_kwargs={'minimum': 1, 'maximum': 4}
     )
 }
 ```
@@ -259,27 +261,21 @@ Task Design:
 ## Query Flow Example
 
 ```python
-@parallel_flow(
-    node_type=NodeType.VALIDATOR,
-    task_type=TaskType.IO_BOUND,
-    name="query_miners"
-)
+@flow(name="query_miners")
 async def query_miners(regions):
     """Query miners in parallel for predictions."""
-    results = []
-    for region in regions:
-        result = await process_region(region)
-        results.append(result)
-    return results
+    async with get_task_runner(TaskType.IO_BOUND) as runner:
+        futures = [
+            runner.submit(process_region, region)
+            for region in regions
+        ]
+        return [await f for f in futures]
 
-@parallel_task(
-    node_type=NodeType.VALIDATOR,
-    task_type=TaskType.CPU_BOUND,
-    name="process_region"
-)
+@task(name="process_region")
 async def process_region(region):
     """Process a single region with parallel scoring."""
-    predictions = await get_predictions(region)
-    scores = await calculate_scores(predictions)
-    return {"region": region, "scores": scores}
+    async with get_task_runner(TaskType.CPU_BOUND) as runner:
+        predictions = await get_predictions(region)
+        scores = await runner.submit(calculate_scores, predictions)
+        return {"region": region, "scores": scores}
 ```

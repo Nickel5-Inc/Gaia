@@ -88,6 +88,16 @@ fi
 export SUBTENSOR_CHAIN_ENDPOINT="$SUBTENSOR_ADDRESS"
 export PREFECT_API_URL="http://127.0.0.1:4200/api"
 export PREFECT_API_DATABASE_CONNECTION_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/prefect_db"
+export PREFECT_WORKER_PREFETCH_SECONDS=30
+export PREFECT_DATABASE_QUERY_BATCH_SIZE=1000
+export PREFECT_LOGGING_LEVEL="WARNING"
+export PREFECT_DATABASE_CONNECTION_TIMEOUT=60
+export PREFECT_API_KEEPALIVE_TIMEOUT=300
+export PREFECT_API_REQUEST_TIMEOUT=300
+export PREFECT_TASK_RUNNER_CLASS="prefect_dask.DaskTaskRunner"
+export PYTHONPATH="${PYTHONPATH}:/root/Gaia"
+export DASK_DISTRIBUTED__SCHEDULER__ALLOWED_FAILURES=10
+export DASK_DISTRIBUTED__WORKER__MULTIPROCESSING_METHOD="fork"
 
 echo "Using configuration:"
 echo "SUBTENSOR_CHAIN_ENDPOINT: $SUBTENSOR_CHAIN_ENDPOINT"
@@ -98,6 +108,8 @@ echo "SUBTENSOR_NETWORK: $SUBTENSOR_NETWORK"
 
 PGPASSWORD=postgres psql -U postgres -h localhost -c "CREATE DATABASE prefect_db;" 2>/dev/null || true
 
+# Start Prefect server
+echo "Starting Prefect server..."
 prefect server start --host 127.0.0.1 &
 PREFECT_PID=$!
 
@@ -122,7 +134,8 @@ python gaia/validator/validator.py \
     --wallet $WALLET_NAME \
     --hotkey $HOTKEY_NAME \
     --netuid $NETUID \
-    --subtensor.chain_endpoint $SUBTENSOR_CHAIN_ENDPOINT \
+    --chain_endpoint $SUBTENSOR_CHAIN_ENDPOINT \
+    --network $SUBTENSOR_NETWORK \
     #--test &
 VALIDATOR_PID=$!
 sleep 5
