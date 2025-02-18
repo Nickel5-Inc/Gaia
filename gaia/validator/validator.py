@@ -1321,11 +1321,11 @@ class GaiaValidator:
                 if np.isnan(geomagnetic_score) and np.isnan(soil_score):
                     weights[idx] = 0.0
                 elif np.isnan(geomagnetic_score):
-                    weights[idx] = 0.75 * soil_score
+                    weights[idx] = 0.60 * soil_score
                 elif np.isnan(soil_score):
-                    weights[idx] = 0.25 * geomagnetic_score
+                    weights[idx] = 0.40 * geomagnetic_score
                 else:
-                    weights[idx] = (0.25 * geomagnetic_score) + (0.75 * soil_score)
+                    weights[idx] = (0.40 * geomagnetic_score) + (0.60 * soil_score)
 
                 logger.info(f"UID {idx}: geo={geomagnetic_score} ({geo_counts[idx]} scores), soil={soil_score} ({soil_counts[idx]} scores), weight={weights[idx]}")
 
