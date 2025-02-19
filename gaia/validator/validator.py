@@ -1308,7 +1308,7 @@ class GaiaValidator:
             logger.info("Recent scores fetched and decay-weighted. Calculating aggregate scores...")
 
             # Use a sigmoid transformation for geo scores
-            def sigmoid(x, k=10, x0=0.55):
+            def sigmoid(x, k=20, x0=0.93):
                 return 1 / (1 + math.exp(-k * (x - x0)))
 
             weights = np.zeros(256)

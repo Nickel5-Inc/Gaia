@@ -2,7 +2,7 @@ import math
 from typing import List
 
 
-def sigmoid(x: float, k: float = 10, x0: float = 0.55) -> float:
+def sigmoid(x: float, k: float = 20, x0: float = 0.93) -> float:
     """
     Apply a sigmoid transformation to the raw geo score.
 
@@ -40,13 +40,13 @@ class Scoring:
 
     def aggregate_task_scores(self, geomagnetic_scores: dict, soil_scores: dict) -> List[float]:
         """
-        Combines scores from multiple tasks into final weights using a 68/32 weighting scheme,
+        Combines scores from multiple tasks into final weights using a 60/40 weighting scheme,
         with a sigmoid transformation applied to geo scores.
 
         - Full miners (both scores available):
-            Effective Score = 0.32 * sigmoid(geo_score) + 0.68 * soil_score
+            Effective Score = 0.40 * sigmoid(geo_score) + 0.60 * soil_score
         - Immune miners (missing soil):
-            Effective Score = 0.32 * sigmoid(geo_score)
+            Effective Score = 0.40 * sigmoid(geo_score)
         - If both scores are missing, the effective score is 0.
         """
         weights = [0.0] * 256
@@ -67,7 +67,7 @@ class Scoring:
                 # Only soil available
                 weights[idx] = 0.60 * soil_score
             elif math.isnan(soil_score):
-                # Only geo available; apply sigmoid and take 32%
+                # Only geo available; apply sigmoid and take 40%
                 weights[idx] = 0.40 * sigmoid(geo_score, k=20, x0=0.93)
             else:
                 # Both scores available
