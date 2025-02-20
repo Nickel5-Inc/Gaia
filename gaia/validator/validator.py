@@ -1307,6 +1307,10 @@ class GaiaValidator:
 
             logger.info("Recent scores fetched and decay-weighted. Calculating aggregate scores...")
 
+            # Use a sigmoid transformation for geo scores
+            def sigmoid(x, k=20, x0=0.93):
+                return 1 / (1 + math.exp(-k * (x - x0)))
+
             weights = np.zeros(256)
             for idx in range(256):
                 geomagnetic_score = geomagnetic_scores[idx]
@@ -1321,11 +1325,11 @@ class GaiaValidator:
                 if np.isnan(geomagnetic_score) and np.isnan(soil_score):
                     weights[idx] = 0.0
                 elif np.isnan(geomagnetic_score):
-                    weights[idx] = 0.5 * soil_score
+                    weights[idx] = 0.60 * soil_score
                 elif np.isnan(soil_score):
-                    weights[idx] = 0.5 * geomagnetic_score
+                    weights[idx] = 0.40 * sigmoid(geomagnetic_score, k=20, x0=0.93)
                 else:
-                    weights[idx] = (0.5 * geomagnetic_score) + (0.5 * soil_score)
+                    weights[idx] = 0.40 * sigmoid(geomagnetic_score, k=20, x0=0.93) + 0.60 * soil_score
 
                 logger.info(f"UID {idx}: geo={geomagnetic_score} ({geo_counts[idx]} scores), soil={soil_score} ({soil_counts[idx]} scores), weight={weights[idx]}")
 
