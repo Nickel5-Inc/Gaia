@@ -463,7 +463,7 @@ class GaiaValidator:
                 # Process responses
                 for hotkey, response in zip(miners_to_query.keys(), miner_responses):
                     if response is not None and not isinstance(response, Exception):
-                        responses[hotkey] = response
+                        responses[response['hotkey']] = response
 
             logger.info(f"Received {len(responses)} valid responses from miners")
             return responses
@@ -829,22 +829,20 @@ class GaiaValidator:
             await self.start_watchdog()
             logger.info("Watchdog started.")
             
-            # Create all tasks in the same event loop
             tasks = [
-                self.geomagnetic_task.validator_execute(self),
-                self.soil_task.validator_execute(self),
-                self.status_logger(),
-                self.main_scoring(),
-                self.handle_miner_deregistration_loop(),
-                #self.miner_score_sender.run_async(), 
-                self.check_for_updates()
+                lambda: self.geomagnetic_task.validator_execute(self),
+                lambda: self.soil_task.validator_execute(self),
+                lambda: self.status_logger(),
+                lambda: self.main_scoring(),
+                lambda: self.handle_miner_deregistration_loop(),
+                #lambda: self.miner_score_sender.run_async(), 
+                lambda: self.check_for_updates()
             ]
             
             try:
                 running_tasks = []
                 while not self._shutdown_event.is_set():
-                    # Start all tasks
-                    running_tasks = [asyncio.create_task(t) for t in tasks]
+                    running_tasks = [asyncio.create_task(t()) for t in tasks]
                     
                     # Wait for either shutdown event or task completion
                     done, pending = await asyncio.wait(
