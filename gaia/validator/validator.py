@@ -44,8 +44,6 @@ from sqlalchemy import text
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
-from gaia.validator.flows import ValidatorFlows
-import anyio
 from prefect import flow, task
 from prefect.tasks import task_input_hash
 from pydantic import BaseModel, Field
@@ -203,7 +201,6 @@ class GaiaValidator:
 
         # Add lock for miner table operations
         self.miner_table_lock = asyncio.Lock()
-        self.flows = ValidatorFlows()
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -899,13 +896,7 @@ class GaiaValidator:
 
             logger.info("Starting all validator flows...")
             try:
-                await asyncio.gather(
-                    self.flows.core_flow(self),
-                    self.main_scoring(),
-                    # perform_update(self),
-                    #self.miner_score_sender.run(),
-                    self.soil_task.validator_execute(self)
-                )
+                await core_flow(self)
             except asyncio.CancelledError:
                 logger.info("Validator flows cancelled, initiating shutdown")
                 if not self._cleanup_done:
@@ -1439,9 +1430,12 @@ class GaiaValidator:
 
 
 if __name__ == "__main__":
+    from multiprocessing import freeze_support
+    freeze_support()
+    
     parser = ArgumentParser()
     subtensor_group = parser.add_argument_group("subtensor")
-
+    
     parser.add_argument("--wallet", type=str, help="Name of the wallet to use")
     parser.add_argument("--hotkey", type=str, help="Name of the hotkey to use")
     parser.add_argument("--netuid", type=int, help="Netuid to use")
@@ -1461,22 +1455,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     
-    # Create a namespace for subtensor args to maintain compatibility
-    class SubtensorArgs:
-        def __init__(self, chain_endpoint=None, network=None):
-            self.chain_endpoint = chain_endpoint
-            self.network = network
+    import asyncio
+    from gaia.validator.validator import GaiaValidator
     
-    args.subtensor = SubtensorArgs(
-        chain_endpoint=args.chain_endpoint if hasattr(args, 'chain_endpoint') else None,
-        network=args.network if hasattr(args, 'network') else None
-    )
-    
-    # Clean up the original attributes to prevent confusion
-    if hasattr(args, 'chain_endpoint'):
-        delattr(args, 'chain_endpoint')
-    if hasattr(args, 'network'):
-        delattr(args, 'network')
-
-    validator = GaiaValidator(args)
+    validator = GaiaValidator(args=args)
     asyncio.run(validator.main())

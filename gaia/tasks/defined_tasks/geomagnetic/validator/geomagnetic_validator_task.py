@@ -109,17 +109,3 @@ class GeomagneticValidatorTask(BaseTask):
                 raise
         else:
             logger.info("Running as validator - skipping model loading")
-
-    async def geo_validator_workflow(self):
-        """Singular entry point for the geomagnetic validator workflow, including data preparation, execution, scoring, and cleanup."""
-        prep_data = await prepare_flow(self)
-        if prep_data is None:
-            logger.info("Geo validator workflow not executed due to timing constraints or missing data.")
-            return
-
-        await execute_flow(self)
-
-        query_hour = datetime.datetime.now(datetime.timezone.utc).replace(minute=0, second=0, microsecond=0)
-        
-        await score_flow(self, query_hour)
-        await cleanup_resources(self)

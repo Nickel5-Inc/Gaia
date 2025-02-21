@@ -125,9 +125,38 @@ done
 echo " Ready!"
 
 prefect config set PREFECT_API_URL="http://127.0.0.1:4200/api"
-prefect work-pool create default-agent-pool --type process --overwrite || true
-prefect worker start -p default-agent-pool &
+
+echo "Creating work pool..."
+prefect work-pool create default --type process --overwrite || true
+
+echo "Starting Prefect worker..."
+prefect worker start -p default &
 WORKER_PID=$!
+
+echo "Deploying flows..."
+python -m gaia.scheduling.apply_deployments
+
+echo "Verifying deployments..."
+MAX_RETRIES=5
+RETRY_COUNT=0
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    echo "Checking deployments (attempt $((RETRY_COUNT+1))/$MAX_RETRIES)..."
+    DEPLOYMENTS=$(prefect deployment ls)
+    if echo "$DEPLOYMENTS" | grep -q "geomagnetic-validator" && echo "$DEPLOYMENTS" | grep -q "soil-validator"; then
+        echo "Deployments successfully created!"
+        break
+    fi
+    echo "Waiting for deployments to be registered..."
+    sleep 10
+    RETRY_COUNT=$((RETRY_COUNT+1))
+done
+
+if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+    echo "Error: Failed to verify deployment creation"
+    echo "Current deployments:"
+    prefect deployment ls
+    exit 1
+fi
 
 echo "Starting validator..."
 python gaia/validator/validator.py \
@@ -139,6 +168,9 @@ python gaia/validator/validator.py \
     #--test &
 VALIDATOR_PID=$!
 sleep 5
+
+echo "Waiting 30 seconds for Prefect deployments to be registered..."
+sleep 30
 
 echo "Deploying flows..."
 python -m gaia.scheduling.apply_deployments

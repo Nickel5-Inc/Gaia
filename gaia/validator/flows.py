@@ -1,3 +1,20 @@
+import sys
+from argparse import ArgumentParser
+
+
+def create_validator_args():
+    parser = ArgumentParser()
+    parser.add_argument('--test', action='store_true', help='Run in test mode')
+    parser.add_argument('--netuid', type=int, default=1, help='Network UID')
+    parser.add_argument('--subtensor.network', type=str, default='finney', help='Subtensor network')
+    parser.add_argument('--logging.debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--neuron.name', type=str, default='validator', help='Neuron name')
+    parser.add_argument('--wallet.name', type=str, default='validator', help='Wallet name')
+    parser.add_argument('--wallet.hotkey', type=str, default='default', help='Wallet hotkey')
+    args = parser.parse_args([])
+    return args
+
+
 from prefect import flow, task
 from prefect.task_runners import ThreadPoolTaskRunner, ConcurrentTaskRunner
 from datetime import datetime, timezone, timedelta
@@ -5,102 +22,150 @@ import asyncio
 import anyio
 from typing import Dict, List, Optional
 from fiber.logging_utils import get_logger
+import traceback
+from prefect.deployments import run_deployment
 
 logger = get_logger(__name__)
 
 class ValidatorFlows:
-    """
-    Flow orchestration layer for the Gaia Validator.
-    
-    This class is responsible for:
-    1. Defining the flow structure and dependencies
-    2. Providing Prefect observability for operations
-    3. Managing task runners and concurrency
-    4. Error handling and retries at the flow level
-    
-    It does NOT:
-    1. Implement core business logic (that stays in validator.py)
-    2. Handle data storage (remains in database_manager)
-    3. Manage state (validator.py maintains state)
-    """
+    """Container for all validator flows."""
+    _validator_instance = None
+    _lock = None
 
+    @staticmethod
+    async def initialize_validator():
+        """Initialize and return the singleton validator instance."""
+        if ValidatorFlows._lock is None:
+            from asyncio import Lock
+            ValidatorFlows._lock = Lock()
+        if ValidatorFlows._validator_instance is None:
+            async with ValidatorFlows._lock:
+                if ValidatorFlows._validator_instance is None:
+                    from gaia.validator.validator import GaiaValidator
+                    #TODO Use create_validator_args defined locally in this module to get default args
+                    args = create_validator_args()
+                    validator = GaiaValidator(args=args)
+                    #TODO Call an initialization method
+                    if hasattr(validator, 'ensure_initialized'):
+                        await validator.ensure_initialized()
+                    ValidatorFlows._validator_instance = validator
+        return ValidatorFlows._validator_instance
+
+    @staticmethod
     @flow(
         name="validator_core_flow",
-        description="Core validator operations"
+        description="Core validator operations",
+        retries=3,
+        retry_delay_seconds=30
     )
-    async def core_flow(self, validator) -> None:
-        """
-        Main flow orchestrating core validator operations.
-        Provides observability while preserving original timing logic.
-        """
+    async def core_flow() -> None:
+        """Single execution of core validator operations."""
         try:
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(self.task_processing_flow, validator)
-                tg.start_soon(self.scoring_flow, validator)
-                tg.start_soon(self.monitoring_flow, validator)
-                
+            logger.info("Starting validator core flow execution")
+            validator = await ValidatorFlows.initialize_validator()
+            await validator.main()
+            logger.info("Completed validator core flow execution")
         except Exception as e:
             logger.error(f"Error in core flow: {e}")
+            logger.error(traceback.format_exc())
             raise
 
+    @staticmethod
     @flow(
         name="scoring_flow",
         description="Weight calculation and setting",
-        task_runner=ThreadPoolTaskRunner()
+        task_runner=ThreadPoolTaskRunner(),
+        retries=3,
+        retry_delay_seconds=30
     )
-    async def scoring_flow(self, validator) -> None:
-        """Wraps the scoring logic for observability while preserving block timing."""
-        while not validator._shutdown_event.is_set():
-            try:
-                await validator.main_scoring()
-                await asyncio.sleep(12)
-            except Exception as e:
-                logger.error(f"Error in scoring flow: {e}")
-                await asyncio.sleep(12)
+    async def scoring_flow() -> None:
+        """Single execution of scoring logic."""
+        try:
+            logger.info("Starting scoring flow execution")
+            validator = await ValidatorFlows.initialize_validator()
+            await validator.main_scoring()
+            logger.info("Completed scoring flow execution")
+        except Exception as e:
+            logger.error(f"Error in scoring flow: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
+    @staticmethod
     @flow(
         name="task_processing_flow",
-        description="Task execution management"
+        description="Task execution management",
+        task_runner=ThreadPoolTaskRunner(),
+        retries=3,
+        retry_delay_seconds=30
     )
-    async def task_processing_flow(self, validator) -> None:
-        """Manages task execution while providing observability."""
-        while not validator._shutdown_event.is_set():
-            try:
-                # Create new coroutine objects each time through the loop
-                await asyncio.gather(
-                    validator.geomagnetic_task.geo_validator_workflow(),
-                    validator.soil_task.validator_execute(validator)
-                )
-                await asyncio.sleep(1)  # Small delay to prevent tight loop
-            except Exception as e:
-                logger.error(f"Error in task processing: {e}")
-                await asyncio.sleep(5)  # Longer delay on error
+    async def task_processing_flow() -> None:
+        """Triggers the child flows using their deployments via run_deployment."""
+        try:
+            logger.info("Starting task processing flow by triggering child flows via run_deployment")
+            validator = await ValidatorFlows.initialize_validator()
+            
+            geo_deployment = "geomagnetic-validator"
+            soil_deployment = "soil-validator"
+            
+            results = await asyncio.gather(
+                run_deployment(geo_deployment, parameters={}),
+                run_deployment(soil_deployment, parameters={})
+            )
+            
+            logger.info(f"Triggered child flows successfully: {results}")
+            logger.info("Completed task processing execution")
+        except Exception as e:
+            logger.error(f"Error in task processing flow: {str(e)}")
+            logger.error(traceback.format_exc())
+            validator = await ValidatorFlows.initialize_validator()
+            await validator.update_task_status('geomagnetic', 'error')
+            await validator.update_task_status('soil', 'error')
+            raise
 
+    @staticmethod
     @flow(
         name="monitoring_flow",
-        description="System monitoring and health checks"
+        description="System monitoring and health checks",
+        retries=3,
+        retry_delay_seconds=30
     )
-    async def monitoring_flow(self, validator) -> None:
-        """Wraps monitoring operations for observability."""
-        while not validator._shutdown_event.is_set():
-            try:
-                await asyncio.gather(
-                    validator.status_logger(),
-                    validator.check_for_updates()
-                )
-            except Exception as e:
-                logger.error(f"Error in monitoring flow: {e}")
-                await asyncio.sleep(60)
+    async def monitoring_flow() -> None:
+        """Single execution of monitoring operations."""
+        try:
+            logger.info("Starting monitoring execution")
+            validator = await ValidatorFlows.initialize_validator()
+            await validator.status_logger()
+            await validator.check_for_updates()
+            logger.info("Completed monitoring execution")
+        except Exception as e:
+            logger.error(f"Error in monitoring flow: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
+    @staticmethod
     @flow(
         name="miner_query_flow",
         description="Parallel miner querying",
-        task_runner=ConcurrentTaskRunner()
+        task_runner=ConcurrentTaskRunner(),
+        retries=3,
+        retry_delay_seconds=30
     )
-    async def miner_query_flow(self, validator, payload: Dict, endpoint: str) -> Dict:
-        """Wraps miner querying for observability."""
+    async def miner_query_flow(payload: Dict, endpoint: str) -> Dict:
+        """Single execution of miner querying."""
         try:
-            return await validator.query_miners(payload, endpoint)
+            logger.info(f"Starting miner query to endpoint: {endpoint}")
+            validator = await ValidatorFlows.initialize_validator()
+            result = await validator.query_miners(payload, endpoint)
+            logger.info("Completed miner query")
+            return result
         except Exception as e:
-            logger.error(f"Error in miner query flow: {e}")
+            logger.error(f"Error in miner query flow: {str(e)}")
+            logger.error(traceback.format_exc())
             raise
+
+# Export flow function
+core_flow = ValidatorFlows.core_flow
+scoring_flow = ValidatorFlows.scoring_flow
+task_processing_flow = ValidatorFlows.task_processing_flow
+monitoring_flow = ValidatorFlows.monitoring_flow
+miner_query_flow = ValidatorFlows.miner_query_flow

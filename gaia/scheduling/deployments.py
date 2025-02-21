@@ -1,5 +1,5 @@
 from prefect.deployments import Deployment
-from prefect.infrastructure.process import Process
+from prefect.infrastructure import Process
 from typing import List, Dict, Optional
 import asyncio
 import os
@@ -45,7 +45,7 @@ async def create_deployment(
         tags=[task.name, "gaia", "validator"],
         infrastructure=infrastructure,
         work_queue_name=config.queue_name,
-        work_pool_name="local-process-pool"
+        work_pool_name="default"
     )
     
     return deployment
@@ -101,7 +101,7 @@ async def update_deployment(
             cpu_limit=config.cpu_limit
         ),
         work_queue_name=config.queue_name,
-        work_pool_name="local-process-pool"
+        work_pool_name="default"
     )
     
     # Apply new deployment
@@ -123,63 +123,23 @@ def get_deployment_status(deployment: Deployment) -> Dict:
     }
 
 async def create_soil_moisture_deployments(task: Task) -> List[Deployment]:
-    """Create deployments for soil moisture prep and execute windows."""
-    deployments = []
-    
-    prep_config = get_schedule_config('soil_moisture_prep')
-    for window in SOIL_MOISTURE_WINDOWS["prep"]:
-        deployment = Deployment.build_from_flow(
-            flow=task._handle_prep_window,
-            name=f"soil_prep_{window['hour']:02d}{window['minute']:02d}",
-            schedule=CronSchedule(
-                cron=f"{window['minute']} {window['hour']} * * *",
-                timezone="UTC"
-            ),
-            tags=["soil_moisture", "prep"],
-            infrastructure=Process(
-                env={"PYTHONPATH": os.getcwd()},
-                working_dir=os.getcwd(),
-                cpu_limit=prep_config.cpu_limit
-            ),
-            work_queue_name=prep_config.queue_name
-        )
-        deployments.append(deployment)
-    
-    exec_config = get_schedule_config('soil_moisture_execute')
-    for window in SOIL_MOISTURE_WINDOWS["execute"]:
-        deployment = Deployment.build_from_flow(
-            flow=task._handle_execution_window,
-            name=f"soil_execute_{window['hour']:02d}{window['minute']:02d}",
-            schedule=CronSchedule(
-                cron=f"{window['minute']} {window['hour']} * * *",
-                timezone="UTC"
-            ),
-            tags=["soil_moisture", "execute"],
-            infrastructure=Process(
-                env={"PYTHONPATH": os.getcwd()},
-                working_dir=os.getcwd(),
-                cpu_limit=exec_config.cpu_limit
-            ),
-            work_queue_name=exec_config.queue_name
-        )
-        deployments.append(deployment)
-    
-    score_config = get_schedule_config('soil_moisture_scoring')
-    score_deployment = Deployment.build_from_flow(
-        flow=task.validator_score,
-        name="soil_scoring",
-        schedule=CronSchedule(cron="0 * * * *", timezone="UTC"),  # Every hour
-        tags=["soil_moisture", "scoring"],
+    """Create a unified deployment for soil validator workflow which internally orchestrates the prep, execute, and scoring flows. This ensures that the soil prep flow happens first."""
+    soil_config = get_schedule_config('soil_validator')
+    soil_deployment = Deployment.build_from_flow(
+        flow=task.soil_validator_workflow,
+        name="soil_validator",
+        schedule=CronSchedule(cron=soil_config.cron, timezone="UTC"),
+        tags=["soil_moisture", "validator"],
         infrastructure=Process(
             env={"PYTHONPATH": os.getcwd()},
             working_dir=os.getcwd(),
-            cpu_limit=score_config.cpu_limit
+            cpu_limit=soil_config.cpu_limit
         ),
-        work_queue_name=score_config.queue_name
+        work_queue_name=soil_config.queue_name,
+        retries=soil_config.max_retries,
+        retry_delay_seconds=int(soil_config.retry_delay.total_seconds())
     )
-    deployments.append(score_deployment)
-    
-    return deployments
+    return [soil_deployment]
 
 async def create_geomagnetic_deployment(task: Task) -> Deployment:
     """Create deployment for geomagnetic validator task."""
@@ -200,7 +160,7 @@ async def create_geomagnetic_deployment(task: Task) -> Deployment:
             memory_limit=config.memory_limit
         ),
         work_queue_name=config.queue_name,
-        work_pool_name="local-process-pool",
+        work_pool_name="default",
         retries=config.max_retries,
         retry_delay_seconds=int(config.retry_delay.total_seconds())
     )
