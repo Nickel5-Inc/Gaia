@@ -300,12 +300,13 @@ def get_smap_data_for_sentinel_bounds(filepath, sentinel_bounds, sentinel_crs):
         sentinel_crs: CRS of Sentinel-2 data
     """
     with xr.open_dataset(filepath, group="Geophysical_Data") as ds:
-
         surface_data = ds["sm_surface"].values
         rootzone_data = ds["sm_rootzone"].values
         smap_y_size, smap_x_size = surface_data.shape
-        smap_lat_range = (-85.0445, 85.0445)
-        smap_lon_range = (-180, 180)
+        
+        ease2_crs = CRS.from_epsg(6933)
+        smap_y_range = (-7314540.11, 7314540.11)
+        smap_x_range = (-17367530.45, 17367530.45)
 
         if sentinel_crs != "EPSG:4326":
             transformer = Transformer.from_crs(
@@ -316,25 +317,29 @@ def get_smap_data_for_sentinel_bounds(filepath, sentinel_bounds, sentinel_crs):
         else:
             left, bottom, right, top = sentinel_bounds
 
+        to_ease2 = Transformer.from_crs("EPSG:4326", ease2_crs, always_xy=True)
+        ease2_bounds = to_ease2.transform_bounds(left, bottom, right, top)
+        ease2_left, ease2_bottom, ease2_right, ease2_top = ease2_bounds
+
         y_idx_start = int(
-            (smap_lat_range[1] - top)
+            (smap_y_range[1] - ease2_top)
             * smap_y_size
-            / (smap_lat_range[1] - smap_lat_range[0])
+            / (smap_y_range[1] - smap_y_range[0])
         )
         y_idx_end = int(
-            (smap_lat_range[1] - bottom)
+            (smap_y_range[1] - ease2_bottom)
             * smap_y_size
-            / (smap_lat_range[1] - smap_lat_range[0])
+            / (smap_y_range[1] - smap_y_range[0])
         )
         x_idx_start = int(
-            (left - smap_lon_range[0])
+            (ease2_left - smap_x_range[0])
             * smap_x_size
-            / (smap_lon_range[1] - smap_lon_range[0])
+            / (smap_x_range[1] - smap_x_range[0])
         )
         x_idx_end = int(
-            (right - smap_lon_range[0])
+            (ease2_right - smap_x_range[0])
             * smap_x_size
-            / (smap_lon_range[1] - smap_lon_range[0])
+            / (smap_x_range[1] - smap_x_range[0])
         )
 
         y_idx_start = max(0, min(y_idx_start, smap_y_size))
@@ -353,6 +358,10 @@ def get_smap_data_for_sentinel_bounds(filepath, sentinel_bounds, sentinel_crs):
                 "y_end": y_idx_end,
                 "x_start": x_idx_start,
                 "x_end": x_idx_end,
+            },
+            "bounds": {
+                "original": sentinel_bounds,
+                "transformed": ease2_bounds,
             },
         }
 
