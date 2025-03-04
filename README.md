@@ -10,7 +10,7 @@ Gaia is a platform for research and development of geospatial machine learning m
 Read more about the long-term vision in our [whitepaper](https://www.gaiaresearch.ai/whitepaper).
 
 >[!NOTE]
-> BETA VERSION = 1.1.3
+> BETA VERSION = 1.1.4
 >
 > The beta version of Gaia launches with limited functionality. Many of the planned features are not yet available, however we are still accepting miners and validators for the initial tasks. 
 
@@ -29,7 +29,11 @@ pip install -e .
 
 Miners develop models to understand future events. These events currently include soil moisture and geomagnetic readings at the equator. Miners will receive data from validators for the models that we have in place. They are also free to gather their own data from other resources. The tasks are consistent in design and in timing; this predictability allows miners the flexibility to retrieve any data that their model requires. 
 
-Miners can choose between these two tasks or perform both. Incentive is split 50:50 between the tasks.
+Miners can choose between these two tasks or perform both. 
+Incentive Distribution:
+40% of emissions are allocated to Geomagnetic Dst Index Prediction.
+60% of emissions are allocated based on a sigmoid-weighted scoring mechanism.
+The incentive split was previously 50:50, but has been adjusted to favor higher-quality predictions.
 
 
 ## Validators
