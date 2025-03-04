@@ -55,6 +55,8 @@ class FiberWeightSetter:
             logger.warning("No active nodes found")
             return None
 
+        logger.info(f"Raw computed weights before normalization: {weights}")
+
         weights_tensor /= weights_tensor.sum()
         warning_threshold = 0.5  # Warn if any node exceeds 50% of total weight
 
@@ -113,8 +115,8 @@ class FiberWeightSetter:
                 cumulative_share = (cumulative_weights[end_idx-1] / total_weight) * 100 if end_idx > 0 else 0
                 
                 # Convert to "Top X%" format
-                top_start = 100 - percentile_points[i+1]
-                top_end = 100 - percentile_points[i]
+                top_start = 100 - percentile_points[i]
+                top_end = 100 - percentile_points[i+1]
                 
                 logger.info(f"Top {top_start:>3}-{top_end:<6} "
                           f"{percentiles[i]:>12.6f} "
