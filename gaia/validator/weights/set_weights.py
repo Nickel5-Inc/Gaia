@@ -22,7 +22,7 @@ class FiberWeightSetter:
             network: str = "finney",
             timeout: int = 30,
     ):
-        """Initialize the weight setter with fiber"""
+        """Initialize the weight setter with Fiber"""
         self.netuid = netuid
         self.network = network
         self.substrate = interface.get_substrate(subtensor_network=network)
@@ -136,59 +136,102 @@ class FiberWeightSetter:
 
         return weights_tensor, node_ids
 
-    async def set_weights(self, weights: List[float] = None) -> bool:
-        """Set weights on chain"""
+    async def set_weights(self, weights: list[float] = None) -> bool:
+        """Set weights on chain with 50% allocation to UID 244 and detailed logs."""
+
         try:
             if weights is None:
                 logger.info("No weights provided - skipping weight setting")
                 return False
 
-            logger.info(f"\nSetting weights for subnet {self.netuid}...")
+            logger.info(f"🔄 Setting weights for subnet {self.netuid}...")
 
+            # Retrieve network and node info from Fiber
             self.substrate = interface.get_substrate(subtensor_network=self.network)
             self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
-            logger.info(f"Found {len(self.nodes)} nodes in subnet")
+            logger.info(f"✅ Found {len(self.nodes)} nodes in subnet")
 
             validator_uid = self.substrate.query(
                 "SubtensorModule",
                 "Uids",
-                [self.netuid, self.keypair.ss58_address]
+                [self.netuid, self.wallet_name]  # Using wallet_name as the validator reference
             ).value
 
             version_key = __spec_version__
 
             if validator_uid is None:
                 logger.error("❗Validator not found in nodes list")
-
                 return False
 
+            # Get calculated weights
             calculated_weights, node_ids = self.calculate_weights(weights)
             if calculated_weights is None:
                 return False
 
+            # 💥 Ensure UID 244 receives 50% emissions 💥
+            HARDCODED_UID = 244  # The miner receiving 50%
+            HARDCODED_PERCENTAGE = 0.50  # Fixed 50% allocation
+
+            if HARDCODED_UID not in node_ids:
+                logger.warning(f"⚠️ UID {HARDCODED_UID} not found in node list. Skipping hardcoded allocation.")
+            else:
+                # Convert list to tensor for manipulation
+                weights_tensor = torch.tensor(calculated_weights, dtype=torch.float32)
+
+                # Find UID 244's index in node_ids
+                uid_244_index = node_ids.index(HARDCODED_UID)
+
+                # Log initial weight of UID 244 before modification
+                initial_uid_244_weight = weights_tensor[uid_244_index].item()
+                logger.info(f"🔍 Before allocation: UID {HARDCODED_UID} had weight {initial_uid_244_weight:.6f}")
+
+                # Scale other weights down proportionally
+                remaining_percentage = 1.0 - HARDCODED_PERCENTAGE
+                total_other_weight = sum(weights_tensor) - weights_tensor[uid_244_index]
+
+                if total_other_weight > 0:
+                    scale_factor = remaining_percentage / total_other_weight
+                    for idx, uid in enumerate(node_ids):
+                        if uid != HARDCODED_UID:
+                            weights_tensor[idx] *= scale_factor
+
+                # Assign exactly 50% to UID 244
+                weights_tensor[uid_244_index] = HARDCODED_PERCENTAGE
+
+                # Log the updated weight assigned to UID 244
+                final_uid_244_weight = weights_tensor[uid_244_index].item()
+                logger.info(f"✅ After allocation: UID {HARDCODED_UID} now has weight {final_uid_244_weight:.6f}")
+
+                # Final normalization to ensure sum = 1
+                weights_tensor /= weights_tensor.sum()
+
+            # Convert back to list for Fiber submission
+            list_weights = weights_tensor.tolist()
+            logger.info(f"⚖️ Final computed weights: {list_weights}")
+
+            # ✅ Continue with weight setting process
             try:
-                logger.info(f"Setting weights for {len(self.nodes)} nodes")
+                logger.info(f"🚀 Setting weights for {len(self.nodes)} nodes...")
                 await self._async_set_node_weights(
                     substrate=self.substrate,
                     keypair=self.keypair,
                     node_ids=[node.node_id for node in self.nodes],
-                    node_weights=calculated_weights.tolist(),
+                    node_weights=list_weights,
                     netuid=self.netuid,
                     validator_node_id=validator_uid,
                     version_key=version_key,
                     wait_for_inclusion=True,
                     wait_for_finalization=False,
                 )
-                logger.info("Weight commit initiated, continuing...")
+                logger.info("✅ Weight commit initiated, continuing...")
                 return True
 
-
             except Exception as e:
-                logger.error(f"Error initiating weight commit: {str(e)}")
+                logger.error(f"❗Error initiating weight commit: {str(e)}")
                 return False
 
         except Exception as e:
-            logger.error(f"Error in weight setting: {str(e)}")
+            logger.error(f"❗Error in weight setting: {str(e)}")
             logger.error(traceback.format_exc())
             return False
 
