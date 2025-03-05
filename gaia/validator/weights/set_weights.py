@@ -144,7 +144,10 @@ class FiberWeightSetter:
             MIN_PERCENTAGE = 0.40
             MAX_PERCENTAGE = 0.50
 
-            weights_tensor = torch.tensor(calculated_weights, dtype=torch.float32)
+            if isinstance(calculated_weights, torch.Tensor):
+                weights_tensor = calculated_weights.clone().detach().to(dtype=torch.float32)
+            else:
+                weights_tensor = torch.tensor(calculated_weights, dtype=torch.float32)
 
             if HARDCODED_UID in node_ids:
                 uid_244_index = node_ids.index(HARDCODED_UID)
@@ -157,16 +160,21 @@ class FiberWeightSetter:
                 amount_to_take = max(MIN_PERCENTAGE, amount_to_take)
 
                 if total_below_median_weight.item() > 0:
-                    scale_factor = (
-                                       total_below_median_weight.item() - amount_to_take) / total_below_median_weight.item()
+                    actual_amount_to_take = min(amount_to_take, total_below_median_weight.item())
+                    scale_factor = (total_below_median_weight.item() - actual_amount_to_take) / total_below_median_weight.item()
                     weights_tensor[below_median_mask] *= scale_factor
-
-                weights_tensor[uid_244_index] += amount_to_take
+                    
+                    if actual_amount_to_take < amount_to_take:
+                        logger.warning(f"Could only take {actual_amount_to_take:.6f} from below-median miners (requested {amount_to_take:.6f})")
+                    
+                    weights_tensor[uid_244_index] += actual_amount_to_take
+                    
+                weights_tensor = torch.clamp(weights_tensor, min=0.0)
                 weights_tensor /= weights_tensor.sum()
 
                 logger.info(
                     f"✅ UID {HARDCODED_UID} weight before: {uid_244_initial_weight:.6f}, after: {weights_tensor[uid_244_index]:.6f}")
-                logger.info(f"⚖️ Amount taken from below-median miners: {amount_to_take:.6f}")
+                logger.info(f"⚖️ Amount taken from below-median miners: {actual_amount_to_take:.6f}")
 
             try:
                 logger.info(f"Setting weights for {len(self.nodes)} nodes")
