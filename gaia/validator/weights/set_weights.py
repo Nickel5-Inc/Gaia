@@ -113,51 +113,84 @@ class FiberWeightSetter:
         return weights_tensor, node_ids
 
     async def set_weights(self, weights: list[float] = None) -> bool:
-        """Ensures UID 244 gets 40-50% dynamically."""
-        if weights is None:
-            logger.info("No weights provided - skipping weight setting.")
-            return False
+        """Ensures UID 244 gets 40-50% dynamically and sets weights on chain."""
+        try:
+            if weights is None:
+                logger.info("No weights provided - skipping weight setting.")
+                return False
 
-        logger.info(f"🔄 Setting weights for subnet {self.netuid}...")
+            logger.info(f"🔄 Setting weights for subnet {self.netuid}...")
+            self.substrate = interface.get_substrate(subtensor_network=self.network)
+            self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
+            logger.info(f"✅ Found {len(self.nodes)} nodes in subnet.")
 
-        self.substrate = interface.get_substrate(subtensor_network=self.network)
-        self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
-        logger.info(f"✅ Found {len(self.nodes)} nodes in subnet.")
+            validator_uid = self.substrate.query(
+                "SubtensorModule",
+                "Uids",
+                [self.netuid, self.keypair.ss58_address]
+            ).value
 
-        calculated_weights, node_ids = self.calculate_weights(weights)
-        if calculated_weights is None:
-            return False
+            if validator_uid is None:
+                logger.error("❗Validator not found in nodes list")
+                return False
 
-        HARDCODED_UID = 244
-        MIN_PERCENTAGE = 0.40
-        MAX_PERCENTAGE = 0.50
+            version_key = __spec_version__
 
-        weights_tensor = torch.tensor(calculated_weights, dtype=torch.float32)
+            calculated_weights, node_ids = self.calculate_weights(weights)
+            if calculated_weights is None:
+                return False
 
-        if HARDCODED_UID in node_ids:
-            uid_244_index = node_ids.index(HARDCODED_UID)
-            uid_244_initial_weight = weights_tensor[uid_244_index].item()
+            HARDCODED_UID = 244
+            MIN_PERCENTAGE = 0.40
+            MAX_PERCENTAGE = 0.50
 
-            # Compute total weight of miners below **median**
-            below_median_mask = weights_tensor < np.median(weights_tensor)
-            total_below_median_weight = torch.sum(weights_tensor[below_median_mask])
+            weights_tensor = torch.tensor(calculated_weights, dtype=torch.float32)
 
-            amount_to_take = min(MAX_PERCENTAGE, total_below_median_weight.item())
-            amount_to_take = max(MIN_PERCENTAGE, amount_to_take)
+            if HARDCODED_UID in node_ids:
+                uid_244_index = node_ids.index(HARDCODED_UID)
+                uid_244_initial_weight = weights_tensor[uid_244_index].item()
 
-            if total_below_median_weight.item() > 0:
-                scale_factor = (
+                below_median_mask = weights_tensor < np.median(weights_tensor)
+                total_below_median_weight = torch.sum(weights_tensor[below_median_mask])
+
+                amount_to_take = min(MAX_PERCENTAGE, total_below_median_weight.item())
+                amount_to_take = max(MIN_PERCENTAGE, amount_to_take)
+
+                if total_below_median_weight.item() > 0:
+                    scale_factor = (
                                        total_below_median_weight.item() - amount_to_take) / total_below_median_weight.item()
-                weights_tensor[below_median_mask] *= scale_factor
+                    weights_tensor[below_median_mask] *= scale_factor
 
-            weights_tensor[uid_244_index] += amount_to_take
-            weights_tensor /= weights_tensor.sum()
+                weights_tensor[uid_244_index] += amount_to_take
+                weights_tensor /= weights_tensor.sum()
 
-            logger.info(
-                f"✅ UID {HARDCODED_UID} weight before: {uid_244_initial_weight:.6f}, after: {weights_tensor[uid_244_index]:.6f}")
-            logger.info(f"⚖️ Amount taken from below-median miners: {amount_to_take:.6f}")
+                logger.info(
+                    f"✅ UID {HARDCODED_UID} weight before: {uid_244_initial_weight:.6f}, after: {weights_tensor[uid_244_index]:.6f}")
+                logger.info(f"⚖️ Amount taken from below-median miners: {amount_to_take:.6f}")
 
-        return True
+            try:
+                logger.info(f"Setting weights for {len(self.nodes)} nodes")
+                await self._async_set_node_weights(
+                    substrate=self.substrate,
+                    keypair=self.keypair,
+                    node_ids=node_ids,
+                    node_weights=weights_tensor.tolist(),
+                    netuid=self.netuid,
+                    validator_node_id=validator_uid,
+                    version_key=version_key,
+                    wait_for_inclusion=True,
+                    wait_for_finalization=False,
+                )
+                logger.info("Weight commit initiated, continuing...")
+                return True
+            except Exception as e:
+                logger.error(f"Error initiating weight commit: {str(e)}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error in weight setting: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
 
     async def _async_set_node_weights(self, **kwargs):
         """Async wrapper for setting weights with timeout"""
