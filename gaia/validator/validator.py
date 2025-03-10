@@ -1314,7 +1314,12 @@ class GaiaValidator:
                 geomagnetic_score = geomagnetic_scores[idx]
                 soil_score = soil_scores[idx]
 
-                # Treat 0.0 scores the same as NaN
+                # 🚨 Explicitly zero out weight if both scores are 0 🚨
+                if geomagnetic_score == 0.0 and soil_score == 0.0:
+                    weights[idx] = 0.0
+                    continue  # Skip further calculations for this node
+
+                # Treat NaN values properly
                 if np.isnan(geomagnetic_score) or geomagnetic_score == 0.0:
                     geomagnetic_score = np.nan
                 if np.isnan(soil_score) or soil_score == 0.0:

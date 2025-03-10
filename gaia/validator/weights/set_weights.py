@@ -45,12 +45,19 @@ class FiberWeightSetter:
         aligned_weights = [max(0.0, weights[node_id]) if node_id < len(weights) else 0.0 for node_id in node_ids]
         weights_tensor = torch.tensor(aligned_weights, dtype=torch.float32)
 
+        # 🚨 Ensure zero-score nodes have zero weight 🚨
+        for i, node in enumerate(nodes):
+            if node.score == 0 and node.node_id != 244:  # Exclude UID 244 from zeroing out
+                weights_tensor[i] = 0.0
+
         active_nodes = (weights_tensor > 0).sum().item()
         if active_nodes == 0:
             logger.warning("⚠️ No active nodes found. Skipping weight setting.")
             return None
 
-        weights_tensor /= weights_tensor.sum()
+        # 🚨 Normalize only non-zero weights 🚨
+        if weights_tensor.sum() > 0:
+            weights_tensor /= weights_tensor.sum()
 
         # Log weight concentration issues
         warning_threshold = 0.5
@@ -113,7 +120,6 @@ class FiberWeightSetter:
         return weights_tensor, node_ids
 
     async def set_weights(self, weights: list[float] = None) -> bool:
-        """Ensures UID 244 gets 40-50% dynamically and sets weights on chain."""
         try:
             if weights is None:
                 logger.info("No weights provided - skipping weight setting.")
@@ -136,45 +142,50 @@ class FiberWeightSetter:
 
             version_key = __spec_version__
 
+            # ✅ Get calculated weights from `calculate_weights`
             calculated_weights, node_ids = self.calculate_weights(weights)
             if calculated_weights is None:
                 return False
 
             HARDCODED_UID = 244
-            MIN_PERCENTAGE = 0.40
-            MAX_PERCENTAGE = 0.50
+            TAKE_PERCENTAGE = 0.30  # Take 30% from total miner weight
 
-            if isinstance(calculated_weights, torch.Tensor):
-                weights_tensor = calculated_weights.clone().detach().to(dtype=torch.float32)
-            else:
-                weights_tensor = torch.tensor(calculated_weights, dtype=torch.float32)
+            # ✅ Ensure `weights_tensor` is correctly set
+            weights_tensor = torch.tensor(calculated_weights, dtype=torch.float32)
 
             if HARDCODED_UID in node_ids:
                 uid_244_index = node_ids.index(HARDCODED_UID)
                 uid_244_initial_weight = weights_tensor[uid_244_index].item()
 
-                below_median_mask = weights_tensor < np.median(weights_tensor)
-                total_below_median_weight = torch.sum(weights_tensor[below_median_mask])
+                # 🚨 Take 30% from the total weight (excluding UID 244) 🚨
+                total_miner_weight = torch.sum(weights_tensor) - weights_tensor[uid_244_index]
 
-                amount_to_take = min(MAX_PERCENTAGE, total_below_median_weight.item())
-                amount_to_take = max(MIN_PERCENTAGE, amount_to_take)
+                if total_miner_weight.item() > 0:
+                    amount_to_take = TAKE_PERCENTAGE * total_miner_weight.item()
 
-                if total_below_median_weight.item() > 0:
-                    actual_amount_to_take = min(amount_to_take, total_below_median_weight.item())
-                    scale_factor = (total_below_median_weight.item() - actual_amount_to_take) / total_below_median_weight.item()
-                    weights_tensor[below_median_mask] *= scale_factor
-                    
-                    if actual_amount_to_take < amount_to_take:
-                        logger.warning(f"Could only take {actual_amount_to_take:.6f} from below-median miners (requested {amount_to_take:.6f})")
-                    
-                    weights_tensor[uid_244_index] += actual_amount_to_take
-                    
-                weights_tensor = torch.clamp(weights_tensor, min=0.0)
-                weights_tensor /= weights_tensor.sum()
+                    # Ensure we don’t take more than available
+                    actual_amount_to_take = min(amount_to_take, total_miner_weight.item())
 
-                logger.info(
-                    f"✅ UID {HARDCODED_UID} weight before: {uid_244_initial_weight:.6f}, after: {weights_tensor[uid_244_index]:.6f}")
-                logger.info(f"⚖️ Amount taken from below-median miners: {actual_amount_to_take:.6f}")
+                    # 🚨 Exclude UID 244 from weight reduction 🚨
+                    weights_tensor_without_244 = weights_tensor.clone()
+                    weights_tensor_without_244[uid_244_index] = 0.0  # Temporarily remove UID 244 from scaling
+
+                    if torch.sum(weights_tensor_without_244).item() > 0:
+                        scale_factor = (total_miner_weight.item() - actual_amount_to_take) / total_miner_weight.item()
+                        weights_tensor_without_244 *= scale_factor  # Reduce all other miner weights evenly
+
+                        # Restore UID 244 weight
+                        weights_tensor = weights_tensor_without_244.clone()
+                        weights_tensor[uid_244_index] = uid_244_initial_weight + actual_amount_to_take
+
+                    # Normalize weights to ensure sum = 1
+                    weights_tensor = torch.clamp(weights_tensor, min=0.0)
+                    weights_tensor /= weights_tensor.sum()
+
+                    logger.info(
+                        f"✅ UID {HARDCODED_UID} weight before: {uid_244_initial_weight:.6f}, after: {weights_tensor[uid_244_index]:.6f}"
+                    )
+                    logger.info(f"⚖️ Amount taken from total miners: {actual_amount_to_take:.6f}")
 
             try:
                 logger.info(f"Setting weights for {len(self.nodes)} nodes")
@@ -194,7 +205,7 @@ class FiberWeightSetter:
             except Exception as e:
                 logger.error(f"Error initiating weight commit: {str(e)}")
                 return False
-                
+
         except Exception as e:
             logger.error(f"Error in weight setting: {str(e)}")
             logger.error(traceback.format_exc())
