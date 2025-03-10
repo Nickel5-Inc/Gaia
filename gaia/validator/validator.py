@@ -46,6 +46,7 @@ from sqlalchemy import text
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
+from gaia.validator.basemodel_evaluator import BaseModelEvaluator
 
 logger = get_logger(__name__)
 
@@ -206,6 +207,14 @@ class GaiaValidator:
 
         # Add lock for miner table operations
         self.miner_table_lock = asyncio.Lock()
+
+        self.basemodel_evaluator = BaseModelEvaluator(
+            db_manager=self.database_manager,
+            test_mode=self.args.test if hasattr(self.args, 'test') else False
+        )
+        logger.info("BaseModelEvaluator initialized")
+        
+
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -829,13 +838,16 @@ class GaiaValidator:
             await self.start_watchdog()
             logger.info("Watchdog started.")
             
+            logger.info("Initializing baseline models...")
+            await self.basemodel_evaluator.initialize_models()
+            logger.info("Baseline models initialization complete")
+            
             tasks = [
                 lambda: self.geomagnetic_task.validator_execute(self),
                 lambda: self.soil_task.validator_execute(self),
                 lambda: self.status_logger(),
                 lambda: self.main_scoring(),
                 lambda: self.handle_miner_deregistration_loop(),
-                #lambda: self.miner_score_sender.run_async(), 
                 lambda: self.check_for_updates()
             ]
             

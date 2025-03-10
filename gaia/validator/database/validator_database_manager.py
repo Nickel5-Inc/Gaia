@@ -14,6 +14,7 @@ import random
 import time
 from functools import wraps
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+import torch
 
 
 
@@ -304,6 +305,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             await self._create_trigger(session)
             await self._initialize_rows(session)
             await self.create_score_table(session)
+            
+            # Create baseline predictions table
+            await self.create_baseline_predictions_table(session)
             
             logger.info("Successfully created core tables")
             
@@ -925,3 +929,154 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 logger.error(traceback.format_exc())
 
         logger.info(f"Score removal complete. Total rows updated: {total_rows_updated}")
+
+    @track_operation('ddl')
+    async def create_baseline_predictions_table(self, session: AsyncSession):
+        """Create a simple table to store baseline model predictions."""
+        try:
+            logger.info("Creating baseline_predictions table if it doesn't exist")
+            
+            create_table_sql = """
+            CREATE TABLE IF NOT EXISTS baseline_predictions (
+                id SERIAL PRIMARY KEY,
+                task_name TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                region_id TEXT,
+                timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+                prediction JSONB NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+            await self.execute(create_table_sql, session=session)
+            
+            index_sql = """
+            CREATE INDEX IF NOT EXISTS idx_baseline_task ON baseline_predictions (task_name, task_id);
+            """
+            await self.execute(index_sql, session=session)
+            
+            logger.info("Successfully created baseline_predictions table")
+        except Exception as e:
+            logger.error(f"Error creating baseline_predictions table: {e}")
+            logger.error(traceback.format_exc())
+            raise DatabaseError(f"Failed to create baseline_predictions table: {str(e)}")
+            
+    @track_operation('write')
+    async def store_baseline_prediction(self, 
+                                       task_name: str, 
+                                       task_id: str, 
+                                       timestamp: datetime, 
+                                       prediction: Any, 
+                                       region_id: Optional[str] = None) -> bool:
+        """
+        Store a baseline model prediction in the database.
+        
+        Args:
+            task_name: Name of the task (e.g., 'geomagnetic', 'soil_moisture')
+            task_id: ID of the specific task execution
+            timestamp: Timestamp for when the prediction was made
+            prediction: The model's prediction (will be JSON serialized)
+            region_id: For soil moisture task, the region identifier (optional)
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if isinstance(prediction, (np.ndarray, torch.Tensor)):
+                prediction = prediction.tolist()
+                
+            prediction_json = json.dumps(prediction, default=self._json_serializer)
+            
+            insert_sql = """
+            INSERT INTO baseline_predictions 
+            (task_name, task_id, region_id, timestamp, prediction)
+            VALUES (:task_name, :task_id, :region_id, :timestamp, :prediction)
+            """
+            
+            params = {
+                "task_name": task_name,
+                "task_id": task_id,
+                "region_id": region_id,
+                "timestamp": timestamp,
+                "prediction": prediction_json
+            }
+            
+            await self.execute(insert_sql, params)
+            logger.debug(f"Stored baseline prediction for {task_name}, task_id: {task_id}, region: {region_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error storing baseline prediction: {e}")
+            logger.error(traceback.format_exc())
+            return False
+            
+    @track_operation('read')
+    async def get_baseline_prediction(self, 
+                                    task_name: str, 
+                                    task_id: str, 
+                                    region_id: Optional[str] = None) -> Optional[Dict]:
+        """
+        Retrieve a baseline prediction from the database.
+        
+        Args:
+            task_name: Name of the task
+            task_id: ID of the specific task execution
+            region_id: For soil moisture task, the region identifier (optional)
+            
+        Returns:
+            Optional[Dict]: The prediction data or None if not found
+        """
+        try:
+            query = """
+            SELECT * FROM baseline_predictions 
+            WHERE task_name = :task_name 
+            AND task_id = :task_id
+            """
+            
+            params = {
+                "task_name": task_name,
+                "task_id": task_id
+            }
+            
+            if region_id:
+                query += " AND region_id = :region_id"
+                params["region_id"] = region_id
+            
+            query += " ORDER BY created_at DESC LIMIT 1"
+            
+            result = await self.fetch_one(query, params)
+            
+            if not result:
+                logger.warning(f"No baseline prediction found for {task_name}, task_id: {task_id}, region: {region_id}")
+                return None
+                
+            prediction_data = json.loads(result['prediction'])
+                
+            return {
+                "task_name": result['task_name'],
+                "task_id": result['task_id'],
+                "region_id": result['region_id'],
+                "timestamp": result['timestamp'],
+                "prediction": prediction_data,
+                "created_at": result['created_at']
+            }
+            
+        except Exception as e:
+            logger.error(f"Error retrieving baseline prediction: {e}")
+            logger.error(traceback.format_exc())
+            return None
+    
+    def _json_serializer(self, obj):
+        """
+        Custom JSON serializer for objects not serializable by default json code.
+        """
+        if isinstance(obj, (datetime, np.datetime64)):
+            return obj.isoformat()
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, torch.Tensor):
+            return obj.cpu().numpy().tolist()
+        raise TypeError(f"Type {type(obj)} not serializable")
