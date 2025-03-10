@@ -1338,6 +1338,40 @@ class GaiaValidator:
 
             logger.info(f"Weights before normalization: {weights}")
 
+            validator_uids = []
+            try:
+                nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
+                for node in nodes:
+                    is_validator = False
+                    if hasattr(node, 'vtrust') and node.vtrust > 0:
+                        is_validator = True
+                    elif hasattr(node, 'is_validator') and node.is_validator:
+                        is_validator = True
+                    
+                    if is_validator:
+                        validator_uids.append(node.node_id)
+                        logger.info(f"Identified validator: UID {node.node_id}, hotkey {node.hotkey}")
+                        
+                if not validator_uids:
+                    logger.warning("No validators identified from node properties. This is unusual.")
+            except Exception as e:
+                logger.warning(f"Error identifying validators from nodes: {e}")
+            
+            if not validator_uids:
+                try:
+                    validator_uid = self.substrate.query(
+                        "SubtensorModule", 
+                        "Uids", 
+                        [self.netuid, self.keypair.ss58_address]
+                    ).value
+                    if validator_uid is not None:
+                        validator_uids.append(validator_uid)
+                        logger.info(f"Added our own validator UID as fallback: {validator_uid}")
+                except Exception as e2:
+                    logger.error(f"Could not identify our own validator UID: {e2}")
+            
+            logger.info(f"Excluding {len(validator_uids)} validators from weight calculation: {validator_uids}")
+
             # generalized logistic curve
             non_zero_mask = weights != 0.0
             if np.any(non_zero_mask):
@@ -1362,6 +1396,11 @@ class GaiaValidator:
                 # Normalize final weights to sum to 1
                 weight_sum = np.sum(new_weights)
                 if weight_sum > 0:
+                    # Double check that validators have zero weight
+                    for validator_uid in validator_uids:
+                        new_weights[validator_uid] = 0.0
+                    # Renormalize after zeroing out validators
+                    weight_sum = np.sum(new_weights)
                     new_weights = new_weights / weight_sum
                     logger.info("Final normalized weights calculated")
                     return new_weights.tolist()

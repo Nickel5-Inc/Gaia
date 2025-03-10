@@ -38,34 +38,61 @@ class FiberWeightSetter:
             logger.warning("⚠️ No weights provided. Skipping weight setting.")
             return None
 
-        nodes = get_nodes_for_netuid(substrate=self.substrate,
-                                     netuid=self.netuid) if self.nodes is None else self.nodes
-        node_ids = [node.node_id for node in nodes]
+        self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
+
+        validator_uids = []
+        for node in self.nodes:
+            is_validator = False
+            if hasattr(node, 'vtrust') and node.vtrust > 0:
+                is_validator = True
+            elif hasattr(node, 'is_validator') and node.is_validator:
+                is_validator = True
+            
+            if is_validator:
+                validator_uids.append(node.node_id)
+                logger.info(f"Identified validator: UID {node.node_id}, hotkey {node.hotkey}")
+        
+        if not validator_uids:
+            logger.warning("No validators identified from node properties. This is unusual.")
+            try:
+                validator_uid = self.substrate.query(
+                    "SubtensorModule", 
+                    "Uids", 
+                    [self.netuid, self.keypair.ss58_address]
+                ).value
+                if validator_uid is not None:
+                    validator_uids.append(validator_uid)
+                    logger.info(f"Added our own validator UID as fallback: {validator_uid}")
+            except Exception as e:
+                logger.error(f"Could not identify our own validator UID: {e}")
+
+        logger.info(f"Excluding {len(validator_uids)} validators from weight setting: {validator_uids}")
+        
+        self.nodes = [node for node in self.nodes if node.node_id not in validator_uids]
+        self.nodes = sorted(self.nodes, key=lambda node: node.node_id)
+        node_ids = [node.node_id for node in self.nodes]
+
+        if not node_ids:
+            logger.warning("⚠️ All nodes were validators. No miners to set weights for.")
+            empty_tensor = torch.tensor([], dtype=torch.float32)
+            return empty_tensor, []
 
         aligned_weights = [max(0.0, weights[node_id]) if node_id < len(weights) else 0.0 for node_id in node_ids]
         weights_tensor = torch.tensor(aligned_weights, dtype=torch.float32)
 
-        # 🚨 Ensure zero-score nodes have zero weight 🚨
-        for i, node in enumerate(nodes):
-            if node.score == 0 and node.node_id != 244:  # Exclude UID 244 from zeroing out
-                weights_tensor[i] = 0.0
-
         active_nodes = (weights_tensor > 0).sum().item()
         if active_nodes == 0:
             logger.warning("⚠️ No active nodes found. Skipping weight setting.")
-            return None
+            return weights_tensor, node_ids
 
-        # 🚨 Normalize only non-zero weights 🚨
         if weights_tensor.sum() > 0:
             weights_tensor /= weights_tensor.sum()
 
-        # Log weight concentration issues
         warning_threshold = 0.5
         high_weight_nodes = torch.where(weights_tensor > warning_threshold)[0]
         for idx in high_weight_nodes:
             logger.warning(f"⚠️ Node {idx} weight {weights_tensor[idx]:.6f} exceeds 50% of total weight.")
 
-        # Analyzing weight distribution
         non_zero_weights = weights_tensor[weights_tensor > 0].numpy()
         total_weight = weights_tensor.sum().item()
 
@@ -87,7 +114,6 @@ class FiberWeightSetter:
             for key, value in stats.items():
                 logger.info(f"✅ {key.capitalize()}: {value:.6f}")
 
-            # Compute proper percentiles
             percentile_intervals = np.linspace(0, 100, 11)
             percentiles = np.percentile(non_zero_weights, percentile_intervals)
 
@@ -142,50 +168,50 @@ class FiberWeightSetter:
 
             version_key = __spec_version__
 
-            # ✅ Get calculated weights from `calculate_weights`
             calculated_weights, node_ids = self.calculate_weights(weights)
-            if calculated_weights is None:
+            if calculated_weights is None or len(calculated_weights) == 0:
+                logger.warning("No valid weights to set. Skipping weight setting.")
                 return False
 
             HARDCODED_UID = 244
-            TAKE_PERCENTAGE = 0.30  # Take 30% from total miner weight
+            MAX_PERCENTAGE = 0.30
+            BOTTOM_PERCENT = 0.5
 
-            # ✅ Ensure `weights_tensor` is correctly set
-            weights_tensor = torch.tensor(calculated_weights, dtype=torch.float32)
-
-            if HARDCODED_UID in node_ids:
+            if node_ids and HARDCODED_UID in node_ids:
                 uid_244_index = node_ids.index(HARDCODED_UID)
-                uid_244_initial_weight = weights_tensor[uid_244_index].item()
+                uid_244_initial_weight = calculated_weights[uid_244_index].item()
 
-                # 🚨 Take 30% from the total weight (excluding UID 244) 🚨
-                total_miner_weight = torch.sum(weights_tensor) - weights_tensor[uid_244_index]
+                precision = 8
+                rounded_weights = torch.round(calculated_weights * 10**precision) / 10**precision
+                
+                weight_tuples = [(i, node_ids[i], rounded_weights[i].item()) for i in range(len(node_ids)) if node_ids[i] != HARDCODED_UID]
+                
+                weight_tuples.sort(key=lambda x: (x[2], x[1]))
+                
+                bottom_count = int(len(weight_tuples) * BOTTOM_PERCENT)
+                bottom_indices = [t[0] for t in weight_tuples[:bottom_count]]
+                
+                bottom_mask = torch.zeros_like(calculated_weights, dtype=torch.bool)
+                for idx in bottom_indices:
+                    bottom_mask[idx] = True
+                
+                total_bottom_weight = calculated_weights[bottom_mask].sum()
+                
+                if total_bottom_weight.item() > 0:
+                    actual_amount_to_take = min(MAX_PERCENTAGE, total_bottom_weight.item())
+                    
+                    calculated_weights[uid_244_index] += actual_amount_to_take
+                    
+                    calculated_weights[bottom_mask] = 0.0
 
-                if total_miner_weight.item() > 0:
-                    amount_to_take = TAKE_PERCENTAGE * total_miner_weight.item()
-
-                    # Ensure we don’t take more than available
-                    actual_amount_to_take = min(amount_to_take, total_miner_weight.item())
-
-                    # 🚨 Exclude UID 244 from weight reduction 🚨
-                    weights_tensor_without_244 = weights_tensor.clone()
-                    weights_tensor_without_244[uid_244_index] = 0.0  # Temporarily remove UID 244 from scaling
-
-                    if torch.sum(weights_tensor_without_244).item() > 0:
-                        scale_factor = (total_miner_weight.item() - actual_amount_to_take) / total_miner_weight.item()
-                        weights_tensor_without_244 *= scale_factor  # Reduce all other miner weights evenly
-
-                        # Restore UID 244 weight
-                        weights_tensor = weights_tensor_without_244.clone()
-                        weights_tensor[uid_244_index] = uid_244_initial_weight + actual_amount_to_take
-
-                    # Normalize weights to ensure sum = 1
-                    weights_tensor = torch.clamp(weights_tensor, min=0.0)
-                    weights_tensor /= weights_tensor.sum()
+                    calculated_weights = torch.clamp(calculated_weights, min=0.0)
+                    calculated_weights /= calculated_weights.sum()
 
                     logger.info(
-                        f"✅ UID {HARDCODED_UID} weight before: {uid_244_initial_weight:.6f}, after: {weights_tensor[uid_244_index]:.6f}"
+                        f"✅ UID {HARDCODED_UID} weight before: {uid_244_initial_weight:.6f}, after: {calculated_weights[uid_244_index]:.6f}"
                     )
-                    logger.info(f"⚖️ Amount taken from total miners: {actual_amount_to_take:.6f}")
+                    logger.info(f"⚖️ Amount taken from bottom {BOTTOM_PERCENT*100}% miners: {actual_amount_to_take:.6f}")
+                    logger.info(f"🔄 Number of bottom miners set to zero: {bottom_mask.sum().item()}")
 
             try:
                 logger.info(f"Setting weights for {len(self.nodes)} nodes")
@@ -193,7 +219,7 @@ class FiberWeightSetter:
                     substrate=self.substrate,
                     keypair=self.keypair,
                     node_ids=node_ids,
-                    node_weights=weights_tensor.tolist(),
+                    node_weights=calculated_weights.tolist(),
                     netuid=self.netuid,
                     validator_node_id=validator_uid,
                     version_key=version_key,
