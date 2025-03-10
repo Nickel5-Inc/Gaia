@@ -22,7 +22,7 @@ class FiberWeightSetter:
             network: str = "finney",
             timeout: int = 30,
     ):
-        """Initialize the weight setter with Fiber"""
+        """Initialize the weight setter with fiber"""
         self.netuid = netuid
         self.network = network
         self.substrate = interface.get_substrate(subtensor_network=network)
@@ -32,74 +32,47 @@ class FiberWeightSetter:
         )
         self.timeout = timeout
 
-    def calculate_weights(self, weights: list[float] = None) -> torch.Tensor:
-        """Normalizes and analyzes miner weights before setting them on-chain."""
+
+    def calculate_weights(self, weights: List[float] = None) -> torch.Tensor:
+        """Convert input weights to normalized tensor with min/max bounds"""
         if weights is None:
-            logger.warning("⚠️ No weights provided. Skipping weight setting.")
+            logger.warning("No weights provided")
             return None
 
-        self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
+        nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid) if self.nodes is None else self.nodes
+        node_ids = [node.node_id for node in nodes]
 
-        validator_uids = []
-        for node in self.nodes:
-            is_validator = False
-            if hasattr(node, 'vtrust') and node.vtrust > 0:
-                is_validator = True
-            elif hasattr(node, 'is_validator') and node.is_validator:
-                is_validator = True
-            
-            if is_validator:
-                validator_uids.append(node.node_id)
-                logger.info(f"Identified validator: UID {node.node_id}, hotkey {node.hotkey}")
-        
-        if not validator_uids:
-            logger.warning("No validators identified from node properties. This is unusual.")
-            try:
-                validator_uid = self.substrate.query(
-                    "SubtensorModule", 
-                    "Uids", 
-                    [self.netuid, self.keypair.ss58_address]
-                ).value
-                if validator_uid is not None:
-                    validator_uids.append(validator_uid)
-                    logger.info(f"Added our own validator UID as fallback: {validator_uid}")
-            except Exception as e:
-                logger.error(f"Could not identify our own validator UID: {e}")
 
-        logger.info(f"Excluding {len(validator_uids)} validators from weight setting: {validator_uids}")
-        
-        self.nodes = [node for node in self.nodes if node.node_id not in validator_uids]
-        self.nodes = sorted(self.nodes, key=lambda node: node.node_id)
-        node_ids = [node.node_id for node in self.nodes]
+        aligned_weights = [
+            max(0.0, weights[node_id]) if node_id < len(weights) else 0.0
+            for node_id in node_ids
+        ]
 
-        if not node_ids:
-            logger.warning("⚠️ All nodes were validators. No miners to set weights for.")
-            empty_tensor = torch.tensor([], dtype=torch.float32)
-            return empty_tensor, []
-
-        aligned_weights = [max(0.0, weights[node_id]) if node_id < len(weights) else 0.0 for node_id in node_ids]
         weights_tensor = torch.tensor(aligned_weights, dtype=torch.float32)
-
         active_nodes = (weights_tensor > 0).sum().item()
+
         if active_nodes == 0:
-            logger.warning("⚠️ No active nodes found. Skipping weight setting.")
-            return weights_tensor, node_ids
+            logger.warning("No active nodes found")
+            return None
 
-        if weights_tensor.sum() > 0:
-            weights_tensor /= weights_tensor.sum()
+        logger.info(f"Raw computed weights before normalization: {weights}")
 
-        warning_threshold = 0.5
-        high_weight_nodes = torch.where(weights_tensor > warning_threshold)[0]
-        for idx in high_weight_nodes:
-            logger.warning(f"⚠️ Node {idx} weight {weights_tensor[idx]:.6f} exceeds 50% of total weight.")
+        weights_tensor /= weights_tensor.sum()
+        warning_threshold = 0.5  # Warn if any node exceeds 50% of total weight
 
+        # Check for concerning weight concentration
+        if torch.any(weights_tensor > warning_threshold):
+            high_weight_nodes = torch.where(weights_tensor > warning_threshold)[0]
+            for idx in high_weight_nodes:
+                logger.warning(f"Node {idx} weight {weights_tensor[idx]:.6f} exceeds 50% of total weight - potential reward concentration issue")
+
+        # Final chain-side distribution analysis before setting weights
         non_zero_weights = weights_tensor[weights_tensor > 0].numpy()
-        total_weight = weights_tensor.sum().item()
-
         if len(non_zero_weights) > 0:
-            sorted_weights = np.sort(non_zero_weights)[::-1]
+            total_weight = weights_tensor.sum().item()
+            sorted_weights = np.sort(non_zero_weights)[::-1]  # Sort in descending order
             cumulative_weights = np.cumsum(sorted_weights)
-
+            
             stats = {
                 'mean': float(np.mean(non_zero_weights)),
                 'median': float(np.median(non_zero_weights)),
@@ -107,54 +80,74 @@ class FiberWeightSetter:
                 'min': float(np.min(non_zero_weights)),
                 'max': float(np.max(non_zero_weights)),
                 'count': len(non_zero_weights),
-                'zero_count': len(weights_tensor) - len(non_zero_weights),
+                'zero_count': len(weights_tensor) - len(non_zero_weights)
             }
-
-            logger.info("\n📊 **Final Weight Distribution Analysis:**")
-            for key, value in stats.items():
-                logger.info(f"✅ {key.capitalize()}: {value:.6f}")
-
-            percentile_intervals = np.linspace(0, 100, 11)
-            percentiles = np.percentile(non_zero_weights, percentile_intervals)
-
-            logger.info("\n📉 **Percentile Analysis:**")
-            logger.info(
-                f"{'Percentile':>10} {'Weight':>12} {'Avg/Node':>12} {'Pool Share %':>12} {'Cumulative %':>12}")
+            
+            # Calculate percentiles in 10% increments
+            percentile_points = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+            percentiles = np.percentile(non_zero_weights, percentile_points)
+            percentile_indices = [int(p * len(sorted_weights) / 100) for p in percentile_points]
+            
+            logger.info("\nFinal Weight Distribution Analysis (after min/max bounds):")
+            logger.info(f"Mean: {stats['mean']:.6f}")
+            logger.info(f"Median: {stats['median']:.6f}")
+            logger.info(f"Std Dev: {stats['std']:.6f}")
+            logger.info(f"Min: {stats['min']:.6f}")
+            logger.info(f"Max: {stats['max']:.6f}")
+            logger.info(f"Non-zero weights: {stats['count']}")
+            logger.info(f"Zero weights: {stats['zero_count']}")
+            
+            logger.info("\nPercentile Analysis (for non-zero weights, sorted by performance):")
+            logger.info(f"{'Performance':>10} {'Weight':>12} {'Avg/Node':>12} {'Pool Share %':>12} {'Cumulative %':>12} {'Node Count':>10}")
             logger.info("-" * 70)
-
-            for i in range(len(percentile_intervals) - 1):
-                start_percentile = 100 - percentile_intervals[i]
-                end_percentile = 100 - percentile_intervals[i + 1]
-
-                segment_weights = sorted_weights[
-                                  int(len(sorted_weights) * (1 - percentile_intervals[i + 1] / 100)):
-                                  int(len(sorted_weights) * (1 - percentile_intervals[i] / 100))
-                                  ]
-
-                if len(segment_weights) == 0:
-                    continue
-
-                segment_total = np.sum(segment_weights)
-                avg_weight = segment_total / len(segment_weights)
+            
+            for i in range(len(percentile_points)-1):
+                start_idx = percentile_indices[i]
+                end_idx = percentile_indices[i+1]
+                if i == len(percentile_points)-2:  # Last segment
+                    end_idx = len(sorted_weights)
+                    
+                segment_weights = sorted_weights[start_idx:end_idx]
+                segment_total = float(np.sum(segment_weights))
+                nodes_in_segment = len(segment_weights)
+                avg_weight_per_node = segment_total / nodes_in_segment if nodes_in_segment > 0 else 0
                 pool_share = (segment_total / total_weight) * 100
-                cumulative_share = (cumulative_weights[int(len(sorted_weights) * (
-                        1 - percentile_intervals[i + 1] / 100))] / total_weight) * 100
+                cumulative_share = (cumulative_weights[end_idx-1] / total_weight) * 100 if end_idx > 0 else 0
+                
+                # Convert to "Top X%" format
+                top_start = 100 - percentile_points[i]
+                top_end = 100 - percentile_points[i+1]
+                
+                logger.info(f"Top {top_start:>3}-{top_end:<6} "
+                          f"{percentiles[i]:>12.6f} "
+                          f"{avg_weight_per_node:>12.6f} "
+                          f"{pool_share:>12.2f}% "
+                          f"{cumulative_share:>12.2f}% "
+                          f"{nodes_in_segment:>10}")
 
-                logger.info(
-                    f"Top {start_percentile:>3}-{end_percentile:<3} {percentiles[i]:>12.6f} {avg_weight:>12.6f} {pool_share:>12.2f}% {cumulative_share:>12.2f}%")
+        logger.info(
+            f"Weight distribution stats:"
+            f"\n- Active nodes: {active_nodes}"
+            f"\n- Max weight: {weights_tensor.max().item():.4f}"
+            f"\n- Min non-zero weight: {weights_tensor[weights_tensor > 0].min().item():.4f}"
+            f"\n- Total weight: {weights_tensor.sum().item():.4f}"
+        )
+        logger.info(f"Weights tensor: {weights_tensor}")
 
         return weights_tensor, node_ids
 
-    async def set_weights(self, weights: list[float] = None) -> bool:
+    async def set_weights(self, weights: List[float] = None) -> bool:
+        """Set weights on chain"""
         try:
             if weights is None:
-                logger.info("No weights provided - skipping weight setting.")
+                logger.info("No weights provided - skipping weight setting")
                 return False
 
-            logger.info(f"🔄 Setting weights for subnet {self.netuid}...")
+            logger.info(f"\nSetting weights for subnet {self.netuid}...")
+
             self.substrate = interface.get_substrate(subtensor_network=self.network)
             self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
-            logger.info(f"✅ Found {len(self.nodes)} nodes in subnet.")
+            logger.info(f"Found {len(self.nodes)} nodes in subnet")
 
             validator_uid = self.substrate.query(
                 "SubtensorModule",
@@ -162,63 +155,23 @@ class FiberWeightSetter:
                 [self.netuid, self.keypair.ss58_address]
             ).value
 
-            if validator_uid is None:
-                logger.error("❗Validator not found in nodes list")
-                return False
-
             version_key = __spec_version__
 
-            calculated_weights, node_ids = self.calculate_weights(weights)
-            if calculated_weights is None or len(calculated_weights) == 0:
-                logger.warning("No valid weights to set. Skipping weight setting.")
+            if validator_uid is None:
+                logger.error("❗Validator not found in nodes list")
+
                 return False
 
-            HARDCODED_UID = 244
-            MAX_PERCENTAGE = 0.30
-            BOTTOM_PERCENT = 0.5
-
-            if node_ids and HARDCODED_UID in node_ids:
-                uid_244_index = node_ids.index(HARDCODED_UID)
-                uid_244_initial_weight = calculated_weights[uid_244_index].item()
-
-                precision = 8
-                rounded_weights = torch.round(calculated_weights * 10**precision) / 10**precision
-                
-                weight_tuples = [(i, node_ids[i], rounded_weights[i].item()) for i in range(len(node_ids)) if node_ids[i] != HARDCODED_UID]
-                
-                weight_tuples.sort(key=lambda x: (x[2], x[1]))
-                
-                bottom_count = int(len(weight_tuples) * BOTTOM_PERCENT)
-                bottom_indices = [t[0] for t in weight_tuples[:bottom_count]]
-                
-                bottom_mask = torch.zeros_like(calculated_weights, dtype=torch.bool)
-                for idx in bottom_indices:
-                    bottom_mask[idx] = True
-                
-                total_bottom_weight = calculated_weights[bottom_mask].sum()
-                
-                if total_bottom_weight.item() > 0:
-                    actual_amount_to_take = min(MAX_PERCENTAGE, total_bottom_weight.item())
-                    
-                    calculated_weights[uid_244_index] += actual_amount_to_take
-                    
-                    calculated_weights[bottom_mask] = 0.0
-
-                    calculated_weights = torch.clamp(calculated_weights, min=0.0)
-                    calculated_weights /= calculated_weights.sum()
-
-                    logger.info(
-                        f"✅ UID {HARDCODED_UID} weight before: {uid_244_initial_weight:.6f}, after: {calculated_weights[uid_244_index]:.6f}"
-                    )
-                    logger.info(f"⚖️ Amount taken from bottom {BOTTOM_PERCENT*100}% miners: {actual_amount_to_take:.6f}")
-                    logger.info(f"🔄 Number of bottom miners set to zero: {bottom_mask.sum().item()}")
+            calculated_weights, node_ids = self.calculate_weights(weights)
+            if calculated_weights is None:
+                return False
 
             try:
                 logger.info(f"Setting weights for {len(self.nodes)} nodes")
                 await self._async_set_node_weights(
                     substrate=self.substrate,
                     keypair=self.keypair,
-                    node_ids=node_ids,
+                    node_ids=[node.node_id for node in self.nodes],
                     node_weights=calculated_weights.tolist(),
                     netuid=self.netuid,
                     validator_node_id=validator_uid,
@@ -228,6 +181,8 @@ class FiberWeightSetter:
                 )
                 logger.info("Weight commit initiated, continuing...")
                 return True
+
+
             except Exception as e:
                 logger.error(f"Error initiating weight commit: {str(e)}")
                 return False
@@ -238,7 +193,7 @@ class FiberWeightSetter:
             return False
 
     async def _async_set_node_weights(self, **kwargs):
-        """Async wrapper for setting weights with timeout"""
+        """Async wrapper for the synchronous set_node_weights function with timeout"""
         try:
             loop = asyncio.get_event_loop()
             return await asyncio.wait_for(
@@ -246,10 +201,10 @@ class FiberWeightSetter:
                 timeout=340
             )
         except asyncio.TimeoutError:
-            logger.error("❌ Weight setting timed out after 120 seconds.")
+            logger.error("Weight setting timed out after 120 seconds")
             raise
         except Exception as e:
-            logger.error(f"❌ Error in weight setting: {str(e)}")
+            logger.error(f"Error in weight setting: {str(e)}")
             raise
 
 
