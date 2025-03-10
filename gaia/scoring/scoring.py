@@ -55,11 +55,9 @@ class Scoring:
             geo_score = geomagnetic_scores.get(idx, float('nan'))
             soil_score = soil_scores.get(idx, float('nan'))
 
-            # Treat 0.0 as missing (if applicable)
-            if geo_score == 0.0:
-                geo_score = float('nan')
-            if soil_score == 0.0:
-                soil_score = float('nan')
+            if geo_score == 0.0 and soil_score == 0.0:
+                weights[idx] = 0.0
+                continue  # Skip further calculations
 
             if math.isnan(geo_score) and math.isnan(soil_score):
                 weights[idx] = 0.0
