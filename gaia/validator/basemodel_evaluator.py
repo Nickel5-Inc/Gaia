@@ -225,15 +225,11 @@ class BaseModelEvaluator:
             logger.info("SOIL BASEMODEL: Running model prediction")
             
             with torch.no_grad():
-                sentinel = processed_data['sentinel_ndvi'][:, :2]
-                logger.info(f"SOIL BASEMODEL: sentinel shape: {sentinel.shape}")
-                era5 = processed_data['era5']
-                logger.info(f"SOIL BASEMODEL: era5 shape: {era5.shape}")
-                
-                ndvi = processed_data['sentinel_ndvi'][:, 2:]
+                sentinel = processed_data['sentinel_ndvi'][:2].unsqueeze(0).to(self.device)
+                era5 = processed_data['era5'].unsqueeze(0).to(self.device)
                 elevation = processed_data['elevation']
-                elev_ndvi = torch.cat([elevation, ndvi], dim=1)
-                logger.info(f"SOIL BASEMODEL: elev_ndvi shape: {elev_ndvi.shape}")
+                ndvi = processed_data['sentinel_ndvi'][2:3]
+                elev_ndvi = torch.cat([elevation, ndvi], dim=0).unsqueeze(0).to(self.device)
                 
                 logger.info(f"SOIL BASEMODEL: Running soil model with inputs:")
                 logger.info(f"SOIL BASEMODEL: - sentinel: {sentinel.shape}")

@@ -253,10 +253,11 @@ class SoilMoistureTask(Task):
                                             logger.error(traceback.format_exc())
                                         
                                         if model_inputs:
+                                            task_id = str(target_smap_time.timestamp())
                                             baseline_prediction = await validator.basemodel_evaluator.predict_soil_and_store(
                                                 data=model_inputs,
-                                                task_id=self.task_id,
-                                                region_id=region["id"]
+                                                task_id=task_id,
+                                                region_id=str(region["id"])
                                             )
                                             if baseline_prediction:
                                                 logger.info(f"Soil moisture baseline prediction stored for region {region['id']}")
