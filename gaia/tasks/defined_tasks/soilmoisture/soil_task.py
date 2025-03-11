@@ -39,6 +39,8 @@ import tempfile
 import math
 import glob
 from collections import defaultdict
+import torch
+from gaia.tasks.defined_tasks.soilmoisture.utils.inference_class import SoilMoistureInferencePreprocessor
 
 logger = get_logger(__name__)
 
@@ -223,6 +225,54 @@ class SoilMoistureTask(Task):
                                     "sentinel_crs": region["sentinel_crs"],
                                     "target_time": target_smap_time.isoformat(),
                                 }
+
+                                if validator.basemodel_evaluator:
+                                    try:
+                                        logger.info(f"Running soil moisture baseline model for region {region['id']}")
+                                        model_inputs = None
+                                        try:
+                                            with tempfile.NamedTemporaryFile(suffix='.tiff', delete=False) as temp_file:
+                                                temp_file.write(combined_data)
+                                                temp_file_path = temp_file.name
+                                            
+                                            preprocessor = SoilMoistureInferencePreprocessor()
+                                            model_inputs = preprocessor.preprocess(temp_file_path)
+                                            
+                                            if model_inputs:
+                                                for key, value in model_inputs.items():
+                                                    if isinstance(value, np.ndarray):
+                                                        model_inputs[key] = torch.from_numpy(value).float()
+                                            
+                                            model_inputs["sentinel_bounds"] = region["sentinel_bounds"]
+                                            model_inputs["sentinel_crs"] = region["sentinel_crs"]
+                                            model_inputs["target_time"] = target_smap_time
+                                            
+                                            logger.info(f"Preprocessed data for soil moisture baseline model. Keys: {list(model_inputs.keys() if model_inputs else [])}")
+                                        except Exception as e:
+                                            logger.error(f"Error preprocessing data for soil moisture baseline model: {str(e)}")
+                                            logger.error(traceback.format_exc())
+                                        
+                                        if model_inputs:
+                                            baseline_prediction = await validator.basemodel_evaluator.predict_soil_and_store(
+                                                data=model_inputs,
+                                                task_id=self.task_id,
+                                                region_id=region["id"]
+                                            )
+                                            if baseline_prediction:
+                                                logger.info(f"Soil moisture baseline prediction stored for region {region['id']}")
+                                            else:
+                                                logger.error(f"Failed to generate soil moisture baseline prediction for region {region['id']}")
+                                        else:
+                                            logger.error(f"Preprocessing failed for soil moisture baseline model, region {region['id']}")
+                                        
+                                        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+                                            try:
+                                                os.unlink(temp_file_path)
+                                            except Exception as e:
+                                                logger.error(f"Error cleaning up temporary file: {str(e)}")
+                                    except Exception as e:
+                                        logger.error(f"Error running soil moisture baseline model: {str(e)}")
+                                        logger.error(traceback.format_exc())
 
                                 payload = {"nonce": str(uuid4()), "data": task_data}
 

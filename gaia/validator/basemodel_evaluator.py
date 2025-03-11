@@ -116,34 +116,71 @@ class BaseModelEvaluator:
             Optional[Dict]: The prediction result or None if prediction fails
         """
         if not self.geo_model_initialized:
-            logger.warning("Geomagnetic model not initialized. Attempting to initialize...")
             await self.initialize_geo_model()
             if not self.geo_model_initialized:
                 logger.error("Failed to initialize geomagnetic model")
                 return None
         
         try:
-            processed_data = self.geo_preprocessing.preprocess(data)
-            prediction_result = self.geo_preprocessing.predict_next_hour(processed_data, model=self.geo_model)
+            logger.info(f"GEO BASEMODEL: Processing data for task_id={task_id}")
             
-            if not prediction_result:
-                logger.error("Failed to get geo prediction result")
+            if data.empty:
+                logger.error("GEO BASEMODEL: Empty DataFrame provided")
                 return None
                 
+            processed_df = data.copy()
+            
+            if 'Dst' in processed_df.columns and 'value' not in processed_df.columns:
+                processed_df = processed_df.rename(columns={'Dst': 'value'})
+            
+            if 'timestamp' not in processed_df.columns or 'value' not in processed_df.columns:
+                logger.error(f"GEO BASEMODEL: Missing required columns. Found: {list(processed_df.columns)}")
+                return None
+            
+            processed_data = self.geo_preprocessing.process_miner_data(processed_df)
+            
+            logger.info(f"GEO BASEMODEL: Processed data shape: {processed_data.shape}")
+            logger.info(f"GEO BASEMODEL: Columns: {list(processed_data.columns)}")
+            
+            logger.info(f"GEO BASEMODEL: Running model prediction")
+            
+            if hasattr(self.geo_model, "run_inference"):
+                # If we have a custom model implementation
+                logger.info("GEO BASEMODEL: Using custom geomagnetic model for inference")
+                predictions = self.geo_model.run_inference(processed_data)
+            else:
+                # This is the standard path for the base model
+                logger.info("GEO BASEMODEL: Using base geomagnetic model")
+                # Use the same run_model_inference logic from GeomagneticTask
+                raw_prediction = self.geo_model.predict(processed_data)
+                
+                # Handle NaN or infinite values
+                if np.isnan(raw_prediction) or np.isinf(raw_prediction):
+                    logger.warning("GEO BASEMODEL: Model returned NaN/Inf, using fallback value")
+                    raw_prediction = float(processed_data["y"].iloc[-1])
+                
+                # Format prediction result like the miner does
+                predictions = {
+                    "predicted_value": float(raw_prediction),
+                    "timestamp": processed_df["timestamp"].iloc[-1]
+                }
+            
+            logger.info(f"GEO BASEMODEL: Prediction result: {predictions['predicted_value']}")
+            
+            # Store the prediction in the database
             if self.db_manager:
-                await self.db_manager.store_baseline_prediction(
+                success = await self.db_manager.store_baseline_prediction(
                     task_name="geomagnetic",
                     task_id=task_id,
-                    timestamp=prediction_result["timestamp"],
-                    prediction=prediction_result["predicted_value"]
+                    timestamp=predictions["timestamp"],
+                    prediction=predictions["predicted_value"]
                 )
-                logger.info(f"Stored geomagnetic baseline prediction: {prediction_result['predicted_value']}")
-            else:
-                logger.warning("No database manager available, prediction not stored")
+                logger.info(f"GEO BASEMODEL: Storage {'successful' if success else 'failed'}")
             
-            return prediction_result
+            return predictions
+            
         except Exception as e:
-            logger.error(f"Error in geomagnetic prediction: {e}")
+            logger.error(f"GEO BASEMODEL ERROR: {str(e)}")
             logger.error(traceback.format_exc())
             return None
     
@@ -155,7 +192,7 @@ class BaseModelEvaluator:
         Make a soil moisture prediction using the same method miners use and store it in the database.
         
         Args:
-            data: The input data for soil moisture prediction, including sentinel, ERA5, and elevation/NDVI data
+            data: The input data for soil moisture prediction, including sentinel_ndvi, era5, and elevation data
             task_id: Unique identifier for the task execution
             region_id: Identifier for the specific region
             
@@ -163,45 +200,98 @@ class BaseModelEvaluator:
             Optional[Dict]: The prediction data or None if prediction fails
         """
         if not self.soil_model_initialized:
-            logger.warning("Soil moisture model not initialized. Attempting to initialize...")
             await self.initialize_soil_model()
             if not self.soil_model_initialized:
                 logger.error("Failed to initialize soil moisture model")
                 return None
         
         try:
-            logger.info(f"Running soil moisture baseline prediction for task {task_id}, region {region_id}")
+            logger.info(f"SOIL BASEMODEL: Processing data for task_id={task_id}, region={region_id}")
+            input_keys = list(data.keys())
+            logger.info(f"SOIL BASEMODEL: Input data keys: {input_keys}")
             
-            model_inputs = await self.soil_preprocessing.process_miner_data(data)
-            prediction = self.soil_preprocessing.predict_smap(model_inputs, self.soil_model)
+            for key in ['sentinel_ndvi', 'era5', 'elevation']:
+                if key in data and isinstance(data[key], torch.Tensor):
+                    logger.info(f"SOIL BASEMODEL: {key} tensor shape: {data[key].shape}")
+                    logger.info(f"SOIL BASEMODEL: {key} min: {data[key].min().item():.4f}, max: {data[key].max().item():.4f}")
             
-            if not prediction:
-                logger.error("Failed to get soil prediction result")
+            processed_data = {}
+            for key, value in data.items():
+                if isinstance(value, torch.Tensor):
+                    processed_data[key] = value.to(self.device)
+                else:
+                    processed_data[key] = value
+            
+            logger.info("SOIL BASEMODEL: Running model prediction")
+            
+            with torch.no_grad():
+                sentinel = processed_data['sentinel_ndvi'][:, :2]
+                logger.info(f"SOIL BASEMODEL: sentinel shape: {sentinel.shape}")
+                era5 = processed_data['era5']
+                logger.info(f"SOIL BASEMODEL: era5 shape: {era5.shape}")
+                
+                ndvi = processed_data['sentinel_ndvi'][:, 2:]
+                elevation = processed_data['elevation']
+                elev_ndvi = torch.cat([elevation, ndvi], dim=1)
+                logger.info(f"SOIL BASEMODEL: elev_ndvi shape: {elev_ndvi.shape}")
+                
+                logger.info(f"SOIL BASEMODEL: Running soil model with inputs:")
+                logger.info(f"SOIL BASEMODEL: - sentinel: {sentinel.shape}")
+                logger.info(f"SOIL BASEMODEL: - era5: {era5.shape}")
+                logger.info(f"SOIL BASEMODEL: - elev_ndvi: {elev_ndvi.shape}")
+                
+                raw_output = self.soil_model(
+                    sentinel=sentinel,
+                    era5=era5,
+                    elev_ndvi=elev_ndvi
+                )
+
+                predictions = {
+                    'surface': raw_output[:, 0].squeeze().cpu().numpy(),
+                    'rootzone': raw_output[:, 1].squeeze().cpu().numpy()
+                }
+            
+            if not predictions or not isinstance(predictions, dict) or 'surface' not in predictions or 'rootzone' not in predictions:
+                logger.error(f"SOIL BASEMODEL: Invalid prediction output. Keys: {list(predictions.keys()) if predictions else 'None'}")
                 return None
             
+            logger.info(
+                f"SOIL BASEMODEL: Surface stats - Min: {predictions['surface'].min():.3f}, "
+                f"Max: {predictions['surface'].max():.3f}, "
+                f"Mean: {predictions['surface'].mean():.3f}"
+            )
+            logger.info(
+                f"SOIL BASEMODEL: Root zone stats - Min: {predictions['rootzone'].min():.3f}, "
+                f"Max: {predictions['rootzone'].max():.3f}, "
+                f"Mean: {predictions['rootzone'].mean():.3f}"
+            )
+            
+            target_time = data.get("target_time", datetime.now(timezone.utc))
+            if isinstance(target_time, str):
+                target_time = datetime.fromisoformat(target_time)
+                
             prediction_data = {
-                "surface_sm": prediction["surface_sm"],
-                "rootzone_sm": prediction["rootzone_sm"],
+                "surface_sm": predictions["surface"].astype(float),
+                "rootzone_sm": predictions["rootzone"].astype(float),
                 "sentinel_bounds": data.get("sentinel_bounds"),
                 "sentinel_crs": data.get("sentinel_crs"),
-                "target_time": data.get("target_time", datetime.now(timezone.utc))
+                "target_time": target_time
             }
             
             if self.db_manager:
-                await self.db_manager.store_baseline_prediction(
+                success = await self.db_manager.store_baseline_prediction(
                     task_name="soil_moisture",
                     task_id=task_id,
                     timestamp=prediction_data["target_time"],
                     prediction=prediction_data,
                     region_id=region_id
                 )
-                logger.info(f"Stored soil moisture baseline prediction for region {region_id}")
-            else:
-                logger.warning("No database manager available, prediction not stored")
+                logger.info(f"SOIL BASEMODEL: Storage {'successful' if success else 'failed'}")
             
             return prediction_data
+            
         except Exception as e:
-            logger.error(f"Error in soil moisture prediction: {e}")
+            logger.error(f"SOIL BASEMODEL ERROR: {str(e)}")
             logger.error(traceback.format_exc())
             return None
     
@@ -226,7 +316,16 @@ class BaseModelEvaluator:
             )
             
             if result:
-                return result["prediction"]
+                prediction = result["prediction"]
+                
+                if isinstance(prediction, dict) and "value" in prediction:
+                    return prediction["value"]
+                
+                if isinstance(prediction, (int, float)):
+                    return float(prediction)
+                
+                logger.warning(f"Unexpected prediction format: {type(prediction)}")
+                return None
             
             logger.warning(f"No geomagnetic baseline prediction found for task {task_id}")
             return None

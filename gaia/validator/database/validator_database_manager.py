@@ -981,10 +981,38 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             bool: True if successful, False otherwise
         """
         try:
+            table_check_sql = """
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'baseline_predictions'
+            );
+            """
+            result = await self.fetch_one(table_check_sql)
+            
+            if result is None or (isinstance(result, (list, tuple)) and (len(result) == 0 or not result[0])):
+                logger.info("Creating baseline_predictions table...")
+                async with self.session() as session:
+                    await self.create_baseline_predictions_table(session)
+            
+            if isinstance(prediction, (int, float)):
+                logger.info(f"DB: Storing {task_name} prediction: {prediction} (region={region_id})")
+                if task_name == "geomagnetic":
+                    prediction = {"value": prediction}
+            else:
+                logger.info(f"DB: Storing {task_name} prediction (region={region_id})")
+            
             if isinstance(prediction, (np.ndarray, torch.Tensor)):
                 prediction = prediction.tolist()
                 
-            prediction_json = json.dumps(prediction, default=self._json_serializer)
+            try:
+                prediction_json = json.dumps(prediction, default=self._json_serializer)
+                logger.info(f"DB: Serialized prediction: {prediction_json[:100]}..." if len(prediction_json) > 100 else prediction_json)
+            except Exception as e:
+                logger.error(f"JSON serialization error: {e}")
+                logger.error(f"Failed to serialize prediction of type {type(prediction)}")
+                if hasattr(e, '__traceback__'):
+                    logger.error(traceback.format_tb(e.__traceback__))
+                return False
             
             insert_sql = """
             INSERT INTO baseline_predictions 
@@ -1000,13 +1028,21 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 "prediction": prediction_json
             }
             
-            await self.execute(insert_sql, params)
-            logger.debug(f"Stored baseline prediction for {task_name}, task_id: {task_id}, region: {region_id}")
-            return True
+            try:
+                await self.execute(insert_sql, params)
+                logger.info(f"DB: Successfully stored {task_name} prediction")
+                return True
+            except Exception as db_error:
+                logger.error(f"DB insert error: {db_error}")
+                if hasattr(db_error, '__traceback__'):
+                    logger.error(traceback.format_tb(db_error.__traceback__))
+                return False
             
         except Exception as e:
-            logger.error(f"Error storing baseline prediction: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"DB: Error storing prediction: {e}")
+            logger.error(f"Prediction value type: {type(prediction)}")
+            if hasattr(e, '__traceback__'):
+                logger.error(traceback.format_tb(e.__traceback__))
             return False
             
     @track_operation('read')

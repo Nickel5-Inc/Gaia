@@ -276,7 +276,13 @@ class GeomagneticTask(Task):
         if timestamp == "N/A" or dst_value == "N/A":
             logger.warning("Invalid geomagnetic data. Skipping miner queries.")
             return
-
+        
+        task_id = str(current_hour_start.timestamp())
+        logger.info(f"running dst basemodel for scoring")
+        await validator.basemodel_evaluator.predict_geo_and_store(
+            historical_data,
+            task_id
+        )
         # Construct Payload for Miners
         nonce = str(uuid4())
 
