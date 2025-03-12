@@ -13,6 +13,7 @@ from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_preprocessing import Geoma
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_scoring_mechanism import GeomagneticScoringMechanism
 from gaia.tasks.defined_tasks.soilmoisture.soil_scoring_mechanism import SoilScoringMechanism
 from gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing import SoilMinerPreprocessing
+from huggingface_hub import hf_hub_download
 
 logger = get_logger(__name__)
 
@@ -90,14 +91,34 @@ class BaseModelEvaluator:
         """Initialize the soil moisture baseline model."""
         try:
             logger.info("Initializing soil moisture baseline model")
-            self.soil_model = SoilModel()
+            
+            model_dir = os.path.join("gaia", "models", "checkpoints", "soil_moisture")
+            os.makedirs(model_dir, exist_ok=True)
+            local_path = os.path.join(model_dir, "SoilModel.ckpt")
+
+            if os.path.exists(local_path):
+                logger.info(f"Loading soil model from local path: {local_path}")
+                self.soil_model = SoilModel.load_from_checkpoint(local_path)
+            else:
+                logger.info("Local checkpoint not found, downloading from HuggingFace...")
+                checkpoint_path = await asyncio.to_thread(
+                    hf_hub_download,
+                    repo_id="Nickel5HF/soil-moisture-model",
+                    filename="SoilModel.ckpt",
+                    local_dir=model_dir
+                )
+                logger.info(f"Loading soil model from HuggingFace: {checkpoint_path}")
+                self.soil_model = SoilModel.load_from_checkpoint(checkpoint_path)
+
             self.soil_model = self.soil_model.to(self.device)
             self.soil_model.eval()
+            
+            param_count = sum(p.numel() for p in self.soil_model.parameters())
+            logger.info(f"Soil model loaded successfully with {param_count:,} parameters")
+            logger.info(f"Soil model device: {next(self.soil_model.parameters()).device}")
+            
             self.soil_model_initialized = True
-
-            logger.info("Soil moisture baseline model initialized")
             return True
-
         except Exception as e:
             logger.error(f"Failed to initialize soil moisture model: {e}")
             logger.error(traceback.format_exc())
