@@ -73,6 +73,7 @@ class SoilMoistureTask(Task):
     node_type: str = Field(default="miner")
     test_mode: bool = Field(default=False)
     use_raw_preprocessing: bool = Field(default=False)
+    validator: Any = Field(default=None, description="Reference to the validator instance")
 
     def __init__(self, db_manager=None, node_type=None, test_mode=False, **data):
         super().__init__(
@@ -141,6 +142,7 @@ class SoilMoistureTask(Task):
         """Execute validator workflow."""
         if not hasattr(self, "db_manager") or self.db_manager is None:
             self.db_manager = validator.db_manager
+        self.validator = validator
 
         await self.ensure_retry_columns_exist()
         
@@ -827,7 +829,7 @@ class SoilMoistureTask(Task):
             for target_time, tasks in tasks_by_time.items():
                 logger.info(f"Processing {len(tasks)} predictions for timestamp {target_time}")
                 
-                smap_url = construct_smap_url(target_time, test_mode=self.test_mode)
+                smap_url = construct_smap_url(target_time, test_mode=self.test_mode, verbose=True)
                 temp_file = None
                 temp_path = None
                 try:
@@ -835,7 +837,7 @@ class SoilMoistureTask(Task):
                     temp_path = temp_file.name
                     temp_file.close()
 
-                    if not download_smap_data(smap_url, temp_file.name):
+                    if not download_smap_data(smap_url, temp_file.name, verbose=True):
                         logger.error(f"Failed to download SMAP data for {target_time}")
                         # Update retry information for failed tasks
                         for task in tasks:
@@ -869,11 +871,52 @@ class SoilMoistureTask(Task):
                                     "region": {"id": task["id"]},
                                     "miner_id": prediction["miner_id"],
                                     "miner_hotkey": prediction["miner_hotkey"],
-                                    "smap_file": temp_path
+                                    "smap_file": temp_path,
+                                    "smap_file_path": temp_path
                                 }
                                 
                                 score = await self.scoring_mechanism.score(pred_data)
                                 if score:
+                                    baseline_score = None
+                                    if self.validator and hasattr(self.validator, 'basemodel_evaluator'):
+                                        try:
+                                            task_id = str(target_time.timestamp()) if isinstance(target_time, datetime) else str(target_time)
+                                            baseline_score = await self.validator.basemodel_evaluator.score_soil_baseline(
+                                                task_id=task_id,
+                                                region_id=str(task["id"]),
+                                                ground_truth=score.get("ground_truth", {}),
+                                                smap_file_path=temp_path
+                                            )
+                                            
+                                            if baseline_score is not None:
+                                                miner_score = score.get("total_score", 0)
+                                                
+                                                miner_metrics = score.get("metrics", {})
+                                                logger.info(f"BASELINE COMPARISON - Miner: {prediction['miner_id']}, Region: {task['id']}")
+                                                logger.info(f"  Miner total score: {miner_score:.4f}")
+                                                logger.info(f"  Baseline total score: {baseline_score:.4f}")
+                                                logger.info(f"  Score difference (miner - baseline): {miner_score - baseline_score:.4f}")
+                                                
+                                                if "surface_rmse" in miner_metrics:
+                                                    logger.info(f"  Miner surface RMSE: {miner_metrics['surface_rmse']:.4f}")
+                                                if "rootzone_rmse" in miner_metrics:
+                                                    logger.info(f"  Miner rootzone RMSE: {miner_metrics['rootzone_rmse']:.4f}")
+                                                
+                                                if miner_score < baseline_score:
+                                                    logger.info(f"  Comparison result: WORSE - Miner score ({miner_score:.4f}) < baseline ({baseline_score:.4f})")
+                                                    logger.info(f"  Setting score to 0")
+                                                    score["total_score"] = 0
+                                                elif miner_score == baseline_score:
+                                                    logger.info(f"  Comparison result: EQUAL - Miner score ({miner_score:.4f}) = baseline ({baseline_score:.4f})")
+                                                    logger.info(f"  Setting score to 0")
+                                                    score["total_score"] = 0
+                                                else:
+                                                    logger.info(f"  Comparison result: BETTER - Miner score ({miner_score:.4f}) > baseline ({baseline_score:.4f})")
+                                                    logger.info(f"  Keeping original score")
+                                        except Exception as e:
+                                            logger.error(f"Error retrieving baseline score: {e}")
+                                            logger.error(traceback.format_exc())
+                                    
                                     scores = score
                                     task["score"] = score
                                     await self.move_task_to_history(

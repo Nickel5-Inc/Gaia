@@ -73,7 +73,7 @@ class BaseModelEvaluator:
         """Initialize the geomagnetic baseline model."""
         try:
             logger.info("Initializing geomagnetic baseline model")
-            self.geo_model = GeoMagBaseModel()
+            self.geo_model = GeoMagBaseModel(random_seed=42)
             self.geo_model_initialized = True
             logger.info("Geomagnetic baseline model initialized")
             
@@ -158,6 +158,14 @@ class BaseModelEvaluator:
                 logger.error(f"GEO BASEMODEL: Missing required columns. Found: {list(processed_df.columns)}")
                 return None
             
+            prediction_timestamp = processed_df["timestamp"].iloc[-1]
+            if isinstance(prediction_timestamp, pd.Timestamp):
+                prediction_timestamp = prediction_timestamp.to_pydatetime()
+                if prediction_timestamp.tzinfo is None:
+                    prediction_timestamp = prediction_timestamp.replace(tzinfo=timezone.utc)
+                    
+            logger.info(f"GEO BASEMODEL: Prediction timestamp: {prediction_timestamp}")
+            
             processed_data = self.geo_preprocessing.process_miner_data(processed_df)
             
             logger.info(f"GEO BASEMODEL: Processed data shape: {processed_data.shape}")
@@ -166,24 +174,19 @@ class BaseModelEvaluator:
             logger.info(f"GEO BASEMODEL: Running model prediction")
             
             if hasattr(self.geo_model, "run_inference"):
-                # If we have a custom model implementation
                 logger.info("GEO BASEMODEL: Using custom geomagnetic model for inference")
                 predictions = self.geo_model.run_inference(processed_data)
             else:
-                # This is the standard path for the base model
                 logger.info("GEO BASEMODEL: Using base geomagnetic model")
-                # Use the same run_model_inference logic from GeomagneticTask
                 raw_prediction = self.geo_model.predict(processed_data)
                 
-                # Handle NaN or infinite values
                 if np.isnan(raw_prediction) or np.isinf(raw_prediction):
                     logger.warning("GEO BASEMODEL: Model returned NaN/Inf, using fallback value")
                     raw_prediction = float(processed_data["y"].iloc[-1])
                 
-                # Format prediction result like the miner does
                 predictions = {
                     "predicted_value": float(raw_prediction),
-                    "timestamp": processed_df["timestamp"].iloc[-1]
+                    "timestamp": prediction_timestamp
                 }
             
             logger.info(f"GEO BASEMODEL: Prediction result: {predictions['predicted_value']}")
@@ -208,14 +211,14 @@ class BaseModelEvaluator:
     async def predict_soil_and_store(self, 
                                     data: Dict[str, Any],
                                     task_id: str,
-                                    region_id: str) -> Optional[Dict]:
+                                    region_id: Union[str, int]) -> Optional[Dict]:
         """
         Make a soil moisture prediction using the same method miners use and store it in the database.
         
         Args:
             data: The input data for soil moisture prediction, including sentinel_ndvi, era5, and elevation data
             task_id: Unique identifier for the task execution
-            region_id: Identifier for the specific region
+            region_id: Identifier for the specific region (can be string or int)
             
         Returns:
             Optional[Dict]: The prediction data or None if prediction fails
@@ -227,9 +230,27 @@ class BaseModelEvaluator:
                 return None
         
         try:
-            logger.info(f"SOIL BASEMODEL: Processing data for task_id={task_id}, region={region_id}")
+            region_id_str = str(region_id)
+            
+            logger.info(f"SOIL BASEMODEL: Processing data for task_id={task_id}, region={region_id_str}")
             input_keys = list(data.keys())
             logger.info(f"SOIL BASEMODEL: Input data keys: {input_keys}")
+            
+            target_time = data.get("target_time", datetime.now(timezone.utc))
+            if isinstance(target_time, str):
+                try:
+                    target_time = datetime.fromisoformat(target_time)
+                except ValueError:
+                    try:
+                        target_time = datetime.fromtimestamp(float(target_time), tz=timezone.utc)
+                    except:
+                        logger.warning(f"Could not parse target_time: {target_time}, using current time")
+                        target_time = datetime.now(timezone.utc)
+            
+            if target_time.tzinfo is None:
+                target_time = target_time.replace(tzinfo=timezone.utc)
+                
+            logger.info(f"SOIL BASEMODEL: Target time: {target_time}")
             
             for key in ['sentinel_ndvi', 'era5', 'elevation']:
                 if key in data and isinstance(data[key], torch.Tensor):
@@ -282,10 +303,6 @@ class BaseModelEvaluator:
                 f"Max: {predictions['rootzone'].max():.3f}, "
                 f"Mean: {predictions['rootzone'].mean():.3f}"
             )
-            
-            target_time = data.get("target_time", datetime.now(timezone.utc))
-            if isinstance(target_time, str):
-                target_time = datetime.fromisoformat(target_time)
                 
             prediction_data = {
                 "surface_sm": predictions["surface"].astype(float),
@@ -299,9 +316,9 @@ class BaseModelEvaluator:
                 success = await self.db_manager.store_baseline_prediction(
                     task_name="soil_moisture",
                     task_id=task_id,
-                    timestamp=prediction_data["target_time"],
+                    timestamp=target_time,
                     prediction=prediction_data,
-                    region_id=region_id
+                    region_id=region_id_str
                 )
                 logger.info(f"SOIL BASEMODEL: Storage {'successful' if success else 'failed'}")
             
@@ -317,7 +334,7 @@ class BaseModelEvaluator:
         Retrieve a geomagnetic baseline prediction from the database.
         
         Args:
-            task_id: ID of the specific task execution
+            task_id: The task ID to retrieve the prediction for
             
         Returns:
             Optional[float]: The prediction or None if not found
@@ -344,20 +361,20 @@ class BaseModelEvaluator:
                 logger.warning(f"Unexpected prediction format: {type(prediction)}")
                 return None
             
-            logger.warning(f"No geomagnetic baseline prediction found for task {task_id}")
+            logger.warning(f"No geomagnetic baseline prediction found for task_id {task_id}")
             return None
         except Exception as e:
             logger.error(f"Error retrieving geomagnetic baseline prediction: {e}")
             logger.error(traceback.format_exc())
             return None
     
-    async def get_soil_baseline_prediction(self, task_id: str, region_id: str) -> Optional[Dict]:
+    async def get_soil_baseline_prediction(self, task_id: str, region_id: Union[str, int]) -> Optional[Dict]:
         """
         Retrieve a soil moisture baseline prediction from the database.
         
         Args:
-            task_id: ID of the specific task execution
-            region_id: Identifier for the specific region
+            task_id: The task ID to retrieve the prediction for
+            region_id: Identifier for the specific region (can be string or int)
             
         Returns:
             Optional[Dict]: The prediction data or None if not found
@@ -367,16 +384,18 @@ class BaseModelEvaluator:
             return None
             
         try:
+            region_id_str = str(region_id)
+            
             result = await self.db_manager.get_baseline_prediction(
                 task_name="soil_moisture",
                 task_id=task_id,
-                region_id=region_id
+                region_id=region_id_str
             )
             
             if result:
                 return result["prediction"]
             
-            logger.warning(f"No soil moisture baseline prediction found for task {task_id}, region {region_id}")
+            logger.warning(f"No soil moisture baseline prediction found for task_id {task_id}, region {region_id_str}")
             return None
         except Exception as e:
             logger.error(f"Error retrieving soil moisture baseline prediction: {e}")
@@ -398,4 +417,192 @@ class BaseModelEvaluator:
             logger.info("BaseModelEvaluator resources cleaned up")
         except Exception as e:
             logger.error(f"Error during BaseModelEvaluator cleanup: {e}")
+    
+    async def score_geo_baseline(self, task_id: str, ground_truth: float) -> Optional[float]:
+        """
+        Score a geomagnetic baseline prediction against ground truth.
+        
+        Args:
+            task_id: The task ID to retrieve the baseline prediction for
+            ground_truth: The ground truth value to score against
+            
+        Returns:
+            Optional[float]: The score, or None if no prediction was found
+        """
+        if not self.geo_scoring:
+            logger.warning("Geomagnetic scoring mechanism not initialized")
+            return None
+        
+        try:
+            baseline_prediction = await self.get_geo_baseline_prediction(task_id)
+            if baseline_prediction is None:
+                logger.warning(f"No geomagnetic baseline prediction found for task_id {task_id}")
+                return None
+            
+            score = self.geo_scoring.calculate_score(baseline_prediction, ground_truth)
+            logger.info(f"Geomagnetic baseline score for task_id {task_id}: {score:.4f}")
+            return score
+        
+        except Exception as e:
+            logger.error(f"Error scoring geomagnetic baseline: {e}")
+            logger.error(traceback.format_exc())
+            return None
+
+    async def score_soil_baseline(self, task_id: str, region_id: Union[str, int], ground_truth: Dict, 
+                                smap_file_path: Optional[str] = None) -> Optional[float]:
+        """
+        Score a soil moisture baseline prediction against ground truth.
+        
+        Args:
+            task_id: The task ID to retrieve the baseline prediction for
+            region_id: The region ID for the prediction (can be string or int)
+            ground_truth: The ground truth data to score against
+            smap_file_path: Optional path to an already downloaded SMAP data file
+            
+        Returns:
+            Optional[float]: The score, or None if no prediction was found
+        """
+        if not self.soil_scoring:
+            logger.warning("Soil scoring mechanism not initialized")
+            return None
+        
+        try:
+            region_id_str = str(region_id)
+            
+            baseline_prediction = await self.get_soil_baseline_prediction(task_id, region_id_str)
+            if baseline_prediction is None:
+                logger.warning(f"No soil baseline prediction found for task_id {task_id}, region {region_id_str}")
+                return None
+            
+            if "surface_sm" in baseline_prediction and "rootzone_sm" in baseline_prediction:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                surface = torch.tensor(baseline_prediction["surface_sm"]).float()
+                rootzone = torch.tensor(baseline_prediction["rootzone_sm"]).float()
+                
+                if surface.dim() == 2:
+                    surface = surface.unsqueeze(0).unsqueeze(0)
+                if rootzone.dim() == 2:
+                    rootzone = rootzone.unsqueeze(0).unsqueeze(0)
+                
+                tensor_predictions = torch.cat([surface, rootzone], dim=1).to(device)
+                
+                logger.info(f"Converted baseline prediction to tensor with shape: {tensor_predictions.shape}")
+            else:
+                logger.error(f"Baseline prediction missing required fields: {list(baseline_prediction.keys())}")
+                return None
+            
+            target_time = baseline_prediction.get("target_time")
+            if isinstance(target_time, str):
+                try:
+                    target_time = datetime.fromisoformat(target_time)
+                except ValueError:
+                    try:
+                        target_time = datetime.strptime(target_time, "%Y-%m-%d %H:%M:%S%z")
+                    except ValueError:
+                        try:
+                            target_time = datetime.fromtimestamp(float(target_time), tz=timezone.utc)
+                        except:
+                            logger.error(f"Could not parse target_time string: {target_time}")
+                            return None
+            
+            if isinstance(target_time, datetime) and target_time.tzinfo is None:
+                target_time = target_time.replace(tzinfo=timezone.utc)
+                
+            logger.info(f"Using target_time: {target_time} (type: {type(target_time)})")
+            
+            scoring_input = {
+                "miner_id": "baseline",
+                "miner_hotkey": "baseline",
+                "predictions": tensor_predictions,
+                "bounds": baseline_prediction.get("sentinel_bounds"),
+                "crs": baseline_prediction.get("sentinel_crs"),
+                "target_time": target_time,
+                "ground_truth": ground_truth
+            }
+            
+            if smap_file_path:
+                scoring_input["smap_file"] = smap_file_path
+                logger.info(f"Using provided SMAP file: {smap_file_path}")
+            
+            metrics = await self.soil_scoring.compute_smap_score_metrics(
+                bounds=scoring_input["bounds"],
+                crs=scoring_input["crs"],
+                model_predictions=scoring_input["predictions"],
+                target_date=scoring_input["target_time"],
+                miner_id="baseline",
+                smap_file_path=smap_file_path if smap_file_path else None
+            )
+            
+            if metrics is None:
+                logger.error(f"Failed to compute metrics for baseline prediction, task_id {task_id}, region {region_id_str}")
+                return None
+                
+            logger.info(f"Computed metrics: {metrics}")
+            
+            score_result = await self.soil_scoring.compute_final_score(metrics)
+            
+            logger.info(f"Soil baseline score for task_id {task_id}, region {region_id_str}: {score_result:.4f}")
+            return score_result
+        
+        except Exception as e:
+            logger.error(f"Error scoring soil baseline: {e}")
+            logger.error(traceback.format_exc())
+            return None
+
+    async def compare_geo_scores(self, task_id: str, ground_truth: float, miner_scores: List[Dict]) -> List[Dict]:
+        """
+        Compare miner geomagnetic scores with baseline score.
+        
+        Args:
+            task_id: The task ID to compare
+            ground_truth: The ground truth value
+            miner_scores: List of miner score dictionaries
+            
+        Returns:
+            List[Dict]: Updated miner scores with baseline comparison
+        """
+        baseline_score = await self.score_geo_baseline(task_id, ground_truth)
+        
+        if baseline_score is None:
+            logger.warning(f"No baseline score available for comparison, task {task_id}")
+            return miner_scores
+        
+        for score in miner_scores:
+            miner_score = score.get("score", 0)
+            logger.info(
+                f"Score comparison - Miner: {score['miner_hotkey']}, "
+                f"Score: {miner_score:.4f}, Baseline: {baseline_score:.4f}, "
+                f"Difference: {miner_score - baseline_score:.4f}"
+            )
+        
+        return miner_scores
+
+    async def compare_soil_scores(self, task_id: str, region_id: Union[str, int], ground_truth: Dict, miner_score: Dict) -> Dict:
+        """
+        Compare miner soil moisture score with baseline score.
+        
+        Args:
+            task_id: The task ID to compare
+            region_id: The region ID to compare (can be string or int)
+            ground_truth: The ground truth data
+            miner_score: Miner score dictionary
+            
+        Returns:
+            Dict: Updated miner score with baseline comparison
+        """
+        region_id_str = str(region_id)
+        baseline_score = await self.score_soil_baseline(task_id, region_id_str, ground_truth)
+        
+        if baseline_score is None:
+            logger.warning(f"No baseline score available for comparison, task {task_id}, region {region_id_str}")
+            return miner_score
+        
+        miner_total = miner_score.get("total_score", 0)
+        logger.info(
+            f"Score comparison - Miner: {miner_score['miner_hotkey']}, Region: {region_id_str}, "
+            f"Score: {miner_total:.4f}, Baseline: {baseline_score:.4f}, "
+            f"Difference: {miner_total - baseline_score:.4f}"
+        )
+        
+        return miner_score
    

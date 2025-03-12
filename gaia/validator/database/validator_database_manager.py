@@ -1085,7 +1085,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 logger.warning(f"No baseline prediction found for {task_name}, task_id: {task_id}, region: {region_id}")
                 return None
                 
-            prediction_data = json.loads(result['prediction'])
+            if isinstance(result['prediction'], dict):
+                prediction_data = result['prediction']
+            else:
+                prediction_data = json.loads(result['prediction'])
                 
             return {
                 "task_name": result['task_name'],

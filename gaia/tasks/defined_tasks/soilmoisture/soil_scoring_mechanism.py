@@ -175,7 +175,8 @@ class SoilScoringMechanism(ScoringMechanism):
                 crs=predictions["crs"],
                 model_predictions=predictions["predictions"],
                 target_date=predictions["target_time"],
-                miner_id=predictions["miner_id"]
+                miner_id=predictions["miner_id"],
+                smap_file_path=predictions.get("smap_file_path")
             )
 
             if isinstance(metrics, dict) and metrics.get("status") == "retry_scheduled":
@@ -218,9 +219,18 @@ class SoilScoringMechanism(ScoringMechanism):
         model_predictions: torch.Tensor,
         target_date: datetime,
         miner_id: str,
+        smap_file_path: Optional[str] = None
     ) -> dict:
         """
         Compute RMSE and SSIM between model predictions and SMAP data for valid pixels only.
+        
+        Args:
+            bounds: The bounding box of the area
+            crs: The coordinate reference system
+            model_predictions: The model predictions as a tensor
+            target_date: The target date for the prediction
+            miner_id: The miner ID
+            smap_file_path: Optional path to an already downloaded SMAP file
         """
         device = model_predictions.device
         loop = asyncio.get_event_loop()
@@ -230,19 +240,27 @@ class SoilScoringMechanism(ScoringMechanism):
         sentinel_crs = CRS.from_epsg(int(crs))
 
         test_mode = getattr(self.task, 'test_mode', False)
-        smap_url = construct_smap_url(target_date, test_mode=test_mode)
         temp_file = None
         temp_path = None
+        should_download = True
+        
+        if smap_file_path and os.path.exists(smap_file_path):
+            temp_path = smap_file_path
+            should_download = False
+            logger.info(f"Using provided SMAP file: {smap_file_path}")
+        
         try:
-            temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
-            temp_path = temp_file.name
-            temp_file.close()
+            if should_download:
+                smap_url = construct_smap_url(target_date, test_mode=test_mode, verbose=True)
+                temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
+                temp_path = temp_file.name
+                temp_file.close()
 
-            if not download_smap_data(smap_url, temp_file.name):
-                return None
+                if not download_smap_data(smap_url, temp_file.name, verbose=True):
+                    return None
 
             smap_data = get_smap_data_for_sentinel_bounds(
-                temp_file.name,
+                temp_path,
                 (
                     sentinel_bounds.left,
                     sentinel_bounds.bottom,

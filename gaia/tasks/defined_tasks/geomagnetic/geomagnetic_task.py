@@ -83,6 +83,10 @@ class GeomagneticTask(Task):
         default=False,
         description="Whether to run in test mode (immediate execution, limited scope)"
     )
+    validator: Any = Field(
+        default=None, 
+        description="Reference to the validator instance"
+    )
 
 
     def __init__(self, node_type: str, db_manager, test_mode: bool = False, **data):
@@ -196,6 +200,8 @@ class GeomagneticTask(Task):
             - Score predictions collected during hour N-1
         - Runs in a continuous loop.
         """
+        self.validator = validator
+        
         while True:
             try:
                 await validator.update_task_status('geomagnetic', 'active')
@@ -313,35 +319,96 @@ class GeomagneticTask(Task):
         logger.info(f"Added {len(responses)} predictions to the database")
 
     async def _process_scores(self, validator, query_hour):
-        """
-        Process and archive scores for predictions collected during the specified hour.
-        
-        Args:
-            validator: The validator instance
-            query_hour: The hour during which predictions were collected
-        """
-        # Fetch Ground Truth
-        ground_truth_value = await self.fetch_ground_truth()
-        if ground_truth_value is None:
-            logger.warning("Ground truth data not available. Skipping scoring.")
-            return
+        """Process task scores for a given hour."""
+        try:
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            logger.info(
+                f"Processing scores for hour starting at {query_hour.isoformat()}"
+            )
 
-        # Get predictions collected during the specified hour
-        hour_start = query_hour
-        hour_end = query_hour + datetime.timedelta(hours=1)
+            # Get tasks for the specified hour
+            tasks = await self.get_tasks_for_hour(
+                query_hour,
+                query_hour + datetime.timedelta(hours=1),
+                validator=validator
+            )
 
-        logger.info(
-            f"Scoring predictions collected between {hour_start} and {hour_end}"
-        )
-        
-        tasks = await self.get_tasks_for_hour(hour_start, hour_end, validator)
-        if not tasks:
-            logger.info(f"No predictions found for collection hour {query_hour}")
-            return
+            if not tasks:
+                logger.info(f"No tasks found for hour {query_hour.isoformat()}")
+                return [], current_time
 
-        current_time = datetime.datetime.now(datetime.timezone.utc)
-        await self.score_tasks(tasks, ground_truth_value, current_time)
-        logger.info(f"Completed scoring {len(tasks)} predictions from hour {query_hour}")
+            # If all tasks are already scored, return early
+            all_processed = all(task.get("status") == "scored" for task in tasks)
+            if all_processed:
+                logger.info(f"All tasks already scored for hour {query_hour.isoformat()}")
+                # Return empty list since we don't need to score anything
+                return [], current_time
+
+            # Get ground truth data
+            ground_truth_value = await self.fetch_ground_truth()
+            if ground_truth_value is None:
+                logger.warning("Could not fetch ground truth value, skipping scoring")
+                return [], current_time
+
+            logger.info(f"Ground truth value: {ground_truth_value}")
+            
+            scored_tasks = []
+            for task in tasks:
+                if task.get("status") == "scored":
+                    logger.info(f"Task {task['id']} already scored, skipping")
+                    continue
+
+                try:
+                    # Use validator's basemodel_evaluator to get the baseline score for comparison
+                    baseline_score = None
+                    if validator and hasattr(validator, 'basemodel_evaluator'):
+                        try:
+                            task_timestamp = task.get("timestamp")
+                            task_id = str(task_timestamp.timestamp()) if isinstance(task_timestamp, datetime.datetime) else str(task_timestamp)
+                            baseline_score = await validator.basemodel_evaluator.score_geo_baseline(
+                                task_id=task_id,
+                                ground_truth=ground_truth_value
+                            )
+                            logger.info(f"Retrieved baseline score for task_id {task_id}: {baseline_score:.4f}")
+                        except Exception as e:
+                            logger.error(f"Error retrieving baseline score: {e}")
+                            logger.error(traceback.format_exc())
+                    
+                    # Calculate score between prediction and ground truth
+                    score = self.scoring_mechanism.calculate_score(
+                        task["predicted_values"], ground_truth_value
+                    )
+
+                    # Compare with baseline score if available
+                    if baseline_score is not None:
+                        logger.info(f"Comparing miner score ({score:.4f}) with baseline ({baseline_score:.4f})")
+                        if score <= baseline_score:
+                            logger.info(f"Miner score ({score:.4f}) <= baseline ({baseline_score:.4f}), setting to 0")
+                            score = 0
+                        else:
+                            logger.info(f"Miner score ({score:.4f}) > baseline ({baseline_score:.4f}), keeping score")
+                            
+                    # Mark task as scored in DB
+                    await self.move_task_to_history(
+                        task, ground_truth_value, score, current_time
+                    )
+
+                    # Add score to task dict for building score row later
+                    task["score"] = score
+                    scored_tasks.append(task)
+                    logger.info(
+                        f"Task {task['id']} scored and archived. Score: {score}"
+                    )
+                except Exception as e:
+                    logger.error(f"Error processing task {task.get('id', 'unknown')}: {e}")
+                    logger.error(traceback.format_exc())
+
+            return scored_tasks, current_time
+
+        except Exception as e:
+            logger.error(f"Error in process_scores: {e}")
+            logger.error(traceback.format_exc())
+            return [], current_time
 
     async def get_tasks_for_hour(self, start_time, end_time, validator=None):
         """

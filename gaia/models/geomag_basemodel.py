@@ -12,6 +12,7 @@ import sys
 import numpy as np
 import json
 import torch
+import random
 
 logger = get_logger(__name__)
 
@@ -28,13 +29,19 @@ class DateTimeEncoder(json.JSONEncoder):
 class FallbackGeoMagModel:
     """A simple fallback model using Prophet when HuggingFace model isn't available."""
 
-    def __init__(self):
+    def __init__(self, random_seed=42):
+        np.random.seed(random_seed)
+        self.random_seed = random_seed
+        
         self.model = Prophet(
             yearly_seasonality=True,
             weekly_seasonality=True,
             daily_seasonality=True,
             interval_width=0.95,
+            mcmc_samples=0
         )
+        
+        self._is_fallback = True
 
     def predict(self, x):
         """
@@ -47,6 +54,8 @@ class FallbackGeoMagModel:
             float: Predicted DST value for next hour
         """
         try:
+            np.random.seed(self.random_seed)
+            
             # Ensure data is in the correct format
             if isinstance(x, pd.DataFrame):
                 # Data is already a DataFrame, just ensure columns are correct
@@ -73,6 +82,8 @@ class FallbackGeoMagModel:
                 df["ds"] = df["ds"].dt.tz_localize(None)
 
             if self._is_fallback:
+                np.random.seed(self.random_seed)
+                
                 # Fit model on current data
                 self.model.fit(df)
 
@@ -118,9 +129,11 @@ class FallbackGeoMagModel:
 class GeoMagBaseModel:
     """Wrapper class for geomagnetic prediction models."""
 
-    def __init__(self, repo_id="Nickel5HF/geomagmodel", filename="BaseModel.py"):
+    def __init__(self, repo_id="Nickel5HF/geomagmodel", filename="BaseModel.py", random_seed=42):
         self.model = None
         self._is_fallback = True
+        self.random_seed = random_seed
+        np.random.seed(random_seed)
 
         try:
             # Download the model file from HuggingFace
@@ -148,7 +161,7 @@ class GeoMagBaseModel:
         except Exception as e:
             logger.warning(f"Failed to load HuggingFace model: {e}")
             logger.info("Using fallback Prophet model")
-            self.model = FallbackGeoMagModel()
+            self.model = FallbackGeoMagModel(random_seed=random_seed)
 
     @property
     def is_fallback(self) -> bool:
@@ -166,6 +179,8 @@ class GeoMagBaseModel:
             float: Predicted DST value.
         """
         try:
+            np.random.seed(self.random_seed)
+            
             # Ensure data is in the correct format
             if isinstance(data, pd.DataFrame):
                 df = data.copy()
@@ -192,6 +207,8 @@ class GeoMagBaseModel:
                 df["ds"] = df["ds"].dt.tz_convert("UTC").dt.tz_localize(None)
 
             if self._is_fallback:
+                np.random.seed(self.random_seed)
+                
                 # Use Prophet model
                 self.model.fit(df)
                 future_dates = pd.date_range(
