@@ -44,7 +44,7 @@ class SessionWithHeaderRedirection(requests.Session):
 session = SessionWithHeaderRedirection(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
 
 
-def construct_smap_url(datetime_obj, test_mode=False, verbose=False):
+def construct_smap_url(datetime_obj, test_mode=False):
     """
     Construct URL for SMAP L4 Global Product data
     Example: SMAP_L4_SM_gph_20241111T013000_Vv7031_001.h5
@@ -60,34 +60,20 @@ def construct_smap_url(datetime_obj, test_mode=False, verbose=False):
     base_url = "https://n5eil01u.ecs.nsidc.org/SMAP/SPL4SMGP.007"
     file_name = f"SMAP_L4_SM_gph_{file_date}{time_str}_Vv7031_001.h5"
 
-    if verbose:
-        print(f"Requesting SMAP data for: {valid_time} ({file_date}{time_str})")
-    
+    print(f"Requesting SMAP data for: {valid_time} ({file_date}{time_str})")
     return f"{base_url}/{date_dir}/{file_name}"
 
 
-def download_smap_data(url, output_path, verbose=True):
+def download_smap_data(url, output_path):
     """
     Download SMAP data with progress bar and caching
-    
-    Args:
-        url: URL to download from
-        output_path: Path to save the downloaded file
-        verbose: Whether to print download information
     """
     cache_dir = Path("smap_cache")
     cache_dir.mkdir(exist_ok=True)
     cache_file = cache_dir / Path(url).name
 
-    # If the output path already exists, assume it's valid
-    if os.path.exists(output_path):
-        if verbose:
-            print(f"Output file already exists at {output_path}, skipping download")
-        return True
-
     if cache_file.exists():
-        if verbose:
-            print(f"Using cached SMAP data from {cache_file}")
+        print(f"Using cached SMAP data from {cache_file}")
         if output_path != str(cache_file):
             shutil.copy(str(cache_file), output_path)
         return True
@@ -95,11 +81,10 @@ def download_smap_data(url, output_path, verbose=True):
     try:
         response = requests.head(url, auth=(EARTHDATA_USERNAME, EARTHDATA_PASSWORD))
         total_size = int(response.headers.get("content-length", 0))
-        if verbose:
-            print(f"Downloading from: {url}")
-            print(f"File size: {total_size / (1024*1024):.1f} MB")
+        print(f"Downloading from: {url}")
+        print(f"File size: {total_size / (1024*1024):.1f} MB")
         with tqdm(
-            total=total_size, unit="B", unit_scale=True, desc="Downloading", disable=not verbose
+            total=total_size, unit="B", unit_scale=True, desc="Downloading"
         ) as pbar:
             process = subprocess.Popen(
                 [
@@ -184,7 +169,7 @@ def get_smap_data(datetime_obj, regions):
         dict: Region-wise SMAP data and metadata
     """
     try:
-        smap_url = construct_smap_url(datetime_obj, verbose=True)
+        smap_url = construct_smap_url(datetime_obj)
         cache_dir = Path("smap_cache")
         cache_dir.mkdir(exist_ok=True)
         temp_filename = f"temp_smap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5"
@@ -203,7 +188,7 @@ def get_smap_data(datetime_obj, regions):
             smap_y_range = (-7314540.11, 7314540.11)
             smap_x_range = (-17367530.45, 17367530.45)
 
-            for i, region in enumerate(regions if isinstance(regions, list) else [regions]):
+            for i, region in enumerate(regions):
                 bounds = region["bounds"]
                 crs = region["crs"]
 
@@ -272,7 +257,7 @@ def get_smap_data(datetime_obj, regions):
         print(f"Error getting SMAP data: {str(e)}")
         return None
     finally:
-        if 'temp_filepath' in locals() and temp_filepath:
+        if 'temp_filepath' in locals() and temp_filepath.exists():
             try:
                 temp_filepath.unlink()
             except Exception as e:

@@ -284,7 +284,10 @@ class GeomagneticTask(Task):
             return
         
         task_id = str(current_hour_start.timestamp())
-        logger.info(f"running dst basemodel for scoring")
+        logger.info(f"Running DST basemodel for scoring with task_id: {task_id} (timestamp: {current_hour_start})")
+        
+        validator.basemodel_evaluator.test_mode = self.test_mode
+        
         await validator.basemodel_evaluator.predict_geo_and_store(
             historical_data,
             task_id
@@ -326,10 +329,17 @@ class GeomagneticTask(Task):
                 f"Processing scores for hour starting at {query_hour.isoformat()}"
             )
 
-            # Get tasks for the specified hour
+            if self.test_mode:
+                start_time = current_time - datetime.timedelta(minutes=10)
+                end_time = current_time
+                logger.info(f"TEST MODE: Using recent time window for immediate scoring: {start_time} to {end_time}")
+            else:
+                start_time = query_hour
+                end_time = query_hour + datetime.timedelta(hours=1)
+
             tasks = await self.get_tasks_for_hour(
-                query_hour,
-                query_hour + datetime.timedelta(hours=1),
+                start_time,
+                end_time,
                 validator=validator
             )
 
@@ -363,10 +373,12 @@ class GeomagneticTask(Task):
                     baseline_score = None
                     if validator and hasattr(validator, 'basemodel_evaluator'):
                         try:
-                            task_timestamp = task.get("timestamp")
+                            task_timestamp = task.get("timestamp", task.get("query_time"))
                             if task_timestamp:
                                 task_id = str(task_timestamp.timestamp()) if isinstance(task_timestamp, datetime.datetime) else str(task_timestamp)
-                                logger.info(f"Looking up baseline prediction with task_id: {task_id}")
+                                logger.info(f"Looking up baseline prediction with task_id: {task_id} (original timestamp: {task_timestamp})")
+                                validator.basemodel_evaluator.test_mode = self.test_mode
+                                
                                 baseline_score = await validator.basemodel_evaluator.score_geo_baseline(
                                     task_id=task_id,
                                     ground_truth=ground_truth_value
@@ -386,15 +398,23 @@ class GeomagneticTask(Task):
                         task["predicted_values"], ground_truth_value
                     )
 
-                    # Compare with baseline score if available
                     if baseline_score is not None:
-                        logger.info(f"Comparing miner score ({score:.4f}) with baseline ({baseline_score:.4f})")
-                        if score <= baseline_score:
-                            logger.info(f"Miner score ({score:.4f}) <= baseline ({baseline_score:.4f}), setting to 0")
+                        logger.info(f"############### BASELINE COMPARISON - Geomagnetic Task - Task ID: {task_id} ###############")
+                        logger.info(f"###### Miner score: {score:.4f}")
+                        logger.info(f"###### Baseline score: {baseline_score:.4f}")
+                        logger.info(f"###### Score difference (miner - baseline): {score - baseline_score:.4f}")
+                        
+                        if score <= baseline_score + 0.005:
+                            logger.info(f"###### RESULT: Miner score ({score:.4f}) not better than baseline ({baseline_score:.4f}), setting to 0")
                             score = 0
                         else:
-                            logger.info(f"Miner score ({score:.4f}) > baseline ({baseline_score:.4f}), keeping score")
-                            
+                            logger.info(f"###### RESULT: Miner score ({score:.4f}) > baseline ({baseline_score:.4f}), keeping score")
+                        logger.info(f"############### END BASELINE COMPARISON ###############")
+                    else:
+                        logger.info(f"############### BASELINE COMPARISON ###############")
+                        logger.info(f"###### No baseline score available for comparison, using miner score: {score:.4f}")
+                        logger.info(f"############### END BASELINE COMPARISON ###############")
+                    
                     # Mark task as scored in DB
                     await self.move_task_to_history(
                         task, ground_truth_value, score, current_time
@@ -482,6 +502,7 @@ class GeomagneticTask(Task):
                     "miner_hotkey": row["miner_hotkey"],
                     "predicted_values": row["predicted_value"],
                     "query_time": row["query_time"],
+                    "timestamp": row["query_time"],
                 }
                 tasks.append(task)
 
@@ -512,7 +533,11 @@ class GeomagneticTask(Task):
         try:
             # Get the current UTC time
             current_time = datetime.datetime.now(datetime.timezone.utc)
-            logger.info(f"Fetching ground truth for UTC hour: {current_time.hour}")
+            
+            if self.test_mode:
+                logger.info(f"TEST MODE: Fetching ground truth for current UTC hour: {current_time.hour}")
+            else:
+                logger.info(f"Fetching ground truth for UTC hour: {current_time.hour}")
 
             # Fetch the most recent geomagnetic data
             timestamp, dst_value = await get_latest_geomag_data(

@@ -176,7 +176,8 @@ class SoilScoringMechanism(ScoringMechanism):
                 model_predictions=predictions["predictions"],
                 target_date=predictions["target_time"],
                 miner_id=predictions["miner_id"],
-                smap_file_path=predictions.get("smap_file_path")
+                smap_file_path=predictions.get("smap_file_path"),
+                test_mode=predictions.get("test_mode")
             )
 
             if isinstance(metrics, dict) and metrics.get("status") == "retry_scheduled":
@@ -219,7 +220,8 @@ class SoilScoringMechanism(ScoringMechanism):
         model_predictions: torch.Tensor,
         target_date: datetime,
         miner_id: str,
-        smap_file_path: Optional[str] = None
+        smap_file_path: Optional[str] = None,
+        test_mode: bool = None
     ) -> dict:
         """
         Compute RMSE and SSIM between model predictions and SMAP data for valid pixels only.
@@ -231,6 +233,7 @@ class SoilScoringMechanism(ScoringMechanism):
             target_date: The target date for the prediction
             miner_id: The miner ID
             smap_file_path: Optional path to an already downloaded SMAP file
+            test_mode: Override the test_mode setting (defaults to task.test_mode if None)
         """
         device = model_predictions.device
         loop = asyncio.get_event_loop()
@@ -239,7 +242,9 @@ class SoilScoringMechanism(ScoringMechanism):
         sentinel_bounds = BoundingBox(left=left, bottom=bottom, right=right, top=top)
         sentinel_crs = CRS.from_epsg(int(crs))
 
-        test_mode = getattr(self.task, 'test_mode', False)
+        if test_mode is None:
+            test_mode = getattr(self.task, 'test_mode', False)
+        
         temp_file = None
         temp_path = None
         should_download = True
@@ -251,12 +256,12 @@ class SoilScoringMechanism(ScoringMechanism):
         
         try:
             if should_download:
-                smap_url = construct_smap_url(target_date, test_mode=test_mode, verbose=True)
+                smap_url = construct_smap_url(target_date, test_mode=test_mode)
                 temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
                 temp_path = temp_file.name
                 temp_file.close()
 
-                if not download_smap_data(smap_url, temp_file.name, verbose=True):
+                if not download_smap_data(smap_url, temp_file.name):
                     return None
             
             self._last_baseline_metrics = None

@@ -533,7 +533,8 @@ class BaseModelEvaluator:
                 model_predictions=scoring_input["predictions"],
                 target_date=scoring_input["target_time"],
                 miner_id="baseline",
-                smap_file_path=smap_file_path if smap_file_path else None
+                smap_file_path=smap_file_path if smap_file_path else None,
+                test_mode=self.test_mode
             )
             
             if metrics is None:
@@ -542,7 +543,7 @@ class BaseModelEvaluator:
                 
             logger.info(f"Computed metrics: {metrics}")
             
-            score_result = await self.soil_scoring.compute_final_score(metrics)
+            score_result = self.soil_scoring.compute_final_score(metrics)
             
             logger.info(f"Soil baseline score for task_id {task_id}, region {region_id_str}: {score_result:.4f}")
             return score_result

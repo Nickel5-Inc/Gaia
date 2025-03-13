@@ -829,7 +829,7 @@ class SoilMoistureTask(Task):
             for target_time, tasks in tasks_by_time.items():
                 logger.info(f"Processing {len(tasks)} predictions for timestamp {target_time}")
                 
-                smap_url = construct_smap_url(target_time, test_mode=self.test_mode, verbose=True)
+                smap_url = construct_smap_url(target_time, test_mode=self.test_mode)
                 temp_file = None
                 temp_path = None
                 try:
@@ -837,7 +837,7 @@ class SoilMoistureTask(Task):
                     temp_path = temp_file.name
                     temp_file.close()
 
-                    if not download_smap_data(smap_url, temp_file.name, verbose=True):
+                    if not download_smap_data(smap_url, temp_file.name):
                         logger.error(f"Failed to download SMAP data for {target_time}")
                         # Update retry information for failed tasks
                         for task in tasks:
@@ -885,6 +885,8 @@ class SoilMoistureTask(Task):
                                             if smap_file_to_use:
                                                 logger.info(f"Using existing SMAP file for baseline scoring: {smap_file_to_use}")
                                             
+                                            self.validator.basemodel_evaluator.test_mode = self.test_mode
+                                            
                                             baseline_score = await self.validator.basemodel_evaluator.score_soil_baseline(
                                                 task_id=task_id,
                                                 region_id=str(task["id"]),
@@ -896,26 +898,50 @@ class SoilMoistureTask(Task):
                                                 miner_score = score.get("total_score", 0)
                                                 
                                                 miner_metrics = score.get("metrics", {})
-                                                logger.info(f"BASELINE COMPARISON - Miner: {prediction['miner_id']}, Region: {task['id']}")
-                                                logger.info(f"  Miner total score: {miner_score:.4f}")
-                                                logger.info(f"  Baseline total score: {baseline_score:.4f}")
-                                                logger.info(f"  Score difference (miner - baseline): {miner_score - baseline_score:.4f}")
+                                                logger.info(f"############### BASELINE COMPARISON - Miner: {prediction['miner_id']}, Region: {task['id']} ###############")
+                                                logger.info(f"###### Miner total score: {miner_score:.4f}")
+                                                logger.info(f"###### Baseline total score: {baseline_score:.4f}")
+                                                logger.info(f"###### Score difference (miner - baseline): {miner_score - baseline_score:.4f}")
                                                 
                                                 if "surface_rmse" in miner_metrics:
-                                                    logger.info(f"  Miner surface RMSE: {miner_metrics['surface_rmse']:.4f}")
-                                                if "rootzone_rmse" in miner_metrics:
-                                                    logger.info(f"  Miner rootzone RMSE: {miner_metrics['rootzone_rmse']:.4f}")
+                                                    surface_rmse = miner_metrics["surface_rmse"]
+                                                    logger.info(f"###### Surface RMSE - Miner: {surface_rmse:.4f}")
+                                                    
+                                                    baseline_metrics = getattr(self.validator.basemodel_evaluator.soil_scoring, '_last_baseline_metrics', {})
+                                                    baseline_surface_rmse = baseline_metrics.get("validation_metrics", {}).get("surface_rmse")
+                                                    
+                                                    if baseline_surface_rmse is not None:
+                                                        logger.info(f"###### Surface RMSE - Baseline: {baseline_surface_rmse:.4f}")
+                                                        logger.info(f"###### Surface RMSE Diff (baseline - miner): {baseline_surface_rmse - surface_rmse:.4f}")
                                                 
-                                                if miner_score < baseline_score:
-                                                    logger.info(f"  Comparison result: WORSE - Miner score ({miner_score:.4f}) < baseline ({baseline_score:.4f})")
-                                                    logger.info(f"  Setting score to 0")
-                                                    score["total_score"] = 0
-                                                elif miner_score == baseline_score:
-                                                    logger.info(f"  Comparison result: EQUAL - Miner score ({miner_score:.4f}) = baseline ({baseline_score:.4f})")
+                                                if "rootzone_rmse" in miner_metrics:
+                                                    rootzone_rmse = miner_metrics["rootzone_rmse"]
+                                                    logger.info(f"###### Rootzone RMSE - Miner: {rootzone_rmse:.4f}")
+                                                    
+                                                    baseline_metrics = getattr(self.validator.basemodel_evaluator.soil_scoring, '_last_baseline_metrics', {})
+                                                    baseline_rootzone_rmse = baseline_metrics.get("validation_metrics", {}).get("rootzone_rmse")
+                                                    
+                                                    if baseline_rootzone_rmse is not None:
+                                                        logger.info(f"###### Rootzone RMSE - Baseline: {baseline_rootzone_rmse:.4f}")
+                                                        logger.info(f"###### Rootzone RMSE Diff (baseline - miner): {baseline_rootzone_rmse - rootzone_rmse:.4f}")
+                                                        
+                                                logger.info(f"############### END BASELINE COMPARISON ###############")
+                                                
+                                                epsilon = 0.005
+                                                
+                                                if miner_score <= baseline_score + epsilon:
+                                                    if miner_score < baseline_score:
+                                                        logger.info(f"  Comparison result: WORSE - Miner score ({miner_score:.4f}) < baseline ({baseline_score:.4f})")
+                                                    elif miner_score == baseline_score:
+                                                        logger.info(f"  Comparison result: EQUAL - Miner score ({miner_score:.4f}) = baseline ({baseline_score:.4f})")
+                                                    else:
+                                                        logger.info(f"  Comparison result: INSUFFICIENT IMPROVEMENT - Miner score ({miner_score:.4f}) only slightly better than baseline ({baseline_score:.4f})")
+                                                        logger.info(f"  Improvement of {miner_score - baseline_score:.4f} is less than required threshold of {epsilon:.4f}")
+                                                    
                                                     logger.info(f"  Setting score to 0")
                                                     score["total_score"] = 0
                                                 else:
-                                                    logger.info(f"  Comparison result: BETTER - Miner score ({miner_score:.4f}) > baseline ({baseline_score:.4f})")
+                                                    logger.info(f"  Comparison result: BETTER - Miner score ({miner_score:.4f}) > baseline ({baseline_score:.4f}) by more than threshold {epsilon:.4f}")
                                                     logger.info(f"  Keeping original score")
                                         except Exception as e:
                                             logger.error(f"Error retrieving baseline score: {e}")
