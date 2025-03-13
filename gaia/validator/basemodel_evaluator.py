@@ -337,29 +337,25 @@ class BaseModelEvaluator:
             task_id: The task ID to retrieve the prediction for
             
         Returns:
-            Optional[float]: The prediction or None if not found
+            Optional[float]: The prediction value or None if not found
         """
         if not self.db_manager:
             logger.warning("No database manager available, cannot retrieve prediction")
             return None
             
         try:
+            if not task_id:
+                logger.warning("No task_id provided, cannot retrieve geomagnetic baseline prediction")
+                return None
+                
+            logger.info(f"Retrieving geomagnetic baseline prediction for task_id: {task_id}")
             result = await self.db_manager.get_baseline_prediction(
                 task_name="geomagnetic",
                 task_id=task_id
             )
             
-            if result:
-                prediction = result["prediction"]
-                
-                if isinstance(prediction, dict) and "value" in prediction:
-                    return prediction["value"]
-                
-                if isinstance(prediction, (int, float)):
-                    return float(prediction)
-                
-                logger.warning(f"Unexpected prediction format: {type(prediction)}")
-                return None
+            if result and 'prediction' in result and 'value' in result['prediction']:
+                return float(result['prediction']['value'])
             
             logger.warning(f"No geomagnetic baseline prediction found for task_id {task_id}")
             return None
@@ -434,13 +430,20 @@ class BaseModelEvaluator:
             return None
         
         try:
+            if not task_id:
+                logger.warning("No task_id provided, cannot score geomagnetic baseline prediction")
+                return None
+                
+            logger.info(f"Scoring geomagnetic baseline prediction for task_id: {task_id}")
+            
             baseline_prediction = await self.get_geo_baseline_prediction(task_id)
             if baseline_prediction is None:
                 logger.warning(f"No geomagnetic baseline prediction found for task_id {task_id}")
                 return None
-            
+                
             score = self.geo_scoring.calculate_score(baseline_prediction, ground_truth)
             logger.info(f"Geomagnetic baseline score for task_id {task_id}: {score:.4f}")
+            
             return score
         
         except Exception as e:

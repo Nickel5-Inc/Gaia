@@ -79,6 +79,12 @@ def download_smap_data(url, output_path, verbose=True):
     cache_dir.mkdir(exist_ok=True)
     cache_file = cache_dir / Path(url).name
 
+    # If the output path already exists, assume it's valid
+    if os.path.exists(output_path):
+        if verbose:
+            print(f"Output file already exists at {output_path}, skipping download")
+        return True
+
     if cache_file.exists():
         if verbose:
             print(f"Using cached SMAP data from {cache_file}")

@@ -881,11 +881,15 @@ class SoilMoistureTask(Task):
                                     if self.validator and hasattr(self.validator, 'basemodel_evaluator'):
                                         try:
                                             task_id = str(target_time.timestamp()) if isinstance(target_time, datetime) else str(target_time)
+                                            smap_file_to_use = temp_path if temp_path and os.path.exists(temp_path) else None
+                                            if smap_file_to_use:
+                                                logger.info(f"Using existing SMAP file for baseline scoring: {smap_file_to_use}")
+                                            
                                             baseline_score = await self.validator.basemodel_evaluator.score_soil_baseline(
                                                 task_id=task_id,
                                                 region_id=str(task["id"]),
                                                 ground_truth=score.get("ground_truth", {}),
-                                                smap_file_path=temp_path
+                                                smap_file_path=smap_file_to_use
                                             )
                                             
                                             if baseline_score is not None:

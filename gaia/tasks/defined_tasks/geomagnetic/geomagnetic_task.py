@@ -364,12 +364,19 @@ class GeomagneticTask(Task):
                     if validator and hasattr(validator, 'basemodel_evaluator'):
                         try:
                             task_timestamp = task.get("timestamp")
-                            task_id = str(task_timestamp.timestamp()) if isinstance(task_timestamp, datetime.datetime) else str(task_timestamp)
-                            baseline_score = await validator.basemodel_evaluator.score_geo_baseline(
-                                task_id=task_id,
-                                ground_truth=ground_truth_value
-                            )
-                            logger.info(f"Retrieved baseline score for task_id {task_id}: {baseline_score:.4f}")
+                            if task_timestamp:
+                                task_id = str(task_timestamp.timestamp()) if isinstance(task_timestamp, datetime.datetime) else str(task_timestamp)
+                                logger.info(f"Looking up baseline prediction with task_id: {task_id}")
+                                baseline_score = await validator.basemodel_evaluator.score_geo_baseline(
+                                    task_id=task_id,
+                                    ground_truth=ground_truth_value
+                                )
+                                if baseline_score is not None:
+                                    logger.info(f"Retrieved baseline score for task_id {task_id}: {baseline_score:.4f}")
+                                else:
+                                    logger.info(f"No baseline score available for task_id {task_id}")
+                            else:
+                                logger.warning(f"Task has no timestamp, cannot retrieve baseline prediction")
                         except Exception as e:
                             logger.error(f"Error retrieving baseline score: {e}")
                             logger.error(traceback.format_exc())

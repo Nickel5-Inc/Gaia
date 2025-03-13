@@ -258,6 +258,8 @@ class SoilScoringMechanism(ScoringMechanism):
 
                 if not download_smap_data(smap_url, temp_file.name, verbose=True):
                     return None
+            
+            self._last_baseline_metrics = None
 
             smap_data = get_smap_data_for_sentinel_bounds(
                 temp_path,
@@ -385,6 +387,9 @@ class SoilScoringMechanism(ScoringMechanism):
                         kernel_size=9,
                     ))
                     results["validation_metrics"]["rootzone_ssim"] = rootzone_ssim.item()
+
+            if miner_id == "baseline":
+                self._last_baseline_metrics = results
 
             return results
 
