@@ -403,12 +403,25 @@ class GeomagneticTask(Task):
                         logger.info(f"###### Miner score: {score:.4f}")
                         logger.info(f"###### Baseline score: {baseline_score:.4f}")
                         logger.info(f"###### Score difference (miner - baseline): {score - baseline_score:.4f}")
+                        benchmark_score = 0.90
+                        epsilon = 0.005
                         
-                        if score <= baseline_score + 0.005:
-                            logger.info(f"###### RESULT: Miner score ({score:.4f}) not better than baseline ({baseline_score:.4f}), setting to 0")
+                        logger.info(f"###### Benchmark score: {benchmark_score:.4f}")
+                        logger.info(f"###### Required score threshold: {benchmark_score:.4f}")
+                        
+                        if score <= baseline_score + epsilon:
+                            if score < baseline_score:
+                                logger.info(f"###### RESULT: Miner score ({score:.4f}) not better than baseline ({baseline_score:.4f}), setting to 0")
+                            else:
+                                logger.info(f"###### RESULT: Miner improvement over baseline not significant enough, setting to 0")
+                            score = 0
+                        elif score < benchmark_score:
+                            logger.info(f"###### RESULT: Miner score ({score:.4f}) below required benchmark score ({benchmark_score:.4f}), setting to 0")
                             score = 0
                         else:
-                            logger.info(f"###### RESULT: Miner score ({score:.4f}) > baseline ({baseline_score:.4f}), keeping score")
+                            logger.info(f"###### RESULT: Miner score ({score:.4f}) > baseline ({baseline_score:.4f}) by more than threshold {epsilon:.4f}")
+                            logger.info(f"###### RESULT: Miner score ({score:.4f}) >= benchmark score ({benchmark_score:.4f})")
+                            logger.info(f"###### RESULT: Keeping score")
                         logger.info(f"############### END BASELINE COMPARISON ###############")
                     else:
                         logger.info(f"############### BASELINE COMPARISON ###############")
