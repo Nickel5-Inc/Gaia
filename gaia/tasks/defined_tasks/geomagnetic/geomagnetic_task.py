@@ -403,8 +403,18 @@ class GeomagneticTask(Task):
                         logger.info(f"###### Miner score: {score:.4f}")
                         logger.info(f"###### Baseline score: {baseline_score:.4f}")
                         logger.info(f"###### Score difference (miner - baseline): {score - baseline_score:.4f}")
+
                         benchmark_score = 0.90
-                        epsilon = 0.005
+                        base_epsilon = 0.005  # Default threshold
+                        theoretical_max = 0.95  # Theoretical upper limit for geomagnetic prediction accuracy
+                        
+                        if baseline_score > theoretical_max - 0.10:  # Within 10% of theoretical max
+                            epsilon = 0.002  # Use smaller threshold when baseline is already excellent
+                            logger.info(f"###### Baseline score ({baseline_score:.4f}) very close to theoretical maximum ({theoretical_max:.4f})")
+                            logger.info(f"###### Using reduced epsilon: {epsilon:.4f}")
+                        else:
+                            epsilon = base_epsilon
+                            logger.info(f"###### Using standard epsilon: {epsilon:.4f}")
                         
                         logger.info(f"###### Benchmark score: {benchmark_score:.4f}")
                         logger.info(f"###### Required score threshold: {benchmark_score:.4f}")

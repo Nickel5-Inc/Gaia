@@ -255,7 +255,7 @@ class SoilMoistureTask(Task):
                                             logger.error(traceback.format_exc())
                                         
                                         if model_inputs:
-                                            task_id = str(target_smap_time.timestamp())
+                                            task_id = str(target_time.timestamp())
                                             baseline_prediction = await validator.basemodel_evaluator.predict_soil_and_store(
                                                 data=model_inputs,
                                                 task_id=task_id,
@@ -927,22 +927,60 @@ class SoilMoistureTask(Task):
                                                         
                                                 logger.info(f"############### END BASELINE COMPARISON ###############")
                                                 
-                                                epsilon = 0.005
+                                                standard_epsilon = 0.005
+                                                excellent_rmse_threshold = 0.04
                                                 
-                                                if miner_score <= baseline_score + epsilon:
-                                                    if miner_score < baseline_score:
-                                                        logger.info(f"  Comparison result: WORSE - Miner score ({miner_score:.4f}) < baseline ({baseline_score:.4f})")
-                                                    elif miner_score == baseline_score:
-                                                        logger.info(f"  Comparison result: EQUAL - Miner score ({miner_score:.4f}) = baseline ({baseline_score:.4f})")
-                                                    else:
-                                                        logger.info(f"  Comparison result: INSUFFICIENT IMPROVEMENT - Miner score ({miner_score:.4f}) only slightly better than baseline ({baseline_score:.4f})")
-                                                        logger.info(f"  Improvement of {miner_score - baseline_score:.4f} is less than required threshold of {epsilon:.4f}")
+                                                baseline_metrics = getattr(self.validator.basemodel_evaluator.soil_scoring, '_last_baseline_metrics', {})
+                                                baseline_surface_rmse = baseline_metrics.get("validation_metrics", {}).get("surface_rmse")
+                                                baseline_rootzone_rmse = baseline_metrics.get("validation_metrics", {}).get("rootzone_rmse")
+                                                
+                                                has_excellent_performance = False
+                                                avg_baseline_rmse = None
+                                                
+                                                if baseline_surface_rmse is not None and baseline_rootzone_rmse is not None:
+                                                    avg_baseline_rmse = (baseline_surface_rmse + baseline_rootzone_rmse) / 2
+                                                    has_excellent_performance = avg_baseline_rmse <= excellent_rmse_threshold
+                                                    logger.info(f"  Average baseline RMSE: {avg_baseline_rmse:.4f}")
                                                     
-                                                    logger.info(f"  Setting score to 0")
-                                                    score["total_score"] = 0
+                                                    if has_excellent_performance:
+                                                        logger.info(f"  Baseline has excellent performance (RMSE <= {excellent_rmse_threshold})")
+                                                        logger.info(f"  Using percentage-based comparison (within 5% of baseline)")
+                                                
+                                                passes_comparison = False
+                                                
+                                                if has_excellent_performance and avg_baseline_rmse is not None:
+                                                    allowed_score_range = baseline_score * 0.95
+                                                    passes_comparison = miner_score >= allowed_score_range
+                                                    
+                                                    if passes_comparison:
+                                                        if miner_score >= baseline_score:
+                                                            logger.info(f"  Comparison result: BETTER - Miner score ({miner_score:.4f}) > baseline ({baseline_score:.4f})")
+                                                        else:
+                                                            logger.info(f"  Comparison result: WITHIN ALLOWANCE - Miner score ({miner_score:.4f}) within 5% of excellent baseline ({baseline_score:.4f})")
+                                                            logger.info(f"  Allowed minimum score: {allowed_score_range:.4f}")
+                                                        
+                                                        logger.info(f"  Keeping original score")
+                                                    else:
+                                                        logger.info(f"  Comparison result: TOO FAR BELOW BASELINE - Miner score ({miner_score:.4f}) < allowed minimum ({allowed_score_range:.4f})")
+                                                        logger.info(f"  Setting score to 0")
+                                                        score["total_score"] = 0
                                                 else:
-                                                    logger.info(f"  Comparison result: BETTER - Miner score ({miner_score:.4f}) > baseline ({baseline_score:.4f}) by more than threshold {epsilon:.4f}")
-                                                    logger.info(f"  Keeping original score")
+                                                    passes_comparison = miner_score > baseline_score + standard_epsilon
+                                                    
+                                                    if not passes_comparison:
+                                                        if miner_score < baseline_score:
+                                                            logger.info(f"  Comparison result: WORSE - Miner score ({miner_score:.4f}) < baseline ({baseline_score:.4f})")
+                                                        elif miner_score == baseline_score:
+                                                            logger.info(f"  Comparison result: EQUAL - Miner score ({miner_score:.4f}) = baseline ({baseline_score:.4f})")
+                                                        else:
+                                                            logger.info(f"  Comparison result: INSUFFICIENT IMPROVEMENT - Miner score ({miner_score:.4f}) only slightly better than baseline ({baseline_score:.4f})")
+                                                            logger.info(f"  Improvement of {miner_score - baseline_score:.4f} is less than required threshold of {standard_epsilon:.4f}")
+                                                        
+                                                        logger.info(f"  Setting score to 0")
+                                                        score["total_score"] = 0
+                                                    else:
+                                                        logger.info(f"  Comparison result: BETTER - Miner score ({miner_score:.4f}) > baseline ({baseline_score:.4f}) by more than threshold {standard_epsilon:.4f}")
+                                                        logger.info(f"  Keeping original score")
                                         except Exception as e:
                                             logger.error(f"Error retrieving baseline score: {e}")
                                             logger.error(traceback.format_exc())
