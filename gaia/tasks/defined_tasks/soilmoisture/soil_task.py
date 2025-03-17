@@ -39,6 +39,8 @@ import tempfile
 import math
 import glob
 from collections import defaultdict
+import torch
+from gaia.tasks.defined_tasks.soilmoisture.utils.inference_class import SoilMoistureInferencePreprocessor
 
 logger = get_logger(__name__)
 
@@ -71,6 +73,7 @@ class SoilMoistureTask(Task):
     node_type: str = Field(default="miner")
     test_mode: bool = Field(default=False)
     use_raw_preprocessing: bool = Field(default=False)
+    validator: Any = Field(default=None, description="Reference to the validator instance")
 
     def __init__(self, db_manager=None, node_type=None, test_mode=False, **data):
         super().__init__(
@@ -139,6 +142,7 @@ class SoilMoistureTask(Task):
         """Execute validator workflow."""
         if not hasattr(self, "db_manager") or self.db_manager is None:
             self.db_manager = validator.db_manager
+        self.validator = validator
 
         await self.ensure_retry_columns_exist()
         
@@ -223,6 +227,55 @@ class SoilMoistureTask(Task):
                                     "sentinel_crs": region["sentinel_crs"],
                                     "target_time": target_smap_time.isoformat(),
                                 }
+
+                                if validator.basemodel_evaluator:
+                                    try:
+                                        logger.info(f"Running soil moisture baseline model for region {region['id']}")
+                                        model_inputs = None
+                                        try:
+                                            with tempfile.NamedTemporaryFile(suffix='.tiff', delete=False) as temp_file:
+                                                temp_file.write(combined_data)
+                                                temp_file_path = temp_file.name
+                                            
+                                            preprocessor = SoilMoistureInferencePreprocessor()
+                                            model_inputs = preprocessor.preprocess(temp_file_path)
+                                            
+                                            if model_inputs:
+                                                for key, value in model_inputs.items():
+                                                    if isinstance(value, np.ndarray):
+                                                        model_inputs[key] = torch.from_numpy(value).float()
+                                            
+                                            model_inputs["sentinel_bounds"] = region["sentinel_bounds"]
+                                            model_inputs["sentinel_crs"] = region["sentinel_crs"]
+                                            model_inputs["target_time"] = target_smap_time
+                                            
+                                            logger.info(f"Preprocessed data for soil moisture baseline model. Keys: {list(model_inputs.keys() if model_inputs else [])}")
+                                        except Exception as e:
+                                            logger.error(f"Error preprocessing data for soil moisture baseline model: {str(e)}")
+                                            logger.error(traceback.format_exc())
+                                        
+                                        if model_inputs:
+                                            task_id = str(target_time.timestamp())
+                                            baseline_prediction = await validator.basemodel_evaluator.predict_soil_and_store(
+                                                data=model_inputs,
+                                                task_id=task_id,
+                                                region_id=str(region["id"])
+                                            )
+                                            if baseline_prediction:
+                                                logger.info(f"Soil moisture baseline prediction stored for region {region['id']}")
+                                            else:
+                                                logger.error(f"Failed to generate soil moisture baseline prediction for region {region['id']}")
+                                        else:
+                                            logger.error(f"Preprocessing failed for soil moisture baseline model, region {region['id']}")
+                                        
+                                        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+                                            try:
+                                                os.unlink(temp_file_path)
+                                            except Exception as e:
+                                                logger.error(f"Error cleaning up temporary file: {str(e)}")
+                                    except Exception as e:
+                                        logger.error(f"Error running soil moisture baseline model: {str(e)}")
+                                        logger.error(traceback.format_exc())
 
                                 payload = {"nonce": str(uuid4()), "data": task_data}
 
@@ -818,11 +871,102 @@ class SoilMoistureTask(Task):
                                     "region": {"id": task["id"]},
                                     "miner_id": prediction["miner_id"],
                                     "miner_hotkey": prediction["miner_hotkey"],
-                                    "smap_file": temp_path
+                                    "smap_file": temp_path,
+                                    "smap_file_path": temp_path
                                 }
                                 
                                 score = await self.scoring_mechanism.score(pred_data)
                                 if score:
+                                    baseline_score = None
+                                    if self.validator and hasattr(self.validator, 'basemodel_evaluator'):
+                                        try:
+                                            task_id = str(target_time.timestamp()) if isinstance(target_time, datetime) else str(target_time)
+                                            smap_file_to_use = temp_path if temp_path and os.path.exists(temp_path) else None
+                                            if smap_file_to_use:
+                                                logger.info(f"Using existing SMAP file for baseline scoring: {smap_file_to_use}")
+                                            
+                                            self.validator.basemodel_evaluator.test_mode = self.test_mode
+                                            
+                                            baseline_score = await self.validator.basemodel_evaluator.score_soil_baseline(
+                                                task_id=task_id,
+                                                region_id=str(task["id"]),
+                                                ground_truth=score.get("ground_truth", {}),
+                                                smap_file_path=smap_file_to_use
+                                            )
+                                            
+                                            if baseline_score is not None:
+                                                miner_score = score.get("total_score", 0)
+                                                
+                                                miner_metrics = score.get("metrics", {})
+                                                logger.info(f"Soil Task - Miner: {prediction['miner_id']}, Region: {task['id']} - Miner: {miner_score:.4f}, Baseline: {baseline_score:.4f}, Diff: {miner_score - baseline_score:.4f}")
+                                                
+                                                if "surface_rmse" in miner_metrics:
+                                                    surface_rmse = miner_metrics["surface_rmse"]
+                                                    
+                                                    baseline_metrics = getattr(self.validator.basemodel_evaluator.soil_scoring, '_last_baseline_metrics', {})
+                                                    baseline_surface_rmse = baseline_metrics.get("validation_metrics", {}).get("surface_rmse")
+                                                    
+                                                    if baseline_surface_rmse is not None:
+                                                        logger.debug(f"Surface RMSE - Miner: {surface_rmse:.4f}, Baseline: {baseline_surface_rmse:.4f}, Diff: {baseline_surface_rmse - surface_rmse:.4f}")
+                                                
+                                                if "rootzone_rmse" in miner_metrics:
+                                                    rootzone_rmse = miner_metrics["rootzone_rmse"]
+                                                    
+                                                    baseline_metrics = getattr(self.validator.basemodel_evaluator.soil_scoring, '_last_baseline_metrics', {})
+                                                    baseline_rootzone_rmse = baseline_metrics.get("validation_metrics", {}).get("rootzone_rmse")
+                                                    
+                                                    if baseline_rootzone_rmse is not None:
+                                                        logger.debug(f"Rootzone RMSE - Miner: {rootzone_rmse:.4f}, Baseline: {baseline_rootzone_rmse:.4f}, Diff: {baseline_rootzone_rmse - rootzone_rmse:.4f}")
+                                                
+                                                standard_epsilon = 0.005
+                                                excellent_rmse_threshold = 0.04
+                                                
+                                                baseline_metrics = getattr(self.validator.basemodel_evaluator.soil_scoring, '_last_baseline_metrics', {})
+                                                baseline_surface_rmse = baseline_metrics.get("validation_metrics", {}).get("surface_rmse")
+                                                baseline_rootzone_rmse = baseline_metrics.get("validation_metrics", {}).get("rootzone_rmse")
+                                                
+                                                has_excellent_performance = False
+                                                avg_baseline_rmse = None
+                                                
+                                                if baseline_surface_rmse is not None and baseline_rootzone_rmse is not None:
+                                                    avg_baseline_rmse = (baseline_surface_rmse + baseline_rootzone_rmse) / 2
+                                                    has_excellent_performance = avg_baseline_rmse <= excellent_rmse_threshold
+                                                    logger.debug(f"Average baseline RMSE: {avg_baseline_rmse:.4f}")
+                                                    
+                                                    if has_excellent_performance:
+                                                        logger.debug(f"Baseline has excellent performance (RMSE <= {excellent_rmse_threshold})")
+                                                
+                                                passes_comparison = False
+                                                
+                                                if has_excellent_performance and avg_baseline_rmse is not None:
+                                                    allowed_score_range = baseline_score * 0.95
+                                                    passes_comparison = miner_score >= allowed_score_range
+                                                    
+                                                    if passes_comparison:
+                                                        if miner_score >= baseline_score:
+                                                            logger.info(f"Score valid - Exceeds excellent baseline: {miner_score:.4f} > {baseline_score:.4f}")
+                                                        else:
+                                                            logger.info(f"Score valid - Within 5% of excellent baseline: {miner_score:.4f} vs {baseline_score:.4f} (min: {allowed_score_range:.4f})")
+                                                    else:
+                                                        logger.info(f"Score zeroed - Too far below excellent baseline: {miner_score:.4f} < {allowed_score_range:.4f}")
+                                                        score["total_score"] = 0
+                                                else:
+                                                    passes_comparison = miner_score > baseline_score + standard_epsilon
+                                                    
+                                                    if not passes_comparison:
+                                                        if miner_score < baseline_score:
+                                                            logger.info(f"Score zeroed - Below baseline: {miner_score:.4f} < {baseline_score:.4f}")
+                                                        elif miner_score == baseline_score:
+                                                            logger.info(f"Score zeroed - Equal to baseline: {miner_score:.4f}")
+                                                        else:
+                                                            logger.info(f"Score zeroed - Insufficient improvement: {miner_score:.4f} vs baseline {baseline_score:.4f} (needed > {baseline_score + standard_epsilon:.4f})")
+                                                        
+                                                        score["total_score"] = 0
+                                                    else:
+                                                        logger.info(f"Score valid - Exceeds baseline by {miner_score - baseline_score:.4f} (threshold: {standard_epsilon:.4f})")
+                                        except Exception as e:
+                                            logger.error(f"Error retrieving baseline score: {e}")
+                                    
                                     scores = score
                                     task["score"] = score
                                     await self.move_task_to_history(

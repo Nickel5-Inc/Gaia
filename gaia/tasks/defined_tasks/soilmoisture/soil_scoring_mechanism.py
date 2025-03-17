@@ -60,12 +60,14 @@ class SoilScoringMechanism(ScoringMechanism):
         rootzone_rmse = metrics["validation_metrics"].get("rootzone_rmse", self.beta)
         surface_ssim = metrics["validation_metrics"].get("surface_ssim", 0)
         rootzone_ssim = metrics["validation_metrics"].get("rootzone_ssim", 0)
-        surface_score = 0.8 * self.sigmoid_rmse(torch.tensor(surface_rmse)) + 0.2 * (
-            (surface_ssim + 1) / 2
-        )
-        rootzone_score = 0.8 * self.sigmoid_rmse(torch.tensor(rootzone_rmse)) + 0.2 * (
-            (rootzone_ssim + 1) / 2
-        )
+        #surface_score = 0.8 * self.sigmoid_rmse(torch.tensor(surface_rmse)) + 0.2 * (
+        #    (surface_ssim + 1) / 2
+        #)
+        #rootzone_score = 0.8 * self.sigmoid_rmse(torch.tensor(rootzone_rmse)) + 0.2 * (
+        #    (rootzone_ssim + 1) / 2
+        #)
+        surface_score = self.sigmoid_rmse(torch.tensor(surface_rmse))
+        rootzone_score = self.sigmoid_rmse(torch.tensor(rootzone_rmse))
         final_score = 0.6 * surface_score + 0.4 * rootzone_score
 
         return final_score.item()
@@ -175,7 +177,9 @@ class SoilScoringMechanism(ScoringMechanism):
                 crs=predictions["crs"],
                 model_predictions=predictions["predictions"],
                 target_date=predictions["target_time"],
-                miner_id=predictions["miner_id"]
+                miner_id=predictions["miner_id"],
+                smap_file_path=predictions.get("smap_file_path"),
+                test_mode=predictions.get("test_mode")
             )
 
             if isinstance(metrics, dict) and metrics.get("status") == "retry_scheduled":
@@ -218,9 +222,20 @@ class SoilScoringMechanism(ScoringMechanism):
         model_predictions: torch.Tensor,
         target_date: datetime,
         miner_id: str,
+        smap_file_path: Optional[str] = None,
+        test_mode: bool = None
     ) -> dict:
         """
         Compute RMSE and SSIM between model predictions and SMAP data for valid pixels only.
+        
+        Args:
+            bounds: The bounding box of the area
+            crs: The coordinate reference system
+            model_predictions: The model predictions as a tensor
+            target_date: The target date for the prediction
+            miner_id: The miner ID
+            smap_file_path: Optional path to an already downloaded SMAP file
+            test_mode: Override the test_mode setting (defaults to task.test_mode if None)
         """
         device = model_predictions.device
         loop = asyncio.get_event_loop()
@@ -229,20 +244,32 @@ class SoilScoringMechanism(ScoringMechanism):
         sentinel_bounds = BoundingBox(left=left, bottom=bottom, right=right, top=top)
         sentinel_crs = CRS.from_epsg(int(crs))
 
-        test_mode = getattr(self.task, 'test_mode', False)
-        smap_url = construct_smap_url(target_date, test_mode=test_mode)
+        if test_mode is None:
+            test_mode = getattr(self.task, 'test_mode', False)
+        
         temp_file = None
         temp_path = None
+        should_download = True
+        
+        if smap_file_path and os.path.exists(smap_file_path):
+            temp_path = smap_file_path
+            should_download = False
+            logger.info(f"Using provided SMAP file: {smap_file_path}")
+        
         try:
-            temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
-            temp_path = temp_file.name
-            temp_file.close()
+            if should_download:
+                smap_url = construct_smap_url(target_date, test_mode=test_mode)
+                temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
+                temp_path = temp_file.name
+                temp_file.close()
 
-            if not download_smap_data(smap_url, temp_file.name):
-                return None
+                if not download_smap_data(smap_url, temp_file.name):
+                    return None
+            
+            self._last_baseline_metrics = None
 
             smap_data = get_smap_data_for_sentinel_bounds(
-                temp_file.name,
+                temp_path,
                 (
                     sentinel_bounds.left,
                     sentinel_bounds.bottom,
@@ -367,6 +394,9 @@ class SoilScoringMechanism(ScoringMechanism):
                         kernel_size=9,
                     ))
                     results["validation_metrics"]["rootzone_ssim"] = rootzone_ssim.item()
+
+            if miner_id == "baseline":
+                self._last_baseline_metrics = results
 
             return results
 

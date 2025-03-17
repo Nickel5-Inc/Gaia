@@ -1,16 +1,50 @@
 import torch
 from datetime import datetime, timezone, timedelta
-from typing import List
+from typing import List, Optional
 import asyncio
 import traceback
 from fiber.chain import interface, chain_utils, weights as w
 from fiber.chain.fetch_nodes import get_nodes_for_netuid
+from fiber import SubstrateInterface
+from fiber.chain.interface import get_substrate
 import sys
+import os
+from dotenv import load_dotenv
 from fiber.logging_utils import get_logger
 import numpy as np
 from gaia import __spec_version__
 
 logger = get_logger(__name__)
+
+
+async def get_active_validator_uids(netuid, subtensor_network="finney", chain_endpoint=None, recent_blocks=500):
+    try:
+        substrate = SubstrateInterface(url=chain_endpoint) if chain_endpoint else get_substrate(subtensor_network=subtensor_network)
+        
+        loop = asyncio.get_event_loop()
+        validator_permits = await loop.run_in_executor(
+            None, 
+            lambda: substrate.query("SubtensorModule", "ValidatorPermit", [netuid]).value
+        )
+        last_update = await loop.run_in_executor(
+            None,
+            lambda: substrate.query("SubtensorModule", "LastUpdate", [netuid]).value
+        )
+        current_block = await loop.run_in_executor(
+            None,
+            lambda: int(substrate.get_block()["header"]["number"])
+        )
+        active_validators = [
+            uid for uid, permit in enumerate(validator_permits)
+            if permit == 1 and uid < len(last_update) and (current_block - last_update[uid]) < recent_blocks
+        ]
+        
+        logger.info(f"Found {len(active_validators)} active validators for netuid {netuid}")
+        return active_validators
+    except Exception as e:
+        logger.error(f"Error getting active validators: {e}")
+        logger.error(traceback.format_exc())
+        return []
 
 
 class FiberWeightSetter:
@@ -159,10 +193,20 @@ class FiberWeightSetter:
 
             if validator_uid is None:
                 logger.error("❗Validator not found in nodes list")
-
                 return False
 
-            calculated_weights, node_ids = self.calculate_weights(weights)
+            active_validator_uids = await get_active_validator_uids(netuid=self.netuid, subtensor_network=self.network)
+            logger.info(f"Found {len(active_validator_uids)} active validators - zeroing their weights")
+            
+            weights_copy = weights.copy()
+            
+            for uid in active_validator_uids:
+                if uid < len(weights_copy):
+                    if weights_copy[uid] > 0:
+                        logger.info(f"Setting validator UID {uid} weight to zero (was {weights_copy[uid]:.6f})")
+                        weights_copy[uid] = 0.0
+
+            calculated_weights, node_ids = self.calculate_weights(weights_copy)
             if calculated_weights is None:
                 return False
 
@@ -181,7 +225,6 @@ class FiberWeightSetter:
                 )
                 logger.info("Weight commit initiated, continuing...")
                 return True
-
 
             except Exception as e:
                 logger.error(f"Error initiating weight commit: {str(e)}")
@@ -210,10 +253,22 @@ class FiberWeightSetter:
 
 async def main():
     try:
+        load_dotenv()
+        
+        network = os.getenv("SUBTENSOR_NETWORK", "test")
+        netuid = int(os.getenv("NETUID", "237"))
+        wallet_name = os.getenv("WALLET_NAME", "test_val")
+        hotkey_name = os.getenv("HOTKEY_NAME", "test_val_hot")
+        
+        logger.info(f"Network configuration from .env: {network} (netuid: {netuid})")
+        
         weight_setter = FiberWeightSetter(
-            netuid=237, wallet_name="gaiatest", hotkey_name="default", network="test"
+            netuid=netuid,
+            wallet_name=wallet_name, 
+            hotkey_name=hotkey_name, 
+            network=network
         )
-
+        
         await weight_setter.set_weights()
 
     except KeyboardInterrupt:
