@@ -403,7 +403,7 @@ class GeomagneticTask(Task):
 
                         benchmark_score = 0.90
                         base_epsilon = 0.005
-                        theoretical_max = 0.95
+                        theoretical_max = 0.99
                         
                         if baseline_score > theoretical_max - 0.10:
                             epsilon = 0.002
