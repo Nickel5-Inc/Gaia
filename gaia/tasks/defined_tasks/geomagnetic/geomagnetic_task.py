@@ -376,7 +376,7 @@ class GeomagneticTask(Task):
                             task_timestamp = task.get("timestamp", task.get("query_time"))
                             if task_timestamp:
                                 task_id = str(task_timestamp.timestamp()) if isinstance(task_timestamp, datetime.datetime) else str(task_timestamp)
-                                logger.info(f"Looking up baseline prediction with task_id: {task_id} (original timestamp: {task_timestamp})")
+                                logger.debug(f"Looking up baseline prediction with task_id: {task_id}")
                                 validator.basemodel_evaluator.test_mode = self.test_mode
                                 
                                 baseline_score = await validator.basemodel_evaluator.score_geo_baseline(
@@ -399,44 +399,31 @@ class GeomagneticTask(Task):
                     )
 
                     if baseline_score is not None:
-                        logger.info(f"############### BASELINE COMPARISON - Geomagnetic Task - Task ID: {task_id} ###############")
-                        logger.info(f"###### Miner score: {score:.4f}")
-                        logger.info(f"###### Baseline score: {baseline_score:.4f}")
-                        logger.info(f"###### Score difference (miner - baseline): {score - baseline_score:.4f}")
+                        logger.info(f"Geomagnetic Task - Miner: {task_id} - Miner score: {score:.4f}, Baseline: {baseline_score:.4f}, Diff: {score - baseline_score:.4f}")
 
                         benchmark_score = 0.90
-                        base_epsilon = 0.005  # Default threshold
-                        theoretical_max = 0.95  # Theoretical upper limit for geomagnetic prediction accuracy
+                        base_epsilon = 0.005
+                        theoretical_max = 0.95
                         
-                        if baseline_score > theoretical_max - 0.10:  # Within 10% of theoretical max
-                            epsilon = 0.002  # Use smaller threshold when baseline is already excellent
-                            logger.info(f"###### Baseline score ({baseline_score:.4f}) very close to theoretical maximum ({theoretical_max:.4f})")
-                            logger.info(f"###### Using reduced epsilon: {epsilon:.4f}")
+                        if baseline_score > theoretical_max - 0.10:
+                            epsilon = 0.002
+                            logger.debug(f"Using reduced epsilon: {epsilon:.4f} (baseline near theoretical max)")
                         else:
                             epsilon = base_epsilon
-                            logger.info(f"###### Using standard epsilon: {epsilon:.4f}")
-                        
-                        logger.info(f"###### Benchmark score: {benchmark_score:.4f}")
-                        logger.info(f"###### Required score threshold: {benchmark_score:.4f}")
                         
                         if score <= baseline_score + epsilon:
                             if score < baseline_score:
-                                logger.info(f"###### RESULT: Miner score ({score:.4f}) not better than baseline ({baseline_score:.4f}), setting to 0")
+                                logger.info(f"Score zeroed - Below baseline: {score:.4f} < {baseline_score:.4f}")
                             else:
-                                logger.info(f"###### RESULT: Miner improvement over baseline not significant enough, setting to 0")
+                                logger.info(f"Score zeroed - Insufficient improvement: {score:.4f} vs baseline {baseline_score:.4f} (needed > {baseline_score + epsilon:.4f})")
                             score = 0
                         elif score < benchmark_score:
-                            logger.info(f"###### RESULT: Miner score ({score:.4f}) below required benchmark score ({benchmark_score:.4f}), setting to 0")
+                            logger.info(f"Score zeroed - Below benchmark: {score:.4f} < {benchmark_score:.4f}")
                             score = 0
                         else:
-                            logger.info(f"###### RESULT: Miner score ({score:.4f}) > baseline ({baseline_score:.4f}) by more than threshold {epsilon:.4f}")
-                            logger.info(f"###### RESULT: Miner score ({score:.4f}) >= benchmark score ({benchmark_score:.4f})")
-                            logger.info(f"###### RESULT: Keeping score")
-                        logger.info(f"############### END BASELINE COMPARISON ###############")
+                            logger.info(f"Score valid - Exceeds baseline by {score - baseline_score:.4f} and meets benchmark {benchmark_score:.4f}")
                     else:
-                        logger.info(f"############### BASELINE COMPARISON ###############")
-                        logger.info(f"###### No baseline score available for comparison, using miner score: {score:.4f}")
-                        logger.info(f"############### END BASELINE COMPARISON ###############")
+                        logger.info(f"No baseline comparison available - using raw score: {score:.4f}")
                     
                     # Mark task as scored in DB
                     await self.move_task_to_history(
