@@ -22,6 +22,7 @@ import requests
 import boto3
 from botocore.config import Config
 from botocore.client import UNSIGNED
+import logging
 
 load_dotenv()
 EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
@@ -72,7 +73,11 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
                 seconds=1
             )
 
-        headers = {"Authorization": f'Bearer {os.getenv("EARTHDATA_API_KEY")}'}
+        # Try first with token auth
+        token = os.getenv("EARTHDATA_API_KEY")
+        use_token = token is not None and len(token) > 10
+
+        # Prepare search parameters
         params = {
             "collection_concept_id": "C2021957295-LPCLOUD",
             "temporal": f"{month_start.strftime('%Y-%m-%d')}T00:00:00Z/{month_end.strftime('%Y-%m-%d')}T23:59:59Z",
@@ -82,20 +87,44 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
         }
 
         print(f"Searching for Sentinel data for {month_start.strftime('%B %Y')}")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                base_url, params=params, headers=headers
-            ) as response:
-                if response.status == 200:
-                    response_json = await response.json()
-                    if "feed" in response_json and "entry" in response_json["feed"]:
-                        entries = response_json["feed"]["entry"]
-                        if entries:
-                            print(f"Found {len(entries)} potential scenes")
-                            return await process_entries(entries, search_date)
-                else:
-                    print(f"Failed to fetch data: {response.status} {response.reason}")
-                return None
+        
+        # Try with token first if available
+        if use_token:
+            try:
+                headers = {"Authorization": f'Bearer {token}'}
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        base_url, params=params, headers=headers
+                    ) as response:
+                        if response.status == 200:
+                            response_json = await response.json()
+                            if "feed" in response_json and "entry" in response_json["feed"]:
+                                entries = response_json["feed"]["entry"]
+                                if entries:
+                                    print(f"Found {len(entries)} potential scenes using token auth")
+                                    return await process_entries(entries, search_date)
+                        else:
+                            print(f"Token auth failed with status {response.status}, trying basic auth...")
+            except Exception as e:
+                print(f"Error with token auth: {str(e)}, falling back to basic auth")
+        
+        # Fall back to basic auth if token failed or not available
+        try:
+            async with aiohttp.ClientSession(auth=EARTHDATA_AUTH) as session:
+                async with session.get(base_url, params=params) as response:
+                    if response.status == 200:
+                        response_json = await response.json()
+                        if "feed" in response_json and "entry" in response_json["feed"]:
+                            entries = response_json["feed"]["entry"]
+                            if entries:
+                                print(f"Found {len(entries)} potential scenes using basic auth")
+                                return await process_entries(entries, search_date)
+                    else:
+                        print(f"Both auth methods failed. Basic auth status: {response.status} {response.reason}")
+        except Exception as e:
+            print(f"Error with basic auth: {str(e)}")
+            
+        return None
 
     async def process_entries(entries, target_date):
         def score_entry(entry):
@@ -145,11 +174,20 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
                         download_dir, f"hls_b8_{entry_date.strftime('%Y%m%d')}.tif"
                     )
 
-                    await download_file(b4_url, b4_path)
-                    print(f"Downloaded B4 to: {b4_path}")
+                    # Try both auth methods for downloading
+                    success = await download_file_with_fallback(b4_url, b4_path)
+                    if success:
+                        print(f"Downloaded B4 to: {b4_path}")
+                    else:
+                        print(f"Failed to download B4 with both auth methods")
+                        continue
 
-                    await download_file(b8_url, b8_path)
-                    print(f"Downloaded B8 to: {b8_path}")
+                    success = await download_file_with_fallback(b8_url, b8_path) 
+                    if success:
+                        print(f"Downloaded B8 to: {b8_path}")
+                    else:
+                        print(f"Failed to download B8 with both auth methods")
+                        continue
 
                     return [b4_path, b8_path]
                 except Exception as e:
@@ -157,20 +195,43 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
                     continue
         return None
 
+    async def download_file_with_fallback(url, destination):
+        # Try token auth first
+        token = os.getenv("EARTHDATA_API_KEY")
+        if token and len(token) > 10:
+            try:
+                headers = {"Authorization": f'Bearer {token}'}
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            with open(destination, "wb") as f:
+                                async for chunk in response.content.iter_chunked(1024 * 1024):
+                                    f.write(chunk)
+                            return True
+                        else:
+                            print(f"Token download failed with status {response.status}, trying basic auth...")
+            except Exception as e:
+                print(f"Error with token download: {str(e)}")
+        
+        # Fall back to basic auth
+        try:
+            async with aiohttp.ClientSession(auth=EARTHDATA_AUTH) as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        with open(destination, "wb") as f:
+                            async for chunk in response.content.iter_chunked(1024 * 1024):
+                                f.write(chunk)
+                        return True
+                    else:
+                        print(f"Basic auth download failed with status {response.status}")
+                        return False
+        except Exception as e:
+            print(f"Error with basic auth download: {str(e)}")
+            return False
+
+    # Keep old method for backward compatibility
     async def download_file(url, destination):
-        async with aiohttp.ClientSession(auth=EARTHDATA_AUTH) as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    with open(destination, "wb") as f:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
-                            f.write(chunk)
-                else:
-                    raise ClientResponseError(
-                        response.request_info,
-                        response.history,
-                        status=response.status,
-                        message=f"Failed to download file from {url}",
-                    )
+        return await download_file_with_fallback(url, destination)
 
     result = await try_month(datetime_obj)
     if result:

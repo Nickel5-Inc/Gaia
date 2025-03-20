@@ -255,7 +255,7 @@ class SoilMoistureTask(Task):
                                             logger.error(traceback.format_exc())
                                         
                                         if model_inputs:
-                                            task_id = str(target_time.timestamp())
+                                            task_id = str(model_inputs["target_time"].timestamp())
                                             baseline_prediction = await validator.basemodel_evaluator.predict_soil_and_store(
                                                 data=model_inputs,
                                                 task_id=task_id,
