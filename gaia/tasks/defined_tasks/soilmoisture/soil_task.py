@@ -1132,29 +1132,60 @@ class SoilMoistureTask(Task):
             """
             miner_mappings = await self.db_manager.fetch_all(miner_query)
             hotkey_to_uid = {row["hotkey"]: row["uid"] for row in miner_mappings}
-            logger.info(f"Found {len(hotkey_to_uid)} miner mappings: {hotkey_to_uid}")
+            logger.info(f"Found {len(hotkey_to_uid)} miner mappings")
 
             scores = [float("nan")] * 256
             current_datetime = datetime.fromisoformat(str(target_time))
 
+            check_query = """
+                SELECT COUNT(*) as count FROM score_table 
+                WHERE task_name = 'soil_moisture' 
+                AND task_id = :task_id
+            """
+            result = await self.db_manager.fetch_one(check_query, {"task_id": str(current_datetime.timestamp())})
+            if result and result["count"] > 0:
+                logger.warning(f"Score row already exists for target_time {target_time}. Skipping.")
+                return []
+
             if recent_tasks:
-                logger.info(f"Processing {len(recent_tasks)} recent tasks")
-                miner_scores = {}
+                logger.info(f"Processing {len(recent_tasks)} recent tasks across all regions")
+                
+                processed_region_ids = set()
+                miner_scores = defaultdict(list)
+                region_counts = defaultdict(set)
                 
                 for task in recent_tasks:
+                    region_id = task.get("id", "unknown")
+                    
+                    if region_id in processed_region_ids:
+                        logger.warning(f"Skipping duplicate region {region_id}")
+                        continue
+                    
+                    processed_region_ids.add(region_id)
                     task_score = task.get("score", {})
+                    
+                    logger.info(f"Processing scores for region {region_id}")
+                    
                     for prediction in task.get("predictions", []):
                         miner_id = prediction.get("miner_id")
-                        if miner_id not in miner_scores:
-                            miner_scores[miner_id] = []
+                        if miner_id is None:
+                            continue
+                            
                         if isinstance(task_score.get("total_score"), (int, float)):
-                            miner_scores[miner_id].append(float(task_score["total_score"]))
-                            logger.info(f"Added score {task_score['total_score']} for miner_id {miner_id} in region {task['id']}")
+                            score_value = float(task_score["total_score"])
+                            miner_scores[miner_id].append(score_value)
+                            region_counts[miner_id].add(region_id)
+                            logger.info(f"Added score {score_value:.4f} for miner_id {miner_id} in region {region_id}")
 
                 for miner_id, scores_list in miner_scores.items():
                     if scores_list:
-                        scores[int(miner_id)] = sum(scores_list) / len(scores_list)
-                        logger.info(f"Final average score for miner {miner_id}: {scores[int(miner_id)]} across {len(scores_list)} regions")
+                        avg_score = sum(scores_list) / len(scores_list)
+                        region_count = len(region_counts[miner_id])
+                        scores[int(miner_id)] = avg_score
+                        logger.info(f"Final average score for miner {miner_id}: {avg_score:.4f} across {region_count} unique regions")
+                        
+                        if region_count > 5:
+                            logger.warning(f"Unexpected number of regions ({region_count}) for miner {miner_id}. Expected maximum 5.")
 
             score_row = {
                 "task_name": "soil_moisture",
@@ -1163,8 +1194,11 @@ class SoilMoistureTask(Task):
                 "status": "completed"
             }
             
-            logger.info(f"Raw score row being inserted: {json.dumps({**score_row, 'score': [f'{s:.4f}' if not math.isnan(s) else 'nan' for s in score_row['score']]})}")
-
+            non_nan_scores = [(i, s) for i, s in enumerate(scores) if not math.isnan(s)]
+            logger.info(f"Built score row with {len(non_nan_scores)} non-NaN scores for target time {target_time}")
+            if non_nan_scores:
+                logger.info(f"Score summary - min: {min(s for _, s in non_nan_scores):.4f}, max: {max(s for _, s in non_nan_scores):.4f}")
+                logger.info(f"Regions per miner: {', '.join([f'miner_{mid}={len(regions)}' for mid, regions in region_counts.items() if len(regions) > 0])}")
             return [score_row]
 
         except Exception as e:

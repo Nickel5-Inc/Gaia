@@ -1427,12 +1427,13 @@ class GaiaValidator:
                     logger.warning("No positive weights found!")
                     return None
                     
-                b = 30    # Growth rate (higher = steeper curve)
-                Q = 5     # Initial value parameter (higher = sharper transition)
-                v = 0.5   # Asymmetry (lower = more asymmetric curve)
-                k = 0.95  # Upper asymptote (higher max value)
-                a = 0.0   # Lower asymptote (keep at 0 to preserve zeros)
-                slope = 0.02  # Tilt (small value to emphasize sigmoid shape)
+                # Increase steepness and asymmetry for more aggressive differentiation
+                b = 70      # Growth rate (higher = steeper curve) - previously 30
+                Q = 8       # Initial value parameter (higher = sharper transition) - previously 5
+                v = 0.3     # Asymmetry (lower = more asymmetric curve) - previously 0.5
+                k = 0.98    # Upper asymptote (higher max value) - previously 0.95
+                a = 0.0     # Lower asymptote (keep at 0 to preserve zeros)
+                slope = 0.01  # Tilt (small value to emphasize sigmoid shape) - previously 0.02
 
                 new_weights = np.zeros_like(weights)
                 non_zero_indices = np.where(weights > 0.0)[0]
@@ -1464,7 +1465,7 @@ class GaiaValidator:
                     for i, idx in enumerate(sorted_indices[:positive_count]):
                         # Power-law formula: score ~ 1/rank^alpha
                         rank = i + 1
-                        alpha = 0.7
+                        alpha = 1.2
                         new_weights[idx] = 1.0 / (rank ** alpha)
                     
                     rank_based_non_zeros = new_weights[new_weights > 0]
