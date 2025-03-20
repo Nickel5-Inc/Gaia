@@ -1275,6 +1275,9 @@ class GaiaValidator:
 
             if geomagnetic_results:
                 geo_scores_by_uid = [[] for _ in range(256)]
+                zero_scores_count = 0
+                all_zeros_count = 0
+                
                 for result in geomagnetic_results:
                     age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
                     decay = np.exp(-age_days * np.log(2))  # Decay by half each day
@@ -1284,16 +1287,49 @@ class GaiaValidator:
                         if isinstance(scores[uid], str) or np.isnan(scores[uid]):
                             scores[uid] = 0.0
                         geo_scores_by_uid[uid].append((scores[uid], decay))
+                        if scores[uid] == 0.0:
+                            zero_scores_count += 1
                 
-                # Calculate weighted averages
+                logger.info(f"Loaded {len(geomagnetic_results)} geomagnetic score records with {zero_scores_count} zero scores")
+                
+                zeros_before = 0
+                zeros_after = 0
+                
                 for uid in range(256):
                     if geo_scores_by_uid[uid]:
-                        scores, weights = zip(*geo_scores_by_uid[uid])
-                        scores = np.array(scores)
-                        weights = np.array(weights)
-                        weight_sum = np.sum(weights)
+                        scores, decay_weights = zip(*geo_scores_by_uid[uid])
+                        scores_array = np.array(scores)
+                        weights_array = np.array(decay_weights)
+                        
+                        zero_mask = (scores_array == 0.0)
+                        zero_count = np.sum(zero_mask)
+                        total_count = len(scores_array)
+                        
+                        if np.all(zero_mask):
+                            geomagnetic_scores[uid] = 0.0
+                            zeros_after += 1
+                            logger.debug(f"UID {uid}: All {total_count} geo scores were zero - final score zeroed")
+                            continue
+                            
+                        masked_scores = scores_array[~zero_mask]
+                        masked_weights = weights_array[~zero_mask]
+                        
+                        if np.any(zero_mask):
+                            masked_count = np.sum(zero_mask)
+                            total_count = len(zero_mask)
+                            logger.debug(f"UID {uid}: Masked {masked_count}/{total_count} zero geo scores from averaging")
+                        
+                        weight_sum = np.sum(masked_weights)
                         if weight_sum > 0:
-                            geomagnetic_scores[uid] = np.sum(scores * weights) / weight_sum
+                            geomagnetic_scores[uid] = np.sum(masked_scores * masked_weights) / weight_sum
+                            if geomagnetic_scores[uid] == 0.0:
+                                zeros_after += 1
+                
+                for uid in range(256):
+                    if not np.isnan(geomagnetic_scores[uid]) and geomagnetic_scores[uid] == 0.0:
+                        zeros_before += 1
+                
+                logger.info(f"Geomagnetic masked array processing: {zeros_after} UIDs have zero final score")
 
             if soil_results:
                 soil_scores_by_uid = [[] for _ in range(256)]
@@ -1306,15 +1342,42 @@ class GaiaValidator:
                             scores[uid] = 0.0
                         soil_scores_by_uid[uid].append((scores[uid], decay))
                 
-                # Calculate weighted averages
+                total_soil_scores = len(soil_results) * 256
+                zero_soil_scores = sum(scores[uid] == 0.0 for result in soil_results for uid in range(256) 
+                                      if isinstance(scores := result['score'], list) and uid < len(scores))
+                logger.info(f"Loaded {len(soil_results)} soil score records with {zero_soil_scores}/{total_soil_scores} zero scores")
+                
+                zeros_before = sum(1 for uid in range(256) if all(score == 0.0 for score, _ in soil_scores_by_uid[uid]))
+                zeros_after = 0
                 for uid in range(256):
                     if soil_scores_by_uid[uid]:
-                        scores, weights = zip(*soil_scores_by_uid[uid])
-                        scores = np.array(scores)
-                        weights = np.array(weights)
-                        weight_sum = np.sum(weights)
+                        scores, decay_weights = zip(*soil_scores_by_uid[uid])
+                        scores_array = np.array(scores)
+                        weights_array = np.array(decay_weights)
+                        zero_mask = (scores_array == 0.0)
+                        
+                        if np.all(zero_mask):
+                            soil_scores[uid] = 0.0
+                            zeros_after += 1
+                            logger.debug(f"UID {uid}: All soil scores were zero, setting final score to zero")
+                            continue
+                            
+                        masked_scores = scores_array[~zero_mask]
+                        masked_weights = weights_array[~zero_mask]
+                        
+                        if np.any(zero_mask):
+                            masked_count = np.sum(zero_mask)
+                            total_count = len(zero_mask)
+                            logger.debug(f"UID {uid}: Masked {masked_count}/{total_count} zero soil scores from averaging")
+                        
+                        weight_sum = np.sum(masked_weights)
                         if weight_sum > 0:
-                            soil_scores[uid] = np.sum(scores * weights) / weight_sum
+                            soil_scores[uid] = np.sum(masked_scores * masked_weights) / weight_sum
+                        else:
+                            soil_scores[uid] = 0.0
+                            zeros_after += 1
+                
+                logger.info(f"Soil task: {zeros_before} UIDs had all zero scores before processing, {zeros_after} UIDs have zero final score after masked array processing")
 
             logger.info("Recent scores fetched and decay-weighted. Calculating aggregate scores...")
 
@@ -1349,33 +1412,89 @@ class GaiaValidator:
             # generalized logistic curve
             non_zero_mask = weights != 0.0
             if np.any(non_zero_mask):
+                non_zero_weights = weights[non_zero_mask]
+                logger.info(f"Found {len(non_zero_weights)} non-zero weights out of 256 miners")
+                logger.info(f"Non-zero weights stats: min={np.min(non_zero_weights):.8f}, max={np.max(non_zero_weights):.8f}, mean={np.mean(non_zero_weights):.8f}")
                 max_weight = np.max(weights[non_zero_mask])
-                normalized_weights = np.where(non_zero_mask, weights/max_weight, 0.0)
-                M = np.percentile(normalized_weights[normalized_weights > 0], 90)
-                b = 25    # Growth rate
-                Q = 4     # Initial value parameter
-                v = 0.6   # Asymmetry
-                k = 0.90  # Upper asymptote
-                a = 0     # Lower asymptote
-                slope = 0.029  # Tilt
+                normalized_weights = np.copy(weights)  # Start with a copy to preserve zeros
+                normalized_weights[non_zero_mask] = weights[non_zero_mask] / max_weight  # Only normalize non-zeros
+                
+                positives = normalized_weights[normalized_weights > 0]
+                if len(positives) > 0:
+                    M = np.percentile(positives, 80)
+                    logger.info(f"Using 80th percentile of non-zero weights: {M:.8f} as curve midpoint")
+                else:
+                    logger.warning("No positive weights found!")
+                    return None
+                    
+                b = 30    # Growth rate (higher = steeper curve)
+                Q = 5     # Initial value parameter (higher = sharper transition)
+                v = 0.5   # Asymmetry (lower = more asymmetric curve)
+                k = 0.95  # Upper asymptote (higher max value)
+                a = 0.0   # Lower asymptote (keep at 0 to preserve zeros)
+                slope = 0.02  # Tilt (small value to emphasize sigmoid shape)
 
                 new_weights = np.zeros_like(weights)
-                non_zero_indices = np.where(weights != 0.0)[0]
+                non_zero_indices = np.where(weights > 0.0)[0]
+                
+                if len(non_zero_indices) == 0:
+                    logger.warning("No positive weight indices found!")
+                    return None
+                
+                logger.info(f"Applying curve transformation to {len(non_zero_indices)} positive weights")
+                
                 for idx in non_zero_indices:
-                    normalized_weight = weights[idx] / max_weight
+                    normalized_weight = normalized_weights[idx]
                     sigmoid_part = a + (k - a) / np.power(1 + Q * np.exp(-b * (normalized_weight - M)), 1/v)
                     linear_part = slope * normalized_weight
                     new_weights[idx] = sigmoid_part + linear_part
+                
+                transformed_non_zeros = new_weights[new_weights > 0]
+                if len(transformed_non_zeros) > 0:
+                    logger.info(f"Transformed weights stats: min={np.min(transformed_non_zeros):.8f}, max={np.max(transformed_non_zeros):.8f}, mean={np.mean(transformed_non_zeros):.8f}, unique={len(np.unique(transformed_non_zeros))}")
+                
+                if len(transformed_non_zeros) > 1 and np.std(transformed_non_zeros) < 0.01:
+                    logger.warning(f"Transformed weights still too uniform! std={np.std(transformed_non_zeros):.8f}")
+                    
+                    logger.info("Switching to rank-based power law distribution")
+                    sorted_indices = np.argsort(-weights)
+                    new_weights = np.zeros_like(weights)
+                    
+                    positive_count = np.sum(weights > 0)
+                    for i, idx in enumerate(sorted_indices[:positive_count]):
+                        # Power-law formula: score ~ 1/rank^alpha
+                        rank = i + 1
+                        alpha = 0.7
+                        new_weights[idx] = 1.0 / (rank ** alpha)
+                    
+                    rank_based_non_zeros = new_weights[new_weights > 0]
+                    logger.info(f"Rank-based weights: min={np.min(rank_based_non_zeros):.8f}, max={np.max(rank_based_non_zeros):.8f}, mean={np.mean(rank_based_non_zeros):.8f}, std={np.std(rank_based_non_zeros):.8f}")
 
-                # Normalize final weights to sum to 1
-                weight_sum = np.sum(new_weights)
-                if weight_sum > 0:
-                    new_weights = new_weights / weight_sum
+                non_zero_sum = np.sum(new_weights[new_weights > 0])
+                if non_zero_sum > 0:
+                    new_weights[new_weights > 0] = new_weights[new_weights > 0] / non_zero_sum
+                    
+                    final_non_zeros = new_weights[new_weights > 0]
+                    if len(final_non_zeros) > 0:
+                        logger.info(f"Final normalized weights: count={len(final_non_zeros)}, min={np.min(final_non_zeros):.8f}, max={np.max(final_non_zeros):.8f}, std={np.std(final_non_zeros):.8f}")
+                        
+                        unique_weights = np.unique(final_non_zeros)
+                        logger.info(f"Found {len(unique_weights)} unique non-zero weight values")
+                        
+                        if len(unique_weights) < len(final_non_zeros) / 2:
+                            logger.warning(f"Too few unique weights! {len(unique_weights)} unique values for {len(final_non_zeros)} non-zero miners")
+                        
+                        if np.max(final_non_zeros) > 0.90:
+                            logger.warning(f"Warning: Max weight is very high: {np.max(final_non_zeros):.4f} - might concentrate too much influence")
+                    
                     logger.info("Final normalized weights calculated")
                     return new_weights.tolist()
-
-            logger.warning("No valid weights calculated")
-            return None
+                else:
+                    logger.warning("No positive weights after transformation!")
+                    return None
+            else:
+                logger.warning("No non-zero weights found to normalize!")
+                return None
 
         except Exception as e:
             logger.error(f"Error calculating weights: {e}")
