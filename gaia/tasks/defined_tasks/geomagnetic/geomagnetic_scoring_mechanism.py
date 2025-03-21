@@ -7,6 +7,7 @@ from pydantic import Field
 from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import text
+import numpy as np
 
 logger = get_logger(__name__)
 
@@ -34,28 +35,35 @@ class GeomagneticScoringMechanism(ScoringMechanism):
 
     def calculate_score(self, predicted_value, actual_value):
         """
-        Calculates the score for a miner's prediction based on the deviation from ground truth.
-        Calculates the score for a miner's prediction based on the deviation from ground truth.
+        Calculates the score for a miner's prediction based on the deviation from ground truth
+        using an exponential function for better differentiation between scores.
 
         Args:
             predicted_value (float): The predicted DST value from the miner.
             actual_value (float): The ground truth DST value.
 
         Returns:
-            float: A higher score indicates a better prediction.
+            float: A score between 0 and 1, where higher scores indicate better predictions.
+                  Maintains high precision (at least 5 decimal places) to distinguish between similar predictions.
         """
         if not isinstance(predicted_value, (int, float)) or not isinstance(actual_value, (int, float)):
             return float("nan")
 
         try:
-
             # Validate that the prediction is within the normalized range (-5, 5)
             if not (-5 <= predicted_value <= 5):
                 logger.warning(f"Out-of-range prediction: {predicted_value}. Expected range: (-5, 5).")
                 return 0.0  # Penalize invalid predictions
 
-            # Calculate the score
-            return max(0, 1 - abs(predicted_value - actual_value))
+            error = abs(predicted_value - actual_value)
+            lambda_param = 3.5 
+            raw_score = np.exp(-lambda_param * np.float64(error))
+            power = 1.2
+            powered_score = np.power(raw_score, power)
+            high_precision_score = float(f"{powered_score:.10f}")
+            logger.debug(f"Error: {error:.8f}, Raw score: {raw_score:.8f}, Power-transformed: {powered_score:.8f}, Final: {high_precision_score:.10f}")
+            
+            return high_precision_score
         except Exception as e:
             logger.error(f"Error calculating score: {e}")
             return float("nan")
