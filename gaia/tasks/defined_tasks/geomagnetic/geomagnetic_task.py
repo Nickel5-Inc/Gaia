@@ -401,7 +401,6 @@ class GeomagneticTask(Task):
                     if baseline_score is not None:
                         logger.info(f"Geomagnetic Task - Miner: {task_id} - Miner score: {score:.4f}, Baseline: {baseline_score:.4f}, Diff: {score - baseline_score:.4f}")
 
-                        benchmark_score = 0.90
                         base_epsilon = 0.005
                         theoretical_max = 0.99
                         
@@ -417,11 +416,8 @@ class GeomagneticTask(Task):
                             else:
                                 logger.info(f"Score zeroed - Insufficient improvement: {score:.4f} vs baseline {baseline_score:.4f} (needed > {baseline_score + epsilon:.4f})")
                             score = 0
-                        elif score < benchmark_score:
-                            logger.info(f"Score zeroed - Below benchmark: {score:.4f} < {benchmark_score:.4f}")
-                            score = 0
                         else:
-                            logger.info(f"Score valid - Exceeds baseline by {score - baseline_score:.4f} and meets benchmark {benchmark_score:.4f}")
+                            logger.info(f"Score valid - Exceeds baseline by {score - baseline_score:.4f}")
                     else:
                         logger.info(f"No baseline comparison available - using raw score: {score:.4f}")
                     
