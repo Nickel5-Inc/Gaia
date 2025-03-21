@@ -436,6 +436,13 @@ class GeomagneticTask(Task):
                     logger.error(f"Error processing task {task.get('id', 'unknown')}: {e}")
                     logger.error(traceback.format_exc())
 
+            # Add score row to score_table if we have scored tasks
+            if scored_tasks:
+                logger.info(f"Building score row for {len(scored_tasks)} scored tasks")
+                await self.build_score_row(query_hour, scored_tasks)
+            else:
+                logger.info("No tasks were scored, skipping score row creation")
+
             return scored_tasks, current_time
 
         except Exception as e:
