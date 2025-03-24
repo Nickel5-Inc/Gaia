@@ -24,3 +24,6 @@ gaia.egg-info/
 # Cache directories
 **/smap_cache/
 smap_cache/
+
+db_wipe_trigger
+db_wipe_trigger.executed.*
