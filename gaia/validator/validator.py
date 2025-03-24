@@ -47,7 +47,6 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from gaia.validator.basemodel_evaluator import BaseModelEvaluator
-from gaia.validator.utils.db_wipe import handle_db_wipe
 
 logger = get_logger(__name__)
 
@@ -809,11 +808,7 @@ class GaiaValidator:
             logger.info("Initializing database tables...")
             await self.database_manager.initialize_database()
             logger.info("Database tables initialized.")
-            
-            logger.warning("\n" + "#" * 70)
-            logger.warning("#" * 20 + " CHECKING FOR DATABASE WIPE TRIGGER " + "#" * 20)
-            logger.warning("#" * 70)
-            await handle_db_wipe(self.database_manager)
+
 
             logger.info("Checking HTTP clients...")
             # Only create clients if they don't exist or are closed
