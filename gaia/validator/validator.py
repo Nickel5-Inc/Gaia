@@ -214,8 +214,6 @@ class GaiaValidator:
             test_mode=self.args.test if hasattr(self.args, 'test') else False
         )
         logger.info("BaseModelEvaluator initialized")
-        self.database_manager._storage_locked = True
-        logger.warning("Database storage is locked - no data will be stored until manually unlocked")
         
 
 
@@ -812,10 +810,13 @@ class GaiaValidator:
             await self.database_manager.initialize_database()
             logger.info("Database tables initialized.")
             
-            logger.warning("\n" + "#" * 70)
-            logger.warning("#" * 20 + " CHECKING FOR DATABASE WIPE TRIGGER " + "#" * 20)
-            logger.warning("#" * 70)
+            logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER " + "#")
             await handle_db_wipe(self.database_manager)
+            
+            # Lock storage to prevent any writes
+            self.database_manager._storage_locked = True
+            if self.database_manager._storage_locked:
+                logger.warning("Database storage is locked - no data will be stored until manually unlocked")
 
             logger.info("Checking HTTP clients...")
             # Only create clients if they don't exist or are closed

@@ -1134,9 +1134,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 return result
             else:
                 async with self.session() as session:
-                    async with session.begin():
-                        result = await session.execute(text(query), params or {})
-                        return result
+                    result = await session.execute(text(query), params or {})
+                    await session.commit()
+                    return result
         except Exception as e:
             logger.error(f"Error executing query: {str(e)}")
             logger.error(traceback.format_exc())
