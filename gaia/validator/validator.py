@@ -47,6 +47,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from gaia.validator.basemodel_evaluator import BaseModelEvaluator
+from gaia.validator.utils.db_wipe import handle_db_wipe
 
 logger = get_logger(__name__)
 
