@@ -214,6 +214,8 @@ class GaiaValidator:
             test_mode=self.args.test if hasattr(self.args, 'test') else False
         )
         logger.info("BaseModelEvaluator initialized")
+        self.database_manager._storage_locked = True
+        logger.warning("Database storage is locked - no data will be stored until manually unlocked")
         
 
 

@@ -60,18 +60,17 @@ async def get_tables_to_wipe(trigger_path: str = DEFAULT_TRIGGER_PATH) -> Option
         with open(trigger_path, 'r') as f:
             content = f.read().strip()
             if not content:
-                return None  # Empty file means wipe all tables
+                return None
             
-            # Parse content as comma-separated list of table names
             tables = [table.strip() for table in content.split(',')]
             return tables if tables else None
     except Exception as e:
         logger.error(f"Error reading tables from trigger file: {e}")
-        return None  # If there's an error reading, default to all tables
+        return None
 
 async def wipe_database(db_manager, tables: Optional[List[str]] = None) -> bool:
     """
-    Wipe the database tables.
+    Wipe the database tables with guaranteed complete data removal.
     
     Args:
         db_manager: Database manager instance
@@ -82,7 +81,6 @@ async def wipe_database(db_manager, tables: Optional[List[str]] = None) -> bool:
     """
     try:
         if not tables:
-            # Get all table names from the database
             query = """
             SELECT table_name 
             FROM information_schema.tables 
@@ -92,11 +90,10 @@ async def wipe_database(db_manager, tables: Optional[List[str]] = None) -> bool:
             result = await db_manager.fetch_all(query)
             tables = [row['table_name'] for row in result if row['table_name'] != 'node_table']
             
-            logger.warning("\n" + "#" * 60)
-            logger.warning("## WIPING ALL TABLES - FULL DATABASE RESET ##")
-            logger.warning("#" * 60)
+            logger.warning("\n" + "#" * 70)
+            logger.warning("#" * 20 + " WIPING ALL TABLES - FULL DATABASE RESET " + "#" * 20)
+            logger.warning("#" * 70)
             
-            # Preserve the node_table structure but clear data
             node_table_clear = """
             UPDATE node_table 
             SET hotkey = NULL, coldkey = NULL, ip = NULL, ip_type = NULL, 
@@ -106,36 +103,64 @@ async def wipe_database(db_manager, tables: Optional[List[str]] = None) -> bool:
             await db_manager.execute(node_table_clear)
             logger.warning("## CLEARED node_table data while preserving structure ##")
         else:
-            logger.warning("\n" + "#" * 60)
-            logger.warning(f"## WIPING SPECIFIC TABLES: {', '.join(tables)} ##")
-            logger.warning("#" * 60)
+            logger.warning("\n" + "#" * 70)
+            logger.warning("#" * 20 + f" WIPING SPECIFIC TABLES: {', '.join(tables)} " + "#" * 20)
+            logger.warning("#" * 70)
+        
+        await db_manager.execute("SET session_replication_role = 'replica';")
+        logger.warning("## DISABLED foreign key constraints ##")
         
         success_count = 0
         error_count = 0
         
-        for table in tables:
-            if table.lower() == 'node_table':
-                # Skip node_table as it's handled separately
-                continue
-                
-            try:
-                logger.warning(f"## WIPING TABLE: {table}")
-                # Truncate table to remove all data
-                await db_manager.execute(f"TRUNCATE TABLE {table} CASCADE")
-                logger.warning(f"## SUCCESSFULLY WIPED table: {table}")
-                success_count += 1
-            except Exception as table_error:
-                logger.error(f"## ERROR WIPING table {table}: {table_error}")
-                error_count += 1
+        table_order = {
+            'history': ['geomagnetic_history', 'soil_moisture_history'],
+            'predictions': ['geomagnetic_predictions', 'soil_moisture_predictions'],
+            'regions': ['soil_moisture_regions'],
+            'core': ['score_table', 'baseline_predictions']
+        }
         
-        logger.warning("\n" + "#" * 60)
-        logger.warning(f"## DATABASE WIPE SUMMARY: {success_count} tables wiped, {error_count} errors ##")
-        logger.warning("#" * 60)
+        for category, category_tables in table_order.items():
+            for table in category_tables:
+                if table in tables:
+                    try:
+                        logger.warning(f"## WIPING TABLE: {table} ##")
+                        
+                        count_query = f"SELECT COUNT(*) as count FROM {table}"
+                        count_result = await db_manager.fetch_one(count_query)
+                        initial_count = count_result['count']
+                        
+                        await db_manager.execute(f"DELETE FROM {table}")
+                        
+                        verify_result = await db_manager.fetch_one(count_query)
+                        final_count = verify_result['count']
+                        
+                        if final_count == 0:
+                            logger.warning(f"## SUCCESSFULLY WIPED table: {table} (removed {initial_count} rows) ##")
+                            success_count += 1
+                        else:
+                            logger.error(f"## FAILED to completely wipe table: {table} (remaining rows: {final_count}) ##")
+                            error_count += 1
+                            
+                    except Exception as table_error:
+                        logger.error(f"## ERROR WIPING table {table}: {table_error} ##")
+                        error_count += 1
         
-        return success_count > 0 or error_count == 0  # Success if we wiped at least one table or had no errors
+        await db_manager.execute("SET session_replication_role = 'origin';")
+        logger.warning("## RE-ENABLED foreign key constraints ##")
+        
+        logger.warning("\n" + "#" * 70)
+        logger.warning("#" * 20 + f" DATABASE WIPE SUMMARY: {success_count} tables wiped, {error_count} errors " + "#" * 20)
+        logger.warning("#" * 70)
+        
+        return success_count > 0 and error_count == 0
         
     except Exception as e:
         logger.error(f"Error wiping database: {e}")
+        try:
+            await db_manager.execute("SET session_replication_role = 'origin';")
+        except:
+            pass
         return False
 
 async def handle_db_wipe(db_manager, trigger_path: str = DEFAULT_TRIGGER_PATH) -> bool:
