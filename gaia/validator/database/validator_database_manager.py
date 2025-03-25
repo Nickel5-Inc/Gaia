@@ -61,6 +61,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         if not hasattr(cls, '_instance'):
             cls._instance = super().__new__(cls, node_type="validator")
             cls._instance._initialized = False
+            cls._instance._storage_locked = False  # Add storage lock flag
             
             # Initialize all required base class attributes
             cls._instance._circuit_breaker = {
@@ -1119,3 +1120,24 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         if isinstance(obj, torch.Tensor):
             return obj.cpu().numpy().tolist()
         raise TypeError(f"Type {type(obj)} not serializable")
+
+    @track_operation('write')
+    async def execute(self, query: str, params: Optional[Dict] = None, session: Optional[AsyncSession] = None) -> Any:
+        """Execute a SQL query with parameters."""
+        try:
+            if self._storage_locked and any(keyword in query.lower() for keyword in ['insert', 'update', 'delete']):
+                logger.warning("Storage is locked - skipping write operation")
+                return None
+                
+            if session:
+                result = await session.execute(text(query), params or {})
+                return result
+            else:
+                async with self.session() as session:
+                    result = await session.execute(text(query), params or {})
+                    await session.commit()
+                    return result
+        except Exception as e:
+            logger.error(f"Error executing query: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise DatabaseError(f"Failed to execute query: {str(e)}")
