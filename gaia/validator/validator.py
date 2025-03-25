@@ -810,11 +810,11 @@ class GaiaValidator:
             await self.database_manager.initialize_database()
             logger.info("Database tables initialized.")
             
-            logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER " + "#")
+            #logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
             await handle_db_wipe(self.database_manager)
             
             # Lock storage to prevent any writes
-            self.database_manager._storage_locked = True
+            self.database_manager._storage_locked = False
             if self.database_manager._storage_locked:
                 logger.warning("Database storage is locked - no data will be stored until manually unlocked")
 
