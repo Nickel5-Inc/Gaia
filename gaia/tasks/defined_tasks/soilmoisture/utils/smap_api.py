@@ -172,7 +172,7 @@ def get_smap_data(datetime_obj, regions):
         smap_url = construct_smap_url(datetime_obj)
         cache_dir = Path("smap_cache")
         cache_dir.mkdir(exist_ok=True)
-        temp_filename = f"temp_smap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5"
+        temp_filename = f"temp_smap_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.h5"
         temp_filepath = cache_dir / temp_filename
         
         if not download_smap_data(smap_url, str(temp_filepath)):

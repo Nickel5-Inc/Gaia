@@ -4,7 +4,7 @@ import psutil
 import os
 import sys
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import glob
 from fiber.logging_utils import get_logger
@@ -96,8 +96,8 @@ class ValidatorMonitor:
         if not self.validator_pid:
             logger.warning("Cannot dump process state - no validator PID")
             return
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
         dump_file = f"{self.dump_dir}/freeze_{timestamp}.txt"
         
         try:
@@ -196,7 +196,7 @@ class ValidatorMonitor:
 
     def _log_resource_warning(self, resource_type, details):
         """Log detailed resource warning information."""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
         warning_file = f"{self.dump_dir}/resource_warning_{resource_type}_{timestamp}.txt"
         
         try:

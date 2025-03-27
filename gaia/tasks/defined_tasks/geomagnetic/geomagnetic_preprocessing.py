@@ -75,7 +75,7 @@ class GeomagneticPreprocessing(Preprocessing):
             processed_df = data.copy()
 
             # Convert timestamps to pandas datetime and remove timezone
-            processed_df["timestamp"] = pd.to_datetime(processed_df["timestamp"])
+            processed_df["timestamp"] = pd.to_datetime(processed_df["timestamp"], utc=True)
             if processed_df["timestamp"].dt.tz is not None:
                 processed_df["timestamp"] = (
                     processed_df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)

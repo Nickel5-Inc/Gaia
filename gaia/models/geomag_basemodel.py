@@ -71,7 +71,7 @@ class FallbackGeoMagModel:
                 df = pd.DataFrame(
                     {
                         "ds": [
-                            pd.to_datetime(x["ds"] if "ds" in x else x["timestamp"])
+                            pd.to_datetime(x["ds"] if "ds" in x else x["timestamp"], utc=True)
                         ],
                         "y": [float(x["y"] if "y" in x else x["value"])],
                     }
@@ -197,7 +197,7 @@ class GeoMagBaseModel:
                 # Create DataFrame from dict
                 df = pd.DataFrame(
                     {
-                        "ds": [pd.to_datetime(data.get("timestamp", data.get("ds")))],
+                        "ds": [pd.to_datetime(data.get("timestamp", data.get("ds")), utc=True)],
                         "y": [float(data.get("value", data.get("y", 0.0)))],
                     }
                 )

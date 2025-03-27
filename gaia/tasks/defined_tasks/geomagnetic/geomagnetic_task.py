@@ -375,7 +375,15 @@ class GeomagneticTask(Task):
                         try:
                             task_timestamp = task.get("timestamp", task.get("query_time"))
                             if task_timestamp:
-                                task_id = str(task_timestamp.timestamp()) if isinstance(task_timestamp, datetime.datetime) else str(task_timestamp)
+                                if isinstance(task_timestamp, datetime.datetime):
+                                    if task_timestamp.tzinfo is not None:
+                                        task_timestamp_utc = task_timestamp.astimezone(datetime.timezone.utc)
+                                    else:
+                                        task_timestamp_utc = task_timestamp.replace(tzinfo=datetime.timezone.utc)
+                                        
+                                    task_id = str(task_timestamp_utc.timestamp())
+                                else:
+                                    task_id = str(task_timestamp)
                                 logger.debug(f"Looking up baseline prediction with task_id: {task_id}")
                                 validator.basemodel_evaluator.test_mode = self.test_mode
                                 
@@ -667,7 +675,7 @@ class GeomagneticTask(Task):
                 # Process current data
                 input_data = pd.DataFrame(
                     {
-                        "timestamp": [pd.to_datetime(data["data"]["timestamp"])],
+                        "timestamp": [pd.to_datetime(data["data"]["timestamp"], utc=True)],
                         "value": [float(data["data"]["value"])],
                     }
                 )
@@ -675,18 +683,10 @@ class GeomagneticTask(Task):
                 # Check and process historical data if available
                 if data["data"].get("historical_values"):
                     historical_df = pd.DataFrame(data["data"]["historical_values"])
-                    historical_df = historical_df.rename(
-                        columns={"Dst": "value"}
-                    )  # Rename Dst to value
-                    historical_df["timestamp"] = pd.to_datetime(
-                        historical_df["timestamp"]
-                    )
-                    historical_df = historical_df[
-                        ["timestamp", "value"]
-                    ]  # Ensure correct columns
-                    combined_df = pd.concat(
-                        [historical_df, input_data], ignore_index=True
-                    )
+                    historical_df = historical_df.rename(columns={"Dst": "value"})  # Rename Dst to value
+                    historical_df["timestamp"] = pd.to_datetime(historical_df["timestamp"], utc=True)
+                    historical_df = historical_df[["timestamp", "value"]]  # Ensure correct columns
+                    combined_df = pd.concat([historical_df, input_data], ignore_index=True)
                 else:
                     combined_df = input_data
 
