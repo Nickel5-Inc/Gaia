@@ -675,7 +675,7 @@ class GeomagneticTask(Task):
                 # Process current data
                 input_data = pd.DataFrame(
                     {
-                        "timestamp": [pd.to_datetime(data["data"]["timestamp"])],
+                        "timestamp": [pd.to_datetime(data["data"]["timestamp"], utc=True)],
                         "value": [float(data["data"]["value"])],
                     }
                 )
@@ -683,18 +683,10 @@ class GeomagneticTask(Task):
                 # Check and process historical data if available
                 if data["data"].get("historical_values"):
                     historical_df = pd.DataFrame(data["data"]["historical_values"])
-                    historical_df = historical_df.rename(
-                        columns={"Dst": "value"}
-                    )  # Rename Dst to value
-                    historical_df["timestamp"] = pd.to_datetime(
-                        historical_df["timestamp"]
-                    )
-                    historical_df = historical_df[
-                        ["timestamp", "value"]
-                    ]  # Ensure correct columns
-                    combined_df = pd.concat(
-                        [historical_df, input_data], ignore_index=True
-                    )
+                    historical_df = historical_df.rename(columns={"Dst": "value"})  # Rename Dst to value
+                    historical_df["timestamp"] = pd.to_datetime(historical_df["timestamp"], utc=True)
+                    historical_df = historical_df[["timestamp", "value"]]  # Ensure correct columns
+                    combined_df = pd.concat([historical_df, input_data], ignore_index=True)
                 else:
                     combined_df = input_data
 
