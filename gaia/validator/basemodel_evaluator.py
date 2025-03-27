@@ -193,10 +193,15 @@ class BaseModelEvaluator:
             
             # Store the prediction in the database
             if self.db_manager:
+                if prediction_timestamp.tzinfo is not None:
+                    prediction_timestamp_utc = prediction_timestamp.astimezone(timezone.utc)
+                else:
+                    prediction_timestamp_utc = prediction_timestamp.replace(tzinfo=timezone.utc)
+                
                 success = await self.db_manager.store_baseline_prediction(
                     task_name="geomagnetic",
                     task_id=task_id,
-                    timestamp=predictions["timestamp"],
+                    timestamp=prediction_timestamp_utc,
                     prediction=predictions["predicted_value"]
                 )
                 logger.info(f"GEO BASEMODEL: Storage {'successful' if success else 'failed'}")

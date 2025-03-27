@@ -375,7 +375,15 @@ class GeomagneticTask(Task):
                         try:
                             task_timestamp = task.get("timestamp", task.get("query_time"))
                             if task_timestamp:
-                                task_id = str(task_timestamp.timestamp()) if isinstance(task_timestamp, datetime.datetime) else str(task_timestamp)
+                                if isinstance(task_timestamp, datetime.datetime):
+                                    if task_timestamp.tzinfo is not None:
+                                        task_timestamp_utc = task_timestamp.astimezone(datetime.timezone.utc)
+                                    else:
+                                        task_timestamp_utc = task_timestamp.replace(tzinfo=datetime.timezone.utc)
+                                        
+                                    task_id = str(task_timestamp_utc.timestamp())
+                                else:
+                                    task_id = str(task_timestamp)
                                 logger.debug(f"Looking up baseline prediction with task_id: {task_id}")
                                 validator.basemodel_evaluator.test_mode = self.test_mode
                                 
