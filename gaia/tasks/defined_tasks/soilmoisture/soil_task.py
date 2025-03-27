@@ -255,7 +255,14 @@ class SoilMoistureTask(Task):
                                             logger.error(traceback.format_exc())
                                         
                                         if model_inputs:
-                                            task_id = str(model_inputs["target_time"].timestamp())
+                                            if isinstance(target_smap_time, datetime):
+                                                if target_smap_time.tzinfo is not None:
+                                                    target_smap_time_utc = target_smap_time.astimezone(timezone.utc)
+                                                else:
+                                                    target_smap_time_utc = target_smap_time.replace(tzinfo=timezone.utc)
+                                            else:
+                                                target_smap_time_utc = target_smap_time
+                                            task_id = str(target_smap_time_utc.timestamp())
                                             baseline_prediction = await validator.basemodel_evaluator.predict_soil_and_store(
                                                 data=model_inputs,
                                                 task_id=task_id,
@@ -880,7 +887,14 @@ class SoilMoistureTask(Task):
                                     baseline_score = None
                                     if self.validator and hasattr(self.validator, 'basemodel_evaluator'):
                                         try:
-                                            task_id = str(target_time.timestamp()) if isinstance(target_time, datetime) else str(target_time)
+                                            if isinstance(target_time, datetime):
+                                                if target_time.tzinfo is not None:
+                                                    target_time_utc = target_time.astimezone(timezone.utc)
+                                                else:
+                                                    target_time_utc = target_time.replace(tzinfo=timezone.utc)
+                                            else:
+                                                target_time_utc = target_time
+                                            task_id = str(target_time_utc.timestamp())
                                             smap_file_to_use = temp_path if temp_path and os.path.exists(temp_path) else None
                                             if smap_file_to_use:
                                                 logger.info(f"Using existing SMAP file for baseline scoring: {smap_file_to_use}")
