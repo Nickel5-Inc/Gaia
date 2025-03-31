@@ -1,0 +1,205 @@
+{
+    "forecast_runs": {
+        "table_name": "forecast_runs",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "start_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "end_time": "TIMESTAMP WITH TIME ZONE",
+            "input_data_hash": "TEXT NOT NULL",
+            "status": "TEXT NOT NULL DEFAULT 'in_progress'",
+            "notes": "TEXT",
+            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+        },
+        "indexes": [
+            {"column": "start_time", "unique": false},
+            {"column": "status", "unique": false}
+        ]
+    },
+    "miner_forecasts": {
+        "table_name": "miner_forecasts",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "run_id": "INTEGER REFERENCES forecast_runs(id)",
+            "miner_uid": "TEXT NOT NULL",
+            "miner_hotkey": "TEXT NOT NULL",
+            "forecast_subset_path": "TEXT NOT NULL",
+            "forecast_hash": "TEXT NOT NULL",
+            "submission_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "metadata": "JSONB",
+            "retention_expires": "TIMESTAMP WITH TIME ZONE",
+            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
+            "status": "TEXT NOT NULL DEFAULT 'active'"
+        },
+        "indexes": [
+            {"column": "run_id", "unique": false},
+            {"column": "miner_hotkey", "unique": false},
+            {"column": "submission_time", "unique": false},
+            {"column": "status", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "run_id",
+                "references": "forecast_runs(id)",
+                "on_delete": "CASCADE"
+            }
+        ]
+    },
+    "validation_points": {
+        "table_name": "validation_points",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "run_id": "INTEGER REFERENCES forecast_runs(id)",
+            "lead_time": "INTEGER NOT NULL",
+            "verification_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "ground_truth_path": "TEXT NOT NULL",
+            "status": "TEXT NOT NULL DEFAULT 'pending'",
+            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+        },
+        "indexes": [
+            {"column": "run_id", "unique": false},
+            {"column": "lead_time", "unique": false},
+            {"column": "status", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "run_id",
+                "references": "forecast_runs(id)",
+                "on_delete": "CASCADE"
+            }
+        ]
+    },
+    "miner_scores": {
+        "table_name": "miner_scores",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "validation_id": "INTEGER REFERENCES validation_points(id)",
+            "miner_uid": "TEXT NOT NULL",
+            "miner_hotkey": "TEXT NOT NULL",
+            "variable_name": "TEXT NOT NULL",
+            "pressure_level": "INTEGER",
+            "rmse": "FLOAT",
+            "mae": "FLOAT",
+            "acc": "FLOAT",
+            "bias": "FLOAT",
+            "normalized_score": "FLOAT",
+            "difficulty_weight": "FLOAT",
+            "matches_stored_forecast": "BOOLEAN",
+            "final_score": "FLOAT",
+            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+        },
+        "indexes": [
+            {"column": "validation_id", "unique": false},
+            {"column": "miner_hotkey", "unique": false},
+            {"column": "variable_name", "unique": false},
+            {"column": "pressure_level", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "validation_id",
+                "references": "validation_points(id)",
+                "on_delete": "CASCADE"
+            }
+        ]
+    },
+    "extreme_event_scores": {
+        "table_name": "extreme_event_scores",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "validation_id": "INTEGER REFERENCES validation_points(id)",
+            "miner_uid": "TEXT NOT NULL",
+            "miner_hotkey": "TEXT NOT NULL",
+            "variable_name": "TEXT NOT NULL",
+            "pressure_level": "INTEGER",
+            "num_events": "INTEGER",
+            "csi_score": "FLOAT",
+            "pod_score": "FLOAT",
+            "far_score": "FLOAT",
+            "threshold_value": "FLOAT",
+            "min_area_size": "INTEGER",
+            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+        },
+        "indexes": [
+            {"column": "validation_id", "unique": false},
+            {"column": "miner_hotkey", "unique": false},
+            {"column": "variable_name", "unique": false},
+            {"column": "pressure_level", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "validation_id",
+                "references": "validation_points(id)",
+                "on_delete": "CASCADE"
+            }
+        ]
+    },
+    "ensemble_forecasts": {
+        "table_name": "ensemble_forecasts",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "run_id": "INTEGER REFERENCES forecast_runs(id)",
+            "creation_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "forecast_path": "TEXT NOT NULL",
+            "metadata": "JSONB",
+            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+        },
+        "indexes": [
+            {"column": "run_id", "unique": false},
+            {"column": "creation_time", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "run_id",
+                "references": "forecast_runs(id)",
+                "on_delete": "CASCADE"
+            }
+        ]
+    },
+    "ensemble_components": {
+        "table_name": "ensemble_components",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "ensemble_id": "INTEGER REFERENCES ensemble_forecasts(id)",
+            "variable_name": "TEXT NOT NULL",
+            "pressure_level": "INTEGER",
+            "miners": "JSONB NOT NULL",
+            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+        },
+        "indexes": [
+            {"column": "ensemble_id", "unique": false},
+            {"column": "variable_name", "unique": false},
+            {"column": "pressure_level", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "ensemble_id",
+                "references": "ensemble_forecasts(id)",
+                "on_delete": "CASCADE"
+            }
+        ]
+    },
+    "historical_weights": {
+        "table_name": "historical_weights",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "miner_uid": "TEXT NOT NULL",
+            "miner_hotkey": "TEXT NOT NULL",
+            "variable_name": "TEXT NOT NULL",
+            "pressure_level": "INTEGER",
+            "weight": "FLOAT NOT NULL",
+            "updated_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+        },
+        "indexes": [
+            {"column": "miner_hotkey", "unique": false},
+            {"column": "variable_name", "unique": false},
+            {"column": "pressure_level", "unique": false}
+        ]
+    }
+}

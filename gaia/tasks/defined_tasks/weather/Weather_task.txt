@@ -1,0 +1,165 @@
+####################################################################################################################
+
+Weather Task Documentation
+ - I am using this to guide the development of task
+   and keep track of the requirements.
+
+ - We will not be using Graphcast due to non-commercial use of its weights.
+ - Aurora is actually a better alternative, with better documentation and is much easier to modify.
+
+####################################################################################################################
+BASEMODEL:
+Microsoft Aurora Foundational Model - https://microsoft.github.io/aurora/intro.html
+                                    - https://github.com/microsoft/aurora
+
+    Notes:   - provides many resolutions, and extremely flexible to modification and fine-tuning
+             - Fine-tuning examples: ocean currents, Air pollution, etc.
+             - Can add new Atmo, land and static variables to predict.
+             - Fine-tuning on new parameters should be done with seperate higher learning rate. 
+             - Extremely sensitive to data source. Trained on ERA5, HRES, and GFS.
+             - Miners will need to fine tune to the provided data source.
+
+####################################################################################################################
+Data Inputs (Data being sent to the miners):
+    NOAA GFS - https://www.nco.ncep.noaa.gov/pmb/products/gfs/
+             - This is the data source we will provide to the miners, and they will need to fine-tune on this data.
+             - The data is available in 0.25 degree horizontal resolution.
+             - The data is available in 13 vertical levels.
+
+####################################################################################################################
+Model Inputs:
+             - 0.25 degree horizontal resolution.
+             - Data dimensions: 721x1440
+
+Surface Variables:
+    2t  - Two-meter temperature in K
+    10u - Ten-meter eastward wind speed in m/s
+    10v - Ten-meter southward wind speed in m/s
+    msl - Mean sea-level pressure in Pa
+
+Static Variables:
+    lsm - Land-sea mask
+    slt - Soil type
+    z   - Surface-level geopotential in m^2 / s^2
+
+Atmospheric Variables (in 13 pressure levels):
+    t - Temperature in K
+    u - Eastward wind speed in m/s
+    v - Southward wind speed in m/s
+    q - Specific humidity in kg / kg
+    z - Geopotential in m^2 / s^2
+
+
+13 pressure levels (hPa):
+ - 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000
+
+Pre-trained model requires exact static variables:
+https://huggingface.co/microsoft/aurora/blob/main/aurora-0.25-static.pickle
+
+
+####################################################################################################################
+Input format:
+
+Must be in the form aurora.Batch
+
+Batches contain:
+    some surface-level variables,
+    some static variables,
+    some atmospheric variables all at the same collection of pressure levels, and
+    metadata describing these variables: latitudes, longitudes, the pressure levels of the atmospheric variables, and the time of the data.
+
+
+## Batch.surf_vars
+
+Batch.surf_vars is a dictionary mapping names of surface-level variables to the numerical values of the variables.
+The surface-level variables must be of the form (b, t, h, w) where b is the batch size, t the history dimension, h the number of latitudes, and w the number of longitudes.
+All Aurora models produce the prediction for the next step from the current and previous step.
+surf_vars[:, 1, :, :] must correspond to the current step, and surf_vars[:, 0, :, :] must correspond to the previous step, so the step before that.
+
+## Batch.static_vars
+
+Batch.static_vars is a dictionary mapping names of static variables to the numerical values of the variables.
+The static variables must be of the form (h, w) where h is the number of latitudes and w the number of longitudes.
+
+
+## Batch.atmos_vars
+
+Batch.atmos_vars is a dictionary mapping names of atmospheric variables to the numerical values of the variables.
+The atmospheric variables must be of the form (b, t, c, h, w) where b is the batch size, t the history dimension,
+c the number of pressure levels, h the number of latitudes, and w the number of longitudes.
+All atmospheric variables must contain the same collection of pressure levels in the same order.
+
+
+## Batch.metadata
+
+Batch.metadata must be a Metadata, which contains the following fields:
+Metadata.lat is the vector of latitudes. The latitudes must be decreasing.
+The latitudes can either include both endpoints, like linspace(90, -90, 721), or not include the south pole, like linspace(90, -90, 721)[:-1].
+For curvilinear grids, this can also be a matrix, in which case the foregoing conditions apply to every column.
+Metadata.lon is the vector of longitudes. The longitudes must be increasing.
+The longitudes must be in the range [0, 360), so they can include zero and cannot include 360.
+For curvilinear grids, this can also be a matrix, in which case the foregoing conditions apply to every row.
+Metadata.atmos_levels is a tuple of the pressure levels of the atmospheric variables in hPa.
+Note that these levels must be in exactly correspond to the order of the atmospheric variables.
+Note also that Metadata.atmos_levels should be a tuple, not a list.
+Metadata.time is a tuple with, for each batch element, a datetime.datetime representing the time of the data.
+If the batch size is one, then this will be a one-element tuple, e.g. (datetime(2024, 1, 1, 12, 0),).
+Since all Aurora models require variables for the current and previous step, Metadata.time corresponds to the time of the current step.
+Specifically, Metadata.time[i] corresponds to the time of Batch.surf_vars[i, -1].
+
+
+####################################################################################################################
+Adding new variables:
+from aurora import Aurora
+from aurora.normalisation import locations, scales
+
+model = Aurora(
+    use_lora=False,
+    surf_vars=("2t", "10u", "10v", "msl", "new_surf_var"),
+    static_vars=("lsm", "z", "slt", "new_static_var"),
+    atmos_vars=("z", "u", "v", "t", "q", "new_atmos_var"),
+)
+model.load_checkpoint("microsoft/aurora", "aurora-0.25-pretrained.ckpt", strict=False)
+
+# Normalisation means:
+locations["new_surf_var"] = 0.0
+locations["new_static_var"] = 0.0
+locations["new_atmos_var"] = 0.0
+
+# Normalisation standard deviations:
+scales["new_surf_var"] = 1.0
+scales["new_static_var"] = 1.0
+scales["new_atmos_var"] = 1.0
+
+####################################################################################################################
+
+Output format:
+The output of aurora.forward(batch) will again be a Batch.
+This batch is of exactly the same form, with only one difference: the history dimension will have size one.
+
+####################################################################################################################
+
+Data handling:
+
+Raw data from GFS is ~400mb raw, With shape time:1 lev:41 lat:721 lon:1440
+
+The data is large in size, so we will need to handle it carefully.
+To performa a BMA we cannot load all the data into memory.
+One route is to BMA a subset of timesteps at a time. Then taking the best aggregate all timesteps.
+
+
+                Validator Node
+                       |
+     +-----------------+----------------+
+     |                 |                |
+Timestep 1-5   Timestep 6-10     Timestep 11-15  ...
+     |                 |                |
+  +--+--+           +--+--+          +--+--+
+  | BMA |           | BMA |          | BMA |
+  +-----+           +-----+          +-----+
+
+
+Another possibility is to delegate a subset of variables and levels to miners on a rotating schedule.
+And miners only get scored for their performance on the variables and levels they are responsible for.
+The best scores for each variable will be used to aggregate the final singular 10 day forecast.
+
