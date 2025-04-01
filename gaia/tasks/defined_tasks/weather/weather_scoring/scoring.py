@@ -2,8 +2,9 @@ import numpy as np
 import xarray as xr
 from typing import Dict, List, Tuple, Union, Optional
 import gc
+import asyncio
 from fiber.logging_utils import get_logger
-from utils.metrics import calculate_rmse, normalize_rmse, calculate_mean_abs_diff
+from gaia.tasks.defined_tasks.weather.weather_scoring.metrics import calculate_rmse_vectorized, normalize_rmse, calculate_mean_abs_diff
 logger = get_logger(__name__)
 
 """
@@ -33,41 +34,7 @@ DEFAULT_THRESHOLD_RMSE = {
     "msl": [100.0] * 40,
 }
 
-def calculate_rmse_vectorized(forecast: Dict, ground_truth: Dict, subsample_factor: int = 1) -> float:
-    """
-    Vectorized RMSE calculation with optional subsampling for efficiency.
-    
-    Args:
-        forecast: Dictionary of predicted variables
-        ground_truth: Dictionary of ground truth variables
-        subsample_factor: Factor to subsample grid points (1 = use all points)
-    
-    Returns:
-        Root Mean Square Error
-    """
-    total_se = 0.0
-    total_count = 0
-    
-    for var in forecast:
-        if var in ground_truth:
-            pred = forecast[var].astype(np.float32)
-            truth = ground_truth[var].astype(np.float32)
-            
-            if subsample_factor > 1:
-                pred = pred[::subsample_factor, ::subsample_factor]
-                truth = truth[::subsample_factor, ::subsample_factor]
-                
-            se = np.sum((pred - truth) ** 2)
-            count = pred.size
-            total_se += se
-            total_count += count
-    
-    if total_count > 0:
-        return np.sqrt(total_se / total_count)
-    else:
-        return float('inf')
-
-def score_accuracy(prediction: Dict, ground_truth: Dict, lead_time: int, 
+async def score_accuracy(prediction: Dict, ground_truth: Dict, lead_time: int, 
                   threshold_rmse: Optional[Dict] = None,
                   subsample_factor: int = 1) -> float:
     """
@@ -83,40 +50,44 @@ def score_accuracy(prediction: Dict, ground_truth: Dict, lead_time: int,
     Returns:
         Accuracy score (0.0 to 1.0+)
     """
+    try:
     if threshold_rmse is None:
         threshold_rmse = DEFAULT_THRESHOLD_RMSE
     
     total_score = 0.0
-    total_weight = 0.0
+        total_weight = 0.0
     
     for var, weight in VARIABLE_WEIGHTS.items():
         if var not in prediction or var not in ground_truth:
             continue
             
-        pred_data = prediction[var]
-        truth_data = ground_truth[var]
+            pred_data = prediction[var]
+            truth_data = ground_truth[var]
         
-        if subsample_factor > 1:
-            pred_data = pred_data[::subsample_factor, ::subsample_factor]
-            truth_data = truth_data[::subsample_factor, ::subsample_factor]
+            if subsample_factor > 1:
+                pred_data = pred_data[::subsample_factor, ::subsample_factor]
+                truth_data = truth_data[::subsample_factor, ::subsample_factor]
         
-        rmse = normalize_rmse(pred_data, truth_data, var)
+            rmse = await normalize_rmse(pred_data, truth_data, var)
         var_threshold = threshold_rmse.get(var, [1.0] * 40)[min(lead_time, 39)]
         skill = max(0.0, 1.0 - rmse / var_threshold)
-        total_score += skill * weight
-        total_weight += weight
-    
-    if total_weight > 0:
-        total_score = total_score / total_weight
+            total_score += skill * weight
+            total_weight += weight
+        
+        if total_weight > 0:
+            total_score = total_score / total_weight
     
     lead_time_factor = 1.0 + (lead_time / 40) * 0.5  # Up to 50% bonus for day 10
     
     return total_score * lead_time_factor
+    except Exception as e:
+        logger.error(f"Error in score_accuracy: {e}")
+        raise
 
-def preprocess_forecasts(miner_data: Dict, variables: List[str], lead_time: int = 72) -> Dict:
+async def preprocess_forecasts(miner_data: Dict, variables: List[str], lead_time: int = 72) -> Dict:
     """
     Extract and format relevant data from miner forecasts.
-
+    
     Args:
         miner_data: Dictionary of all miner forecasts
         variables: List of variables to extract
@@ -125,31 +96,35 @@ def preprocess_forecasts(miner_data: Dict, variables: List[str], lead_time: int 
     Returns:
         Dictionary of processed forecast data by miner and variable
     """
-    processed_data = {}
-    timestep = lead_time // 12
-    
-    for miner_id, forecast in miner_data.items():
-        processed_data[miner_id] = {}
+    try:
+        processed_data = {}
+        timestep = lead_time // 12
         
-        for var in variables:
-            if var not in forecast:
-                continue
-                
-            # Surface variables (time, lat, lon)
-            if var.startswith('surf_') or var in ['2t', 'msl', '10u', '10v']:
-                if timestep < len(forecast[var]):
-                    processed_data[miner_id][var] = forecast[var][timestep]
+        for miner_id, forecast in miner_data.items():
+            processed_data[miner_id] = {}
             
-            # Atmospheric variables (time, level, lat, lon)
-            elif var in ['t', 'q', 'z', 'u', 'v']:
-                processed_data[miner_id][var] = {}
-                for level_idx, level in enumerate(forecast.get(f"{var}_levels", [])):
+            for var in variables:
+                if var not in forecast:
+                    continue
+                    
+                # Surface variables (time, lat, lon)
+                if var.startswith('surf_') or var in ['2t', 'msl', '10u', '10v']:
                     if timestep < len(forecast[var]):
-                        processed_data[miner_id][var][level] = forecast[var][timestep, level_idx]
-    
-    return processed_data
+                        processed_data[miner_id][var] = forecast[var][timestep]
+                
+                # Atmospheric variables (time, level, lat, lon)
+                elif var in ['t', 'q', 'z', 'u', 'v']:
+                    processed_data[miner_id][var] = {}
+                    for level_idx, level in enumerate(forecast.get(f"{var}_levels", [])):
+                        if timestep < len(forecast[var]):
+                            processed_data[miner_id][var][level] = forecast[var][timestep, level_idx]
+        
+        return processed_data
+    except Exception as e:
+        logger.error(f"Error in preprocess_forecasts: {e}")
+        raise
 
-def create_base_ensemble(processed_forecasts: Dict, variables: List[str]) -> Tuple[Dict, Dict]:
+async def create_base_ensemble(processed_forecasts: Dict, variables: List[str]) -> Tuple[Dict, Dict]:
     """
     Create base ensemble using mean of all forecasts.
     
@@ -160,64 +135,66 @@ def create_base_ensemble(processed_forecasts: Dict, variables: List[str]) -> Tup
     Returns:
         Tuple of (base_ensemble, variable_forecast_data)
     """
-    base_ensemble = {}
-    var_forecasts = {}
-    
-    for var in variables:
-        # Surface variables
-        if var.startswith('surf_') or var in ['2t', 'msl', '10u', '10v']:
-            # Collect all forecasts for this variable
-            forecasts_for_var = []
-            miner_ids_for_var = []
-            
-            for miner_id, forecast in processed_forecasts.items():
-                if var in forecast:
-                    forecasts_for_var.append(forecast[var])
-                    miner_ids_for_var.append(miner_id)
-            
-            if forecasts_for_var:
-                stacked = np.stack(forecasts_for_var)
-                base_ensemble[var] = np.mean(stacked, axis=0)
-                var_forecasts[var] = {
-                    'stacked': stacked,
-                    'miner_ids': miner_ids_for_var,
-                    'sum': np.sum(stacked, axis=0),
-                    'count': len(forecasts_for_var)
-                }
+    try:
+        base_ensemble = {}
+        var_forecasts = {}
         
-        # Atmospheric variables (by pressure level)
-        elif var in ['t', 'q', 'z', 'u', 'v']:
-            all_levels = set()
-            for forecast in processed_forecasts.values():
-                if var in forecast:
-                    all_levels.update(forecast[var].keys())
-            
-            # Create ensemble for each level
-            for level in sorted(all_levels):
-                level_key = f"{var}_{level}"
-                forecasts_for_level = []
-                miner_ids_for_level = []
+        for var in variables:
+            # Surface variables
+            if var.startswith('surf_') or var in ['2t', 'msl', '10u', '10v']:
+                forecasts_for_var = []
+                miner_ids_for_var = []
                 
                 for miner_id, forecast in processed_forecasts.items():
-                    if var in forecast and level in forecast[var]:
-                        forecasts_for_level.append(forecast[var][level])
-                        miner_ids_for_level.append(miner_id)
+                    if var in forecast:
+                        forecasts_for_var.append(forecast[var])
+                        miner_ids_for_var.append(miner_id)
                 
-                if forecasts_for_level:
-                    stacked = np.stack(forecasts_for_level)
-                    if level_key not in base_ensemble:
-                        base_ensemble[level_key] = np.mean(stacked, axis=0)
-                    
-                    var_forecasts[level_key] = {
+                if forecasts_for_var:
+                    stacked = np.stack(forecasts_for_var)
+                    base_ensemble[var] = np.mean(stacked, axis=0)
+                    var_forecasts[var] = {
                         'stacked': stacked,
-                        'miner_ids': miner_ids_for_level,
+                        'miner_ids': miner_ids_for_var,
                         'sum': np.sum(stacked, axis=0),
-                        'count': len(forecasts_for_level)
+                        'count': len(forecasts_for_var)
                     }
-    
-    return base_ensemble, var_forecasts
+            
+            # Atmospheric variables (by pressure level)
+            elif var in ['t', 'q', 'z', 'u', 'v']:
+                all_levels = set()
+                for forecast in processed_forecasts.values():
+                    if var in forecast:
+                        all_levels.update(forecast[var].keys())
+                
+                for level in sorted(all_levels):
+                    level_key = f"{var}_{level}"
+                    forecasts_for_level = []
+                    miner_ids_for_level = []
+                    
+                    for miner_id, forecast in processed_forecasts.items():
+                        if var in forecast and level in forecast[var]:
+                            forecasts_for_level.append(forecast[var][level])
+                            miner_ids_for_level.append(miner_id)
+                    
+                    if forecasts_for_level:
+                        stacked = np.stack(forecasts_for_level)
+                        if level_key not in base_ensemble:
+                            base_ensemble[level_key] = np.mean(stacked, axis=0)
+                        
+                        var_forecasts[level_key] = {
+                            'stacked': stacked,
+                            'miner_ids': miner_ids_for_level,
+                            'sum': np.sum(stacked, axis=0),
+                            'count': len(forecasts_for_level)
+                        }
+        
+        return base_ensemble, var_forecasts
+    except Exception as e:
+        logger.error(f"Error in create_base_ensemble: {e}")
+        raise
 
-def calculate_contribution_scores(base_ensemble: Dict, var_forecasts: Dict, 
+async def calculate_contribution_scores(base_ensemble: Dict, var_forecasts: Dict, 
                                  ground_truth: Dict, subsample_factor: int = 1) -> Dict:
     """
     Calculate contribution scores using leave-one-out method.
@@ -231,41 +208,45 @@ def calculate_contribution_scores(base_ensemble: Dict, var_forecasts: Dict,
     Returns:
         Dictionary of contribution scores by miner
     """
-    base_error = calculate_rmse_vectorized(base_ensemble, ground_truth, subsample_factor)
-    all_contributions = {}
-    miner_to_var_contributions = {}
-    
-    for var in var_forecasts:
-        if var not in ground_truth:
-            continue
-            
-        var_data = var_forecasts[var]
-        var_count = var_data['count']
+    try:
+        base_error = await calculate_rmse_vectorized(base_ensemble, ground_truth, subsample_factor)
+        all_contributions = {}
+        miner_to_var_contributions = {}
         
-        if var_count <= 1:
-            continue
+        for var in var_forecasts:
+            if var not in ground_truth:
+                continue
+                
+            var_data = var_forecasts[var]
+            var_count = var_data['count']
             
-        var_ground_truth = {var: ground_truth[var]}
-        for i, miner_id in enumerate(var_data['miner_ids']):
-            loo_ensemble_i = (var_data['sum'] - var_data['stacked'][i]) / (var_count - 1)
-            loo_ensemble_dict = {var: loo_ensemble_i}
-            loo_error = calculate_rmse_vectorized(loo_ensemble_dict, var_ground_truth, subsample_factor)
-            
-            # Positive means ensemble gets worse without this miner
-            contribution = (loo_error - base_error) / max(base_error, 1e-8)
-            if miner_id not in miner_to_var_contributions:
-                miner_to_var_contributions[miner_id] = {}
-            
-            miner_to_var_contributions[miner_id][var] = contribution
-    
-    # Average contribution across variables for each miner
-    for miner_id, var_contributions in miner_to_var_contributions.items():
-        if var_contributions:
-            all_contributions[miner_id] = np.mean(list(var_contributions.values()))
-    
-    return all_contributions
+            if var_count <= 1:
+                continue
+                
+            var_ground_truth = {var: ground_truth[var]}
+            for i, miner_id in enumerate(var_data['miner_ids']):
+                loo_ensemble_i = (var_data['sum'] - var_data['stacked'][i]) / (var_count - 1)
+                loo_ensemble_dict = {var: loo_ensemble_i}
+                loo_error = await calculate_rmse_vectorized(loo_ensemble_dict, var_ground_truth, subsample_factor)
+                
+                # Positive means ensemble gets worse without this miner
+                contribution = (loo_error - base_error) / max(base_error, 1e-8)
+                if miner_id not in miner_to_var_contributions:
+                    miner_to_var_contributions[miner_id] = {}
+                
+                miner_to_var_contributions[miner_id][var] = contribution
+        
+        # Average contribution across variables for each miner
+        for miner_id, var_contributions in miner_to_var_contributions.items():
+            if var_contributions:
+                all_contributions[miner_id] = np.mean(list(var_contributions.values()))
+        
+        return all_contributions
+    except Exception as e:
+        logger.error(f"Error in calculate_contribution_scores: {e}")
+        raise
 
-def detect_similar_forecasts(miner_forecasts: Dict, threshold: float = 0.01) -> Dict:
+async def detect_similar_forecasts(miner_forecasts: Dict, threshold: float = 0.01) -> Dict:
     """
     Detect groups of miners with highly similar forecasts, likely using the same model.
     
@@ -276,83 +257,87 @@ def detect_similar_forecasts(miner_forecasts: Dict, threshold: float = 0.01) -> 
     Returns:
         Dictionary mapping miners to their uniqueness score
     """
-    uniqueness_scores = {}
-    n_miners = len(miner_forecasts)
-    
-    if n_miners < 3:
-        return {m: 1.0 for m in miner_forecasts}
-    
-    pairwise_diffs = {}
-    key_variables = ["2t", "msl", "z"]  # Variables to focus on
-    
-    for m1 in miner_forecasts:
-        for m2 in miner_forecasts:
-            if m1 >= m2:
-                continue
-                
-            pair_key = f"{m1}_{m2}"
-            diffs = []
-            
-            for var in key_variables:
-                if var in miner_forecasts[m1] and var in miner_forecasts[m2]:
-                    var_diff = calculate_mean_abs_diff(
-                        miner_forecasts[m1][var], 
-                        miner_forecasts[m2][var]
-                    )
-                    diffs.append(var_diff)
-            
-            if diffs:
-                pairwise_diffs[pair_key] = np.mean(diffs)
-    
     try:
-        from sklearn.cluster import DBSCAN
+        uniqueness_scores = {}
+        n_miners = len(miner_forecasts)
         
-        dist_matrix = np.zeros((n_miners, n_miners))
-        miner_idx = {m: i for i, m in enumerate(miner_forecasts)}
+        if n_miners < 3:
+            return {m: 1.0 for m in miner_forecasts}
         
-        for pair, diff in pairwise_diffs.items():
-            m1, m2 = pair.split('_')
-            i, j = miner_idx[m1], miner_idx[m2]
-            dist_matrix[i, j] = dist_matrix[j, i] = diff
+        pairwise_diffs = {}
+        key_variables = ["2t", "msl", "z"]  # Variables to focus on
         
-        # Cluster miners by forecast similarity
-        clustering = DBSCAN(eps=threshold, min_samples=2, metric='precomputed')
-        clusters = clustering.fit_predict(dist_matrix)
+        for m1 in miner_forecasts:
+            for m2 in miner_forecasts:
+                if m1 >= m2:
+                    continue
+                    
+                pair_key = f"{m1}_{m2}"
+                diffs = []
+                
+                for var in key_variables:
+                    if var in miner_forecasts[m1] and var in miner_forecasts[m2]:
+                        var_diff = await calculate_mean_abs_diff(
+                            miner_forecasts[m1][var], 
+                            miner_forecasts[m2][var]
+                        )
+                        diffs.append(var_diff)
+                
+                if diffs:
+                    pairwise_diffs[pair_key] = np.mean(diffs)
         
-        # Uniqueness scores
-        cluster_counts = {}
-        for c in clusters:
-            if c >= 0:  # -1 means no cluster assigned
-                cluster_counts[c] = cluster_counts.get(c, 0) + 1
-        
-        for miner, idx in miner_idx.items():
-            cluster = clusters[idx]
-            if cluster == -1:  # Unique model. Assign uniqueness score of 1.0  
-                uniqueness_scores[miner] = 1.0
-            else:
-                # Penalty based on cluster size (larger clusters = more similar models)
-                cluster_size = cluster_counts.get(cluster, 1)
-                uniqueness_scores[miner] = max(0.2, 1.0 - (cluster_size / n_miners))
-    
-    except ImportError:
-        for miner in miner_forecasts:
-            similar_count = 0
-            total_comparisons = 0
+        try:
+            from sklearn.cluster import DBSCAN
+            
+            dist_matrix = np.zeros((n_miners, n_miners))
+            miner_idx = {m: i for i, m in enumerate(miner_forecasts)}
             
             for pair, diff in pairwise_diffs.items():
-                if miner in pair.split('_'):
-                    total_comparisons += 1
-                    if diff < threshold:
-                        similar_count += 1
+                m1, m2 = pair.split('_')
+                i, j = miner_idx[m1], miner_idx[m2]
+                dist_matrix[i, j] = dist_matrix[j, i] = diff
             
-            if total_comparisons > 0:
-                uniqueness_scores[miner] = 1.0 - (similar_count / total_comparisons)
-            else:
-                uniqueness_scores[miner] = 1.0
-    
-    return uniqueness_scores
+            # Cluster miners by forecast similarity
+            clustering = DBSCAN(eps=threshold, min_samples=2, metric='precomputed')
+            clusters = clustering.fit_predict(dist_matrix)
+            
+            # Uniqueness scores
+            cluster_counts = {}
+            for c in clusters:
+                if c >= 0:  # -1 means no cluster assigned
+                    cluster_counts[c] = cluster_counts.get(c, 0) + 1
+            
+            for miner, idx in miner_idx.items():
+                cluster = clusters[idx]
+                if cluster == -1:  # Unique model. Assign uniqueness score of 1.0  
+                    uniqueness_scores[miner] = 1.0
+    else:
+                    # Penalty based on cluster size (larger clusters = more similar models)
+                    cluster_size = cluster_counts.get(cluster, 1)
+                    uniqueness_scores[miner] = max(0.2, 1.0 - (cluster_size / n_miners))
+        
+        except ImportError:
+            for miner in miner_forecasts:
+                similar_count = 0
+                total_comparisons = 0
+                
+                for pair, diff in pairwise_diffs.items():
+                    if miner in pair.split('_'):
+                        total_comparisons += 1
+                        if diff < threshold:
+                            similar_count += 1
+                
+                if total_comparisons > 0:
+                    uniqueness_scores[miner] = 1.0 - (similar_count / total_comparisons)
+                else:
+                    uniqueness_scores[miner] = 1.0
+        
+        return uniqueness_scores
+    except Exception as e:
+        logger.error(f"Error in detect_similar_forecasts: {e}")
+        raise
 
-def update_bma_weights(current_weights: Dict[str, float], 
+async def update_bma_weights(current_weights: Dict[str, float], 
                       contribution_scores: Dict[str, float], 
                       learning_rate: float = 0.2) -> Dict[str, float]:
     """
@@ -366,35 +351,39 @@ def update_bma_weights(current_weights: Dict[str, float],
     Returns:
         Dictionary of updated weights
     """
-    weight_factors = {
-        m: np.exp(max(-5, min(5, score * 3))) 
-        for m, score in contribution_scores.items()
-    }
-    
-    updated_weights = {}
-    
-    for miner_id, current_weight in current_weights.items():
-        if miner_id in weight_factors:
-            updated_weights[miner_id] = (
-                (1 - learning_rate) * current_weight + 
-                learning_rate * weight_factors[miner_id]
-            )
-        else:
-            updated_weights[miner_id] = current_weight * 0.5
-    
-    for miner_id in weight_factors:
-        if miner_id not in current_weights:
-            updated_weights[miner_id] = weight_factors[miner_id]
-    
-    total_weight = sum(updated_weights.values())
-    if total_weight > 0:
-        normalized_weights = {m: w/total_weight for m, w in updated_weights.items()}
+    try:
+        weight_factors = {
+            m: np.exp(max(-5, min(5, score * 3))) 
+            for m, score in contribution_scores.items()
+        }
+        
+        updated_weights = {}
+        
+        for miner_id, current_weight in current_weights.items():
+            if miner_id in weight_factors:
+                updated_weights[miner_id] = (
+                    (1 - learning_rate) * current_weight + 
+                    learning_rate * weight_factors[miner_id]
+                )
+            else:
+                updated_weights[miner_id] = current_weight * 0.5
+        
+        for miner_id in weight_factors:
+            if miner_id not in current_weights:
+                updated_weights[miner_id] = weight_factors[miner_id]
+        
+        total_weight = sum(updated_weights.values())
+        if total_weight > 0:
+            normalized_weights = {m: w/total_weight for m, w in updated_weights.items()}
     else:
-        normalized_weights = {m: 1.0/len(updated_weights) for m in updated_weights}
-    
-    return normalized_weights
+            normalized_weights = {m: 1.0/len(updated_weights) for m in updated_weights}
+        
+        return normalized_weights
+    except Exception as e:
+        logger.error(f"Error in update_bma_weights: {e}")
+        raise
 
-def compute_final_scores(
+async def compute_final_scores(
     accuracy_scores: Dict[str, float],
     contribution_scores: Dict[str, float],
     uniqueness_scores: Dict[str, float],
@@ -408,25 +397,29 @@ def compute_final_scores(
         contribution_scores: Dictionary of contribution scores
         uniqueness_scores: Dictionary of uniqueness scores
         weights: Dictionary of component weights
-    
+        
     Returns:
         Dictionary of final scores
     """
-    final_scores = {}
-    all_miners = set()
-    all_miners.update(accuracy_scores.keys())
-    all_miners.update(contribution_scores.keys())
-    all_miners.update(uniqueness_scores.keys())
-    
-    for miner_id in all_miners:
-        accuracy = accuracy_scores.get(miner_id, 0.0)
-        contribution = contribution_scores.get(miner_id, 0.0)
-        uniqueness = uniqueness_scores.get(miner_id, 0.0)
+    try:
+        final_scores = {}
+        all_miners = set()
+        all_miners.update(accuracy_scores.keys())
+        all_miners.update(contribution_scores.keys())
+        all_miners.update(uniqueness_scores.keys())
         
-        final_scores[miner_id] = (
-            accuracy * weights["accuracy"] +
-            contribution * weights["contribution"] +
-            uniqueness * weights["uniqueness"]
-        )
-    
-    return final_scores
+        for miner_id in all_miners:
+            accuracy = accuracy_scores.get(miner_id, 0.0)
+            contribution = contribution_scores.get(miner_id, 0.0)
+            uniqueness = uniqueness_scores.get(miner_id, 0.0)
+            
+            final_scores[miner_id] = (
+                accuracy * weights["accuracy"] +
+                contribution * weights["contribution"] +
+                uniqueness * weights["uniqueness"]
+            )
+        
+        return final_scores
+    except Exception as e:
+        logger.error(f"Error in compute_final_scores: {e}")
+        raise
