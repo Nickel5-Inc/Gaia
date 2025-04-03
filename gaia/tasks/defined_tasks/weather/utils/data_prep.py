@@ -229,6 +229,7 @@ def create_aurora_batch_from_gfs(
     Returns:
         Batch: An Aurora Batch object ready for input to the model
     """
+    # Make sure we have required packages
     try:
         import pandas as pd
     except ImportError:

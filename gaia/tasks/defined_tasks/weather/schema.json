@@ -1,205 +1,137 @@
 {
-    "forecast_runs": {
-        "table_name": "forecast_runs",
+    "weather_forecast_runs": {
+        "table_name": "weather_forecast_runs",
         "database_type": "validator",
         "columns": {
             "id": "SERIAL PRIMARY KEY",
-            "start_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
-            "end_time": "TIMESTAMP WITH TIME ZONE",
-            "input_data_hash": "TEXT NOT NULL",
-            "status": "TEXT NOT NULL DEFAULT 'in_progress'",
-            "notes": "TEXT",
-            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+            "run_initiation_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "target_forecast_time_utc": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "gfs_init_time_utc": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "gfs_input_metadata": "JSONB",
+            "status": "VARCHAR(50) NOT NULL DEFAULT 'pending'",
+            "completion_time": "TIMESTAMP WITH TIME ZONE",
+            "error_message": "TEXT"
         },
         "indexes": [
-            {"column": "start_time", "unique": false},
+            {"column": "run_initiation_time", "unique": false},
+            {"column": "target_forecast_time_utc", "unique": false},
+            {"column": "gfs_init_time_utc", "unique": false},
             {"column": "status", "unique": false}
-        ]
+        ],
+        "foreign_keys": [],
+        "comment": "Tracks each weather forecast run initiated by the validator."
     },
-    "miner_forecasts": {
-        "table_name": "miner_forecasts",
+    "weather_miner_responses": {
+        "table_name": "weather_miner_responses",
         "database_type": "validator",
         "columns": {
             "id": "SERIAL PRIMARY KEY",
-            "run_id": "INTEGER REFERENCES forecast_runs(id)",
-            "miner_uid": "TEXT NOT NULL",
-            "miner_hotkey": "TEXT NOT NULL",
-            "forecast_subset_path": "TEXT NOT NULL",
-            "forecast_hash": "TEXT NOT NULL",
-            "submission_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
-            "metadata": "JSONB",
-            "retention_expires": "TIMESTAMP WITH TIME ZONE",
-            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
-            "status": "TEXT NOT NULL DEFAULT 'active'"
+            "run_id": "INTEGER NOT NULL",
+            "miner_uid": "INTEGER NOT NULL",
+            "miner_hotkey": "VARCHAR(255) NOT NULL",
+            "response_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "kerchunk_json_url": "TEXT",
+            "target_netcdf_url_template": "TEXT",
+            "kerchunk_json_retrieved": "JSONB",
+            "verification_hash_computed": "VARCHAR(64)",
+            "verification_hash_claimed": "VARCHAR(64)",
+            "verification_passed": "BOOLEAN",
+            "status": "VARCHAR(50) NOT NULL DEFAULT 'received'",
+            "error_message": "TEXT"
         },
         "indexes": [
             {"column": "run_id", "unique": false},
+            {"column": "miner_uid", "unique": false},
             {"column": "miner_hotkey", "unique": false},
-            {"column": "submission_time", "unique": false},
-            {"column": "status", "unique": false}
+            {"column": "verification_passed", "unique": false},
+            {"column": "status", "unique": false},
+            {"name": "idx_weather_responses_run_miner", "columns": ["run_id", "miner_uid"], "unique": true}
         ],
         "foreign_keys": [
             {
                 "column": "run_id",
-                "references": "forecast_runs(id)",
+                "references": "weather_forecast_runs(id)",
                 "on_delete": "CASCADE"
             }
-        ]
-    },
-    "validation_points": {
-        "table_name": "validation_points",
-        "database_type": "validator",
-        "columns": {
-            "id": "SERIAL PRIMARY KEY",
-            "run_id": "INTEGER REFERENCES forecast_runs(id)",
-            "lead_time": "INTEGER NOT NULL",
-            "verification_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
-            "ground_truth_path": "TEXT NOT NULL",
-            "status": "TEXT NOT NULL DEFAULT 'pending'",
-            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
-        },
-        "indexes": [
-            {"column": "run_id", "unique": false},
-            {"column": "lead_time", "unique": false},
-            {"column": "status", "unique": false}
         ],
-        "foreign_keys": [
-            {
-                "column": "run_id",
-                "references": "forecast_runs(id)",
-                "on_delete": "CASCADE"
-            }
-        ]
+        "comment": "Records miner responses (Kerchunk info) for a specific forecast run."
     },
-    "miner_scores": {
-        "table_name": "miner_scores",
+    "weather_miner_scores": {
+        "table_name": "weather_miner_scores",
         "database_type": "validator",
         "columns": {
             "id": "SERIAL PRIMARY KEY",
-            "validation_id": "INTEGER REFERENCES validation_points(id)",
-            "miner_uid": "TEXT NOT NULL",
-            "miner_hotkey": "TEXT NOT NULL",
-            "variable_name": "TEXT NOT NULL",
-            "pressure_level": "INTEGER",
-            "rmse": "FLOAT",
-            "mae": "FLOAT",
-            "acc": "FLOAT",
-            "bias": "FLOAT",
-            "normalized_score": "FLOAT",
-            "difficulty_weight": "FLOAT",
-            "matches_stored_forecast": "BOOLEAN",
+            "response_id": "INTEGER NOT NULL",
+            "run_id": "INTEGER NOT NULL",
+            "miner_uid": "INTEGER NOT NULL",
+            "miner_hotkey": "VARCHAR(255) NOT NULL",
+            "score_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "metrics": "JSONB",
             "final_score": "FLOAT",
-            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+            "baseline_metrics": "JSONB",
+            "baseline_final_score": "FLOAT",
+            "error_message": "TEXT"
         },
         "indexes": [
-            {"column": "validation_id", "unique": false},
-            {"column": "miner_hotkey", "unique": false},
-            {"column": "variable_name", "unique": false},
-            {"column": "pressure_level", "unique": false}
-        ],
-        "foreign_keys": [
-            {
-                "column": "validation_id",
-                "references": "validation_points(id)",
-                "on_delete": "CASCADE"
-            }
-        ]
-    },
-    "extreme_event_scores": {
-        "table_name": "extreme_event_scores",
-        "database_type": "validator",
-        "columns": {
-            "id": "SERIAL PRIMARY KEY",
-            "validation_id": "INTEGER REFERENCES validation_points(id)",
-            "miner_uid": "TEXT NOT NULL",
-            "miner_hotkey": "TEXT NOT NULL",
-            "variable_name": "TEXT NOT NULL",
-            "pressure_level": "INTEGER",
-            "num_events": "INTEGER",
-            "csi_score": "FLOAT",
-            "pod_score": "FLOAT",
-            "far_score": "FLOAT",
-            "threshold_value": "FLOAT",
-            "min_area_size": "INTEGER",
-            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
-        },
-        "indexes": [
-            {"column": "validation_id", "unique": false},
-            {"column": "miner_hotkey", "unique": false},
-            {"column": "variable_name", "unique": false},
-            {"column": "pressure_level", "unique": false}
-        ],
-        "foreign_keys": [
-            {
-                "column": "validation_id",
-                "references": "validation_points(id)",
-                "on_delete": "CASCADE"
-            }
-        ]
-    },
-    "ensemble_forecasts": {
-        "table_name": "ensemble_forecasts",
-        "database_type": "validator",
-        "columns": {
-            "id": "SERIAL PRIMARY KEY",
-            "run_id": "INTEGER REFERENCES forecast_runs(id)",
-            "creation_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
-            "forecast_path": "TEXT NOT NULL",
-            "metadata": "JSONB",
-            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
-        },
-        "indexes": [
+            {"column": "response_id", "unique": true},
             {"column": "run_id", "unique": false},
-            {"column": "creation_time", "unique": false}
+            {"column": "miner_uid", "unique": false},
+            {"column": "miner_hotkey", "unique": false},
+            {"column": "score_time", "unique": false}
         ],
         "foreign_keys": [
+            {
+                "column": "response_id",
+                "references": "weather_miner_responses(id)",
+                "on_delete": "CASCADE"
+            },
             {
                 "column": "run_id",
-                "references": "forecast_runs(id)",
+                "references": "weather_forecast_runs(id)",
                 "on_delete": "CASCADE"
             }
-        ]
-    },
-    "ensemble_components": {
-        "table_name": "ensemble_components",
-        "database_type": "validator",
-        "columns": {
-            "id": "SERIAL PRIMARY KEY",
-            "ensemble_id": "INTEGER REFERENCES ensemble_forecasts(id)",
-            "variable_name": "TEXT NOT NULL",
-            "pressure_level": "INTEGER",
-            "miners": "JSONB NOT NULL",
-            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
-        },
-        "indexes": [
-            {"column": "ensemble_id", "unique": false},
-            {"column": "variable_name", "unique": false},
-            {"column": "pressure_level", "unique": false}
         ],
-        "foreign_keys": [
-            {
-                "column": "ensemble_id",
-                "references": "ensemble_forecasts(id)",
-                "on_delete": "CASCADE"
-            }
-        ]
+        "comment": "Stores calculated scores and metrics for each verified miner response."
     },
-    "historical_weights": {
-        "table_name": "historical_weights",
+    "weather_historical_weights": {
+        "table_name": "weather_historical_weights",
         "database_type": "validator",
         "columns": {
-            "id": "SERIAL PRIMARY KEY",
-            "miner_uid": "TEXT NOT NULL",
-            "miner_hotkey": "TEXT NOT NULL",
-            "variable_name": "TEXT NOT NULL",
-            "pressure_level": "INTEGER",
-            "weight": "FLOAT NOT NULL",
-            "updated_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+            "miner_uid": "INTEGER PRIMARY KEY",
+            "miner_hotkey": "VARCHAR(255) NOT NULL",
+            "last_updated": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "weight": "FLOAT NOT NULL DEFAULT 0.0"
         },
         "indexes": [
-            {"column": "miner_hotkey", "unique": false},
-            {"column": "variable_name", "unique": false},
-            {"column": "pressure_level", "unique": false}
-        ]
+            {"column": "miner_hotkey", "unique": false}
+        ],
+        "foreign_keys": [],
+        "comment": "Tracks the exponentially weighted moving average score for each miner over time."
+    },
+    "weather_miner_jobs": {
+        "table_name": "weather_miner_jobs",
+        "database_type": "miner",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "validator_request_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "validator_hotkey": "VARCHAR(255)",
+            "gfs_init_time_utc": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "gfs_input_metadata": "JSONB",
+            "processing_start_time": "TIMESTAMP WITH TIME ZONE",
+            "processing_end_time": "TIMESTAMP WITH TIME ZONE",
+            "output_netcdf_path": "TEXT",
+            "output_kerchunk_path": "TEXT",
+            "verification_hash": "VARCHAR(64)",
+            "ipfs_cid": "VARCHAR(255)",
+            "status": "VARCHAR(50) NOT NULL DEFAULT 'received'",
+            "error_message": "TEXT"
+        },
+        "indexes": [
+            {"column": "validator_request_time", "unique": false},
+            {"column": "gfs_init_time_utc", "unique": false},
+            {"column": "status", "unique": false}
+        ],
+        "foreign_keys": [],
+        "comment": "Tracks weather forecast jobs processed by the miner."
     }
 }
