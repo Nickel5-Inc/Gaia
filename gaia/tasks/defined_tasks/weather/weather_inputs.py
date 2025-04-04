@@ -39,7 +39,7 @@ class WeatherRequestPayload(BaseModel):
 class WeatherInputs(Inputs):
     """
     Input schema definitions for weather forecasting task.
-    Defines both validator and miner input formats.
+    Defines both validator input formats.
     """
     
     inputs: Dict[str, Any] = {
@@ -117,3 +117,20 @@ class WeatherInputs(Inputs):
         bio = xr.backends.to_netcdf(dataset, compute=True)
         return bio.read()
     
+class WeatherInputData(BaseModel):
+    """ Defines the structure for the input data sent by the validator to trigger a forecast run."""
+    forecast_start_time: datetime = Field(..., description="ISO 8601 timestamp for the forecast initialization time (T=0h).")
+    gfs_timestep_1: str = Field(..., description="Serialized representation (e.g., base64 encoded pickle) of the GFS data for the T-6h timestep.")
+    gfs_timestep_2: str = Field(..., description="Serialized representation (e.g., base64 encoded pickle) of the GFS data for the T=0h timestep.")
+
+    class Config:
+        arbitrary_types_allowed = True
+
+class WeatherForecastRequest(BaseModel):
+    """ The overall request model containing the nonce and the weather input data."""
+    nonce: str | None = None
+    data: WeatherInputData
+
+class WeatherKerchunkRequestData(BaseModel):
+    """ Defines the data structure for requesting Kerchunk/hash details for a specific job."""
+    job_id: str = Field(..., description="The unique job ID returned by the miner during the initial forecast request acceptance.")

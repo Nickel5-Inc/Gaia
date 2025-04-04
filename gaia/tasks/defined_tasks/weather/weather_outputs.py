@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any, Union, Set
+from typing import Dict, List, Tuple, Optional, Any, Union, Set, Literal
 import numpy as np
 import xarray as xr
 from pydantic import BaseModel, Field, validator, ConfigDict, root_validator
@@ -527,3 +527,11 @@ class WeatherOutputs(Outputs):
             )
             
         return forecast
+
+class WeatherKerchunkResponseData(BaseModel):
+    """ Defines the structure for the miner's response to a Kerchunk/hash request."""
+    status: Literal['completed', 'processing', 'error', 'not_found'] = Field(..., description="The status of the requested forecast job.")
+    message: Optional[str] = Field(None, description="Optional message, e.g., error details or status update.")
+    kerchunk_json_url: Optional[str] = Field(None, description="URL from which the validator can download the Kerchunk JSON file. Required if status is 'completed'.")
+    verification_hash: Optional[str] = Field(None, description="The SHA256 verification hash claimed by the miner. Required if status is 'completed'.")
+    access_token: Optional[str] = Field(None, description="Short-lived JWT token required to access the forecast data via the /forecasts/ endpoint. Required if status is 'completed'.")

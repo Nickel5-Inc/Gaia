@@ -17,12 +17,23 @@ from pathlib import Path
 import xarray as xr
 import pickle
 import base64
+import jwt
+
+# --- Aurora Imports (Ensure these are available in the environment) ---
+try:
+    from aurora.core import Batch
+    _AURORA_AVAILABLE = True
+except ImportError:
+    logger.warning("Aurora library not found. Batch type hinting and related functionality may fail.")
+    Batch = Any # Define Batch as Any if Aurora is not installed
+    _AURORA_AVAILABLE = False
+# --- End Aurora Imports ---
 
 from gaia.tasks.defined_tasks.weather.utils.hashing import compute_verification_hash
 from gaia.tasks.defined_tasks.weather.utils.kerchunk_utils import generate_kerchunk_json_from_local_file
 from gaia.tasks.defined_tasks.weather.weather_metadata import WeatherMetadata
 from gaia.tasks.defined_tasks.weather.weather_inputs import WeatherInputs, WeatherForecastRequest, WeatherInputData
-from gaia.tasks.defined_tasks.weather.weather_outputs import WeatherOutputs, WeatherKerchunkResponse
+from gaia.tasks.defined_tasks.weather.weather_outputs import WeatherOutputs, WeatherKerchunkResponseData
 from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import WeatherScoringMechanism
 from gaia.tasks.defined_tasks.weather.weather_miner_preprocessing import WeatherMinerPreprocessing
 from gaia.tasks.defined_tasks.weather.weather_validator_preprocessing import WeatherValidatorPreprocessing
@@ -41,6 +52,13 @@ class WeatherBaseModel: pass
 DEFAULT_FORECAST_DIR_BG = Path("./miner_forecasts/")
 MINER_FORECAST_DIR_BG = Path(os.getenv("MINER_FORECAST_DIR", DEFAULT_FORECAST_DIR_BG))
 MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
+
+# JWT Configuration
+MINER_JWT_SECRET_KEY = os.getenv("MINER_JWT_SECRET_KEY", "default-insecure-secret-key-replace-me")
+if MINER_JWT_SECRET_KEY == "default-insecure-secret-key-replace-me":
+    logger.warning("Using default insecure JWT secret key. Set MINER_JWT_SECRET_KEY environment variable for production.")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 15 # Token validity duration
 
 class WeatherTask(Task):
     """
@@ -475,30 +493,65 @@ class WeatherTask(Task):
         Handles the initial request from the validator, preprocesses data,
         creates a job record, launches the background inference task,
         and returns an immediate 'Accepted' response.
+        Checks for existing jobs for the same forecast time to avoid redundant runs.
         """
         logger.info("Miner execute called for WeatherTask")
-        job_id = str(uuid.uuid4())
+        new_job_id = str(uuid.uuid4())
 
         if self.inference_runner is None:
-             logger.error(f"[Job {job_id}] Cannot execute: Inference Runner not available.")
+             logger.error(f"[New Job Attempt {new_job_id}] Cannot execute: Inference Runner not available.")
              return {"status": "error", "message": "Miner inference component not ready"}
         if not data or 'data' not in data:
-             logger.error(f"[Job {job_id}] Invalid or missing payload data.")
+             logger.error(f"[New Job Attempt {new_job_id}] Invalid or missing payload data.")
              return {"status": "error", "message": "Invalid payload structure"}
 
-        validator_hotkey = miner.config.keypair.ss58_address
+        validator_hotkey = data.get("sender_hotkey", "unknown")
         payload_data = data['data']
 
         try:
             gfs_init_time = payload_data.get('forecast_start_time')
             if not isinstance(gfs_init_time, datetime):
                  try:
-                     gfs_init_time = datetime.fromisoformat(str(gfs_init_time))
-                 except (ValueError, TypeError):
-                     logger.error(f"[Job {job_id}] Invalid forecast_start_time format: {gfs_init_time}")
-                     return {"status": "error", "message": "Invalid forecast_start_time format"}
+                     gfs_init_time_str = str(gfs_init_time)
+                     if gfs_init_time_str.endswith('Z'):
+                         gfs_init_time_str = gfs_init_time_str[:-1] + '+00:00'
+                     gfs_init_time = datetime.fromisoformat(gfs_init_time_str)
+                     if gfs_init_time.tzinfo is None:
+                         gfs_init_time = gfs_init_time.replace(tzinfo=timezone.utc)
+                     else:
+                         gfs_init_time = gfs_init_time.astimezone(timezone.utc)
 
-            logger.info(f"[Job {job_id}] Processing request for GFS init time: {gfs_init_time}")
+                 except (ValueError, TypeError) as parse_err:
+                     logger.error(f"[New Job Attempt {new_job_id}] Invalid forecast_start_time format: {gfs_init_time}. Error: {parse_err}")
+                     return {"status": "error", "message": f"Invalid forecast_start_time format: {parse_err}"}
+
+            logger.info(f"Processing request for GFS init time: {gfs_init_time}")
+
+            existing_job_query = """
+                SELECT id, status
+                FROM weather_miner_jobs
+                WHERE gfs_init_time_utc = :gfs_init
+                  AND status != 'error'
+                ORDER BY
+                    CASE status
+                        WHEN 'completed' THEN 1
+                        WHEN 'processing' THEN 2
+                        WHEN 'received' THEN 3
+                        ELSE 4
+                    END,
+                    validator_request_time DESC
+                LIMIT 1;
+            """
+            existing_job = await self.db_manager.fetch_one(existing_job_query, {"gfs_init": gfs_init_time})
+
+            if existing_job:
+                existing_job_id = existing_job['id']
+                existing_status = existing_job['status']
+                logger.info(f"[Job {existing_job_id}] Found existing {existing_status} job for GFS init time {gfs_init_time}. Reusing this job ID.")
+                return {"status": "accepted", "job_id": existing_job_id, "message": f"Accepted. Reusing existing {existing_status} job."}
+
+            job_id = new_job_id
+            logger.info(f"[Job {job_id}] No suitable existing job found. Creating new job for GFS init time {gfs_init_time}.")
 
             logger.info(f"[Job {job_id}] Starting preprocessing...")
             preprocessing_start_time = time.time()
@@ -513,10 +566,13 @@ class WeatherTask(Task):
                 INSERT INTO weather_miner_jobs (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_input_metadata, status, processing_start_time)
                 VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_meta, :status, :proc_start)
             """
+            if gfs_init_time.tzinfo is None:
+                 gfs_init_time = gfs_init_time.replace(tzinfo=timezone.utc)
+
             await self.db_manager.execute(insert_query, {
                 "id": job_id,
                 "req_time": datetime.now(timezone.utc),
-                "val_hk": validator_hotkey, # Placeholder
+                "val_hk": validator_hotkey,
                 "gfs_init": gfs_init_time,
                 "gfs_meta": json.dumps(payload_data, default=str),
                 "status": "received",
@@ -538,13 +594,100 @@ class WeatherTask(Task):
             return {"status": "accepted", "job_id": job_id, "message": "Weather forecast job accepted for processing."}
 
         except Exception as e:
-            logger.error(f"[Job {job_id}] Error during initial miner_execute: {e}", exc_info=True)
-            try:
-                 await self._update_job_status(job_id, 'error', error_message=f"Initial processing error: {e}")
-            except Exception as db_err:
-                 logger.error(f"[Job {job_id}] Failed to update job status to error after exception: {db_err}")
+            job_id_for_error = new_job_id
+            logger.error(f"[Job {job_id_for_error}] Error during initial miner_execute: {e}", exc_info=True)
+            return {"status": "error", "job_id": None, "message": f"Failed to initiate job: {e}"}
 
-            return {"status": "error", "job_id": job_id, "message": f"Failed to initiate job: {e}"}
+    async def handle_kerchunk_request(self, job_id: str) -> Dict[str, Any]:
+        """
+        Handles the validator's request for results (Kerchunk JSON, hash, token) for a given job ID.
+        Queries the miner's local database to check the job status and retrieve results if ready.
+
+        Args:
+            job_id: The unique ID of the job being queried.
+
+        Returns:
+            A dictionary containing the status and results:
+            {
+                "status": "completed" | "pending" | "error" | "not_found",
+                "message": Optional[str],
+                "kerchunk_json_path": Optional[str],
+                "verification_hash": Optional[str],
+                "access_token": Optional[str]
+            }
+        """
+        logger.info(f"[Job {job_id}] Handling Kerchunk/result request.")
+
+        if not self.db_manager:
+            logger.error(f"[Job {job_id}] Database manager not available.")
+            return {"status": "error", "message": "Internal server error: DB unavailable."}
+
+        query = """
+            SELECT
+                status,
+                output_kerchunk_path,
+                verification_hash,
+                error_message
+            FROM weather_miner_jobs
+            WHERE id = :job_id
+        """
+        try:
+            job_record = await self.db_manager.fetch_one(query, {"job_id": job_id})
+        except Exception as db_err:
+            logger.error(f"[Job {job_id}] Database error querying job status: {db_err}", exc_info=True)
+            return {"status": "error", "message": "Internal server error: Failed to query job status."}
+
+        if not job_record:
+            logger.warning(f"[Job {job_id}] Job ID not found in database.")
+            return {"status": "not_found", "message": "Job ID not found."}
+
+        status = job_record.get('status')
+        logger.info(f"[Job {job_id}] Found job with status: {status}")
+
+        if status == 'completed':
+            kerchunk_path_str = job_record.get('output_kerchunk_path')
+            verification_hash = job_record.get('verification_hash')
+            if not kerchunk_path_str or not verification_hash:
+                 logger.error(f"[Job {job_id}] Job marked completed, but missing kerchunk path or hash in DB.")
+                 return {"status": "error", "message": "Internal error: Job complete but results missing."}
+
+            try:
+                kerchunk_path = Path(kerchunk_path_str)
+                if not kerchunk_path.exists():
+                    logger.error(f"[Job {job_id}] Kerchunk file path found in DB ({kerchunk_path_str}) but file does not exist on disk.")
+                    return {"status": "error", "message": "Internal error: Result file missing."}
+
+                expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+                relative_kerchunk_path = str(kerchunk_path.relative_to(MINER_FORECAST_DIR_BG))
+                token_payload = {
+                    "sub": job_id,
+                    "file_path": relative_kerchunk_path,
+                    "exp": expire
+                }
+                access_token = jwt.encode(token_payload, MINER_JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+                logger.info(f"[Job {job_id}] Generated access token expiring at {expire}. Granting access to {relative_kerchunk_path}")
+
+                return {
+                    "status": "completed",
+                    "message": "Job completed successfully.",
+                    "kerchunk_json_path": relative_kerchunk_path,
+                    "verification_hash": verification_hash,
+                    "access_token": access_token
+                }
+            except Exception as token_err:
+                 logger.error(f"[Job {job_id}] Failed to generate access token or process path: {token_err}", exc_info=True)
+                 return {"status": "error", "message": "Internal error: Failed to prepare access token."}
+
+        elif status in ['processing', 'received']:
+            logger.info(f"[Job {job_id}] Job is still pending ({status}).")
+            return {"status": "pending", "message": f"Job processing is not yet complete (status: {status})."}
+        elif status == 'error':
+            error_msg = job_record.get('error_message', 'An unknown error occurred.')
+            logger.warning(f"[Job {job_id}] Job resulted in an error: {error_msg}")
+            return {"status": "error", "message": f"Job failed: {error_msg}"}
+        else:
+            logger.error(f"[Job {job_id}] Encountered unexpected job status: {status}")
+            return {"status": "error", "message": f"Internal error: Unexpected job status '{status}'."}
 
     ############################################################
     # Helper Methods
