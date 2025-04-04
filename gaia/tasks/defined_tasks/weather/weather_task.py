@@ -15,12 +15,11 @@ import uuid
 import time
 from pathlib import Path
 import xarray as xr
-from gaia.tasks.defined_tasks.weather.utils.hashing import compute_verification_hash
-from gaia.tasks.defined_tasks.weather.utils.kerchunk_utils import generate_kerchunk_json_from_local_file
 import pickle
 import base64
 
-# This file only has the skeleton of the task, with placeholders for the actual implementations
+from gaia.tasks.defined_tasks.weather.utils.hashing import compute_verification_hash
+from gaia.tasks.defined_tasks.weather.utils.kerchunk_utils import generate_kerchunk_json_from_local_file
 from gaia.tasks.defined_tasks.weather.weather_metadata import WeatherMetadata
 from gaia.tasks.defined_tasks.weather.weather_inputs import WeatherInputs, WeatherForecastRequest, WeatherInputData
 from gaia.tasks.defined_tasks.weather.weather_outputs import WeatherOutputs, WeatherKerchunkResponse
@@ -133,7 +132,7 @@ class WeatherTask(Task):
 
 
     ############################################################
-    # Validator methods\
+    # Validator methods
     ############################################################
 
     async def validator_prepare_subtasks(self):
@@ -428,7 +427,6 @@ class WeatherTask(Task):
                 logger.error(traceback.format_exc())
                 return None
 
-            # --- 2. Combine Datasets ---
             if 'time' not in ds_hist.dims or 'time' not in ds_curr.dims:
                  logger.error("Decoded datasets missing 'time' dimension.")
                  return None
@@ -481,7 +479,6 @@ class WeatherTask(Task):
         logger.info("Miner execute called for WeatherTask")
         job_id = str(uuid.uuid4())
 
-        # --- Check Prerequisites ---
         if self.inference_runner is None:
              logger.error(f"[Job {job_id}] Cannot execute: Inference Runner not available.")
              return {"status": "error", "message": "Miner inference component not ready"}
@@ -503,7 +500,6 @@ class WeatherTask(Task):
 
             logger.info(f"[Job {job_id}] Processing request for GFS init time: {gfs_init_time}")
 
-            # --- Preprocessing ---
             logger.info(f"[Job {job_id}] Starting preprocessing...")
             preprocessing_start_time = time.time()
             initial_batch = await self.miner_preprocess(data=payload_data)
@@ -520,7 +516,7 @@ class WeatherTask(Task):
             await self.db_manager.execute(insert_query, {
                 "id": job_id,
                 "req_time": datetime.now(timezone.utc),
-                "val_hk": validator_hotkey, # Placeholder - Needs actual validator hotkey
+                "val_hk": validator_hotkey, # Placeholder
                 "gfs_init": gfs_init_time,
                 "gfs_meta": json.dumps(payload_data, default=str),
                 "status": "received",
@@ -528,7 +524,6 @@ class WeatherTask(Task):
             })
             logger.info(f"[Job {job_id}] Initial job record created.")
 
-            # --- Launch Background Task ---
             logger.info(f"[Job {job_id}] Launching background inference task...")
             asyncio.create_task(
                 self._run_inference_background(
@@ -540,7 +535,6 @@ class WeatherTask(Task):
             )
             logger.info(f"[Job {job_id}] Background task launched.")
 
-            # --- Return Immediate Acceptance Response ---
             return {"status": "accepted", "job_id": job_id, "message": "Weather forecast job accepted for processing."}
 
         except Exception as e:
@@ -597,7 +591,7 @@ class WeatherTask(Task):
                 logger.info(f"[Job {job_id}] GPU semaphore acquired. Starting inference.")
                 inference_start_time = time.time()
 
-                # --- Run Inference (Blocking part in thread) ---
+                # Inference (Blocking part in thread)
                 try:
                     def _blocking_inference():
                         return self.inference_runner.run_multistep_inference(initial_batch, steps=40)
@@ -620,11 +614,9 @@ class WeatherTask(Task):
 
                     forecast_datasets = []
                     lead_times_hours = []
-                    base_time = pd.to_datetime(initial_batch.metadata.time[0]) # GFS Init time (T=0)
+                    base_time = pd.to_datetime(initial_batch.metadata.time[0])
 
                     for i, batch in enumerate(selected_predictions_cpu):
-                         # step_index in rollout was odd: 1, 3, 5...
-                         # Corresponding lead times: T+12h, T+24h, T+36h...
                          step_index_original = i * 2 + 1
                          lead_time_hours = (step_index_original + 1) * 6
                          forecast_time = base_time + timedelta(hours=lead_time_hours)
@@ -702,7 +694,7 @@ class WeatherTask(Task):
         if 'verification_hash' in kwargs and kwargs['verification_hash']:
             update_fields.append("verification_hash = :verification_hash")
             params["verification_hash"] = kwargs['verification_hash']
-        if 'error_message' in kwargs: # Allow setting None or a string
+        if 'error_message' in kwargs:
             update_fields.append("error_message = :error_message")
             params["error_message"] = kwargs['error_message']
         if 'end_time' in kwargs and kwargs['end_time']:

@@ -67,7 +67,7 @@ async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: 
                     closest_idx = np.argmin(time_diffs)
                     time_indices.append(closest_idx)
                     actual_time = dataset_times_np[closest_idx]
-                    if abs(vt_np - actual_time) > np.timedelta64(3, 'h'): # GFS interval is often 3 or 6 hrs
+                    if abs(vt_np - actual_time) > np.timedelta64(3, 'h'):
                         logger.warning(f"Requested time {vt} has large difference from closest dataset time {actual_time} at index {closest_idx}")
                     else:
                         logger.debug(f"Requested time {vt} matches dataset time {actual_time} at index {closest_idx}")
