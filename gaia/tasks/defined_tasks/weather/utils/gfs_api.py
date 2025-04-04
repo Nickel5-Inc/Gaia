@@ -1,16 +1,17 @@
 import os
-import logging
+from fiber.logging_utils import get_logger
 from datetime import datetime, timedelta
 from typing import List, Optional, Union, Tuple
 import numpy as np
 import xarray as xr
 import warnings
+import asyncio
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('gfs_api')
+logger = get_logger('gfs_api')
+G = 9.80665
 
-warnings.filterwarnings('ignore', 
-                       message='Ambiguous reference date string', 
+warnings.filterwarnings('ignore',
+                       message='Ambiguous reference date string',
                        category=xr.SerializationWarning,
                        module='xarray.coding.times')
 
@@ -18,196 +19,206 @@ warnings.filterwarnings('ignore',
                        message='numpy.core.numeric is deprecated',
                        category=DeprecationWarning)
 
-def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: Optional[str] = None) -> xr.Dataset:
+async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: Optional[str] = None) -> xr.Dataset:
     """
-    Fetch GFS data for the given run_time and lead_hours using OPeNDAP.
-    
+    Fetch GFS data asynchronously for the given run_time and lead_hours using OPeNDAP.
+
     Args:
         run_time: The model run datetime (e.g., 2023-08-01 00:00)
         lead_hours: List of forecast lead times in hours to retrieve
         output_dir: Optional directory to save NetCDF output (if None, don't save files)
-        
-    Returns:
-        xr.Dataset: Dataset containing all required variables
-    """
-    logger.info(f"Fetching GFS data for run time: {run_time}, lead hours: {lead_hours}")
-    date_str = run_time.strftime('%Y%m%d')
-    cycle_str = f"{run_time.hour:02d}"
 
-    dods_base = "https://nomads.ncep.noaa.gov/dods/gfs_0p25/gfs"
-    base_url = f"{dods_base}{date_str}/gfs_0p25_{cycle_str}z"
-    logger.info(f"Using OPeNDAP URL: {base_url}")
-    
-    aurora_pressure_levels = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
-    
-    aurora_level_indices = [22, 20, 19, 18, 17, 16, 14, 12, 10, 8, 5, 3, 0]
-    
-    level_index_to_value = {
-        0: 1000,   # 1000 hPa
-        3: 925,    # 925 hPa
-        5: 850,    # 850 hPa
-        8: 700,    # 700 hPa
-        10: 600,   # 600 hPa
-        12: 500,   # 500 hPa
-        14: 400,   # 400 hPa
-        16: 300,   # 300 hPa
-        17: 250,   # 250 hPa
-        18: 200,   # 200 hPa
-        19: 150,   # 150 hPa
-        20: 100,   # 100 hPa
-        22: 50     # 50 hPa
-    }
-    
-    surface_vars = ["tmp2m", "ugrd10m", "vgrd10m", "prmslmsl"]
-    atmos_vars = ["tmpprs", "ugrdprs", "vgrdprs", "spfhprs", "hgtprs"]
-    
-    valid_times = [run_time + timedelta(hours=h) for h in lead_hours]
-    
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=xr.SerializationWarning)
-            
-            logger.info("Loading dataset metadata to find time indices and available dimensions")
-            full_ds = xr.open_dataset(base_url, decode_times=True)
-            
-            time_indices = []
-            for vt in valid_times:
-                time_diffs = abs(full_ds.time.values - np.datetime64(vt))
-                closest_idx = np.argmin(time_diffs)
-                time_indices.append(closest_idx)
-                actual_time = full_ds.time.values[closest_idx]
-                logger.info(f"Requested time {vt} matches dataset time {actual_time} at index {closest_idx}")
-            
-            logger.info(f"Loading surface variables: {surface_vars}")
-            surface_ds = full_ds[surface_vars].isel(time=time_indices)
-            
-            atmos_ds = None
-            
-            for var in atmos_vars:
-                logger.info(f"Loading {var} with only the required 13 pressure levels using exact indices")
-                
-                if var in full_ds:
-                    var_ds = full_ds[[var]].isel(time=time_indices, lev=aurora_level_indices)
-                    logger.info(f"Selected pressure levels for {var}: {var_ds.lev.values}")
-                    
-                    if atmos_ds is None:
-                        atmos_ds = var_ds
+    Returns:
+        xr.Dataset: Dataset containing all required variables, processed for Aurora.
+    """
+    logger.info(f"Asynchronously fetching GFS data for run time: {run_time}, lead hours: {lead_hours}")
+
+    def _sync_fetch_and_process():
+        """Synchronous function containing the blocking xarray/OPeNDAP logic."""
+        logger.debug(f"Executing synchronous fetch for {run_time} in thread.")
+        date_str = run_time.strftime('%Y%m%d')
+        cycle_str = f"{run_time.hour:02d}"
+
+        dods_base = "https://nomads.ncep.noaa.gov/dods/gfs_0p25/gfs"
+        base_url = f"{dods_base}{date_str}/gfs_0p25_{cycle_str}z"
+        logger.info(f"Using OPeNDAP URL: {base_url}")
+
+        aurora_pressure_levels = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+        aurora_level_indices = [22, 20, 19, 18, 17, 16, 14, 12, 10, 8, 5, 3, 0]
+
+        surface_vars = ["tmp2m", "ugrd10m", "vgrd10m", "prmslmsl"]
+        atmos_vars = ["tmpprs", "ugrdprs", "vgrdprs", "spfhprs", "hgtprs"]
+
+        valid_times = [run_time + timedelta(hours=h) for h in lead_hours]
+
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=xr.SerializationWarning)
+
+                logger.info("Opening dataset via OPeNDAP (this might take time)...")
+                full_ds = xr.open_dataset(base_url, decode_times=True)
+                logger.info("Dataset metadata loaded. Selecting time indices.")
+
+                time_indices = []
+                dataset_times_np = full_ds.time.values
+                for vt in valid_times:
+                    vt_np = np.datetime64(vt)
+                    time_diffs = np.abs(dataset_times_np - vt_np)
+                    closest_idx = np.argmin(time_diffs)
+                    time_indices.append(closest_idx)
+                    actual_time = dataset_times_np[closest_idx]
+                    if abs(vt_np - actual_time) > np.timedelta64(3, 'h'): # GFS interval is often 3 or 6 hrs
+                        logger.warning(f"Requested time {vt} has large difference from closest dataset time {actual_time} at index {closest_idx}")
                     else:
-                        atmos_ds = xr.merge([atmos_ds, var_ds])
+                        logger.debug(f"Requested time {vt} matches dataset time {actual_time} at index {closest_idx}")
+
+                time_indices = sorted(list(set(time_indices)))
+                logger.info(f"Selected time indices: {time_indices}")
+                logger.info(f"Loading surface variables: {surface_vars} at selected times.")
+                surface_ds = full_ds[surface_vars].isel(time=time_indices).load()
+                logger.info("Surface variables loaded.")
+
+                atmos_ds_list = []
+                for var in atmos_vars:
+                    logger.info(f"Loading atmospheric variable: {var} at selected times and levels.")
+                    if var in full_ds:
+                        var_ds = full_ds[[var]].isel(time=time_indices, lev=aurora_level_indices).load()
+                        logger.debug(f"Loaded {var}, shape: {var_ds[var].shape}")
+                        atmos_ds_list.append(var_ds)
+                    else:
+                        logger.warning(f"Atmospheric variable {var} not found in dataset.")
+
+                if atmos_ds_list:
+                    atmos_ds = xr.merge(atmos_ds_list)
+                    logger.info("Atmospheric variables loaded and merged.")
                 else:
-                    logger.warning(f"Variable {var} not found in dataset")
-            
-            ds = xr.merge([surface_ds, atmos_ds])
-            
-            if 'lev' in ds.dims:
-                actual_levels = [float(lev) for lev in ds.lev.values]
-                logger.info(f"Final pressure levels in dataset: {actual_levels}")
-                
-                if len(actual_levels) != len(aurora_pressure_levels):
-                    logger.warning(f"Expected {len(aurora_pressure_levels)} pressure levels but got {len(actual_levels)}")
-                
-                for i, level in enumerate(aurora_pressure_levels):
-                    if i < len(actual_levels):
-                        if abs(actual_levels[i] - level) > 1:  # Allow 1 hPa difference for floating point
-                            logger.warning(f"Level mismatch: Expected {level} hPa, got {actual_levels[i]} hPa")
-            
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                out_file = os.path.join(output_dir, f"gfs_{date_str}_{cycle_str}z.nc")
-                logger.info(f"Saving data to: {out_file}")
-                ds.to_netcdf(out_file)
-            
-            logger.info("Processing dataset to match Aurora requirements")
-            processed_ds = process_opendap_dataset(ds)
-            
-            return processed_ds
-        
+                    atmos_ds = xr.Dataset()
+
+                full_ds.close()
+                logger.info("Closed remote dataset connection.")
+                ds = xr.merge([surface_ds, atmos_ds])
+
+                if output_dir:
+                    try:
+                        os.makedirs(output_dir, exist_ok=True)
+                        out_file = os.path.join(output_dir, f"gfs_raw_{date_str}_{cycle_str}z.nc")
+                        logger.info(f"Saving raw fetched data to: {out_file}")
+                        ds.to_netcdf(out_file)
+                    except Exception as save_err:
+                         logger.error(f"Failed to save raw NetCDF file: {save_err}")
+
+                logger.info("Processing fetched data for Aurora requirements...")
+                processed_ds = process_opendap_dataset(ds)
+                logger.info("Data processing complete.")
+
+                return processed_ds
+
+        except Exception as e:
+            logger.error(f"Error during synchronous OPeNDAP fetch/process: {e}", exc_info=True)
+            if 'full_ds' in locals() and hasattr(full_ds, 'close'):
+                try: full_ds.close()
+                except: pass
+            raise
+
+    try:
+        result_dataset = await asyncio.to_thread(_sync_fetch_and_process)
+        return result_dataset
     except Exception as e:
-        logger.error(f"Error accessing OPeNDAP: {e}")
-        raise
+        logger.error(f"Async fetch GFS data failed: {e}")
+        return None
+
 
 def process_opendap_dataset(ds: xr.Dataset) -> xr.Dataset:
-    """Process the OPeNDAP dataset to match Aurora's expected format."""
-    var_attrs = {}
-    for var_name in ds.data_vars:
-        var_attrs[var_name] = ds[var_name].attrs.copy()
-    
+    """Process the OPeNDAP dataset to match Aurora's expected format, including Geopotential conversion."""
+    logger.debug("Starting dataset processing...")
+    var_attrs = {var_name: ds[var_name].attrs.copy() for var_name in ds.data_vars}
+
     var_mapping = {
-        'tmp2m': '2t',             # '2m_temperature'
-        'ugrd10m': '10u',          # '10m_u_component_of_wind'
-        'vgrd10m': '10v',          # '10m_v_component_of_wind'
-        'prmslmsl': 'msl',         # 'mean_sea_level_pressure'
-        'tmpprs': 't',             # 'temperature'
-        'ugrdprs': 'u',            # 'u_component_of_wind'
-        'vgrdprs': 'v',            # 'v_component_of_wind'
-        'spfhprs': 'q',            # 'specific_humidity'
-        'hgtprs': 'z',             # 'geopotential'
+        'tmp2m': '2t',
+        'ugrd10m': '10u',
+        'vgrd10m': '10v',
+        'prmslmsl': 'msl',
+        'tmpprs': 't',
+        'ugrdprs': 'u',
+        'vgrdprs': 'v',
+        'spfhprs': 'q',
+        'hgtprs': 'z_height',
     }
-    
+
     new_ds = xr.Dataset(coords=ds.coords)
+    found_vars = []
     for old_name, new_name in var_mapping.items():
         if old_name in ds:
-            new_ds[new_name] = ds[old_name].copy()
+            new_ds[new_name] = ds[old_name].copy(deep=True)
             if old_name in var_attrs:
-                new_ds[new_name].attrs = var_attrs[old_name]
-    
-    ds = new_ds
+                 new_ds[new_name].attrs = var_attrs[old_name]
+            found_vars.append(new_name)
+        else:
+            logger.debug(f"Variable {old_name} not found in input dataset.")
+
+    logger.debug(f"Renamed variables present: {found_vars}")
+
+    if 'z_height' in new_ds:
+        logger.info("Converting Geopotential Height (z_height) to Geopotential (z)...")
+        z_height_var = new_ds['z_height']
+        geopotential = G * z_height_var
+        new_ds['z'] = geopotential
+        new_ds['z'].attrs['units'] = 'm2 s-2'
+        new_ds['z'].attrs['long_name'] = 'Geopotential'
+        new_ds['z'].attrs['standard_name'] = 'geopotential'
+        new_ds['z'].attrs['comment'] = f'Calculated as g * z_height, with g={G} m/s^2'
+        del new_ds['z_height']
+        logger.info("Geopotential (z) calculated and added.")
+    elif 'z' not in new_ds:
+        logger.warning("Geopotential Height (hgtprs/z_height) not found, cannot calculate Geopotential (z).")
+
+
+    # Units 
     default_units = {
-        '2t': 'K',                    # Temperature in Kelvin
-        '10u': 'm s-1',               # Wind in meters per second
-        '10v': 'm s-1',               # Wind in meters per second
-        'msl': 'Pa',                  # Pressure in Pascal
-        't': 'K',                     # Temperature in Kelvin
-        'u': 'm s-1',                 # Wind in meters per second
-        'v': 'm s-1',                 # Wind in meters per second
-        'q': 'kg kg-1',               # Specific humidity in kg/kg
-        'z': 'm2 s-2'                 # Geopotential in m²/s²
+        '2t': 'K', '10u': 'm s-1', '10v': 'm s-1', 'msl': 'Pa',
+        't': 'K', 'u': 'm s-1', 'v': 'm s-1', 'q': 'kg kg-1', 'z': 'm2 s-2'
     }
-    
-    for var_name, units in default_units.items():
-        if var_name in ds and ('units' not in ds[var_name].attrs or not ds[var_name].attrs['units']):
-            ds[var_name].attrs['units'] = units
-    
-    if 'msl' in ds:
-        sample_value = float(ds['msl'].isel(time=0, lat=0, lon=0).values)
-        if 900 < sample_value < 1100:
-            logger.info("Converting mean sea level pressure from hPa to Pa")
-            ds['msl'] = ds['msl'] * 100.0
-            ds['msl'].attrs['units'] = 'Pa'
-    
-    if 'lat' in ds.coords:
-        lat_orientation = "decreasing" if ds.lat[0] > ds.lat[-1] else "increasing"
-        logger.info(f"Latitude orientation: {lat_orientation} (first: {ds.lat[0].item():.2f}, last: {ds.lat[-1].item():.2f})")
-        
-        if lat_orientation != "decreasing":
-            logger.info("Flipping latitudes to match Aurora requirements (90 to -90)")
-            ds = ds.reindex(lat=ds.lat[::-1])
-    
-    if 'lon' in ds.coords:
-        lon_range = f"[{ds.lon.min().item():.2f}, {ds.lon.max().item():.2f}]"
-        logger.info(f"Longitude range: {lon_range}")
-        
-        if ds.lon.min() < 0:
-            logger.info("Converting longitude range from [-180, 180] to [0, 360)")
-            ds = ds.assign_coords(lon=(ds.lon % 360))
-            ds = ds.sortby('lon')
-    
-    logger.info(f"Grid dimensions: {len(ds.lat)}x{len(ds.lon)}")
-    
-    if len(ds.lat) != 721 or len(ds.lon) != 1440:
-        logger.warning(f"Grid dimensions {len(ds.lat)}x{len(ds.lon)} don't match Aurora requirements (721x1440)")
-    
-    return ds
+
+    for var_name, expected_units in default_units.items():
+        if var_name in new_ds:
+            current_units = new_ds[var_name].attrs.get('units', '').lower()
+            if not current_units:
+                logger.debug(f"Assigning default units '{expected_units}' to {var_name}.")
+                new_ds[var_name].attrs['units'] = expected_units
+            elif var_name == 'msl' and current_units in ['hpa', 'millibars', 'mb']:
+                logger.info(f"Converting MSL pressure from {current_units} to Pa.")
+                new_ds['msl'] = new_ds['msl'] * 100.0
+                new_ds['msl'].attrs['units'] = 'Pa'
+            elif current_units != expected_units.lower():
+                 logger.warning(f"Unexpected units for {var_name}. Expected '{expected_units}', found '{current_units}'. No conversion applied.")
+
+    if 'lat' in new_ds.coords:
+        if new_ds.lat.values[0] < new_ds.lat.values[-1]:
+            logger.info("Reversing latitude coordinate to be decreasing (90 to -90).")
+            new_ds = new_ds.reindex(lat=new_ds.lat[::-1])
+
+    if 'lon' in new_ds.coords:
+        if new_ds.lon.values.min() < -1.0
+            logger.info("Adjusting longitude coordinate from [-180, 180] to [0, 360).")
+            new_ds = new_ds.assign_coords(lon=(((new_ds.lon + 180) % 360) - 180 + 360) % 360) # Careful conversion
+            new_ds = new_ds.sortby('lon')
+        elif new_ds.lon.values.max() >= 360.0:
+             logger.info("Adjusting longitude to be strictly < 360.")
+             new_ds = new_ds.sel(lon=new_ds.lon < 360.0)
+
+    logger.debug("Dataset processing finished.")
+    return new_ds
+
 
 def get_consecutive_lead_hours(first_lead: int, last_lead: int, interval: int = 6) -> List[int]:
     """
     Generate a list of consecutive lead hours at specified intervals.
-    
+
     Args:
         first_lead: The first lead hour to include
         last_lead: The last lead hour to include
         interval: Hour interval between lead times
-        
+
     Returns:
         List[int]: List of lead hours
     """

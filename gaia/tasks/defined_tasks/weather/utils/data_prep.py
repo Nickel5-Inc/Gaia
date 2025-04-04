@@ -113,7 +113,6 @@ def prepare_aurora_batch(
             logger.info(f"Filtering {var_name} to Aurora supported pressure levels")
             gfs_data[var_name] = gfs_data[var_name].sel(lev=aurora_pressure_levels, method="nearest")
     
-    # Check if we have enough time steps for history
     if 'time' in gfs_data.dims and len(gfs_data.time) < history_steps:
         raise ValueError(f"Need at least {history_steps} time steps, but only have {len(gfs_data.time)}")
     
@@ -128,44 +127,33 @@ def prepare_aurora_batch(
         gfs_data = gfs_data.assign_coords(lon=(gfs_data.lon % 360))
         gfs_data = gfs_data.sortby('lon')
     
-    # Select specific lead time if requested
     if lead_time is not None and 'time' in gfs_data.dims:
         gfs_data = gfs_data.isel(time=slice(lead_time, lead_time + history_steps))
     
-    # Initialize variables for Aurora Batch
     surface_vars = {}
     atmos_vars = {}
     
-    # Define variable lists
     surf_var_names = ['2t', '10u', '10v', 'msl']
     atmos_var_names = ['t', 'u', 'v', 'q', 'z']
     
-    # Convert to numpy arrays and create tensors
-    # For surface variables: (batch_size, time_steps, lat, lon)
     for var_name in surf_var_names:
         if var_name in gfs_data:
-            # Get data and ensure it has shape (time, lat, lon)
             var_data = gfs_data[var_name].values
             
-            # Add batch dimension if not processing multiple forecasts
-            var_data = var_data[-history_steps:].copy()  # Get the last 'history_steps' time steps
-            var_data = var_data[None, ...]  # Add batch dimension
+            var_data = var_data[-history_steps:].copy()
+            var_data = var_data[None, ...]
             
-            # Convert to torch tensor
             surface_vars[var_name] = torch.from_numpy(var_data)
         else:
             logger.warning(f"Surface variable {var_name} not found in GFS data")
     
-    # For atmospheric variables: (batch_size, time_steps, pressure_levels, lat, lon)
     for var_name in atmos_var_names:
         if var_name in gfs_data and 'lev' in gfs_data[var_name].dims:
-            # Get data with shape (time, level, lat, lon)
             var_data = gfs_data[var_name].values
             
-            var_data = var_data[-history_steps:].copy()  # Get the last 'history_steps' time steps
-            var_data = var_data[None, ...]  # Add batch dimension
+            var_data = var_data[-history_steps:].copy()
+            var_data = var_data[None, ...]
             
-            # Convert to torch tensor
             atmos_vars[var_name] = torch.from_numpy(var_data)
         elif var_name in gfs_data:
             logger.warning(f"Atmospheric variable {var_name} has no level dimension")
@@ -187,7 +175,6 @@ def prepare_aurora_batch(
         time_tuples = (datetime.now(),)
     
     # Always use Aurora's supported pressure levels for metadata
-    # This ensures compatibility with the normalization function
     pressure_levels = tuple(aurora_pressure_levels)
     logger.info(f"Using pressure levels for Aurora: {pressure_levels}")
     
@@ -229,7 +216,6 @@ def create_aurora_batch_from_gfs(
     Returns:
         Batch: An Aurora Batch object ready for input to the model
     """
-    # Make sure we have required packages
     try:
         import pandas as pd
     except ImportError:
