@@ -1,5 +1,5 @@
 from functools import partial
-from fastapi import Depends, Request
+from fastapi import Depends, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.routing import APIRouter
 from pydantic import BaseModel
@@ -20,17 +20,27 @@ import json
 from pydantic import ValidationError
 import os
 from pathlib import Path
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt
 
-# Define max request size (5MB in bytes)
-MAX_REQUEST_SIZE = 5 * 1024 * 1024  # 5MB
+MAX_REQUEST_SIZE = 100 * 1024 * 1024  # 100MB
 
 logger = get_logger(__name__)
 
-# --- Forecast File Storage ---
 DEFAULT_FORECAST_DIR = Path("./miner_forecasts/")
 MINER_FORECAST_DIR = Path(os.getenv("MINER_FORECAST_DIR", DEFAULT_FORECAST_DIR))
 MINER_FORECAST_DIR.mkdir(parents=True, exist_ok=True)
 logger.info(f"Serving forecast files from: {MINER_FORECAST_DIR.resolve()}")
+
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 120
+
+MINER_JWT_SECRET_KEY = os.getenv("MINER_JWT_SECRET_KEY")
+if not MINER_JWT_SECRET_KEY:
+    logger.warning("MINER_JWT_SECRET_KEY not set in environment. Using default insecure key.")
+    MINER_JWT_SECRET_KEY = "insecure_default_key_for_development_only"
+
+security = HTTPBearer()
 
 class DataModel(BaseModel):
     name: str
@@ -49,16 +59,12 @@ class SoilmoistureRequest(BaseModel):
     data: SoilMoisturePayload
 
 
-# --- Models for Weather Forecast Request (Validator Sends Input) ---
 class WeatherInputData(BaseModel):
     """ Defines the structure for the input data sent by the validator to trigger a forecast run."""
     forecast_start_time: datetime = Field(..., description="ISO 8601 timestamp for the forecast initialization time.")
     gfs_timestep_1: Dict[str, Any] = Field(..., description="Data for the first GFS input timestep. Structure TBD (e.g., dict mapping variable names to base64 encoded numpy arrays or similar).")
     gfs_timestep_2: Dict[str, Any] = Field(..., description="Data for the second GFS input timestep. Structure TBD.")
-    # Optional: Add other necessary metadata like grid info if not implicitly known by the miner
-    # grid_metadata: Dict[str, Any] | None = None 
     class Config:
-        # Allows using datetime objects directly
         arbitrary_types_allowed = True 
 
 class WeatherForecastRequest(BaseModel):
@@ -160,8 +166,29 @@ def factory_router(miner_instance) -> APIRouter:
                 status_code=500, content={"error": f"Internal server error: {str(e)}"}
             )
             
-    async def get_forecast_file(filename: str):
+    async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+        """Verify JWT token and return decoded payload."""
         try:
+            token = credentials.credentials
+            payload = jwt.decode(
+                token,
+                MINER_JWT_SECRET_KEY,
+                algorithms=[JWT_ALGORITHM]
+            )
+            
+            if datetime.fromtimestamp(payload["exp"], tz=timezone.utc) < datetime.now(timezone.utc):
+                raise HTTPException(status_code=401, detail="Token has expired")
+            
+            return payload
+        except jwt.PyJWTError as e:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+    async def get_forecast_file(filename: str, token_payload: dict = Depends(verify_token)):
+        """Serve forecast file with JWT validation."""
+        try:
+            if token_payload.get("file_path") != filename:
+                raise HTTPException(status_code=403, detail="Token not valid for this file")
+            
             file_path = (MINER_FORECAST_DIR / filename).resolve()
 
             if not file_path.is_file() or MINER_FORECAST_DIR.resolve() not in file_path.parents:
@@ -175,6 +202,8 @@ def factory_router(miner_instance) -> APIRouter:
                 media_type='application/x-netcdf'
             )
             
+        except HTTPException as e:
+            raise e
         except Exception as e:
             logger.error(f"Error serving forecast file {filename}: {e}")
             logger.error(traceback.format_exc())
@@ -196,28 +225,37 @@ def factory_router(miner_instance) -> APIRouter:
                 return JSONResponse(status_code=500, content={"error": "Miner not configured for weather task"})
             
             input_data = decrypted_payload.data.model_dump()
-            
             logger.info(f"Initiating weather forecast run for start time: {input_data.get('forecast_start_time')}")
             
-            # Trigger the asynchronous forecast generation process in WeatherTask
-            # This method needs to accept the validator-provided input data.
-            # TODO: Implement miner_instance.weather_task.execute_validator_driven_run
-            # result = await miner_instance.weather_task.execute_validator_driven_run(input_data, miner_instance)
+            result = await miner_instance.weather_task.miner_execute(input_data, miner_instance)
             
-            # Placeholder
-            forecast_id = f"forecast_{input_data.get('forecast_start_time')}_{miner_instance.keypair.ss58_address[:8]}"
-            logger.info(f"Weather forecast run initiated successfully. ID: {forecast_id}")
-            result = {"status": "success", "message": "Forecast run initiated", "forecast_id": forecast_id}
+            if not result:
+                logger.error("Weather forecast execution failed")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "Failed to execute weather forecast"}
+                )
             
-            return JSONResponse(content=result)
+            return JSONResponse(content={
+                "status": "success",
+                "message": "Forecast run initiated",
+                "job_id": result.get("job_id"),
+                "forecast_start_time": input_data.get("forecast_start_time")
+            })
 
         except ValidationError as e:
-             logger.error(f"Validation error processing weather forecast request: {e}")
-             return JSONResponse(status_code=422, content={"error": "Invalid request payload structure", "details": e.errors()})
+            logger.error(f"Validation error processing weather forecast request: {e}")
+            return JSONResponse(
+                status_code=422,
+                content={"error": "Invalid request payload structure", "details": e.errors()}
+            )
         except Exception as e:
             logger.error(f"Error processing weather forecast request: {e}")
             logger.error(traceback.format_exc())
-            return JSONResponse(status_code=500, content={"error": f"Internal server error: {str(e)}"})
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Internal server error: {str(e)}"}
+            )
 
     class WeatherKerchunkRequest(BaseModel):
         nonce: str | None = None
@@ -241,16 +279,22 @@ def factory_router(miner_instance) -> APIRouter:
             request_data = decrypted_payload.data 
             logger.info(f"Handling weather kerchunk request...")
             
-            # TODO: Implement miner_instance.weather_task.handle_kerchunk_request
-            # kerchunk_json = await miner_instance.weather_task.handle_kerchunk_request(request_data, miner_instance)
+            job_id = request_data.get('job_id')
+            if not job_id:
+                logger.error("Missing job_id in request data")
+                return JSONResponse(status_code=400, content={"error": "Missing job_id in request"})
             
-            kerchunk_json = {"version": 1, "refs": {".zgroup": "{\"zarr_format\": 2}"}, "message": "placeholder - implement handle_kerchunk_request in WeatherTask"}
+            response_dict = await miner_instance.weather_task.handle_kerchunk_request(job_id)
             
-            if kerchunk_json:
-                return JSONResponse(content=kerchunk_json)
-            else:
-                logger.warning(f"Kerchunk JSON not found for request data: {request_data}")
-                return JSONResponse(status_code=404, content={"error": "Kerchunk JSON not found for specified forecast"})
+            response_data = WeatherKerchunkResponseData(
+                status=response_dict['status'],
+                message=response_dict['message'],
+                kerchunk_json_url=response_dict.get('kerchunk_json_url'),
+                verification_hash=response_dict.get('verification_hash'),
+                access_token=response_dict.get('access_token')
+            )
+            
+            return JSONResponse(content=response_data.model_dump())
 
         except Exception as e:
             logger.error(f"Error processing weather kerchunk request: {e}")
