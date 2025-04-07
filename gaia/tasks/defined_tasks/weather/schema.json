@@ -93,6 +93,61 @@
         ],
         "comment": "Stores calculated scores and metrics for each verified miner response."
     },
+    "weather_ensemble_forecasts": {
+        "table_name": "weather_ensemble_forecasts",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "run_id": "INTEGER NOT NULL",
+            "creation_time": "TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            "ensemble_netcdf_path": "TEXT",
+            "ensemble_kerchunk_path": "TEXT",
+            "verification_hash": "VARCHAR(64)",
+            "status": "VARCHAR(50) NOT NULL DEFAULT 'pending'",
+            "error_message": "TEXT"
+        },
+        "indexes": [
+            {"column": "run_id", "unique": true}
+        ],
+        "foreign_keys": [
+            {
+                "column": "run_id",
+                "references": "weather_forecast_runs(id)",
+                "on_delete": "CASCADE"
+            }
+        ],
+        "comment": "Stores ensemble forecast information created by combining multiple miner forecasts."
+    },
+    "weather_ensemble_components": {
+        "table_name": "weather_ensemble_components",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "ensemble_id": "INTEGER NOT NULL",
+            "response_id": "INTEGER NOT NULL",
+            "weight": "FLOAT NOT NULL",
+            "variable": "VARCHAR(50)",
+            "level": "VARCHAR(50)",
+            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+        },
+        "indexes": [
+            {"column": "ensemble_id", "unique": false},
+            {"column": "response_id", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "ensemble_id",
+                "references": "weather_ensemble_forecasts(id)",
+                "on_delete": "CASCADE"
+            },
+            {
+                "column": "response_id",
+                "references": "weather_miner_responses(id)",
+                "on_delete": "CASCADE"
+            }
+        ],
+        "comment": "Tracks which miner forecasts are included in an ensemble and their weights."
+    },
     "weather_historical_weights": {
         "table_name": "weather_historical_weights",
         "database_type": "validator",
@@ -113,20 +168,22 @@
         "database_type": "miner",
         "columns": {
             "id": "SERIAL PRIMARY KEY",
+            "job_id": "VARCHAR(100) UNIQUE NOT NULL",
             "validator_request_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
             "validator_hotkey": "VARCHAR(255)",
             "gfs_init_time_utc": "TIMESTAMP WITH TIME ZONE NOT NULL",
             "gfs_input_metadata": "JSONB",
             "processing_start_time": "TIMESTAMP WITH TIME ZONE",
             "processing_end_time": "TIMESTAMP WITH TIME ZONE",
-            "output_netcdf_path": "TEXT",
-            "output_kerchunk_path": "TEXT",
+            "target_netcdf_path": "TEXT",
+            "kerchunk_json_path": "TEXT",
             "verification_hash": "VARCHAR(64)",
             "ipfs_cid": "VARCHAR(255)",
             "status": "VARCHAR(50) NOT NULL DEFAULT 'received'",
             "error_message": "TEXT"
         },
         "indexes": [
+            {"column": "job_id", "unique": true},
             {"column": "validator_request_time", "unique": false},
             {"column": "gfs_init_time_utc", "unique": false},
             {"column": "status", "unique": false}

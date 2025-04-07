@@ -18,6 +18,7 @@ import xarray as xr
 import pickle
 import base64
 import jwt
+import numpy as np
 
 # --- Aurora Imports (Ensure these are available in the environment) ---
 try:
@@ -54,9 +55,10 @@ MINER_FORECAST_DIR_BG = Path(os.getenv("MINER_FORECAST_DIR", DEFAULT_FORECAST_DI
 MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
 
 # JWT Configuration
-MINER_JWT_SECRET_KEY = os.getenv("MINER_JWT_SECRET_KEY", "default-insecure-secret-key-replace-me")
-if MINER_JWT_SECRET_KEY == "default-insecure-secret-key-replace-me":
-    logger.warning("Using default insecure JWT secret key. Set MINER_JWT_SECRET_KEY environment variable for production.")
+MINER_JWT_SECRET_KEY = os.getenv("MINER_JWT_SECRET_KEY")
+if not MINER_JWT_SECRET_KEY:
+    logger.warning("MINER_JWT_SECRET_KEY not set in environment. Using default insecure key.")
+    MINER_JWT_SECRET_KEY = "insecure_default_key_for_development_only"
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 15 # Token validity duration
 
@@ -527,22 +529,7 @@ class WeatherTask(Task):
 
             logger.info(f"Processing request for GFS init time: {gfs_init_time}")
 
-            existing_job_query = """
-                SELECT id, status
-                FROM weather_miner_jobs
-                WHERE gfs_init_time_utc = :gfs_init
-                  AND status != 'error'
-                ORDER BY
-                    CASE status
-                        WHEN 'completed' THEN 1
-                        WHEN 'processing' THEN 2
-                        WHEN 'received' THEN 3
-                        ELSE 4
-                    END,
-                    validator_request_time DESC
-                LIMIT 1;
-            """
-            existing_job = await self.db_manager.fetch_one(existing_job_query, {"gfs_init": gfs_init_time})
+            existing_job = await self.get_job_by_gfs_init_time(gfs_init_time)
 
             if existing_job:
                 existing_job_id = existing_job['id']
@@ -600,94 +587,91 @@ class WeatherTask(Task):
 
     async def handle_kerchunk_request(self, job_id: str) -> Dict[str, Any]:
         """
-        Handles the validator's request for results (Kerchunk JSON, hash, token) for a given job ID.
-        Queries the miner's local database to check the job status and retrieve results if ready.
-
+        Handle a request for Kerchunk JSON metadata for a specific forecast job.
+        
         Args:
-            job_id: The unique ID of the job being queried.
-
+            job_id: The unique identifier for the job
+            
         Returns:
-            A dictionary containing the status and results:
-            {
-                "status": "completed" | "pending" | "error" | "not_found",
-                "message": Optional[str],
-                "kerchunk_json_path": Optional[str],
-                "verification_hash": Optional[str],
-                "access_token": Optional[str]
-            }
+            Dict containing status, message, and if completed:
+            - kerchunk_json_url: URL to access the Kerchunk JSON
+            - verification_hash: Hash to verify forecast integrity
+            - access_token: JWT token for accessing forecast files
         """
-        logger.info(f"[Job {job_id}] Handling Kerchunk/result request.")
-
-        if not self.db_manager:
-            logger.error(f"[Job {job_id}] Database manager not available.")
-            return {"status": "error", "message": "Internal server error: DB unavailable."}
-
-        query = """
-            SELECT
-                status,
-                output_kerchunk_path,
-                verification_hash,
-                error_message
-            FROM weather_miner_jobs
-            WHERE id = :job_id
-        """
+        logger.info(f"Handling kerchunk request for job_id: {job_id}")
+        
         try:
-            job_record = await self.db_manager.fetch_one(query, {"job_id": job_id})
-        except Exception as db_err:
-            logger.error(f"[Job {job_id}] Database error querying job status: {db_err}", exc_info=True)
-            return {"status": "error", "message": "Internal server error: Failed to query job status."}
-
-        if not job_record:
-            logger.warning(f"[Job {job_id}] Job ID not found in database.")
-            return {"status": "not_found", "message": "Job ID not found."}
-
-        status = job_record.get('status')
-        logger.info(f"[Job {job_id}] Found job with status: {status}")
-
-        if status == 'completed':
-            kerchunk_path_str = job_record.get('output_kerchunk_path')
-            verification_hash = job_record.get('verification_hash')
-            if not kerchunk_path_str or not verification_hash:
-                 logger.error(f"[Job {job_id}] Job marked completed, but missing kerchunk path or hash in DB.")
-                 return {"status": "error", "message": "Internal error: Job complete but results missing."}
-
-            try:
-                kerchunk_path = Path(kerchunk_path_str)
-                if not kerchunk_path.exists():
-                    logger.error(f"[Job {job_id}] Kerchunk file path found in DB ({kerchunk_path_str}) but file does not exist on disk.")
-                    return {"status": "error", "message": "Internal error: Result file missing."}
-
-                expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-                relative_kerchunk_path = str(kerchunk_path.relative_to(MINER_FORECAST_DIR_BG))
-                token_payload = {
-                    "sub": job_id,
-                    "file_path": relative_kerchunk_path,
-                    "exp": expire
+            # Query the job status from the database
+            query = """
+            SELECT job_id, status, target_netcdf_path, kerchunk_json_path, verification_hash, error_message
+            FROM weather_miner_jobs
+            WHERE job_id = :job_id
+            """
+            job = await self.db_manager.fetch_one(query, {"job_id": job_id})
+            
+            if not job:
+                logger.warning(f"Job not found for job_id: {job_id}")
+                return {
+                    "status": "error",
+                    "message": f"Job with ID {job_id} not found"
                 }
-                access_token = jwt.encode(token_payload, MINER_JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
-                logger.info(f"[Job {job_id}] Generated access token expiring at {expire}. Granting access to {relative_kerchunk_path}")
-
+                
+            # Check the job status
+            if job["status"] == "completed":
+                # Get the filename from the path
+                netcdf_path = job["target_netcdf_path"]
+                if not netcdf_path:
+                    return {
+                        "status": "error",
+                        "message": "NetCDF path not set for completed job"
+                    }
+                    
+                # Extract just the filename from the path
+                filename = os.path.basename(netcdf_path)
+                
+                # Generate access token for this file
+                token_data = {
+                    "job_id": job_id,
+                    "file_path": filename,
+                    "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+                }
+                
+                access_token = jwt.encode(
+                    token_data,
+                    MINER_JWT_SECRET_KEY,
+                    algorithm=JWT_ALGORITHM
+                )
+                
+                # Return the completed job information with token
+                kerchunk_url = f"/forecasts/{os.path.basename(job['kerchunk_json_path'])}"
+                
                 return {
                     "status": "completed",
-                    "message": "Job completed successfully.",
-                    "kerchunk_json_path": relative_kerchunk_path,
-                    "verification_hash": verification_hash,
+                    "message": "Forecast completed and ready for access",
+                    "kerchunk_json_url": kerchunk_url,
+                    "verification_hash": job["verification_hash"],
                     "access_token": access_token
                 }
-            except Exception as token_err:
-                 logger.error(f"[Job {job_id}] Failed to generate access token or process path: {token_err}", exc_info=True)
-                 return {"status": "error", "message": "Internal error: Failed to prepare access token."}
-
-        elif status in ['processing', 'received']:
-            logger.info(f"[Job {job_id}] Job is still pending ({status}).")
-            return {"status": "pending", "message": f"Job processing is not yet complete (status: {status})."}
-        elif status == 'error':
-            error_msg = job_record.get('error_message', 'An unknown error occurred.')
-            logger.warning(f"[Job {job_id}] Job resulted in an error: {error_msg}")
-            return {"status": "error", "message": f"Job failed: {error_msg}"}
-        else:
-            logger.error(f"[Job {job_id}] Encountered unexpected job status: {status}")
-            return {"status": "error", "message": f"Internal error: Unexpected job status '{status}'."}
+                
+            elif job["status"] == "error":
+                return {
+                    "status": "error",
+                    "message": f"Job failed: {job['error_message'] or 'Unknown error'}"
+                }
+                
+            else:
+                # Job is still processing
+                return {
+                    "status": "processing",
+                    "message": f"Job is currently in status: {job['status']}"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error handling kerchunk request for job_id {job_id}: {e}", exc_info=True)
+            return {
+                "status": "error",
+                "message": f"Failed to process request: {str(e)}"
+            }
 
     ############################################################
     # Helper Methods
@@ -709,48 +693,39 @@ class WeatherTask(Task):
 
     async def _run_inference_background(self, initial_batch: Batch, job_id: str, gfs_init_time: datetime, miner_hotkey: str):
         """
-        Runs the heavy inference, saves results, and updates the DB job status.
-        Designed to be run via asyncio.create_task.
+        Runs the weather forecast inference as a background task.
+        
+        Args:
+            initial_batch: The preprocessed Aurora batch
+            job_id: The unique job identifier
+            gfs_init_time: The GFS initialization time
+            miner_hotkey: The miner's hotkey
         """
-        start_time = time.time()
-        logger.info(f"[Job {job_id}] Background inference task started.")
-
-        if self.inference_runner is None or self.gpu_semaphore is None:
-             logger.error(f"[Job {job_id}] Inference runner or semaphore not initialized. Aborting background task.")
-             await self._update_job_status(job_id, 'error', error_message="Miner inference component not ready.")
-             return
-
-        output_netcdf_path_str = None
-        output_kerchunk_path_str = None
-        computed_hash = None
-        final_status = 'error'
-        error_message_log = "An unspecified error occurred in the background task."
-
+        logger.info(f"[Job {job_id}] Starting background inference task...")
+        
         try:
-            await self._update_job_status(job_id, 'processing')
-
-            logger.info(f"[Job {job_id}] Waiting to acquire GPU semaphore...")
+            await self.update_job_status(job_id, "processing")
+            
+            logger.info(f"[Job {job_id}] Waiting for GPU semaphore...")
             async with self.gpu_semaphore:
-                logger.info(f"[Job {job_id}] GPU semaphore acquired. Starting inference.")
-                inference_start_time = time.time()
-
-                # Inference (Blocking part in thread)
+                logger.info(f"[Job {job_id}] Acquired GPU semaphore, running inference...")
+                
                 try:
-                    def _blocking_inference():
-                        return self.inference_runner.run_multistep_inference(initial_batch, steps=40)
-
-                    selected_predictions_cpu: List[Batch] = await asyncio.to_thread(_blocking_inference)
-                    logger.info(f"[Job {job_id}] Inference completed in {time.time() - inference_start_time:.2f} seconds. Received {len(selected_predictions_cpu)} prediction steps.")
-
-                except Exception as inference_err:
-                     logger.error(f"[Job {job_id}] Error during model inference: {inference_err}", exc_info=True)
-                     error_message_log = f"Model inference failed: {inference_err}"
-                     raise
-
-            logger.info(f"[Job {job_id}] Processing and saving results...")
-            processing_start_time = time.time()
-
+                    selected_predictions_cpu = await asyncio.to_thread(
+                        self.inference_runner.run_multistep_inference,
+                        initial_batch,
+                        steps=40  # 40 steps of 6h each = 10 days
+                    )
+                    logger.info(f"[Job {job_id}] Inference completed with {len(selected_predictions_cpu)} time steps")
+                    
+                except Exception as infer_err:
+                    logger.error(f"[Job {job_id}] Inference failed: {infer_err}", exc_info=True)
+                    await self.update_job_status(job_id, "error", error_message=f"Inference error: {infer_err}")
+                    return
+            
             try:
+                MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
+                
                 def _blocking_save_and_process():
                     if not selected_predictions_cpu:
                         raise ValueError("Inference returned no prediction steps.")
@@ -760,67 +735,91 @@ class WeatherTask(Task):
                     base_time = pd.to_datetime(initial_batch.metadata.time[0])
 
                     for i, batch in enumerate(selected_predictions_cpu):
-                         step_index_original = i * 2 + 1
-                         lead_time_hours = (step_index_original + 1) * 6
-                         forecast_time = base_time + timedelta(hours=lead_time_hours)
+                        step_index_original = i * 2 + 1
+                        lead_time_hours = (step_index_original + 1) * 6
+                        forecast_time = base_time + timedelta(hours=lead_time_hours)
 
-                         ds_step = batch.to_xarray_dataset()
-                         ds_step = ds_step.assign_coords(time=[forecast_time])
-                         ds_step = ds_step.expand_dims('time')
-                         forecast_datasets.append(ds_step)
-                         lead_times_hours.append(lead_time_hours)
+                        ds_step = batch.to_xarray_dataset()
+                        ds_step = ds_step.assign_coords(time=[forecast_time])
+                        ds_step = ds_step.expand_dims('time')
+                        forecast_datasets.append(ds_step)
+                        lead_times_hours.append(lead_time_hours)
 
                     combined_forecast_ds = xr.concat(forecast_datasets, dim='time')
                     combined_forecast_ds = combined_forecast_ds.assign_coords(lead_time=('time', lead_times_hours))
                     logger.info(f"[Job {job_id}] Combined forecast dimensions: {combined_forecast_ds.dims}")
 
-
                     gfs_time_str = gfs_init_time.strftime('%Y%m%d%H')
                     unique_suffix = str(uuid.uuid4())[:8]
                     filename_nc = f"weather_forecast_{gfs_time_str}_{miner_hotkey[:8]}_{unique_suffix}.nc"
                     output_nc_path = MINER_FORECAST_DIR_BG / filename_nc
+                    
                     combined_forecast_ds.to_netcdf(output_nc_path)
                     logger.info(f"[Job {job_id}] Saved forecast to NetCDF: {output_nc_path}")
-
-                    filename_json = f"{output_nc_path.stem}.json"
-                    output_json_path = output_nc_path.with_suffix('.json')
-                    kerchunk_refs = generate_kerchunk_json_from_local_file(
-                         str(output_nc_path),
-                         output_json_path=str(output_json_path)
-                    )
-                    if not output_json_path.exists():
-                         raise RuntimeError("Kerchunk JSON file was not created.")
+                    
+                    filename_json = f"{os.path.splitext(filename_nc)[0]}.json"
+                    output_json_path = MINER_FORECAST_DIR_BG / filename_json
+                    
+                    from kerchunk.hdf import SingleHdf5ToZarr
+                    h5chunks = SingleHdf5ToZarr(str(output_nc_path), inline_threshold=0)
+                    kerchunk_metadata = h5chunks.translate()
+                    
+                    with open(output_json_path, 'w') as f:
+                        json.dump(kerchunk_metadata, f)
                     logger.info(f"[Job {job_id}] Generated Kerchunk JSON: {output_json_path}")
-
-                    local_hash = compute_verification_hash(str(output_nc_path), str(output_json_path))
-                    logger.info(f"[Job {job_id}] Computed verification hash: {local_hash}")
-
-                    return str(output_nc_path), str(output_json_path), local_hash
-
-                output_netcdf_path_str, output_kerchunk_path_str, computed_hash = await asyncio.to_thread(_blocking_save_and_process)
-                final_status = 'completed'
-                error_message_log = None
-                logger.info(f"[Job {job_id}] Result processing completed in {time.time() - processing_start_time:.2f} seconds.")
-
-            except Exception as proc_err:
-                 logger.error(f"[Job {job_id}] Error processing/saving results: {proc_err}", exc_info=True)
-                 error_message_log = f"Result processing/saving failed: {proc_err}"
-
-        except Exception as bg_err:
-             logger.error(f"[Job {job_id}] Unhandled error in background task: {bg_err}", exc_info=True)
-             error_message_log = f"Background task failed: {bg_err}"
-
-        finally:
-             await self._update_job_status(
-                 job_id,
-                 final_status,
-                 netcdf_path=output_netcdf_path_str,
-                 kerchunk_path=output_kerchunk_path_str,
-                 verification_hash=computed_hash,
-                 error_message=error_message_log,
-                 end_time=datetime.now(timezone.utc)
-             )
-             logger.info(f"[Job {job_id}] Background task finished with status '{final_status}' in {time.time() - start_time:.2f} seconds.")
+                    
+                    from gaia.tasks.defined_tasks.weather.utils.hashing import compute_verification_hash
+                    
+                    forecast_metadata = {
+                        "time": [base_time],
+                        "source_model": "aurora",
+                        "resolution": 0.25
+                    }
+                    
+                    variables_to_hash = ["2t", "10u", "10v", "msl", "z", "u", "v", "t", "q"]
+                    timesteps_to_hash = list(range(len(forecast_datasets)))
+                
+                    data_for_hash = {
+                        "surf_vars": {},
+                        "atmos_vars": {}
+                    }
+                    
+                    for var in combined_forecast_ds.data_vars:
+                        if var in ["2t", "10u", "10v", "msl"]:
+                            data_for_hash["surf_vars"][var] = combined_forecast_ds[var].values[np.newaxis, :]
+                        elif var in ["z", "u", "v", "t", "q"]:
+                            data_for_hash["atmos_vars"][var] = combined_forecast_ds[var].values[np.newaxis, :]
+                    
+                    verification_hash = compute_verification_hash(
+                        data=data_for_hash,
+                        metadata=forecast_metadata,
+                        variables=[v for v in variables_to_hash if v in combined_forecast_ds.data_vars],
+                        timesteps=timesteps_to_hash
+                    )
+                    
+                    logger.info(f"[Job {job_id}] Computed verification hash: {verification_hash}")
+                    
+                    return str(output_nc_path), str(output_json_path), verification_hash
+                
+                nc_path, json_path, v_hash = await asyncio.to_thread(_blocking_save_and_process)
+                
+                await self.update_job_paths(
+                    job_id=job_id, 
+                    target_netcdf_path=nc_path, 
+                    kerchunk_json_path=json_path, 
+                    verification_hash=v_hash
+                )
+                
+                await self.update_job_status(job_id, "completed")
+                logger.info(f"[Job {job_id}] Background task completed successfully")
+                
+            except Exception as save_err:
+                logger.error(f"[Job {job_id}] Failed to save results: {save_err}", exc_info=True)
+                await self.update_job_status(job_id, "error", error_message=f"Processing error: {save_err}")
+        
+        except Exception as e:
+            logger.error(f"[Job {job_id}] Background task failed: {e}", exc_info=True)
+            await self.update_job_status(job_id, "error", error_message=f"Task error: {e}")
 
     async def _update_job_status(self, job_id: str, status: str, **kwargs):
         """Helper to update the job status in the database."""
@@ -854,3 +853,109 @@ class WeatherTask(Task):
             logger.info(f"[Job {job_id}] Successfully updated status to '{status}'.")
         except Exception as db_err:
             logger.error(f"[Job {job_id}] Failed to update job status to '{status}': {db_err}", exc_info=True)
+
+    async def get_job_by_gfs_init_time(self, gfs_init_time_utc: datetime) -> Optional[Dict[str, Any]]:
+        """
+        Check if a job exists for the given GFS initialization time.
+        
+        Args:
+            gfs_init_time_utc: The GFS initialization time to check
+            
+        Returns:
+            Job record if found, None otherwise
+        """
+        try:
+            query = """
+            SELECT id, job_id, status, target_netcdf_path, kerchunk_json_path 
+            FROM weather_miner_jobs
+            WHERE gfs_init_time_utc = :gfs_init_time
+            ORDER BY id DESC
+            LIMIT 1
+            """
+            job = await self.db_manager.fetch_one(query, {"gfs_init_time": gfs_init_time_utc})
+            return job
+        except Exception as e:
+            logger.error(f"Error checking for existing job with GFS init time {gfs_init_time_utc}: {e}")
+            return None
+
+    async def update_job_status(self, job_id: str, status: str, error_message: Optional[str] = None) -> bool:
+        """
+        Update the status of a job in the database.
+        
+        Args:
+            job_id: The job ID
+            status: The new status
+            error_message: Optional error message
+            
+        Returns:
+            True if update was successful, False otherwise
+        """
+        try:
+            update_fields = ["status = :status", "updated_at = :updated_at"]
+            params = {
+                "job_id": job_id,
+                "status": status,
+                "updated_at": datetime.now(timezone.utc)
+            }
+            
+            if status == "processing":
+                update_fields.append("processing_start_time = :proc_start")
+                params["proc_start"] = datetime.now(timezone.utc)
+            elif status == "completed":
+                update_fields.append("processing_end_time = :proc_end")
+                params["proc_end"] = datetime.now(timezone.utc)
+            
+            if error_message:
+                update_fields.append("error_message = :error_msg")
+                params["error_msg"] = error_message
+                
+            query = f"""
+            UPDATE weather_miner_jobs
+            SET {", ".join(update_fields)}
+            WHERE job_id = :job_id
+            """
+            
+            await self.db_manager.execute(query, params)
+            logger.info(f"Updated job {job_id} status to {status}")
+            return True
+        except Exception as e:
+            logger.error(f"Error updating job status for {job_id}: {e}")
+            return False
+
+    async def update_job_paths(self, job_id: str, target_netcdf_path: str, kerchunk_json_path: str, verification_hash: str) -> bool:
+        """
+        Update the file paths and verification hash for a completed job.
+        
+        Args:
+            job_id: The job ID
+            target_netcdf_path: Path to the NetCDF file
+            kerchunk_json_path: Path to the Kerchunk JSON file
+            verification_hash: Hash to verify the forecast files
+            
+        Returns:
+            True if update was successful, False otherwise
+        """
+        try:
+            query = """
+            UPDATE weather_miner_jobs
+            SET target_netcdf_path = :netcdf_path,
+                kerchunk_json_path = :kerchunk_path,
+                verification_hash = :hash,
+                updated_at = :updated_at
+            WHERE job_id = :job_id
+            """
+            
+            params = {
+                "job_id": job_id,
+                "netcdf_path": target_netcdf_path,
+                "kerchunk_path": kerchunk_json_path,
+                "hash": verification_hash,
+                "updated_at": datetime.now(timezone.utc)
+            }
+            
+            await self.db_manager.execute(query, params)
+            logger.info(f"Updated job {job_id} with file paths and verification hash")
+            return True
+        except Exception as e:
+            logger.error(f"Error updating job paths for {job_id}: {e}")
+            return False
