@@ -48,6 +48,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from gaia.validator.basemodel_evaluator import BaseModelEvaluator
 from gaia.validator.utils.db_wipe import handle_db_wipe
+from gaia.validator.utils.earthdata_tokens import ensure_valid_earthdata_token
 
 logger = get_logger(__name__)
 
@@ -858,7 +859,8 @@ class GaiaValidator:
                 lambda: self.main_scoring(),
                 lambda: self.handle_miner_deregistration_loop(),
                 #lambda: self.miner_score_sender.run_async(),
-                lambda: self.check_for_updates()
+                lambda: self.check_for_updates(),
+                lambda: self.manage_earthdata_token()
             ]
             
             try:
@@ -1518,6 +1520,22 @@ class GaiaValidator:
             self.last_set_weights_block = block_number
         except Exception as e:
             logger.error(f"Error updating last weights block: {e}")
+
+    async def manage_earthdata_token(self):
+        """Periodically checks and refreshes the Earthdata token."""
+        while not self._shutdown_event.is_set():
+            try:
+                logger.info("Running Earthdata token check...")
+                token = await ensure_valid_earthdata_token()
+                if token:
+                    logger.info(f"Earthdata token check successful. Current token (first 10 chars): {token[:10]}...")
+                else:
+                    logger.warning("Earthdata token check failed or no token available.")
+
+                await asyncio.sleep(86400)
+
+            except asyncio.CancelledError:
+                logger.info("Earthdata token management task cancelled.")
 
 
 if __name__ == "__main__":
