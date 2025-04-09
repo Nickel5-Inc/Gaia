@@ -10,7 +10,7 @@ Gaia is a platform for research and development of geospatial machine learning m
 Read more about the long-term vision in our [whitepaper](https://www.gaiaresearch.ai/whitepaper).
 
 >[!NOTE]
-> BETA VERSION = 1.1.7
+> BETA VERSION = 1.1.8
 >
 > The beta version of Gaia launches with limited functionality. Many of the planned features are not yet available, however we are still accepting miners and validators for the initial tasks. 
 
