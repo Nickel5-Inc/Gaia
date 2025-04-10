@@ -134,3 +134,6 @@ xarray==2024.7.0
 xxhash==3.5.0
 yarl==1.17.2
 fiber[full] @ git+https://github.com/rayonlabs/fiber.git@production
+xskillscore
+metpy
+microsoft-aurora
