@@ -10,6 +10,8 @@ import numpy as np
 import xarray as xr
 from kerchunk.hdf import SingleHdf5ToZarr
 import pandas as pd
+import shutil
+import time
 
 from fiber.logging_utils import get_logger
 
@@ -600,28 +602,20 @@ async def finalize_scores_worker(self):
 
                 logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 data fetched/loaded.")
 
-                # --- 3. Score Individual Miners (vs ERA5) --- 
-                # ... (fetch verified_responses) ...
                 logger.info(f"[FinalizeWorker] Run {run_id}: Found {len(verified_responses)} verified miner responses for final scoring.")
                 tasks = []
                 
-                # Replace nested function with call to scoring mechanism
                 for resp in verified_responses:
-                     # Pass run_id to the response dict if not already there, needed for DB storage
                      resp_with_run_id = resp.copy()
                      resp_with_run_id['run_id'] = run_id 
                      tasks.append(calculate_era5_miner_score(self, resp_with_run_id, target_datetimes, era5_ds))
                          
-                # Execute scoring concurrently
                 miner_scoring_results = await asyncio.gather(*tasks)
-                # Result is now just True/False for success/failure
                 successful_miner_scores = sum(1 for success in miner_scoring_results if success)
                 logger.info(f"[FinalizeWorker] Run {run_id}: Completed final scoring attempts for {successful_miner_scores}/{len(verified_responses)} miners.")
                 
-                # --- 4. Trigger build_score_row --- 
                 if successful_miner_scores > 0: 
                     logger.info(f"[FinalizeWorker] Run {run_id}: Building final score row using available ERA5 scores..." )
-                    # Pass era5_ds which build_score_row will pass to calculate_era5_ensemble_score
                     await build_score_row(self, run_id, ground_truth_ds=era5_ds)
                     await self._update_run_status(run_id, "scored")
                     logger.info(f"[FinalizeWorker] Run {run_id}: Final scoring process completed.")
@@ -655,3 +649,91 @@ async def finalize_scores_worker(self):
         except asyncio.CancelledError:
                 logger.info("[FinalizeWorker] Sleep interrupted, worker stopping.")
                 break
+
+async def cleanup_worker(task_instance: 'WeatherTask'):
+    """Periodically cleans up old cache files, ensemble files, and DB records."""
+    CHECK_INTERVAL_SECONDS = int(getattr(task_instance.config, 'cleanup_check_interval_seconds', 6 * 3600))
+    GFS_CACHE_RETENTION_DAYS = int(getattr(task_instance.config, 'gfs_cache_retention_days', 7))
+    ERA5_CACHE_RETENTION_DAYS = int(getattr(task_instance.config, 'era5_cache_retention_days', 30))
+    ENSEMBLE_RETENTION_DAYS = int(getattr(task_instance.config, 'ensemble_retention_days', 14))
+    DB_RUN_RETENTION_DAYS = int(getattr(task_instance.config, 'db_run_retention_days', 20))
+    
+    gfs_cache_dir = Path(getattr(task_instance.config, 'gfs_analysis_cache_dir', './gfs_analysis_cache'))
+    era5_cache_dir = Path(getattr(task_instance.config, 'era5_cache_dir', './era5_cache'))
+    ensemble_dir = VALIDATOR_ENSEMBLE_DIR
+    
+    while task_instance.cleanup_worker_running:
+        try:
+            now_ts = time.time()
+            now_dt_utc = datetime.now(timezone.utc)
+            logger.info("[CleanupWorker] Starting cleanup cycle...")
+
+            async def cleanup_directory(dir_path: Path, retention_days: int, pattern: str = "*.nc"):
+                if not dir_path.is_dir():
+                    logger.debug(f"[CleanupWorker] Directory not found, skipping: {dir_path}")
+                    return 0
+                    
+                cutoff_time = now_ts - (retention_days * 24 * 3600)
+                deleted_count = 0
+                try:
+                    for filepath in dir_path.glob(pattern):
+                        try:
+                            if filepath.is_file():
+                                file_mod_time = filepath.stat().st_mtime
+                                if file_mod_time < cutoff_time:
+                                    filepath.unlink()
+                                    logger.debug(f"[CleanupWorker] Deleted old file: {filepath}")
+                                    deleted_count += 1
+                        except FileNotFoundError:
+                            continue
+                        except Exception as e_file:
+                            logger.warning(f"[CleanupWorker] Error deleting file {filepath}: {e_file}")
+                    if pattern == "*.json":
+                         for item in dir_path.iterdir(): 
+                              if item.is_dir() and not any(item.iterdir()):
+                                   try:
+                                        item.rmdir()
+                                        logger.debug(f"[CleanupWorker] Removed empty directory: {item}")
+                                   except OSError as e_dir:
+                                        logger.warning(f"[CleanupWorker] Error removing empty dir {item}: {e_dir}")
+                                        
+                except Exception as e_glob:
+                     logger.error(f"[CleanupWorker] Error processing directory {dir_path}: {e_glob}")
+                logger.info(f"[CleanupWorker] Deleted {deleted_count} files older than {retention_days} days from {dir_path} matching {pattern}.")
+                return deleted_count
+
+            logger.info("[CleanupWorker] Cleaning up GFS cache...")
+            await cleanup_directory(gfs_cache_dir, GFS_CACHE_RETENTION_DAYS, "*.nc")
+            logger.info("[CleanupWorker] Cleaning up ERA5 cache...")
+            await cleanup_directory(era5_cache_dir, ERA5_CACHE_RETENTION_DAYS, "*.nc")
+            logger.info("[CleanupWorker] Cleaning up Ensemble files...")
+            await cleanup_directory(ensemble_dir, ENSEMBLE_RETENTION_DAYS, "*.nc")
+            await cleanup_directory(ensemble_dir, ENSEMBLE_RETENTION_DAYS, "*.json")
+
+            logger.info("[CleanupWorker] Cleaning up old database records...")
+            db_cutoff_time = now_dt_utc - timedelta(days=DB_RUN_RETENTION_DAYS)
+            try:
+                delete_runs_query = "DELETE FROM weather_forecast_runs WHERE run_initiation_time < :cutoff"
+                result = await task_instance.db_manager.execute(delete_runs_query, {"cutoff": db_cutoff_time})
+                if result and hasattr(result, 'rowcount'):
+                    logger.info(f"[CleanupWorker] Deleted {result.rowcount} old runs (and related data via cascade) older than {db_cutoff_time}.")
+                else:
+                     logger.info(f"[CleanupWorker] Executed old run deletion query (rowcount not available).")
+                     
+            except Exception as e_db:
+                logger.error(f"[CleanupWorker] Error during database cleanup: {e_db}", exc_info=True)
+                
+            logger.info("[CleanupWorker] Cleanup cycle finished.")
+
+        except asyncio.CancelledError:
+            logger.info("[CleanupWorker] Worker cancelled")
+            break
+        except Exception as e_outer:
+            logger.error(f"[CleanupWorker] Unexpected error in main loop: {e_outer}", exc_info=True)
+            await asyncio.sleep(60) 
+            
+        try:
+            await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+             logger.info("[CleanupWorker] Sleep interrupted, worker stopping.")
+             break

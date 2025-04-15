@@ -10,6 +10,7 @@
             "gfs_input_metadata": "JSONB",
             "status": "VARCHAR(50) NOT NULL DEFAULT 'pending'",
             "completion_time": "TIMESTAMP WITH TIME ZONE",
+            "final_scoring_attempted_time": "TIMESTAMP WITH TIME ZONE NULL",
             "error_message": "TEXT"
         },
         "indexes": [
@@ -30,6 +31,7 @@
             "miner_uid": "INTEGER NOT NULL",
             "miner_hotkey": "VARCHAR(255) NOT NULL",
             "response_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "job_id": "VARCHAR(100) NULL",
             "kerchunk_json_url": "TEXT",
             "target_netcdf_url_template": "TEXT",
             "kerchunk_json_retrieved": "JSONB",
@@ -65,19 +67,19 @@
             "run_id": "INTEGER NOT NULL",
             "miner_uid": "INTEGER NOT NULL",
             "miner_hotkey": "VARCHAR(255) NOT NULL",
-            "score_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "score_type": "VARCHAR(50) NOT NULL",
+            "calculation_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
             "metrics": "JSONB",
-            "final_score": "FLOAT",
-            "baseline_metrics": "JSONB",
-            "baseline_final_score": "FLOAT",
+            "score": "FLOAT",
             "error_message": "TEXT"
         },
         "indexes": [
-            {"column": "response_id", "unique": true},
             {"column": "run_id", "unique": false},
             {"column": "miner_uid", "unique": false},
             {"column": "miner_hotkey", "unique": false},
-            {"column": "score_time", "unique": false}
+            {"column": "calculation_time", "unique": false},
+            {"column": "score_type", "unique": false},
+            {"name": "uq_weather_miner_scores_resp_type", "columns": ["response_id", "score_type"], "unique": true}
         ],
         "foreign_keys": [
             {
@@ -91,27 +93,28 @@
                 "on_delete": "CASCADE"
             }
         ],
-        "comment": "Stores calculated scores and metrics for each verified miner response."
+        "comment": "Stores calculated scores (e.g., gfs_rmse, era5_rmse) for each miner response."
     },
     "weather_ensemble_forecasts": {
         "table_name": "weather_ensemble_forecasts",
         "database_type": "validator",
         "columns": {
             "id": "SERIAL PRIMARY KEY",
-            "run_id": "INTEGER NOT NULL",
+            "forecast_run_id": "INTEGER NOT NULL",
             "creation_time": "TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP",
-            "ensemble_netcdf_path": "TEXT",
+            "processing_end_time": "TIMESTAMP WITH TIME ZONE NULL",
+            "ensemble_path": "TEXT",
             "ensemble_kerchunk_path": "TEXT",
-            "verification_hash": "VARCHAR(64)",
+            "ensemble_verification_hash": "VARCHAR(64)",
             "status": "VARCHAR(50) NOT NULL DEFAULT 'pending'",
             "error_message": "TEXT"
         },
         "indexes": [
-            {"column": "run_id", "unique": true}
+            {"column": "forecast_run_id", "unique": true}
         ],
         "foreign_keys": [
             {
-                "column": "run_id",
+                "column": "forecast_run_id",
                 "references": "weather_forecast_runs(id)",
                 "on_delete": "CASCADE"
             }
@@ -126,8 +129,6 @@
             "ensemble_id": "INTEGER NOT NULL",
             "response_id": "INTEGER NOT NULL",
             "weight": "FLOAT NOT NULL",
-            "variable": "VARCHAR(50)",
-            "level": "VARCHAR(50)",
             "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
         },
         "indexes": [
@@ -152,23 +153,33 @@
         "table_name": "weather_historical_weights",
         "database_type": "validator",
         "columns": {
-            "miner_uid": "INTEGER PRIMARY KEY",
             "miner_hotkey": "VARCHAR(255) NOT NULL",
-            "last_updated": "TIMESTAMP WITH TIME ZONE NOT NULL",
-            "weight": "FLOAT NOT NULL DEFAULT 0.0"
+            "run_id": "INTEGER NOT NULL",
+            "score_type": "VARCHAR(50) NOT NULL",
+            "score": "FLOAT",
+            "weight": "FLOAT",
+            "last_updated": "TIMESTAMP WITH TIME ZONE NOT NULL"
         },
         "indexes": [
-            {"column": "miner_hotkey", "unique": false}
+            {"column": "miner_hotkey", "unique": false},
+            {"column": "run_id", "unique": false},
+            {"column": "score_type", "unique": false},
+            {"name": "pk_weather_hist_weights", "columns": ["miner_hotkey", "run_id", "score_type"], "unique": true}
         ],
-        "foreign_keys": [],
-        "comment": "Tracks the exponentially weighted moving average score for each miner over time."
+        "foreign_keys": [
+            {
+                "column": "run_id",
+                "references": "weather_forecast_runs(id)",
+                "on_delete": "CASCADE"
+            }
+        ],
+        "comment": "Stores calculated scores and weights for miners on a per-run basis (e.g., initial GFS score)."
     },
     "weather_miner_jobs": {
         "table_name": "weather_miner_jobs",
         "database_type": "miner",
         "columns": {
-            "id": "SERIAL PRIMARY KEY",
-            "job_id": "VARCHAR(100) UNIQUE NOT NULL",
+            "id": "VARCHAR(100) PRIMARY KEY",
             "validator_request_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
             "validator_hotkey": "VARCHAR(255)",
             "gfs_init_time_utc": "TIMESTAMP WITH TIME ZONE NOT NULL",
@@ -180,7 +191,8 @@
             "verification_hash": "VARCHAR(64)",
             "ipfs_cid": "VARCHAR(255)",
             "status": "VARCHAR(50) NOT NULL DEFAULT 'received'",
-            "error_message": "TEXT"
+            "error_message": "TEXT",
+            "updated_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
         },
         "indexes": [
             {"column": "job_id", "unique": true},

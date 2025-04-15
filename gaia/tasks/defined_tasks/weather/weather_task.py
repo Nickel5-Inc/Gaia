@@ -125,6 +125,10 @@ class WeatherTask(Task):
         self.gpu_semaphore = asyncio.Semaphore(getattr(self.config, 'max_concurrent_inferences', 1))
         self.inference_runner = WeatherInferenceRunner(self.config)
 
+        # Add cleanup worker state
+        self.cleanup_worker_running = False
+        self.cleanup_workers = []
+
         if self.node_type == "validator":
             logger.info("Initialized validator components for WeatherTask")
         else:
@@ -703,11 +707,38 @@ class WeatherTask(Task):
         self.final_scoring_workers = []
         logger.info("Stopped all final scoring workers")
         
-    async def start_background_workers(self, num_ensemble_workers=1, num_initial_scoring_workers=1, num_final_scoring_workers=1):
+    async def start_cleanup_workers(self, num_workers=1):
+        """Start background workers for cleaning up old data."""
+        if self.cleanup_worker_running:
+            logger.info("Cleanup workers already running")
+            return
+            
+        self.cleanup_worker_running = True
+        for _ in range(num_workers):
+            worker = asyncio.create_task(self._cleanup_worker())
+            self.cleanup_workers.append(worker)
+            
+        logger.info(f"Started {num_workers} cleanup workers")
+        
+    async def stop_cleanup_workers(self):
+        """Stop all background cleanup workers."""
+        if not self.cleanup_worker_running:
+            return
+            
+        self.cleanup_worker_running = False
+        logger.info("Stopping cleanup workers...")
+        for worker in self.cleanup_workers:
+            worker.cancel()
+            
+        self.cleanup_workers = []
+        logger.info("Stopped all cleanup workers")
+        
+    async def start_background_workers(self, num_ensemble_workers=1, num_initial_scoring_workers=1, num_final_scoring_workers=1, num_cleanup_workers=1):
          """Starts all background worker types."""
          await self.start_ensemble_workers(num_ensemble_workers)
          await self.start_initial_scoring_workers(num_initial_scoring_workers)
          await self.start_final_scoring_workers(num_final_scoring_workers)
+         await self.start_cleanup_workers(num_cleanup_workers)
          
     async def stop_background_workers(self):
         """Stops all background worker types."""
@@ -717,4 +748,6 @@ class WeatherTask(Task):
         except Exception as e: logger.error(f"Error stopping initial scoring workers: {e}")
         try: await self.stop_final_scoring_workers()
         except Exception as e: logger.error(f"Error stopping final scoring workers: {e}")
+        try: await self.stop_cleanup_workers()
+        except Exception as e: logger.error(f"Error stopping cleanup workers: {e}")
             
