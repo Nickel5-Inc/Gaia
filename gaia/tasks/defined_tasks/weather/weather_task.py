@@ -37,7 +37,7 @@ from .processing.weather_miner_preprocessing import WeatherMinerPreprocessing, p
 from .processing.weather_validator_preprocessing import WeatherValidatorPreprocessing
 from .processing.weather_logic import (
     _update_run_status, build_score_row, get_ground_truth_data,
-    _trigger_initial_scoring, _request_fresh_token,
+    _trigger_initial_scoring, _request_fresh_token, verify_miner_response,
     get_job_by_gfs_init_time, update_job_status, update_job_paths
 )
 from .processing.weather_workers import (
@@ -347,225 +347,56 @@ class WeatherTask(Task):
 
     async def validator_score(self, result=None):
         """
-        Scores verified miner forecasts:
-        1. Identify responses ready for scoring (verified, past delay if any).
-        2. Use Kerchunk JSON to access specific data subsets from miners via Range Requests.
-        3. Fetch corresponding ground truth/reference data (e.g., ERA5).
-        4. Calculate metrics using the scoring mechanism.
-        5. Compare against baseline model scores.
-        6. Store scores in weather_miner_scores.
-        7. Update historical weights.
-        8. Build and store the global score row in score_table.
+        Initiates the verification process for completed miner responses.
+        Actual scoring happens in background workers.
         """
-        logger.info("Starting weather forecast validation and scoring...")
+        logger.info("Validator scoring check initiated...")
         
         query = """
-        SELECT id, run_id, gfs_init_time_utc
+        SELECT id, gfs_init_time_utc 
         FROM weather_forecast_runs
         WHERE status = 'awaiting_results' 
-        AND run_initiation_time < :cutoff_time
+        AND run_initiation_time < :cutoff_time 
         ORDER BY run_initiation_time ASC
         LIMIT 10
         """
-        
-        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=getattr(self.config, 'verification_wait_minutes', 30))
         forecast_runs = await self.db_manager.fetch_all(query, {"cutoff_time": cutoff_time})
         
         if not forecast_runs:
-            logger.info("No forecast runs ready for scoring.")
+            logger.debug("No runs found awaiting results within cutoff.")
             return
         
         for run in forecast_runs:
             run_id = run['id']
-            logger.info(f"Processing run {run_id} for scoring...")
+            logger.info(f"[Run {run_id}] Checking responses for verification...")
+            current_run_status_rec = await self.db_manager.fetch_one("SELECT status FROM weather_forecast_runs WHERE id = :run_id", {"run_id": run_id})
+            current_run_status = current_run_status_rec['status'] if current_run_status_rec else 'unknown'
             
-            await _update_run_status(self, run_id, "scoring")
+            if current_run_status == 'awaiting_results':
+                await _update_run_status(self, run_id, "verifying") 
+            else:
+                 logger.info(f"[Run {run_id}] Status is already '{current_run_status}', skipping verification trigger step.")
+                 continue
             
             responses_query = """
-            SELECT mr.id, mr.miner_hotkey, mr.status
+            SELECT mr.id, mr.miner_hotkey, mr.status, mr.job_id
             FROM weather_miner_responses mr
             WHERE mr.run_id = :run_id
-            AND mr.status = 'accepted'
+            AND mr.status = 'accepted' -- Only check newly accepted ones
             """
-            
             miner_responses = await self.db_manager.fetch_all(responses_query, {"run_id": run_id})
-            logger.info(f"Found {len(miner_responses)} miner responses to process for run {run_id}")
+            logger.info(f"[Run {run_id}] Found {len(miner_responses)} accepted responses to verify.")
             
+            verification_tasks = []
             for response in miner_responses:
-                response_id = response['id']
-                miner_hotkey = response['miner_hotkey']
-                
-                logger.info(f"Requesting Kerchunk JSON from miner {miner_hotkey} for response {response_id}")
-                
-                try:
-                    kerchunk_request_payload = {
-                        "nonce": str(uuid.uuid4()),
-                        "data": {
-                            "job_id": f"forecast_{run['gfs_init_time_utc'].strftime('%Y%m%d%H')}_{miner_hotkey[:8]}"
-                        }
-                    }
-                    
-                    kerchunk_response = await self.validator.query_miner(
-                        miner_hotkey=miner_hotkey,
-                        payload=kerchunk_request_payload,
-                        endpoint="/weather-kerchunk-request"
-                    )
-                    
-                    if not kerchunk_response or "status" not in kerchunk_response:
-                        logger.warning(f"Invalid response format from miner {miner_hotkey}")
-                        continue
-                    
-                    if kerchunk_response["status"] == "completed":
-                        kerchunk_json_url = kerchunk_response.get("kerchunk_json_url")
-                        verification_hash_claimed = kerchunk_response.get("verification_hash")
-                        access_token = kerchunk_response.get("access_token")
-                        
-                        miner_url = self.validator.get_miner_url(miner_hotkey)
-                        if not miner_url:
-                            logger.warning(f"Could not get URL for miner {miner_hotkey}")
-                            continue
-                        
-                        full_kerchunk_url = f"{miner_url}{kerchunk_json_url}"
-                        
-                        update_query = """
-                        UPDATE weather_miner_responses
-                        SET kerchunk_json_url = :kerchunk_url,
-                            verification_hash_claimed = :claimed_hash,
-                            status = 'verifying',
-                            response_time = :resp_time
-                        WHERE id = :response_id
-                        """
-                        
-                        await self.db_manager.execute(update_query, {
-                            "kerchunk_url": full_kerchunk_url,
-                            "claimed_hash": verification_hash_claimed,
-                            "resp_time": datetime.now(timezone.utc),
-                            "response_id": response_id
-                        })
-                        
-                        logger.info(f"Verifying hash for response {response_id} from miner {miner_hotkey}")
-                        
-                        variables_to_check = ["2t", "10u", "10v", "msl", "z", "u", "v", "t", "q"]
-                        metadata = {
-                            "time": [run['gfs_init_time_utc']],
-                            "source_model": "aurora",
-                            "resolution": 0.25
-                        }
-                        
-                        headers = {
-                            "Authorization": f"Bearer {access_token}"
-                        }
-                        
-                        try:
-                            from .utils.hashing import verify_forecast_hash
-                            
-                            timesteps = list(range(40))
-                            
-                            verification_timeout = 1000
-                            
-                            verification_result = await asyncio.wait_for(
-                                verify_forecast_hash(
-                                    kerchunk_url=full_kerchunk_url,
-                                    claimed_hash=verification_hash_claimed,
-                                    metadata=metadata,
-                                    variables=variables_to_check,
-                                    timesteps=timesteps,
-                                    headers=headers
-                                ),
-                                timeout=verification_timeout
-                            )
-                            
-                            verification_update = """
-                            UPDATE weather_miner_responses
-                            SET verification_passed = :verified,
-                                status = :new_status
-                            WHERE id = :response_id
-                            """
-                            
-                            new_status = "verified" if verification_result else "verification_failed"
-                            
-                            await self.db_manager.execute(verification_update, {
-                                "verified": verification_result,
-                                "new_status": new_status,
-                                "response_id": response_id
-                            })
-                            
-                            logger.info(f"Hash verification {'succeeded' if verification_result else 'failed'} for response {response_id}")
-                            
-                            if verification_result:
-                                score_result = await self.scoring_mechanism.score_forecast(
-                                    response_id=response_id,
-                                    run_id=run_id,
-                                    kerchunk_url=full_kerchunk_url,
-                                    miner_hotkey=miner_hotkey,
-                                    headers=headers
-                                )
-                                
-                                if score_result:
-                                    logger.info(f"Successfully scored response {response_id} from miner {miner_hotkey}")
-                                else:
-                                    logger.warning(f"Failed to score response {response_id} from miner {miner_hotkey}")
-                            
-                        except asyncio.TimeoutError:
-                            logger.error(f"Verification timed out for response {response_id}")
-                            await self.db_manager.execute("""
-                            UPDATE weather_miner_responses
-                            SET status = 'verification_timeout'
-                            WHERE id = :response_id
-                            """, {"response_id": response_id})
-                        
-                        except Exception as verify_err:
-                            logger.error(f"Error during verification for response {response_id}: {verify_err}", exc_info=True)
-                            await self.db_manager.execute("""
-                            UPDATE weather_miner_responses
-                            SET status = 'verification_error',
-                                error_message = :error_msg
-                            WHERE id = :response_id
-                            """, {
-                                "response_id": response_id,
-                                "error_msg": str(verify_err)
-                            })
-                    
-                    elif kerchunk_response["status"] == "processing":
-                        await self.db_manager.execute("""
-                        UPDATE weather_miner_responses
-                        SET status = 'awaiting_completion'
-                        WHERE id = :response_id
-                        """, {"response_id": response_id})
-                        
-                        logger.info(f"Miner {miner_hotkey} is still processing for response {response_id}")
-                    
-                    else:
-                        await self.db_manager.execute("""
-                        UPDATE weather_miner_responses
-                        SET status = 'failed',
-                            error_message = :error_msg
-                        WHERE id = :response_id
-                        """, {
-                            "response_id": response_id,
-                            "error_msg": kerchunk_response.get("message", "Unknown error")
-                        })
-                        
-                        logger.warning(f"Miner {miner_hotkey} reported error for response {response_id}: {kerchunk_response.get('message')}")
-                
-                except Exception as e:
-                    logger.error(f"Error processing response {response_id}: {e}", exc_info=True)
-                    await self.db_manager.execute("""
-                    UPDATE weather_miner_responses
-                    SET status = 'error',
-                        error_message = :error_msg
-                    WHERE id = :response_id
-                    """, {
-                        "response_id": response_id,
-                        "error_msg": str(e)
-                    })
-            
-            verified_responses_query = """
-            SELECT COUNT(*) as count
-            FROM weather_miner_responses
-            WHERE run_id = :run_id
-            AND verification_passed = TRUE
-            """
+                 verification_tasks.append(verify_miner_response(self, run, response))
+                 
+            if verification_tasks:
+                 await asyncio.gather(*verification_tasks)
+                 logger.info(f"[Run {run_id}] Completed verification attempts for {len(verification_tasks)} responses.")
+                 
+            verified_responses_query = "SELECT COUNT(*) as count FROM weather_miner_responses WHERE run_id = :run_id AND verification_passed = TRUE"
             verified_count_result = await self.db_manager.fetch_one(verified_responses_query, {"run_id": run_id})
             verified_count = verified_count_result["count"] if verified_count_result else 0
             
@@ -575,23 +406,22 @@ class WeatherTask(Task):
             
             min_ensemble_members = getattr(self.config, 'min_ensemble_members', 3)
             
-            current_run_status = await self.db_manager.fetch_one("SELECT status FROM weather_forecast_runs WHERE id = :run_id", {"run_id": run_id})
-            if current_run_status and current_run_status['status'] == 'scoring': # Only proceed if still in scoring state
+            current_run_status_rec = await self.db_manager.fetch_one("SELECT status FROM weather_forecast_runs WHERE id = :run_id", {"run_id": run_id})
+            current_run_status = current_run_status_rec['status'] if current_run_status_rec else None
+            
+            if current_run_status == 'verifying':
                 if verified_count >= min_ensemble_members:
-                    logger.info(f"Run {run_id} has {verified_count} verified responses (>= {min_ensemble_members}). Triggering initial scoring.")
-                    await _trigger_initial_scoring(self, run_id) 
-                elif total_responses > 0:
+                    logger.info(f"[Run {run_id}] {verified_count} verified. Triggering initial scoring.")
+                    await _trigger_initial_scoring(self, run_id)
+                elif total_responses > 0: 
                      if verified_count > 0:
-                         logger.info(f"Run {run_id} has {verified_count}/{total_responses} verified responses (< {min_ensemble_members}). Setting to partially_verified.")
                          await _update_run_status(self, run_id, "partially_verified")
                      else:
-                         logger.info(f"Run {run_id} has 0/{total_responses} verified responses. Setting to verification_failed.")
                          await _update_run_status(self, run_id, "verification_failed")
                 else:
-                    logger.warning(f"Run {run_id}: No responses processed. Setting status to verification_failed.")
-                    await _update_run_status(self, run_id, "verification_failed")
+                    logger.warning(f"[Run {run_id}] No responses found after verification attempts. Status remains 'verifying'.")
             else:
-                 logger.warning(f"Run {run_id} status is not 'scoring' ({current_run_status['status'] if current_run_status else 'Not Found'}). Skipping status update logic in validator_score.")
+                 logger.info(f"[Run {run_id}] Status changed from 'verifying' to '{current_run_status}' during verification. No further status update needed here.")
 
     ############################################################
     # Miner methods
