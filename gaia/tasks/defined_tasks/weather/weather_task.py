@@ -21,6 +21,34 @@ import jwt
 import numpy as np
 import fsspec
 from kerchunk.hdf import SingleHdf5ToZarr
+import pandas as pd
+
+from .utils.era5_api import fetch_era5_data
+from .utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
+from .utils.hashing import compute_verification_hash, verify_forecast_hash
+from .utils.kerchunk_utils import generate_kerchunk_json_from_local_file
+from .utils.data_prep import create_aurora_batch_from_gfs
+from .schemas.weather_metadata import WeatherMetadata
+from .schemas.weather_inputs import WeatherInputs, WeatherForecastRequest, WeatherInputData
+from .schemas.weather_outputs import WeatherOutputs, WeatherKerchunkResponseData
+from .scoring.ensemble import create_weighted_ensemble, create_physics_aware_ensemble, ALL_EXPECTED_VARIABLES, _open_dataset_lazily
+from .scoring.metrics import calculate_rmse
+from .processing.weather_miner_preprocessing import WeatherMinerPreprocessing, prepare_miner_batch_from_payload
+from .processing.weather_validator_preprocessing import WeatherValidatorPreprocessing
+from .processing.weather_logic import (
+    _update_run_status, build_score_row, get_ground_truth_data,
+    _trigger_initial_scoring, _request_fresh_token,
+    get_job_by_gfs_init_time, update_job_status, update_job_paths
+)
+from .processing.weather_workers import (
+    initial_scoring_worker, 
+    ensemble_worker, 
+    finalize_scores_worker, 
+    run_inference_background
+)
+
+from gaia.models.weather_basemodel import WeatherBaseModel
+from gaia.tasks.defined_tasks.weather.weather_inference_runner import WeatherInferenceRunner
 
 try:
     from aurora.core import Batch
@@ -30,26 +58,7 @@ except ImportError:
     Batch = Any
     _AURORA_AVAILABLE = False
 
-from gaia.tasks.defined_tasks.weather.utils.hashing import compute_verification_hash
-from gaia.tasks.defined_tasks.weather.utils.kerchunk_utils import generate_kerchunk_json_from_local_file
-from gaia.tasks.defined_tasks.weather.weather_metadata import WeatherMetadata
-from gaia.tasks.defined_tasks.weather.weather_inputs import WeatherInputs, WeatherForecastRequest, WeatherInputData
-from gaia.tasks.defined_tasks.weather.weather_outputs import WeatherOutputs, WeatherKerchunkResponseData
-from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import WeatherScoringMechanism
-from gaia.tasks.defined_tasks.weather.weather_miner_preprocessing import WeatherMinerPreprocessing
-from gaia.tasks.defined_tasks.weather.weather_validator_preprocessing import WeatherValidatorPreprocessing
-from gaia.models.weather_basemodel import WeatherBaseModel
-from gaia.tasks.defined_tasks.weather.utils.data_prep import create_aurora_batch_from_gfs
-from gaia.tasks.defined_tasks.weather.weather_inference_runner import WeatherInferenceRunner
-from gaia.tasks.defined_tasks.weather.utils.gfs_api import fetch_gfs_data
-from gaia.tasks.defined_tasks.weather.weather_scoring.ensemble import create_weighted_ensemble, create_physics_aware_ensemble
-
 logger = get_logger(__name__)
-
-# placeholder classes until I build them
-class WeatherMinerPreprocessing: pass
-class WeatherValidatorPreprocessing: pass
-class WeatherBaseModel: pass
 
 DEFAULT_FORECAST_DIR_BG = Path("./miner_forecasts/")
 MINER_FORECAST_DIR_BG = Path(os.getenv("MINER_FORECAST_DIR", DEFAULT_FORECAST_DIR_BG))
@@ -73,14 +82,6 @@ class WeatherTask(Task):
     db_manager: Union[ValidatorDatabaseManager, MinerDatabaseManager] = Field(
         ...,
         description="Database manager for the task",
-    )
-    miner_preprocessing: Optional[WeatherMinerPreprocessing] = Field(
-        default=None,
-        description="Preprocessing component for miner",
-    )
-    validator_preprocessing: Optional[WeatherValidatorPreprocessing] = Field(
-        default=None,
-        description="Preprocessing component for validator",
     )
     model: Optional[WeatherBaseModel] = Field(
         default=None, description="The weather prediction model"
@@ -107,50 +108,26 @@ class WeatherTask(Task):
     )
 
     def __init__(self, db_manager=None, node_type=None, test_mode=False, **data):
-        if db_manager is None:
-             raise ValueError("db_manager must be provided to WeatherTask")
-        if node_type is None:
-            raise ValueError("node_type must be provided to WeatherTask ('validator' or 'miner')")
-
-        super().__init__(
-            name="WeatherTask",
-            description="Weather forecast generation and verification task",
-            task_type="atomic",
-            metadata=WeatherMetadata(),
-            inputs=WeatherInputs(),
-            outputs=WeatherOutputs(),
-            scoring_mechanism=WeatherScoringMechanism(
-                db_manager=db_manager,
-                task=None
-            ),
-            **data
-        )
-
+        super().__init__(**data)
         self.db_manager = db_manager
         self.node_type = node_type
         self.test_mode = test_mode
-        self.scoring_mechanism.task = self
-        self.validator = data.get('validator', None)
-        
         self.ensemble_task_queue = asyncio.Queue()
-        self.ensemble_workers = []
         self.ensemble_worker_running = False
+        self.ensemble_workers = []
+        self.initial_scoring_queue = asyncio.Queue()
+        self.initial_scoring_worker_running = False
+        self.initial_scoring_workers = []
+        self.final_scoring_queue = asyncio.Queue()
+        self.final_scoring_worker_running = False
+        self.final_scoring_workers = []
+        self.config = self._load_config()
+        self.gpu_semaphore = asyncio.Semaphore(getattr(self.config, 'max_concurrent_inferences', 1))
+        self.inference_runner = WeatherInferenceRunner(self.config)
 
         if self.node_type == "validator":
-            self.validator_preprocessing = WeatherValidatorPreprocessing()
             logger.info("Initialized validator components for WeatherTask")
         else:
-            self.miner_preprocessing = WeatherMinerPreprocessing()
-            try:
-                self.inference_runner = WeatherInferenceRunner(device="cuda")
-                self.model = self.inference_runner.model
-                self.gpu_semaphore = asyncio.Semaphore(1)
-                logger.info("Initialized Inference Runner and GPU Semaphore (limit 1).")
-            except Exception as e:
-                logger.error(f"Failed to initialize WeatherInferenceRunner: {e}", exc_info=True)
-                self.inference_runner = None
-                self.model = None
-
             logger.info("Initialized miner components for WeatherTask")
             if self.inference_runner is None:
                  logger.warning("WeatherInferenceRunner could not be initialized. Miner will likely fail.")
@@ -366,31 +343,7 @@ class WeatherTask(Task):
                       except: pass
                  await asyncio.sleep(300)
 
-    async def _update_run_status(self, run_id: int, status: str, error_message: Optional[str] = None, gfs_metadata: Optional[dict] = None):
-        """Helper to update the forecast run status and optionally other fields."""
-        logger.debug(f"[Run {run_id}] Updating run status to '{status}'.")
-        update_fields = ["status = :status"]
-        params = {"run_id": run_id, "status": status}
 
-        if error_message is not None:
-            update_fields.append("error_message = :error_msg")
-            params["error_msg"] = error_message
-        if gfs_metadata is not None:
-             update_fields.append("gfs_input_metadata = :gfs_meta")
-             params["gfs_meta"] = json.dumps(gfs_metadata, default=str)
-        if status in ["completed", "error"]:
-             update_fields.append("completion_time = :comp_time")
-             params["comp_time"] = datetime.now(timezone.utc)
-
-        query = f"""
-            UPDATE weather_forecast_runs
-            SET {', '.join(update_fields)}
-            WHERE id = :run_id
-        """
-        try:
-            await self.db_manager.execute(query, params)
-        except Exception as db_err:
-            logger.error(f"[Run {run_id}] Failed to update run status to '{status}': {db_err}", exc_info=True)
 
     async def validator_score(self, result=None):
         """
@@ -504,7 +457,7 @@ class WeatherTask(Task):
                         }
                         
                         try:
-                            from gaia.tasks.defined_tasks.weather.utils.hashing import verify_forecast_hash
+                            from .utils.hashing import verify_forecast_hash
                             
                             timesteps = list(range(40))
                             
@@ -613,32 +566,32 @@ class WeatherTask(Task):
             WHERE run_id = :run_id
             AND verification_passed = TRUE
             """
-            
             verified_count_result = await self.db_manager.fetch_one(verified_responses_query, {"run_id": run_id})
             verified_count = verified_count_result["count"] if verified_count_result else 0
             
-            if verified_count >= 3:
-                logger.info(f"Creating ensemble forecast for run {run_id} with {verified_count} verified responses")
-                
-                if not self.ensemble_worker_running:
-                    await self.start_ensemble_workers()
-                    
-                await self.ensemble_task_queue.put(run_id)
-                logger.info(f"Queued ensemble creation for run {run_id}")
-                
-                await self._update_run_status(run_id, "processing_ensemble")
-            else:
-                logger.info(f"Not enough verified responses ({verified_count}) for run {run_id} to create ensemble")
-                if verified_count > 0:
-                    await self._update_run_status(run_id, "partially_verified")
+            total_responses_query = "SELECT COUNT(*) as count FROM weather_miner_responses WHERE run_id = :run_id"
+            total_responses_result = await self.db_manager.fetch_one(total_responses_query, {"run_id": run_id})
+            total_responses = total_responses_result["count"] if total_responses_result else 0
+            
+            min_ensemble_members = getattr(self.config, 'min_ensemble_members', 3)
+            
+            current_run_status = await self.db_manager.fetch_one("SELECT status FROM weather_forecast_runs WHERE id = :run_id", {"run_id": run_id})
+            if current_run_status and current_run_status['status'] == 'scoring': # Only proceed if still in scoring state
+                if verified_count >= min_ensemble_members:
+                    logger.info(f"Run {run_id} has {verified_count} verified responses (>= {min_ensemble_members}). Triggering initial scoring.")
+                    await self._trigger_initial_scoring(run_id) 
+                elif total_responses > 0:
+                     if verified_count > 0:
+                         logger.info(f"Run {run_id} has {verified_count}/{total_responses} verified responses (< {min_ensemble_members}). Setting to partially_verified.")
+                         await self._update_run_status(run_id, "partially_verified")
+                     else:
+                         logger.info(f"Run {run_id} has 0/{total_responses} verified responses. Setting to verification_failed.")
+                         await self._update_run_status(run_id, "verification_failed")
                 else:
+                    logger.warning(f"Run {run_id}: No responses processed. Setting status to verification_failed.")
                     await self._update_run_status(run_id, "verification_failed")
-        
-        for run in forecast_runs:
-            try:
-                await self.build_score_row(run['id'])
-            except Exception as e:
-                logger.error(f"Error building score row for run {run['id']}: {e}", exc_info=True)
+            else:
+                 logger.warning(f"Run {run_id} status is not 'scoring' ({current_run_status['status'] if current_run_status else 'Not Found'}). Skipping status update logic in validator_score.")
 
     ############################################################
     # Miner methods
@@ -646,92 +599,26 @@ class WeatherTask(Task):
 
     async def miner_preprocess(
         self,
-        preprocessing: Optional[WeatherMinerPreprocessing] = None,
         data: Optional[Dict[str, Any]] = None,
     ) -> Optional[Batch]:
         """
-        Preprocesses the input GFS data received from the validator.
-        Decodes the data, combines timesteps, and creates an Aurora Batch object.
-
+        Loads and preprocesses the input GFS data payload received from the validator
+        by calling the dedicated preprocessing function.
+        
         Args:
-            data: Dictionary containing the raw payload from the validator,
-                  expected to have 'gfs_timestep_1' and 'gfs_timestep_2'
-                  containing base64 encoded pickled xarray Datasets.
+            data: Dictionary containing the raw payload from the validator.
 
         Returns:
             An aurora.Batch object ready for model inference, or None if preprocessing fails.
         """
-        if not data:
-            logger.error("No data provided to miner_preprocess.")
-            return None
-
+        logger.debug("Calling prepare_miner_batch_from_payload...")
         try:
-            logger.info("Starting miner preprocessing...")
-
-            if 'gfs_timestep_1' not in data or 'gfs_timestep_2' not in data:
-                 logger.error("Missing 'gfs_timestep_1' or 'gfs_timestep_2' in input data.")
-                 return None
-
-            try:
-                logger.debug("Decoding gfs_timestep_1 (historical, e.g., 00z)")
-                ds_hist_bytes = base64.b64decode(data['gfs_timestep_1'])
-                ds_hist = pickle.loads(ds_hist_bytes)
-                if not isinstance(ds_hist, xr.Dataset):
-                    raise TypeError("Decoded gfs_timestep_1 is not an xarray Dataset")
-
-                logger.debug("Decoding gfs_timestep_2 (current, e.g., 06z)")
-                ds_curr_bytes = base64.b64decode(data['gfs_timestep_2'])
-                ds_curr = pickle.loads(ds_curr_bytes)
-                if not isinstance(ds_curr, xr.Dataset):
-                    raise TypeError("Decoded gfs_timestep_2 is not an xarray Dataset")
-
-            except (TypeError, pickle.UnpicklingError, base64.binascii.Error) as decode_err:
-                logger.error(f"Failed to decode/unpickle GFS data: {decode_err}")
-                logger.error(traceback.format_exc())
-                return None
-
-            if 'time' not in ds_hist.dims or 'time' not in ds_curr.dims:
-                 logger.error("Decoded datasets missing 'time' dimension.")
-                 return None
-                 
-            if ds_hist.time.values[0] >= ds_curr.time.values[0]:
-                logger.warning("gfs_timestep_1 (historical) time is not strictly before gfs_timestep_2 (current). Ensure correct order.")
-
-            try:
-                logger.info("Combining historical and current GFS timesteps.")
-                combined_gfs_data = xr.concat([ds_hist, ds_curr], dim='time')
-                combined_gfs_data = combined_gfs_data.sortby('time')
-                logger.info(f"Combined dataset time range: {combined_gfs_data.time.min().values} to {combined_gfs_data.time.max().values}")
-                if len(combined_gfs_data.time) != 2:
-                    logger.warning(f"Expected 2 time steps after combining, found {len(combined_gfs_data.time)}")
-
-            except Exception as combine_err:
-                 logger.error(f"Failed to combine GFS datasets: {combine_err}")
-                 logger.error(traceback.format_exc())
-                 return None
-
-            resolution = '0.25'
-            static_download_dir = './static_data'
-
-            logger.info(f"Creating Aurora Batch using {resolution} resolution settings.")
-            aurora_batch = create_aurora_batch_from_gfs(
-                gfs_data=combined_gfs_data,
-                resolution=resolution,
-                download_dir=static_download_dir,
-                history_steps=2
-            )
-
-            if not isinstance(aurora_batch, Batch):
-                 logger.error("Failed to create a valid Aurora Batch object.")
-                 return None
-
-            logger.info("Successfully finished miner preprocessing.")
-            return aurora_batch
-
+            result_batch = await prepare_miner_batch_from_payload(data)
+            logger.debug(f"prepare_miner_batch_from_payload returned: {type(result_batch)}")
+            return result_batch
         except Exception as e:
-            logger.error(f"Unhandled error in miner_preprocess: {e}")
-            logger.error(traceback.format_exc())
-            return None
+             logger.error(f"Error calling prepare_miner_batch_from_payload: {e}", exc_info=True)
+             return None
 
     async def miner_execute(self, data: Dict[str, Any], miner) -> Optional[Dict[str, Any]]:
         """
@@ -812,7 +699,8 @@ class WeatherTask(Task):
 
             logger.info(f"[Job {job_id}] Launching background inference task...")
             asyncio.create_task(
-                self._run_inference_background(
+                run_inference_background(
+                    task_instance=self,
                     initial_batch=initial_batch,
                     job_id=job_id,
                     gfs_init_time=gfs_init_time,
@@ -914,150 +802,6 @@ class WeatherTask(Task):
     # Helper Methods
     ############################################################
 
-    async def build_score_row(self, forecast_run_id: int):
-        """
-        Aggregates individual miner scores for a completed forecast run
-        and inserts/updates the corresponding row in the main score_table.
-        """
-        logger.info(f"Building score row for forecast run {forecast_run_id}")
-        
-        try:
-            run_query = """
-            SELECT id, gfs_init_time_utc
-            FROM weather_forecast_runs
-            WHERE id = :run_id
-            """
-            
-            run = await self.db_manager.fetch_one(run_query, {"run_id": forecast_run_id})
-            if not run:
-                logger.error(f"Run {forecast_run_id} not found")
-                return
-            
-            scores_query = """
-            SELECT 
-                ms.miner_response_id,
-                mr.miner_hotkey,
-                ms.total_score,
-                ms.rmse_score,
-                ms.bias_score,
-                ms.pattern_correlation
-            FROM 
-                weather_miner_scores ms
-            JOIN 
-                weather_miner_responses mr ON ms.miner_response_id = mr.id
-            WHERE 
-                mr.run_id = :run_id
-                AND mr.verification_passed = TRUE
-            """
-            
-            scores = await self.db_manager.fetch_all(scores_query, {"run_id": forecast_run_id})
-            
-            if not scores:
-                logger.warning(f"No scored responses found for run {forecast_run_id}")
-                return
-            
-            miner_count = len(scores)
-            avg_score = sum(s['total_score'] for s in scores) / miner_count if miner_count > 0 else 0
-            max_score = max(s['total_score'] for s in scores) if miner_count > 0 else 0
-            min_score = min(s['total_score'] for s in scores) if miner_count > 0 else 0
-            
-            best_miner = max(scores, key=lambda s: s['total_score']) if scores else None
-            best_miner_hotkey = best_miner['miner_hotkey'] if best_miner else None
-            
-            ensemble_query = """
-            SELECT ef.id
-            FROM weather_ensemble_forecasts ef
-            WHERE ef.forecast_run_id = :run_id AND ef.status = 'completed'
-            """
-            
-            ensemble = await self.db_manager.fetch_one(ensemble_query, {"run_id": forecast_run_id})
-            ensemble_score = None
-            
-            if ensemble:
-                # TODO: Implement ensemble scoring here
-                ensemble_score = avg_score * 1.1 # Will remove this
-            score_data = {
-                "task_name": "weather",
-                "subtask_name": "forecast",
-                "run_id": str(forecast_run_id),
-                "run_timestamp": run['gfs_init_time_utc'].isoformat(),
-                "avg_score": float(avg_score),
-                "max_score": float(max_score),
-                "min_score": float(min_score),
-                "miner_count": miner_count,
-                "best_miner": best_miner_hotkey,
-                "ensemble_score": float(ensemble_score) if ensemble_score is not None else None,
-                "metadata": {
-                    "gfs_init_time": run['gfs_init_time_utc'].isoformat(),
-                    "verified_count": miner_count,
-                    "has_ensemble": ensemble is not None
-                }
-            }
-            
-            exists_query = """
-            SELECT id FROM score_table
-            WHERE task_name = 'weather' AND run_id = :run_id
-            """
-            
-            existing = await self.db_manager.fetch_one(exists_query, {"run_id": str(forecast_run_id)})
-            
-            if existing:
-                update_query = """
-                UPDATE score_table
-                SET 
-                    avg_score = :avg_score,
-                    max_score = :max_score,
-                    min_score = :min_score,
-                    miner_count = :miner_count,
-                    best_miner = :best_miner,
-                    ensemble_score = :ensemble_score,
-                    metadata = :metadata
-                WHERE 
-                    id = :id
-                """
-                
-                await self.db_manager.execute(update_query, {
-                    "id": existing['id'],
-                    "avg_score": score_data['avg_score'],
-                    "max_score": score_data['max_score'],
-                    "min_score": score_data['min_score'],
-                    "miner_count": score_data['miner_count'],
-                    "best_miner": score_data['best_miner'],
-                    "ensemble_score": score_data['ensemble_score'],
-                    "metadata": json.dumps(score_data['metadata'])
-                })
-                
-                logger.info(f"Updated score row for run {forecast_run_id}")
-                
-            else:
-                insert_query = """
-                INSERT INTO score_table
-                (task_name, subtask_name, run_id, run_timestamp, avg_score, max_score, min_score, 
-                 miner_count, best_miner, ensemble_score, metadata)
-                VALUES
-                (:task_name, :subtask_name, :run_id, :run_timestamp, :avg_score, :max_score, :min_score,
-                 :miner_count, :best_miner, :ensemble_score, :metadata)
-                """
-                
-                await self.db_manager.execute(insert_query, {
-                    "task_name": score_data['task_name'],
-                    "subtask_name": score_data['subtask_name'],
-                    "run_id": score_data['run_id'],
-                    "run_timestamp": score_data['run_timestamp'],
-                    "avg_score": score_data['avg_score'],
-                    "max_score": score_data['max_score'],
-                    "min_score": score_data['min_score'],
-                    "miner_count": score_data['miner_count'],
-                    "best_miner": score_data['best_miner'],
-                    "ensemble_score": score_data['ensemble_score'],
-                    "metadata": json.dumps(score_data['metadata'])
-                })
-                
-                logger.info(f"Inserted new score row for run {forecast_run_id}")
-                
-        except Exception as e:
-            logger.error(f"Error building score row for run {forecast_run_id}: {e}", exc_info=True)
-
     async def cleanup_resources(self):
         """
         Clean up resources like temporary files or reset database statuses
@@ -1077,772 +821,70 @@ class WeatherTask(Task):
                 logger.warning("Timed out waiting for ensemble tasks to complete")
                 
         logger.info("Weather task cleanup completed")
-
-    async def _run_inference_background(self, initial_batch: Batch, job_id: str, gfs_init_time: datetime, miner_hotkey: str):
-        """
-        Runs the weather forecast inference as a background task.
-        
-        Args:
-            initial_batch: The preprocessed Aurora batch
-            job_id: The unique job identifier
-            gfs_init_time: The GFS initialization time
-            miner_hotkey: The miner's hotkey
-        """
-        logger.info(f"[Job {job_id}] Starting background inference task...")
-        
-        try:
-            await self.update_job_status(job_id, "processing")
-            
-            logger.info(f"[Job {job_id}] Waiting for GPU semaphore...")
-            async with self.gpu_semaphore:
-                logger.info(f"[Job {job_id}] Acquired GPU semaphore, running inference...")
-                
-                try:
-                    selected_predictions_cpu = await asyncio.to_thread(
-                        self.inference_runner.run_multistep_inference,
-                        initial_batch,
-                        steps=40  # 40 steps of 6h each = 10 days
-                    )
-                    logger.info(f"[Job {job_id}] Inference completed with {len(selected_predictions_cpu)} time steps")
-                    
-                except Exception as infer_err:
-                    logger.error(f"[Job {job_id}] Inference failed: {infer_err}", exc_info=True)
-                    await self.update_job_status(job_id, "error", error_message=f"Inference error: {infer_err}")
-                    return
-            
-            try:
-                MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
-                
-                def _blocking_save_and_process():
-                    if not selected_predictions_cpu:
-                        raise ValueError("Inference returned no prediction steps.")
-
-                    forecast_datasets = []
-                    lead_times_hours = []
-                    base_time = pd.to_datetime(initial_batch.metadata.time[0])
-
-                    for i, batch in enumerate(selected_predictions_cpu):
-                        step_index_original = i * 2 + 1
-                        lead_time_hours = (step_index_original + 1) * 6
-                        forecast_time = base_time + timedelta(hours=lead_time_hours)
-
-                        ds_step = batch.to_xarray_dataset()
-                        ds_step = ds_step.assign_coords(time=[forecast_time])
-                        ds_step = ds_step.expand_dims('time')
-                        forecast_datasets.append(ds_step)
-                        lead_times_hours.append(lead_time_hours)
-
-                    combined_forecast_ds = xr.concat(forecast_datasets, dim='time')
-                    combined_forecast_ds = combined_forecast_ds.assign_coords(lead_time=('time', lead_times_hours))
-                    logger.info(f"[Job {job_id}] Combined forecast dimensions: {combined_forecast_ds.dims}")
-
-                    gfs_time_str = gfs_init_time.strftime('%Y%m%d%H')
-                    unique_suffix = str(uuid.uuid4())[:8]
-                    filename_nc = f"weather_forecast_{gfs_time_str}_{miner_hotkey[:8]}_{unique_suffix}.nc"
-                    output_nc_path = MINER_FORECAST_DIR_BG / filename_nc
-                    
-                    combined_forecast_ds.to_netcdf(output_nc_path)
-                    logger.info(f"[Job {job_id}] Saved forecast to NetCDF: {output_nc_path}")
-                    
-                    filename_json = f"{os.path.splitext(filename_nc)[0]}.json"
-                    output_json_path = MINER_FORECAST_DIR_BG / filename_json
-                    
-                    from kerchunk.hdf import SingleHdf5ToZarr
-                    h5chunks = SingleHdf5ToZarr(str(output_nc_path), inline_threshold=0)
-                    kerchunk_metadata = h5chunks.translate()
-                    
-                    with open(output_json_path, 'w') as f:
-                        json.dump(kerchunk_metadata, f)
-                    logger.info(f"[Job {job_id}] Generated Kerchunk JSON: {output_json_path}")
-                    
-                    from gaia.tasks.defined_tasks.weather.utils.hashing import compute_verification_hash
-                    
-                    forecast_metadata = {
-                        "time": [base_time],
-                        "source_model": "aurora",
-                        "resolution": 0.25
-                    }
-                    
-                    variables_to_hash = ["2t", "10u", "10v", "msl", "z", "u", "v", "t", "q"]
-                    timesteps_to_hash = list(range(len(forecast_datasets)))
-                
-                    data_for_hash = {
-                        "surf_vars": {},
-                        "atmos_vars": {}
-                    }
-                    
-                    for var in combined_forecast_ds.data_vars:
-                        if var in ["2t", "10u", "10v", "msl"]:
-                            data_for_hash["surf_vars"][var] = combined_forecast_ds[var].values[np.newaxis, :]
-                        elif var in ["z", "u", "v", "t", "q"]:
-                            data_for_hash["atmos_vars"][var] = combined_forecast_ds[var].values[np.newaxis, :]
-                    
-                    verification_hash = compute_verification_hash(
-                        data=data_for_hash,
-                        metadata=forecast_metadata,
-                        variables=[v for v in variables_to_hash if v in combined_forecast_ds.data_vars],
-                        timesteps=timesteps_to_hash
-                    )
-                    
-                    logger.info(f"[Job {job_id}] Computed verification hash: {verification_hash}")
-                    
-                    return str(output_nc_path), str(output_json_path), verification_hash
-                
-                nc_path, json_path, v_hash = await asyncio.to_thread(_blocking_save_and_process)
-                
-                await self.update_job_paths(
-                    job_id=job_id, 
-                    target_netcdf_path=nc_path, 
-                    kerchunk_json_path=json_path, 
-                    verification_hash=v_hash
-                )
-                
-                await self.update_job_status(job_id, "completed")
-                logger.info(f"[Job {job_id}] Background task completed successfully")
-                
-            except Exception as save_err:
-                logger.error(f"[Job {job_id}] Failed to save results: {save_err}", exc_info=True)
-                await self.update_job_status(job_id, "error", error_message=f"Processing error: {save_err}")
-        
-        except Exception as e:
-            logger.error(f"[Job {job_id}] Background task failed: {e}", exc_info=True)
-            await self.update_job_status(job_id, "error", error_message=f"Task error: {e}")
-
-    async def _update_job_status(self, job_id: str, status: str, **kwargs):
-        """Helper to update the job status in the database."""
-        logger.debug(f"[Job {job_id}] Updating status to '{status}' with args: {kwargs}")
-        update_fields = ["status = :status"]
-        params = {"job_id": job_id, "status": status}
-
-        if 'netcdf_path' in kwargs and kwargs['netcdf_path']:
-            update_fields.append("output_netcdf_path = :netcdf_path")
-            params["netcdf_path"] = kwargs['netcdf_path']
-        if 'kerchunk_path' in kwargs and kwargs['kerchunk_path']:
-            update_fields.append("output_kerchunk_path = :kerchunk_path")
-            params["kerchunk_path"] = kwargs['kerchunk_path']
-        if 'verification_hash' in kwargs and kwargs['verification_hash']:
-            update_fields.append("verification_hash = :verification_hash")
-            params["verification_hash"] = kwargs['verification_hash']
-        if 'error_message' in kwargs:
-            update_fields.append("error_message = :error_message")
-            params["error_message"] = kwargs['error_message']
-        if 'end_time' in kwargs and kwargs['end_time']:
-            update_fields.append("processing_end_time = :end_time")
-            params["end_time"] = kwargs['end_time']
-
-        query = f"""
-            UPDATE weather_miner_jobs
-            SET {', '.join(update_fields)}
-            WHERE job_id = :job_id
-        """
-        try:
-            await self.db_manager.execute(query, params)
-            logger.info(f"[Job {job_id}] Successfully updated status to '{status}'.")
-        except Exception as db_err:
-            logger.error(f"[Job {job_id}] Failed to update job status to '{status}': {db_err}", exc_info=True)
-
-    async def get_job_by_gfs_init_time(self, gfs_init_time_utc: datetime) -> Optional[Dict[str, Any]]:
-        """
-        Check if a job exists for the given GFS initialization time.
-        
-        Args:
-            gfs_init_time_utc: The GFS initialization time to check
-            
-        Returns:
-            Job record if found, None otherwise
-        """
-        try:
-            query = """
-            SELECT id, job_id, status, target_netcdf_path, kerchunk_json_path 
-            FROM weather_miner_jobs
-            WHERE gfs_init_time_utc = :gfs_init_time
-            ORDER BY id DESC
-            LIMIT 1
-            """
-            job = await self.db_manager.fetch_one(query, {"gfs_init_time": gfs_init_time_utc})
-            return job
-        except Exception as e:
-            logger.error(f"Error checking for existing job with GFS init time {gfs_init_time_utc}: {e}")
-            return None
-
-    async def update_job_status(self, job_id: str, status: str, error_message: Optional[str] = None) -> bool:
-        """
-        Update the status of a job in the database.
-        
-        Args:
-            job_id: The job ID
-            status: The new status
-            error_message: Optional error message
-            
-        Returns:
-            True if update was successful, False otherwise
-        """
-        try:
-            update_fields = ["status = :status", "updated_at = :updated_at"]
-            params = {
-                "job_id": job_id,
-                "status": status,
-                "updated_at": datetime.now(timezone.utc)
-            }
-            
-            if status == "processing":
-                update_fields.append("processing_start_time = :proc_start")
-                params["proc_start"] = datetime.now(timezone.utc)
-            elif status == "completed":
-                update_fields.append("processing_end_time = :proc_end")
-                params["proc_end"] = datetime.now(timezone.utc)
-            
-            if error_message:
-                update_fields.append("error_message = :error_msg")
-                params["error_msg"] = error_message
-                
-            query = f"""
-            UPDATE weather_miner_jobs
-            SET {", ".join(update_fields)}
-            WHERE job_id = :job_id
-            """
-            
-            await self.db_manager.execute(query, params)
-            logger.info(f"Updated job {job_id} status to {status}")
-            return True
-        except Exception as e:
-            logger.error(f"Error updating job status for {job_id}: {e}")
-            return False
-
-    async def update_job_paths(self, job_id: str, target_netcdf_path: str, kerchunk_json_path: str, verification_hash: str) -> bool:
-        """
-        Update the file paths and verification hash for a completed job.
-        
-        Args:
-            job_id: The job ID
-            target_netcdf_path: Path to the NetCDF file
-            kerchunk_json_path: Path to the Kerchunk JSON file
-            verification_hash: Hash to verify the forecast files
-            
-        Returns:
-            True if update was successful, False otherwise
-        """
-        try:
-            query = """
-            UPDATE weather_miner_jobs
-            SET target_netcdf_path = :netcdf_path,
-                kerchunk_json_path = :kerchunk_path,
-                verification_hash = :hash,
-                updated_at = :updated_at
-            WHERE job_id = :job_id
-            """
-            
-            params = {
-                "job_id": job_id,
-                "netcdf_path": target_netcdf_path,
-                "kerchunk_path": kerchunk_json_path,
-                "hash": verification_hash,
-                "updated_at": datetime.now(timezone.utc)
-            }
-            
-            await self.db_manager.execute(query, params)
-            logger.info(f"Updated job {job_id} with file paths and verification hash")
-            return True
-        except Exception as e:
-            logger.error(f"Error updating job paths for {job_id}: {e}")
-            return False
-
-    async def create_ensemble_forecast(self, run_id: int) -> bool:
-        """Creates an ensemble forecast from verified miner forecasts."""
-        logger.info(f"Creating ensemble forecast for run {run_id}")
-        
-        try:
-            query = """
-            SELECT 
-                mr.id as response_id, 
-                mr.miner_hotkey,
-                mr.kerchunk_json_url,
-                COALESCE(
-                    (SELECT weight FROM weather_historical_weights 
-                     WHERE miner_hotkey = mr.miner_hotkey 
-                     ORDER BY last_updated DESC LIMIT 1),
-                    0.5
-                ) as miner_weight,
-                fr.gfs_init_time_utc
-            FROM 
-                weather_miner_responses mr
-            JOIN
-                weather_forecast_runs fr ON mr.run_id = fr.id
-            WHERE 
-                mr.run_id = :run_id
-                AND mr.verification_passed = TRUE
-                AND mr.status = 'verified'
-            """
-            
-            responses = await self.db_manager.fetch_all(query, {"run_id": run_id})
-            
-            if not responses or len(responses) < 3:
-                logger.warning(f"Not enough verified responses for run {run_id} to create ensemble")
-                return False
-            
-            create_ensemble_query = """
-            INSERT INTO weather_ensemble_forecasts 
-            (forecast_run_id, creation_time, status)
-            VALUES (:run_id, :creation_time, 'processing')
-            RETURNING id
-            """
-            
-            ensemble_record = await self.db_manager.execute(
-                create_ensemble_query, 
-                {
-                    "run_id": run_id, 
-                    "creation_time": datetime.now(timezone.utc)
-                },
-                fetch_one=True
-            )
-            
-            if not ensemble_record or 'id' not in ensemble_record:
-                logger.error(f"Failed to create ensemble record for run {run_id}")
-                return False
-            
-            ensemble_id = ensemble_record['id']
-            
-            predictions = {}
-            weights = {}
-            
-            for response in responses:
-                miner_id = response['miner_hotkey']
-                weights[miner_id] = float(response.get('miner_weight', 0.5))
-                
-                await self.db_manager.execute("""
-                INSERT INTO weather_ensemble_components
-                (ensemble_id, response_id, weight)
-                VALUES (:ensemble_id, :response_id, :weight)
-                """, {
-                    "ensemble_id": ensemble_id,
-                    "response_id": response['response_id'],
-                    "weight": weights[miner_id]
-                })
-                
-                token_response = await self._request_fresh_token(miner_id, response['job_id'])
-                if not token_response or 'access_token' not in token_response:
-                    logger.warning(f"Could not get access token for miner {miner_id}")
-                    continue
-                    
-                try:
-                    headers = {"Authorization": f"Bearer {token_response['access_token']}"}
-                    ds = await self._open_forecast_dataset(response['kerchunk_json_url'], headers)
-                    
-                    key_variables = ["2t", "10u", "10v", "msl", "z", "u", "v", "t", "q"]
-                    miner_data = {}
-                    
-                    for var in key_variables:
-                        if var in ds:
-                            miner_data[var] = ds[var].values
-                    
-                    predictions[miner_id] = miner_data
-                    
-                except Exception as e:
-                    logger.error(f"Error loading forecast from miner {miner_id}: {e}")
-            
-            ensemble_data = await create_weighted_ensemble(predictions, weights)
-            
-            if not ensemble_data:
-                logger.error(f"Failed to create ensemble data for run {run_id}")
-                await self.db_manager.execute("""
-                UPDATE weather_ensemble_forecasts
-                SET status = 'failed'
-                WHERE id = :ensemble_id
-                """, {"ensemble_id": ensemble_id})
-                return False
-            
-            sample_ds = None
-            for miner_id in predictions:
-                if predictions[miner_id]:
-                    sample_ds = await self._open_forecast_dataset(
-                        responses[0]['kerchunk_json_url'], 
-                        {"Authorization": f"Bearer {token_response['access_token']}"}
-                    )
-                    break
-                    
-            if not sample_ds:
-                logger.error("Could not get dimension information from any dataset")
-                return False
-            
-            ensemble_ds = xr.Dataset()
-            
-            for var, data in ensemble_data.items():
-                if var in sample_ds:
-                    ensemble_ds[var] = (sample_ds[var].dims, data)
-                    
-            for coord_name, coord in sample_ds.coords.items():
-                if coord_name not in ensemble_ds.coords:
-                    ensemble_ds.coords[coord_name] = coord
-            
-            gfs_init_time = responses[0]['gfs_init_time_utc']
-            time_str = gfs_init_time.strftime('%Y%m%d%H') if hasattr(gfs_init_time, 'strftime') else str(gfs_init_time)
-            
-            ensemble_filename = f"ensemble_forecast_{time_str}.nc"
-            ensemble_dir = Path("./validator_ensembles/")
-            ensemble_dir.mkdir(parents=True, exist_ok=True)
-            ensemble_path = ensemble_dir / ensemble_filename
-            ensemble_ds.to_netcdf(str(ensemble_path))
-            
-            kerchunk_filename = f"{os.path.splitext(ensemble_filename)[0]}.json"
-            kerchunk_path = ensemble_dir / kerchunk_filename
-            
-            from kerchunk.hdf import SingleHdf5ToZarr
-            h5chunks = SingleHdf5ToZarr(str(ensemble_path), inline_threshold=0)
-            kerchunk_metadata = h5chunks.translate()
-            
-            with open(kerchunk_path, 'w') as f:
-                json.dump(kerchunk_metadata, f)
-            
-            from gaia.tasks.defined_tasks.weather.utils.hashing import compute_verification_hash
-            
-            ensemble_metadata = {
-                "time": [gfs_init_time],
-                "source_model": "ensemble",
-                "resolution": 0.25
-            }
-            
-            variables_to_hash = [var for var in ["2t", "10u", "10v", "msl", "z", "u", "v", "t", "q"] 
-                                 if var in ensemble_ds]
-            
-            data_for_hash = {
-                "surf_vars": {},
-                "atmos_vars": {}
-            }
-            
-            for var in variables_to_hash:
-                if var in ["2t", "10u", "10v", "msl"]:
-                    data_for_hash["surf_vars"][var] = ensemble_ds[var].values[np.newaxis, :]
-                elif var in ["z", "u", "v", "t", "q"]:
-                    data_for_hash["atmos_vars"][var] = ensemble_ds[var].values[np.newaxis, :]
-            
-            verification_hash = compute_verification_hash(
-                data=data_for_hash,
-                metadata=ensemble_metadata,
-                variables=variables_to_hash,
-                timesteps=list(range(len(ensemble_ds.time)))
-            )
-            
-            await self.db_manager.execute("""
-            UPDATE weather_ensemble_forecasts
-            SET ensemble_path = :path,
-                ensemble_kerchunk_path = :kerchunk_path,
-                ensemble_verification_hash = :hash,
-                status = 'completed'
-            WHERE id = :ensemble_id
-            """, {
-                "path": str(ensemble_path),
-                "kerchunk_path": str(kerchunk_path),
-                "hash": verification_hash,
-                "ensemble_id": ensemble_id
-            })
-            
-            logger.info(f"Successfully created ensemble forecast for run {run_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error creating ensemble forecast for run {run_id}: {e}", exc_info=True)
-            
-            if 'ensemble_id' in locals():
-                await self.db_manager.execute("""
-                UPDATE weather_ensemble_forecasts
-                SET status = 'error',
-                    error_message = :error_msg
-                WHERE id = :ensemble_id
-                """, {
-                    "error_msg": str(e),
-                    "ensemble_id": ensemble_id
-                })
-            
-            return False
-
-    async def _request_fresh_token(self, miner_hotkey, job_id):
-        """Request a fresh access token for a job."""
-        try:
-            kerchunk_request_payload = {
-                "nonce": str(uuid.uuid4()),
-                "data": {"job_id": job_id}
-            }
-            
-            response = await self.validator.query_miner(
-                miner_hotkey=miner_hotkey,
-                payload=kerchunk_request_payload,
-                endpoint="/weather-kerchunk-request"
-            )
-            
-            if response and response.get("status") == "completed":
-                return {
-                    "access_token": response.get("access_token")
-                }
-            return None
-        except Exception as e:
-            logger.error(f"Error requesting token: {e}")
-            return None
-
-    async def _open_forecast_dataset(self, kerchunk_url, headers):
-        """Open a forecast dataset using kerchunk JSON."""
-        try:
-            fs = fsspec.filesystem(
-                "reference", 
-                fo=kerchunk_url, 
-                remote_options={"headers": headers}
-            )
-            
-            mapper = fs.get_mapper("")
-            ds = xr.open_dataset(mapper, engine="zarr", backend_kwargs={"consolidated": False})
-            
-            return ds
-        except Exception as e:
-            logger.error(f"Error opening forecast: {e}")
-            raise
-        
-    async def start_ensemble_workers(self, num_workers=1):
-        """Start background workers for ensemble processing."""
-        if self.ensemble_worker_running:
-            logger.info("Ensemble workers already running")
+       
+    async def start_initial_scoring_workers(self, num_workers=1):
+        """Start background workers for initial scoring processing."""
+        if self.initial_scoring_worker_running:
+            logger.info("Initial scoring workers already running")
             return
             
-        self.ensemble_worker_running = True
+        self.initial_scoring_worker_running = True
         for _ in range(num_workers):
-            worker = asyncio.create_task(self._ensemble_worker())
-            self.ensemble_workers.append(worker)
-            
-        logger.info(f"Started {num_workers} ensemble workers")
+            worker = asyncio.create_task(initial_scoring_worker(self))
+            self.initial_scoring_workers.append(worker)
+        logger.info(f"Started {num_workers} initial scoring workers")
         
-    async def stop_ensemble_workers(self):
-        """Stop all background ensemble workers."""
-        if not self.ensemble_worker_running:
+    async def stop_initial_scoring_workers(self):
+        """Stop all background initial scoring workers."""
+        if not self.initial_scoring_worker_running:
             return
             
-        self.ensemble_worker_running = False
-        
-        for worker in self.ensemble_workers:
+        self.initial_scoring_worker_running = False
+        logger.info("Stopping initial scoring workers...")
+        for worker in self.initial_scoring_workers:
             worker.cancel()
             
-        self.ensemble_workers = []
-        logger.info("Stopped all ensemble workers")
+            
+        self.initial_scoring_workers = []
+        logger.info("Stopped all initial scoring workers")
         
-    async def _ensemble_worker(self):
-        """Background worker that processes ensemble tasks using the advanced method."""
-        while self.ensemble_worker_running:
-            run_id = None
-            ensemble_id = None
-            try:
-                try:
-                    run_id = await asyncio.wait_for(self.ensemble_task_queue.get(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    continue
-
-                logger.info(f"[EnsembleWorker] Processing ensemble for run {run_id}")
-
-                query = """
-                SELECT 
-                    mr.miner_hotkey,
-                    mr.kerchunk_json_url,
-                    mr.job_id,  -- Need job_id for token requests
-                    fr.gfs_init_time_utc,
-                    ef.id as ensemble_id,
-                    COALESCE(
-                        (SELECT weight FROM weather_historical_weights 
-                         WHERE miner_hotkey = mr.miner_hotkey 
-                         ORDER BY last_updated DESC LIMIT 1),
-                        0.5 -- Default weight if none found
-                    ) as miner_weight
-                FROM 
-                    weather_miner_responses mr
-                JOIN
-                    weather_forecast_runs fr ON mr.run_id = fr.id
-                JOIN
-                    weather_ensemble_forecasts ef ON ef.forecast_run_id = fr.id
-                WHERE 
-                    mr.run_id = :run_id
-                    AND mr.verification_passed = TRUE
-                    AND mr.status = 'verified'
-                """
-                responses = await self.db_manager.fetch_all(query, {"run_id": run_id})
-
-                if not responses or len(responses) < 3:
-                    logger.warning(f"[EnsembleWorker] Not enough verified responses ({len(responses)}) for run {run_id} to create ensemble. Min required: {getattr(self.config, 'min_ensemble_members', 3)}")
-                    await self.db_manager.execute(
-                        "UPDATE weather_ensemble_forecasts SET status = 'failed', error_message = :msg WHERE id = :eid",
-                        {"eid": ensemble_id, "msg": "Insufficient verified members"}
-                    )
-                    self.ensemble_task_queue.task_done()
-                    continue
-                    
-                ensemble_id = responses[0]['ensemble_id']
-                gfs_init_time = responses[0]['gfs_init_time_utc']
-
-                miner_forecast_refs = {}
-                miner_weights = {}
-                skipped_miners = []
-
-                async def _get_miner_ref(response):
-                    miner_id = response['miner_hotkey']
-                    job_id = response['job_id']
-                    kerchunk_url = response['kerchunk_json_url']
-                    weight = float(response['miner_weight'])
-                    
-                    token_response = await self._request_fresh_token(miner_id, job_id)
-                    if not token_response or 'access_token' not in token_response:
-                        logger.warning(f"[EnsembleWorker] Could not get access token for miner {miner_id}, job {job_id}. Skipping for ensemble.")
-                        return None, miner_id
-                        
-                    access_token = token_response['access_token']
-                    ref_spec = {
-                        'url': kerchunk_url,
-                        'protocol': 'http',
-                        'options': {
-                            'headers': {
-                                'Authorization': f'Bearer {access_token}'
-                            }
-                        }
-                    }
-                    return (miner_id, ref_spec, weight), None
-
-                tasks = [_get_miner_ref(resp) for resp in responses]
-                results = await asyncio.gather(*tasks)
-
-                for result, skipped_miner_id in results:
-                     if skipped_miner_id:
-                         skipped_miners.append(skipped_miner_id)
-                     elif result:
-                         miner_id, ref_spec, weight = result
-                         miner_forecast_refs[miner_id] = ref_spec
-                         miner_weights[miner_id] = weight
-
-                if len(miner_forecast_refs) < getattr(self.config, 'min_ensemble_members', 3):
-                    logger.warning(f"[EnsembleWorker] Not enough valid miners ({len(miner_forecast_refs)}) after token requests for run {run_id}. Min required: {getattr(self.config, 'min_ensemble_members', 3)}")
-                    await self.db_manager.execute(
-                        "UPDATE weather_ensemble_forecasts SET status = 'failed', error_message = :msg WHERE id = :eid",
-                        {"eid": ensemble_id, "msg": "Insufficient members after token fetch"}
-                    )
-                    self.ensemble_task_queue.task_done()
-                    continue
-
-                top_k = getattr(self.config, 'top_k_ensemble', None)
-                ensemble_ds = await create_physics_aware_ensemble(
-                    miner_forecast_refs=miner_forecast_refs,
-                    miner_weights=miner_weights,
-                    top_k=top_k
-                    #variables_to_process=... # optional subset
-                    #consistency_checks=... # optional override default
-                )
-
-                if ensemble_ds:
-                    logger.info(f"[EnsembleWorker] Successfully created ensemble dataset for run {run_id}")
-                    
-                    time_str = gfs_init_time.strftime('%Y%m%d%H')
-                    ensemble_nc_filename = f"ensemble_run_{run_id}_{time_str}.nc"
-                    ensemble_path = VALIDATOR_ENSEMBLE_DIR / ensemble_nc_filename
-                    try:
-                        encoding = {var: {'zlib': True, 'complevel': 5} for var in ensemble_ds.data_vars}
-                        await asyncio.to_thread(ensemble_ds.to_netcdf, path=str(ensemble_path), encoding=encoding)
-                        logger.info(f"[EnsembleWorker] Saved ensemble NetCDF: {ensemble_path}")
-                    except Exception as e_save:
-                         logger.error(f"[EnsembleWorker] Failed to save ensemble NetCDF for run {run_id}: {e_save}", exc_info=True)
-                         await self.db_manager.execute(
-                            "UPDATE weather_ensemble_forecasts SET status = 'failed', error_message = :msg WHERE id = :eid",
-                            {"eid": ensemble_id, "msg": f"Failed to save NetCDF: {e_save}"}
-                         )
-                         await self._update_run_status(run_id, "ensemble_failed", error_message=f"Failed to save NetCDF")
-                         self.ensemble_task_queue.task_done()
-                         continue
-
-                    kerchunk_filename = f"{os.path.splitext(ensemble_nc_filename)[0]}.json"
-                    kerchunk_path = VALIDATOR_ENSEMBLE_DIR / kerchunk_filename
-                    try:
-                        h5chunks = SingleHdf5ToZarr(str(ensemble_path), inline_threshold=0)
-                        kerchunk_metadata = h5chunks.translate()
-                        with open(kerchunk_path, 'w') as f:
-                            json.dump(kerchunk_metadata, f)
-                        logger.info(f"[EnsembleWorker] Generated ensemble Kerchunk JSON: {kerchunk_path}")
-                    except Exception as e_kc:
-                        logger.error(f"[EnsembleWorker] Failed to generate Kerchunk JSON for run {run_id}: {e_kc}", exc_info=True)
-                        kerchunk_path = None
-
-                    verification_hash = None
-                    try:
-                        ensemble_metadata_for_hash = {
-                            "time": [gfs_init_time],
-                            "source_model": "physics_aware_ensemble",
-                            "resolution": ensemble_ds.attrs.get('resolution', 0.25)
-                        }
-                        variables_to_hash = [v for v in ensemble_ds.data_vars if v in ALL_EXPECTED_VARIABLES]
-                        
-                        data_for_hash = {"surf_vars": {}, "atmos_vars": {}}
-                        for var in variables_to_hash:
-                            var_data = ensemble_ds[var].values
-                            if 'time' not in ensemble_ds[var].dims:
-                                var_data = np.expand_dims(var_data, axis=0)
-                                
-                            if var in AURORA_FUNDAMENTAL_SURFACE_VARIABLES + [dv for dv in AURORA_DERIVED_VARIABLES if dv in ensemble_ds]:
-                                data_for_hash["surf_vars"][var] = var_data
-                            elif var in AURORA_FUNDAMENTAL_ATMOS_VARIABLES:
-                                data_for_hash["atmos_vars"][var] = var_data
-
-                        if not data_for_hash["surf_vars"] and not data_for_hash["atmos_vars"]:
-                             logger.warning(f"[EnsembleWorker] No variables found for hashing in ensemble for run {run_id}")
-                        else:
-                            verification_hash = compute_verification_hash(
-                                data=data_for_hash,
-                                metadata=ensemble_metadata_for_hash,
-                                variables=variables_to_hash,
-                                timesteps=list(range(len(ensemble_ds.time)))
-                            )
-                            logger.info(f"[EnsembleWorker] Computed ensemble verification hash for run {run_id}: {verification_hash[:10]}..."
-                        )
-                    except Exception as e_hash:
-                         logger.error(f"[EnsembleWorker] Failed to compute verification hash for ensemble run {run_id}: {e_hash}", exc_info=True)
-
-                    update_params = {
-                        "eid": ensemble_id,
-                        "status": "completed",
-                        "path": str(ensemble_path),
-                        "kpath": str(kerchunk_path) if kerchunk_path else None,
-                        "hash": verification_hash,
-                        "end_time": datetime.now(timezone.utc)
-                    }
-                    update_query = """
-                    UPDATE weather_ensemble_forecasts
-                    SET status = :status, 
-                        ensemble_path = :path,
-                        ensemble_kerchunk_path = :kpath,
-                        ensemble_verification_hash = :hash,
-                        processing_end_time = :end_time,
-                        error_message = NULL
-                    WHERE id = :eid
-                    """
-                    await self.db_manager.execute(update_query, update_params)
-                    await self._update_run_status(run_id, "completed")
-                    logger.info(f"[EnsembleWorker] Successfully completed and recorded ensemble for run {run_id}")
-
-                else:
-                    logger.error(f"[EnsembleWorker] create_physics_aware_ensemble failed for run {run_id}")
-                    await self.db_manager.execute(
-                        "UPDATE weather_ensemble_forecasts SET status = 'failed', error_message = :msg WHERE id = :eid",
-                        {"eid": ensemble_id, "msg": "Ensemble creation function returned None"}
-                    )
-                    await self._update_run_status(run_id, "ensemble_failed", error_message="Ensemble function failed")
-
-                self.ensemble_task_queue.task_done()
-
-            except asyncio.CancelledError:
-                logger.info("[EnsembleWorker] Worker cancelled")
-                if run_id is not None and self.ensemble_task_queue._unfinished_tasks > 0:
-                     self.ensemble_task_queue.task_done()
-                break
-
-            except Exception as e:
-                logger.error(f"[EnsembleWorker] Unexpected error processing run {run_id}: {e}", exc_info=True)
-                if run_id and ensemble_id:
-                    try:
-                        await self.db_manager.execute(
-                            "UPDATE weather_ensemble_forecasts SET status = 'error', error_message = :msg WHERE id = :eid",
-                            {"eid": ensemble_id, "msg": f"Worker error: {e}"}
-                        )
-                        await self._update_run_status(run_id, "ensemble_failed", error_message=f"Worker error: {e}")
-                    except Exception as db_err:
-                         logger.error(f"[EnsembleWorker] Failed to update DB on error: {db_err}")
-                if run_id is not None and self.ensemble_task_queue._unfinished_tasks > 0:
-                     self.ensemble_task_queue.task_done()
-                await asyncio.sleep(1)
+    async def start_final_scoring_workers(self, num_workers=1):
+        """Start background workers for final ERA5-based scoring."""
+        if self.final_scoring_worker_running:
+            logger.info("Final scoring workers already running")
+            return
+            
+        self.final_scoring_worker_running = True
+        for _ in range(num_workers):
+            worker = asyncio.create_task(finalize_scores_worker(self))
+            self.final_scoring_workers.append(worker)
+        logger.info(f"Started {num_workers} final scoring workers")
+        
+    async def stop_final_scoring_workers(self):
+        """Stop all background final scoring workers."""
+        if not self.final_scoring_worker_running:
+            return
+            
+        self.final_scoring_worker_running = False
+        logger.info("Stopping final scoring workers...")
+        for worker in self.final_scoring_workers:
+            worker.cancel()
+            
+        self.final_scoring_workers = []
+        logger.info("Stopped all final scoring workers")
+        
+    async def start_background_workers(self, num_ensemble_workers=1, num_initial_scoring_workers=1, num_final_scoring_workers=1):
+         """Starts all background worker types."""
+         await self.start_ensemble_workers(num_ensemble_workers)
+         await self.start_initial_scoring_workers(num_initial_scoring_workers)
+         await self.start_final_scoring_workers(num_final_scoring_workers)
+         
+    async def stop_background_workers(self):
+        """Stops all background worker types."""
+        try: await self.stop_ensemble_workers()
+        except Exception as e: logger.error(f"Error stopping ensemble workers: {e}")
+        try: await self.stop_initial_scoring_workers()
+        except Exception as e: logger.error(f"Error stopping initial scoring workers: {e}")
+        try: await self.stop_final_scoring_workers()
+        except Exception as e: logger.error(f"Error stopping final scoring workers: {e}")
+            
