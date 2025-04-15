@@ -44,6 +44,7 @@ from ..scoring.ensemble import (
     AURORA_DERIVED_VARIABLES
 )
 from ..scoring.metrics import calculate_rmse
+from ..scoring.mechanism import calculate_gfs_score_and_weight, calculate_era5_miner_score
 logger = get_logger(__name__)
 
 VALIDATOR_ENSEMBLE_DIR = Path("./validator_ensembles/")
@@ -458,81 +459,25 @@ async def _initial_scoring_worker(self):
                     
             logger.info(f"[InitialScoringWorker] Run {run_id}: GFS analysis data fetched/loaded.")
             
+            # --- 3. Iterate and Score Miners against GFS --- 
             calculated_weights = {}
             scored_miners_count = 0
             tasks = []
 
-            async def score_individual_miner(response):
-                response_id = response['response_id']
-                miner_hotkey = response['miner_hotkey']
-                kerchunk_url = response['kerchunk_json_url']
-                job_id = response['job_id']
-                miner_sparse_ds = None
-                miner_ds_lazy = None
-                local_weight = None
-                local_score = None
-                
-                try:
-                    logger.debug(f"[InitialScoringWorker] Scoring miner {miner_hotkey} for response {response_id}")
-                    token_response = await self._request_fresh_token(miner_hotkey, job_id)
-                    if not token_response or 'access_token' not in token_response:
-                        logger.warning(f"[InitialScoringWorker] Run {run_id}: Could not get token for {miner_hotkey}. Skipping initial score.")
-                        return miner_hotkey, None, None
-                        
-                ref_spec = {
-                    'url': kerchunk_url,
-                        'protocol': 'http',
-                        'options': {'headers': {'Authorization': f'Bearer {token_response["access_token"]}'}}
-                    }
-                    
-                    miner_ds_lazy = await _open_dataset_lazily(ref_spec)
-                    if miner_ds_lazy is None:
-                            logger.warning(f"[InitialScoringWorker] Run {run_id}: Failed to open lazy dataset for {miner_hotkey}. Skipping.")
-                            return miner_hotkey, None, None
-                            
-                    miner_sparse_ds = await asyncio.to_thread(
-                        lambda: miner_ds_lazy.sel(time=target_datetimes, method='nearest').load()
-                    )
-                    
-                    gfs_sparse_ds = gfs_analysis_ds.sel(time=target_datetimes, method='nearest')
-
-                    common_vars = [v for v in ALL_EXPECTED_VARIABLES if v in miner_sparse_ds and v in gfs_sparse_ds]
-                    if not common_vars:
-                            logger.warning(f"[InitialScoringWorker] Run {run_id}, Miner {miner_hotkey}: No common vars with GFS. Skipping score.")
-                            return miner_hotkey, None, None
-                    
-                    miner_dict = {var: miner_sparse_ds[var].values for var in common_vars}
-                    gfs_dict = {var: gfs_sparse_ds[var].values for var in common_vars}
-                    
-                    local_score = await calculate_rmse(miner_dict, gfs_dict)
-                    if local_score is None or not np.isfinite(local_score):
-                            logger.warning(f"[InitialScoringWorker] Run {run_id}, Miner {miner_hotkey}: Invalid score calculated ({local_score}). Skipping weight.")
-                            return miner_hotkey, None, None
-                            
-                    local_weight = 1.0 / (1.0 + max(0, local_score))
-                    
-                    logger.info(f"[InitialScoringWorker] Run {run_id}, Miner {miner_hotkey}: GFS Score (RMSE)={local_score:.4f}, Weight={local_weight:.4f}")
-                    return miner_hotkey, local_weight, local_score
-                    
-                except Exception as e_score:
-                    logger.error(f"[InitialScoringWorker] Run {run_id}: Error scoring miner {miner_hotkey}: {e_score}", exc_info=False)
-                    logger.debug(traceback.format_exc())
-                    return miner_hotkey, None, None
-                finally:
-                    if miner_ds_lazy: miner_ds_lazy.close()
-                    del miner_sparse_ds
-                    gc.collect()
-                    
+            # Replace nested function with call to scoring mechanism
             for resp in responses:
-                    tasks.append(score_individual_miner(resp))
-                    
+                 tasks.append(calculate_gfs_score_and_weight(self, resp, target_datetimes, gfs_analysis_ds))
+                     
+            # Execute scoring concurrently
             scoring_results = await asyncio.gather(*tasks)
             
+            # Process results and store weights
             for hotkey, weight, score in scoring_results:
-                    if weight is not None and score is not None:
-                        calculated_weights[hotkey] = weight
-                        scored_miners_count += 1
-                        try:
+                 if weight is not None and score is not None:
+                     calculated_weights[hotkey] = weight
+                     scored_miners_count += 1
+                     # Store historical weight/score immediately
+                     try:
                         insert_weight_query = """
                             INSERT INTO weather_historical_weights 
                             (miner_hotkey, run_id, score_type, score, weight, last_updated)
@@ -543,16 +488,12 @@ async def _initial_scoring_worker(self):
                             last_updated = EXCLUDED.last_updated
                         """
                         await self.db_manager.execute(insert_weight_query, {
-                            "hk": hotkey, 
-                            "rid": run_id, 
-                            "stype": 'gfs_rmse', # Store score type explicitly
-                            "score": score, 
-                            "weight": weight, 
-                            "ts": datetime.now(timezone.utc)
+                            "hk": hotkey, "rid": run_id, "stype": 'gfs_rmse', 
+                            "score": score, "weight": weight, "ts": datetime.now(timezone.utc)
                         })
                         logger.debug(f"[InitialScoringWorker] Stored GFS weight for {hotkey}, run {run_id}")
-                        except Exception as db_err:
-                            logger.error(f"[InitialScoringWorker] Run {run_id}: Failed to store GFS-based weight for {hotkey}: {db_err}")
+                     except Exception as db_err:
+                          logger.error(f"[InitialScoringWorker] Run {run_id}: Failed to store GFS-based weight for {hotkey}: {db_err}")
             
             logger.info(f"[InitialScoringWorker] Run {run_id}: Successfully processed GFS scores for {scored_miners_count}/{len(responses)} miners.")
             
@@ -592,7 +533,7 @@ async def _initial_scoring_worker(self):
                         pass 
                 gc.collect()
 
-async def _finalize_scores_worker(self):
+async def finalize_scores_worker(self):
     """Background worker to calculate final scores against ERA5 after delay."""
     CHECK_INTERVAL_SECONDS = int(getattr(self.config, 'final_scoring_check_interval_seconds', 3600)) # Default 1 hour
     ERA5_DELAY_DAYS = int(getattr(self.config, 'era5_delay_days', 5))
@@ -659,93 +600,34 @@ async def _finalize_scores_worker(self):
 
                 logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 data fetched/loaded.")
 
-                # Score Individual Miners (vs ERA5)
-                miner_responses_query = """
-                SELECT id as response_id, miner_hotkey, kerchunk_json_url, job_id
-                FROM weather_miner_responses
-                WHERE run_id = :run_id AND verification_passed = TRUE
-                """
-                verified_responses = await self.db_manager.fetch_all(miner_responses_query, {"run_id": run_id})
-
+                # --- 3. Score Individual Miners (vs ERA5) --- 
+                # ... (fetch verified_responses) ...
                 logger.info(f"[FinalizeWorker] Run {run_id}: Found {len(verified_responses)} verified miner responses for final scoring.")
                 tasks = []
-
-                async def score_individual_miner_era5(response):
-                    response_id = response['response_id']
-                    miner_hotkey = response['miner_hotkey']
-                    kerchunk_url = response['kerchunk_json_url']
-                    job_id = response['job_id']
-                    miner_sparse_ds = None
-                    miner_ds_lazy = None
-                    local_score = None
-
-                    try:
-                        logger.debug(f"[FinalizeWorker] Final scoring miner {miner_hotkey} vs ERA5 (Resp ID: {response_id})")
-                        if not kerchunk_url:
-                            logger.warning(f"[FinalizeWorker] Missing Kerchunk URL for verified response {response_id}. Skipping final score.")
-                            return False
-
-                        token_response = await self._request_fresh_token(miner_hotkey, job_id)
-                        if not token_response or 'access_token' not in token_response:
-                            logger.warning(f"[FinalizeWorker] Run {run_id}: Could not get token for {miner_hotkey} for final scoring. Skipping.")
-                            return False
-
-                        ref_spec = {'url': kerchunk_url, 'protocol': 'http', 'options': {'headers': {'Authorization': f'Bearer {token_response["access_token"]}'}}}
-                        miner_ds_lazy = await _open_dataset_lazily(ref_spec)
-                        if miner_ds_lazy is None: return False
-
-                        miner_sparse_ds = await asyncio.to_thread(
-                            lambda: miner_ds_lazy.sel(time=target_datetimes, method='nearest').load()
-                        )
-                        era5_sparse_ds = era5_ds.sel(time=target_datetimes, method='nearest')
-
-                        common_vars = [v for v in ALL_EXPECTED_VARIABLES if v in miner_sparse_ds and v in era5_sparse_ds]
-                        if not common_vars:
-                            logger.warning(f"[FinalizeWorker] Miner {miner_hotkey} - No common variables with ERA5 found for scoring.")
-                            return False
-
-                        miner_dict = {var: miner_sparse_ds[var].values for var in common_vars}
-                        era5_dict = {var: era5_sparse_ds[var].values for var in common_vars}
-
-                        local_score = await calculate_rmse(miner_dict, gfs_dict=era5_dict) # Pass ERA5 as gfs_dict
-                        if local_score is None or not np.isfinite(local_score):
-                            logger.warning(f"[FinalizeWorker] Miner {miner_hotkey} - Invalid ERA5 score calculated ({local_score}).")
-                            return False
-
-                        await self.db_manager.execute("""
-                            INSERT INTO weather_miner_scores (response_id, run_id, score_type, score, calculation_time)
-                            VALUES (:resp_id, :run_id, 'era5_rmse', :score, :ts)
-                            ON CONFLICT (response_id, score_type) DO UPDATE SET
-                            score = EXCLUDED.score, calculation_time = EXCLUDED.calculation_time
-                        """, {
-                            "resp_id": response_id, "run_id": run_id, "score": local_score, "ts": datetime.now(timezone.utc)
-                        })
-                        logger.debug(f"[FinalizeWorker] Run {run_id}: Stored final ERA5 score ({local_score:.4f}) for miner {miner_hotkey} (Resp ID: {response_id})")
-                        return True
-
-                    except Exception as e_score:
-                        logger.error(f"[FinalizeWorker] Run {run_id}: Error final scoring miner {miner_hotkey} (Resp ID: {response_id}): {e_score}", exc_info=False)
-                        return False
-                    finally:
-                        if miner_ds_lazy: miner_ds_lazy.close()
-                        del miner_sparse_ds; gc.collect()
-
+                
+                # Replace nested function with call to scoring mechanism
                 for resp in verified_responses:
-                        tasks.append(score_individual_miner_era5(resp))
+                     # Pass run_id to the response dict if not already there, needed for DB storage
+                     resp_with_run_id = resp.copy()
+                     resp_with_run_id['run_id'] = run_id 
+                     tasks.append(calculate_era5_miner_score(self, resp_with_run_id, target_datetimes, era5_ds))
+                         
+                # Execute scoring concurrently
                 miner_scoring_results = await asyncio.gather(*tasks)
+                # Result is now just True/False for success/failure
                 successful_miner_scores = sum(1 for success in miner_scoring_results if success)
                 logger.info(f"[FinalizeWorker] Run {run_id}: Completed final scoring attempts for {successful_miner_scores}/{len(verified_responses)} miners.")
-
-                if successful_miner_scores > 0:
+                
+                # --- 4. Trigger build_score_row --- 
+                if successful_miner_scores > 0: 
                     logger.info(f"[FinalizeWorker] Run {run_id}: Building final score row using available ERA5 scores..." )
-                    await self.build_score_row(run_id)
-
+                    # Pass era5_ds which build_score_row will pass to calculate_era5_ensemble_score
+                    await build_score_row(self, run_id, ground_truth_ds=era5_ds)
                     await self._update_run_status(run_id, "scored")
                     logger.info(f"[FinalizeWorker] Run {run_id}: Final scoring process completed.")
                 else:
-                        logger.warning(f"[FinalizeWorker] Run {run_id}: No miners successfully scored against ERA5. Skipping score row build.")
-                        await self._update_run_status(run_id, "final_scoring_failed", error_message="No miners scored vs ERA5")
-
+                     logger.warning(f"[FinalizeWorker] Run {run_id}: No miners successfully scored against ERA5. Skipping score row build.")
+                     await self._update_run_status(run_id, "final_scoring_failed", error_message="No miners scored vs ERA5")
                 processed_run_ids.add(run_id)
 
         except asyncio.CancelledError:

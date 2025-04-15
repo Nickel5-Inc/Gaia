@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 from ..utils.era5_api import fetch_era5_data
 from ..scoring.ensemble import _open_dataset_lazily, ALL_EXPECTED_VARIABLES
 from ..scoring.metrics import calculate_rmse
+from ..scoring.mechanism import calculate_era5_ensemble_score
 
 logger = get_logger(__name__)
 async def _update_run_status(task_instance: 'WeatherTask', run_id: int, status: str, error_message: Optional[str] = None, gfs_metadata: Optional[dict] = None):
@@ -46,7 +47,7 @@ async def _update_run_status(task_instance: 'WeatherTask', run_id: int, status: 
     except Exception as db_err:
         logger.error(f"[Run {run_id}] Failed to update run status to '{status}': {db_err}", exc_info=True)
 
-async def build_score_row(task_instance: 'WeatherTask', forecast_run_id: int):
+async def build_score_row(task_instance: 'WeatherTask', forecast_run_id: int, ground_truth_ds: Optional[xr.Dataset] = None):
     """Builds the aggregate score row using FINAL (ERA5) scores."""
     logger.info(f"[build_score_row] Building final score row for forecast run {forecast_run_id}")
 
@@ -91,66 +92,53 @@ async def build_score_row(task_instance: 'WeatherTask', forecast_run_id: int):
             ensemble_details = await task_instance.db_manager.fetch_one(ensemble_query, {"run_id": forecast_run_id})
 
             if ensemble_details and (ensemble_details.get('ensemble_path') or ensemble_details.get('ensemble_kerchunk_path')):
-                logger.info(f"[build_score_row] Found completed ensemble for run {forecast_run_id}. Scoring vs ERA5.")
-                ensemble_ds = None
-                ground_truth_ds = None
+                logger.info(f"[build_score_row] Found completed ensemble for run {forecast_run_id}. Attempting to score vs ERA5.")
+                local_ground_truth_ds = ground_truth_ds
+                close_gt_later = False
+                
                 try:
-                    if ensemble_details.get('ensemble_kerchunk_path'):
-                            logger.debug(f"Loading ensemble via Kerchunk: {ensemble_details['ensemble_kerchunk_path']}")
-                            ref_spec = {'url': ensemble_details['ensemble_kerchunk_path'], 'protocol': 'file'}
-                            ensemble_ds = await _open_dataset_lazily(ref_spec)
-                            if ensemble_ds: ensemble_ds = await asyncio.to_thread(ensemble_ds.load)
-                    elif ensemble_details.get('ensemble_path') and os.path.exists(ensemble_details['ensemble_path']):
-                        logger.debug(f"Loading ensemble via NetCDF: {ensemble_details['ensemble_path']}")
-                        ensemble_ds = await asyncio.to_thread(xr.open_dataset, ensemble_details['ensemble_path'])
-                    else:
-                            logger.warning(f"[build_score_row] Ensemble file path/kerchunk missing/invalid for run {forecast_run_id}.")
-
-                    if ensemble_ds:
-                        logger.info("[build_score_row] Fetching ERA5 ground truth for ensemble scoring...")
-                        sparse_lead_hours_final = getattr(task_instance.config, 'final_scoring_lead_hours', [120, 168])
-                        target_datetimes_final = [run['gfs_init_time_utc'] + timedelta(hours=h) for h in sparse_lead_hours_final]
-                        times_in_ensemble_dt = [pd.Timestamp(t).to_pydatetime(warn=False).replace(tzinfo=timezone.utc) for t in ensemble_ds.time.values]
-                        target_datetimes_in_ensemble = [t for t in target_datetimes_final if t in times_in_ensemble_dt]
-
-                        if not target_datetimes_in_ensemble:
-                            logger.warning(f"[build_score_row] Ensemble dataset for run {forecast_run_id} does not contain the target scoring times. Skipping. Target={target_datetimes_final}, Ensemble={times_in_ensemble_dt}")
+                    if local_ground_truth_ds is None:
+                        logger.info("[build_score_row] Ground truth not passed, fetching ERA5 for ensemble scoring...")
+                        if not run:
+                            run = await task_instance.db_manager.fetch_one("SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id", {"run_id": forecast_run_id})
+                        
+                        if run:
+                            sparse_lead_hours_final = getattr(task_instance.config, 'final_scoring_lead_hours', [120, 168])
+                            target_datetimes_final = [run['gfs_init_time_utc'] + timedelta(hours=h) for h in sparse_lead_hours_final]
+                            local_ground_truth_ds = await get_ground_truth_data(task_instance, run['gfs_init_time_utc'], np.array(target_datetimes_final, dtype='datetime64[ns]'))
+                            close_gt_later = True
                         else:
-                            ground_truth_ds = await get_ground_truth_data(task_instance, run['gfs_init_time_utc'], np.array(target_datetimes_in_ensemble, dtype='datetime64[ns]'))
-
-                            if ground_truth_ds:
-                                logger.info("[build_score_row] Calculating final ensemble score vs ERA5...")
-                                common_vars = [v for v in ALL_EXPECTED_VARIABLES if v in ensemble_ds and v in ground_truth_ds]
-
-                                if not common_vars:
-                                        logger.warning(f"[build_score_row] No common vars between ensemble and ERA5 for run {forecast_run_id}.")
-                                else:
-                                    ensemble_subset = ensemble_ds[common_vars].sel(time=target_datetimes_in_ensemble, method='nearest')
-                                    ground_truth_aligned = ground_truth_ds[common_vars].sel(time=target_datetimes_in_ensemble, method='nearest')
-                                    ensemble_dict = {var: ensemble_subset[var].values for var in common_vars}
-                                    ground_truth_dict = {var: ground_truth_aligned[var].values for var in common_vars}
-                                    calculated_score = await calculate_rmse(ensemble_dict, ground_truth_dict)
-                                    if calculated_score is not None and np.isfinite(calculated_score):
-                                        ensemble_score = float(calculated_score)
-                                        logger.info(f"[build_score_row] Calculated final ensemble score (RMSE) for run {forecast_run_id}: {ensemble_score:.4f}")
-                                    else:
-                                            logger.warning(f"[build_score_row] Invalid ensemble score calculated ({calculated_score}).")
-                            else:
-                                logger.warning(f"[build_score_row] Could not retrieve ERA5 ground truth for run {forecast_run_id}. Cannot score ensemble.")
-
+                            logger.error(f"[build_score_row] Cannot fetch GT for ensemble, run details missing for {forecast_run_id}")
+                    
+                    if local_ground_truth_ds:
+                        target_datetimes_for_scoring = [pd.Timestamp(t).to_pydatetime(warn=False).replace(tzinfo=timezone.utc) for t in local_ground_truth_ds.time.values]
+                        
+                        logger.info(f"[build_score_row] Calling calculate_era5_ensemble_score...")
+                        ensemble_score = await calculate_era5_ensemble_score(
+                            task_instance=task_instance, 
+                            ensemble_details=ensemble_details, 
+                            target_datetimes=target_datetimes_for_scoring,
+                            ground_truth_ds=local_ground_truth_ds
+                        )
+                        if ensemble_score is not None:
+                            logger.info(f"[build_score_row] Received ensemble score: {ensemble_score:.4f}")
+                        else:
+                            logger.warning(f"[build_score_row] Ensemble scoring failed or returned None.")
+                    else:
+                        logger.warning(f"[build_score_row] Could not retrieve/receive ground truth data. Cannot score ensemble.")
+                            
                 except Exception as score_err:
-                    logger.error(f"[build_score_row] Error scoring ensemble for run {forecast_run_id}: {score_err}", exc_info=True)
+                    logger.error(f"[build_score_row] Error during ensemble scoring call: {score_err}", exc_info=True)
                 finally:
-                        if ensemble_ds and hasattr(ensemble_ds, 'close'): ensemble_ds.close()
-                        if ground_truth_ds and hasattr(ground_truth_ds, 'close'): ground_truth_ds.close()
-                        gc.collect()
+                    if close_gt_later and local_ground_truth_ds and hasattr(local_ground_truth_ds, 'close'): 
+                        local_ground_truth_ds.close()
+                    gc.collect()
             else:
                 logger.info(f"[build_score_row] No completed ensemble found for run {forecast_run_id}. Skipping ensemble scoring.")
 
         except Exception as e_ens_score:
-                logger.error(f"[build_score_row] Unexpected error during ensemble scoring setup for run {forecast_run_id}: {e_ens_score}", exc_info=True)
+            logger.error(f"[build_score_row] Unexpected error during ensemble scoring setup: {e_ens_score}", exc_info=True)
 
-        # Build Final Score Data
         score_data = {
             "task_name": "weather", "subtask_name": "forecast",
             "run_id": str(forecast_run_id), "run_timestamp": run['gfs_init_time_utc'].isoformat(),
@@ -261,16 +249,6 @@ async def _request_fresh_token(task_instance: 'WeatherTask', miner_hotkey: str, 
     except Exception as e:
         logger.error(f"Error requesting token for job {job_id} from {miner_hotkey}: {e}", exc_info=True)
         return None
-
-async def _open_forecast_dataset(task_instance: 'WeatherTask', kerchunk_url: str, headers: dict) -> Optional[xr.Dataset]:
-    """ (DEPRECATED - Use _open_dataset_lazily from ensemble.py) Opens a forecast dataset using kerchunk JSON."""
-    logger.warning("_open_forecast_dataset is deprecated. Use _open_dataset_lazily from weather_scoring.ensemble instead.")
-    ref_spec = {
-        'url': kerchunk_url,
-        'protocol': 'http',
-        'options': {'headers': headers}
-    }
-    return await _open_dataset_lazily(ref_spec)
 
 async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_utc: datetime) -> Optional[Dict[str, Any]]:
     """

@@ -244,11 +244,11 @@ class WeatherTask(Task):
                          raise ValueError("Failed to retrieve one or both required GFS analysis datasets.")
 
                      logger.info(f"[Run {run_id}] Successfully fetched GFS analysis data for T=0h and T=-6h.")
-                     await self._update_run_status(run_id, "serializing_gfs")
+                     await _update_run_status(self, run_id, "serializing_gfs")
 
                 except Exception as fetch_err:
                      logger.error(f"[Run {run_id}] Failed to fetch GFS data: {fetch_err}", exc_info=True)
-                     await self._update_run_status(run_id, "error", error_message=f"GFS Fetch Failed: {fetch_err}")
+                     await _update_run_status(self, run_id, "error", error_message=f"GFS Fetch Failed: {fetch_err}")
                      await asyncio.sleep(60)
                      continue
 
@@ -266,12 +266,12 @@ class WeatherTask(Task):
                          "variables_t0": list(ds_t0.data_vars.keys()),
                          "variables_t_minus_6": list(ds_t_minus_6.data_vars.keys())
                      }
-                     await self._update_run_status(run_id, "querying_miners", gfs_metadata=gfs_metadata)
+                     await _update_run_status(self, run_id, "querying_miners", gfs_metadata=gfs_metadata)
                      logger.info(f"[Run {run_id}] GFS data serialized.")
 
                 except Exception as serial_err:
                      logger.error(f"[Run {run_id}] Failed to serialize GFS data: {serial_err}", exc_info=True)
-                     await self._update_run_status(run_id, "error", error_message=f"GFS Serialization Failed: {serial_err}")
+                     await _update_run_status(self, run_id, "error", error_message=f"GFS Serialization Failed: {serial_err}")
                      await asyncio.sleep(60)
                      continue
 
@@ -329,7 +329,7 @@ class WeatherTask(Task):
                           logger.error(f"[Run {run_id}] Error processing response from {miner_hotkey}: {resp_proc_err}", exc_info=True)
 
                 logger.info(f"[Run {run_id}] Completed processing initial responses. {accepted_count} miners accepted.")
-                await self._update_run_status(run_id, "awaiting_results") # Stage 1 complete
+                await _update_run_status(self, run_id, "awaiting_results") # Stage 1 complete
 
                 if self.test_mode:
                      logger.info("TEST MODE: Exiting validator loop after one run.")
@@ -339,7 +339,7 @@ class WeatherTask(Task):
                  logger.error(f"Error in validator_execute main loop: {loop_err}", exc_info=True)
                  await validator.update_task_status('weather', 'error')
                  if 'run_id' in locals() and run_id is not None:
-                      try: await self._update_run_status(run_id, "error", error_message=f"Unhandled loop error: {loop_err}")
+                      try: await _update_run_status(self, run_id, "error", error_message=f"Unhandled loop error: {loop_err}")
                       except: pass
                  await asyncio.sleep(300)
 
@@ -379,7 +379,7 @@ class WeatherTask(Task):
             run_id = run['id']
             logger.info(f"Processing run {run_id} for scoring...")
             
-            await self._update_run_status(run_id, "scoring")
+            await _update_run_status(self, run_id, "scoring")
             
             responses_query = """
             SELECT mr.id, mr.miner_hotkey, mr.status
@@ -579,17 +579,17 @@ class WeatherTask(Task):
             if current_run_status and current_run_status['status'] == 'scoring': # Only proceed if still in scoring state
                 if verified_count >= min_ensemble_members:
                     logger.info(f"Run {run_id} has {verified_count} verified responses (>= {min_ensemble_members}). Triggering initial scoring.")
-                    await self._trigger_initial_scoring(run_id) 
+                    await _trigger_initial_scoring(self, run_id) 
                 elif total_responses > 0:
                      if verified_count > 0:
                          logger.info(f"Run {run_id} has {verified_count}/{total_responses} verified responses (< {min_ensemble_members}). Setting to partially_verified.")
-                         await self._update_run_status(run_id, "partially_verified")
+                         await _update_run_status(self, run_id, "partially_verified")
                      else:
                          logger.info(f"Run {run_id} has 0/{total_responses} verified responses. Setting to verification_failed.")
-                         await self._update_run_status(run_id, "verification_failed")
+                         await _update_run_status(self, run_id, "verification_failed")
                 else:
                     logger.warning(f"Run {run_id}: No responses processed. Setting status to verification_failed.")
-                    await self._update_run_status(run_id, "verification_failed")
+                    await _update_run_status(self, run_id, "verification_failed")
             else:
                  logger.warning(f"Run {run_id} status is not 'scoring' ({current_run_status['status'] if current_run_status else 'Not Found'}). Skipping status update logic in validator_score.")
 
