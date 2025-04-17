@@ -23,7 +23,7 @@ from pathlib import Path
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 
-MAX_REQUEST_SIZE = 100 * 1024 * 1024  # 100MB
+MAX_REQUEST_SIZE = 800 * 1024 * 1024  # 800MB
 
 logger = get_logger(__name__)
 

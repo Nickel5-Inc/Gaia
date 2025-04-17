@@ -20,7 +20,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import asyncio
 
-MAX_REQUEST_SIZE = 5 * 1024 * 1024  # 5MB
+MAX_REQUEST_SIZE = 800 * 1024 * 1024  # 800MB
 
 
 os.environ["NODE_TYPE"] = "miner"

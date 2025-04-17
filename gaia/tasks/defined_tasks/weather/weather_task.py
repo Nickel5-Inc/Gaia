@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 import os
 import importlib.util
 import json
-from pydantic import Field
+from pydantic import Field, ConfigDict
 from fiber.logging_utils import get_logger
 from gaia.tasks.base.task import Task
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
@@ -31,10 +31,9 @@ from .utils.data_prep import create_aurora_batch_from_gfs
 from .schemas.weather_metadata import WeatherMetadata
 from .schemas.weather_inputs import WeatherInputs, WeatherForecastRequest, WeatherInputData
 from .schemas.weather_outputs import WeatherOutputs, WeatherKerchunkResponseData
-from .scoring.ensemble import create_weighted_ensemble, create_physics_aware_ensemble, ALL_EXPECTED_VARIABLES, _open_dataset_lazily
-from .scoring.metrics import calculate_rmse
-from .processing.weather_miner_preprocessing import WeatherMinerPreprocessing, prepare_miner_batch_from_payload
-from .processing.weather_validator_preprocessing import WeatherValidatorPreprocessing
+from .weather_scoring.ensemble import create_physics_aware_ensemble, ALL_EXPECTED_VARIABLES, _open_dataset_lazily
+from .weather_scoring.metrics import calculate_rmse
+from .processing.weather_miner_preprocessing import prepare_miner_batch_from_payload
 from .processing.weather_logic import (
     _update_run_status, build_score_row, get_ground_truth_data,
     _trigger_initial_scoring, _request_fresh_token, verify_miner_response,
@@ -46,9 +45,8 @@ from .processing.weather_workers import (
     finalize_scores_worker, 
     run_inference_background
 )
-
-from gaia.models.weather_basemodel import WeatherBaseModel
-from gaia.tasks.defined_tasks.weather.weather_inference_runner import WeatherInferenceRunner
+from gaia.tasks.defined_tasks.weather.utils.inference_class import WeatherInferenceRunner
+logger = get_logger(__name__)
 
 try:
     from aurora.core import Batch
@@ -58,7 +56,6 @@ except ImportError:
     Batch = Any
     _AURORA_AVAILABLE = False
 
-logger = get_logger(__name__)
 
 DEFAULT_FORECAST_DIR_BG = Path("./miner_forecasts/")
 MINER_FORECAST_DIR_BG = Path(os.getenv("MINER_FORECAST_DIR", DEFAULT_FORECAST_DIR_BG))
@@ -72,70 +69,104 @@ if not MINER_JWT_SECRET_KEY:
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 15 # Token validity duration
 
-class WeatherTask(Task):
-    """
-    Task for weather forecasting using GFS inputs and generating NetCDF/Kerchunk outputs.
-    Handles validator orchestration (requesting forecasts, verifying, scoring)
-    and miner execution (running forecast model, providing data access).
-    """
+def _load_config(self):
+    """Loads configuration for the WeatherTask from environment variables."""
+    logger.info("Loading WeatherTask configuration from environment variables...")
+    config = {}
+    
+    def parse_int_list(env_var, default_list): 
+        val_str = os.getenv(env_var)
+        if val_str:
+            try: return [int(x.strip()) for x in val_str.split(',')]
+            except ValueError: logger.warning(f"Invalid format for {env_var}: '{val_str}'. Using default.")
+        return default_list
+        
+    # Worker/Run Parameters
+    config['min_ensemble_members'] = int(os.getenv('WEATHER_MIN_ENSEMBLE_MEMBERS', '3'))
+    config['top_k_ensemble'] = int(os.getenv('WEATHER_TOP_K_ENSEMBLE', '0')) # 0 or less means use all
+    if config['top_k_ensemble'] <= 0: config['top_k_ensemble'] = None
+    config['max_concurrent_inferences'] = int(os.getenv('WEATHER_MAX_CONCURRENT_INFERENCES', '1'))
+    config['inference_steps'] = int(os.getenv('WEATHER_INFERENCE_STEPS', '40'))
+    config['forecast_step_hours'] = int(os.getenv('WEATHER_FORECAST_STEP_HOURS', '6'))
+    config['forecast_duration_hours'] = config['inference_steps'] * config['forecast_step_hours'] # Calculate based on steps
+    
+    # Scoring Parameters
+    config['initial_scoring_lead_hours'] = parse_int_list('WEATHER_INITIAL_SCORING_LEAD_HOURS', [24, 72]) # Day 1, 3
+    config['final_scoring_lead_hours'] = parse_int_list('WEATHER_FINAL_SCORING_LEAD_HOURS', [120, 168]) # Day 5, 7
+    config['verification_wait_minutes'] = int(os.getenv('WEATHER_VERIFICATION_WAIT_MINUTES', '30'))
+    config['verification_timeout_seconds'] = int(os.getenv('WEATHER_VERIFICATION_TIMEOUT_SECONDS', '120'))
+    config['final_scoring_check_interval_seconds'] = int(os.getenv('WEATHER_FINAL_SCORING_INTERVAL_S', '3600')) # 1 hour
+    config['era5_delay_days'] = int(os.getenv('WEATHER_ERA5_DELAY_DAYS', '5'))
+    config['cleanup_check_interval_seconds'] = int(os.getenv('WEATHER_CLEANUP_INTERVAL_S', '21600')) # 6 hours
+    config['gfs_analysis_cache_dir'] = os.getenv('WEATHER_GFS_CACHE_DIR', './gfs_analysis_cache')
+    config['era5_cache_dir'] = os.getenv('WEATHER_ERA5_CACHE_DIR', './era5_cache')
+    config['gfs_cache_retention_days'] = int(os.getenv('WEATHER_GFS_CACHE_RETENTION_DAYS', '7'))
+    config['era5_cache_retention_days'] = int(os.getenv('WEATHER_ERA5_CACHE_RETENTION_DAYS', '30'))
+    config['ensemble_retention_days'] = int(os.getenv('WEATHER_ENSEMBLE_RETENTION_DAYS', '14'))
+    config['db_run_retention_days'] = int(os.getenv('WEATHER_DB_RUN_RETENTION_DAYS', '90'))
+    config['run_hour_utc'] = int(os.getenv('WEATHER_RUN_HOUR_UTC', '1')) # Example: 1 UTC
+    config['run_minute_utc'] = int(os.getenv('WEATHER_RUN_MINUTE_UTC', '0'))
 
-    db_manager: Union[ValidatorDatabaseManager, MinerDatabaseManager] = Field(
-        ...,
-        description="Database manager for the task",
-    )
-    model: Optional[WeatherBaseModel] = Field(
-        default=None, description="The weather prediction model"
-    )
-    node_type: str = Field(
-        default="validator",
-        description="Type of node running the task (validator or miner)"
-    )
-    test_mode: bool = Field(
-        default=False,
-        description="Whether to run in test mode (e.g., different timing, sample data)"
-    )
-    validator: Optional[Any] = Field(
-        default=None,
-        description="Reference to the validator instance, set during execution"
-    )
-    gpu_semaphore: Optional[asyncio.Semaphore] = Field(
-        default=None,
-        description="Semaphore to limit concurrent GPU-intensive inference tasks."
-    )
-    inference_runner: Optional[WeatherInferenceRunner] = Field(
-        default=None,
-        description="Instance of the inference runner."
+    logger.info(f"WeatherTask configuration loaded: {config}")
+    return config
+
+class WeatherTask(Task):
+    db_manager: Union[ValidatorDatabaseManager, MinerDatabaseManager]
+    node_type: str = Field(default="validator")
+    test_mode: bool = Field(default=False)
+ 
+    model_config = ConfigDict(
+        extra = 'allow',
+        arbitrary_types_allowed=True
     )
 
     def __init__(self, db_manager=None, node_type=None, test_mode=False, **data):
-        super().__init__(**data)
+        loaded_config = self._load_config() 
+        
+        super_data = {
+            "name": "WeatherTask",
+            "description": "Weather forecast generation and verification task",
+            "task_type": "atomic",
+            "metadata": WeatherMetadata(),
+            "db_manager": db_manager,
+            "node_type": node_type,
+            "test_mode": test_mode,
+            **data 
+        }
+        super().__init__(**super_data)
+        
         self.db_manager = db_manager
         self.node_type = node_type
         self.test_mode = test_mode
+        self.config = loaded_config 
+        self.validator = data.get('validator')
+
         self.ensemble_task_queue = asyncio.Queue()
         self.ensemble_worker_running = False
         self.ensemble_workers = []
         self.initial_scoring_queue = asyncio.Queue()
         self.initial_scoring_worker_running = False
         self.initial_scoring_workers = []
-        self.final_scoring_queue = asyncio.Queue()
         self.final_scoring_worker_running = False
         self.final_scoring_workers = []
-        self.config = self._load_config()
-        self.gpu_semaphore = asyncio.Semaphore(getattr(self.config, 'max_concurrent_inferences', 1))
-        self.inference_runner = WeatherInferenceRunner(self.config)
-
-        # Add cleanup worker state
         self.cleanup_worker_running = False
         self.cleanup_workers = []
+        
+        self.gpu_semaphore = asyncio.Semaphore(self.config.get('max_concurrent_inferences', 1))
+        
+        self.inference_runner = None 
+        if self.node_type == "miner":
+            try:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                self.inference_runner = WeatherInferenceRunner(device=device, config=self.config) 
+                logger.info(f"Initialized Miner components (Inference Runner on {device}).")
+            except Exception as e:
+                logger.error(f"Failed to initialize WeatherInferenceRunner: {e}", exc_info=True)
+                self.inference_runner = None 
+        else: # Validator
+             logger.info("Initialized validator components for WeatherTask")
 
-        if self.node_type == "validator":
-            logger.info("Initialized validator components for WeatherTask")
-        else:
-            logger.info("Initialized miner components for WeatherTask")
-            if self.inference_runner is None:
-                 logger.warning("WeatherInferenceRunner could not be initialized. Miner will likely fail.")
-
+    _load_config = _load_config
 
     ############################################################
     # Validator methods
@@ -206,27 +237,19 @@ class WeatherTask(Task):
                         RETURNING id
                     """
                     effective_forecast_start_time = gfs_t0_run_time
-                    run_record = await self.db_manager.execute(run_insert_query, {
+                    run_record = await self.db_manager.fetch_one(run_insert_query, { 
                          "init_time": now_utc,
                          "target_time": effective_forecast_start_time,
                          "gfs_init": effective_forecast_start_time,
                          "status": "fetching_gfs"
-                    }, fetch_one=True)
+                    })
 
                     if run_record and 'id' in run_record:
                         run_id = run_record['id']
                         logger.info(f"Created weather_forecast_runs record with ID: {run_id}")
                     else:
-                         logger.warning("Could not retrieve run_id via RETURNING. Attempting fallback query.")
-                         fallback_query = """
-                              SELECT id FROM weather_forecast_runs
-                              WHERE gfs_init_time_utc = :gfs_init ORDER BY run_initiation_time DESC LIMIT 1
-                         """
-                         fallback_record = await self.db_manager.fetch_one(fallback_query, {"gfs_init": effective_forecast_start_time})
-                         if fallback_record: run_id = fallback_record['id']
-
-                    if run_id is None:
-                        raise RuntimeError("Failed to create or retrieve run_id for forecast run.")
+                        logger.error("Failed to retrieve run_id using fetch_one after insert.")
+                        raise RuntimeError("Failed to create run_id for forecast run.")
 
                 except Exception as db_err:
                      logger.error(f"Failed to create forecast run record in DB: {db_err}", exc_info=True)
@@ -656,6 +679,32 @@ class WeatherTask(Task):
                 
         logger.info("Weather task cleanup completed")
        
+    async def start_ensemble_workers(self, num_workers=1):
+        """Start background workers for ensemble processing."""
+        if self.ensemble_worker_running:
+            logger.info("Ensemble workers already running")
+            return
+            
+        self.ensemble_worker_running = True
+        for _ in range(num_workers):
+            worker = asyncio.create_task(ensemble_worker(self)) 
+            self.ensemble_workers.append(worker)
+            
+        logger.info(f"Started {num_workers} ensemble workers")
+        
+    async def stop_ensemble_workers(self):
+        """Stop all background ensemble workers."""
+        if not self.ensemble_worker_running:
+            return
+            
+        self.ensemble_worker_running = False
+        logger.info("Stopping ensemble workers...")
+        for worker in self.ensemble_workers:
+            worker.cancel()
+                        
+        self.ensemble_workers = []
+        logger.info("Stopped all ensemble workers")
+
     async def start_initial_scoring_workers(self, num_workers=1):
         """Start background workers for initial scoring processing."""
         if self.initial_scoring_worker_running:

@@ -48,6 +48,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from gaia.validator.basemodel_evaluator import BaseModelEvaluator
 from gaia.validator.utils.db_wipe import handle_db_wipe
+from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 
 logger = get_logger(__name__)
 
@@ -70,6 +71,11 @@ class GaiaValidator:
             node_type="validator",
             db_manager=self.database_manager,
             test_mode=args.test
+        )
+        self.weather_task = WeatherTask(
+            db_manager=self.database_manager,
+            node_type="validator",
+            test_mode=args.test,
         )
         self.weights = [0.0] * 256
         self.last_set_weights_block = 0
@@ -854,11 +860,12 @@ class GaiaValidator:
             tasks = [
                 lambda: self.geomagnetic_task.validator_execute(self),
                 lambda: self.soil_task.validator_execute(self),
+                lambda: self.weather_task.validator_execute(self),
                 lambda: self.status_logger(),
                 lambda: self.main_scoring(),
                 lambda: self.handle_miner_deregistration_loop(),
                 #lambda: self.miner_score_sender.run_async(),
-                lambda: self.check_for_updates()
+                #lambda: self.check_for_updates()
             ]
             
             try:

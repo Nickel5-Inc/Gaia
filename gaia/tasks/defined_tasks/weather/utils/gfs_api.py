@@ -208,7 +208,7 @@ def process_opendap_dataset(ds: xr.Dataset) -> xr.Dataset:
             new_ds = new_ds.reindex(lat=new_ds.lat[::-1])
 
     if 'lon' in new_ds.coords:
-        if new_ds.lon.values.min() < -1.0
+        if new_ds.lon.values.min() < -1.0:
             logger.info("Adjusting longitude coordinate from [-180, 180] to [0, 360).")
             new_ds = new_ds.assign_coords(lon=(((new_ds.lon + 180) % 360) - 180 + 360) % 360) # Careful conversion
             new_ds = new_ds.sortby('lon')

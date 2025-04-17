@@ -16,9 +16,9 @@ from typing import TYPE_CHECKING, Any, Optional, Dict, List
 if TYPE_CHECKING:
     from ..weather_task import WeatherTask
 from ..utils.era5_api import fetch_era5_data
-from ..scoring.ensemble import _open_dataset_lazily, ALL_EXPECTED_VARIABLES
-from ..scoring.metrics import calculate_rmse
-from ..scoring.mechanism import calculate_era5_ensemble_score
+from ..weather_scoring.ensemble import _open_dataset_lazily, ALL_EXPECTED_VARIABLES
+from ..weather_scoring.metrics import calculate_rmse
+from ..weather_scoring_mechanism import calculate_era5_ensemble_score
 
 logger = get_logger(__name__)
 async def _update_run_status(task_instance: 'WeatherTask', run_id: int, status: str, error_message: Optional[str] = None, gfs_metadata: Optional[dict] = None):
@@ -103,7 +103,7 @@ async def build_score_row(task_instance: 'WeatherTask', forecast_run_id: int, gr
                             run = await task_instance.db_manager.fetch_one("SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id", {"run_id": forecast_run_id})
                         
                         if run:
-                            sparse_lead_hours_final = getattr(task_instance.config, 'final_scoring_lead_hours', [120, 168])
+                            sparse_lead_hours_final = task_instance.config.get('final_scoring_lead_hours', [120, 168])
                             target_datetimes_final = [run['gfs_init_time_utc'] + timedelta(hours=h) for h in sparse_lead_hours_final]
                             local_ground_truth_ds = await get_ground_truth_data(task_instance, run['gfs_init_time_utc'], np.array(target_datetimes_final, dtype='datetime64[ns]'))
                             close_gt_later = True
@@ -192,7 +192,7 @@ async def get_ground_truth_data(task_instance: 'WeatherTask', init_time: datetim
         logger.error(f"Failed to convert forecast_times to Python datetimes: {e}")
         return None
 
-    era5_cache_dir = Path(getattr(task_instance.config, 'era5_cache_dir', './era5_cache'))
+    era5_cache_dir = Path(task_instance.config.get('era5_cache_dir', './era5_cache'))
     try:
         ground_truth_ds = await fetch_era5_data(
             target_times=target_datetimes,
@@ -402,8 +402,8 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
         variables_to_check = ALL_EXPECTED_VARIABLES 
         metadata = {"time": [gfs_init_time], "source_model": "aurora", "resolution": 0.25}
         headers = {"Authorization": f"Bearer {access_token}"}
-        timesteps = list(range(getattr(task_instance.config, 'inference_steps', 40)))
-        verification_timeout = getattr(task_instance.config, 'verification_timeout_seconds', 120)
+        timesteps = list(range(task_instance.config.get('inference_steps', 40)))
+        verification_timeout = task_instance.config.get('verification_timeout_seconds', 120)
         
         verification_result = await asyncio.wait_for(
             verify_forecast_hash(

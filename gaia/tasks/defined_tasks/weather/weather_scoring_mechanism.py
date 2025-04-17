@@ -15,9 +15,8 @@ from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple
 if TYPE_CHECKING:
     from ..weather_task import WeatherTask 
 
-from .metrics import calculate_rmse
-from .ensemble import _open_dataset_lazily, ALL_EXPECTED_VARIABLES
-from ..processing.weather_logic import _request_fresh_token 
+from .weather_scoring.metrics import calculate_rmse
+from .weather_scoring.ensemble import _open_dataset_lazily, ALL_EXPECTED_VARIABLES
 
 logger = get_logger(__name__)
 
@@ -56,6 +55,7 @@ async def calculate_gfs_score_and_weight(task_instance: 'WeatherTask',
              logger.warning(f"[ScoringMech] Missing kerchunk_url or job_id for {miner_hotkey} (Resp: {response_id}). Skipping.")
              return miner_hotkey, None, None
              
+        from ..processing.weather_logic import _request_fresh_token
         token_response = await _request_fresh_token(task_instance, miner_hotkey, job_id)
         if not token_response or 'access_token' not in token_response:
             logger.warning(f"[ScoringMech] Could not get token for {miner_hotkey} (Resp: {response_id}). Skipping initial score.")
@@ -143,6 +143,7 @@ async def calculate_era5_miner_score(task_instance: 'WeatherTask',
             logger.warning(f"[ScoringMech] Missing kerchunk_url or job_id for {miner_hotkey} (Resp: {response_id}). Skipping final score.")
             return False
             
+        from ..processing.weather_logic import _request_fresh_token
         token_response = await _request_fresh_token(task_instance, miner_hotkey, job_id)
         if not token_response or 'access_token' not in token_response: 
             logger.warning(f"[ScoringMech] Could not get token for {miner_hotkey} (Resp: {response_id}) for final scoring. Skipping.")

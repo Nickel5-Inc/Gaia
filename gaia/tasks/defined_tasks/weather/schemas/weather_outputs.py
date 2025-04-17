@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any, Union, Set, Literal
 import numpy as np
 import xarray as xr
-from pydantic import BaseModel, Field, validator, ConfigDict, root_validator
+from pydantic import BaseModel, Field, validator, ConfigDict, root_validator, model_validator
 from gaia.tasks.base.components.outputs import Outputs
 from gaia.tasks.base.decorators import handle_validation_error
 from fiber.logging_utils import get_logger
@@ -98,7 +98,10 @@ class ForecastMetadata(BaseModel):
     longitude: np.ndarray = Field(..., description="Longitude values (must be 0 to 360, not including 360)")
     pressure_levels: Optional[List[int]] = Field(None, description="Pressure levels in hPa")
     
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        protected_namespaces=(),
+        arbitrary_types_allowed=True
+    )
     
     @validator('lead_time')
     def validate_lead_time(cls, v):
@@ -159,16 +162,12 @@ class WeatherForecast(BaseModel):
     
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
-    @root_validator
-    def validate_variables_present(cls, values):
-        """Validate that at least one variable is present."""
-        surface_vars = values.get('surface_variables', {})
-        atmos_vars = values.get('atmospheric_variables', {})
-        
-        if not surface_vars and not atmos_vars:
-            raise ValueError("Forecast must contain at least one variable")
-            
-        return values
+    @model_validator(mode='after')
+    def validate_variables_present(self) -> 'WeatherForecast':
+        """Ensure at least one surface or atmospheric variable is present."""
+        if not self.surface_variables and not self.atmospheric_variables:
+            raise ValueError("Forecast must contain at least one surface or atmospheric variable.")
+        return self
     
     @classmethod
     def from_aurora_batch(cls, batch, forecast_id: str, miner_id: str, model_version: str) -> "WeatherForecast":

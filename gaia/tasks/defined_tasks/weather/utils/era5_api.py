@@ -200,7 +200,7 @@ async def fetch_era5_data(
 
 async def _test_fetch():
     print("Testing ERA5 fetch...")
-    test_times = [1
+    test_times = [1,
         datetime(2025, 4, 9, 6, 0),
         datetime(2025, 4, 9, 12, 0)
     ]

@@ -46,8 +46,7 @@
             {"column": "miner_uid", "unique": false},
             {"column": "miner_hotkey", "unique": false},
             {"column": "verification_passed", "unique": false},
-            {"column": "status", "unique": false},
-            {"name": "idx_weather_responses_run_miner", "columns": ["run_id", "miner_uid"], "unique": true}
+            {"column": "status", "unique": false}
         ],
         "foreign_keys": [
             {
@@ -78,8 +77,7 @@
             {"column": "miner_uid", "unique": false},
             {"column": "miner_hotkey", "unique": false},
             {"column": "calculation_time", "unique": false},
-            {"column": "score_type", "unique": false},
-            {"name": "uq_weather_miner_scores_resp_type", "columns": ["response_id", "score_type"], "unique": true}
+            {"column": "score_type", "unique": false}
         ],
         "foreign_keys": [
             {
@@ -110,7 +108,7 @@
             "error_message": "TEXT"
         },
         "indexes": [
-            {"column": "forecast_run_id", "unique": true}
+            {"column": "forecast_run_id"}
         ],
         "foreign_keys": [
             {
@@ -163,8 +161,7 @@
         "indexes": [
             {"column": "miner_hotkey", "unique": false},
             {"column": "run_id", "unique": false},
-            {"column": "score_type", "unique": false},
-            {"name": "pk_weather_hist_weights", "columns": ["miner_hotkey", "run_id", "score_type"], "unique": true}
+            {"column": "score_type", "unique": false}
         ],
         "foreign_keys": [
             {

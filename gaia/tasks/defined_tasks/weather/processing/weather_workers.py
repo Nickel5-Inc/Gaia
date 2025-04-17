@@ -37,7 +37,7 @@ from .weather_logic import (
 from ..utils.gfs_api import fetch_gfs_analysis_data
 from ..utils.era5_api import fetch_era5_data
 from ..utils.hashing import compute_verification_hash
-from ..scoring.ensemble import (
+from ..weather_scoring.ensemble import (
     create_physics_aware_ensemble,
     _open_dataset_lazily,
     ALL_EXPECTED_VARIABLES,
@@ -45,15 +45,15 @@ from ..scoring.ensemble import (
     AURORA_FUNDAMENTAL_ATMOS_VARIABLES,
     AURORA_DERIVED_VARIABLES
 )
-from ..scoring.metrics import calculate_rmse
-from ..scoring.mechanism import calculate_gfs_score_and_weight, calculate_era5_miner_score
+from ..weather_scoring.metrics import calculate_rmse
+from ..weather_scoring_mechanism import calculate_gfs_score_and_weight, calculate_era5_miner_score
 logger = get_logger(__name__)
 
 VALIDATOR_ENSEMBLE_DIR = Path("./validator_ensembles/")
 MINER_FORECAST_DIR_BG = Path("./miner_forecasts_background/")
 
 
-async def _ensemble_worker(self):
+async def ensemble_worker(self):
     """Background worker that processes ensemble tasks using the advanced method."""
     while self.ensemble_worker_running:
         run_id = None
@@ -93,7 +93,7 @@ async def _ensemble_worker(self):
             responses = await self.db_manager.fetch_all(query, {"run_id": run_id})
 
             if not responses or len(responses) < 3:
-                logger.warning(f"[EnsembleWorker] Not enough verified responses ({len(responses)}) for run {run_id} to create ensemble. Min required: {getattr(self.config, 'min_ensemble_members', 3)}")
+                logger.warning(f"[EnsembleWorker] Not enough verified responses ({len(responses)}) for run {run_id} to create ensemble. Min required: {self.config.get('min_ensemble_members', 3)}")
                 await self.db_manager.execute(
                     "UPDATE weather_ensemble_forecasts SET status = 'failed', error_message = :msg WHERE id = :eid",
                     {"eid": ensemble_id, "msg": "Insufficient verified members"}
@@ -142,8 +142,8 @@ async def _ensemble_worker(self):
                         miner_forecast_refs[miner_id] = ref_spec
                         miner_weights[miner_id] = weight
 
-            if len(miner_forecast_refs) < getattr(self.config, 'min_ensemble_members', 3):
-                logger.warning(f"[EnsembleWorker] Not enough valid miners ({len(miner_forecast_refs)}) after token requests for run {run_id}. Min required: {getattr(self.config, 'min_ensemble_members', 3)}")
+            if len(miner_forecast_refs) < self.config.get('min_ensemble_members', 3):
+                logger.warning(f"[EnsembleWorker] Not enough valid miners ({len(miner_forecast_refs)}) after token requests for run {run_id}. Min required: {self.config.get('min_ensemble_members', 3)}")
                 await self.db_manager.execute(
                     "UPDATE weather_ensemble_forecasts SET status = 'failed', error_message = :msg WHERE id = :eid",
                     {"eid": ensemble_id, "msg": "Insufficient members after token fetch"}
@@ -151,7 +151,7 @@ async def _ensemble_worker(self):
                 self.ensemble_task_queue.task_done()
                 continue
 
-            top_k = getattr(self.config, 'top_k_ensemble', None)
+            top_k = self.config.get('top_k_ensemble', None)
             ensemble_ds = await create_physics_aware_ensemble(
                 miner_forecast_refs=miner_forecast_refs,
                 miner_weights=miner_weights,
@@ -204,27 +204,31 @@ async def _ensemble_worker(self):
                     data_for_hash = {"surf_vars": {}, "atmos_vars": {}}
                     for var in variables_to_hash:
                         var_data = ensemble_ds[var].values
-                        if 'time' not in ensemble_ds[var].dims:
-                            var_data = np.expand_dims(var_data, axis=0)
-                            
-                        if var in AURORA_FUNDAMENTAL_SURFACE_VARIABLES + [dv for dv in AURORA_DERIVED_VARIABLES if dv in ensemble_ds]:
+                        if var in AURORA_FUNDAMENTAL_SURFACE_VARIABLES + AURORA_DERIVED_VARIABLES:
                             data_for_hash["surf_vars"][var] = var_data
                         elif var in AURORA_FUNDAMENTAL_ATMOS_VARIABLES:
                             data_for_hash["atmos_vars"][var] = var_data
 
                     if not data_for_hash["surf_vars"] and not data_for_hash["atmos_vars"]:
-                            logger.warning(f"[EnsembleWorker] No variables found for hashing in ensemble for run {run_id}")
-                else:
+                         logger.warning(f"[EnsembleWorker] No variables categorized for hashing in ensemble for run {run_id}. Hash set to None.")
+                         verification_hash = None
+                    else:
+                        logger.debug(f"[EnsembleWorker] Data prepared for hashing. Computing hash...")
                         verification_hash = compute_verification_hash(
                             data=data_for_hash,
                             metadata=ensemble_metadata_for_hash,
-                            variables=variables_to_hash,
+                            variables=list(data_for_hash["surf_vars"].keys()) + list(data_for_hash["atmos_vars"].keys()),
                             timesteps=list(range(len(ensemble_ds.time)))
                         )
-                        logger.info(f"[EnsembleWorker] Computed ensemble verification hash for run {run_id}: {verification_hash[:10]}..."
-                    )
+                        if verification_hash:
+                            logger.info(f"[EnsembleWorker] Computed ensemble verification hash for run {run_id}: {verification_hash[:10]}..."
+                        )
+                        else:
+                            logger.warning(f"[EnsembleWorker] compute_verification_hash returned None for run {run_id}")
+                
                 except Exception as e_hash:
-                        logger.error(f"[EnsembleWorker] Failed to compute verification hash for ensemble run {run_id}: {e_hash}", exc_info=True)
+                     logger.error(f"[EnsembleWorker] Failed during hash preparation/computation for run {run_id}: {e_hash}", exc_info=True)
+                     verification_hash = None
 
                 update_params = {
                     "eid": ensemble_id,
@@ -279,7 +283,7 @@ async def _ensemble_worker(self):
                     self.ensemble_task_queue.task_done()
             await asyncio.sleep(1)
 
-async def _run_inference_background(self, initial_batch: Batch, job_id: str, gfs_init_time: datetime, miner_hotkey: str):
+async def run_inference_background(self, initial_batch: Batch, job_id: str, gfs_init_time: datetime, miner_hotkey: str):
     """
     Runs the weather forecast inference as a background task.
     
@@ -302,7 +306,7 @@ async def _run_inference_background(self, initial_batch: Batch, job_id: str, gfs
                 selected_predictions_cpu = await asyncio.to_thread(
                     self.inference_runner.run_multistep_inference,
                     initial_batch,
-                    steps=40  # 40 steps of 6h each = 10 days
+                    steps=self.config.get('inference_steps', 40)  # 40 steps of 6h each = 10 days
                 )
                 logger.info(f"[Job {job_id}] Inference completed with {len(selected_predictions_cpu)} time steps")
                 
@@ -324,7 +328,7 @@ async def _run_inference_background(self, initial_batch: Batch, job_id: str, gfs
 
                 for i, batch in enumerate(selected_predictions_cpu):
                     step_index_original = i * 2 + 1
-                    lead_time_hours = (step_index_original + 1) * 6
+                    lead_time_hours = (step_index_original + 1) * self.config.get('forecast_step_hours', 6)
                     forecast_time = base_time + timedelta(hours=lead_time_hours)
 
                     ds_step = batch.to_xarray_dataset()
@@ -409,7 +413,7 @@ async def _run_inference_background(self, initial_batch: Batch, job_id: str, gfs
         logger.error(f"[Job {job_id}] Background task failed: {e}", exc_info=True)
         await self.update_job_status(job_id, "error", error_message=f"Task error: {e}")
 
-async def _initial_scoring_worker(self):
+async def initial_scoring_worker(self):
     """Background worker to calculate initial scores/weights vs GFS analysis."""
     while self.initial_scoring_worker_running:
         run_id = None
@@ -436,49 +440,44 @@ async def _initial_scoring_worker(self):
             """
             responses = await self.db_manager.fetch_all(responses_query, {"run_id": run_id})
             
-            min_members = getattr(self.config, 'min_ensemble_members', 3)
+            min_members = self.config.get('min_ensemble_members', 3)
             if not responses or len(responses) < min_members:
                 logger.warning(f"[InitialScoringWorker] Run {run_id}: Insufficient verified responses ({len(responses)} < {min_members}) found for initial scoring.")
                 await self._update_run_status(run_id, "initial_scoring_failed", error_message="Insufficient verified members")
                 self.initial_scoring_queue.task_done()
-                    continue
+                continue
                 
             gfs_init_time = responses[0]['gfs_init_time_utc']
             logger.info(f"[InitialScoringWorker] Run {run_id}: Found {len(responses)} verified responses. Init time: {gfs_init_time}")
             
-            sparse_lead_hours = getattr(self.config, 'initial_scoring_lead_hours', [24, 72])
+            sparse_lead_hours = self.config.get('initial_scoring_lead_hours', [24, 72])
             target_datetimes = [gfs_init_time + timedelta(hours=h) for h in sparse_lead_hours]
             logger.info(f"[InitialScoringWorker] Run {run_id}: Fetching GFS analysis for initial scoring at lead hours: {sparse_lead_hours}.")
             
-            gfs_cache = Path(getattr(self.config, 'gfs_analysis_cache_dir', './gfs_analysis_cache'))
+            gfs_cache = Path(self.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
             gfs_analysis_ds = await fetch_gfs_analysis_data(target_times=target_datetimes, cache_dir=gfs_cache)
             
             if gfs_analysis_ds is None:
                 logger.error(f"[InitialScoringWorker] Run {run_id}: Failed to fetch GFS analysis data. Aborting initial scoring.")
                 await self._update_run_status(run_id, "initial_scoring_failed", error_message="GFS analysis fetch failed")
                 self.initial_scoring_queue.task_done()
-                    continue
+                continue
                     
             logger.info(f"[InitialScoringWorker] Run {run_id}: GFS analysis data fetched/loaded.")
             
-            # --- 3. Iterate and Score Miners against GFS --- 
             calculated_weights = {}
             scored_miners_count = 0
             tasks = []
 
-            # Replace nested function with call to scoring mechanism
             for resp in responses:
                  tasks.append(calculate_gfs_score_and_weight(self, resp, target_datetimes, gfs_analysis_ds))
                      
-            # Execute scoring concurrently
             scoring_results = await asyncio.gather(*tasks)
             
-            # Process results and store weights
             for hotkey, weight, score in scoring_results:
                  if weight is not None and score is not None:
                      calculated_weights[hotkey] = weight
                      scored_miners_count += 1
-                     # Store historical weight/score immediately
                      try:
                         insert_weight_query = """
                             INSERT INTO weather_historical_weights 
@@ -537,9 +536,9 @@ async def _initial_scoring_worker(self):
 
 async def finalize_scores_worker(self):
     """Background worker to calculate final scores against ERA5 after delay."""
-    CHECK_INTERVAL_SECONDS = int(getattr(self.config, 'final_scoring_check_interval_seconds', 3600)) # Default 1 hour
-    ERA5_DELAY_DAYS = int(getattr(self.config, 'era5_delay_days', 5))
-    FORECAST_DURATION_HOURS = int(getattr(self.config, 'forecast_duration_hours', 240)) # 10 days
+    CHECK_INTERVAL_SECONDS = int(self.config.get('final_scoring_check_interval_seconds', 3600)) # Default 1 hour
+    ERA5_DELAY_DAYS = int(self.config.get('era5_delay_days', 5))
+    FORECAST_DURATION_HOURS = int(self.config.get('forecast_duration_hours', 240)) # 10 days
 
     while self.final_scoring_worker_running:
         run_id = None
@@ -587,11 +586,11 @@ async def finalize_scores_worker(self):
                         {"now": now_utc, "rid": run_id}
                 )
 
-                sparse_lead_hours = getattr(self.config, 'final_scoring_lead_hours', [120, 168]) # Day 5, Day 7 defaults
+                sparse_lead_hours = self.config.get('final_scoring_lead_hours', [120, 168]) # Day 5, Day 7 defaults
                 target_datetimes = [gfs_init_time + timedelta(hours=h) for h in sparse_lead_hours]
                 logger.info(f"[FinalizeWorker] Run {run_id}: Fetching ERA5 analysis for final scoring at lead hours: {sparse_lead_hours}.")
 
-                era5_cache = Path(getattr(self.config, 'era5_cache_dir', './era5_cache'))
+                era5_cache = Path(self.config.get('era5_cache_dir', './era5_cache'))
                 era5_ds = await fetch_era5_data(target_times=target_datetimes, cache_dir=era5_cache)
 
                 if era5_ds is None:
@@ -652,14 +651,14 @@ async def finalize_scores_worker(self):
 
 async def cleanup_worker(task_instance: 'WeatherTask'):
     """Periodically cleans up old cache files, ensemble files, and DB records."""
-    CHECK_INTERVAL_SECONDS = int(getattr(task_instance.config, 'cleanup_check_interval_seconds', 6 * 3600))
-    GFS_CACHE_RETENTION_DAYS = int(getattr(task_instance.config, 'gfs_cache_retention_days', 7))
-    ERA5_CACHE_RETENTION_DAYS = int(getattr(task_instance.config, 'era5_cache_retention_days', 30))
-    ENSEMBLE_RETENTION_DAYS = int(getattr(task_instance.config, 'ensemble_retention_days', 14))
-    DB_RUN_RETENTION_DAYS = int(getattr(task_instance.config, 'db_run_retention_days', 20))
+    CHECK_INTERVAL_SECONDS = int(task_instance.config.get('cleanup_check_interval_seconds', 6 * 3600))
+    GFS_CACHE_RETENTION_DAYS = int(task_instance.config.get('gfs_cache_retention_days', 7))
+    ERA5_CACHE_RETENTION_DAYS = int(task_instance.config.get('era5_cache_retention_days', 30))
+    ENSEMBLE_RETENTION_DAYS = int(task_instance.config.get('ensemble_retention_days', 14))
+    DB_RUN_RETENTION_DAYS = int(task_instance.config.get('db_run_retention_days', 90))
     
-    gfs_cache_dir = Path(getattr(task_instance.config, 'gfs_analysis_cache_dir', './gfs_analysis_cache'))
-    era5_cache_dir = Path(getattr(task_instance.config, 'era5_cache_dir', './era5_cache'))
+    gfs_cache_dir = Path(task_instance.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
+    era5_cache_dir = Path(task_instance.config.get('era5_cache_dir', './era5_cache'))
     ensemble_dir = VALIDATOR_ENSEMBLE_DIR
     
     while task_instance.cleanup_worker_running:
