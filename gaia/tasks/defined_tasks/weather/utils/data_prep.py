@@ -10,9 +10,10 @@ from typing import Dict, Tuple, List, Optional, Union
 import warnings
 from aurora import Batch, Metadata
 import pandas as pd
+from fiber.logging_utils import get_logger
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('aurora_data_prep')
+logger = get_logger(__name__)
+
 warnings.filterwarnings('ignore', message='numpy.core.numeric is deprecated', category=DeprecationWarning)
 
 
