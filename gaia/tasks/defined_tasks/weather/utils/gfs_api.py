@@ -1,6 +1,6 @@
 import os
 from fiber.logging_utils import get_logger
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Union, Tuple
 import numpy as np
 import xarray as xr
@@ -72,7 +72,13 @@ async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: 
                 time_indices = []
                 dataset_times_np = full_ds.time.values
                 for vt in valid_times:
-                    vt_np = np.datetime64(vt)
+                    if vt.tzinfo is None:
+                        vt_utc = vt.replace(tzinfo=timezone.utc)
+                    else:
+                        vt_utc = vt.astimezone(timezone.utc)
+                    vt_naive_utc = vt_utc.replace(tzinfo=None)
+                    vt_np = np.datetime64(vt_naive_utc)
+                    
                     time_diffs = np.abs(dataset_times_np - vt_np)
                     closest_idx = np.argmin(time_diffs)
                     time_indices.append(closest_idx)
