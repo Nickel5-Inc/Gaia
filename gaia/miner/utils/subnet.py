@@ -2,7 +2,7 @@ from functools import partial
 from fastapi import Depends, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.routing import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from fiber.encrypted.miner.dependencies import blacklist_low_stake, verify_request
 from fiber.encrypted.miner.security.encryption import decrypt_general_payload
 from fiber.logging_utils import get_logger
@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
+from typing import Any, Dict
 
 MAX_REQUEST_SIZE = 800 * 1024 * 1024  # 800MB
 
