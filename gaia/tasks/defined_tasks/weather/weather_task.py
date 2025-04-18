@@ -290,18 +290,20 @@ class WeatherTask(Task):
 
                 await validator.update_task_status('weather', 'processing', 'querying_miners')
                 payload_data = WeatherInputData(
-                     forecast_start_time=effective_forecast_start_time,
-                     gfs_timestep_1=gfs_t_minus_6_serial, # T-6h data (first history step)
-                     gfs_timestep_2=gfs_t0_serial       # T=0h data (second history step, effective T=0)
+                     forecast_start_time=effective_forecast_start_time.isoformat(),
+                     gfs_timestep_1=gfs_t_minus_6_serial, 
+                     gfs_timestep_2=gfs_t0_serial
                 )
-                payload = WeatherForecastRequest(
-                     nonce=str(uuid.uuid4()),
-                     data=payload_data
-                )
+                payload_dict = payload_data.model_dump() 
+                
+                payload = {
+                     "nonce": str(uuid.uuid4()),
+                     "data": payload_dict 
+                }
 
                 logger.info(f"[Run {run_id}] Querying miners with weather forecast request...")
                 responses = await validator.query_miners(
-                     payload=payload.model_dump(),
+                     payload=payload,
                      endpoint="/weather-forecast-request"
                 )
                 logger.info(f"[Run {run_id}] Received {len(responses)} initial responses from miners.")
