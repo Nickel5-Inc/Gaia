@@ -10,12 +10,13 @@ def generate_secure_secret():
     return secret_key
 
 def main():
-    env_path = Path(__file__).parent.parent.parent / '.env'
+    project_root = Path(os.getcwd())
+    env_path = project_root / '.env'
     
     if not env_path.exists():
-        print("Error: No .env file found in the root directory.")
-        print("Please create a .env file first with your configuration.")
-        print("Then run this script to add a secure JWT secret key.")
+        print(f"Error: No .env file found in the current directory: {project_root}")
+        print("Please ensure you run this script from the project root directory ('/root/Gaia/' in this case)")
+        print("and that the .env file exists there.")
         return
         
     new_secret = generate_secure_secret()
@@ -30,7 +31,7 @@ def main():
     else:
         with open(env_path, 'a') as f:
             f.write(f"\nMINER_JWT_SECRET_KEY={new_secret}\n")
-        print(f"Added MINER_JWT_SECRET_KEY to .env file")
+        print(f"Added MINER_JWT_SECRET_KEY to {env_path}")
 
 if __name__ == "__main__":
     main() 
