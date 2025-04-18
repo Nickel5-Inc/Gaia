@@ -14,16 +14,7 @@ import shutil
 import time
 
 from fiber.logging_utils import get_logger
-
-from typing import TYPE_CHECKING, Any, Optional, Dict, List
-if TYPE_CHECKING:
-    from ..weather_task import WeatherTask
-    try:
-        from aurora.core import Batch
-    except ImportError:
-        Batch = Any
-else:
-    Batch = Any 
+from aurora import Batch
 
 from .weather_logic import (
     _request_fresh_token,

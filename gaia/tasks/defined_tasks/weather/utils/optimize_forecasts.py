@@ -25,7 +25,7 @@ def optimize_forecast_precision(ds: xr.Dataset) -> Tuple[xr.Dataset, Dict]:
     encoding = {}
     
     # Surface variables (K)
-    temp_scale = 0.01  # 0.01K precision (sufficient for weather forecasts)
+    temp_scale = 0.01  # 0.01K precision
     temp_vars = ['surf_2t', 'atmos_t']
     for var in temp_vars:
         if var in ds:
@@ -222,13 +222,8 @@ def optimize_forecast_full(ds: xr.Dataset,
     Returns:
         Tuple of (optimized dataset, encoding dictionary)
     """
-    # 1. Remove singleton dimensions
     ds = remove_singleton_dims(ds)
-    
-    # 2. Extract static fields
     ds = extract_and_reference_static_fields(ds, static_file_path)
-    
-    # 3. Apply precision and compression encoding
     ds, encoding = optimize_forecast_precision(ds)
     
     return ds, encoding

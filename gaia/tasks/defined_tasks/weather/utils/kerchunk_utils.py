@@ -2,8 +2,6 @@ import fsspec
 import kerchunk.hdf
 import json
 from typing import Dict, Any
-# TODO: Add in app level short lived signed token for kerchunk json - miner will share it with validator, then only with it will valdiator be able to access the endpoint
-
 
 def generate_kerchunk_json_from_local_file(
     local_netcdf_path: str, 
@@ -37,8 +35,6 @@ def generate_kerchunk_json_from_local_file(
         Exception: If any error occurs during Kerchunk processing.
     """
     try:
-        # Use fsspec to open the local file
-        # 'rb' mode is important for reading binary data
         with fsspec.open(f"file://{local_netcdf_path}", mode="rb") as file_obj:
             h5chunks = kerchunk.hdf.SingleHdf5ToZarr(
                 file_obj, 
@@ -46,7 +42,6 @@ def generate_kerchunk_json_from_local_file(
                 inline_threshold=inline_threshold
             )
             
-            # translate() converts the scanned structure into the dictionary format
             reference_dict = h5chunks.translate()
             return reference_dict
             
@@ -71,39 +66,9 @@ def save_kerchunk_json(reference_dict: Dict[str, Any], output_json_path: str) ->
         Exception: If any error occurs during file writing or JSON serialization.
     """
     try:
-        # Use fsspec to handle writing potentially to various filesystems, 
-        # though here primarily for local files. 'wb' for writing bytes.
-        # We use json.dumps with encode() because fsspec expects bytes.
         with fsspec.open(output_json_path, mode="wb") as f:
             f.write(json.dumps(reference_dict).encode('utf-8'))
         print(f"Kerchunk JSON saved successfully to {output_json_path}")
     except Exception as e:
         print(f"Error saving Kerchunk JSON to {output_json_path}: {e}")
         raise
-
-# Example Usage (can be commented out or removed in final version)
-# if __name__ == '__main__':
-#     # --- Configuration ---
-#     local_path = "/path/to/your/local/forecast.nc" # CHANGE THIS
-#     remote_url = "s3://your-bucket/forecast.nc" # CHANGE THIS (or http://..., file://...)
-#     output_path = "/path/to/your/output/forecast_kerchunk.json" # CHANGE THIS
-#     
-#     # --- Generate & Save ---
-#     try:
-#         print(f"Generating Kerchunk references for: {local_path}")
-#         print(f"Target URL for references: {remote_url}")
-#         
-#         kerchunk_refs = generate_kerchunk_json_from_local_file(
-#             local_netcdf_path=local_path,
-#             target_netcdf_url=remote_url
-#         )
-#         
-#         print(f"Kerchunk references generated. Saving to: {output_path}")
-#         save_kerchunk_json(kerchunk_refs, output_path)
-#         
-#         # Optional: Print a snippet of the generated JSON
-#         # print("\nGenerated Kerchunk JSON (snippet):")
-#         # print(json.dumps(kerchunk_refs, indent=2)[:1000] + "\n...") 
-#         
-#     except Exception as e:
-#         print(f"An error occurred during the example usage: {e}") 

@@ -47,27 +47,13 @@ from .processing.weather_workers import (
 )
 from gaia.tasks.defined_tasks.weather.utils.inference_class import WeatherInferenceRunner
 logger = get_logger(__name__)
-
-try:
-    from aurora.core import Batch
-    _AURORA_AVAILABLE = True
-except ImportError:
-    logger.warning("Aurora library not found. Batch type hinting and related functionality may fail.")
-    Batch = Any
-    _AURORA_AVAILABLE = False
-
+from aurora import Batch
 
 DEFAULT_FORECAST_DIR_BG = Path("./miner_forecasts/")
 MINER_FORECAST_DIR_BG = Path(os.getenv("MINER_FORECAST_DIR", DEFAULT_FORECAST_DIR_BG))
+VALIDATOR_ENSEMBLE_DIR = Path("./validator_ensembles/")
 MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
-
-# JWT Configuration
-MINER_JWT_SECRET_KEY = os.getenv("MINER_JWT_SECRET_KEY")
-if not MINER_JWT_SECRET_KEY:
-    logger.warning("MINER_JWT_SECRET_KEY not set in environment. Using default insecure key.")
-    MINER_JWT_SECRET_KEY = "insecure_default_key_for_development_only"
-JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 15 # Token validity duration
+VALIDATOR_ENSEMBLE_DIR.mkdir(parents=True, exist_ok=True)
 
 def _load_config(self):
     """Loads configuration for the WeatherTask from environment variables."""
@@ -585,75 +571,69 @@ class WeatherTask(Task):
             - kerchunk_json_url: URL to access the Kerchunk JSON
             - verification_hash: Hash to verify forecast integrity
             - access_token: JWT token for accessing forecast files
-        """
+        """            
         logger.info(f"Handling kerchunk request for job_id: {job_id}")
         
         try:
             query = """
-            SELECT job_id, status, target_netcdf_path, kerchunk_json_path, verification_hash, error_message
+            SELECT id as job_id, status, target_netcdf_path, kerchunk_json_path, verification_hash, error_message
             FROM weather_miner_jobs
-            WHERE job_id = :job_id
+            WHERE id = :job_id 
             """
             job = await self.db_manager.fetch_one(query, {"job_id": job_id})
             
             if not job:
                 logger.warning(f"Job not found for job_id: {job_id}")
-                return {
-                    "status": "error",
-                    "message": f"Job with ID {job_id} not found"
-                }
+                return {"status": "error", "message": f"Job with ID {job_id} not found"}
                 
             if job["status"] == "completed":
                 netcdf_path = job["target_netcdf_path"]
-                if not netcdf_path:
-                    return {
-                        "status": "error",
-                        "message": "NetCDF path not set for completed job"
-                    }
+                kerchunk_path_str = job["kerchunk_json_path"]
+                verification_hash = job["verification_hash"]
+                
+                if not netcdf_path or not kerchunk_path_str or not verification_hash:
+                    logger.error(f"Job {job_id} completed but missing required path/hash info.")
+                    return {"status": "error", "message": "Job completed but data paths or hash missing"}
                     
                 filename = os.path.basename(netcdf_path)
                 
+                miner_jwt_secret_key = self.config.get('miner_jwt_secret_key', os.getenv("MINER_JWT_SECRET_KEY"))
+                if not miner_jwt_secret_key:
+                    logger.warning("MINER_JWT_SECRET_KEY not set in config or environment. Using default insecure key.")
+                    miner_jwt_secret_key = "insecure_default_key_for_development_only"
+                jwt_algorithm = self.config.get('jwt_algorithm', "HS256")
+                token_expire_minutes = int(self.config.get('access_token_expire_minutes', 15))
+                
                 token_data = {
                     "job_id": job_id,
-                    "file_path": filename,
-                    "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+                    "file_path": filename, 
+                    "exp": datetime.now(timezone.utc) + timedelta(minutes=token_expire_minutes)
                 }
                 
                 access_token = jwt.encode(
                     token_data,
-                    MINER_JWT_SECRET_KEY,
-                    algorithm=JWT_ALGORITHM
+                    miner_jwt_secret_key, 
+                    algorithm=jwt_algorithm
                 )
                 
-                # Return the completed job information with token
-                kerchunk_url = f"/forecasts/{os.path.basename(job['kerchunk_json_path'])}"
+                kerchunk_url = f"/forecasts/{os.path.basename(kerchunk_path_str)}"
                 
                 return {
                     "status": "completed",
                     "message": "Forecast completed and ready for access",
                     "kerchunk_json_url": kerchunk_url,
-                    "verification_hash": job["verification_hash"],
+                    "verification_hash": verification_hash,
                     "access_token": access_token
                 }
                 
             elif job["status"] == "error":
-                return {
-                    "status": "error",
-                    "message": f"Job failed: {job['error_message'] or 'Unknown error'}"
-                }
-                
+                return {"status": "error", "message": f"Job failed: {job['error_message'] or 'Unknown error'}"}
             else:
-                return {
-                    "status": "processing",
-                    "message": f"Job is currently in status: {job['status']}"
-                }
+                return {"status": "processing", "message": f"Job is currently in status: {job['status']}"}
                 
         except Exception as e:
             logger.error(f"Error handling kerchunk request for job_id {job_id}: {e}", exc_info=True)
-            return {
-                "status": "error",
-                "message": f"Failed to process request: {str(e)}"
-            }
+            return {"status": "error", "message": f"Failed to process request: {str(e)}"}
 
     ############################################################
     # Helper Methods

@@ -6,20 +6,7 @@ from typing import Any, Dict, Optional
 import xarray as xr
 from fiber.logging_utils import get_logger
 from ..utils.data_prep import create_aurora_batch_from_gfs
-
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    try:
-        from aurora.core import Batch
-    except ImportError:
-        Batch = Any
-else:
-    try:
-        from aurora.core import Batch
-        _AURORA_AVAILABLE = True
-    except ImportError:
-        Batch = Any
-        _AURORA_AVAILABLE = False
+from aurora import Batch
 
 logger = get_logger(__name__)
 
