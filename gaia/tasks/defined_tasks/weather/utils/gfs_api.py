@@ -405,17 +405,23 @@ async def fetch_gfs_analysis_data(
             logger.warning("Geopotential Height (hgtprs/z_height) not found.")
 
         if 'pressure_level' in processed_ds.coords:
-             if processed_ds['pressure_level'].attrs.get('units', '').lower() == 'pa':
-                  logger.info("Converting pressure_level coordinate from Pa to hPa.")
+             current_units = processed_ds['pressure_level'].attrs.get('units', '').lower()
+             if current_units == 'pa' or not current_units:
+                  log_msg = f"Converting pressure_level coordinate from {current_units if current_units else '[ASSUMED Pa]'} to hPa."
+                  logger.info(log_msg)
                   processed_ds['pressure_level'] = processed_ds['pressure_level'] / 100.0
                   processed_ds['pressure_level'].attrs['units'] = 'hPa'
-                  try:
-                       processed_ds = processed_ds.sel(pressure_level=AURORA_PRESSURE_LEVELS_HPA)
-                       logger.info(f"Selected standard pressure levels: {AURORA_PRESSURE_LEVELS_HPA}")
-                  except Exception as e_sel_p:
-                       logger.warning(f"Could not select standard pressure levels after conversion: {e_sel_p}")
-             elif processed_ds['pressure_level'].attrs.get('units', '').lower() != 'hpa':
-                  logger.warning(f"Pressure level units are not Pa or hPa.")
+                  processed_ds['pressure_level'].attrs['long_name'] = 'pressure'
+             elif current_units == 'hpa':
+                  logger.info("Pressure level units are already hPa.")
+             else:
+                  logger.warning(f"Pressure level units '{current_units}' are not Pa or hPa. Proceeding without conversion.")
+
+             try:
+                  processed_ds = processed_ds.sel(pressure_level=AURORA_PRESSURE_LEVELS_HPA)
+                  logger.info(f"Selected standard pressure levels: {AURORA_PRESSURE_LEVELS_HPA}")
+             except Exception as e_sel_p:
+                  logger.warning(f"Could not select standard pressure levels after unit processing: {e_sel_p}")
 
         default_units = {
             '2t': 'K', '10u': 'm s-1', '10v': 'm s-1', 'msl': 'Pa',
