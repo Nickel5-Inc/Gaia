@@ -163,3 +163,8 @@ class WeatherStartInferenceRequest(BaseModel):
      """ Request model for /weather-start-inference """
      nonce: str | None = None
      data: WeatherStartInferenceData
+
+class WeatherKerchunkRequest(BaseModel):
+    """ The overall request model for requesting Kerchunk details."""
+    nonce: str | None = None
+    data: WeatherKerchunkRequestData

@@ -24,6 +24,15 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 from typing import Any, Dict
 
+from gaia.tasks.defined_tasks.weather.schemas.weather_inputs import (
+    WeatherForecastRequest, WeatherKerchunkRequest, WeatherInputData,
+    WeatherInitiateFetchRequest, WeatherGetInputStatusRequest, WeatherStartInferenceRequest
+)
+from gaia.tasks.defined_tasks.weather.schemas.weather_outputs import (
+    WeatherKerchunkResponseData,
+    WeatherInitiateFetchResponse, WeatherGetInputStatusResponse, WeatherStartInferenceResponse
+)
+
 MAX_REQUEST_SIZE = 800 * 1024 * 1024  # 800MB
 
 logger = get_logger(__name__)
@@ -59,14 +68,6 @@ class SoilmoistureRequest(BaseModel):
     nonce: str | None = None
     data: SoilMoisturePayload
 
-
-class WeatherInputData(BaseModel):
-    """ Defines the structure for the input data sent by the validator to trigger a forecast run."""
-    forecast_start_time: datetime = Field(..., description="ISO 8601 timestamp for the forecast initialization time.")
-    gfs_timestep_1: Dict[str, Any] = Field(..., description="Data for the first GFS input timestep. Structure TBD (e.g., dict mapping variable names to base64 encoded numpy arrays or similar).")
-    gfs_timestep_2: Dict[str, Any] = Field(..., description="Data for the second GFS input timestep. Structure TBD.")
-    class Config:
-        arbitrary_types_allowed = True 
 
 class WeatherForecastRequest(BaseModel):
     """ The overall request model containing the nonce and the weather input data."""
@@ -267,10 +268,6 @@ def factory_router(miner_instance) -> APIRouter:
                 content={"error": f"Internal server error: {str(e)}"}
             )
 
-    class WeatherKerchunkRequest(BaseModel):
-        nonce: str | None = None
-        data: Any 
-        
     async def weather_kerchunk_require(
         decrypted_payload: WeatherKerchunkRequest = Depends(
             partial(decrypt_general_payload, WeatherKerchunkRequest),
