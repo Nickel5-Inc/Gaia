@@ -19,6 +19,7 @@ import pickle
 import base64
 import jwt
 import numpy as np
+import torch
 import fsspec
 from kerchunk.hdf import SingleHdf5ToZarr
 import pandas as pd
