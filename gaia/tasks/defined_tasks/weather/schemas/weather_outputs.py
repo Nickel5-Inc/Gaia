@@ -534,3 +534,21 @@ class WeatherKerchunkResponseData(BaseModel):
     kerchunk_json_url: Optional[str] = Field(None, description="URL from which the validator can download the Kerchunk JSON file. Required if status is 'completed'.")
     verification_hash: Optional[str] = Field(None, description="The SHA256 verification hash claimed by the miner. Required if status is 'completed'.")
     access_token: Optional[str] = Field(None, description="Short-lived JWT token required to access the forecast data via the /forecasts/ endpoint. Required if status is 'completed'.")
+
+class WeatherInitiateFetchResponse(BaseModel):
+    """ Response model for /weather-initiate-fetch """
+    status: str = Field(..., description="Status indicator, e.g., 'fetch_accepted'")
+    job_id: str = Field(..., description="The unique job ID assigned by the miner.")
+    message: Optional[str] = Field(None, description="Optional message.")
+
+class WeatherGetInputStatusResponse(BaseModel):
+    """ Response model for /weather-get-input-status """
+    job_id: str = Field(..., description="The job ID.")
+    status: str = Field(..., description="Current status of the input fetching/hashing process (e.g., 'fetch_queued', 'fetching_gfs', 'hashing_input', 'input_hashed_awaiting_validation', 'fetch_error').")
+    input_data_hash: Optional[str] = Field(None, description="The computed SHA-256 hash of the input data, if available.")
+    message: Optional[str] = Field(None, description="Optional message, especially for errors.")
+
+class WeatherStartInferenceResponse(BaseModel):
+     """ Response model for /weather-start-inference """
+     status: str = Field(..., description="Status indicator, e.g., 'inference_started', 'error'")
+     message: Optional[str] = Field(None, description="Optional message.")

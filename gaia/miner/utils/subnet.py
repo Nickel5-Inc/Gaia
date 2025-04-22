@@ -114,7 +114,7 @@ def factory_router(miner_instance) -> APIRouter:
                             logger.warning("Could not convert prediction to float, setting to 0.0")
                             result["predicted_values"] = float(0.0)
                     else:
-                        logger.error("Missing 'predicted_values' in result. Setting to default 0.0")
+                        logger.error("Missing 'predicted_values' in result, setting to default 0.0")
                         result["predicted_values"] = float(0.0)
 
                     if "timestamp" not in result:
@@ -219,7 +219,8 @@ def factory_router(miner_instance) -> APIRouter:
         Handles requests from validators to initiate a weather forecast run 
         using the provided GFS input data.
         """
-        logger.info(f"Received decrypted weather forecast request payload")
+        logger.info("Entered weather_forecast_require handler.")
+        logger.info(f"Successfully decrypted weather forecast payload. Type: {type(decrypted_payload)}")
         try:
             if not hasattr(miner_instance, 'weather_task'):
                 logger.error("Miner instance is missing the 'weather_task' attribute.")
@@ -228,15 +229,23 @@ def factory_router(miner_instance) -> APIRouter:
             input_data = decrypted_payload.data.model_dump()
             logger.info(f"Initiating weather forecast run for start time: {input_data.get('forecast_start_time')}")
             
-            result = await miner_instance.weather_task.miner_execute(input_data, miner_instance)
+            try:
+                logger.info("Calling miner_instance.weather_task.miner_execute...")
+                result = await miner_instance.weather_task.miner_execute(input_data, miner_instance)
+                logger.info(f"miner_instance.weather_task.miner_execute completed. Result: {type(result)}")
+            except Exception as task_exec_error:
+                logger.error(f"Error during miner_instance.weather_task.miner_execute: {task_exec_error}")
+                logger.error(traceback.format_exc())
+                return JSONResponse(status_code=500, content={"error": "Error during task execution"})
             
             if not result:
-                logger.error("Weather forecast execution failed")
+                logger.error("Weather forecast execution failed (result was None or empty)")
                 return JSONResponse(
                     status_code=500,
                     content={"error": "Failed to execute weather forecast"}
                 )
             
+            logger.info(f"Successfully initiated forecast. Job ID: {result.get('job_id')}")
             return JSONResponse(content={
                 "status": "success",
                 "message": "Forecast run initiated",
@@ -251,7 +260,7 @@ def factory_router(miner_instance) -> APIRouter:
                 content={"error": "Invalid request payload structure", "details": e.errors()}
             )
         except Exception as e:
-            logger.error(f"Error processing weather forecast request: {e}")
+            logger.error(f"Unhandled error in weather_forecast_require handler: {e}")
             logger.error(traceback.format_exc())
             return JSONResponse(
                 status_code=500,
@@ -273,33 +282,141 @@ def factory_router(miner_instance) -> APIRouter:
         """
         logger.info(f"Received decrypted weather kerchunk request")
         try:
-            if not hasattr(miner_instance, 'weather_task'):
-                logger.error("Miner instance is missing the 'weather_task' attribute.")
+            if not hasattr(miner_instance, 'weather_task') or miner_instance.weather_task is None:
+                logger.error("Miner instance is missing the 'weather_task' attribute or it is None.")
                 return JSONResponse(status_code=500, content={"error": "Miner not configured for weather task"})
-            
-            request_data = decrypted_payload.data 
+
+            request_data = decrypted_payload.data
             logger.info(f"Handling weather kerchunk request...")
-            
+
             job_id = request_data.get('job_id')
             if not job_id:
                 logger.error("Missing job_id in request data")
                 return JSONResponse(status_code=400, content={"error": "Missing job_id in request"})
-            
+
             response_dict = await miner_instance.weather_task.handle_kerchunk_request(job_id)
-            
+
+            if not isinstance(response_dict, dict):
+                 logger.error(f"handle_kerchunk_request returned invalid type: {type(response_dict)}")
+                 return JSONResponse(status_code=500, content={"error": "Internal error processing kerchunk request"})
+
             response_data = WeatherKerchunkResponseData(
-                status=response_dict['status'],
-                message=response_dict['message'],
+                status=response_dict.get('status', 'error'),
+                message=response_dict.get('message', 'Failed to process'),
                 kerchunk_json_url=response_dict.get('kerchunk_json_url'),
                 verification_hash=response_dict.get('verification_hash'),
                 access_token=response_dict.get('access_token')
             )
-            
+
             return JSONResponse(content=response_data.model_dump())
 
         except Exception as e:
             logger.error(f"Error processing weather kerchunk request: {e}")
             logger.error(traceback.format_exc())
+            return JSONResponse(status_code=500, content={"error": f"Internal server error: {str(e)}"})
+
+    async def weather_initiate_fetch_require(
+        decrypted_payload: WeatherInitiateFetchRequest = Depends(
+            partial(decrypt_general_payload, WeatherInitiateFetchRequest)
+        ),
+    ):
+        """
+        Validator requests the miner to fetch GFS data based on timestamps.
+        Miner creates a job record and starts a background task for fetching & hashing.
+        """
+        logger.info("Entered /weather-initiate-fetch handler.")
+        try:
+            if not hasattr(miner_instance, 'weather_task') or miner_instance.weather_task is None:
+                logger.error("Miner not configured for weather task (weather_task missing or None).")
+                return JSONResponse(status_code=500, content={"error": "Miner not configured for weather task"})
+
+            response_data = await miner_instance.weather_task.handle_initiate_fetch(
+                decrypted_payload.data, decrypted_payload.sender_hotkey
+            )
+
+            if not isinstance(response_data, dict):
+                 logger.error(f"handle_initiate_fetch returned invalid type: {type(response_data)}")
+                 return JSONResponse(status_code=500, content={"error": "Internal error processing fetch initiation"})
+
+            response_model = WeatherInitiateFetchResponse(**response_data)
+            return JSONResponse(content=response_model.model_dump())
+
+        except ValidationError as e:
+            logger.error(f"Validation error processing initiate fetch request: {e}")
+            return JSONResponse(status_code=422, content={"error": "Invalid request payload", "details": e.errors()})
+        except Exception as e:
+            logger.error(f"Error in /weather-initiate-fetch handler: {e}", exc_info=True)
+            return JSONResponse(status_code=500, content={"error": f"Internal server error: {str(e)}"})
+
+    async def weather_get_input_status_require(
+        decrypted_payload: WeatherGetInputStatusRequest = Depends(
+            partial(decrypt_general_payload, WeatherGetInputStatusRequest)
+        ),
+    ):
+        """
+        Validator polls for the status of the GFS fetch/hash process.
+        Miner returns the job status and the input hash if available.
+        """
+        logger.info("Entered /weather-get-input-status handler.")
+        try:
+            if not hasattr(miner_instance, 'weather_task') or miner_instance.weather_task is None:
+                logger.error("Miner not configured for weather task (weather_task missing or None).")
+                return JSONResponse(status_code=500, content={"error": "Miner not configured for weather task"})
+
+            job_id = decrypted_payload.data.job_id
+            if not job_id:
+                 return JSONResponse(status_code=400, content={"error": "Missing job_id in request"})
+
+            response_data = await miner_instance.weather_task.handle_get_input_status(job_id)
+
+            if not isinstance(response_data, dict):
+                 logger.error(f"handle_get_input_status returned invalid type: {type(response_data)}")
+                 return JSONResponse(status_code=500, content={"error": "Internal error fetching input status"})
+
+            response_model = WeatherGetInputStatusResponse(**response_data)
+            return JSONResponse(content=response_model.model_dump())
+
+        except ValidationError as e:
+            logger.error(f"Validation error processing get input status request: {e}")
+            return JSONResponse(status_code=422, content={"error": "Invalid request payload", "details": e.errors()})
+        except Exception as e:
+            logger.error(f"Error in /weather-get-input-status handler: {e}", exc_info=True)
+            return JSONResponse(status_code=500, content={"error": f"Internal server error: {str(e)}"})
+
+    async def weather_start_inference_require(
+        decrypted_payload: WeatherStartInferenceRequest = Depends(
+            partial(decrypt_general_payload, WeatherStartInferenceRequest)
+        ),
+    ):
+        """
+        Validator, after verifying the input hash, triggers the miner
+        to start the actual model inference.
+        """
+        logger.info("Entered /weather-start-inference handler.")
+        try:
+            if not hasattr(miner_instance, 'weather_task') or miner_instance.weather_task is None:
+                logger.error("Miner not configured for weather task (weather_task missing or None).")
+                return JSONResponse(status_code=500, content={"error": "Miner not configured for weather task"})
+
+            job_id = decrypted_payload.data.job_id
+            validator_hotkey = decrypted_payload.sender_hotkey
+            if not job_id:
+                 return JSONResponse(status_code=400, content={"error": "Missing job_id in request"})
+
+            response_data = await miner_instance.weather_task.handle_start_inference(job_id, validator_hotkey)
+
+            if not isinstance(response_data, dict):
+                 logger.error(f"handle_start_inference returned invalid type: {type(response_data)}")
+                 return JSONResponse(status_code=500, content={"error": "Internal error starting inference"})
+
+            response_model = WeatherStartInferenceResponse(**response_data)
+            return JSONResponse(content=response_model.model_dump())
+
+        except ValidationError as e:
+            logger.error(f"Validation error processing start inference request: {e}")
+            return JSONResponse(status_code=422, content={"error": "Invalid request payload", "details": e.errors()})
+        except Exception as e:
+            logger.error(f"Error in /weather-start-inference handler: {e}", exc_info=True)
             return JSONResponse(status_code=500, content={"error": f"Internal server error: {str(e)}"})
 
     router.add_api_route(
@@ -338,6 +455,30 @@ def factory_router(miner_instance) -> APIRouter:
     router.add_api_route(
         "/weather-kerchunk-request", 
         weather_kerchunk_require,
+        tags=["Weather"],
+        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+        methods=["POST"],
+        response_class=JSONResponse
+    )
+    router.add_api_route(
+        "/weather-initiate-fetch",
+        weather_initiate_fetch_require,
+        tags=["Weather"],
+        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+        methods=["POST"],
+        response_class=JSONResponse
+    )
+    router.add_api_route(
+        "/weather-get-input-status",
+        weather_get_input_status_require,
+        tags=["Weather"],
+        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+        methods=["POST"],
+        response_class=JSONResponse
+    )
+    router.add_api_route(
+        "/weather-start-inference",
+        weather_start_inference_require,
         tags=["Weather"],
         dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
         methods=["POST"],

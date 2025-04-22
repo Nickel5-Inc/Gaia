@@ -46,7 +46,8 @@
             {"column": "miner_uid", "unique": false},
             {"column": "miner_hotkey", "unique": false},
             {"column": "verification_passed", "unique": false},
-            {"column": "status", "unique": false}
+            {"column": "status", "unique": false},
+            {"column": "job_id", "unique": false}
         ],
         "foreign_keys": [
             {
@@ -55,7 +56,7 @@
                 "on_delete": "CASCADE"
             }
         ],
-        "comment": "Records miner responses (Kerchunk info) for a specific forecast run."
+        "comment": "Records miner responses for a specific forecast run. Tracks status through fetch, hash verification, and inference."
     },
     "weather_miner_scores": {
         "table_name": "weather_miner_scores",
@@ -189,15 +190,16 @@
             "ipfs_cid": "VARCHAR(255)",
             "status": "VARCHAR(50) NOT NULL DEFAULT 'received'",
             "error_message": "TEXT",
-            "updated_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+            "updated_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
+            "gfs_t_minus_6_time_utc": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "input_data_hash": "TEXT NULL"
         },
         "indexes": [
-            {"column": "job_id", "unique": true},
             {"column": "validator_request_time", "unique": false},
             {"column": "gfs_init_time_utc", "unique": false},
             {"column": "status", "unique": false}
         ],
         "foreign_keys": [],
-        "comment": "Tracks weather forecast jobs processed by the miner."
+        "comment": "Tracks weather forecast jobs processed by the miner. Includes status for fetch/hash step."
     }
 }

@@ -5,11 +5,21 @@ from typing import Dict, List, Tuple, Any, Optional, Set, Union
 import numpy as np
 import xarray as xr
 import fsspec
+import pickle
+from datetime import datetime
+from pathlib import Path
+from .gfs_api import fetch_gfs_analysis_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
+from fiber.logging_utils import get_logger
 
+logger = get_logger(__name__)
 
 NUM_SAMPLES = 1000
 HASH_VERSION = "1"
 
+CANONICAL_VARS_FOR_HASHING = sorted([
+    '2t', '10u', '10v', 'msl', # Surface
+    't', 'u', 'v', 'q', 'z'   # Atmospheric
+])
 
 def generate_deterministic_seed(
     forecast_date: str,
@@ -340,4 +350,127 @@ def get_forecast_summary(
         "variables": variables,
         "kerchunk_url": kerchunk_url,
         "status": "placeholder"
-    } 
+    }
+
+
+def _get_canonical_bytes(ds_t0: xr.Dataset, ds_t_minus_6: xr.Dataset) -> Optional[bytes]:
+    """
+    Prepares the two input datasets into a canonical byte representation for hashing.
+    Sorts variables, ensures consistent data types, and flattens data.
+
+    Args:
+        ds_t0: Processed xarray Dataset for T=0h analysis.
+        ds_t_minus_6: Processed xarray Dataset for T=-6h analysis.
+
+    Returns:
+        Bytes representation or None if input is invalid.
+    """
+    if not isinstance(ds_t0, xr.Dataset) or not isinstance(ds_t_minus_6, xr.Dataset):
+        logger.error("Invalid input: Both ds_t0 and ds_t_minus_6 must be xarray Datasets.")
+        return None
+    if 'time' not in ds_t0.coords or 'time' not in ds_t_minus_6.coords:
+         logger.error("Invalid input: Datasets must have a 'time' coordinate.")
+         return None
+    if len(ds_t0.time) != 1 or len(ds_t_minus_6.time) != 1:
+         logger.error("Invalid input: Datasets should contain only one time step for analysis.")
+         return None
+
+    logger.debug("Creating canonical byte representation for input data hashing...")
+    all_bytes_list = []
+
+    ds_t_minus_6_squeezed = ds_t_minus_6.squeeze('time', drop=True)
+    for var in CANONICAL_VARS_FOR_HASHING:
+        if var in ds_t_minus_6_squeezed:
+            data_array = ds_t_minus_6_squeezed[var].load().astype(np.float32).values
+            all_bytes_list.append(data_array.tobytes())
+            logger.debug(f"Added T-6h var '{var}' (shape: {data_array.shape}, dtype: {data_array.dtype}) to canonical bytes.")
+        else:
+             logger.warning(f"Required variable '{var}' missing in T-6h data for hashing.")
+             pass
+
+    ds_t0_squeezed = ds_t0.squeeze('time', drop=True)
+    for var in CANONICAL_VARS_FOR_HASHING:
+        if var in ds_t0_squeezed:
+            data_array = ds_t0_squeezed[var].load().astype(np.float32).values
+            all_bytes_list.append(data_array.tobytes())
+            logger.debug(f"Added T=0h var '{var}' (shape: {data_array.shape}, dtype: {data_array.dtype}) to canonical bytes.")
+        else:
+             logger.warning(f"Required variable '{var}' missing in T=0h data for hashing.")
+             pass
+
+    if not all_bytes_list:
+         logger.error("No data variables found to create canonical bytes.")
+         return None
+
+    canonical_bytes = b"".join(all_bytes_list)
+    logger.info(f"Generated canonical byte representation: {len(canonical_bytes)} bytes.")
+    return canonical_bytes
+
+
+async def compute_input_data_hash(
+    t0_run_time: datetime,
+    t_minus_6_run_time: datetime,
+    cache_dir: Path
+) -> Optional[str]:
+    """
+    Fetches the required GFS analysis data subsets (T=0h, T=-6h),
+    creates a canonical byte representation, and computes its SHA-256 hash.
+
+    Args:
+        t0_run_time: The datetime for the T=0h GFS analysis.
+        t_minus_6_run_time: The datetime for the T=-6h GFS analysis.
+        cache_dir: Path object for the GFS analysis cache directory.
+
+    Returns:
+        SHA-256 hash hex digest, or None if fetching/processing fails.
+    """
+    logger.info(f"Computing input data hash for T0={t0_run_time}, T-6={t_minus_6_run_time}")
+
+    ds_t0 = None
+    ds_t_minus_6 = None
+    try:
+        ds_t0 = await fetch_gfs_analysis_data([t0_run_time], cache_dir=cache_dir)
+        ds_t_minus_6 = await fetch_gfs_analysis_data([t_minus_6_run_time], cache_dir=cache_dir)
+
+        if ds_t0 is None or ds_t_minus_6 is None:
+            logger.error("Failed to fetch one or both GFS analysis datasets needed for hashing.")
+            return None
+
+        t0_run_time_np = np.datetime64(t0_run_time.replace(tzinfo=None))
+        t_minus_6_run_time_np = np.datetime64(t_minus_6_run_time.replace(tzinfo=None))
+
+        if (t0_run_time_np not in ds_t0.time.values or
+            t_minus_6_run_time_np not in ds_t_minus_6.time.values):
+             logger.error("Fetched datasets do not contain the exact requested time coordinates.")
+             logger.debug(f"Expected T0: {t0_run_time_np}, Got: {ds_t0.time.values if ds_t0 else 'None'}")
+             logger.debug(f"Expected T-6: {t_minus_6_run_time_np}, Got: {ds_t_minus_6.time.values if ds_t_minus_6 else 'None'}")
+             return None
+
+        canonical_bytes = _get_canonical_bytes(ds_t0, ds_t_minus_6)
+
+        if canonical_bytes is None:
+            logger.error("Failed to generate canonical byte representation.")
+            return None
+        else:
+            hasher = hashlib.sha256()
+            hasher.update(canonical_bytes)
+            hex_digest = hasher.hexdigest()
+            logger.info(f"Computed input data SHA-256 hash: {hex_digest}")
+            return hex_digest
+
+    except Exception as e:
+        logger.error(f"Error during input data hash computation: {e}", exc_info=True)
+        return None
+    finally:
+        if ds_t0 is not None and hasattr(ds_t0, 'close'):
+            try:
+                ds_t0.close()
+                logger.debug("Closed ds_t0 dataset.")
+            except Exception as close_err:
+                 logger.warning(f"Exception closing ds_t0: {close_err}")
+        if ds_t_minus_6 is not None and hasattr(ds_t_minus_6, 'close'):
+            try:
+                ds_t_minus_6.close()
+                logger.debug("Closed ds_t_minus_6 dataset.")
+            except Exception as close_err:
+                 logger.warning(f"Exception closing ds_t_minus_6: {close_err}") 

@@ -16,6 +16,8 @@ import time
 from fiber.logging_utils import get_logger
 from aurora import Batch
 
+from ..utils.data_prep import create_aurora_batch_from_gfs
+
 from .weather_logic import (
     _request_fresh_token,
     _update_run_status,
@@ -274,135 +276,216 @@ async def ensemble_worker(self):
                     self.ensemble_task_queue.task_done()
             await asyncio.sleep(1)
 
-async def run_inference_background(self, initial_batch: Batch, job_id: str, gfs_init_time: datetime, miner_hotkey: str):
+async def run_inference_background(
+    task_instance: 'WeatherTask',
+    job_id: str,
+):
     """
     Runs the weather forecast inference as a background task.
+    Fetches data based on job_id (expects cache hit from fetch_and_hash task)
+    and prepares the batch before running the model.
     
     Args:
-        initial_batch: The preprocessed Aurora batch
-        job_id: The unique job identifier
-        gfs_init_time: The GFS initialization time
-        miner_hotkey: The miner's hotkey
+        task_instance: The WeatherTask instance (miner-side).
+        job_id: The unique job identifier.
     """
-    logger.info(f"[Job {job_id}] Starting background inference task...")
-    
+    logger.info(f"[InferenceTask Job {job_id}] Starting background inference task...")
+    if task_instance.inference_runner is None:
+        logger.error(f"[InferenceTask Job {job_id}] Inference runner not available. Aborting.")
+        await update_job_status(task_instance, job_id, "error", "Inference runner missing")
+        return
+    if task_instance.db_manager is None:
+         logger.error(f"[InferenceTask Job {job_id}] DB manager not available. Aborting.")
+         return
+
+    prepared_batch = None
+    ds_t0 = None
+    ds_t_minus_6 = None
     try:
-        await self.update_job_status(job_id, "processing")
+        logger.info(f"[InferenceTask Job {job_id}] Fetching job details from DB...")
+        query = "SELECT status, gfs_init_time_utc, gfs_t_minus_6_time_utc, validator_hotkey, miner_hotkey FROM weather_miner_jobs WHERE id = :job_id"
+        job_details = await task_instance.db_manager.fetch_one(query, {"job_id": job_id})
+
+        if not job_details:
+            logger.error(f"[InferenceTask Job {job_id}] Job details not found in DB. Aborting.")
+            return
+
+        if task_instance.keypair:
+             miner_hotkey = task_instance.keypair.ss58_address
+        else:
+             logger.warning(f"[InferenceTask Job {job_id}] Miner keypair not found in WeatherTask instance. Using placeholder hotkey.")
+             miner_hotkey = "miner_hk_missing"
+
+        current_status = job_details['status']
+        if current_status != 'inference_queued':
+             logger.warning(f"[InferenceTask Job {job_id}] Expected status 'inference_queued' but found '{current_status}'. Proceeding cautiously...")
         
-        logger.info(f"[Job {job_id}] Waiting for GPU semaphore...")
-        async with self.gpu_semaphore:
-            logger.info(f"[Job {job_id}] Acquired GPU semaphore, running inference...")
-            
+        gfs_init_time_utc = job_details['gfs_init_time_utc']
+        gfs_t_minus_6_time_utc = job_details['gfs_t_minus_6_time_utc']
+        if not gfs_init_time_utc or not gfs_t_minus_6_time_utc:
+            logger.error(f"[InferenceTask Job {job_id}] Missing GFS timestamps in DB record. Aborting.")
+            await update_job_status(task_instance, job_id, "error", "Missing GFS timestamps for inference")
+            return
+        
+        await update_job_status(task_instance, job_id, "loading_input")
+        logger.info(f"[InferenceTask Job {job_id}] Fetching GFS data (expecting cache hit) for T0={gfs_init_time_utc}, T-6={gfs_t_minus_6_time_utc}")
+        gfs_cache_dir = Path(task_instance.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
+        ds_t0 = await fetch_gfs_analysis_data([gfs_init_time_utc], cache_dir=gfs_cache_dir)
+        ds_t_minus_6 = await fetch_gfs_analysis_data([gfs_t_minus_6_time_utc], cache_dir=gfs_cache_dir)
+
+        if ds_t0 is None or ds_t_minus_6 is None:
+            logger.error(f"[InferenceTask Job {job_id}] Failed to fetch/load GFS data from cache. Aborting.")
+            await update_job_status(task_instance, job_id, "error", "Failed to load GFS data for inference")
+            return
+
+        logger.info(f"[InferenceTask Job {job_id}] Preparing Aurora Batch from fetched datasets...")
+        try:
+            prepared_batch = await asyncio.to_thread(create_aurora_batch_from_gfs, ds_t0, ds_t_minus_6)
+
+            if prepared_batch is None:
+                raise ValueError("Batch preparation function returned None")
+            logger.info(f"[InferenceTask Job {job_id}] Aurora Batch prepared successfully.")
+        except Exception as batch_prep_err:
+            logger.error(f"[InferenceTask Job {job_id}] Failed to prepare Aurora Batch: {batch_prep_err}", exc_info=True)
+            await update_job_status(task_instance, job_id, "error", f"Batch preparation failed: {batch_prep_err}")
+            return
+        finally:
+            if ds_t0 and hasattr(ds_t0, 'close'): ds_t0.close()
+            if ds_t_minus_6 and hasattr(ds_t_minus_6, 'close'): ds_t_minus_6.close()
+
+        await update_job_status(task_instance, job_id, "running_inference")
+        logger.info(f"[InferenceTask Job {job_id}] Waiting for GPU semaphore...")
+        async with task_instance.gpu_semaphore:
+            logger.info(f"[InferenceTask Job {job_id}] Acquired GPU semaphore, running inference...")
             try:
                 selected_predictions_cpu = await asyncio.to_thread(
-                    self.inference_runner.run_multistep_inference,
-                    initial_batch,
-                    steps=self.config.get('inference_steps', 40)  # 40 steps of 6h each = 10 days
+                    task_instance.inference_runner.run_multistep_inference,
+                    prepared_batch,
+                    steps=task_instance.config.get('inference_steps', 40)
                 )
-                logger.info(f"[Job {job_id}] Inference completed with {len(selected_predictions_cpu)} time steps")
-                
+                logger.info(f"[InferenceTask Job {job_id}] Inference completed with {len(selected_predictions_cpu)} time steps")
+
             except Exception as infer_err:
-                logger.error(f"[Job {job_id}] Inference failed: {infer_err}", exc_info=True)
-                await self.update_job_status(job_id, "error", error_message=f"Inference error: {infer_err}")
+                logger.error(f"[InferenceTask Job {job_id}] Inference failed: {infer_err}", exc_info=True)
+                await update_job_status(task_instance, job_id, "error", error_message=f"Inference error: {infer_err}")
                 return
-        
+
+        await update_job_status(task_instance, job_id, "processing_output")
         try:
             MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
-            
+
             def _blocking_save_and_process():
                 if not selected_predictions_cpu:
                     raise ValueError("Inference returned no prediction steps.")
 
                 forecast_datasets = []
                 lead_times_hours = []
-                base_time = pd.to_datetime(initial_batch.metadata.time[0])
+                base_time = pd.to_datetime(gfs_init_time_utc)
 
-                for i, batch in enumerate(selected_predictions_cpu):
-                    step_index_original = i * 2 + 1
-                    lead_time_hours = (step_index_original + 1) * self.config.get('forecast_step_hours', 6)
+                for i, batch_step in enumerate(selected_predictions_cpu):
+                    lead_time_hours = (i + 1) * task_instance.config.get('forecast_step_hours', 6) # Example: check actual model step logic
                     forecast_time = base_time + timedelta(hours=lead_time_hours)
 
-                    ds_step = batch.to_xarray_dataset()
+                    if not isinstance(batch_step, Batch):
+                         logger.warning(f"[InferenceTask Job {job_id}] Step {i} prediction is not an aurora.Batch, attempting conversion if possible.")
+                         raise TypeError(f"Prediction step {i} has unexpected type: {type(batch_step)}")
+
+                    ds_step = batch_step.to_xarray_dataset()
                     ds_step = ds_step.assign_coords(time=[forecast_time])
                     ds_step = ds_step.expand_dims('time')
                     forecast_datasets.append(ds_step)
                     lead_times_hours.append(lead_time_hours)
 
+                if not forecast_datasets:
+                    raise ValueError("No forecast datasets created after processing prediction steps.")
+
                 combined_forecast_ds = xr.concat(forecast_datasets, dim='time')
                 combined_forecast_ds = combined_forecast_ds.assign_coords(lead_time=('time', lead_times_hours))
-                logger.info(f"[Job {job_id}] Combined forecast dimensions: {combined_forecast_ds.dims}")
+                logger.info(f"[InferenceTask Job {job_id}] Combined forecast dimensions: {combined_forecast_ds.dims}")
 
-                gfs_time_str = gfs_init_time.strftime('%Y%m%d%H')
-                unique_suffix = str(uuid.uuid4())[:8]
+                gfs_time_str = gfs_init_time_utc.strftime('%Y%m%d%H')
+                unique_suffix = job_id.split('-')[0]
                 filename_nc = f"weather_forecast_{gfs_time_str}_{miner_hotkey[:8]}_{unique_suffix}.nc"
                 output_nc_path = MINER_FORECAST_DIR_BG / filename_nc
-                
-                combined_forecast_ds.to_netcdf(output_nc_path)
-                logger.info(f"[Job {job_id}] Saved forecast to NetCDF: {output_nc_path}")
-                
+
+                encoding = {var: {'zlib': True, 'complevel': 4} for var in combined_forecast_ds.data_vars}
+                combined_forecast_ds.to_netcdf(output_nc_path, encoding=encoding)
+                logger.info(f"[InferenceTask Job {job_id}] Saved forecast to NetCDF: {output_nc_path}")
+
                 filename_json = f"{os.path.splitext(filename_nc)[0]}.json"
                 output_json_path = MINER_FORECAST_DIR_BG / filename_json
-                
-                from kerchunk.hdf import SingleHdf5ToZarr
-                h5chunks = SingleHdf5ToZarr(str(output_nc_path), inline_threshold=0)
+
+                h5chunks = SingleHdf5ToZarr(str(output_nc_path), inline_threshold=100)
                 kerchunk_metadata = h5chunks.translate()
-                
                 with open(output_json_path, 'w') as f:
                     json.dump(kerchunk_metadata, f)
-                logger.info(f"[Job {job_id}] Generated Kerchunk JSON: {output_json_path}")
-                
+                logger.info(f"[InferenceTask Job {job_id}] Generated Kerchunk JSON: {output_json_path}")
+
                 from gaia.tasks.defined_tasks.weather.utils.hashing import compute_verification_hash
-                
-                forecast_metadata = {
+                output_metadata = {
                     "time": [base_time],
                     "source_model": "aurora",
                     "resolution": 0.25
                 }
+                data_for_hash = {"surf_vars": {}, "atmos_vars": {}}
+                for var_name in combined_forecast_ds.data_vars:
+                     if var_name in CANONICAL_VARS_FOR_HASHING:
+                          is_surface = len(combined_forecast_ds[var_name].dims) == 3 # time, lat, lon
+                          is_atmos = len(combined_forecast_ds[var_name].dims) == 4 # time, level, lat, lon
+                          if is_surface:
+                               data_for_hash["surf_vars"][var_name] = combined_forecast_ds[var_name].values[np.newaxis, ...]
+                          elif is_atmos:
+                               data_for_hash["atmos_vars"][var_name] = combined_forecast_ds[var_name].values[np.newaxis, ...]
+
+                variables_to_hash = list(data_for_hash["surf_vars"].keys()) + list(data_for_hash["atmos_vars"].keys())
+                timesteps_to_hash = list(range(len(combined_forecast_ds.time)))
                 
-                variables_to_hash = ["2t", "10u", "10v", "msl", "z", "u", "v", "t", "q"]
-                timesteps_to_hash = list(range(len(forecast_datasets)))
-            
-                data_for_hash = {
-                    "surf_vars": {},
-                    "atmos_vars": {}
-                }
-                
-                for var in combined_forecast_ds.data_vars:
-                    if var in ["2t", "10u", "10v", "msl"]:
-                        data_for_hash["surf_vars"][var] = combined_forecast_ds[var].values[np.newaxis, :]
-                    elif var in ["z", "u", "v", "t", "q"]:
-                        data_for_hash["atmos_vars"][var] = combined_forecast_ds[var].values[np.newaxis, :]
-                
-                verification_hash = compute_verification_hash(
-                    data=data_for_hash,
-                    metadata=forecast_metadata,
-                    variables=[v for v in variables_to_hash if v in combined_forecast_ds.data_vars],
-                    timesteps=timesteps_to_hash
-                )
-                
-                logger.info(f"[Job {job_id}] Computed verification hash: {verification_hash}")
-                
+                if not variables_to_hash:
+                    logger.warning(f"[InferenceTask Job {job_id}] No variables found/categorized for output hashing!")
+                    verification_hash = None
+                else:
+                    verification_hash = compute_verification_hash(
+                        data=data_for_hash,
+                        metadata=output_metadata,
+                        variables=variables_to_hash,
+                        timesteps=timesteps_to_hash
+                    )
+                    if verification_hash:
+                         logger.info(f"[InferenceTask Job {job_id}] Computed output verification hash: {verification_hash[:10]}...")
+                    else:
+                         logger.warning(f"[InferenceTask Job {job_id}] compute_verification_hash returned None for output.")
+
                 return str(output_nc_path), str(output_json_path), verification_hash
-            
+
             nc_path, json_path, v_hash = await asyncio.to_thread(_blocking_save_and_process)
-            
-            await self.update_job_paths(
-                job_id=job_id, 
-                target_netcdf_path=nc_path, 
-                kerchunk_json_path=json_path, 
+
+            await update_job_paths(
+                task_instance=task_instance,
+                job_id=job_id,
+                target_netcdf_path=nc_path,
+                kerchunk_json_path=json_path,
                 verification_hash=v_hash
             )
-            
-            await self.update_job_status(job_id, "completed")
-            logger.info(f"[Job {job_id}] Background task completed successfully")
-            
+            await update_job_status(task_instance, job_id, "completed")
+            logger.info(f"[InferenceTask Job {job_id}] Background inference task completed successfully.")
+
         except Exception as save_err:
-            logger.error(f"[Job {job_id}] Failed to save results: {save_err}", exc_info=True)
-            await self.update_job_status(job_id, "error", error_message=f"Processing error: {save_err}")
-    
+            logger.error(f"[InferenceTask Job {job_id}] Failed to save or process output: {save_err}", exc_info=True)
+            await update_job_status(task_instance, job_id, "error", error_message=f"Output processing error: {save_err}")
+
     except Exception as e:
-        logger.error(f"[Job {job_id}] Background task failed: {e}", exc_info=True)
-        await self.update_job_status(job_id, "error", error_message=f"Task error: {e}")
+        logger.error(f"[InferenceTask Job {job_id}] Background inference task failed unexpectedly: {e}", exc_info=True)
+        try:
+             await update_job_status(task_instance, job_id, "error", error_message=f"Unexpected task error: {e}")
+        except Exception as final_db_err:
+             logger.error(f"[InferenceTask Job {job_id}] Failed to update job status to error after task failure: {final_db_err}")
+    finally:
+        if ds_t0 is not None and hasattr(ds_t0, 'close'):
+            try: ds_t0.close() 
+            except Exception: pass
+        if ds_t_minus_6 is not None and hasattr(ds_t_minus_6, 'close'):
+            try: ds_t_minus_6.close()
+            except Exception: pass
 
 async def initial_scoring_worker(self):
     """Background worker to calculate initial scores/weights vs GFS analysis."""
@@ -727,3 +810,56 @@ async def cleanup_worker(task_instance: 'WeatherTask'):
         except asyncio.CancelledError:
              logger.info("[CleanupWorker] Sleep interrupted, worker stopping.")
              break
+
+async def fetch_and_hash_gfs_task(
+    task_instance: 'WeatherTask',
+    job_id: str,
+    t0_run_time: datetime,
+    t_minus_6_run_time: datetime
+):
+    """
+    Background task for miners: Fetches GFS analysis data for T=0h and T=-6h,
+    computes the canonical input hash, and updates the job record in the database.
+    """
+    logger.info(f"[FetchHashTask Job {job_id}] Starting GFS fetch and input hash computation for T0={t0_run_time}, T-6={t_minus_6_run_time}")
+
+    try:
+        await update_job_status(task_instance, job_id, "fetching_gfs")
+
+        cache_dir_str = task_instance.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache')
+        gfs_cache_dir = Path(cache_dir_str)
+        gfs_cache_dir.mkdir(parents=True, exist_ok=True) # Ensure it exists
+
+        logger.info(f"[FetchHashTask Job {job_id}] Calling compute_input_data_hash...")
+        computed_hash = await compute_input_data_hash(
+            t0_run_time=t0_run_time,
+            t_minus_6_run_time=t_minus_6_run_time,
+            cache_dir=gfs_cache_dir
+        )
+
+        if computed_hash:
+            logger.info(f"[FetchHashTask Job {job_id}] Successfully computed input hash: {computed_hash[:10]}... Updating DB.")
+            update_query = """
+                UPDATE weather_miner_jobs
+                SET input_data_hash = :hash, status = :status, updated_at = :now
+                WHERE id = :job_id
+            """
+            await task_instance.db_manager.execute(update_query, {
+                "job_id": job_id,
+                "hash": computed_hash,
+                "status": "input_hashed_awaiting_validation",
+                "now": datetime.now(timezone.utc)
+            })
+            logger.info(f"[FetchHashTask Job {job_id}] Status updated to input_hashed_awaiting_validation.")
+        else:
+            logger.error(f"[FetchHashTask Job {job_id}] compute_input_data_hash failed (returned None). Updating status to fetch_error.")
+            await update_job_status(task_instance, job_id, "fetch_error", "Failed to fetch GFS data or compute input hash.")
+
+    except Exception as e:
+        logger.error(f"[FetchHashTask Job {job_id}] Unexpected error: {e}", exc_info=True)
+        try:
+            await update_job_status(task_instance, job_id, "error", f"Unexpected error during fetch/hash: {e}")
+        except Exception as db_err:
+            logger.error(f"[FetchHashTask Job {job_id}] Failed to update status to error after exception: {db_err}")
+
+    logger.info(f"[FetchHashTask Job {job_id}] Task finished.")
