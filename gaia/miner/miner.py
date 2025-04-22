@@ -68,6 +68,7 @@ class Miner:
         self.database_manager = MinerDatabaseManager()
         async def init_db():
             await self.database_manager.ensure_engine_initialized()
+            await self.database_manager.initialize_database() 
             
         loop = asyncio.get_event_loop()
         loop.run_until_complete(init_db())

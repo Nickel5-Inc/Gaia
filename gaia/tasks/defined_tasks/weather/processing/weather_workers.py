@@ -29,7 +29,7 @@ from .weather_logic import (
 
 from ..utils.gfs_api import fetch_gfs_analysis_data
 from ..utils.era5_api import fetch_era5_data
-from ..utils.hashing import compute_verification_hash
+from ..utils.hashing import compute_verification_hash, compute_input_data_hash
 from ..weather_scoring.ensemble import (
     create_physics_aware_ensemble,
     _open_dataset_lazily,
