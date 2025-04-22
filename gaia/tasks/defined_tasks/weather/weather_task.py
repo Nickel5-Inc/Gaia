@@ -147,7 +147,7 @@ class WeatherTask(Task):
         if self.node_type == "miner":
             try:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
-                self.inference_runner = WeatherInferenceRunner(device=device, config=self.config) 
+                self.inference_runner = WeatherInferenceRunner(device=device) 
                 logger.info(f"Initialized Miner components (Inference Runner on {device}).")
             except Exception as e:
                 logger.error(f"Failed to initialize WeatherInferenceRunner: {e}", exc_info=True)

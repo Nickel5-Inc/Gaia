@@ -139,3 +139,4 @@ metpy
 microsoft-aurora
 jwt
 kerchunk
+cdsapi
