@@ -1,5 +1,5 @@
 from functools import partial
-from fastapi import Depends, Request, HTTPException
+from fastapi import Depends, Request, HTTPException, Header
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.routing import APIRouter
 from pydantic import BaseModel, Field
@@ -313,12 +313,13 @@ def factory_router(miner_instance) -> APIRouter:
             return JSONResponse(status_code=500, content={"error": f"Internal server error: {str(e)}"})
 
     async def weather_initiate_fetch_require(
+        validator_hotkey: str = Header(..., alias=cst.VALIDATOR_HOTKEY),
         decrypted_payload: WeatherInitiateFetchRequest = Depends(
             partial(decrypt_general_payload, WeatherInitiateFetchRequest)
         ),
     ):
         """
-        Validator requests the miner to fetch GFS data based on timestamps.
+        Handles Step 1: Validator requests the miner to fetch GFS data based on timestamps.
         Miner creates a job record and starts a background task for fetching & hashing.
         """
         logger.info("Entered /weather-initiate-fetch handler.")
@@ -328,7 +329,8 @@ def factory_router(miner_instance) -> APIRouter:
                 return JSONResponse(status_code=500, content={"error": "Miner not configured for weather task"})
 
             response_data = await miner_instance.weather_task.handle_initiate_fetch(
-                decrypted_payload.data, decrypted_payload.sender_hotkey
+                request_data=decrypted_payload.data, 
+                validator_hotkey=validator_hotkey
             )
 
             if not isinstance(response_data, dict):
@@ -351,7 +353,7 @@ def factory_router(miner_instance) -> APIRouter:
         ),
     ):
         """
-        Validator polls for the status of the GFS fetch/hash process.
+        Handles Step 3: Validator polls for the status of the GFS fetch/hash process.
         Miner returns the job status and the input hash if available.
         """
         logger.info("Entered /weather-get-input-status handler.")
@@ -381,12 +383,13 @@ def factory_router(miner_instance) -> APIRouter:
             return JSONResponse(status_code=500, content={"error": f"Internal server error: {str(e)}"})
 
     async def weather_start_inference_require(
+        validator_hotkey: str = Header(..., alias=cst.VALIDATOR_HOTKEY),
         decrypted_payload: WeatherStartInferenceRequest = Depends(
             partial(decrypt_general_payload, WeatherStartInferenceRequest)
         ),
     ):
         """
-        Validator, after verifying the input hash, triggers the miner
+        Handles Step 5: Validator, after verifying the input hash, triggers the miner
         to start the actual model inference.
         """
         logger.info("Entered /weather-start-inference handler.")
@@ -396,7 +399,6 @@ def factory_router(miner_instance) -> APIRouter:
                 return JSONResponse(status_code=500, content={"error": "Miner not configured for weather task"})
 
             job_id = decrypted_payload.data.job_id
-            validator_hotkey = decrypted_payload.sender_hotkey
             if not job_id:
                  return JSONResponse(status_code=400, content={"error": "Missing job_id in request"})
 
