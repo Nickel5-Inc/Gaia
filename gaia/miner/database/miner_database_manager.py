@@ -236,18 +236,29 @@ class MinerDatabaseManager(BaseDatabaseManager):
     @track_operation('ddl')
     async def initialize_task_tables(self, task_schemas: Dict[str, Dict[str, Any]]):
         """Initialize miner-specific task tables."""
+        logger.info(f"Initializing task tables for node type: {self.node_type}")
         for schema_name, schema in task_schemas.items():
+            logger.debug(f"Processing schema: {schema_name}")
             try:
-                if isinstance(schema, dict) and 'table_name' not in schema:
-                    for table_name, table_schema in schema.items():
-                        if isinstance(table_schema, dict) and table_schema.get("database_type") in ["miner", "both"]:
-                            await self._create_task_table(table_schema)
-                else:
-                    if schema.get("database_type") in ["miner", "both"]:
+                if isinstance(schema, dict) and 'table_name' in schema:
+                    if schema.get("database_type") in [self.node_type, "both"]:
+                        logger.info(f"Attempting to create table based on single-table schema: {schema.get('table_name')}")
                         await self._create_task_table(schema)
+                    else:
+                        logger.debug(f"Skipping table {schema.get('table_name')} - node type mismatch.")
+                else:
+                    for table_name, table_schema in schema.items():
+                        if isinstance(table_schema, dict):
+                            if table_schema.get("database_type") in [self.node_type, "both"]:
+                                logger.info(f"Attempting to create table from multi-table schema: {table_schema.get('table_name')} (key: {table_name}) for node type {self.node_type}")
+                                await self._create_task_table(table_schema)
+                            else:
+                                logger.debug(f"Skipping table {table_schema.get('table_name')} (key: {table_name}) - node type mismatch (Expected: {self.node_type} or both, Got: {table_schema.get('database_type')}).")
+                        else:
+                             logger.warning(f"Skipping invalid entry '{table_name}' in schema '{schema_name}' - not a dictionary.")
             except Exception as e:
-                logger.error(f"Error initializing table for schema {schema_name}: {e}")
-                raise DatabaseError(f"Failed to initialize table for schema {schema_name}: {str(e)}")
+                logger.error(f"Error initializing table(s) for schema {schema_name}: {e}", exc_info=True) # Add traceback
+                logger.warning(f"Continuing initialization despite error in schema {schema_name}")
 
     async def load_task_schemas(self) -> Dict[str, Dict[str, Any]]:
         """Load task schemas for miner tasks from schema.json files."""
