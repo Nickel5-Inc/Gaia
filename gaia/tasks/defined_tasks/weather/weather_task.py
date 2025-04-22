@@ -794,7 +794,7 @@ class WeatherTask(Task):
             return {"status": "error", "message": f"Failed to process request: {str(e)}"}
 
 
-    async def handle_initiate_fetch(self, request_data: 'WeatherInitiateFetchData', validator_hotkey: str) -> Dict[str, Any]:
+    async def handle_initiate_fetch(self, request_data: 'WeatherInitiateFetchData') -> Dict[str, Any]:
         """
         Handles the /weather-initiate-fetch request.
         Creates a job record and launches the background task for fetching GFS and hashing.
@@ -805,7 +805,7 @@ class WeatherTask(Task):
             return {"status": "error", "job_id": None, "message": "Invalid node type"}
 
         job_id = str(uuid.uuid4())
-        logger.info(f"[Miner Job {job_id}] Received initiate_fetch request from {validator_hotkey[:8]}... for T0={request_data.forecast_start_time}")
+        logger.info(f"[Miner Job {job_id}] Received initiate_fetch request for T0={request_data.forecast_start_time}")
 
         try:
             t0_run_time = request_data.forecast_start_time
@@ -816,12 +816,11 @@ class WeatherTask(Task):
 
             insert_query = """
                 INSERT INTO weather_miner_jobs
-                (id, validator_hotkey, validator_request_time, gfs_init_time_utc, gfs_t_minus_6_time_utc, status)
-                VALUES (:id, :val_hk, :req_time, :gfs_init, :gfs_t_minus_6, :status)
+                (id, validator_request_time, gfs_init_time_utc, gfs_t_minus_6_time_utc, status)
+                VALUES (:id, :req_time, :gfs_init, :gfs_t_minus_6, :status)
             """
             await self.db_manager.execute(insert_query, {
                 "id": job_id,
-                "val_hk": validator_hotkey,
                 "req_time": datetime.now(timezone.utc),
                 "gfs_init": t0_run_time,          # T=0h time
                 "gfs_t_minus_6": t_minus_6_run_time, # T=-6h time
@@ -877,7 +876,7 @@ class WeatherTask(Task):
             logger.error(f"[Miner Job {job_id}] Error during handle_get_input_status: {e}", exc_info=True)
             return {"status": "error", "job_id": job_id, "message": f"Failed to get status: {e}"}
 
-    async def handle_start_inference(self, job_id: str, validator_hotkey: str) -> Dict[str, Any]:
+    async def handle_start_inference(self, job_id: str) -> Dict[str, Any]:
         """
         Handles the /weather-start-inference request.
         Verifies the job is ready and triggers the main inference background task.
@@ -887,9 +886,9 @@ class WeatherTask(Task):
             logger.error("handle_start_inference called on non-miner node.")
             return {"status": "error", "message": "Invalid node type"}
 
-        logger.info(f"[Miner Job {job_id}] Received start_inference request from {validator_hotkey[:8]}...")
+        logger.info(f"[Miner Job {job_id}] Received start_inference request...") 
         try:
-            query = "SELECT status, validator_hotkey, gfs_init_time_utc, gfs_t_minus_6_time_utc FROM weather_miner_jobs WHERE id = :job_id"
+            query = "SELECT status FROM weather_miner_jobs WHERE id = :job_id"
             job_details = await self.db_manager.fetch_one(query, {"job_id": job_id})
 
             if not job_details:

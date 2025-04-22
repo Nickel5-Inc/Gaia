@@ -313,7 +313,6 @@ def factory_router(miner_instance) -> APIRouter:
             return JSONResponse(status_code=500, content={"error": f"Internal server error: {str(e)}"})
 
     async def weather_initiate_fetch_require(
-        validator_hotkey: str = Header(..., alias=cst.VALIDATOR_HOTKEY),
         decrypted_payload: WeatherInitiateFetchRequest = Depends(
             partial(decrypt_general_payload, WeatherInitiateFetchRequest)
         ),
@@ -329,8 +328,7 @@ def factory_router(miner_instance) -> APIRouter:
                 return JSONResponse(status_code=500, content={"error": "Miner not configured for weather task"})
 
             response_data = await miner_instance.weather_task.handle_initiate_fetch(
-                request_data=decrypted_payload.data, 
-                validator_hotkey=validator_hotkey
+                request_data=decrypted_payload.data 
             )
 
             if not isinstance(response_data, dict):
@@ -383,7 +381,6 @@ def factory_router(miner_instance) -> APIRouter:
             return JSONResponse(status_code=500, content={"error": f"Internal server error: {str(e)}"})
 
     async def weather_start_inference_require(
-        validator_hotkey: str = Header(..., alias=cst.VALIDATOR_HOTKEY),
         decrypted_payload: WeatherStartInferenceRequest = Depends(
             partial(decrypt_general_payload, WeatherStartInferenceRequest)
         ),
@@ -402,7 +399,7 @@ def factory_router(miner_instance) -> APIRouter:
             if not job_id:
                  return JSONResponse(status_code=400, content={"error": "Missing job_id in request"})
 
-            response_data = await miner_instance.weather_task.handle_start_inference(job_id, validator_hotkey)
+            response_data = await miner_instance.weather_task.handle_start_inference(job_id)
 
             if not isinstance(response_data, dict):
                  logger.error(f"handle_start_inference returned invalid type: {type(response_data)}")
