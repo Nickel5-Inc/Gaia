@@ -411,11 +411,13 @@ async def fetch_gfs_analysis_data(
                   logger.info(log_msg)
                   processed_ds['pressure_level'] = processed_ds['pressure_level'] / 100.0
                   processed_ds['pressure_level'].attrs['units'] = 'hPa'
-                  processed_ds['pressure_level'].attrs['long_name'] = 'pressure'
-             elif current_units == 'hpa':
-                  logger.info("Pressure level units are already hPa.")
+                  processed_ds['pressure_level'].attrs['long_name'] = 'pressure' 
+             elif current_units in ['hpa', 'millibar', 'mb']:
+                  logger.info(f"Pressure level units ('{current_units}') are already hPa equivalent. Ensuring units attribute is 'hPa'.")
+                  processed_ds['pressure_level'].attrs['units'] = 'hPa' 
+                  processed_ds['pressure_level'].attrs['long_name'] = 'pressure' 
              else:
-                  logger.warning(f"Pressure level units '{current_units}' are not Pa or hPa. Proceeding without conversion.")
+                  logger.warning(f"Pressure level units '{current_units}' are not Pa, hPa, or millibar. Proceeding without conversion.")
 
              try:
                   processed_ds = processed_ds.sel(pressure_level=AURORA_PRESSURE_LEVELS_HPA)
@@ -446,9 +448,12 @@ async def fetch_gfs_analysis_data(
 
         try:
             logger.info(f"Saving processed GFS analysis data to cache: {cache_filename}")
+            cache_dir.mkdir(parents=True, exist_ok=True)
             processed_ds.to_netcdf(cache_filename)
         except Exception as e_cache:
             logger.error(f"Failed to save GFS analysis to cache {cache_filename}: {e_cache}")
+            if isinstance(e_cache, PermissionError):
+                 logger.error(f"** PERMISSION DENIED saving to {cache_dir}. Please check directory permissions. **")
             
         return processed_ds
 
