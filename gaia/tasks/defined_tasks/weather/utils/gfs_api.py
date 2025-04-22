@@ -325,8 +325,11 @@ async def fetch_gfs_analysis_data(
                     logger.info(f"Opening GFS cycle {target_time} from {base_url} for analysis (T+0h)...")
                     full_ds = xr.open_dataset(base_url, decode_times=True, chunks={})
 
-                    analysis_slice = full_ds.sel(time=target_time, method='nearest')
-                    if abs(analysis_slice.time.values - np.datetime64(target_time)) > np.timedelta64(1, 'h'):
+                    target_time_naive_np = np.datetime64(target_time.replace(tzinfo=None))
+
+                    analysis_slice = full_ds.sel(time=target_time_naive_np, method='nearest')
+                    
+                    if abs(analysis_slice.time.values - target_time_naive_np) > np.timedelta64(1, 'h'):
                         logger.error(f"Nearest time found ({analysis_slice.time.values}) is too far from requested analysis time {target_time} for cycle {target_time}. Skipping.")
                         continue
 
