@@ -5,10 +5,10 @@ from numpy.typing import NDArray
 from gaia.tasks.base.components.outputs import Outputs
 from gaia.tasks.base.decorators import handle_validation_error
 from datetime import datetime
-import logging
+from fiber.logging_utils import get_logger
 from scipy.stats import sigmaclip
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ROBUST_STD_THRESHOLD = 0.005
 SIGMA_CLIP_LOW = 3.0
