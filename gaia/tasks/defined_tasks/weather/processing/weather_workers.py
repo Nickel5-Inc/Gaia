@@ -340,7 +340,13 @@ async def run_inference_background(
 
         logger.info(f"[InferenceTask Job {job_id}] Preparing Aurora Batch from fetched datasets...")
         try:
-            prepared_batch = await asyncio.to_thread(create_aurora_batch_from_gfs, ds_t0, ds_t_minus_6)
+            input_gfs_data = xr.concat([ds_t_minus_6, ds_t0], dim='time').sortby('time')
+            logger.debug(f"Combined input GFS data times: {input_gfs_data.time.values}")
+            
+            prepared_batch = await asyncio.to_thread(
+                create_aurora_batch_from_gfs, 
+                gfs_data=input_gfs_data
+            )
 
             if prepared_batch is None:
                 raise ValueError("Batch preparation function returned None")

@@ -149,7 +149,7 @@ def prepare_aurora_batch(
             logger.warning(f"Surface variable {var_name} not found in GFS data")
     
     for var_name in atmos_var_names:
-        if var_name in gfs_data and 'lev' in gfs_data[var_name].dims:
+        if var_name in gfs_data and 'pressure_level' in gfs_data[var_name].dims:
             var_data = gfs_data[var_name].values
             
             var_data = var_data[-history_steps:].copy()
@@ -157,7 +157,7 @@ def prepare_aurora_batch(
             
             atmos_vars[var_name] = torch.from_numpy(var_data)
         elif var_name in gfs_data:
-            logger.warning(f"Atmospheric variable {var_name} has no level dimension")
+            logger.warning(f"Atmospheric variable {var_name} missing expected 'pressure_level' dimension")
         else:
             logger.warning(f"Atmospheric variable {var_name} not found in GFS data")
     

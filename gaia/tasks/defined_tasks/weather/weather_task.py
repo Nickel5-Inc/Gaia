@@ -114,7 +114,7 @@ class WeatherTask(Task):
         arbitrary_types_allowed=True
     )
 
-    def __init__(self, db_manager=None, node_type=None, test_mode=False, **data):
+    def __init__(self, db_manager=None, node_type=None, test_mode=False, keypair=None, **data):
         loaded_config = self._load_config() 
         
         super_data = {
@@ -129,6 +129,7 @@ class WeatherTask(Task):
         }
         super().__init__(**super_data)
         
+        self.keypair = keypair
         self.db_manager = db_manager
         self.node_type = node_type
         self.test_mode = test_mode
