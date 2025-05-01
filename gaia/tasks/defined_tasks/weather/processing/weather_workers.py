@@ -303,7 +303,7 @@ async def run_inference_background(
     ds_t_minus_6 = None
     try:
         logger.info(f"[InferenceTask Job {job_id}] Fetching job details from DB...")
-        query = "SELECT status, gfs_init_time_utc, gfs_t_minus_6_time_utc, validator_hotkey, miner_hotkey FROM weather_miner_jobs WHERE id = :job_id"
+        query = "SELECT status, gfs_init_time_utc, gfs_t_minus_6_time_utc, validator_hotkey FROM weather_miner_jobs WHERE id = :job_id"
         job_details = await task_instance.db_manager.fetch_one(query, {"job_id": job_id})
 
         if not job_details:
@@ -514,6 +514,15 @@ async def initial_scoring_worker(self):
             """
             responses = await self.db_manager.fetch_all(responses_query, {"run_id": run_id})
             
+            if self.test_mode and (not responses or len(responses) < self.config.get('min_ensemble_members', 3)):
+                wait_count = 0
+                max_wait_attempts = 3
+                while wait_count < max_wait_attempts and (not responses or len(responses) < self.config.get('min_ensemble_members', 3)):
+                    logger.info(f"[InitialScoringWorker] TEST MODE: Only {len(responses) if responses else 0} verified responses found. Waiting 10s before checking again. Attempt {wait_count+1}/{max_wait_attempts}")
+                    await asyncio.sleep(10)
+                    responses = await self.db_manager.fetch_all(responses_query, {"run_id": run_id})
+                    wait_count += 1
+
             min_members = self.config.get('min_ensemble_members', 3)
             if not responses or len(responses) < min_members:
                 logger.warning(f"[InitialScoringWorker] Run {run_id}: Insufficient verified responses ({len(responses)} < {min_members}) found for initial scoring.")
@@ -610,7 +619,7 @@ async def initial_scoring_worker(self):
 
 async def finalize_scores_worker(self):
     """Background worker to calculate final scores against ERA5 after delay."""
-    CHECK_INTERVAL_SECONDS = int(self.config.get('final_scoring_check_interval_seconds', 3600)) # Default 1 hour
+    CHECK_INTERVAL_SECONDS = 30 if self.test_mode else int(self.config.get('final_scoring_check_interval_seconds', 3600))
     ERA5_DELAY_DAYS = int(self.config.get('era5_delay_days', 5))
     FORECAST_DURATION_HOURS = int(self.config.get('forecast_duration_hours', 240)) # 10 days
 
@@ -623,24 +632,37 @@ async def finalize_scores_worker(self):
             logger.info("[FinalizeWorker] Checking for runs ready for final ERA5 scoring...")
 
             now_utc = datetime.now(timezone.utc)
-            forecast_end_cutoff = now_utc - timedelta(days=ERA5_DELAY_DAYS)
-            init_time_cutoff = forecast_end_cutoff - timedelta(hours=FORECAST_DURATION_HOURS)
-
-            runs_to_score_query = """
-            SELECT id, gfs_init_time_utc
-            FROM weather_forecast_runs
-            WHERE status IN ('processing_ensemble', 'completed', 'initial_scoring_failed', 'ensemble_failed', 'final_scoring_failed', 'scored') -- Include 'scored' for potential re-scoring needs? Or exclude? Let's exclude for now.
-            AND (final_scoring_attempted_time IS NULL OR final_scoring_attempted_time < :retry_cutoff) -- Allow retries after a while
-            AND gfs_init_time_utc < :init_time_cutoff
-            ORDER BY gfs_init_time_utc ASC
-            LIMIT 10 -- Process in batches
-            """
-            retry_cutoff_time = now_utc - timedelta(hours=6)
-
-            ready_runs = await self.db_manager.fetch_all(runs_to_score_query, {
-                "init_time_cutoff": init_time_cutoff,
-                "retry_cutoff": retry_cutoff_time
-            })
+           
+            if self.test_mode:
+                logger.info("[FinalizeWorker] TEST MODE: Ignoring ERA5 delay, checking all runs for final scoring")
+                runs_to_score_query = """
+                SELECT id, gfs_init_time_utc
+                FROM weather_forecast_runs
+                WHERE status IN ('completed', 'awaiting_inference_results', 'ensemble_created')
+                AND final_scoring_attempted_time IS NULL
+                ORDER BY gfs_init_time_utc ASC
+                LIMIT 10
+                """
+                ready_runs = await self.db_manager.fetch_all(runs_to_score_query, {})
+            else:
+                forecast_end_cutoff = now_utc - timedelta(days=ERA5_DELAY_DAYS)
+                init_time_cutoff = forecast_end_cutoff - timedelta(hours=FORECAST_DURATION_HOURS)
+                
+                runs_to_score_query = """
+                SELECT id, gfs_init_time_utc
+                FROM weather_forecast_runs
+                WHERE status IN ('processing_ensemble', 'completed', 'initial_scoring_failed', 'ensemble_failed', 'final_scoring_failed', 'scored')
+                AND (final_scoring_attempted_time IS NULL OR final_scoring_attempted_time < :retry_cutoff)
+                AND gfs_init_time_utc < :init_time_cutoff
+                ORDER BY gfs_init_time_utc ASC
+                LIMIT 10 -- Process in batches
+                """
+                retry_cutoff_time = now_utc - timedelta(hours=6)
+                
+                ready_runs = await self.db_manager.fetch_all(runs_to_score_query, {
+                    "init_time_cutoff": init_time_cutoff,
+                    "retry_cutoff": retry_cutoff_time
+                })
 
             if not ready_runs:
                 logger.debug("[FinalizeWorker] No runs ready for final scoring.")
@@ -662,6 +684,13 @@ async def finalize_scores_worker(self):
 
                 sparse_lead_hours = self.config.get('final_scoring_lead_hours', [120, 168]) # Day 5, Day 7 defaults
                 target_datetimes = [gfs_init_time + timedelta(hours=h) for h in sparse_lead_hours]
+
+                if self.test_mode:
+                    adjustment = now_utc - (gfs_init_time + timedelta(hours=sparse_lead_hours[-1])) - timedelta(days=ERA5_DELAY_DAYS+1)
+                    logger.info(f"[FinalizeWorker] TEST MODE: Adjusting target dates by {adjustment} to ensure ERA5 data availability")
+                    target_datetimes = [dt + adjustment for dt in target_datetimes]
+                    logger.info(f"[FinalizeWorker] TEST MODE: Adjusted target dates to {target_datetimes}")
+
                 logger.info(f"[FinalizeWorker] Run {run_id}: Fetching ERA5 analysis for final scoring at lead hours: {sparse_lead_hours}.")
 
                 era5_cache = Path(self.config.get('era5_cache_dir', './era5_cache'))

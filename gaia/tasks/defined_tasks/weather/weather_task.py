@@ -23,6 +23,11 @@ import torch
 import fsspec
 from kerchunk.hdf import SingleHdf5ToZarr
 import pandas as pd
+from cryptography.fernet import Fernet
+from fiber.encrypted.validator import handshake
+from fiber.encrypted.validator import client as vali_client
+from sqlalchemy import text, bindparam, TEXT
+import httpx
 
 from .utils.era5_api import fetch_era5_data
 from .utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
@@ -270,7 +275,18 @@ class WeatherTask(Task):
                 accepted_count = 0
                 for miner_hotkey, response_data in responses.items():
                      try:
-                         if isinstance(response_data, dict) and response_data.get("status") == "fetch_accepted" and response_data.get("job_id"):
+                         miner_response = response_data
+                         if isinstance(response_data, dict) and 'text' in response_data:
+                             try:
+                                 miner_response = json.loads(response_data['text'])
+                                 logger.debug(f"[Run {run_id}] Parsed JSON from response text for {miner_hotkey}: {miner_response}")
+                             except (json.JSONDecodeError, TypeError) as json_err:
+                                 logger.warning(f"[Run {run_id}] Failed to parse response text for {miner_hotkey}: {json_err}")
+                                 miner_response = {"status": "parse_error", "message": str(json_err)}
+                                 
+                         if (isinstance(miner_response, dict) and 
+                             miner_response.get("status") == "fetch_accepted" and 
+                             miner_response.get("job_id")):
                               miner_uid_result = await self.db_manager.fetch_one("SELECT uid FROM node_table WHERE hotkey = :hk", {"hk": miner_hotkey})
                               miner_uid = miner_uid_result['uid'] if miner_uid_result else -1
  
@@ -278,16 +294,16 @@ class WeatherTask(Task):
                                   logger.warning(f"[Run {run_id}] Miner {miner_hotkey} accepted but UID not found in node_table.")
                                   continue
  
-                              miner_job_id = response_data.get("job_id")
+                              miner_job_id = miner_response.get("job_id")
  
                               insert_resp_query = """
                                    INSERT INTO weather_miner_responses
-                                   (run_id, miner_uid, miner_hotkey, response_time, status, job_id)
-                                   VALUES (:run_id, :uid, :hk, :resp_time, :status, :job_id)
+                                    (run_id, miner_uid, miner_hotkey, response_time, status, job_id)
+                                    VALUES (:run_id, :uid, :hk, :resp_time, :status, :job_id)
                                    ON CONFLICT (run_id, miner_uid) DO UPDATE SET
-                                   response_time = EXCLUDED.response_time, 
-                                   status = EXCLUDED.status,
-                                   job_id = EXCLUDED.job_id
+                                    response_time = EXCLUDED.response_time, 
+                                    status = EXCLUDED.status,
+                                    job_id = EXCLUDED.job_id
                               """
                               await self.db_manager.execute(insert_resp_query, {
                                    "run_id": run_id,
@@ -295,22 +311,23 @@ class WeatherTask(Task):
                                    "hk": miner_hotkey,
                                    "resp_time": datetime.now(timezone.utc),
                                    "status": "fetch_initiated",
+                                   "job_id": miner_job_id
                               })
                               accepted_count += 1
                               logger.debug(f"[Run {run_id}] Recorded acceptance from Miner UID {miner_uid} ({miner_hotkey}). Miner Job ID: {miner_job_id}")
                          else:
-                              logger.warning(f"[Run {run_id}] Miner {miner_hotkey} did not return successful 'fetch_accepted' status or job_id. Response: {response_data}")
+                              logger.warning(f"[Run {run_id}] Miner {miner_hotkey} did not return successful 'fetch_accepted' status or job_id. Response: {miner_response}")
                      except Exception as resp_proc_err:
                           logger.error(f"[Run {run_id}] Error processing response from {miner_hotkey}: {resp_proc_err}", exc_info=True)
 
                 logger.info(f"[Run {run_id}] Completed processing initiate fetch responses. {accepted_count} miners accepted.")
                 await _update_run_status(self, run_id, "awaiting_input_hashes") 
 
-                if self.test_mode:
-                     logger.info("TEST MODE: Exiting validator loop after one successful attempt or error within the attempt.")
-                     break
-
                 wait_minutes = self.config.get('validator_hash_wait_minutes', 10)
+                if self.test_mode:
+                    original_wait = wait_minutes
+                    wait_minutes = 1
+                    logger.info(f"TEST MODE: Using shortened wait time of {wait_minutes} minute(s) instead of {original_wait} minutes")
                 logger.info(f"[Run {run_id}] Waiting for {wait_minutes} minutes for miners to fetch GFS and compute input hash...")
                 await validator.update_task_status('weather', 'waiting', 'miner_fetch_wait')
                 await asyncio.sleep(wait_minutes * 60)
@@ -333,23 +350,40 @@ class WeatherTask(Task):
                     resp_id = response_rec['id']
                     miner_hk = response_rec['miner_hotkey']
                     miner_job_id = response_rec['job_id']
-                    logger.debug(f"[Run {run_id}] Querying miner {miner_hk[:8]} (Job: {miner_job_id}) for input status.")
+                    logger.debug(f"[Run {run_id}] Polling miner {miner_hk[:8]} (Job: {miner_job_id}) for input status using query_miners.")
+                    
+                    node = validator.metagraph.nodes.get(miner_hk)
+                    if not node or not node.ip or not node.port:
+                         logger.warning(f"[Run {run_id}] Miner {miner_hk[:8]} not found in metagraph or missing IP/Port. Cannot poll.")
+                         return resp_id, {"status": "validator_poll_error", "message": "Miner not found in metagraph"}
+
                     try:
                         status_payload_data = WeatherGetInputStatusData(job_id=miner_job_id)
                         status_payload = {"nonce": str(uuid.uuid4()), "data": status_payload_data.model_dump()}
+                        endpoint = "/weather-get-input-status"
                         
-                        status_response = await validator.query_miner(
-                            miner_hotkey=miner_hk,
+                        all_responses = await validator.query_miners(
                             payload=status_payload,
-                            endpoint="/weather-get-input-status"
+                            endpoint=endpoint
                         )
                         
+                        status_response = all_responses.get(miner_hk)
+                        
                         if status_response:
-                            logger.debug(f"[Run {run_id}] Received status from {miner_hk[:8]}: {status_response}")
-                            return resp_id, status_response 
+                            parsed_response = status_response
+                            if isinstance(status_response, dict) and 'text' in status_response:
+                                try:
+                                    parsed_response = json.loads(status_response['text'])
+                                except (json.JSONDecodeError, TypeError) as json_err:
+                                    logger.warning(f"[Run {run_id}] Failed to parse status response text for {miner_hk[:8]}: {json_err}")
+                                    parsed_response = {"status": "parse_error", "message": str(json_err)}
+                            
+                            logger.debug(f"[Run {run_id}] Received status from {miner_hk[:8]}: {parsed_response}")
+                            return resp_id, parsed_response
                         else:
-                            logger.warning(f"[Run {run_id}] No valid response received from {miner_hk[:8]} for status check.")
-                            return resp_id, {"status": "validator_poll_failed", "message": "No response from miner"}
+                             logger.warning(f"[Run {run_id}] No response received from target miner {miner_hk[:8]} via query_miners.")
+                             return resp_id, {"status": "validator_poll_failed", "message": "No response from miner via query_miners"}
+                             
                     except Exception as poll_err:
                         logger.error(f"[Run {run_id}] Error polling miner {miner_hk[:8]}: {poll_err}", exc_info=True)
                         return resp_id, {"status": "validator_poll_error", "message": str(poll_err)}
@@ -425,7 +459,7 @@ class WeatherTask(Task):
                                     input_hash_miner = :m_hash,
                                     input_hash_validator = :v_hash,
                                     input_hash_match = :match,
-                                    error_message = CASE WHEN :err IS NOT NULL THEN COALESCE(error_message || '; ', '') || :err ELSE error_message END,
+                                    error_message = :err,
                                     last_polled_time = :now
                                 WHERE id = :resp_id
                             """
@@ -435,7 +469,7 @@ class WeatherTask(Task):
                                 "m_hash": miner_hash,
                                 "v_hash": validator_input_hash,
                                 "match": hash_match,
-                                "err": error_msg,
+                                "err": error_msg if error_msg is not None else "",
                                 "now": datetime.now(timezone.utc)
                             }))
                     
@@ -449,20 +483,32 @@ class WeatherTask(Task):
                     trigger_tasks = []
 
                     async def _trigger_single_miner(resp_id, miner_hk, miner_job_id):
-                        logger.debug(f"[Run {run_id}] Sending /weather-start-inference to {miner_hk[:8]} (Job: {miner_job_id}).")
+                        logger.debug(f"[Run {run_id}] Attempting to trigger inference for {miner_hk[:8]} (Job: {miner_job_id}) using query_miners.")
                         try:
                             trigger_payload_data = WeatherStartInferenceData(job_id=miner_job_id)
                             trigger_payload = {"nonce": str(uuid.uuid4()), "data": trigger_payload_data.model_dump()}
-                            trigger_response = await validator.query_miner(
-                                miner_hotkey=miner_hk,
+                            endpoint="/weather-start-inference"
+                            
+                            all_responses = await validator.query_miners(
                                 payload=trigger_payload,
-                                endpoint="/weather-start-inference"
+                                endpoint=endpoint
                             )
-                            if trigger_response and trigger_response.get('status') == 'inference_started':
+                            
+                            trigger_response = all_responses.get(miner_hk)
+                            
+                            parsed_response = trigger_response
+                            if isinstance(trigger_response, dict) and 'text' in trigger_response:
+                                try:
+                                    parsed_response = json.loads(trigger_response['text'])
+                                except (json.JSONDecodeError, TypeError) as json_err:
+                                    logger.warning(f"[Run {run_id}] Failed to parse trigger response text for {miner_hk[:8]}: {json_err}")
+                                    parsed_response = {"status": "parse_error", "message": str(json_err)}
+                                    
+                            if parsed_response and parsed_response.get('status') == 'inference_started':
                                 logger.info(f"[Run {run_id}] Successfully triggered inference for {miner_hk[:8]} (Job: {miner_job_id}).")
                                 return resp_id, True
                             else:
-                                logger.warning(f"[Run {run_id}] Failed to trigger inference for {miner_hk[:8]} (Job: {miner_job_id}). Response: {trigger_response}")
+                                logger.warning(f"[Run {run_id}] Failed to trigger inference for {miner_hk[:8]} (Job: {miner_job_id}). Response: {parsed_response}")
                                 return resp_id, False
                         except Exception as trigger_err:
                             logger.error(f"[Run {run_id}] Error triggering inference for {miner_hk[:8]} (Job: {miner_job_id}): {trigger_err}", exc_info=True)
@@ -510,9 +556,9 @@ class WeatherTask(Task):
                       try: await _update_run_status(self, run_id, "error", error_message=f"Unhandled loop error: {loop_err}")
                       except: pass
                  
+                 # In test mode, log the error but continue to try the full pipeline
                  if self.test_mode:
-                     logger.info("TEST MODE: Exiting validator loop due to unhandled exception.")
-                     break 
+                     logger.info("TEST MODE: Encountered an error but continuing to try and complete the full pipeline.")
                  
                  await asyncio.sleep(600) # Sleep only if not in test mode
 
@@ -1060,4 +1106,90 @@ class WeatherTask(Task):
         except Exception as e: logger.error(f"Error stopping final scoring workers: {e}")
         try: await self.stop_cleanup_workers()
         except Exception as e: logger.error(f"Error stopping cleanup workers: {e}")
+            
+    async def miner_fetch_hash_worker(self):
+        """Worker that periodically checks for jobs awaiting input hash verification."""
+        CHECK_INTERVAL_SECONDS = 10 if self.test_mode else 60
+        
+        while getattr(self, 'miner_fetch_hash_worker_running', False):
+            try:
+                logger.info("Miner fetch hash worker checking for runs awaiting hash verification...")
+                
+                query = """
+                SELECT id, gfs_init_time_utc
+                FROM weather_forecast_runs 
+                WHERE status = 'awaiting_input_hashes'
+                ORDER BY run_initiation_time ASC
+                LIMIT 5
+                """
+
+                runs = await self.db_manager.fetch_all(query)
+                if not runs:
+                    logger.debug(f"No runs awaiting hash verification. Sleeping for {CHECK_INTERVAL_SECONDS}s...")
+                    await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+                    continue
+                    
+                for run in runs:
+                    run_id = run['id']
+                    gfs_init_time = run['gfs_init_time_utc']
+                    current_time = datetime.now(timezone.utc)
+                    elapsed_minutes = (current_time - gfs_init_time).total_seconds() / 60
+                    
+                    min_wait_minutes = getattr(self.config, 'verification_wait_minutes', 30)
+                    
+                    if elapsed_minutes < min_wait_minutes and not self.test_mode:
+                        logger.info(f"[HashWorker] [Run {run_id}] Only {elapsed_minutes:.1f} minutes elapsed, "
+                                    f"waiting for minimum {min_wait_minutes} minutes")
+                        continue
+                    elif self.test_mode and elapsed_minutes < 0.1:
+                        logger.info(f"[HashWorker] [Run {run_id}] TEST MODE: Minimal wait of 0.1 minutes")
+                        await asyncio.sleep(6)
+                    
+                    responses_query = """
+                    SELECT id, miner_hotkey, job_id
+                    FROM weather_miner_responses
+                    WHERE run_id = :run_id
+                    AND status = 'fetch_initiated'
+                    """
+                    miners_to_poll = await self.db_manager.fetch_all(responses_query, {"run_id": run_id})
+                    logger.info(f"[HashWorker] [Run {run_id}] Polling {len(miners_to_poll)} miners for input hash status.")
+
+                    for resp_rec in miners_to_poll:
+                        resp_id = resp_rec['id']
+                        miner_hk = resp_rec['miner_hotkey']
+                        miner_job_id = resp_rec['job_id']
+                        logger.debug(f"[HashWorker] [Run {run_id}] Querying miner {miner_hk[:8]} (Job: {miner_job_id}) for input status.")
+                        try:
+                            status_payload_data = WeatherGetInputStatusData(job_id=miner_job_id)
+                            status_payload = {"nonce": str(uuid.uuid4()), "data": status_payload_data.model_dump()}
+                            
+                            responses_dict = await self.query_miners(
+                                payload=status_payload,
+                                endpoint="/weather-get-input-status",
+                                hotkeys=[miner_hk] 
+                            )
+                            
+                            status_response = responses_dict.get(miner_hk)
+
+                            if status_response:
+                                parsed_response = status_response
+                                if isinstance(status_response, dict) and 'text' in status_response:
+                                    try:
+                                        parsed_response = json.loads(status_response['text'])
+                                    except (json.JSONDecodeError, TypeError) as json_err:
+                                        logger.warning(f"[Run {run_id}] Failed to parse status response text for {miner_hk[:8]}: {json_err}")
+                                        parsed_response = {"status": "parse_error", "message": str(json_err)}
+                                
+                                logger.debug(f"[Run {run_id}] Received status from {miner_hk[:8]}: {parsed_response}")
+                                return resp_id, parsed_response
+                            else:
+                                logger.warning(f"[Run {run_id}] No valid response received from {miner_hk[:8]} using query_miners.")
+                                return resp_id, {"status": "validator_poll_failed", "message": "No response from miner via query_miners"}
+                        except Exception as poll_err:
+                            logger.error(f"[Run {run_id}] Error polling miner {miner_hk[:8]}: {poll_err}", exc_info=True)
+                            return resp_id, {"status": "validator_poll_error", "message": str(poll_err)}
+
+            except Exception as e:
+                logger.error(f"Error in miner_fetch_hash_worker: {e}", exc_info=True)
+                await asyncio.sleep(60)
             

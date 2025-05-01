@@ -39,7 +39,11 @@
             "verification_hash_claimed": "VARCHAR(64)",
             "verification_passed": "BOOLEAN",
             "status": "VARCHAR(50) NOT NULL DEFAULT 'received'",
-            "error_message": "TEXT"
+            "error_message": "TEXT",
+            "input_hash_miner": "VARCHAR(64)",
+            "input_hash_validator": "VARCHAR(64)",
+            "input_hash_match": "BOOLEAN",
+            "last_polled_time": "TIMESTAMP WITH TIME ZONE"
         },
         "indexes": [
             {"column": "run_id", "unique": false},
@@ -54,6 +58,12 @@
                 "column": "run_id",
                 "references": "weather_forecast_runs(id)",
                 "on_delete": "CASCADE"
+            }
+        ],
+        "unique_constraints": [
+            {
+                "name": "uq_weather_miner_responses_run_miner",
+                "columns": ["run_id", "miner_uid"]
             }
         ],
         "comment": "Records miner responses for a specific forecast run. Tracks status through fetch, hash verification, and inference."
@@ -180,6 +190,7 @@
             "id": "VARCHAR(100) PRIMARY KEY",
             "validator_request_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
             "validator_hotkey": "VARCHAR(255)",
+            "miner_hotkey": "VARCHAR(255)",
             "gfs_init_time_utc": "TIMESTAMP WITH TIME ZONE NOT NULL",
             "gfs_input_metadata": "JSONB",
             "processing_start_time": "TIMESTAMP WITH TIME ZONE",

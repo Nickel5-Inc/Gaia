@@ -333,21 +333,31 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 logger.error(f"Invalid schema format for table {table_name}")
                 return
 
-            columns = []
+            columns_sql = []
             for col_name, col_type in table_schema['columns'].items():
-                columns.append(f"{col_name} {col_type}")
+                columns_sql.append(f"{col_name} {col_type}")
 
-            # Add foreign key constraints if specified
             if 'foreign_keys' in table_schema:
                 for fk in table_schema['foreign_keys']:
                     fk_def = f"FOREIGN KEY ({fk['column']}) REFERENCES {fk['references']}"
                     if 'on_delete' in fk:
                         fk_def += f" ON DELETE {fk['on_delete']}"
-                    columns.append(fk_def)
+                    columns_sql.append(fk_def)
+
+            unique_constraints_sql = []
+            if 'unique_constraints' in table_schema:
+                for uc in table_schema['unique_constraints']:
+                    uc_name = uc.get("name")
+                    uc_columns = uc.get("columns")
+                    if uc_name and uc_columns:
+                        uc_columns_str = ", ".join(uc_columns)
+                        unique_constraints_sql.append(f"CONSTRAINT {uc_name} UNIQUE ({uc_columns_str})")
+
+            table_definitions = columns_sql + unique_constraints_sql
 
             create_table_sql = f"""
                 CREATE TABLE IF NOT EXISTS {table_schema['table_name']} (
-                    {', '.join(columns)}
+                    {', '.join(table_definitions)}
                 );
             """
             await self.execute(create_table_sql, session=session)
@@ -356,14 +366,19 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 for index in table_schema['indexes']:
                     index_name = f"{table_schema['table_name']}_{index['column']}_idx"
                     unique = "UNIQUE" if index.get('unique', False) else ""
+                    index_cols = index['column']
+                    if isinstance(index_cols, list):
+                         index_cols_str = ", ".join(index_cols)
+                    else:
+                         index_cols_str = index_cols
                     create_index_sql = f"""
                         CREATE INDEX IF NOT EXISTS {index_name}
-                        ON {table_schema['table_name']} ({index['column']})
+                        ON {table_schema['table_name']} ({index_cols_str})
                         {unique};
                     """
                     await self.execute(create_index_sql, session=session)
 
-            logger.info(f"Successfully created table {table_schema['table_name']} with indexes")
+            logger.info(f"Successfully created/verified table {table_schema['table_name']} with constraints and indexes")
 
         except Exception as e:
             logger.error(f"Error creating table {table_name}: {str(e)}")
