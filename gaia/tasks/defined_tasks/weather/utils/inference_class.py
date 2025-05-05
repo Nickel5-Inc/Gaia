@@ -104,7 +104,7 @@ class WeatherInferenceRunner:
             logger.error("Aurora Foundry components are not available. Cannot run Foundry inference.")
             return []
 
-       endpoint_url = os.getenv("FOUNDRY_ENDPOINT_URL")
+        endpoint_url = os.getenv("FOUNDRY_ENDPOINT_URL")
         access_token = os.getenv("FOUNDRY_ACCESS_TOKEN")
         blob_sas_url = os.getenv("BLOB_URL_WITH_RW_SAS")
 
