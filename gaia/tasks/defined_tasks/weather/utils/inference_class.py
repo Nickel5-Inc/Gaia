@@ -3,6 +3,8 @@ from aurora import Aurora, Batch, rollout
 from typing import List
 from fiber.logging_utils import get_logger
 import os
+from azure.ai.foundry import FoundryClient, BlobStorageChannel
+import traceback
 
 logger = get_logger(__name__)
 
@@ -80,3 +82,78 @@ class WeatherInferenceRunner:
         del self.model
         if self.device == torch.device("cuda"):
             torch.cuda.empty_cache()
+
+    async def run_foundry_inference(self, initial_batch: Batch, steps: int) -> List[Batch]:
+        """
+        Runs multi-step inference using the Azure AI Foundry endpoint.
+
+        Args:
+            initial_batch: The initial aurora.Batch object (should be on CPU).
+            steps: The total number of 6-hour steps to simulate (e.g., 40 for 10 days).
+
+        Returns:
+            A list containing aurora.Batch objects for each prediction step, moved to CPU.
+            Returns an empty list if Foundry components are unavailable or an error occurs.
+
+        Raises:
+            RuntimeError: If required environment variables are not set.
+        """
+        logger.info(f"Starting Azure AI Foundry inference for {steps} steps...")
+
+        if not FoundryClient or not BlobStorageChannel or not submit:
+            logger.error("Aurora Foundry components are not available. Cannot run Foundry inference.")
+            return []
+
+       endpoint_url = os.getenv("FOUNDRY_ENDPOINT_URL")
+        access_token = os.getenv("FOUNDRY_ACCESS_TOKEN")
+        blob_sas_url = os.getenv("BLOB_URL_WITH_RW_SAS")
+
+        if not all([endpoint_url, access_token, blob_sas_url]):
+            missing = [var for var, val in [("FOUNDRY_ENDPOINT_URL", endpoint_url),
+                                            ("FOUNDRY_ACCESS_TOKEN", access_token),
+                                            ("BLOB_URL_WITH_RW_SAS", blob_sas_url)] if not val]
+            msg = f"Missing required environment variables for Azure AI Foundry: {', '.join(missing)}"
+            logger.error(msg)
+            raise RuntimeError(msg)
+
+        predictions_list: List[Batch] = []
+        try:
+            logger.debug("Initializing FoundryClient...")
+            foundry_client = FoundryClient(
+                endpoint=endpoint_url,
+                token=access_token,
+            )
+            logger.debug("Initializing BlobStorageChannel...")
+            channel = BlobStorageChannel(blob_sas_url)
+
+            model_name = "aurora-0.25-finetuned"
+            logger.info(f"Submitting inference job to Foundry endpoint for model '{model_name}'...")
+
+            prediction_iterator = submit(
+                batch=initial_batch,
+                model_name=model_name,
+                num_steps=steps,
+                foundry_client=foundry_client,
+                channel=channel,
+            )
+
+            logger.info("Waiting for prediction results from Foundry...")
+            for step_idx, pred_batch in enumerate(prediction_iterator):
+                logger.debug(f"Retrieved prediction step {step_idx + 1}/{steps} from Foundry.")
+                if step_idx % 2 != 0:
+                    logger.info(f"Keeping prediction step {step_idx + 1}/{steps} (T+{(step_idx + 1) * 6}h)")
+                    predictions_list.append(pred_batch)
+                else:
+                    logger.debug(f"Skipping prediction step {step_idx + 1}/{steps}")
+
+            logger.info(f"Successfully retrieved and selected {len(predictions_list)} prediction steps from Azure AI Foundry.")
+
+        except ImportError as e:
+            logger.error(f"ImportError during Foundry inference: {e}. Is aurora.foundry installed?")
+            return []
+        except Exception as e:
+            logger.error(f"Error during Azure AI Foundry inference: {e}", exc_info=True)
+            logger.error(traceback.format_exc())
+            return []
+
+        return predictions_list
