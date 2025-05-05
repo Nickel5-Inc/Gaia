@@ -3,7 +3,7 @@ from aurora import Aurora, Batch, rollout
 from typing import List
 from fiber.logging_utils import get_logger
 import os
-from azure.ai.foundry import FoundryClient, BlobStorageChannel
+from aurora.foundry import FoundryClient, BlobStorageChannel, submit
 import traceback
 
 logger = get_logger(__name__)
