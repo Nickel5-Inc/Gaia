@@ -276,10 +276,7 @@ async def ensemble_worker(self):
                     self.ensemble_task_queue.task_done()
             await asyncio.sleep(1)
 
-async def run_inference_background(
-    task_instance: 'WeatherTask',
-    job_id: str,
-):
+async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
     """
     Runs the weather forecast inference as a background task.
     Fetches data based on job_id (expects cache hit from fetch_and_hash task)
@@ -322,6 +319,7 @@ async def run_inference_background(
         
         gfs_init_time_utc = job_details['gfs_init_time_utc']
         gfs_t_minus_6_time_utc = job_details['gfs_t_minus_6_time_utc']
+        
         if not gfs_init_time_utc or not gfs_t_minus_6_time_utc:
             logger.error(f"[InferenceTask Job {job_id}] Missing GFS timestamps in DB record. Aborting.")
             await update_job_status(task_instance, job_id, "error", "Missing GFS timestamps for inference")
@@ -364,13 +362,49 @@ async def run_inference_background(
         async with task_instance.gpu_semaphore:
             logger.info(f"[InferenceTask Job {job_id}] Acquired GPU semaphore, running inference...")
             try:
-                selected_predictions_cpu = await asyncio.to_thread(
-                    task_instance.inference_runner.run_multistep_inference,
-                    prepared_batch,
-                    steps=task_instance.config.get('inference_steps', 40)
-                )
-                logger.info(f"[InferenceTask Job {job_id}] Inference completed with {len(selected_predictions_cpu)} time steps")
+                 inference_type = task_instance.config.get("weather_inference_type", "local").lower()
 
+                 if inference_type == "azure_foundry":
+                     logger.info(f"[InferenceTask Job {job_id}] Using Azure AI Foundry for inference (type: {inference_type})...")
+                     if task_instance.inference_runner is None:
+                         logger.error(f"[InferenceTask Job {job_id}] Inference runner is None, cannot run Foundry inference. Aborting.")
+                         await update_job_status(task_instance, job_id, "error", "Foundry inference runner not configured")
+                         return
+                     
+                     predictions_list = await task_instance.inference_runner.run_foundry_inference(
+                         initial_batch=prepared_batch, 
+                         steps=task_instance.config.get('inference_steps', 40)
+                     )
+                     logger.info(f"[InferenceTask Job {job_id}] Foundry inference completed. Received {len(predictions_list)} steps.")
+                     selected_predictions_cpu = predictions_list 
+                 
+                 elif inference_type == "local":
+                     logger.info(f"[InferenceTask Job {job_id}] Using local runner for inference (type: {inference_type})...")
+                     if task_instance.inference_runner is None or task_instance.inference_runner.model is None:
+                         logger.error(f"[InferenceTask Job {job_id}] Local model/runner not loaded. Aborting.")
+                         await update_job_status(task_instance, job_id, "error", "Local model not loaded")
+                         return
+
+                     selected_predictions_cpu = await asyncio.to_thread(
+                         task_instance.inference_runner.run_multistep_inference,
+                         prepared_batch,
+                         steps=task_instance.config.get('inference_steps', 40)
+                     )
+                     logger.info(f"[InferenceTask Job {job_id}] Local inference completed. Received {len(selected_predictions_cpu)} steps.")
+                 else:
+                     logger.error(f"[InferenceTask Job {job_id}] Unknown inference type configured: '{inference_type}'. Aborting.")
+                     await update_job_status(task_instance, job_id, "error", f"Unknown inference type: {inference_type}")
+                     return
+
+                 if selected_predictions_cpu is None:
+                     logger.error(f"[InferenceTask Job {job_id}] Inference call returned None. This indicates an error in the inference process.")
+                     await update_job_status(task_instance, job_id, "error", error_message="Inference process returned None.")
+                     return
+                 if not selected_predictions_cpu:
+                     logger.error(f"[InferenceTask Job {job_id}] Inference did not return any prediction steps.")
+                     await update_job_status(task_instance, job_id, "error", error_message="Inference returned no prediction steps.")
+                     return
+                     
             except Exception as infer_err:
                 logger.error(f"[InferenceTask Job {job_id}] Inference failed: {infer_err}", exc_info=True)
                 await update_job_status(task_instance, job_id, "error", error_message=f"Inference error: {infer_err}")
@@ -389,15 +423,43 @@ async def run_inference_background(
                 base_time = pd.to_datetime(gfs_init_time_utc)
 
                 for i, batch_step in enumerate(selected_predictions_cpu):
-                    lead_time_hours = (i + 1) * task_instance.config.get('forecast_step_hours', 6) # Example: check actual model step logic
+                    lead_time_hours = (i * 12) + 12
                     forecast_time = base_time + timedelta(hours=lead_time_hours)
 
                     if not isinstance(batch_step, Batch):
-                         logger.warning(f"[InferenceTask Job {job_id}] Step {i} prediction is not an aurora.Batch, attempting conversion if possible.")
-                         raise TypeError(f"Prediction step {i} has unexpected type: {type(batch_step)}")
+                         logger.warning(f"[InferenceTask Job {job_id}] Step {i} prediction is not an aurora.Batch, skipping.")
+                         continue
 
-                    ds_step = batch_step.to_xarray_dataset()
-                    ds_step = ds_step.assign_coords(time=[forecast_time])
+                    logger.debug(f"Converting prediction Batch step {i+1} (T+{lead_time_hours}h) to xarray Dataset...")
+                    data_vars = {}
+                    for var_name, tensor_data in batch_step.surf_vars.items():
+                        try:
+                            np_data = tensor_data.squeeze().cpu().numpy()
+                            data_vars[var_name] = xr.DataArray(np_data, dims=["lat", "lon"], name=var_name)
+                        except Exception as e_surf:
+                             logger.error(f"Error processing surface var {var_name} for step {i+1}: {e_surf}")
+                    
+                    for var_name, tensor_data in batch_step.atmos_vars.items():
+                         try:
+                             np_data = tensor_data.squeeze().cpu().numpy()
+                             data_vars[var_name] = xr.DataArray(np_data, dims=["pressure_level", "lat", "lon"], name=var_name)
+                         except Exception as e_atmos:
+                              logger.error(f"Error processing atmos var {var_name} for step {i+1}: {e_atmos}")
+
+                    lat_coords = batch_step.metadata.lat.cpu().numpy()
+                    lon_coords = batch_step.metadata.lon.cpu().numpy()
+                    level_coords = np.array(batch_step.metadata.atmos_levels) 
+                    
+                    ds_step = xr.Dataset(
+                        data_vars,
+                        coords={
+                            "time": ([forecast_time]),
+                            "pressure_level": (("pressure_level"), level_coords),
+                            "lat": (("lat"), lat_coords),
+                            "lon": (("lon"), lon_coords),
+                        }
+                    )
+
                     ds_step = ds_step.expand_dims('time')
                     forecast_datasets.append(ds_step)
                     lead_times_hours.append(lead_time_hours)

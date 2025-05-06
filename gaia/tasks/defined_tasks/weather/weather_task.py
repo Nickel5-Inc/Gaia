@@ -152,12 +152,35 @@ class WeatherTask(Task):
         self.inference_runner = None 
         if self.node_type == "miner":
             try:
+                # Inference type from .env
+                inference_type = os.getenv("WEATHER_INFERENCE_TYPE", "local").lower()
+                load_local_model_flag = True
+
+                if inference_type == "azure_foundry":
+                    logger.info("Configured to use Azure Foundry for inference. Local model will not be loaded.")
+                    load_local_model_flag = False
+                elif inference_type == "local":
+                    logger.info("Configured to use local model for inference.")
+                else:
+                    logger.warning(f"Invalid WEATHER_INFERENCE_TYPE: '{inference_type}'. Defaulting to 'local'.")
+                    inference_type = "local"
+                
+                self.config['weather_inference_type'] = inference_type 
+
                 device = "cuda" if torch.cuda.is_available() else "cpu"
-                self.inference_runner = WeatherInferenceRunner(device=device) 
-                logger.info(f"Initialized Miner components (Inference Runner on {device}).")
+                self.inference_runner = WeatherInferenceRunner(device=device, load_local_model=load_local_model_flag)
+                 
+                if load_local_model_flag and self.inference_runner.model is not None:
+                    logger.info(f"Initialized Miner components (Local Inference Runner on {device}, model loaded).")
+                elif load_local_model_flag and self.inference_runner.model is None:
+                    logger.error(f"Initialized Miner components (Local Inference Runner on {device}, BUT MODEL FAILED TO LOAD).")
+                else:
+                    logger.info(f"Initialized Miner components (Prepared for {inference_type} inference).")
+
             except Exception as e:
-                logger.error(f"Failed to initialize WeatherInferenceRunner: {e}", exc_info=True)
+                logger.error(f"Failed to initialize WeatherInferenceRunner or set inference type: {e}", exc_info=True)
                 self.inference_runner = None 
+                self.config['weather_inference_type'] = "local" # Fallback
         else: # Validator
              logger.info("Initialized validator components for WeatherTask")
 

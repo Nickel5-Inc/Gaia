@@ -9,30 +9,35 @@ import traceback
 logger = get_logger(__name__)
 
 class WeatherInferenceRunner:
-    def __init__(self, model_repo="microsoft/aurora", checkpoint="aurora-0.25-pretrained.ckpt", device="cuda", use_lora=False):
+    def __init__(self, model_repo="microsoft/aurora", checkpoint="aurora-0.25-pretrained.ckpt", device="cuda", use_lora=False, load_local_model=True):
         """
-        Initializes the inference runner by loading the Aurora model.
+        Initializes the inference runner.
 
         Args:
             model_repo: HuggingFace repository name.
             checkpoint: Checkpoint file name within the repository.
             device: Device to run inference on ('cuda' or 'cpu').
             use_lora: Whether the model uses LoRA (False for pretrained).
+            load_local_model: If True, loads the model into memory. If False, prepares for other modes (e.g., Foundry).
         """
-        logger.info(f"Initializing WeatherInferenceRunner with device: {device}")
+        logger.info(f"Initializing WeatherInferenceRunner with device: {device}, load_local_model: {load_local_model}")
         self.device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
         logger.info(f"Using device: {self.device}")
+        self.model = None
 
-        try:
-            self.model = Aurora(use_lora=use_lora)
-            logger.info(f"Loading checkpoint {checkpoint} from {model_repo}...")
-            self.model.load_checkpoint(model_repo, checkpoint)
-            self.model.eval()
-            self.model = self.model.to(self.device)
-            logger.info("Model loaded successfully and moved to device.")
-        except Exception as e:
-            logger.error(f"Failed to load Aurora model: {e}", exc_info=True)
-            raise RuntimeError(f"Could not initialize Aurora model: {e}") from e
+        if load_local_model:
+            try:
+                self.model = Aurora(use_lora=use_lora)
+                logger.info(f"Loading checkpoint {checkpoint} from {model_repo}...")
+                self.model.load_checkpoint(model_repo, checkpoint)
+                self.model.eval()
+                self.model = self.model.to(self.device)
+                logger.info("Local model loaded successfully and moved to device.")
+            except Exception as e:
+                logger.error(f"Failed to load Aurora model locally: {e}", exc_info=True)
+                self.model = None 
+        else:
+            logger.info("Local model loading skipped by configuration (e.g., for Azure Foundry mode).")
 
     def run_multistep_inference(self, initial_batch: Batch, steps: int) -> List[Batch]:
         """
