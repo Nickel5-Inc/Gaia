@@ -769,16 +769,6 @@ class WeatherTask(Task):
             logger.info(f"[Job {job_id}] Initial job record created.")
 
             logger.info(f"[Job {job_id}] Launching background inference task...")
-            asyncio.create_task(
-                run_inference_background(
-                    task_instance=self,
-                    initial_batch=initial_batch,
-                    job_id=job_id,
-                    gfs_init_time=gfs_init_time,
-                    miner_hotkey=miner.keypair.ss58_address
-                )
-            )
-            logger.info(f"[Job {job_id}] Background task launched.")
 
             return {"status": "accepted", "job_id": job_id, "message": "Weather forecast job accepted for processing."}
 
