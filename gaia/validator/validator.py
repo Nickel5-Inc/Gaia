@@ -1,3 +1,16 @@
+import logging
+import sys
+
+# # Basic, safe logging config BEFORE fiber.logging_utils is imported/used
+# logging.basicConfig(
+#     level=logging.INFO, # Let's use INFO to see Alembic's own INFO messages
+#     stream=sys.stdout,
+#     format='%(asctime)s | %(levelname)-5.5s | [%(name)s] %(message)s',
+#     datefmt='%Y-%m-%d %H:%M:%S.%f'
+# )
+# # Optionally, quiet down very verbose loggers if they become an issue later
+# # logging.getLogger('some_very_chatty_library').setLevel(logging.WARNING)
+
 from datetime import datetime, timezone, timedelta
 import os
 import time
@@ -61,6 +74,11 @@ from gaia.validator.utils.db_wipe import handle_db_wipe
 from gaia.validator.utils.earthdata_tokens import ensure_valid_earthdata_token
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 
+# Imports for Alembic check
+from alembic.config import Config
+from alembic import command
+from alembic.util import CommandError # Import CommandError
+
 logger = get_logger(__name__)
 
 
@@ -120,7 +138,6 @@ class GaiaValidator:
 
         # Now create MinerScoreSender with the initialized api_client
         self.miner_score_sender = MinerScoreSender(database_manager=self.database_manager,
-                                                   loop=asyncio.get_event_loop(),
                                                    api_client=self.api_client)
 
         self.last_successful_weight_set = time.time()
@@ -857,6 +874,9 @@ class GaiaValidator:
 
     async def main(self):
         """Main execution loop for the validator."""
+
+        # --- Alembic check removed from here --- 
+
         try:
             logger.info("Setting up neuron...")
             if not self.setup_neuron():
@@ -872,9 +892,9 @@ class GaiaValidator:
 
             logger.info("Metagraph initialized.")
 
-            logger.info("Initializing database tables...")
+            logger.info("Initializing database connection...") 
             await self.database_manager.initialize_database()
-            logger.info("Database tables initialized.")
+            logger.info("Database connection initialized.")
             
             #logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
             await handle_db_wipe(self.database_manager)
@@ -1624,5 +1644,46 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # --- Run Alembic check synchronously BEFORE starting the application --- 
+    try:
+        # Use basic logging setup here, as app logger might not be configured yet
+        # Or configure application logging before this check if preferred.
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+        alembic_logger = logging.getLogger('alembic')
+        alembic_logger.setLevel(logging.INFO)
+        
+        print("[Startup] Checking database schema version using Alembic...") # Use print as logger might not be fully setup
+        alembic_cfg = Config("alembic.ini") 
+        command.upgrade(alembic_cfg, "head")
+        print("[Startup] Database schema is up-to-date.")
+    except CommandError as e:
+         # Use print here as well
+         print(f"[Startup] ERROR: Alembic command failed during startup check: {e}")
+         print("[Startup] ERROR: Please ensure the database is accessible and migrations are correct.")
+         sys.exit("Database migration/check failed.") # Exit directly
+    except Exception as e:
+        print(f"[Startup] ERROR: Failed to check/upgrade database schema during startup: {e}")
+        traceback.print_exc() # Print full traceback for unexpected errors
+        sys.exit("Database schema check failed.")
+    # --- End Alembic check --- 
+
+    # Now proceed with application setup and launch
     validator = GaiaValidator(args)
-    asyncio.run(validator.main())
+    try:
+        asyncio.run(validator.main())
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received, shutting down...")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in main loop: {e}", exc_info=True)
+    finally:
+        # Ensure cleanup runs even if main loop crashes
+        if hasattr(validator, '_cleanup_done') and not validator._cleanup_done:
+             try:
+                 # Ensure a loop exists for final cleanup if needed
+                 loop = asyncio.get_event_loop()
+                 if loop.is_closed():
+                     loop = asyncio.new_event_loop()
+                     asyncio.set_event_loop(loop)
+                 loop.run_until_complete(validator._initiate_shutdown())
+             except Exception as cleanup_e:
+                 logger.error(f"Error during final cleanup: {cleanup_e}")

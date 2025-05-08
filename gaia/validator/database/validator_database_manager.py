@@ -130,10 +130,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 password=password,
             )
             
-            # Store database name
+            # Store database name (might still be useful for logging/config)
             self.database = database
             
-            # Set database URL
+            # Set database URL (crucial)
             self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
             
             # Custom timeouts for validator operations
@@ -141,89 +141,6 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             self.VALIDATOR_TRANSACTION_TIMEOUT = 300  # 5 minutes
             
             self._initialized = True
-
-    async def _initialize_validator_database(self) -> None:
-        """Initialize validator-specific database schema and columns."""
-        try:
-            schema_path = Path(__file__).parent.parent.parent / "tasks" / "defined_tasks" / "soilmoisture" / "schema.json"
-            with open(schema_path) as f:
-                schema = json.load(f)
-
-            for table_name, table_schema in schema.items():
-                if table_schema.get("database_type") != "validator":
-                    continue
-
-                exists_query = """
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_schema = 'public' 
-                        AND table_name = :table_name
-                    )
-                """
-                result = await self.fetch_one(exists_query, {"table_name": table_name})
-                table_exists = result["exists"] if result else False
-
-                if not table_exists:
-                    columns = []
-                    for col_name, col_type in table_schema["columns"].items():
-                        columns.append(f"{col_name} {col_type}")
-
-                    if "foreign_keys" in table_schema:
-                        for fk in table_schema["foreign_keys"]:
-                            fk_def = f"FOREIGN KEY ({fk['column']}) REFERENCES {fk['references']}"
-                            if "on_delete" in fk:
-                                fk_def += f" ON DELETE {fk['on_delete']}"
-                            columns.append(fk_def)
-
-                    create_table_sql = f"""
-                        CREATE TABLE IF NOT EXISTS {table_schema['table_name']} (
-                            {', '.join(columns)}
-                        );
-                    """
-                    await self.execute(create_table_sql)
-                    logger.info(f"Created table {table_name}")
-
-                    if "indexes" in table_schema:
-                        for index in table_schema["indexes"]:
-                            index_name = f"{table_name}_{index['column']}_idx"
-                            unique = "UNIQUE" if index.get("unique", False) else ""
-                            create_index_sql = f"""
-                                CREATE INDEX IF NOT EXISTS {index_name}
-                                ON {table_name} ({index['column']})
-                                {unique};
-                            """
-                            await self.execute(create_index_sql)
-                        logger.info(f"Created indexes for {table_name}")
-                else:
-                    for col_name, col_type in table_schema["columns"].items():
-                        check_column_sql = """
-                            SELECT EXISTS (
-                                SELECT 1 
-                                FROM information_schema.columns 
-                                WHERE table_name = :table_name 
-                                AND column_name = :column_name
-                            )
-                        """
-                        result = await self.fetch_one(
-                            check_column_sql, 
-                            {"table_name": table_name, "column_name": col_name}
-                        )
-                        column_exists = result["exists"] if result else False
-
-                        if not column_exists:
-                            add_column_sql = f"""
-                                ALTER TABLE {table_name} 
-                                ADD COLUMN {col_name} {col_type};
-                            """
-                            await self.execute(add_column_sql)
-                            logger.info(f"Added column {col_name} to {table_name}")
-
-            logger.info("Validator database initialization completed")
-            
-        except Exception as e:
-            logger.error(f"Error initializing validator database: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise DatabaseError(f"Failed to initialize validator database: {str(e)}")
 
     async def get_operation_stats(self) -> Dict[str, Any]:
         """Get current operation statistics."""
@@ -237,302 +154,81 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         return stats
 
     async def _initialize_engine(self) -> None:
-        """Initialize database engine and session factory with validator-specific settings."""
+        """Initialize database engine and session factory. Assumes DB exists."""
         try:
             if not self.db_url:
+                logger.error("Database URL not set during engine initialization.")
                 raise DatabaseError("Database URL not initialized")
-            
-            # First create a connection to default postgres database to check/create our database
-            default_url = self.db_url.rsplit('/', 1)[0] + '/postgres'
-            temp_engine = create_async_engine(default_url)
-            
+
+            # Log initialization attempt
+            masked_url = str(self.db_url)
             try:
-                # Check if our database exists
-                async with temp_engine.connect() as conn:
-                    result = await conn.execute(text(f"SELECT 1 FROM pg_database WHERE datname = '{self.database}'"))
-                    exists = result.scalar() is not None
-                    
-                    if not exists:
-                        logger.info(f"Database {self.database} does not exist, creating...")
-                        # Need to be outside transaction for CREATE DATABASE
-                        await conn.execute(text("COMMIT"))
-                        await conn.execute(text(f"CREATE DATABASE {self.database}"))
-                        logger.info(f"Created database {self.database}")
-            finally:
-                await temp_engine.dispose()
-            
-            # Now create our main engine
+                # Attempt to mask credentials if present in the URL
+                split_at = masked_url.find('@')
+                if split_at != -1:
+                    split_protocol = masked_url.find('://')
+                    if split_protocol != -1:
+                       masked_url = masked_url[:split_protocol+3] + '***:***@' + masked_url[split_at+1:]
+            except Exception:
+                 pass # Keep original URL if masking fails
+            logger.info(f"Attempting to initialize main database engine for: {masked_url}")
+
+            # Create our main engine pointing directly to the application DB
             self._engine = create_async_engine(
                 self.db_url,
-                pool_size=self.MAX_CONNECTIONS,
+                pool_size=self.MAX_CONNECTIONS, # Use class attribute 
                 max_overflow=10,
-                pool_timeout=self.DEFAULT_CONNECTION_TIMEOUT,
-                pool_recycle=300,  # Recycle connections every 5 minutes
-                pool_pre_ping=True,  # Enable connection health checks
-                echo=False,  # Set to True for SQL query logging
+                pool_timeout=self.DEFAULT_CONNECTION_TIMEOUT, # Use base class attribute
+                pool_recycle=300,
+                pool_pre_ping=True,
+                echo=False,
                 connect_args={
-                    "command_timeout": self.VALIDATOR_QUERY_TIMEOUT,
-                    "timeout": self.DEFAULT_CONNECTION_TIMEOUT,
+                    "command_timeout": self.VALIDATOR_QUERY_TIMEOUT, # Use validator timeout
+                    "timeout": self.DEFAULT_CONNECTION_TIMEOUT, # Use base class connection timeout
                 }
             )
             
+            # Initialize session factory
             self._session_factory = async_sessionmaker(
                 self._engine,
                 expire_on_commit=False,
                 class_=AsyncSession,
-                autobegin=False  # Prevent automatic transaction creation
+                autobegin=False
             )
             
-            # Test the connection
+            # Test the connection to the application database
             async with self._engine.connect() as conn:
                 await conn.execute(text("SELECT 1"))
             
-            logger.info(f"Successfully initialized database engine for {self.node_type}")
+            logger.info(f"Successfully initialized database engine for {self.node_type} node.")
         except Exception as e:
-            logger.error(f"Failed to initialize database engine: {str(e)}")
-            raise DatabaseError(f"Failed to initialize database engine: {str(e)}")
+            logger.error(f"Failed to initialize main database engine: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Ensure engine and factory are None if init fails
+            self._engine = None
+            self._session_factory = None
+            raise DatabaseError(f"Failed to initialize database engine: {str(e)}") from e
 
-    @track_operation('ddl')
-    @BaseDatabaseManager.with_transaction()
-    async def initialize_database(self, session: AsyncSession):
-        """Initialize database tables and schemas for validator tasks."""
+    async def initialize_database(self):
+        """Placeholder for any non-schema initialization needed at startup."""
+        # This method previously called the DDL creation methods.
+        # Now, it assumes the schema exists (created by Alembic).
+        # If there are other non-schema setup tasks (e.g., populating
+        # volatile cache from DB, specific startup checks), they could go here.
+        # For now, it might do nothing or just ensure the engine is ready.
         try:
-            # Initialize engine first
-            await self._initialize_engine()
-            
-            # Create core tables
-            await self._create_node_table(session)
-            await self._create_trigger_function(session)
-            await self._create_trigger(session)
-            await self._initialize_rows(session)
-            await self.create_score_table(session)
-            
-            # Create baseline predictions table
-            await self.create_baseline_predictions_table(session)
-            
-            logger.info("Successfully created core tables")
-            
-            # Initialize validator-specific tables from task schemas
-            await self._initialize_validator_database()
-            
-            # Initialize task tables
-            task_schemas = await self.load_task_schemas()
-            await self.initialize_task_tables(task_schemas, session)
-            logger.info("Successfully initialized task tables")
-            
+            logger.info("Ensuring database engine is initialized (schema assumed to exist)...")
+            # Ensure engine is created and connection is tested
+            await self.ensure_engine_initialized() 
+            logger.info("Database engine initialization check complete.")
+            # Removed calls to: 
+            # _create_node_table, _create_trigger_function, _create_trigger, 
+            # _initialize_rows, create_score_table, create_baseline_predictions_table, 
+            # _initialize_validator_database, load_task_schemas, initialize_task_tables
         except Exception as e:
-            logger.error(f"Error initializing database: {str(e)}")
-            raise DatabaseError(f"Failed to initialize database: {str(e)}")
-
-    @track_operation('ddl')
-    async def _create_task_table(self, schema: Dict[str, Any], table_name: str, session: AsyncSession) -> None:
-        """Create a table for a specific task using the provided schema."""
-        try:
-            table_schema = schema.get(table_name, schema)
-            if not isinstance(table_schema, dict) or 'columns' not in table_schema:
-                logger.error(f"Invalid schema format for table {table_name}")
-                return
-
-            columns_sql = []
-            for col_name, col_type in table_schema['columns'].items():
-                columns_sql.append(f"{col_name} {col_type}")
-
-            if 'foreign_keys' in table_schema:
-                for fk in table_schema['foreign_keys']:
-                    fk_def = f"FOREIGN KEY ({fk['column']}) REFERENCES {fk['references']}"
-                    if 'on_delete' in fk:
-                        fk_def += f" ON DELETE {fk['on_delete']}"
-                    columns_sql.append(fk_def)
-
-            unique_constraints_sql = []
-            if 'unique_constraints' in table_schema:
-                for uc in table_schema['unique_constraints']:
-                    uc_name = uc.get("name")
-                    uc_columns = uc.get("columns")
-                    if uc_name and uc_columns:
-                        uc_columns_str = ", ".join(uc_columns)
-                        unique_constraints_sql.append(f"CONSTRAINT {uc_name} UNIQUE ({uc_columns_str})")
-
-            table_definitions = columns_sql + unique_constraints_sql
-
-            create_table_sql = f"""
-                CREATE TABLE IF NOT EXISTS {table_schema['table_name']} (
-                    {', '.join(table_definitions)}
-                );
-            """
-            await self.execute(create_table_sql, session=session)
-
-            if 'indexes' in table_schema:
-                for index in table_schema['indexes']:
-                    index_name = f"{table_schema['table_name']}_{index['column']}_idx"
-                    unique = "UNIQUE" if index.get('unique', False) else ""
-                    index_cols = index['column']
-                    if isinstance(index_cols, list):
-                         index_cols_str = ", ".join(index_cols)
-                    else:
-                         index_cols_str = index_cols
-                    create_index_sql = f"""
-                        CREATE INDEX IF NOT EXISTS {index_name}
-                        ON {table_schema['table_name']} ({index_cols_str})
-                        {unique};
-                    """
-                    await self.execute(create_index_sql, session=session)
-
-            logger.info(f"Successfully created/verified table {table_schema['table_name']} with constraints and indexes")
-
-        except Exception as e:
-            logger.error(f"Error creating table {table_name}: {str(e)}")
-            raise DatabaseError(f"Failed to create table {table_name}: {str(e)}")
-
-    @track_operation('ddl')
-    async def initialize_task_tables(self, task_schemas: Dict[str, Dict[str, Any]], session: AsyncSession):
-        """Initialize validator-specific task tables."""
-        for schema_name, schema in task_schemas.items():
-            try:
-                if isinstance(schema, dict) and 'table_name' not in schema:
-                    for table_name, table_schema in schema.items():
-                        if isinstance(table_schema, dict) and table_schema.get("database_type") in ["validator", "both"]:
-                            await self._create_task_table(schema, table_name, session)
-                else:
-                    if schema.get("database_type") in ["validator", "both"]:
-                        await self._create_task_table({schema_name: schema}, schema_name, session)
-            except Exception as e:
-                logger.error(f"Error initializing table for schema {schema_name}: {e}")
-                raise DatabaseError(f"Failed to initialize table for schema {schema_name}: {str(e)}")
-
-    @track_operation('ddl')
-    async def create_index(self, table_name: str, column_name: str, unique: bool = False):
-        """Create an index on a specific column in a table."""
-        try:
-            index_name = f"idx_{table_name}_{column_name}"
-            unique_str = "UNIQUE" if unique else ""
-            query = f"""
-                CREATE {unique_str} INDEX IF NOT EXISTS {index_name}
-                ON {table_name} ({column_name});
-            """
-            await self.execute(query)
-        except Exception as e:
-            logger.error(f"Error creating index on {table_name}.{column_name}: {str(e)}")
-            raise DatabaseError(f"Failed to create index: {str(e)}")
-
-    @track_operation('ddl')
-    async def create_score_table(self, session: AsyncSession):
-        """Create the score table for task scoring."""
-        try:
-            # Check if table exists
-            result = await self.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = 'score_table'
-                );
-            """, session=session)
-            table_exists = result.scalar()
-            logger.info(f"Score table exists: {table_exists}")
-
-            if not table_exists:
-                logger.info("Creating score table...")
-                await self.execute("""
-                    CREATE TABLE score_table (
-                        task_name VARCHAR,
-                        task_id TEXT,
-                        score FLOAT[],
-                        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                        status VARCHAR DEFAULT 'pending'
-                    )
-                """, session=session)
-                logger.info("Score table created successfully")
-
-                # Create index on created_at
-                logger.info("Creating score table timestamp index...")
-                await self.execute("""
-                    CREATE INDEX score_created_at_idx ON score_table(created_at)
-                """, session=session)
-                logger.info("Score table index created successfully")
-
-        except Exception as e:
-            logger.error(f"Error creating score table: {str(e)}")
-            raise DatabaseError(f"Failed to create score table: {str(e)}")
-
-    @track_operation('ddl')
-    async def _create_node_table(self, session: AsyncSession):
-        """Create the base node table."""
-        try:
-            await self.execute("""
-                CREATE TABLE IF NOT EXISTS node_table (
-                    uid INTEGER PRIMARY KEY,
-                    hotkey TEXT,
-                    coldkey TEXT,
-                    ip TEXT,
-                    ip_type TEXT,
-                    port INTEGER,
-                    incentive FLOAT,
-                    stake FLOAT,
-                    trust FLOAT,
-                    vtrust FLOAT,
-                    protocol TEXT,
-                    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    CHECK (uid >= 0 AND uid < 256)
-                )
-            """, session=session)
-        except Exception as e:
-            logger.error(f"Error creating node table: {str(e)}")
-            raise DatabaseError(f"Failed to create node table: {str(e)}")
-
-    @track_operation('ddl')
-    async def _create_trigger_function(self, session: AsyncSession):
-        """Create the trigger function for size checking."""
-        try:
-            await self.execute("""
-                CREATE OR REPLACE FUNCTION check_node_table_size()
-                RETURNS TRIGGER AS $$
-                BEGIN
-                    IF (SELECT COUNT(*) FROM node_table) > 256 THEN
-                        RAISE EXCEPTION 'Cannot exceed 256 rows in node_table';
-                    END IF;
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql
-            """, session=session)
-        except Exception as e:
-            logger.error(f"Error creating trigger function: {str(e)}")
-            raise DatabaseError(f"Failed to create trigger function: {str(e)}")
-
-    @track_operation('ddl')
-    async def _create_trigger(self, session: AsyncSession):
-        """Create trigger to enforce node table size limit."""
-        try:
-            result = await self.execute("""
-                SELECT EXISTS (
-                    SELECT 1 
-                    FROM pg_trigger 
-                    WHERE tgname = 'enforce_node_table_size'
-                )
-            """, session=session)
-            trigger_exists = result.scalar()
-            
-            if not trigger_exists:
-                await self.execute("""
-                    CREATE TRIGGER enforce_node_table_size
-                    BEFORE INSERT ON node_table
-                    FOR EACH ROW
-                    EXECUTE FUNCTION check_node_table_size()
-                """, session=session)
-        except Exception as e:
-            logger.error(f"Error creating trigger: {str(e)}")
-            raise DatabaseError(f"Failed to create trigger: {str(e)}")
-
-    @track_operation('write')
-    async def _initialize_rows(self, session: AsyncSession):
-        """Initialize the node table with 256 empty rows."""
-        try:
-            await self.execute("""
-                INSERT INTO node_table (uid)
-                SELECT generate_series(0, 255) as uid
-                WHERE NOT EXISTS (SELECT 1 FROM node_table LIMIT 1);
-            """, session=session)
-        except Exception as e:
-            logger.error(f"Error initializing rows: {str(e)}")
-            raise DatabaseError(f"Failed to initialize rows: {str(e)}")
+            logger.error(f"Error during simplified database initialization check: {str(e)}")
+            # Decide if this should re-raise or just log
+            raise DatabaseError(f"Failed during simplified initialization: {str(e)}") from e
 
     @track_operation('read')
     async def get_recent_scores(self, task_type: str) -> List[float]:
@@ -592,68 +288,6 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             logger.error(f"Error closing database connections: {e}")
             logger.error(traceback.format_exc())
             raise DatabaseError(f"Failed to close database connections: {str(e)}")
-
-    async def load_task_schemas(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Load database schemas for all tasks from their respective schema.json files.
-        Searches through the defined_tasks directory for schema definitions.
-        """
-        try:
-            # Get the absolute path to the defined_tasks directory
-            base_dir = Path(__file__).parent.parent.parent
-            tasks_dir = base_dir / "tasks" / "defined_tasks"
-
-            if not tasks_dir.exists():
-                raise FileNotFoundError(f"Tasks directory not found at {tasks_dir}")
-
-            schemas = {}
-
-            # Loop through all subdirectories in the tasks directory
-            for task_dir in tasks_dir.iterdir():
-                if task_dir.is_dir():
-                    schema_file = task_dir / "schema.json"
-
-                    # Skip if no schema file exists
-                    if not schema_file.exists():
-                        continue
-
-                    try:
-                        # Load and validate the schema
-                        with open(schema_file, "r") as f:
-                            schema = json.load(f)
-
-                        if isinstance(schema, dict):
-                            if "table_name" in schema:
-                                if not all(key in schema for key in ["table_name", "columns"]):
-                                    raise ValueError(
-                                        f"Invalid schema in {schema_file}. "
-                                        "Must contain 'table_name' and 'columns'"
-                                    )
-                            else:
-                                for table_name, table_schema in schema.items():
-                                    if not all(
-                                        key in table_schema for key in ["table_name", "columns"]
-                                    ):
-                                        raise ValueError(
-                                            f"Invalid table schema for {table_name} in {schema_file}. "
-                                            "Must contain 'table_name' and 'columns'"
-                                        )
-
-                            schemas[task_dir.name] = schema
-                        else:
-                            raise ValueError(f"Invalid schema format in {schema_file}")
-
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Error parsing schema.json in {task_dir.name}: {e}")
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error processing schema for {task_dir.name}: {e}")
-                        continue
-
-            return schemas
-        except Exception as e:
-            logger.error(f"Error loading task schemas: {str(e)}")
-            raise DatabaseError(f"Failed to load task schemas: {str(e)}")
 
     @track_operation('write')
     async def update_miner_info(
@@ -946,36 +580,6 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
         logger.info(f"Score removal complete. Total rows updated: {total_rows_updated}")
 
-    @track_operation('ddl')
-    async def create_baseline_predictions_table(self, session: AsyncSession):
-        """Create a simple table to store baseline model predictions."""
-        try:
-            logger.info("Creating baseline_predictions table if it doesn't exist")
-            
-            create_table_sql = """
-            CREATE TABLE IF NOT EXISTS baseline_predictions (
-                id SERIAL PRIMARY KEY,
-                task_name TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                region_id TEXT,
-                timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-                prediction JSONB NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-            await self.execute(create_table_sql, session=session)
-            
-            index_sql = """
-            CREATE INDEX IF NOT EXISTS idx_baseline_task ON baseline_predictions (task_name, task_id);
-            """
-            await self.execute(index_sql, session=session)
-            
-            logger.info("Successfully created baseline_predictions table")
-        except Exception as e:
-            logger.error(f"Error creating baseline_predictions table: {e}")
-            logger.error(traceback.format_exc())
-            raise DatabaseError(f"Failed to create baseline_predictions table: {str(e)}")
-            
     @track_operation('write')
     async def store_baseline_prediction(self, 
                                        task_name: str, 
@@ -997,37 +601,13 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             bool: True if successful, False otherwise
         """
         try:
-            table_check_sql = """
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'baseline_predictions'
-            );
-            """
-            result = await self.fetch_one(table_check_sql)
-            
-            if result is None or (isinstance(result, (list, tuple)) and (len(result) == 0 or not result[0])):
-                logger.info("Creating baseline_predictions table...")
-                async with self.session() as session:
-                    await self.create_baseline_predictions_table(session)
-            
-            if isinstance(prediction, (int, float)):
-                logger.info(f"DB: Storing {task_name} prediction: {prediction} (region={region_id})")
-                if task_name == "geomagnetic":
-                    prediction = {"value": prediction}
-            else:
-                logger.info(f"DB: Storing {task_name} prediction (region={region_id})")
-            
             if isinstance(prediction, (np.ndarray, torch.Tensor)):
                 prediction = prediction.tolist()
                 
             try:
                 prediction_json = json.dumps(prediction, default=self._json_serializer)
-                logger.info(f"DB: Serialized prediction: {prediction_json[:100]}..." if len(prediction_json) > 100 else prediction_json)
             except Exception as e:
                 logger.error(f"JSON serialization error: {e}")
-                logger.error(f"Failed to serialize prediction of type {type(prediction)}")
-                if hasattr(e, '__traceback__'):
-                    logger.error(traceback.format_tb(e.__traceback__))
                 return False
             
             insert_sql = """
@@ -1044,23 +624,13 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 "prediction": prediction_json
             }
             
-            try:
-                await self.execute(insert_sql, params)
-                logger.info(f"DB: Successfully stored {task_name} prediction")
-                return True
-            except Exception as db_error:
-                logger.error(f"DB insert error: {db_error}")
-                if hasattr(db_error, '__traceback__'):
-                    logger.error(traceback.format_tb(db_error.__traceback__))
-                return False
+            await self.execute(insert_sql, params)
+            return True
             
         except Exception as e:
             logger.error(f"DB: Error storing prediction: {e}")
-            logger.error(f"Prediction value type: {type(prediction)}")
-            if hasattr(e, '__traceback__'):
-                logger.error(traceback.format_tb(e.__traceback__))
             return False
-            
+
     @track_operation('read')
     async def get_baseline_prediction(self, 
                                     task_name: str, 

@@ -49,7 +49,7 @@ class BaseDatabaseManager(ABC):
     _lock = asyncio.Lock()
 
     # Default timeouts
-    DEFAULT_QUERY_TIMEOUT = 30  # 30 seconds
+    DEFAULT_QUERY_TIMEOUT = 120  # Changed from 30 seconds
     DEFAULT_TRANSACTION_TIMEOUT = 180  # 3 minutes
     DEFAULT_CONNECTION_TIMEOUT = 10  # 10 seconds
 
@@ -431,9 +431,10 @@ class BaseDatabaseManager(ABC):
     def with_timeout(timeout: float):
         """
         Decorator that adds timeout to a database operation.
+        Checks for a 'timeout' kwarg in the wrapped function call to override.
         
         Args:
-            timeout (float): Timeout in seconds
+            timeout (float): Default timeout in seconds
             
         Returns:
             Callable: Decorated function with timeout
@@ -441,14 +442,18 @@ class BaseDatabaseManager(ABC):
         def decorator(func: Callable[..., T]) -> Callable[..., T]:
             @wraps(func)
             async def wrapper(self, *args, **kwargs) -> T:
+                # Determine the effective timeout
+                call_timeout = kwargs.get('timeout')
+                effective_timeout = call_timeout if call_timeout is not None else timeout
+                
                 try:
                     return await asyncio.wait_for(
-                        func(self, *args, **kwargs),
-                        timeout=timeout
+                        func(self, *args, **kwargs), 
+                        timeout=effective_timeout
                     )
                 except asyncio.TimeoutError:
-                    logger.error(f"Operation timed out after {timeout}s")
-                    raise DatabaseTimeout(f"Operation timed out after {timeout}s")
+                    logger.error(f"Operation {func.__name__} timed out after {effective_timeout}s")
+                    raise DatabaseTimeout(f"Operation {func.__name__} timed out after {effective_timeout}s")
             return wrapper
         return decorator
 

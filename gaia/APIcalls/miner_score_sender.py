@@ -23,17 +23,15 @@ def prepare_prediction_field(data_list):
 logger = get_logger(__name__)
 
 class MinerScoreSender:
-    def __init__(self, database_manager, loop, api_client=None):
+    def __init__(self, database_manager, api_client=None):
         """
         Initialize the MinerScoreSender.
 
         Args:
             database_manager: Database manager instance
-            loop: Asyncio event loop
             api_client: Optional httpx.AsyncClient for API communication
         """
         self.db_manager = database_manager
-        self.loop = loop
         self.api_client = api_client
         self._external_api_client = api_client is not None
 
@@ -234,9 +232,6 @@ class MinerScoreSender:
             except Exception as e:
                 logger.error(f"| MinerScoreSender | ❗ Error in run_async: {e}")
                 await asyncio.sleep(30)
-
-    def run(self):
-        asyncio.run_coroutine_threadsafe(self.run_async(), self.loop)
 
     async def cleanup(self):
         try:
