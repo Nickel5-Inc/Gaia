@@ -10,22 +10,21 @@ logger = get_logger(__name__)
 
 async def fetch_data(url=None, max_retries=3):
     """
-    Fetch raw geomagnetic data from the specified or dynamically generated URL.
-
-    Args:
-        url (str, optional): The URL to fetch data from. If not provided, a URL will be generated
-                             based on the current year and month.
-        max_retries (int): Maximum number of retry attempts
-
-    Returns:
-        str: The raw data as a text string.
+    Fetch raw geomagnetic data from Kyoto WDC.
     """
-    # Generate the default URL based on the current year and month if not provided
+
+    # Add delay logic to avoid premature data fetch near the top of the hour (2 mins)
+    now_utc = datetime.now(pytz.UTC)
+    if now_utc.minute == 0 and now_utc.second < 120:
+        wait_seconds = 120 - now_utc.second
+        logger.info(f"⏳ Waiting {wait_seconds}s for Kyoto data to refresh...")
+        await asyncio.sleep(wait_seconds)
+        now_utc = datetime.now(pytz.UTC)  # Refresh after wait
+
+    # Proceed as before with generating URL
     if url is None:
-        current_time = datetime.now(pytz.UTC)
-        current_year = current_time.year
-        current_month = current_time.month
-        # Format the URL dynamically
+        current_year = now_utc.year
+        current_month = now_utc.month
         url = f"https://wdc.kugi.kyoto-u.ac.jp/dst_realtime/{current_year}{current_month:02d}/dst{str(current_year)[-2:]}{current_month:02d}.for.request"
 
     logger.info(f"Fetching data from URL: {url}")

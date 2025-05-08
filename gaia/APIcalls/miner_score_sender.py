@@ -4,7 +4,7 @@ from fiber.logging_utils import get_logger
 import pprint
 import math
 import traceback
-
+import httpx
 from gaia.APIcalls.website_api import GaiaCommunicator
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 
@@ -35,6 +35,7 @@ class MinerScoreSender:
         self.db_manager = database_manager
         self.loop = loop
         self.api_client = api_client
+        self._external_api_client = api_client is not None
 
     async def fetch_active_miners(self) -> list:
         """
@@ -59,7 +60,7 @@ class MinerScoreSender:
             )
         """
         await self.db_manager.execute(cleanup_query, {"miner_hotkey": miner_hotkey})
-        
+
         # Then fetch valid records
         query = """
             SELECT id, query_time AS prediction_datetime, predicted_value, ground_truth_value, score, scored_at
@@ -75,7 +76,7 @@ class MinerScoreSender:
             LIMIT 10
         """
         results = await self.db_manager.fetch_all(query, {"miner_hotkey": miner_hotkey})
-        
+
         valid_predictions = []
         for row in results:
             try:
@@ -83,11 +84,8 @@ class MinerScoreSender:
                 pred_value = float(row["predicted_value"])
                 truth_value = float(row["ground_truth_value"])
                 score_value = float(row["score"])
-                
-                if (not math.isnan(pred_value) and not math.isinf(pred_value) and
-                    not math.isnan(truth_value) and not math.isinf(truth_value) and
-                    not math.isnan(score_value) and not math.isinf(score_value)):
-                    
+
+                if all(not math.isnan(v) and not math.isinf(v) for v in [pred_value, truth_value, score_value]):
                     valid_predictions.append({
                         "predictionId": row["id"],
                         "predictionDate": row["prediction_datetime"].isoformat(),
@@ -100,8 +98,6 @@ class MinerScoreSender:
                     })
             except (ValueError, TypeError) as e:
                 logger.warning(f"Invalid numeric value in row {row['id']}, skipping: {e}")
-                continue
-                
         return valid_predictions
 
     async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
@@ -111,7 +107,6 @@ class MinerScoreSender:
                    soil_moisture_history.region_id, 
                    soil_moisture_predictions.sentinel_bounds, 
                    soil_moisture_predictions.sentinel_crs,
-                   soil_moisture_history.target_time, 
                    soil_moisture_history.surface_rmse, 
                    soil_moisture_history.rootzone_rmse, 
                    soil_moisture_history.surface_sm_pred,
@@ -129,9 +124,7 @@ class MinerScoreSender:
             LIMIT 10
         """
         results = await self.db_manager.fetch_all(query, {"miner_hotkey": miner_hotkey})
-        
         import json
-        
         return [
             {
                 "predictionId": row["id"],
@@ -155,28 +148,35 @@ class MinerScoreSender:
 
     async def send_to_gaia(self):
         try:
+            if not self.api_client or self.api_client.is_closed:
+                self.api_client = httpx.AsyncClient(
+                    timeout=30.0,
+                    follow_redirects=True,
+                    limits=httpx.Limits(
+                        max_connections=100,
+                        max_keepalive_connections=20,
+                        keepalive_expiry=30,
+                    ),
+                    transport=httpx.AsyncHTTPTransport(retries=3),
+                )
+                logger.warning("| MinerScoreSender | Re-created closed API client")
+
             async with GaiaCommunicator("/Predictions", client=self.api_client) as gaia_communicator:
                 active_miners = await self.fetch_active_miners()
                 if not active_miners:
                     logger.warning("| MinerScoreSender | No active miners found.")
                     return
 
-                # Increase batch size but keep it reasonable to avoid overwhelming the API
                 batch_size = 10
                 total_batches = (len(active_miners) + batch_size - 1) // batch_size
-                
-                # Process batches concurrently with a semaphore to control concurrency
-                semaphore = asyncio.Semaphore(3)  # Allow up to 3 concurrent batch operations
-                
+                semaphore = asyncio.Semaphore(3)
+
                 async def process_miner(miner):
-                    """Process a single miner's data concurrently"""
                     try:
-                        # Fetch both histories concurrently
                         geo_history, soil_history = await asyncio.gather(
                             self.fetch_geomagnetic_history(miner["hotkey"]),
                             self.fetch_soil_moisture_history(miner["hotkey"])
                         )
-                        
                         return {
                             "minerHotKey": miner["hotkey"],
                             "minerColdKey": miner["coldkey"],
@@ -188,17 +188,11 @@ class MinerScoreSender:
                         return None
 
                 async def process_batch(batch):
-                    """Process a batch of miners with controlled concurrency"""
                     async with semaphore:
                         try:
-                            # Process all miners in the batch concurrently
                             miner_tasks = [process_miner(miner) for miner in batch]
                             results = await asyncio.gather(*miner_tasks, return_exceptions=True)
-                            
-                            # Filter out failed results and send valid ones
                             valid_payloads = [r for r in results if r is not None]
-                            
-                            # Send payloads with retries
                             for payload in valid_payloads:
                                 try:
                                     await asyncio.wait_for(
@@ -210,11 +204,9 @@ class MinerScoreSender:
                                     logger.error(f"Timeout sending data for miner {payload['minerHotKey']}")
                                 except Exception as e:
                                     logger.error(f"Error sending data for miner {payload['minerHotKey']}: {str(e)}")
-                            
                         except Exception as e:
                             logger.error(f"Error processing batch: {str(e)}")
 
-                # Process all batches
                 batch_tasks = []
                 for i in range(0, len(active_miners), batch_size):
                     batch = active_miners[i:i + batch_size]
@@ -222,7 +214,6 @@ class MinerScoreSender:
                     logger.info(f"Processing batch {current_batch} of {total_batches}")
                     batch_tasks.append(process_batch(batch))
 
-                # Wait for all batches to complete
                 await asyncio.gather(*batch_tasks)
                 logger.info("Completed processing all miners")
 
@@ -231,10 +222,6 @@ class MinerScoreSender:
             raise
 
     async def run_async(self):
-        """
-        Run the process to send geomagnetic and soil moisture scores as asyncio tasks.
-        Runs once per hour with automatic restart on failure.
-        """
         while True:
             try:
                 logger.info("| MinerScoreSender | Starting hourly process to send scores to Gaia API...")
@@ -249,28 +236,16 @@ class MinerScoreSender:
                 await asyncio.sleep(30)
 
     def run(self):
-        """
-        Entry point for running the MinerScoreSender in a thread-safe manner.
-        """
         asyncio.run_coroutine_threadsafe(self.run_async(), self.loop)
 
     async def cleanup(self):
-        """Clean up resources used by MinerScoreSender."""
         try:
-            # Only close the API client if we own it (it wasn't passed in)
-            if (hasattr(self, 'api_client') and 
-                self.api_client and 
-                not getattr(self, '_external_api_client', False)):
+            if self.api_client and not self._external_api_client:
                 await self.api_client.aclose()
                 logger.info("Closed MinerScoreSender API client")
-
-            # Clean up database manager if we own it
-            if (hasattr(self, 'db_manager') and 
-                self.db_manager and 
-                not getattr(self, '_external_db_manager', False)):
+            if self.db_manager and not getattr(self, '_external_db_manager', False):
                 await self.db_manager.close_all_connections()
                 logger.info("Closed MinerScoreSender database connections")
-
         except Exception as e:
             logger.error(f"Error cleaning up MinerScoreSender: {e}")
             logger.error(traceback.format_exc())
