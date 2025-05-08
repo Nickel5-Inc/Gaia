@@ -387,10 +387,28 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
         if not kerchunk_json_url or not verification_hash_claimed:
              raise ValueError("Missing Kerchunk URL or Hash in miner response")
             
-        miner_url = task_instance.validator.get_miner_url(miner_hotkey)
-        if not miner_url: raise ValueError(f"Could not get URL for miner {miner_hotkey}")
+        validator_instance = task_instance.validator 
+        if not validator_instance or not hasattr(validator_instance, 'metagraph') or not validator_instance.metagraph:
+             logger.error(f"[VerifyLogic, Resp {response_id}] Validator instance or its metagraph is not available.")
+             await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Validator metagraph unavailable' WHERE id = :id", {"id": response_id})
+             raise ValueError(f"Metagraph data unavailable for miner {miner_hotkey} lookup")
+
+        node_info = validator_instance.metagraph.nodes.get(miner_hotkey) 
+
+        if not node_info:
+            logger.error(f"[VerifyLogic, Resp {response_id}] Could not find node info for hotkey {miner_hotkey} in validator's metagraph.")
+            await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Miner not found in metagraph' WHERE id = :id", {"id": response_id})
+            return
+
+        if not node_info.ip or not hasattr(node_info, 'port') or node_info.port is None:
+             logger.error(f"[VerifyLogic, Resp {response_id}] Node info for {miner_hotkey} is missing IP or Port details in metagraph.")
+             await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Metagraph missing IP/Port for miner' WHERE id = :id", {"id": response_id})
+             return
+
+        # TODO: Consider using node_info.protocol or config to determine http vs https scheme?
+        miner_url = f"https://{node_info.ip}:{node_info.port}"
         full_kerchunk_url = f"{miner_url.rstrip('/')}{kerchunk_json_url}"
-        
+            
         await task_instance.db_manager.execute("""
             UPDATE weather_miner_responses
             SET kerchunk_json_url = :url, verification_hash_claimed = :hash, status = 'verifying'

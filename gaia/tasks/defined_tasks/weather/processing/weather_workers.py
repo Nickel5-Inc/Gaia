@@ -628,6 +628,7 @@ async def initial_scoring_worker(self):
                 mr.miner_hotkey, 
                 mr.kerchunk_json_url, 
                 mr.job_id,
+                mr.run_id,
                 fr.gfs_init_time_utc
             FROM weather_miner_responses mr
             JOIN weather_forecast_runs fr ON mr.run_id = fr.id
@@ -669,48 +670,88 @@ async def initial_scoring_worker(self):
                     
             logger.info(f"[InitialScoringWorker] Run {run_id}: GFS analysis data fetched/loaded.")
             
-            calculated_weights = {}
+            preliminary_weights = {}
+            gfs_mae_scores = {}
             scored_miners_count = 0
             tasks = []
+            num_verified_miners_in_run = len(responses)
 
             for resp in responses:
-                 tasks.append(calculate_gfs_score_and_weight(self, resp, target_datetimes, gfs_analysis_ds))
+                 tasks.append(calculate_gfs_score_and_weight(self, resp, target_datetimes, gfs_analysis_ds, num_verified_miners_in_run))
                      
             scoring_results = await asyncio.gather(*tasks)
             
-            for hotkey, weight, score in scoring_results:
-                 if weight is not None and score is not None:
-                     calculated_weights[hotkey] = weight
+            valid_prelim_weights = []
+            for hotkey, prelim_weight, gfs_mae in scoring_results:
+                 if prelim_weight is not None and gfs_mae is not None:
+                     preliminary_weights[hotkey] = prelim_weight
+                     gfs_mae_scores[hotkey] = gfs_mae
+                     valid_prelim_weights.append(prelim_weight)
                      scored_miners_count += 1
-                     try:
-                        insert_weight_query = """
-                            INSERT INTO weather_historical_weights 
-                            (miner_hotkey, run_id, score_type, score, weight, last_updated)
-                            VALUES (:hk, :rid, :stype, :score, :weight, :ts)
-                            ON CONFLICT (miner_hotkey, run_id, score_type) DO UPDATE SET
-                            score = EXCLUDED.score, 
-                            weight = EXCLUDED.weight, 
-                            last_updated = EXCLUDED.last_updated
-                        """
-                        await self.db_manager.execute(insert_weight_query, {
-                            "hk": hotkey, "rid": run_id, "stype": 'gfs_rmse', 
-                            "score": score, "weight": weight, "ts": datetime.now(timezone.utc)
-                        })
-                        logger.debug(f"[InitialScoringWorker] Stored GFS weight for {hotkey}, run {run_id}")
-                     except Exception as db_err:
-                          logger.error(f"[InitialScoringWorker] Run {run_id}: Failed to store GFS-based weight for {hotkey}: {db_err}")
+                 else:
+                     logger.warning(f"[InitialScoringWorker] Miner {hotkey} failed prelim weight/score calculation.")
             
+            final_initial_weights = {}
+            total_prelim_weight = sum(valid_prelim_weights)
+            if scored_miners_count >= min_members and total_prelim_weight > 1e-9:
+                logger.info(f"[InitialScoringWorker] Normalizing preliminary weights (Sum: {total_prelim_weight:.4f}) for {scored_miners_count} miners.")
+                for hotkey, prelim_weight in preliminary_weights.items():
+                    final_initial_weights[hotkey] = prelim_weight / total_prelim_weight
+            elif scored_miners_count >= min_members: # Handle zero sum case - assign equal weights
+                logger.warning(f"[InitialScoringWorker] Total preliminary weight is near zero. Assigning equal weights to {scored_miners_count} scored miners.")
+                equal_weight = 1.0 / scored_miners_count
+                for hotkey in preliminary_weights.keys():
+                    final_initial_weights[hotkey] = equal_weight
+            else:
+                # normalization not possible/needed
+                pass
+
+            store_tasks = []
+            for hotkey, final_weight in final_initial_weights.items():
+                gfs_mae = gfs_mae_scores.get(hotkey)
+                if gfs_mae is None: continue
+
+                insert_mae_query = """
+                    INSERT INTO weather_historical_weights 
+                    (miner_hotkey, run_id, score_type, score, last_updated)
+                    VALUES (:hk, :rid, 'gfs_mae', :score, :ts)
+                    ON CONFLICT (miner_hotkey, run_id, score_type) DO UPDATE SET
+                    score = EXCLUDED.score, last_updated = EXCLUDED.last_updated
+                """
+                store_tasks.append(self.db_manager.execute(insert_mae_query, {
+                    "hk": hotkey, "rid": run_id, "score": gfs_mae, "ts": datetime.now(timezone.utc)
+                }))
+
+                insert_weight_query = """
+                    INSERT INTO weather_historical_weights 
+                    (miner_hotkey, run_id, score_type, weight, last_updated)
+                    VALUES (:hk, :rid, 'initial_ensemble_weight', :weight, :ts)
+                    ON CONFLICT (miner_hotkey, run_id, score_type) DO UPDATE SET
+                    weight = EXCLUDED.weight, last_updated = EXCLUDED.last_updated
+                """
+                store_tasks.append(self.db_manager.execute(insert_weight_query, {
+                    "hk": hotkey, "rid": run_id, "weight": final_weight, "ts": datetime.now(timezone.utc)
+                }))
+                logger.debug(f"[InitialScoringWorker] Storing GFS MAE ({gfs_mae:.4f}) and Initial Weight ({final_weight:.4f}) for {hotkey}, run {run_id}")
+
+            if store_tasks:
+                try:
+                    await asyncio.gather(*store_tasks)
+                    logger.info(f"[InitialScoringWorker] Stored initial scores/weights for {len(final_initial_weights)} miners.")
+                except Exception as db_err:
+                     logger.error(f"[InitialScoringWorker] Run {run_id}: Failed during bulk DB storage of initial scores/weights: {db_err}")
+
             logger.info(f"[InitialScoringWorker] Run {run_id}: Successfully processed GFS scores for {scored_miners_count}/{len(responses)} miners.")
             
-            if scored_miners_count < min_members:
-                logger.warning(f"[InitialScoringWorker] Run {run_id}: Only {scored_miners_count} miners successfully scored (min {min_members}). Cannot proceed to ensemble.")
-                await self._update_run_status(run_id, "initial_scoring_failed", error_message=f"Scored {scored_miners_count}/{min_members} needed")
-                self.initial_scoring_queue.task_done()
-                continue
-                
-            logger.info(f"[InitialScoringWorker] Run {run_id}: Initial scoring complete. Triggering ensemble creation.")
-            await self.ensemble_task_queue.put(run_id)
-            await self._update_run_status(run_id, "processing_ensemble")
+            if len(final_initial_weights) >= min_members:
+                 logger.info(f"[InitialScoringWorker] Run {run_id}: Initial scoring complete ({len(final_initial_weights)} weighted miners). Triggering ensemble creation.")
+                 await self.ensemble_task_queue.put(run_id)
+                 await self._update_run_status(run_id, "processing_ensemble")
+            else:
+                 logger.warning(f"[InitialScoringWorker] Run {run_id}: Only {scored_miners_count} miners successfully scored (min {min_members}). Cannot proceed to ensemble.")
+                 await self._update_run_status(run_id, "initial_scoring_failed", error_message=f"Scored {scored_miners_count}/{min_members} needed")
+                 self.initial_scoring_queue.task_done()
+                 continue
             
             self.initial_scoring_queue.task_done()
             
@@ -735,7 +776,7 @@ async def initial_scoring_worker(self):
                     try:
                         gfs_analysis_ds.close()
                     except Exception:
-                        pass 
+                        pass
                 gc.collect()
 
 async def finalize_scores_worker(self):

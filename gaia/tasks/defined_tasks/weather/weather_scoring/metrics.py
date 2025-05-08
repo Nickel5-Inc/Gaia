@@ -165,6 +165,54 @@ async def calculate_mae(prediction: np.ndarray, ground_truth: np.ndarray) -> flo
         logger.error(f"Error in calculate_mae: {e}")
         raise
 
+async def calculate_mae_dict(prediction: Dict, ground_truth: Dict) -> float:
+    """
+    Calculate overall MAE across all variables in the provided dictionaries.
+    Assumes variable values are numpy arrays.
+    
+    Args:
+        prediction: Dictionary of predicted variables {var_name: array}
+        ground_truth: Dictionary of ground truth variables {var_name: array}
+    
+    Returns:
+        Mean Absolute Error value across all common variables and valid points.
+    """
+    try:
+        total_absolute_error = 0.0
+        total_count = 0
+        
+        common_vars = set(prediction.keys()) & set(ground_truth.keys())
+        if not common_vars:
+            logger.warning("calculate_mae_dict: No common variables found.")
+            return float('inf')
+            
+        for var in common_vars:
+            pred_data = prediction[var]
+            truth_data = ground_truth[var]
+            
+            if not isinstance(pred_data, np.ndarray) or not isinstance(truth_data, np.ndarray):
+                logger.warning(f"calculate_mae_dict: Skipping var '{var}', data is not a numpy array.")
+                continue
+                
+            if pred_data.shape != truth_data.shape:
+                logger.warning(f"calculate_mae_dict: Skipping var '{var}', shape mismatch {pred_data.shape} vs {truth_data.shape}.")
+                continue
+                    
+            absolute_error = np.abs(pred_data - truth_data)
+            valid_mask = ~np.isnan(absolute_error)
+            
+            total_absolute_error += np.sum(absolute_error[valid_mask])
+            total_count += np.sum(valid_mask)
+        
+        if total_count > 0:
+            return total_absolute_error / total_count
+        else:
+            logger.warning("calculate_mae_dict: No valid (non-NaN) data points found for comparison.")
+            return float('inf')
+    except Exception as e:
+        logger.error(f"Error in calculate_mae_dict: {e}")
+        raise
+
 async def calculate_bias(prediction: np.ndarray, ground_truth: np.ndarray) -> float:
     """
     Calculate bias (mean error).
