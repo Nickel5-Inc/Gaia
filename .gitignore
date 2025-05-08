@@ -25,5 +25,9 @@ gaia.egg-info/
 **/smap_cache/
 smap_cache/
 
+# Specific analysis cache
+gfs_analysis_cache/
+
 db_wipe_trigger
 db_wipe_trigger.executed.*
+gaia/models/checkpoints/*
