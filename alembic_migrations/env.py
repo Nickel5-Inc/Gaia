@@ -1,4 +1,6 @@
-from logging.config import fileConfig
+from fiber.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 # from sqlalchemy import engine_from_config # No longer needed
 from sqlalchemy import pool

@@ -1646,11 +1646,10 @@ if __name__ == "__main__":
 
     # --- Run Alembic check synchronously BEFORE starting the application --- 
     try:
-        # Use basic logging setup here, as app logger might not be configured yet
         # Or configure application logging before this check if preferred.
-        logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
-        alembic_logger = logging.getLogger('alembic')
-        alembic_logger.setLevel(logging.INFO)
+        # logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+        # alembic_logger = logging.getLogger('alembic')
+        # alembic_logger.setLevel(logging.INFO)
         
         print("[Startup] Checking database schema version using Alembic...") # Use print as logger might not be fully setup
         alembic_cfg = Config("alembic.ini") 

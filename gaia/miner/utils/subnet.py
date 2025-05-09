@@ -286,7 +286,7 @@ def factory_router(miner_instance) -> APIRouter:
             request_data = decrypted_payload.data
             logger.info(f"Handling weather kerchunk request...")
 
-            job_id = request_data.get('job_id')
+            job_id = request_data.job_id
             if not job_id:
                 logger.error("Missing job_id in request data")
                 return JSONResponse(status_code=400, content={"error": "Missing job_id in request"})

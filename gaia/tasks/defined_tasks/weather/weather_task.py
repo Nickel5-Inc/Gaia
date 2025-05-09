@@ -214,8 +214,10 @@ class WeatherTask(Task):
         await self.start_ensemble_workers()
         logger.info("Started ensemble workers for asynchronous processing")
 
-        RUN_HOUR_UTC = 12
-        RUN_MINUTE_UTC = 0
+        run_hour_utc = self.config.get('run_hour_utc', 12) # Default to 12 if not in config for some reason
+        run_minute_utc = self.config.get('run_minute_utc', 0)
+        logger.info(f"Validator execute loop configured to run around {run_hour_utc:02d}:{run_minute_utc:02d} UTC.")
+
         if self.test_mode:
              logger.warning("Running in TEST MODE: Execution will run once immediately.")
 
@@ -225,7 +227,7 @@ class WeatherTask(Task):
                 now_utc = datetime.now(timezone.utc)
 
                 if not self.test_mode:
-                    target_run_time_today = now_utc.replace(hour=RUN_HOUR_UTC, minute=RUN_MINUTE_UTC, second=0, microsecond=0)
+                    target_run_time_today = now_utc.replace(hour=run_hour_utc, minute=run_minute_utc, second=0, microsecond=0)
                     if now_utc >= target_run_time_today:
                         next_run_trigger_time = target_run_time_today + timedelta(days=1)
                     else:
@@ -569,6 +571,9 @@ class WeatherTask(Task):
                      logger.warning(f"[Run {run_id}] No miners eligible for inference trigger after hash verification.")
                      await _update_run_status(self, run_id, "no_matching_hashes")
 
+                logger.info(f"[ValidatorExecute] Concluded processing for run {run_id}. Triggering validator_score.")
+                await self.validator_score()
+
                 if self.test_mode:
                      logger.info("TEST MODE: Exiting validator loop after one successful attempt or error within the attempt.")
                      break
@@ -593,45 +598,58 @@ class WeatherTask(Task):
         """
         logger.info("Validator scoring check initiated...")
         
+        verification_wait_minutes_actual = self.config.get('verification_wait_minutes', 30)
+        if self.test_mode:
+            logger.info("[validator_score] TEST MODE: Setting verification_wait_minutes to 0 for immediate processing.")
+            verification_wait_minutes_actual = 0
+            logger.info("[validator_score] TEST MODE: Adding a 30-second delay before processing runs for miner data preparation.")
+            await asyncio.sleep(30)
+
+        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=verification_wait_minutes_actual)
+        
         query = """
         SELECT id, gfs_init_time_utc 
         FROM weather_forecast_runs
-        WHERE status = 'awaiting_results' 
+        WHERE status = 'awaiting_inference_results' 
         AND run_initiation_time < :cutoff_time 
         ORDER BY run_initiation_time ASC
         LIMIT 10
         """
-        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=getattr(self.config, 'verification_wait_minutes', 30))
         forecast_runs = await self.db_manager.fetch_all(query, {"cutoff_time": cutoff_time})
         
         if not forecast_runs:
-            logger.debug("No runs found awaiting results within cutoff.")
+            logger.debug(f"No runs found awaiting inference results within cutoff (test_mode active: {self.test_mode}, cutoff: {cutoff_time}).")
             return
         
-        for run in forecast_runs:
-            run_id = run['id']
+        for run_record in forecast_runs:
+            run_id = run_record['id']
             logger.info(f"[Run {run_id}] Checking responses for verification...")
             current_run_status_rec = await self.db_manager.fetch_one("SELECT status FROM weather_forecast_runs WHERE id = :run_id", {"run_id": run_id})
             current_run_status = current_run_status_rec['status'] if current_run_status_rec else 'unknown'
             
-            if current_run_status == 'awaiting_results':
-                await _update_run_status(self, run_id, "verifying") 
+            if current_run_status == 'awaiting_inference_results':
+                await _update_run_status(self, run_id, "verifying_miner_forecasts") 
             else:
-                 logger.info(f"[Run {run_id}] Status is already '{current_run_status}', skipping verification trigger step.")
+                 logger.info(f"[Run {run_id}] Status is already '{current_run_status}' (expected 'awaiting_inference_results'), skipping verification trigger step.")
                  continue
             
             responses_query = """
             SELECT mr.id, mr.miner_hotkey, mr.status, mr.job_id
             FROM weather_miner_responses mr
             WHERE mr.run_id = :run_id
-            AND mr.status = 'accepted' -- Only check newly accepted ones
+            AND mr.status = 'inference_triggered'
             """
             miner_responses = await self.db_manager.fetch_all(responses_query, {"run_id": run_id})
-            logger.info(f"[Run {run_id}] Found {len(miner_responses)} accepted responses to verify.")
             
+            num_attempted_verification = len(miner_responses)
+            if not miner_responses:
+                logger.info(f"[Run {run_id}] No miner responses found with status 'inference_triggered'.")
+            else:
+                logger.info(f"[Run {run_id}] Found {num_attempted_verification} 'inference_triggered' responses to verify.")
+
             verification_tasks = []
             for response in miner_responses:
-                 verification_tasks.append(verify_miner_response(self, run, response))
+                 verification_tasks.append(verify_miner_response(self, run_record, response))
                  
             if verification_tasks:
                  await asyncio.gather(*verification_tasks)
@@ -641,28 +659,27 @@ class WeatherTask(Task):
             verified_count_result = await self.db_manager.fetch_one(verified_responses_query, {"run_id": run_id})
             verified_count = verified_count_result["count"] if verified_count_result else 0
             
-            total_responses_query = "SELECT COUNT(*) as count FROM weather_miner_responses WHERE run_id = :run_id"
-            total_responses_result = await self.db_manager.fetch_one(total_responses_query, {"run_id": run_id})
-            total_responses = total_responses_result["count"] if total_responses_result else 0
+            min_ensemble_members = self.config.get('min_ensemble_members', 3)
             
-            min_ensemble_members = getattr(self.config, 'min_ensemble_members', 3)
+            current_run_status_rec_after_verify = await self.db_manager.fetch_one("SELECT status FROM weather_forecast_runs WHERE id = :run_id", {"run_id": run_id})
+            current_run_status_after_verify = current_run_status_rec_after_verify['status'] if current_run_status_rec_after_verify else 'unknown'
             
-            current_run_status_rec = await self.db_manager.fetch_one("SELECT status FROM weather_forecast_runs WHERE id = :run_id", {"run_id": run_id})
-            current_run_status = current_run_status_rec['status'] if current_run_status_rec else None
-            
-            if current_run_status == 'verifying':
+            if current_run_status_after_verify == 'verifying_miner_forecasts':
                 if verified_count >= min_ensemble_members:
-                    logger.info(f"[Run {run_id}] {verified_count} verified. Triggering initial scoring.")
+                    logger.info(f"[Run {run_id}] {verified_count} verified responses meeting/exceeding minimum {min_ensemble_members}. Triggering initial scoring.")
                     await _trigger_initial_scoring(self, run_id)
-                elif total_responses > 0: 
-                     if verified_count > 0:
-                         await _update_run_status(self, run_id, "partially_verified")
-                     else:
-                         await _update_run_status(self, run_id, "verification_failed")
-                else:
-                    logger.warning(f"[Run {run_id}] No responses found after verification attempts. Status remains 'verifying'.")
+                elif num_attempted_verification > 0: 
+                     if verified_count > 0: # Some passed, but not enough for full ensemble
+                         logger.info(f"[Run {run_id}] {verified_count} verified responses, (less than {min_ensemble_members} minimum). Status: partially_verified_ready_for_scoring.")
+                         await _update_run_status(self, run_id, "partially_verified_ready_for_scoring")
+                     else: # None passed verification out of those attempted
+                         logger.warning(f"[Run {run_id}] No responses passed verification out of {num_attempted_verification} attempted. Status: all_forecasts_failed_verification.")
+                         await _update_run_status(self, run_id, "all_forecasts_failed_verification")
+                else: # num_attempted_verification == 0: No 'inference_triggered' responses were found for this run.
+                    logger.warning(f"[Run {run_id}] Run was '{current_run_status_after_verify}' but no 'inference_triggered' miner responses found to verify. Setting status to 'stalled_no_valid_forecasts'.")
+                    await _update_run_status(self, run_id, "stalled_no_valid_forecasts")
             else:
-                 logger.info(f"[Run {run_id}] Status changed from 'verifying' to '{current_run_status}' during verification. No further status update needed here.")
+                 logger.info(f"[Run {run_id}] Status changed from 'verifying_miner_forecasts' to '{current_run_status_after_verify}' during verification logic. No further status update needed here.")
 
     ############################################################
     # Miner methods

@@ -10,15 +10,16 @@ import xarray as xr
 import pandas as pd
 import fsspec
 import jwt
-
-from fiber.logging_utils import get_logger
-from typing import TYPE_CHECKING, Any, Optional, Dict, List
+import traceback
+from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple
 if TYPE_CHECKING:
     from ..weather_task import WeatherTask
 from ..utils.era5_api import fetch_era5_data
 from ..weather_scoring.ensemble import _open_dataset_lazily, ALL_EXPECTED_VARIABLES
 from ..weather_scoring.metrics import calculate_rmse
 from ..weather_scoring_mechanism import calculate_era5_ensemble_score
+from ..schemas.weather_outputs import WeatherKerchunkResponseData
+from fiber.logging_utils import get_logger
 
 logger = get_logger(__name__)
 async def _update_run_status(task_instance: 'WeatherTask', run_id: int, status: str, error_message: Optional[str] = None, gfs_metadata: Optional[dict] = None):
@@ -218,36 +219,60 @@ async def _trigger_initial_scoring(task_instance: 'WeatherTask', run_id: int):
     await task_instance.initial_scoring_queue.put(run_id)
     await _update_run_status(task_instance, run_id, "initial_scoring_queued")
 
+async def _request_fresh_token(task_instance, miner_hotkey: str, job_id: str) -> Optional[Tuple[str, str, str]]:
+    """Requests a fresh JWT from the miner for a given job_id."""
+    logger.info(f"[VerifyLogic] Requesting fresh token for job {job_id} from miner {miner_hotkey[:12]}...")
+    kerchunk_request_payload = {
+        "nonce": str(uuid.uuid4()),
+        "data": {"job_id": job_id}
+    }
+    endpoint_to_call = "/weather-kerchunk-request"
 
-
-async def _request_fresh_token(task_instance: 'WeatherTask', miner_hotkey: str, job_id: str) -> Optional[Dict[str, Any]]:
-    """Request a fresh access token for a specific job from a miner."""
-    if task_instance.validator is None:
-        logger.error("Validator instance not available in WeatherTask. Cannot request token.")
-        return None
-        
     try:
-        kerchunk_request_payload = {
-            "nonce": str(uuid.uuid4()),
-            "data": {"job_id": job_id}
-        }
-        
-        logger.debug(f"Requesting token for job {job_id} from miner {miner_hotkey}")
-        response = await task_instance.validator.query_miner(
-            miner_hotkey=miner_hotkey,
+        all_responses = await task_instance.validator.query_miners(
             payload=kerchunk_request_payload,
-            endpoint="/weather-kerchunk-request"
+            endpoint=endpoint_to_call
         )
         
-        if response and response.get("status") == "completed" and response.get("access_token"):
-            logger.debug(f"Successfully received token for job {job_id} from {miner_hotkey}")
-            return {"access_token": response.get("access_token")}
+        response_dict = all_responses.get(miner_hotkey)
+
+        if not response_dict:
+            logger.error(f"[VerifyLogic] No response from {miner_hotkey[:12]} for token request for job {job_id} via query_miners.")
+            return None
+
+        if response_dict.get("status_code") == 200:
+            try:
+                miner_response_data = json.loads(response_dict['text'])
+                if miner_response_data.get("status") == "completed":
+                    token = miner_response_data.get("access_token")
+                    kerchunk_url = miner_response_data.get("kerchunk_json_url") # This is relative to miner's host
+                    verification_hash = miner_response_data.get("verification_hash")
+                    
+                    if token and kerchunk_url and verification_hash:
+                        logger.info(f"[VerifyLogic] Successfully received token, kerchunk URL, and hash for job {job_id} from {miner_hotkey[:12]}.")
+                        # The kerchunk_url from miner is relative, need the miner's base IP/port.
+                        miner_base_url = f"https://{response_dict['ip']}:{response_dict['port']}"
+                        full_kerchunk_url = f"{miner_base_url}{kerchunk_url}"
+                        return token, full_kerchunk_url, verification_hash
+                    else:
+                        logger.error(f"[VerifyLogic] Miner {miner_hotkey[:12]} response for job {job_id} missing token, URL, or hash. Data: {miner_response_data}")
+                        return None
+                elif miner_response_data.get("status") == "processing":
+                     logger.warning(f"[VerifyLogic] Miner {miner_hotkey[:12]} is still processing job {job_id}. Token not yet available. Response: {miner_response_data}")
+                     return None
+                else: 
+                    logger.error(f"[VerifyLogic] Miner {miner_hotkey[:12]} returned non-completed status for job {job_id} token request. Response: {miner_response_data}")
+                    return None
+            except json.JSONDecodeError:
+                logger.error(f"[VerifyLogic] Failed to decode JSON response from {miner_hotkey[:12]} for job {job_id}. Raw text: {response_dict.get('text')[:200]}")
+                return None
         else:
-             logger.warning(f"Failed to get valid token response for job {job_id} from {miner_hotkey}. Response: {response}")
-             return None
-             
+            logger.error(f"[VerifyLogic] Miner {miner_hotkey[:12]} returned error status {response_dict.get('status_code')} for job {job_id} token request. Response text: {response_dict.get('text')[:200]}")
+            return None
+
     except Exception as e:
-        logger.error(f"Error requesting token for job {job_id} from {miner_hotkey}: {e}", exc_info=True)
+        logger.error(f"[VerifyLogic] Error requesting token for job {job_id} from {miner_hotkey[:12]}: {e!r}")
+        logger.debug(traceback.format_exc())
         return None
 
 async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_utc: datetime) -> Optional[Dict[str, Any]]:

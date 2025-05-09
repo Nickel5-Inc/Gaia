@@ -697,7 +697,7 @@ async def initial_scoring_worker(self):
                 logger.info(f"[InitialScoringWorker] Normalizing preliminary weights (Sum: {total_prelim_weight:.4f}) for {scored_miners_count} miners.")
                 for hotkey, prelim_weight in preliminary_weights.items():
                     final_initial_weights[hotkey] = prelim_weight / total_prelim_weight
-            elif scored_miners_count >= min_members: # Handle zero sum case - assign equal weights
+            elif scored_miners_count >= min_members:
                 logger.warning(f"[InitialScoringWorker] Total preliminary weight is near zero. Assigning equal weights to {scored_miners_count} scored miners.")
                 equal_weight = 1.0 / scored_miners_count
                 for hotkey in preliminary_weights.keys():
