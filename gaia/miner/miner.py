@@ -279,7 +279,7 @@ class Miner:
                 host="0.0.0.0",
                 port=self.port,
                 log_config=log_config,
-                log_level="trace",
+                log_level="debug",
             )
         except Exception as e:
             self.logger.error(f"Error starting miner: {e}")

@@ -182,17 +182,53 @@ def factory_router(miner_instance) -> APIRouter:
             )
             
             if datetime.fromtimestamp(payload["exp"], tz=timezone.utc) < datetime.now(timezone.utc):
+                logger.warning(f"Token expired for job_id: {payload.get('job_id')}, file_path: {payload.get('file_path')}")
                 raise HTTPException(status_code=401, detail="Token has expired")
             
+
+            logger.debug(f"Token successfully decoded and validated (not expired). Payload: {payload}")
             return payload
+        except jwt.ExpiredSignatureError:
+            logger.warning(f"JWT token has expired.")
+            raise HTTPException(status_code=401, detail="Token has expired (signature)")
         except jwt.PyJWTError as e:
-            raise HTTPException(status_code=401, detail="Invalid token")
+            logger.warning(f"Invalid JWT token: {e}")
+            raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
     async def get_forecast_file(filename: str, token_payload: dict = Depends(verify_token)):
         """Serve forecast file with JWT validation."""
         try:
-            if token_payload.get("file_path") != filename:
-                raise HTTPException(status_code=403, detail="Token not valid for this file")
+            token_file_claim = token_payload.get("file_path")
+            job_id_claim = token_payload.get("job_id")
+            
+            logger.info(f"File request for job '{job_id_claim}': Requested file '{filename}'. Token originally for '{token_file_claim}'.")
+
+            allow_access = False
+            s_token_file_claim = token_file_claim or ""
+            s_filename = filename or ""
+
+            if s_token_file_claim == s_filename: 
+                allow_access = True
+                logger.info(f"Exact filename match in token. Access granted for '{filename}'.")
+            else:
+                token_base, token_ext = os.path.splitext(s_token_file_claim)
+                requested_base, requested_ext = os.path.splitext(s_filename)
+
+                logger.info(f"DEBUG_AUTH: Requested: '{s_filename}' (Base: '{requested_base}', Ext: '{requested_ext}')")
+                logger.info(f"DEBUG_AUTH: Token Claim: '{s_token_file_claim}' (Base: '{token_base}', Ext: '{token_ext}')")
+                logger.info(f"DEBUG_AUTH: Base Match: {token_base == requested_base}")
+                logger.info(f"DEBUG_AUTH: JSON token -> NC request: {token_ext == '.json' and requested_ext == '.nc'}")
+                logger.info(f"DEBUG_AUTH: NC token -> JSON request: {token_ext == '.nc' and requested_ext == '.json'}")
+
+                if token_base == requested_base and \
+                   ((token_ext == ".json" and requested_ext == ".nc") or \
+                    (token_ext == ".nc" and requested_ext == ".json")):
+                    logger.info(f"Authorizing access to '{s_filename}' based on token for related file '{s_token_file_claim}' from same job bundle.")
+                    allow_access = True
+            
+            if not allow_access:
+                logger.warning(f"Access DENIED for '{s_filename}'. Token for '{s_token_file_claim}' (job: {job_id_claim}) not valid for this specific file request.")
+                raise HTTPException(status_code=403, detail="Token not valid for this specific file or its related data bundle")
             
             file_path = (MINER_FORECAST_DIR / filename).resolve()
 
@@ -204,14 +240,13 @@ def factory_router(miner_instance) -> APIRouter:
             return FileResponse(
                 path=str(file_path), 
                 filename=filename, 
-                media_type='application/x-netcdf'
+                media_type='application/octet-stream'
             )
             
         except HTTPException as e:
-            raise e
+            raise e 
         except Exception as e:
-            logger.error(f"Error serving forecast file {filename}: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error serving forecast file {filename}: {e}", exc_info=True)
             return JSONResponse(status_code=500, content={"error": "Internal server error serving file"})
 
     async def weather_forecast_require(
@@ -438,7 +473,7 @@ def factory_router(miner_instance) -> APIRouter:
         "/forecasts/{filename}",
         get_forecast_file,
         tags=["Weather"],
-        methods=["GET"],
+        methods=["GET", "HEAD"],
         response_class=FileResponse
     )
     # Route for triggering weather forecast run

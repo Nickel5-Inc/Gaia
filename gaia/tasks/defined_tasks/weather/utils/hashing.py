@@ -244,115 +244,89 @@ def compute_verification_hash(
     return hash_obj.hexdigest()
 
 
-# This will be run in an executor
-def _sync_open_kerchunk_dataset_from_refs(
-    refs_dict: Dict, 
-    base_url_for_refs: str, # e.g. "https://host:port"
-    remote_protocol_for_refs: str, # e.g. "https"
-    sync_http_options: Dict # Options for the sync HTTPFileSystem
+def _synchronous_kerchunk_open(
+    kerchunk_json_url: str, 
+    http_fs_kwargs: Dict
 ) -> xr.Dataset:
-    logger.debug(f"SYNC_OPEN: Creating synchronous reference filesystem. Base URL for refs: {base_url_for_refs}, Remote protocol: {remote_protocol_for_refs}")
+    logger.info(f"SYNC_KERCHUNK_OPEN: Starting for URL: {kerchunk_json_url}")
+    logger.warning("SYNC_KERCHUNK_OPEN: SSL certificate verification is DISABLED for HTTP requests within this synchronous function. FOR TESTING ONLY.")
+
+    refs_dict = None
+    try:
+        logger.debug(f"SYNC_KERCHUNK_OPEN: Fetching main JSON from {kerchunk_json_url} with options: {http_fs_kwargs}")
+        with fsspec.open(kerchunk_json_url, mode='rb', **http_fs_kwargs) as f:
+            refs_dict = json.load(f)
+        logger.debug("SYNC_KERCHUNK_OPEN: Successfully fetched and parsed main Kerchunk JSON.")
+    except Exception as e_json_fetch:
+        logger.error(f"SYNC_KERCHUNK_OPEN: Failed to fetch/parse main JSON from {kerchunk_json_url}: {e_json_fetch!r}", exc_info=True)
+        raise IOError(f"Failed to fetch/parse main Kerchunk JSON from {kerchunk_json_url}") from e_json_fetch
+
+    if refs_dict is None:
+        raise IOError(f"refs_dict is None after attempting to fetch {kerchunk_json_url}")
+
+    if 'refs' in refs_dict and 'lat/0' in refs_dict['refs']:
+        logger.info(f"SYNC_KERCHUNK_OPEN DEBUG: refs_dict['refs']['lat/0'] = {refs_dict['refs']['lat/0']}")
+    elif 'refs' in refs_dict and len(refs_dict['refs']) > 0:
+        first_ref_key = list(refs_dict['refs'].keys())[0]
+        logger.info(f"SYNC_KERCHUNK_OPEN DEBUG: 'lat/0' not in refs_dict['refs']. First ref '{first_ref_key}': {refs_dict['refs'][first_ref_key]}")
+    else:
+        logger.info(f"SYNC_KERCHUNK_OPEN DEBUG: 'refs' key missing or empty in refs_dict.")
+
+    parsed_main_json_url = urllib.parse.urlparse(kerchunk_json_url)
     
-    parsed_base_url = urllib.parse.urlparse(base_url_for_refs)
-    
-    final_remote_options = {
-        "host": parsed_base_url.hostname,
-        "port": parsed_base_url.port,
-        "client_kwargs": sync_http_options.get("client_kwargs", {}), 
-        "asynchronous": False,
+    chunk_fetch_fs_options = {
+        "headers": http_fs_kwargs.get("headers", {}),
+        "verify_ssl": http_fs_kwargs.get("verify_ssl", True),
+        "asynchronous": False
     }
 
     fs_ref_sync = fsspec.filesystem(
         "reference",
         fo=refs_dict,
-        remote_protocol=remote_protocol_for_refs, 
-        remote_options=final_remote_options,
-        asynchronous=False 
+        remote_protocol=parsed_main_json_url.scheme,
+        remote_options=chunk_fetch_fs_options,
+        asynchronous=False
     )
 
     ref_root_mapper_sync = fs_ref_sync.get_mapper("") 
     
-    logger.debug("SYNC_OPEN: Calling xr.open_dataset (engine='zarr') with sync reference mapper.")
-    ds = xr.open_dataset(ref_root_mapper_sync, engine="zarr", consolidated=False, chunks={})
-    logger.info("SYNC_OPEN: Successfully opened Zarr dataset via sync reference filesystem.")
-    return ds
+    logger.debug("SYNC_KERCHUNK_OPEN: Calling xr.open_dataset (engine='zarr') with sync reference mapper.")
+    try:
+        ds = xr.open_dataset(ref_root_mapper_sync, engine="zarr", consolidated=False, chunks={})
+        logger.info("SYNC_KERCHUNK_OPEN: Successfully opened Zarr dataset via sync reference filesystem.")
+        return ds
+    except Exception as e_xr_open:
+        logger.error(f"SYNC_KERCHUNK_OPEN: Failed to open Zarr dataset with xarray: {e_xr_open!r}", exc_info=True)
+        raise
 
 
 async def open_remote_dataset_with_kerchunk(url: str, variables: List[str], storage_options: Optional[Dict] = None) -> xr.Dataset:
-    logger.info(f"Attempting to open remote Kerchunk dataset (async fetch, sync open): {url} with storage_options: {storage_options is not None}")
+    logger.info(f"Attempting to open remote Kerchunk dataset (fully sync in executor): {url} with storage_options: {storage_options is not None}")
     
     session_headers = None
     if storage_options and 'headers' in storage_options:
         session_headers = storage_options['headers']
 
-    logger.warning("SSL certificate verification is DISABLED for initial JSON fetch (using aiohttp.TCPConnector(ssl=False)). FOR TESTING ONLY.")
-    
-    current_loop = asyncio.get_running_loop()
-    connector = aiohttp.TCPConnector(ssl=False, loop=current_loop) 
-    
-    refs_dict: Optional[Dict] = None
-
-    async with aiohttp.ClientSession(connector=connector, headers=session_headers, loop=current_loop) as session:
-        try:
-            protocol_for_main_json = url.split("://")[0]
-            if protocol_for_main_json not in ['http', 'https']:
-                protocol_for_main_json = 'https'
-
-            async def get_client_override(loop=None, **kwargs_passed_by_fsspec):
-                return session
-            
-            fs_http_async = fsspec.filesystem(
-                protocol_for_main_json,
-                asynchronous=True,
-                get_client=get_client_override,
-                loop=current_loop
-            )
-            await fs_http_async.set_session()
-
-            logger.debug(f"Fetching Kerchunk JSON content from: {url} using fs_http_async._cat_file")
-            json_content_bytes = await fs_http_async._cat_file(url)
-            refs_dict = json.loads(json_content_bytes.decode())
-            logger.debug(f"Successfully fetched and parsed Kerchunk JSON from {url}")
-
-        except Exception as e_fetch:
-            logger.error(f"Error fetching main Kerchunk JSON from {url}: {e_fetch!r}", exc_info=True)
-            if connector and not connector.closed:
-                 await connector.close()
-            raise 
-
-    if refs_dict is None:
-        if connector and not connector.closed:
-            await connector.close()
-        raise IOError(f"Failed to fetch or parse main Kerchunk JSON from {url}")
-
-    parsed_main_json_url = urllib.parse.urlparse(url)
-    base_url_for_chunks = f"{parsed_main_json_url.scheme}://{parsed_main_json_url.netloc}"
-
-    sync_http_fs_options = {
-        "client_kwargs": {
-            "headers": session_headers or {},
-            "verify": False
-        }
+    http_client_kwargs_for_sync = {
+        "headers": session_headers or {},
+        "verify_ssl": False
     }
+    logger.warning("SSL certificate verification will be DISABLED for HTTP requests within the executor. FOR TESTING ONLY.")
 
+    current_loop = asyncio.get_running_loop()
     try:
-        logger.debug(f"Calling _sync_open_kerchunk_dataset_from_refs for {url} in executor...")
+        logger.debug(f"Calling _synchronous_kerchunk_open for {url} in executor...")
         ds = await current_loop.run_in_executor(
             None,  
-            _sync_open_kerchunk_dataset_from_refs, 
-            refs_dict, 
-            base_url_for_chunks,
-            parsed_main_json_url.scheme,
-            sync_http_fs_options
+            _synchronous_kerchunk_open, 
+            url,
+            http_client_kwargs_for_sync
         )
-        logger.info(f"Successfully opened remote Zarr dataset via sync reference FS in executor: {url}")
+        logger.info(f"Successfully opened remote Zarr dataset via executor: {url}")
         return ds
     except Exception as e_open:
-        logger.error(f"Error in executor opening dataset from refs for {url}: {e_open!r}", exc_info=True)
+        logger.error(f"Error in executor running _synchronous_kerchunk_open for {url}: {e_open!r}", exc_info=True)
         raise
-    finally:
-        if connector and not connector.closed:
-            pass
 
 
 async def verify_forecast_hash(
