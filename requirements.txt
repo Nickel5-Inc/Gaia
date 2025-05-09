@@ -138,5 +138,5 @@ xskillscore
 metpy
 microsoft-aurora
 jwt
-kerchunk
+kerchunk==0.2.7
 cdsapi
