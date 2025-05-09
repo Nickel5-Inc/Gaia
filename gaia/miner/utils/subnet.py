@@ -37,8 +37,11 @@ MAX_REQUEST_SIZE = 800 * 1024 * 1024  # 800MB
 
 logger = get_logger(__name__)
 
-DEFAULT_FORECAST_DIR = Path("./miner_forecasts/")
-MINER_FORECAST_DIR = Path(os.getenv("MINER_FORECAST_DIR", DEFAULT_FORECAST_DIR))
+current_file_path = Path(__file__).resolve()
+gaia_repo_root = current_file_path.parent.parent.parent.parent 
+
+DEFAULT_FORECAST_DIR = gaia_repo_root / "miner_forecasts_background"
+MINER_FORECAST_DIR = Path(os.getenv("MINER_FORECAST_DIR", str(DEFAULT_FORECAST_DIR))) # Ensure DEFAULT_FORECAST_DIR is str for os.getenv fallback
 MINER_FORECAST_DIR.mkdir(parents=True, exist_ok=True)
 logger.info(f"Serving forecast files from: {MINER_FORECAST_DIR.resolve()}")
 

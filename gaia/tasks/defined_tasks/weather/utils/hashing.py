@@ -8,8 +8,12 @@ import fsspec
 import pickle
 from datetime import datetime
 from pathlib import Path
+import aiohttp
+import asyncio
+from functools import partial
 from .gfs_api import fetch_gfs_analysis_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
 from fiber.logging_utils import get_logger
+import urllib.parse
 
 logger = get_logger(__name__)
 
@@ -240,25 +244,115 @@ def compute_verification_hash(
     return hash_obj.hexdigest()
 
 
-async def open_remote_dataset_with_kerchunk(
-    kerchunk_url: str, 
-    variables: Optional[List[str]] = None,
-    timesteps: Optional[List[int]] = None
+# This will be run in an executor
+def _sync_open_kerchunk_dataset_from_refs(
+    refs_dict: Dict, 
+    base_url_for_refs: str, # e.g. "https://host:port"
+    remote_protocol_for_refs: str, # e.g. "https"
+    sync_http_options: Dict # Options for the sync HTTPFileSystem
 ) -> xr.Dataset:
-    """
-    Open a remote dataset using kerchunk index.
+    logger.debug(f"SYNC_OPEN: Creating synchronous reference filesystem. Base URL for refs: {base_url_for_refs}, Remote protocol: {remote_protocol_for_refs}")
     
-    Args:
-        kerchunk_url: URL to the kerchunk index JSON
-        variables: Optional list of variables to load
-        timesteps: Optional list of timestep indices to load
-        
-    Returns:
-        xarray Dataset
-    """
-    from gaia.tasks.defined_tasks.weather.weather_scoring.validator_scoring_utils import open_remote_dataset_with_kerchunk
+    parsed_base_url = urllib.parse.urlparse(base_url_for_refs)
     
-    return await open_remote_dataset_with_kerchunk(kerchunk_url, variables, timesteps)
+    final_remote_options = {
+        "host": parsed_base_url.hostname,
+        "port": parsed_base_url.port,
+        "client_kwargs": sync_http_options.get("client_kwargs", {}), 
+        "asynchronous": False,
+    }
+
+    fs_ref_sync = fsspec.filesystem(
+        "reference",
+        fo=refs_dict,
+        remote_protocol=remote_protocol_for_refs, 
+        remote_options=final_remote_options,
+        asynchronous=False 
+    )
+
+    ref_root_mapper_sync = fs_ref_sync.get_mapper("") 
+    
+    logger.debug("SYNC_OPEN: Calling xr.open_dataset (engine='zarr') with sync reference mapper.")
+    ds = xr.open_dataset(ref_root_mapper_sync, engine="zarr", consolidated=False, chunks={})
+    logger.info("SYNC_OPEN: Successfully opened Zarr dataset via sync reference filesystem.")
+    return ds
+
+
+async def open_remote_dataset_with_kerchunk(url: str, variables: List[str], storage_options: Optional[Dict] = None) -> xr.Dataset:
+    logger.info(f"Attempting to open remote Kerchunk dataset (async fetch, sync open): {url} with storage_options: {storage_options is not None}")
+    
+    session_headers = None
+    if storage_options and 'headers' in storage_options:
+        session_headers = storage_options['headers']
+
+    logger.warning("SSL certificate verification is DISABLED for initial JSON fetch (using aiohttp.TCPConnector(ssl=False)). FOR TESTING ONLY.")
+    
+    current_loop = asyncio.get_running_loop()
+    connector = aiohttp.TCPConnector(ssl=False, loop=current_loop) 
+    
+    refs_dict: Optional[Dict] = None
+
+    async with aiohttp.ClientSession(connector=connector, headers=session_headers, loop=current_loop) as session:
+        try:
+            protocol_for_main_json = url.split("://")[0]
+            if protocol_for_main_json not in ['http', 'https']:
+                protocol_for_main_json = 'https'
+
+            async def get_client_override(loop=None, **kwargs_passed_by_fsspec):
+                return session
+            
+            fs_http_async = fsspec.filesystem(
+                protocol_for_main_json,
+                asynchronous=True,
+                get_client=get_client_override,
+                loop=current_loop
+            )
+            await fs_http_async.set_session()
+
+            logger.debug(f"Fetching Kerchunk JSON content from: {url} using fs_http_async._cat_file")
+            json_content_bytes = await fs_http_async._cat_file(url)
+            refs_dict = json.loads(json_content_bytes.decode())
+            logger.debug(f"Successfully fetched and parsed Kerchunk JSON from {url}")
+
+        except Exception as e_fetch:
+            logger.error(f"Error fetching main Kerchunk JSON from {url}: {e_fetch!r}", exc_info=True)
+            if connector and not connector.closed:
+                 await connector.close()
+            raise 
+
+    if refs_dict is None:
+        if connector and not connector.closed:
+            await connector.close()
+        raise IOError(f"Failed to fetch or parse main Kerchunk JSON from {url}")
+
+    parsed_main_json_url = urllib.parse.urlparse(url)
+    base_url_for_chunks = f"{parsed_main_json_url.scheme}://{parsed_main_json_url.netloc}"
+
+    sync_http_fs_options = {
+        "client_kwargs": {
+            "headers": session_headers or {},
+            "verify": False
+        }
+    }
+
+    try:
+        logger.debug(f"Calling _sync_open_kerchunk_dataset_from_refs for {url} in executor...")
+        ds = await current_loop.run_in_executor(
+            None,  
+            _sync_open_kerchunk_dataset_from_refs, 
+            refs_dict, 
+            base_url_for_chunks,
+            parsed_main_json_url.scheme,
+            sync_http_fs_options
+        )
+        logger.info(f"Successfully opened remote Zarr dataset via sync reference FS in executor: {url}")
+        return ds
+    except Exception as e_open:
+        logger.error(f"Error in executor opening dataset from refs for {url}: {e_open!r}", exc_info=True)
+        raise
+    finally:
+        if connector and not connector.closed:
+            pass
 
 
 async def verify_forecast_hash(
@@ -266,7 +360,8 @@ async def verify_forecast_hash(
     claimed_hash: str,
     metadata: Dict[str, Any],
     variables: List[str],
-    timesteps: List[int]
+    timesteps: List[int],
+    headers: Optional[Dict[str, str]] = None
 ) -> bool:
     """
     Verify a forecast hash against a claimed value (validator-side).
@@ -277,12 +372,18 @@ async def verify_forecast_hash(
         metadata: Dictionary with forecast metadata 
         variables: List of variables to include in hash
         timesteps: List of timestep indices to include in hash
+        headers: Optional dictionary of headers to use for the request (e.g., for auth)
         
     Returns:
         Boolean indicating whether the hash is verified
     """
+    storage_options = {}
+    if headers:
+        storage_options['headers'] = headers
+
     try:
-        ds = await open_remote_dataset_with_kerchunk(kerchunk_url, variables)
+        logger.debug(f"Calling open_remote_dataset_with_kerchunk with URL: {kerchunk_url} and headers: {headers is not None}")
+        ds = await open_remote_dataset_with_kerchunk(kerchunk_url, variables, storage_options=storage_options if storage_options else None)
     except Exception as e:
         print(f"Error opening dataset: {e}")
         return False

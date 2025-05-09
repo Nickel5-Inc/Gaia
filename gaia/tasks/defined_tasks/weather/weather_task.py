@@ -819,7 +819,7 @@ class WeatherTask(Task):
             
             if not job:
                 logger.warning(f"Job not found for job_id: {job_id}")
-                return {"status": "error", "message": f"Job with ID {job_id} not found"}
+                return {"status": "not_found", "message": f"Job with ID {job_id} not found"}
                 
             if job["status"] == "completed":
                 netcdf_path = job["target_netcdf_path"]
@@ -830,7 +830,7 @@ class WeatherTask(Task):
                     logger.error(f"Job {job_id} completed but missing required path/hash info.")
                     return {"status": "error", "message": "Job completed but data paths or hash missing"}
                     
-                filename = os.path.basename(netcdf_path)
+                filename_for_jwt_claim = os.path.basename(kerchunk_path_str)
                 
                 miner_jwt_secret_key = self.config.get('miner_jwt_secret_key', os.getenv("MINER_JWT_SECRET_KEY"))
                 if not miner_jwt_secret_key:
@@ -841,7 +841,7 @@ class WeatherTask(Task):
                 
                 token_data = {
                     "job_id": job_id,
-                    "file_path": filename, 
+                    "file_path": filename_for_jwt_claim,
                     "exp": datetime.now(timezone.utc) + timedelta(minutes=token_expire_minutes)
                 }
                 
@@ -851,12 +851,12 @@ class WeatherTask(Task):
                     algorithm=jwt_algorithm
                 )
                 
-                kerchunk_url = f"/forecasts/{os.path.basename(kerchunk_path_str)}"
+                kerchunk_url_for_response = f"/forecasts/{os.path.basename(kerchunk_path_str)}"
                 
                 return {
                     "status": "completed",
                     "message": "Forecast completed and ready for access",
-                    "kerchunk_json_url": kerchunk_url,
+                    "kerchunk_json_url": kerchunk_url_for_response,
                     "verification_hash": verification_hash,
                     "access_token": access_token
                 }
@@ -869,7 +869,6 @@ class WeatherTask(Task):
         except Exception as e:
             logger.error(f"Error handling kerchunk request for job_id {job_id}: {e}", exc_info=True)
             return {"status": "error", "message": f"Failed to process request: {str(e)}"}
-
 
     async def handle_initiate_fetch(self, request_data: 'WeatherInitiateFetchData') -> Dict[str, Any]:
         """

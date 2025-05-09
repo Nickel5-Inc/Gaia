@@ -137,6 +137,6 @@ fiber[full] @ git+https://github.com/rayonlabs/fiber.git@production
 xskillscore
 metpy
 microsoft-aurora
-jwt
+PyJWT~=2.8.0
 kerchunk==0.2.7
 cdsapi

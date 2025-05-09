@@ -11,10 +11,12 @@ import pandas as pd
 import fsspec
 import jwt
 import traceback
+import ipaddress
 from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple
 if TYPE_CHECKING:
     from ..weather_task import WeatherTask
 from ..utils.era5_api import fetch_era5_data
+from ..utils.gfs_api import fetch_gfs_analysis_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
 from ..weather_scoring.ensemble import _open_dataset_lazily, ALL_EXPECTED_VARIABLES
 from ..weather_scoring.metrics import calculate_rmse
 from ..weather_scoring_mechanism import calculate_era5_ensemble_score
@@ -222,11 +224,12 @@ async def _trigger_initial_scoring(task_instance: 'WeatherTask', run_id: int):
 async def _request_fresh_token(task_instance, miner_hotkey: str, job_id: str) -> Optional[Tuple[str, str, str]]:
     """Requests a fresh JWT from the miner for a given job_id."""
     logger.info(f"[VerifyLogic] Requesting fresh token for job {job_id} from miner {miner_hotkey[:12]}...")
+                                                          
     kerchunk_request_payload = {
         "nonce": str(uuid.uuid4()),
-        "data": {"job_id": job_id}
+        "data": {"job_id": job_id} 
     }
-    endpoint_to_call = "/weather-kerchunk-request"
+    endpoint_to_call = "/weather-kerchunk-request" 
 
     try:
         all_responses = await task_instance.validator.query_miners(
@@ -245,15 +248,44 @@ async def _request_fresh_token(task_instance, miner_hotkey: str, job_id: str) ->
                 miner_response_data = json.loads(response_dict['text'])
                 if miner_response_data.get("status") == "completed":
                     token = miner_response_data.get("access_token")
-                    kerchunk_url = miner_response_data.get("kerchunk_json_url") # This is relative to miner's host
+                    kerchunk_url = miner_response_data.get("kerchunk_json_url") 
                     verification_hash = miner_response_data.get("verification_hash")
                     
                     if token and kerchunk_url and verification_hash:
                         logger.info(f"[VerifyLogic] Successfully received token, kerchunk URL, and hash for job {job_id} from {miner_hotkey[:12]}.")
-                        # The kerchunk_url from miner is relative, need the miner's base IP/port.
-                        miner_base_url = f"https://{response_dict['ip']}:{response_dict['port']}"
-                        full_kerchunk_url = f"{miner_base_url}{kerchunk_url}"
-                        return token, full_kerchunk_url, verification_hash
+                        try:
+                            ip_val = response_dict['ip']
+                            port_val = response_dict['port']
+                            
+                            ip_str: str
+                            if isinstance(ip_val, int):
+                                ip_str = str(ipaddress.ip_address(ip_val))
+                                logger.info(f"[VerifyLogic] Converted integer IP {ip_val} to string '{ip_str}' for miner {miner_hotkey[:12]}.")
+                            elif isinstance(ip_val, str):
+                                try:
+                                    ip_as_int = int(ip_val)
+                                    ip_str = str(ipaddress.ip_address(ip_as_int))
+                                    logger.info(f"[VerifyLogic] Converted string-integer IP '{ip_val}' to string '{ip_str}' for miner {miner_hotkey[:12]}.")
+                                except ValueError:
+                                    try:
+                                        _ = ipaddress.ip_address(ip_val) 
+                                        ip_str = ip_val 
+                                        logger.info(f"[VerifyLogic] Using provided IP string '{ip_val}' for miner {miner_hotkey[:12]}.")
+                                    except ValueError:
+                                        logger.warning(f"[VerifyLogic] IP value '{ip_val}' for miner {miner_hotkey[:12]} is not a standard IP format. Assuming it's a resolvable hostname.")
+                                        ip_str = ip_val 
+                            else:
+                                logger.error(f"[VerifyLogic] Miner {miner_hotkey[:12]} has unexpected IP type: {type(ip_val)}. Cannot form base URL.")
+                                return None
+
+                            miner_base_url = f"https://{ip_str}:{port_val}"
+                            
+                            full_kerchunk_url = f"{miner_base_url}{kerchunk_url}"
+                            logger.info(f"[VerifyLogic] PRE-RETURN SUCCESS: About to return tuple for job {job_id}. Token: {'Yes' if token else 'No'}, URL: {full_kerchunk_url}, Hash: {'Yes' if verification_hash else 'No'}")
+                            return token, full_kerchunk_url, verification_hash
+                        except Exception as e_inner:
+                            logger.error(f"[VerifyLogic] EXCEPTION DURING SUCCESS RETURN PREP for job {job_id}: {e_inner!r}", exc_info=True)
+                            return None
                     else:
                         logger.error(f"[VerifyLogic] Miner {miner_hotkey[:12]} response for job {job_id} missing token, URL, or hash. Data: {miner_response_data}")
                         return None
@@ -271,7 +303,7 @@ async def _request_fresh_token(task_instance, miner_hotkey: str, job_id: str) ->
             return None
 
     except Exception as e:
-        logger.error(f"[VerifyLogic] Error requesting token for job {job_id} from {miner_hotkey[:12]}: {e!r}")
+        logger.error(f"[VerifyLogic] UNHANDLED EXCEPTION in _request_fresh_token for job {job_id} from {miner_hotkey[:12]}: {e!r}")
         logger.debug(traceback.format_exc())
         return None
 
@@ -383,70 +415,52 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
     gfs_init_time = run_details['gfs_init_time_utc']
     response_id = response_details['id']
     miner_hotkey = response_details['miner_hotkey']
-    job_id = response_details.get('job_id') or f"forecast_{gfs_init_time.strftime('%Y%m%d%H')}_{miner_hotkey[:8]}"
+    job_id = response_details.get('job_id') 
     
-    logger.info(f"[VerifyLogic] Verifying response {response_id} from {miner_hotkey} (Job: {job_id})")
-    kerchunk_json_url = None
-    verification_hash_claimed = None
+    if not job_id: 
+        logger.error(f"[VerifyLogic, Resp {response_id}] Missing job_id in response_details for miner {miner_hotkey}. Cannot verify.")
+        await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Internal: Missing job_id for verification' WHERE id = :id", {"id": response_id})
+        return 
+
+    logger.info(f"[VerifyLogic] Verifying response {response_id} from {miner_hotkey} (Miner Job ID: {job_id})")
+    
     access_token = None
     full_kerchunk_url = None
+    verification_hash_claimed = None
     
     try:
-        kerchunk_response = await _request_fresh_token(task_instance, miner_hotkey, job_id)
+        token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, job_id)
  
-        if not kerchunk_response or 'access_token' not in kerchunk_response:
+        if token_data_tuple is None: 
+            logger.error(f"[VerifyLogic, Resp {response_id}] _request_fresh_token returned None for {miner_hotkey} (Miner Job: {job_id}).")
             raise ValueError(f"Failed to get access token for {miner_hotkey} job {job_id}")
-        access_token = kerchunk_response['access_token']
-        
-        logger.debug(f"[VerifyLogic] Fetching full Kerchunk details for job {job_id}")
-        kerchunk_request_payload = {"nonce": str(uuid.uuid4()), "data": {"job_id": job_id}}
-        full_kerchunk_details = await task_instance.validator.query_miner(
-                miner_hotkey=miner_hotkey,
-                payload=kerchunk_request_payload,
-                endpoint="/weather-kerchunk-request"
-            )
-        if not full_kerchunk_details or full_kerchunk_details.get("status") != "completed":
-            raise ValueError(f"Failed to get completed Kerchunk details. Status: {full_kerchunk_details.get('status')}")
-        kerchunk_json_url = full_kerchunk_details.get("kerchunk_json_url")
-        verification_hash_claimed = full_kerchunk_details.get("verification_hash")
-        if not kerchunk_json_url or not verification_hash_claimed:
-             raise ValueError("Missing Kerchunk URL or Hash in miner response")
+
+        access_token, full_kerchunk_url, verification_hash_claimed = token_data_tuple
+        logger.info(f"[VerifyLogic, Resp {response_id}] Successfully unpacked token data tuple. Token: {'Yes' if access_token else 'No'}, URL: {full_kerchunk_url}, Hash: {'Yes' if verification_hash_claimed else 'No'}")
             
+        if not all([access_token, full_kerchunk_url, verification_hash_claimed]):
+            logger.error(f"[VerifyLogic, Resp {response_id}] One or more critical items (token, URL, hash) are None/empty after unpacking. Token: {'Set' if access_token else 'Not Set'}, URL: {full_kerchunk_url}, Hash: {'Set' if verification_hash_claimed else 'Not Set'}")
+            raise ValueError("Critical information (token, URL, or hash) missing after token request.")
+
         validator_instance = task_instance.validator 
         if not validator_instance or not hasattr(validator_instance, 'metagraph') or not validator_instance.metagraph:
              logger.error(f"[VerifyLogic, Resp {response_id}] Validator instance or its metagraph is not available.")
              await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Validator metagraph unavailable' WHERE id = :id", {"id": response_id})
-             raise ValueError(f"Metagraph data unavailable for miner {miner_hotkey} lookup")
+             return 
 
-        node_info = validator_instance.metagraph.nodes.get(miner_hotkey) 
-
-        if not node_info:
-            logger.error(f"[VerifyLogic, Resp {response_id}] Could not find node info for hotkey {miner_hotkey} in validator's metagraph.")
-            await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Miner not found in metagraph' WHERE id = :id", {"id": response_id})
-            return
-
-        if not node_info.ip or not hasattr(node_info, 'port') or node_info.port is None:
-             logger.error(f"[VerifyLogic, Resp {response_id}] Node info for {miner_hotkey} is missing IP or Port details in metagraph.")
-             await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Metagraph missing IP/Port for miner' WHERE id = :id", {"id": response_id})
-             return
-
-        # TODO: Consider using node_info.protocol or config to determine http vs https scheme?
-        miner_url = f"https://{node_info.ip}:{node_info.port}"
-        full_kerchunk_url = f"{miner_url.rstrip('/')}{kerchunk_json_url}"
-            
         await task_instance.db_manager.execute("""
             UPDATE weather_miner_responses
-            SET kerchunk_json_url = :url, verification_hash_claimed = :hash, status = 'verifying'
+            SET kerchunk_json_url = :url, verification_hash_claimed = :hash, status = 'verifying_hash'
             WHERE id = :id
         """, {"id": response_id, "url": full_kerchunk_url, "hash": verification_hash_claimed})
 
-        logger.info(f"[VerifyLogic, Resp {response_id}] Verifying hash...")
-        from ..utils.hashing import verify_forecast_hash
+        logger.info(f"[VerifyLogic, Resp {response_id}] Verifying hash for URL: {full_kerchunk_url}...")
+        from ..utils.hashing import verify_forecast_hash 
         variables_to_check = ALL_EXPECTED_VARIABLES 
         metadata = {"time": [gfs_init_time], "source_model": "aurora", "resolution": 0.25}
         headers = {"Authorization": f"Bearer {access_token}"}
         timesteps = list(range(task_instance.config.get('inference_steps', 40)))
-        verification_timeout = task_instance.config.get('verification_timeout_seconds', 120)
+        verification_timeout_seconds = task_instance.config.get('verification_timeout_seconds', 120)
         
         verification_result = await asyncio.wait_for(
             verify_forecast_hash(
@@ -454,21 +468,23 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
                 metadata=metadata, variables=variables_to_check,
                 timesteps=timesteps, headers=headers
             ),
-            timeout=verification_timeout
+            timeout=verification_timeout_seconds
         )
         
-        new_status = "verified" if verification_result else "verification_failed"
+        new_status = "verified_success" if verification_result else "verified_failed_hash_mismatch"
         await task_instance.db_manager.execute("""
-            UPDATE weather_miner_responses SET verification_passed = :verified, status = :new_status WHERE id = :id
+            UPDATE weather_miner_responses SET verification_passed = :verified, status = :new_status
+            WHERE id = :id
         """, {"id": response_id, "verified": verification_result, "new_status": new_status})
         logger.info(f"[VerifyLogic, Resp {response_id}] Hash verification {'succeeded' if verification_result else 'failed'}.")
         
     except asyncio.TimeoutError:
-        logger.error(f"[VerifyLogic, Resp {response_id}] Verification timed out for {miner_hotkey}.")
-        await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_timeout' WHERE id = :id", {"id": response_id})
+        logger.error(f"[VerifyLogic, Resp {response_id}] Verification timed out for {miner_hotkey} (Miner Job: {job_id}).")
+        await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_timeout', error_message = 'Verification process timed out' WHERE id = :id", {"id": response_id})
     except Exception as err:
-        logger.error(f"[VerifyLogic, Resp {response_id}] Error verifying response from {miner_hotkey}: {err}", exc_info=True)
+        logger.error(f"[VerifyLogic, Resp {response_id}] Error verifying response from {miner_hotkey} (Miner Job: {job_id}): {err!r}", exc_info=True) 
         await task_instance.db_manager.execute("""
-            UPDATE weather_miner_responses SET status = 'verification_error', error_message = :msg WHERE id = :id
+            UPDATE weather_miner_responses SET status = 'verification_error', error_message = :msg 
+            WHERE id = :id
         """, {"id": response_id, "msg": str(err)})
         

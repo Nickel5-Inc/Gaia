@@ -477,7 +477,8 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                 base_time = pd.to_datetime(gfs_init_time_utc)
 
                 for i, batch_step in enumerate(selected_predictions_cpu):
-                    lead_time_hours = (i * 12) + 12
+                    forecast_step_h = task_instance.config.get('forecast_step_hours', 6)
+                    lead_time_hours = (i + 1) * forecast_step_h 
                     forecast_time = base_time + timedelta(hours=lead_time_hours)
 
                     if not isinstance(batch_step, Batch):
@@ -536,8 +537,20 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                 filename_json = f"{os.path.splitext(filename_nc)[0]}.json"
                 output_json_path = MINER_FORECAST_DIR_BG / filename_json
 
-                h5chunks = SingleHdf5ToZarr(str(output_nc_path), inline_threshold=100)
-                kerchunk_metadata = h5chunks.translate()
+                miner_public_base_url = task_instance.config.get('miner_public_base_url')
+                target_url_for_nc_refs: str
+                if miner_public_base_url:
+                    target_url_for_nc_refs = f"{miner_public_base_url.rstrip('/')}/forecasts/{filename_nc}"
+                    logger.info(f"[InferenceTask Job {job_id}] Using discovered public base URL for Kerchunk refs: {miner_public_base_url}")
+                else:
+                    target_url_for_nc_refs = f"/forecasts/{filename_nc}" 
+                    logger.warning(f"[InferenceTask Job {job_id}] Miner public base URL not available. Kerchunk refs will be relative: {target_url_for_nc_refs}")
+                
+                logger.info(f"[InferenceTask Job {job_id}] Generating Kerchunk JSON. Source NC: {output_nc_path}, Target URL for NC references: {target_url_for_nc_refs}")
+                with open(output_nc_path, 'rb') as fobj:
+                    h5chunks = SingleHdf5ToZarr(fobj, target_url_for_nc_refs, inline_threshold=100)
+                    kerchunk_metadata = h5chunks.translate()
+                
                 with open(output_json_path, 'w') as f:
                     json.dump(kerchunk_metadata, f)
                 logger.info(f"[InferenceTask Job {job_id}] Generated Kerchunk JSON: {output_json_path}")
@@ -551,8 +564,8 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                 data_for_hash = {"surf_vars": {}, "atmos_vars": {}}
                 for var_name in combined_forecast_ds.data_vars:
                      if var_name in CANONICAL_VARS_FOR_HASHING:
-                          is_surface = len(combined_forecast_ds[var_name].dims) == 3 # time, lat, lon
-                          is_atmos = len(combined_forecast_ds[var_name].dims) == 4 # time, level, lat, lon
+                          is_surface = len(combined_forecast_ds[var_name].dims) == 3 
+                          is_atmos = len(combined_forecast_ds[var_name].dims) == 4 
                           if is_surface:
                                data_for_hash["surf_vars"][var_name] = combined_forecast_ds[var_name].values[np.newaxis, ...]
                           elif is_atmos:

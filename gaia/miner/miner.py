@@ -8,7 +8,7 @@ from fiber.logging_utils import get_logger
 from fiber.encrypted.miner import server
 from fiber.encrypted.miner.core import configuration
 from fiber.encrypted.miner.middleware import configure_extra_logging_middleware
-from fiber.chain import chain_utils
+from fiber.chain import chain_utils, fetch_nodes
 from gaia.miner.utils.subnet import factory_router
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
@@ -20,6 +20,8 @@ from fiber import logging_utils
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import asyncio
+import ipaddress
+from typing import Optional
 
 MAX_REQUEST_SIZE = 800 * 1024 * 1024  # 800MB
 
@@ -35,6 +37,10 @@ class Miner:
     def __init__(self, args):
         self.args = args
         self.logger = get_logger(__name__)
+        self.my_public_ip_str: Optional[str] = None
+        self.my_public_port: Optional[int] = None
+        self.my_public_protocol: Optional[str] = None
+        self.my_public_base_url: Optional[str] = None
 
         # Load environment variables
         load_dotenv("dev.env")
@@ -71,7 +77,10 @@ class Miner:
             await self.database_manager.initialize_database() 
             
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(init_db())
+        if loop.is_running():
+            asyncio.ensure_future(init_db()) 
+        else:
+            loop.run_until_complete(init_db())
         
         self.geomagnetic_task = GeomagneticTask(
             node_type="miner",
@@ -91,32 +100,106 @@ class Miner:
         Set up the miner neuron with necessary configurations and connections.
         """
         self.logger.info("Setting up miner neuron...")
-        self.keypair = chain_utils.load_hotkey_keypair(self.wallet, self.hotkey)
-        
-        config = configuration.factory_config()
-        config.keypair = self.keypair
-        config.min_stake_threshold = float(os.getenv("MIN_STAKE_THRESHOLD", 5))
-        config.netuid = self.netuid
-        config.subtensor_network = self.subtensor_network
-        config.chain_endpoint = self.subtensor_chain_endpoint
-        self.config = config
+        try: 
+            self.keypair = chain_utils.load_hotkey_keypair(self.wallet, self.hotkey)
+            
+            config = configuration.factory_config() 
+            config.keypair = self.keypair
+            config.min_stake_threshold = float(os.getenv("MIN_STAKE_THRESHOLD", 5))
+            config.netuid = self.netuid
+            config.subtensor_network = self.subtensor_network 
+            config.chain_endpoint = self.subtensor_chain_endpoint
+            self.config = config
+            
+            if hasattr(self.weather_task, 'config') and self.weather_task.config is not None:
+                self.weather_task.config['netuid'] = self.netuid
+                self.weather_task.config['chain_endpoint'] = self.subtensor_chain_endpoint
+                if 'miner_public_base_url' not in self.weather_task.config:
+                     self.weather_task.config['miner_public_base_url'] = None
+            else:
+                self.weather_task.config = {
+                    'netuid': self.netuid,
+                    'chain_endpoint': self.subtensor_chain_endpoint,
+                    'miner_public_base_url': None
+                }
+            self.weather_task.keypair = self.keypair
 
-        self.logger.debug(
-            f"""
-Detailed Neuron Configuration:
-----------------------------
-Wallet Path: {self.wallet}
-Hotkey Path: {self.hotkey}
-Keypair SS58 Address: {self.keypair.ss58_address}
-Keypair Public Key: {self.keypair.public_key}
-Subtensor Chain Endpoint: {self.subtensor_chain_endpoint}
-Network: {self.subtensor_network}
-Port: {self.port}
-Min Stake Threshold: {config.min_stake_threshold}
-        """
-        )
+            self.logger.debug(
+                f"""
+    Detailed Neuron Configuration Initialized:
+    ----------------------------
+    Wallet Path: {self.wallet}
+    Hotkey Path: {self.hotkey}
+    Keypair SS58 Address: {self.keypair.ss58_address}
+    Keypair Public Key: {self.keypair.public_key}
+    Subtensor Chain Endpoint: {self.subtensor_chain_endpoint}
+    Network: {self.subtensor_network}
+    FastAPI Port (serving on): {self.port}
+    Target Netuid: {self.netuid}
+            """
+            )
 
-        return True
+            substrate_for_check = None
+            try:
+                self.logger.info("MINER_SELF_CHECK: Attempting to fetch own registered axon info...")
+                endpoint_to_use = self.config.chain_endpoint 
+                
+                substrate_for_check = SubstrateInterface(url=endpoint_to_use)
+                
+                all_nodes = fetch_nodes.get_nodes_for_netuid(substrate_for_check, self.netuid)
+                found_own_node = None
+                for node_info_from_list in all_nodes:
+                    if node_info_from_list.hotkey == self.keypair.ss58_address:
+                        found_own_node = node_info_from_list
+                        break
+                
+                if found_own_node:
+                    self.logger.info(f"MINER_SELF_CHECK: Found own node info in metagraph. Raw IP from node object: '{found_own_node.ip}', Port: {found_own_node.port}, Protocol: {found_own_node.protocol}")
+                    ip_to_convert = found_own_node.ip
+                    try:
+                        if isinstance(ip_to_convert, str) and ip_to_convert.isdigit():
+                            self.my_public_ip_str = str(ipaddress.ip_address(int(ip_to_convert)))
+                        elif isinstance(ip_to_convert, int):
+                             self.my_public_ip_str = str(ipaddress.ip_address(ip_to_convert))
+                        else: 
+                             ipaddress.ip_address(ip_to_convert)
+                             self.my_public_ip_str = ip_to_convert 
+                        
+                        self.my_public_port = int(found_own_node.port)
+                        self.my_public_protocol = "https" if int(found_own_node.protocol) == 4 else "http"
+                        if int(found_own_node.protocol) not in [3,4]:
+                             self.logger.warning(f"MINER_SELF_CHECK: Registered axon protocol is {found_own_node.protocol} (int: {int(found_own_node.protocol)}), not HTTP(3) or HTTPS(4). Using '{self.my_public_protocol}'.")
+
+                        self.my_public_base_url = f"{self.my_public_protocol}://{self.my_public_ip_str}:{self.my_public_port}"
+                        
+                        self.logger.info(f"MINER_SELF_CHECK: Stored Public IP: {self.my_public_ip_str}")
+                        self.logger.info(f"MINER_SELF_CHECK: Stored Public Port: {self.my_public_port}")
+                        self.logger.info(f"MINER_SELF_CHECK: Stored Public Protocol: {self.my_public_protocol}")
+                        self.logger.info(f"MINER_SELF_CHECK: Stored Public Base URL: {self.my_public_base_url}")
+                        
+                        if hasattr(self.weather_task, 'config') and self.weather_task.config is not None:
+                            self.weather_task.config['miner_public_base_url'] = self.my_public_base_url
+                            self.logger.info(f"MINER_SELF_CHECK: Updated WeatherTask config with miner_public_base_url: {self.my_public_base_url}")
+                        else:
+                            self.logger.warning("MINER_SELF_CHECK: WeatherTask.config not found or is None, cannot set miner_public_base_url.")
+
+                    except ValueError as e_ip_conv:
+                        self.logger.error(f"MINER_SELF_CHECK: Could not convert/validate IP '{ip_to_convert}' to standard string: {e_ip_conv}. Public URL not set.")
+                    except Exception as e_node_parse: 
+                        self.logger.error(f"MINER_SELF_CHECK: Error parsing axon details from node_info: {e_node_parse}", exc_info=False)
+                else:
+                    self.logger.warning(f"MINER_SELF_CHECK: Hotkey {self.keypair.ss58_address} not found in metagraph. Public URL not set.")
+            except Exception as e_check:
+                self.logger.error(f"MINER_SELF_CHECK: Error fetching own axon info: {e_check}", exc_info=False) 
+            finally:
+                if substrate_for_check:
+                    substrate_for_check.close()
+                    self.logger.debug("MINER_SELF_CHECK: Substrate connection for self-check closed.")
+
+            return True
+        except Exception as e_outer_setup: 
+            self.logger.error(f"Outer error in setup_neuron: {e_outer_setup}", exc_info=True)
+            return False
 
     def run(self):
         """
@@ -124,8 +207,13 @@ Min Stake Threshold: {config.min_stake_threshold}
         """
         try:
             if not self.setup_neuron():
-                self.logger.error("Failed to setup neuron")
+                self.logger.error("Failed to setup neuron, exiting...")
                 return
+            
+            if self.my_public_base_url:
+                self.logger.info(f"Miner public base URL for Kerchunk determined as: {self.my_public_base_url}")
+            else:
+                self.logger.warning("Miner public base URL could not be determined. Kerchunk JSONs may use relative paths.")
 
             self.logger.info("Starting miner server...")
             app = server.factory_app(debug=True)
