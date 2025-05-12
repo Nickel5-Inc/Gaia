@@ -7,6 +7,7 @@ from pathlib import Path
 from fiber.logging_utils import get_logger
 from functools import wraps
 import time
+import os # Ensure os is imported for getenv
 
 logger = get_logger(__name__)
 
@@ -61,13 +62,29 @@ class MinerDatabaseManager(BaseDatabaseManager):
     ):
         """Initialize the miner database manager (only once)."""
         if not hasattr(self, '_initialized'):
+            # Resolve parameters: Use environment variables if set, otherwise use constructor defaults.
+            # load_dotenv() should have been called by the main Miner class before this is instantiated.
+            db_name_resolved = os.getenv("MINER_DB_NAME", database)
+            db_host_resolved = os.getenv("MINER_DB_HOST", host)
+            db_port_resolved = int(os.getenv("MINER_DB_PORT", str(port))) # Ensure port is int
+            db_user_resolved = os.getenv("MINER_DB_USER", user)
+            db_password_resolved = os.getenv("MINER_DB_PASSWORD", password)
+
+            # Log which DB parameters are being used
+            logger.info(f"MinerDatabaseManager connecting with: host='{db_host_resolved}', port={db_port_resolved}, db='{db_name_resolved}', user='{db_user_resolved}'")
+            if db_password_resolved and db_password_resolved != password: # Only log if different from default, for slight security
+                logger.info("MinerDatabaseManager using a custom password from environment.")
+            elif not db_password_resolved and password:
+                logger.info("MinerDatabaseManager using default password as MINER_DB_PASSWORD env var is not set.")
+
+
             super().__init__(
                 node_type="miner",
-                database=database,
-                host=host,
-                port=port,
-                user=user,
-                password=password,
+                database=db_name_resolved,
+                host=db_host_resolved,
+                port=db_port_resolved,
+                user=db_user_resolved,
+                password=db_password_resolved,
             )
             # Operation statistics for monitoring
             self._operation_stats = {

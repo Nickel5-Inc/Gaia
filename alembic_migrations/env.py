@@ -6,12 +6,15 @@ logger = get_logger(__name__)
 from sqlalchemy import pool
 from sqlalchemy import create_engine # Changed from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 import sqlalchemy as sa # Added
-# from sqlalchemy import MetaData # No longer need a generic one here
+from sqlalchemy.schema import MetaData # Import MetaData for combining
 
 from alembic import context
 
-# Import the MetaData object from your new schema file
-from gaia.database.validator_schema import validator_metadata # Updated
+# Import the MetaData object from your validator schema file
+from gaia.database.validator_schema import validator_metadata
+
+# Import the Base for miner-specific tables
+from gaia.database.miner_schema import MinerBase as MinerSpecificBase
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -22,11 +25,25 @@ config = context.config
 # if config.config_file_name is not None: # Keep commented out to prevent hang
 #     fileConfig(config.config_file_name)  # Keep commented out
 
-# add your model's MetaData object here
-# for 'autogenerate' support
-# from myapp import mymodel
-# target_metadata = mymodel.Base.metadata
-target_metadata = validator_metadata # Updated
+# --- New combined metadata setup ---
+# Create a new MetaData instance to hold all tables.
+combined_metadata = MetaData()
+
+# Function to add tables from a given metadata object to the combined_metadata
+def include_metadata(source_metadata, target_metadata_obj):
+    if source_metadata is not None:
+        for table in source_metadata.tables.values():
+            table.tometadata(target_metadata_obj)
+
+# Include tables from the validator schema
+include_metadata(validator_metadata, combined_metadata)
+
+# Include tables from the miner schema
+# (MinerSpecificBase.metadata contains the tables defined using MinerBase)
+include_metadata(MinerSpecificBase.metadata, combined_metadata)
+
+target_metadata = combined_metadata
+# --- End of new combined metadata setup ---
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:

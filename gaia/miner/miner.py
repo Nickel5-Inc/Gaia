@@ -1,5 +1,6 @@
 import os
-import traceback
+import sys  # Add sys import
+import traceback # Add traceback import
 from dotenv import load_dotenv
 import argparse
 from fiber import SubstrateInterface
@@ -23,8 +24,14 @@ import asyncio
 import ipaddress
 from typing import Optional
 
+# Imports for Alembic check
+from alembic.config import Config # Add Alembic import
+from alembic import command # Add Alembic import
+from alembic.util import CommandError # Add Alembic import
+
 MAX_REQUEST_SIZE = 800 * 1024 * 1024  # 800MB
 
+logger = get_logger(__name__)
 
 os.environ["NODE_TYPE"] = "miner"
 
@@ -43,33 +50,49 @@ class Miner:
         self.my_public_base_url: Optional[str] = None
 
         # Load environment variables
-        load_dotenv("dev.env")
+        load_dotenv(".env")
 
-        # Load wallet and network settings from args or env
+        # Load wallet and network settings from args or env (CLI > ENV > Default)
         self.wallet = (
-            args.wallet if args.wallet else os.getenv("WALLET_NAME", "default")
+            args.wallet if args.wallet is not None else os.getenv("WALLET_NAME", "default")
         )
         self.hotkey = (
-            args.hotkey if args.hotkey else os.getenv("HOTKEY_NAME", "default")
+            args.hotkey if args.hotkey is not None else os.getenv("HOTKEY_NAME", "default")
         )
-        self.netuid = args.netuid if args.netuid else int(os.getenv("NETUID", 237))
-        self.port = args.port if args.port else int(os.getenv("PORT", 8091))
-        # Load chain endpoint from args or env
+        self.netuid = (
+            args.netuid if args.netuid is not None else int(os.getenv("NETUID", 237))
+        )
+        self.port = (
+            args.port if args.port is not None else int(os.getenv("PORT", 8091))
+        )
+        
+        # Load chain endpoint from args or env (CLI > ENV > Default)
+        # Check if args.subtensor and args.subtensor.chain_endpoint exist and were provided via CLI
+        cli_chain_endpoint = None
+        if hasattr(args, "subtensor") and hasattr(args.subtensor, "chain_endpoint"):
+             cli_chain_endpoint = args.subtensor.chain_endpoint # Will be None if not provided via CLI (due to default=None)
+
         self.subtensor_chain_endpoint = (
-            self.args.subtensor.chain_endpoint
-            if hasattr(self.args, "subtensor")
-            and hasattr(self.args.subtensor, "chain_endpoint")
-            else os.getenv(
-                "SUBTENSOR_ADDRESS", "wss://test.finney.opentensor.ai:443/"
-            )
+             cli_chain_endpoint if cli_chain_endpoint is not None
+             else os.getenv("SUBTENSOR_ADDRESS", "wss://test.finney.opentensor.ai:443/")
         )
 
+        # Load chain network from args or env (CLI > ENV > Default)
+        cli_network = None
+        if hasattr(args, "subtensor") and hasattr(args.subtensor, "network"):
+            cli_network = args.subtensor.network # Will be None if not provided via CLI
+
         self.subtensor_network = (
-            self.args.subtensor.network
-            if hasattr(self.args, "subtensor")
-            and hasattr(self.args.subtensor, "network")
-            else os.getenv("SUBTENSOR_NETWORK", "test")
+             cli_network if cli_network is not None
+             else os.getenv("SUBTENSOR_NETWORK", "test")
         )
+
+        logger.info(f"Subtensor network: {self.subtensor_network}")
+        logger.info(f"Subtensor chain endpoint: {self.subtensor_chain_endpoint}")
+        logger.info(f"Subtensor netuid: {self.netuid}")
+        logger.info(f"Subtensor port: {self.port}")
+        logger.info(f" Wallet Name: {self.wallet}")
+        logger.info(f" Hotkey Name: {self.hotkey}")
 
         self.database_manager = MinerDatabaseManager()
         async def init_db():
@@ -94,6 +117,7 @@ class Miner:
             db_manager=self.database_manager,
             node_type="miner"
         )
+    
 
     def setup_neuron(self) -> bool:
         """
@@ -293,35 +317,71 @@ class Miner:
 
 
 if __name__ == "__main__":
-    # Add arguments
+    # Load environment variables *before* anything else (like Alembic check)
+    load_dotenv(".env")
+
+    # --- Alembic check code ---
+    # Copied from validator.py
+    try:
+        # Use print here as logger might not be fully setup yet
+        print("[Startup] Checking database schema version using Alembic...")
+        # Construct path relative to this script file to find alembic.ini at project root
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(script_dir, "..", "..")) # Assumes script is in gaia/miner/
+        alembic_ini_path = os.path.join(project_root, "alembic.ini")
+
+        if not os.path.exists(alembic_ini_path):
+            print(f"[Startup] ERROR: alembic.ini not found at expected path: {alembic_ini_path}")
+            sys.exit("Alembic configuration not found.")
+
+        alembic_cfg = Config(alembic_ini_path)
+        # Ensure alembic.ini is accessible from the miner's execution context
+        # If miner runs from a different directory, adjust the path to alembic.ini
+        command.upgrade(alembic_cfg, "head")
+        print("[Startup] Database schema is up-to-date.")
+    except CommandError as e:
+         # Use print here as well
+         print(f"[Startup] ERROR: Alembic command failed during startup check: {e}")
+         print("[Startup] ERROR: Please ensure the database is accessible and migrations are correct.")
+         sys.exit("Database migration/check failed.") # Exit directly
+    except Exception as e:
+        print(f"[Startup] ERROR: Failed to check/upgrade database schema during startup: {e}")
+        traceback.print_exc() # Print full traceback for unexpected errors
+        sys.exit("Database schema check failed.")
+    # --- End Alembic check ---
+
+    logger.info("Miner Alembic check complete. Starting main miner application...") # Keep this log message after the check
+    
+    # --- Argument Parsing ---
     parser = argparse.ArgumentParser(description="Start the miner with optional flags.")
+    
+    # Wallet and network arguments
+    parser.add_argument("--wallet", type=str, default=None, help="Name of the wallet to use (overrides WALLET_NAME env var)")
+    parser.add_argument("--hotkey", type=str, default=None, help="Name of the hotkey to use (overrides HOTKEY_NAME env var)")
+    parser.add_argument("--netuid", type=int, default=None, help="Netuid to use (overrides NETUID env var)")
+
+    # Optional arguments
+    parser.add_argument("--port", type=int, default=None, help="Port to run the miner on (overrides PORT env var)")
+    parser.add_argument("--use_base_model", action="store_true", help="Enable base model usage")
 
     # Create a subtensor group
     subtensor_group = parser.add_argument_group("subtensor")
-
-    # Wallet and network arguments
-    parser.add_argument("--wallet", type=str, help="Name of the wallet to use")
-    parser.add_argument("--hotkey", type=str, help="Name of the hotkey to use")
-    parser.add_argument("--netuid", type=int, help="Netuid to use")
-
-    # Optional arguments
-    parser.add_argument(
-        "--port", type=int, default=8091, help="Port to run the miner on"
-    )
-    parser.add_argument(
-        "--use_base_model", action="store_true", help="Enable base model usage"
-    )
-
     # Subtensor arguments
-    subtensor_group.add_argument(
-        "--subtensor.chain_endpoint", type=str, help="Subtensor chain endpoint to use"
-    )
-    subtensor_group.add_argument(
-        "--subtensor.network", type=str, default="test", help="Subtensor network to use"
-    )
+    subtensor_group.add_argument("--subtensor.chain_endpoint", type=str, default=None, help="Subtensor chain endpoint to use (overrides SUBTENSOR_ADDRESS env var)")
+    subtensor_group.add_argument("--subtensor.network", type=str, default=None, help="Subtensor network to use (overrides SUBTENSOR_NETWORK env var)")
 
-    # Parse arguments and start the miner
+    # Parse arguments
     args = parser.parse_args()
+
+    # Instantiate and run the miner
     miner = Miner(args)
-    miner.run()
+
+    try:
+        miner.run() # Assuming miner.run() contains the main logic now, replacing placeholder
+    except KeyboardInterrupt:
+        logger.info("Miner application interrupted. Shutting down...")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in miner main application: {e}", exc_info=True)
+    finally:
+        logger.info("Miner application has finished.")
 

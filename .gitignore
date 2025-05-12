@@ -31,3 +31,9 @@ gfs_analysis_cache/
 db_wipe_trigger
 db_wipe_trigger.executed.*
 gaia/models/checkpoints/*
+
+miner_forecasts_background/*
+ecosystem.config.js
+fiber_debug.log
+
+gaia/models/geomagnetic_model.pkl
