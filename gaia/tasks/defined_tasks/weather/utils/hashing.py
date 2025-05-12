@@ -6,14 +6,21 @@ import numpy as np
 import xarray as xr
 import fsspec
 import pickle
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import aiohttp
 import asyncio
 from functools import partial
+import traceback
 from .gfs_api import fetch_gfs_analysis_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
 from fiber.logging_utils import get_logger
 import urllib.parse
+import requests
+import time
+import logging
+import os
+import psutil
+import ssl
 
 logger = get_logger(__name__)
 
@@ -21,9 +28,16 @@ NUM_SAMPLES = 1000
 HASH_VERSION = "1"
 
 CANONICAL_VARS_FOR_HASHING = sorted([
-    '2t', '10u', '10v', 'msl', # Surface
-    't', 'u', 'v', 'q', 'z'   # Atmospheric
+    '2t', '10u', '10v', 'msl',
+    't', 'u', 'v', 'q', 'z' 
 ])
+
+logging.getLogger('fsspec').setLevel(logging.DEBUG)
+
+def get_current_memory_usage_mb():
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    return mem_info.rss / (1024 * 1024)
 
 def generate_deterministic_seed(
     forecast_date: str,
@@ -244,93 +258,118 @@ def compute_verification_hash(
     return hash_obj.hexdigest()
 
 
-def _synchronous_kerchunk_open(
-    kerchunk_json_url: str, 
+def _synchronous_zarr_open(
+    zarr_store_url: str,
     http_fs_kwargs: Dict
 ) -> xr.Dataset:
-    logger.info(f"SYNC_KERCHUNK_OPEN: Starting for URL: {kerchunk_json_url}")
-    logger.warning("SYNC_KERCHUNK_OPEN: SSL certificate verification is DISABLED for HTTP requests within this synchronous function. FOR TESTING ONLY.")
+    """
+    Open a Zarr store over HTTP synchronously.
+    
+    Args:
+        zarr_store_url: URL to the Zarr store (.zarr directory)
+        http_fs_kwargs: Dictionary of HTTP options (headers, SSL verification)
+        
+    Returns:
+        xarray Dataset opened from the store
+    """
+    zarr_store_url = zarr_store_url.rstrip('/')
+    logger.info(f"SYNC_ZARR_OPEN: Starting. Initial Memory: {get_current_memory_usage_mb():.2f} MB. Target URL: {zarr_store_url}")
+    overall_start_time = time.time()
 
-    refs_dict = None
-    try:
-        logger.debug(f"SYNC_KERCHUNK_OPEN: Fetching main JSON from {kerchunk_json_url} with options: {http_fs_kwargs}")
-        with fsspec.open(kerchunk_json_url, mode='rb', **http_fs_kwargs) as f:
-            refs_dict = json.load(f)
-        logger.debug("SYNC_KERCHUNK_OPEN: Successfully fetched and parsed main Kerchunk JSON.")
-    except Exception as e_json_fetch:
-        logger.error(f"SYNC_KERCHUNK_OPEN: Failed to fetch/parse main JSON from {kerchunk_json_url}: {e_json_fetch!r}", exc_info=True)
-        raise IOError(f"Failed to fetch/parse main Kerchunk JSON from {kerchunk_json_url}") from e_json_fetch
-
-    if refs_dict is None:
-        raise IOError(f"refs_dict is None after attempting to fetch {kerchunk_json_url}")
-
-    if 'refs' in refs_dict and 'lat/0' in refs_dict['refs']:
-        logger.info(f"SYNC_KERCHUNK_OPEN DEBUG: refs_dict['refs']['lat/0'] = {refs_dict['refs']['lat/0']}")
-    elif 'refs' in refs_dict and len(refs_dict['refs']) > 0:
-        first_ref_key = list(refs_dict['refs'].keys())[0]
-        logger.info(f"SYNC_KERCHUNK_OPEN DEBUG: 'lat/0' not in refs_dict['refs']. First ref '{first_ref_key}': {refs_dict['refs'][first_ref_key]}")
+    should_verify_ssl = http_fs_kwargs.get("verify_ssl", True)
+    if not should_verify_ssl:
+        logger.warning("SYNC_ZARR_OPEN: SSL certificate verification is explicitly DISABLED. FOR TESTING ONLY.")
+        fsspec_remote_opts = {"verify_ssl": False}
     else:
-        logger.info(f"SYNC_KERCHUNK_OPEN DEBUG: 'refs' key missing or empty in refs_dict.")
+        logger.info("SYNC_ZARR_OPEN: SSL certificate verification is ENABLED.")
+        fsspec_remote_opts = {"verify_ssl": True}
 
-    parsed_main_json_url = urllib.parse.urlparse(kerchunk_json_url)
+    if "headers" in http_fs_kwargs:
+        fsspec_remote_opts["headers"] = http_fs_kwargs["headers"]
     
-    chunk_fetch_fs_options = {
-        "headers": http_fs_kwargs.get("headers", {}),
-        "verify_ssl": http_fs_kwargs.get("verify_ssl", True),
-        "asynchronous": False
-    }
-
-    fs_ref_sync = fsspec.filesystem(
-        "reference",
-        fo=refs_dict,
-        remote_protocol=parsed_main_json_url.scheme,
-        remote_options=chunk_fetch_fs_options,
-        asynchronous=False
-    )
-
-    ref_root_mapper_sync = fs_ref_sync.get_mapper("") 
+    protocol = "https"
     
-    logger.debug("SYNC_KERCHUNK_OPEN: Calling xr.open_dataset (engine='zarr') with sync reference mapper.")
+    time_before_fs_init = time.time()
     try:
-        ds = xr.open_dataset(ref_root_mapper_sync, engine="zarr", consolidated=False, chunks={})
-        logger.info("SYNC_KERCHUNK_OPEN: Successfully opened Zarr dataset via sync reference filesystem.")
+        logger.info(f"SYNC_ZARR_OPEN: Opening Zarr store at URL: {zarr_store_url}")
+        fs = fsspec.filesystem(
+            protocol,
+            **fsspec_remote_opts
+        )
+        mapper = fs.get_mapper(zarr_store_url)
+            
+        logger.info(f"SYNC_ZARR_OPEN: Initialized filesystem and mapper in {time.time() - time_before_fs_init:.2f}s.")
+    except Exception as e_fs_init:
+        logger.error(f"SYNC_ZARR_OPEN: Failed to initialize filesystem: {e_fs_init!r}", exc_info=True)
+        raise
+
+    logger.info(f"SYNC_ZARR_OPEN: Memory before xr.open_dataset: {get_current_memory_usage_mb():.2f} MB.")
+    logger.info("SYNC_ZARR_OPEN: Calling xr.open_dataset (engine='zarr', consolidated=True) with mapper.")
+    time_before_xr_open = time.time()
+    ds = None
+    try:
+        ds = xr.open_dataset(
+            mapper,
+            engine="zarr",
+            consolidated=True,
+            chunks={},
+        )
+        logger.info(f"SYNC_ZARR_OPEN: Successfully opened Zarr dataset in {time.time() - time_before_xr_open:.2f}s. Memory after: {get_current_memory_usage_mb():.2f} MB.")
         return ds
     except Exception as e_xr_open:
-        logger.error(f"SYNC_KERCHUNK_OPEN: Failed to open Zarr dataset with xarray: {e_xr_open!r}", exc_info=True)
+        logger.error(f"SYNC_ZARR_OPEN: Failed to open Zarr dataset with xarray: {e_xr_open!r}. Memory at failure: {get_current_memory_usage_mb():.2f} MB.", exc_info=True)
+        if "KeyError: '.zmetadata'" in traceback.format_exc():
+             logger.error("SYNC_ZARR_OPEN: Encountered KeyError for '.zmetadata'. Check if .zmetadata is accessible via the URL and miner permissions.")
         raise
+    finally:
+        logger.info(f"SYNC_ZARR_OPEN: Exiting. Total time in function: {time.time() - overall_start_time:.2f}s. Final Memory: {get_current_memory_usage_mb():.2f} MB.")
 
 
-async def open_remote_dataset_with_kerchunk(url: str, variables: List[str], storage_options: Optional[Dict] = None) -> xr.Dataset:
-    logger.info(f"Attempting to open remote Kerchunk dataset (fully sync in executor): {url} with storage_options: {storage_options is not None}")
+async def open_remote_zarr_dataset(
+    zarr_store_url: str,
+    variables: List[str],
+    storage_options: Optional[Dict] = None
+) -> Optional[xr.Dataset]:
+    """
+    Open a remote Zarr dataset asynchronously through an executor.
     
-    session_headers = None
-    if storage_options and 'headers' in storage_options:
-        session_headers = storage_options['headers']
+    Args:
+        zarr_store_url: URL to the Zarr store (.zarr directory)
+        variables: List of variable names to load (currently unused but kept for API compatibility)
+        storage_options: Optional dictionary with HTTP options (headers, SSL verification)
+        
+    Returns:
+        xarray Dataset opened from the Zarr store or None if opening fails
+    """
+    logger.info(f"Attempting to open remote Zarr dataset (sync in executor): {zarr_store_url} with storage_options: {storage_options is not None}")
 
-    http_client_kwargs_for_sync = {
-        "headers": session_headers or {},
+    http_client_kwargs_for_fsspec = {
+        "headers": (storage_options.get("headers") if storage_options else {}) or {},
         "verify_ssl": False
     }
-    logger.warning("SSL certificate verification will be DISABLED for HTTP requests within the executor. FOR TESTING ONLY.")
 
     current_loop = asyncio.get_running_loop()
+    ds = None
     try:
-        logger.debug(f"Calling _synchronous_kerchunk_open for {url} in executor...")
+        logger.debug(f"Calling _synchronous_zarr_open for Zarr store {zarr_store_url} in executor...")
         ds = await current_loop.run_in_executor(
-            None,  
-            _synchronous_kerchunk_open, 
-            url,
-            http_client_kwargs_for_sync
+            None,
+            _synchronous_zarr_open,
+            zarr_store_url,
+            http_client_kwargs_for_fsspec
         )
-        logger.info(f"Successfully opened remote Zarr dataset via executor: {url}")
+        if ds:
+            logger.info(f"Successfully opened remote Zarr dataset via executor: {zarr_store_url}")
+        else:
+            logger.error(f"_synchronous_zarr_open returned None for Zarr store: {zarr_store_url}")
         return ds
     except Exception as e_open:
-        logger.error(f"Error in executor running _synchronous_kerchunk_open for {url}: {e_open!r}", exc_info=True)
-        raise
+        logger.error(f"Error in executor running _synchronous_zarr_open for Zarr store {zarr_store_url}: {e_open!r}", exc_info=True)
+        return None
 
 
 async def verify_forecast_hash(
-    kerchunk_url: str,
+    zarr_store_url: str,
     claimed_hash: str,
     metadata: Dict[str, Any],
     variables: List[str],
@@ -338,92 +377,109 @@ async def verify_forecast_hash(
     headers: Optional[Dict[str, str]] = None
 ) -> bool:
     """
-    Verify a forecast hash against a claimed value (validator-side).
+    Verify a forecast hash against a claimed value (validator-side) by sampling from Zarr store.
     
     Args:
-        kerchunk_url: URL to the kerchunk index for the forecast
-        claimed_hash: Hash value provided by the miner
-        metadata: Dictionary with forecast metadata 
+        zarr_store_url: URL to the Zarr store (.zarr directory)
+        claimed_hash: Hash value claimed by the miner
+        metadata: Dictionary with forecast metadata
         variables: List of variables to include in hash
         timesteps: List of timestep indices to include in hash
-        headers: Optional dictionary of headers to use for the request (e.g., for auth)
+        headers: Optional HTTP headers for authentication
         
     Returns:
-        Boolean indicating whether the hash is verified
+        True if the computed hash matches the claimed hash, False otherwise
     """
     storage_options = {}
     if headers:
         storage_options['headers'] = headers
 
+    ds = None
     try:
-        logger.debug(f"Calling open_remote_dataset_with_kerchunk with URL: {kerchunk_url} and headers: {headers is not None}")
-        ds = await open_remote_dataset_with_kerchunk(kerchunk_url, variables, storage_options=storage_options if storage_options else None)
+        logger.debug(f"Calling open_remote_zarr_dataset with URL: {zarr_store_url} for hash verification.")
+        ds = await open_remote_zarr_dataset(zarr_store_url, variables, storage_options=storage_options)
     except Exception as e:
-        print(f"Error opening dataset: {e}")
+        logger.error(f"Failed to open remote Zarr dataset {zarr_store_url} for hash verification: {e}", exc_info=True)
         return False
     
-    data = {
-        "surf_vars": {},
-        "atmos_vars": {}
-    }
-    
-    var_mapping = {
-        "t2m": ("surf_vars", "2t"),
-        "u10": ("surf_vars", "10u"),
-        "v10": ("surf_vars", "10v"),
-        "msl": ("surf_vars", "msl"),
-        "z": ("atmos_vars", "z"),
-        "u": ("atmos_vars", "u"),
-        "v": ("atmos_vars", "v"),
-        "t": ("atmos_vars", "t"),
-        "q": ("atmos_vars", "q")
-    }
-    
-    for var in variables:
-        xr_var = var
-        for ds_name, (category, aurora_name) in var_mapping.items():
-            if aurora_name == var and ds_name in ds:
-                if category == "surf_vars":
-                    data[category][var] = ds[ds_name].values[np.newaxis, :, :, :]
-                else:
-                    data[category][var] = ds[ds_name].values[np.newaxis, :, :, :, :]
-                break
-    
-    hash_metadata = {
-        "time": metadata["time"],
-        "source_model": metadata.get("source_model", "aurora"),
-        "resolution": metadata.get("resolution", 0.25)
-    }
-    
-    computed_hash = compute_verification_hash(
-        data, hash_metadata, variables, timesteps
-    )
-    
-    return computed_hash == claimed_hash
+    if ds is None:
+        logger.error(f"Opening remote Zarr dataset {zarr_store_url} returned None. Cannot verify hash.")
+        return False
+
+    try:
+        logger.info(f"Starting efficient hash verification for {zarr_store_url}")
+        var_mapping = {
+            "t2m": ("surf_vars", "2t"), "u10": ("surf_vars", "10u"), "v10": ("surf_vars", "10v"), "msl": ("surf_vars", "msl"),
+            "z": ("atmos_vars", "z"), "u": ("atmos_vars", "u"), "v": ("atmos_vars", "v"), 
+            "t": ("atmos_vars", "t"), "q": ("atmos_vars", "q")
+        }
+        
+        variables_for_hash = CANONICAL_VARS_FOR_HASHING
+        timesteps_for_hash = timesteps
+        hash_metadata_for_validator = {
+            "time": metadata["time"],
+            "source_model": metadata.get("source_model", "aurora"),
+            "resolution": metadata.get("resolution", 0.25)
+        }
+
+        data_shape_validator = _get_data_shape_from_xarray_dataset(ds, variables_for_hash, var_mapping)
+        if not data_shape_validator or (not data_shape_validator.get("surf_vars") and not data_shape_validator.get("atmos_vars")):
+            logger.error("Could not determine shapes for any variables from the dataset. Cannot generate sample indices.")
+            if ds is not None:
+                ds.close()
+                logger.debug(f"Closed xarray dataset for {zarr_store_url} after shape error.")
+            return False
+
+        seed = generate_deterministic_seed(
+            hash_metadata_for_validator["time"][0].strftime("%Y-%m-%d"), 
+            hash_metadata_for_validator["source_model"], 
+            hash_metadata_for_validator["resolution"], 
+            len(variables_for_hash)
+        )
+        rng = np.random.Generator(np.random.PCG64(seed))
+        sample_indices = generate_sample_indices(rng, data_shape_validator, variables_for_hash, timesteps_for_hash, NUM_SAMPLES)
+
+        if not sample_indices:
+            logger.error("Failed to generate sample indices. Cannot compute hash.")
+            if ds is not None:
+                ds.close()
+                logger.debug(f"Closed xarray dataset for {zarr_store_url} after sample index error.")
+            return False
+
+        serialized_data_validator = _efficient_canonical_serialization(sample_indices, ds, var_mapping)
+        
+        hash_obj = hashlib.sha256(serialized_data_validator)
+        computed_hash_validator = hash_obj.hexdigest()
+
+        logger.info(f"Validator computed hash: {computed_hash_validator}, Miner claimed hash: {claimed_hash}")
+        return computed_hash_validator == claimed_hash
+
+    except Exception as e_hash_verify:
+        logger.error(f"Error during efficient hash verification for {zarr_store_url}: {e_hash_verify}", exc_info=True)
+        return False
+    finally:
+        if ds is not None:
+            ds.close()
+            logger.debug(f"Closed xarray dataset for {zarr_store_url}")
 
 
 def get_forecast_summary(
-    kerchunk_url: str,
+    zarr_store_url: str,
     variables: List[str]
 ) -> Dict[str, Any]:
     """
     Get a summary of forecast properties without loading all data.
     
     Args:
-        kerchunk_url: URL to the kerchunk index
+        zarr_store_url: URL to the Zarr store
         variables: List of variables to include
     Returns:
         Dictionary with summary statistics
     """
-    # Placeholder implementation
-    # this will:
-    # 1. Open the kerchunk index
-    # 2. Extract metadata
-    # 3. Compute and return basic statistics
-    
+
     return {
         "variables": variables,
-        "kerchunk_url": kerchunk_url,
+        "zarr_store_url": zarr_store_url,
         "status": "placeholder"
     }
 
@@ -548,4 +604,88 @@ async def compute_input_data_hash(
                 ds_t_minus_6.close()
                 logger.debug("Closed ds_t_minus_6 dataset.")
             except Exception as close_err:
-                 logger.warning(f"Exception closing ds_t_minus_6: {close_err}") 
+                 logger.warning(f"Exception closing ds_t_minus_6: {close_err}")
+
+
+def _get_data_shape_from_xarray_dataset(
+    ds: xr.Dataset, 
+    variables_to_include: List[str], 
+    var_mapping: Dict[str, Tuple[str, str]]
+) -> Dict[str, Dict[str, Tuple[int, ...]]]:
+    data_shape = {"surf_vars": {}, "atmos_vars": {}}
+    for aurora_var_name in variables_to_include:
+        ds_var_name = None
+        category = None
+        for map_ds_name, (cat, aur_name) in var_mapping.items():
+            if aur_name == aurora_var_name:
+                ds_var_name = map_ds_name
+                category = cat
+                break
+        
+        if ds_var_name and ds_var_name in ds and category:
+            actual_shape = ds[ds_var_name].shape
+            data_shape[category][aurora_var_name] = (1,) + actual_shape 
+            logger.debug(f"Shape for {aurora_var_name} (in ds as {ds_var_name}): {actual_shape} -> {(1,) + actual_shape} for sampling struct")
+        else:
+            logger.warning(f"Variable '{aurora_var_name}' (ds name: '{ds_var_name}') not found in dataset or category not identified. Cannot determine shape for hashing.")
+    logger.info(f"_get_data_shape_from_xarray_dataset: Populated data_shape: {data_shape}")
+    return data_shape
+
+
+def _efficient_canonical_serialization(
+    sample_indices: List[Dict[str, Any]],
+    dataset: xr.Dataset,
+    var_mapping: Dict[str, Tuple[str, str]]
+) -> bytes:
+    logger.info(f"EFFICIENT_SERIALIZATION: Starting serialization for {len(sample_indices)} sample indices.")
+    overall_serialization_start_time = time.time()
+    serialized = bytearray()
+    sorted_indices = sorted(sample_indices, key=lambda x: (x["variable"], x["category"], x["timestep"], x.get("level", 0), x["lat"], x["lon"]))
+
+    for i, idx_info in enumerate(sorted_indices):
+        aurora_var_name = idx_info["variable"]
+        category = idx_info["category"]
+        
+        ds_var_name = None
+        for map_ds_name, (cat, aur_name) in var_mapping.items():
+            if aur_name == aurora_var_name:
+                ds_var_name = map_ds_name
+                break
+        
+        log_prefix = f"EFFICIENT_SERIALIZATION: Index {i+1}/{len(sorted_indices)} (Var: {aurora_var_name}, DS_Var: {ds_var_name}, Cat: {category}, T: {idx_info['timestep']}, Lt: {idx_info['lat']}, Ln: {idx_info['lon']}"
+        if 'level' in idx_info:
+            log_prefix += f", Lvl: {idx_info['level']}"
+        log_prefix += ")"
+
+        if not ds_var_name or ds_var_name not in dataset:
+            logger.warning(f"{log_prefix} - Variable not found in dataset. Using NaN.")
+            serialized.extend(serialize_float(float('nan')))
+            continue
+
+        try:
+            time_dim = 'time' 
+            lat_dim = 'lat'
+            lon_dim = 'lon'
+            level_dim = 'pressure_level'
+
+            isel_kwargs = {
+                time_dim: idx_info["timestep"],
+                lat_dim: idx_info["lat"],
+                lon_dim: idx_info["lon"]
+            }
+            if category == "atmos_vars":
+                isel_kwargs[level_dim] = idx_info["level"]
+            
+            logger.debug(f"{log_prefix} - Attempting .isel() with kwargs: {isel_kwargs}")
+            point_fetch_start_time = time.time()
+            value = dataset[ds_var_name].isel(**isel_kwargs).data.item()
+            point_fetch_duration = time.time() - point_fetch_start_time
+            logger.debug(f"{log_prefix} - Successfully fetched point. Value: {value:.4f if isinstance(value, float) else value}. Time: {point_fetch_duration:.3f}s")
+            serialized.extend(serialize_float(value))
+        except Exception as e_serial:
+            logger.warning(f"{log_prefix} - Error serializing point: {e_serial}. Using NaN.", exc_info=True)
+            serialized.extend(serialize_float(float('nan')))
+            
+    total_serialization_duration = time.time() - overall_serialization_start_time
+    logger.info(f"EFFICIENT_SERIALIZATION: Finished. Total bytes: {len(serialized)}. Total time: {total_serialization_duration:.3f}s")
+    return bytes(serialized) 

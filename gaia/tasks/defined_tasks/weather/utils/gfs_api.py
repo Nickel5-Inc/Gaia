@@ -317,20 +317,26 @@ async def fetch_gfs_analysis_data(
             for target_time in target_times:
                 full_ds = None
                 try:
-                    base_url = _get_gfs_cycle_url(target_time)
+                    # --- MODIFICATION FOR TESTING ---
+                    # Subtract 24 hours from the target_time to fetch older data
+                    modified_target_time = target_time - timedelta(hours=24) 
+                    logger.warning(f"MODIFIED FOR TESTING: Original target_time {target_time}, fetching for {modified_target_time}")
+                    # --- END MODIFICATION ---
+                    
+                    base_url = _get_gfs_cycle_url(modified_target_time)
                     if not base_url:
-                        logger.error(f"Could not get URL for GFS cycle {target_time}. Skipping.")
+                        logger.error(f"Could not get URL for GFS cycle based on original {target_time} (modified to {modified_target_time}). Skipping.")
                         continue
                         
-                    logger.info(f"Opening GFS cycle {target_time} from {base_url} for analysis (T+0h)...")
+                    logger.info(f"Opening GFS cycle {modified_target_time} (original was {target_time}) from {base_url} for analysis (T+0h)...")
                     full_ds = xr.open_dataset(base_url, decode_times=True, chunks={})
 
-                    target_time_naive_np = np.datetime64(target_time.replace(tzinfo=None))
+                    analysis_select_time_np = np.datetime64(modified_target_time.replace(tzinfo=None))
 
-                    analysis_slice = full_ds.sel(time=target_time_naive_np, method='nearest')
+                    analysis_slice = full_ds.sel(time=analysis_select_time_np, method='nearest')
                     
-                    if abs(analysis_slice.time.values - target_time_naive_np) > np.timedelta64(1, 'h'):
-                        logger.error(f"Nearest time found ({analysis_slice.time.values}) is too far from requested analysis time {target_time} for cycle {target_time}. Skipping.")
+                    if abs(analysis_slice.time.values - analysis_select_time_np) > np.timedelta64(1, 'h'):
+                        logger.error(f"Nearest time found ({analysis_slice.time.values}) is too far from requested analysis time {modified_target_time} for cycle {modified_target_time}. Skipping.")
                         continue
 
                     vars_to_load = [v for v in GFS_SURFACE_VARS + GFS_ATMOS_VARS if v in full_ds]
@@ -340,13 +346,13 @@ async def fetch_gfs_analysis_data(
                          
                     loaded_slice = analysis_slice[vars_to_load].load()
                     loaded_slice = loaded_slice.expand_dims(dim='time', axis=0)
-                    loaded_slice['time'] = [np.datetime64(target_time)]
+                    loaded_slice['time'] = [np.datetime64(target_time)] 
                     
-                    logger.info(f"Loaded analysis slice for {target_time}")
+                    logger.info(f"Loaded analysis slice for original target {target_time} (fetched for {modified_target_time})")
                     analysis_slices.append(loaded_slice)
 
                 except Exception as e:
-                    logger.error(f"Failed to fetch/process analysis for {target_time}: {e}", exc_info=True)
+                    logger.error(f"Failed to fetch/process analysis for original target {target_time} (attempted {modified_target_time}): {e}", exc_info=True)
                 finally:
                     if full_ds:
                         try: full_ds.close()

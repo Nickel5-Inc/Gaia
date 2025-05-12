@@ -1,6 +1,6 @@
 from functools import partial
 from fastapi import Depends, Request, HTTPException, Header
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.routing import APIRouter
 from pydantic import BaseModel, Field
 from fiber.encrypted.miner.dependencies import blacklist_low_stake, verify_request
@@ -198,56 +198,76 @@ def factory_router(miner_instance) -> APIRouter:
     async def get_forecast_file(filename: str, token_payload: dict = Depends(verify_token)):
         """Serve forecast file with JWT validation."""
         try:
-            token_file_claim = token_payload.get("file_path")
+            token_base_claim = token_payload.get("file_path")
             job_id_claim = token_payload.get("job_id")
-            
-            logger.info(f"File request for job '{job_id_claim}': Requested file '{filename}'. Token originally for '{token_file_claim}'.")
+
+            logger.info(f"File request for job '{job_id_claim}': Requested file '{filename}'. Token claim base: '{token_base_claim}'.")
 
             allow_access = False
-            s_token_file_claim = token_file_claim or ""
-            s_filename = filename or ""
+            requested_relative_path_str = filename
+            requested_path = Path(requested_relative_path_str)
 
-            if s_token_file_claim == s_filename: 
-                allow_access = True
-                logger.info(f"Exact filename match in token. Access granted for '{filename}'.")
-            else:
-                token_base, token_ext = os.path.splitext(s_token_file_claim)
-                requested_base, requested_ext = os.path.splitext(s_filename)
+            requested_filename_itself = requested_path.name
+            requested_parent_dir_name = requested_path.parent.name
 
-                logger.info(f"DEBUG_AUTH: Requested: '{s_filename}' (Base: '{requested_base}', Ext: '{requested_ext}')")
-                logger.info(f"DEBUG_AUTH: Token Claim: '{s_token_file_claim}' (Base: '{token_base}', Ext: '{token_ext}')")
-                logger.info(f"DEBUG_AUTH: Base Match: {token_base == requested_base}")
-                logger.info(f"DEBUG_AUTH: JSON token -> NC request: {token_ext == '.json' and requested_ext == '.nc'}")
-                logger.info(f"DEBUG_AUTH: NC token -> JSON request: {token_ext == '.nc' and requested_ext == '.json'}")
-
-                if token_base == requested_base and \
-                   ((token_ext == ".json" and requested_ext == ".nc") or \
-                    (token_ext == ".nc" and requested_ext == ".json")):
-                    logger.info(f"Authorizing access to '{s_filename}' based on token for related file '{s_token_file_claim}' from same job bundle.")
+            is_zarr_request = token_base_claim.endswith('.zarr')
+            
+            if is_zarr_request:
+                expected_zarr_dir = token_base_claim
+                
+                if requested_path == Path(expected_zarr_dir) or requested_path.is_relative_to(Path(expected_zarr_dir)):
                     allow_access = True
-            
-            if not allow_access:
-                logger.warning(f"Access DENIED for '{s_filename}'. Token for '{s_token_file_claim}' (job: {job_id_claim}) not valid for this specific file request.")
-                raise HTTPException(status_code=403, detail="Token not valid for this specific file or its related data bundle")
-            
-            file_path = (MINER_FORECAST_DIR / filename).resolve()
+                    logger.info(f"Authorized access to Zarr store file '{filename}' within '{expected_zarr_dir}'.")
+            else:
+                expected_asset_dir_name = f"{token_base_claim}_kerchunk_assets"
+                expected_nc_filename = f"{token_base_claim}_rechunked.nc"
 
-            if not file_path.is_file() or MINER_FORECAST_DIR.resolve() not in file_path.parents:
-                logger.warning(f"Forecast file request denied or file not found: {filename} (Resolved: {file_path})")
-                return JSONResponse(status_code=404, content={"error": "File not found or access denied"})
-            
+                if requested_filename_itself == expected_nc_filename and requested_parent_dir_name == "":
+                     allow_access = True
+                     logger.info(f"Authorized access to main data file '{filename}' for base '{token_base_claim}'.")
+                elif requested_filename_itself == expected_asset_dir_name and requested_parent_dir_name == "":
+                     allow_access = True
+                     logger.info(f"Authorized access to asset directory '{filename}' for base '{token_base_claim}'.")
+                elif requested_parent_dir_name == expected_asset_dir_name and requested_filename_itself in ["reference.json", ".zmetadata"]:
+                     allow_access = True
+                     logger.info(f"Authorized access to metadata file '{filename}' within asset dir '{expected_asset_dir_name}' for base '{token_base_claim}'.")
+
+            if not allow_access:
+                logger.warning(f"DEBUG_AUTH Failed: Requested relative file path: {requested_relative_path_str}")
+                logger.warning(f"DEBUG_AUTH Failed: Requested filename: {requested_filename_itself}")
+                logger.warning(f"DEBUG_AUTH Failed: Requested parent dir: '{requested_parent_dir_name}'")
+                logger.warning(f"DEBUG_AUTH Failed: Expected token base: '{token_base_claim}'")
+                logger.warning(f"DEBUG_AUTH Failed: Is Zarr request: {is_zarr_request}")
+                
+                logger.warning(f"Access DENIED for '{filename}'. Token for base '{token_base_claim}' (job: {job_id_claim}) not valid for this file request structure.")
+                raise HTTPException(status_code=403, detail="Token not valid for this specific file or its related data bundle")
+
+            if (is_zarr_request and requested_filename_itself == token_base_claim) or \
+               (not is_zarr_request and requested_filename_itself == expected_asset_dir_name and requested_parent_dir_name == ""):
+                return RedirectResponse(url=f"/forecasts/{filename}/", status_code=307)
+
+            file_path = (MINER_FORECAST_DIR / requested_relative_path_str).resolve()
+
+            if not file_path.exists() or MINER_FORECAST_DIR.resolve() not in file_path.parents:
+                logger.warning(f"Forecast file request denied or not found (post-auth check): {filename} (Resolved: {file_path})")
+                raise HTTPException(status_code=404, detail="File not found or outside allowed directory")
+
+            if file_path.is_dir():
+                logger.info(f"Serving directory: {file_path}")
+                return JSONResponse(content={"status": "ok", "type": "directory"})
+
             logger.info(f"Serving forecast file: {file_path}")
             return FileResponse(
-                path=str(file_path), 
-                filename=filename, 
+                path=str(file_path),
+                filename=file_path.name,
                 media_type='application/octet-stream'
             )
-            
+
         except HTTPException as e:
-            raise e 
+            raise e
         except Exception as e:
             logger.error(f"Error serving forecast file {filename}: {e}", exc_info=True)
-            return JSONResponse(status_code=500, content={"error": "Internal server error serving file"})
+            return JSONResponse(status_code=500, content={"error": f"Internal server error serving file: {str(e)}"})
 
     async def weather_forecast_require(
         decrypted_payload: WeatherForecastRequest = Depends(
@@ -312,17 +332,17 @@ def factory_router(miner_instance) -> APIRouter:
         ),
     ):
         """
-        Handles requests from validators for Kerchunk JSON metadata of a specific forecast.
-        The actual logic for finding/generating the JSON resides in the WeatherTask.
+        Handles requests from validators for forecast data (Zarr store or Kerchunk JSON) of a specific forecast.
+        The actual logic for finding/generating the store resides in the WeatherTask.
         """
-        logger.info(f"Received decrypted weather kerchunk request")
+        logger.info(f"Received decrypted weather forecast data request")
         try:
             if not hasattr(miner_instance, 'weather_task') or miner_instance.weather_task is None:
                 logger.error("Miner instance is missing the 'weather_task' attribute or it is None.")
                 return JSONResponse(status_code=500, content={"error": "Miner not configured for weather task"})
 
             request_data = decrypted_payload.data
-            logger.info(f"Handling weather kerchunk request...")
+            logger.info(f"Handling weather forecast data request...")
 
             job_id = request_data.job_id
             if not job_id:
@@ -333,12 +353,16 @@ def factory_router(miner_instance) -> APIRouter:
 
             if not isinstance(response_dict, dict):
                  logger.error(f"handle_kerchunk_request returned invalid type: {type(response_dict)}")
-                 return JSONResponse(status_code=500, content={"error": "Internal error processing kerchunk request"})
+                 return JSONResponse(status_code=500, content={"error": "Internal error processing forecast data request"})
 
+            zarr_store_url = response_dict.get('zarr_store_url')
+            if not zarr_store_url and 'kerchunk_json_url' in response_dict:
+                zarr_store_url = response_dict.get('kerchunk_json_url')
+            
             response_data = WeatherKerchunkResponseData(
                 status=response_dict.get('status', 'error'),
                 message=response_dict.get('message', 'Failed to process'),
-                kerchunk_json_url=response_dict.get('kerchunk_json_url'),
+                zarr_store_url=zarr_store_url,
                 verification_hash=response_dict.get('verification_hash'),
                 access_token=response_dict.get('access_token')
             )
@@ -346,7 +370,7 @@ def factory_router(miner_instance) -> APIRouter:
             return JSONResponse(content=response_data.model_dump())
 
         except Exception as e:
-            logger.error(f"Error processing weather kerchunk request: {e}")
+            logger.error(f"Error processing weather forecast data request: {e}")
             logger.error(traceback.format_exc())
             return JSONResponse(status_code=500, content={"error": f"Internal server error: {str(e)}"})
 

@@ -408,49 +408,40 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                     # TODO: DEV OVERRIDE - Using hardcoded job_id to fetch paths/hash. REMOVE
                     hardcoded_job_id_for_dev_override = '702c840c-2176-4c4c-ac5c-573515016fc9' 
                     logger.warning(f"[InferenceTask Job {job_id}] DEV_OVERRIDE: Forcing use of data associated with hardcoded job ID: {hardcoded_job_id_for_dev_override}")
-                    job_skip_details_query = """
-                        SELECT target_netcdf_path, kerchunk_json_path, verification_hash
-                        FROM weather_miner_jobs WHERE id = :hardcoded_id 
-                    """
-                    job_skip_details = await task_instance.db_manager.fetch_one(job_skip_details_query, {"hardcoded_id": hardcoded_job_id_for_dev_override})
                     
-                    if not job_skip_details:
-                        # This failure is now about the *hardcoded* ID
-                        logger.error(f"[InferenceTask Job {job_id}] DEV_OVERRIDE_FAILED: Cannot find job details in DB for hardcoded override job ID '{hardcoded_job_id_for_dev_override}'.")
-                        await update_job_status(task_instance, job_id, "error", f"DevOverride: Cannot find data for hardcoded job {hardcoded_job_id_for_dev_override}. Original error: {dev_error_message}")
-                        return
+                    fallback_job_query = "SELECT target_netcdf_path, verification_hash FROM weather_miner_jobs WHERE id = :id"
+                    fallback_job_details = await task_instance.db_manager.fetch_one(fallback_job_query, {"id": hardcoded_job_id_for_dev_override})
 
-                    nc_path = job_skip_details.get('target_netcdf_path')
-                    json_path = job_skip_details.get('kerchunk_json_path')
-                    v_hash = job_skip_details.get('verification_hash')
-                    
-                    files_ok_dev = False
-                    path_errors_dev = []
-                    if nc_path and json_path:
-                        try:
-                            nc_exists_dev = Path(nc_path).exists()
-                            json_exists_dev = Path(json_path).exists()
-                            files_ok_dev = nc_exists_dev and json_exists_dev
-                            if not nc_exists_dev: path_errors_dev.append(f"NetCDF missing at '{nc_path}' (from hardcoded job '{hardcoded_job_id_for_dev_override}')")
-                            if not json_exists_dev: path_errors_dev.append(f"Kerchunk JSON missing at '{json_path}' (from hardcoded job '{hardcoded_job_id_for_dev_override}')")
-                        except Exception as e_path_dev:
-                            path_error_msg_dev = f"Path error accessing ('{nc_path}', '{json_path}') from hardcoded job '{hardcoded_job_id_for_dev_override}': {str(e_path_dev)}"
-                            path_errors_dev.append(path_error_msg_dev)
-                            files_ok_dev = False
+                    if fallback_job_details and fallback_job_details['target_netcdf_path'] and fallback_job_details['verification_hash']:
+                        zarr_path_override = fallback_job_details['target_netcdf_path']
+                        hash_override = fallback_job_details['verification_hash']
+                        
+                        if not zarr_path_override.endswith('.zarr'):
+                            logger.error(f"[InferenceTask Job {job_id}] DEV_OVERRIDE ERROR: The target_netcdf_path for the hardcoded job '{hardcoded_job_id_for_dev_override}' is '{zarr_path_override}', which does not have a .zarr extension. Please ensure the fallback job has been processed with the latest Zarr conversion scripts.")
+                            await update_job_status(task_instance, job_id, "error", "DEV_OVERRIDE failed: Fallback job data not in Zarr format.")
+                            return
 
-                    if nc_path and json_path and v_hash and files_ok_dev:
-                        logger.info(f"[InferenceTask Job {job_id}] DEV_OVERRIDE_SUCCESS: Using data from hardcoded job '{hardcoded_job_id_for_dev_override}'. NC: '{nc_path}', JSON: '{json_path}', HASH: '{v_hash[:10] if v_hash else 'None'}'.")
-                        # Update the *CURRENT* job's record with the data from the hardcoded one.
-                        await update_job_paths(task_instance, job_id, nc_path, json_path, v_hash)
+                        logger.info(f"[InferenceTask Job {job_id}] DEV_OVERRIDE_SUCCESS: Using data from hardcoded job '{hardcoded_job_id_for_dev_override}'. Zarr_Path: '{zarr_path_override}', HASH: '{hash_override[:10]}...'.")
+                        
+                        await update_job_paths(
+                            task_instance,
+                            job_id,
+                            zarr_path_override,
+                            hash_override
+                        )
                         await update_job_status(task_instance, job_id, "completed")
                         logger.info(f"[InferenceTask Job {job_id}] DEV_OVERRIDE: Marked current job '{job_id}' as completed using data from '{hardcoded_job_id_for_dev_override}'.")
-                        return # Successfully bypassed, exit function.
+                        return
                     else:
                         missing_prereqs_dev = []
-                        if not nc_path: missing_prereqs_dev.append(f"DB target_netcdf_path (for job {hardcoded_job_id_for_dev_override})")
-                        if not json_path: missing_prereqs_dev.append(f"DB kerchunk_json_path (for job {hardcoded_job_id_for_dev_override})")
-                        if not v_hash: missing_prereqs_dev.append(f"DB verification_hash (for job {hardcoded_job_id_for_dev_override})")
-                        missing_prereqs_dev.extend(path_errors_dev)
+                        if not fallback_job_details:
+                            missing_prereqs_dev.append(f"DB record for job {hardcoded_job_id_for_dev_override}")
+                        else:
+                            if not fallback_job_details.get('target_netcdf_path'): 
+                                missing_prereqs_dev.append(f"DB target_netcdf_path (for job {hardcoded_job_id_for_dev_override})")
+                            if not fallback_job_details.get('verification_hash'): 
+                                missing_prereqs_dev.append(f"DB verification_hash (for job {hardcoded_job_id_for_dev_override})")
+                        
                         final_dev_error_msg = f"DevOverride: Prerequisites missing/invalid for hardcoded job '{hardcoded_job_id_for_dev_override}' - {', '.join(list(set(missing_prereqs_dev)))}. Original error for job '{job_id}': {dev_error_message}"
                         logger.error(f"[InferenceTask Job {job_id}] DEV_OVERRIDE_FAILED: {final_dev_error_msg}")
                         await update_job_status(task_instance, job_id, "error", final_dev_error_msg)
@@ -464,7 +455,7 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
 
         # If we reach here, selected_predictions_cpu should be valid from a real successful inference.
         await update_job_status(task_instance, job_id, "processing_output")
-        output_nc_path_val, output_json_path_val, output_v_hash_val = None, None, None 
+        output_zarr_path_val, output_v_hash_val = None, None 
         try:
             MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
 
@@ -527,34 +518,47 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
 
                 gfs_time_str = gfs_init_time_utc.strftime('%Y%m%d%H')
                 unique_suffix = job_id.split('-')[0]
-                filename_nc = f"weather_forecast_{gfs_time_str}_{miner_hotkey[:8]}_{unique_suffix}.nc"
-                output_nc_path = MINER_FORECAST_DIR_BG / filename_nc
-
-                encoding = {var: {'zlib': True, 'complevel': 4} for var in combined_forecast_ds.data_vars}
-                combined_forecast_ds.to_netcdf(output_nc_path, encoding=encoding)
-                logger.info(f"[InferenceTask Job {job_id}] Saved forecast to NetCDF: {output_nc_path}")
-
-                filename_json = f"{os.path.splitext(filename_nc)[0]}.json"
-                output_json_path = MINER_FORECAST_DIR_BG / filename_json
-
-                miner_public_base_url = task_instance.config.get('miner_public_base_url')
-                target_url_for_nc_refs: str
-                if miner_public_base_url:
-                    target_url_for_nc_refs = f"{miner_public_base_url.rstrip('/')}/forecasts/{filename_nc}"
-                    logger.info(f"[InferenceTask Job {job_id}] Using discovered public base URL for Kerchunk refs: {miner_public_base_url}")
-                else:
-                    target_url_for_nc_refs = f"/forecasts/{filename_nc}" 
-                    logger.warning(f"[InferenceTask Job {job_id}] Miner public base URL not available. Kerchunk refs will be relative: {target_url_for_nc_refs}")
                 
-                logger.info(f"[InferenceTask Job {job_id}] Generating Kerchunk JSON. Source NC: {output_nc_path}, Target URL for NC references: {target_url_for_nc_refs}")
-                with open(output_nc_path, 'rb') as fobj:
-                    h5chunks = SingleHdf5ToZarr(fobj, target_url_for_nc_refs, inline_threshold=100)
-                    kerchunk_metadata = h5chunks.translate()
-                
-                with open(output_json_path, 'w') as f:
-                    json.dump(kerchunk_metadata, f)
-                logger.info(f"[InferenceTask Job {job_id}] Generated Kerchunk JSON: {output_json_path}")
+                dirname_zarr = f"weather_forecast_{gfs_time_str}_miner_hk_{unique_suffix}.zarr"
+                output_zarr_path = MINER_FORECAST_DIR_BG / dirname_zarr
 
+                time_chunk_size = 1
+                level_chunk_size = 1
+                lat_chunk_size = 180  # 720/4 = 180
+                lon_chunk_size = 360  # 1440/4 = 360
+
+                encoding = {}
+                for var_name, da in combined_forecast_ds.data_vars.items():
+                    var_chunks = {}
+                    dims = da.dims
+                    
+                    if 'time' in dims:
+                        var_chunks['time'] = time_chunk_size
+                    if 'pressure_level' in dims:
+                        var_chunks['pressure_level'] = level_chunk_size
+                    if 'lat' in dims:
+                        var_chunks['lat'] = lat_chunk_size
+                    if 'lon' in dims:
+                        var_chunks['lon'] = lon_chunk_size
+                    
+                    encoding[var_name] = {
+                        'chunks': var_chunks,
+                        'compressor': {'id': 'blosc', 'cname': 'zstd', 'clevel': 3, 'shuffle': 2}
+                    }
+                
+                logger.info(f"[InferenceTask Job {job_id}] Saving forecast to Zarr store with chunking. Path: {output_zarr_path}")
+                
+                if os.path.exists(output_zarr_path):
+                    import shutil
+                    shutil.rmtree(output_zarr_path)
+                
+                combined_forecast_ds.to_zarr(
+                    output_zarr_path,
+                    encoding=encoding,
+                    consolidated=True
+                )
+                
+                logger.info(f"[InferenceTask Job {job_id}] Successfully saved forecast to Zarr store: {output_zarr_path}")
                 from gaia.tasks.defined_tasks.weather.utils.hashing import compute_verification_hash
                 output_metadata = {
                     "time": [base_time],
@@ -589,15 +593,15 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                     else:
                          logger.warning(f"[InferenceTask Job {job_id}] compute_verification_hash returned None for output.")
 
-                return str(output_nc_path), str(output_json_path), verification_hash
+                return str(output_zarr_path), verification_hash
 
-            nc_path, json_path, v_hash = await asyncio.to_thread(_blocking_save_and_process)
+            zarr_path, v_hash = await asyncio.to_thread(_blocking_save_and_process)
 
             await update_job_paths(
                 task_instance=task_instance,
                 job_id=job_id,
-                target_netcdf_path=nc_path,
-                kerchunk_json_path=json_path,
+                target_netcdf_path=zarr_path,
+                kerchunk_json_path=zarr_path,
                 verification_hash=v_hash
             )
             await update_job_status(task_instance, job_id, "completed")

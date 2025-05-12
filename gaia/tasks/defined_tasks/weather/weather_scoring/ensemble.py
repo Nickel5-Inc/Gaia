@@ -36,7 +36,7 @@ async def _open_dataset_lazily(reference_spec: Dict) -> Optional[xr.Dataset]:
             remote_options=reference_spec.get("options", {}),
         )
         mapper = fs.get_mapper("")
-        ds = xr.open_dataset(mapper, engine="zarr", consolidated=False, chunks={})
+        ds = xr.open_dataset(mapper, engine="zarr", consolidated=True, chunks={})
         logger.debug(f"Successfully opened lazy dataset: {url}")
         return ds
     except FileNotFoundError:

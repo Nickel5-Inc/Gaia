@@ -528,10 +528,10 @@ class WeatherOutputs(Outputs):
         return forecast
 
 class WeatherKerchunkResponseData(BaseModel):
-    """ Defines the structure for the miner's response to a Kerchunk/hash request."""
+    """ Defines the structure for the miner's response to a forecast data request."""
     status: Literal['completed', 'processing', 'error', 'not_found'] = Field(..., description="The status of the requested forecast job.")
     message: Optional[str] = Field(None, description="Optional message, e.g., error details or status update.")
-    kerchunk_json_url: Optional[str] = Field(None, description="URL from which the validator can download the Kerchunk JSON file. Required if status is 'completed'.")
+    zarr_store_url: Optional[str] = Field(None, description="URL from which the validator can access the Zarr store. Required if status is 'completed'.")
     verification_hash: Optional[str] = Field(None, description="The SHA256 verification hash claimed by the miner. Required if status is 'completed'.")
     access_token: Optional[str] = Field(None, description="Short-lived JWT token required to access the forecast data via the /forecasts/ endpoint. Required if status is 'completed'.")
 

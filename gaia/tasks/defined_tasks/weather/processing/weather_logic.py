@@ -225,15 +225,15 @@ async def _request_fresh_token(task_instance, miner_hotkey: str, job_id: str) ->
     """Requests a fresh JWT from the miner for a given job_id."""
     logger.info(f"[VerifyLogic] Requesting fresh token for job {job_id} from miner {miner_hotkey[:12]}...")
                                                           
-    kerchunk_request_payload = {
+    forecast_request_payload = {
         "nonce": str(uuid.uuid4()),
         "data": {"job_id": job_id} 
     }
-    endpoint_to_call = "/weather-kerchunk-request" 
+    endpoint_to_call = "/weather-kerchunk-request"
 
     try:
         all_responses = await task_instance.validator.query_miners(
-            payload=kerchunk_request_payload,
+            payload=forecast_request_payload,
             endpoint=endpoint_to_call
         )
         
@@ -248,11 +248,11 @@ async def _request_fresh_token(task_instance, miner_hotkey: str, job_id: str) ->
                 miner_response_data = json.loads(response_dict['text'])
                 if miner_response_data.get("status") == "completed":
                     token = miner_response_data.get("access_token")
-                    kerchunk_url = miner_response_data.get("kerchunk_json_url") 
+                    zarr_store_url = miner_response_data.get("zarr_store_url") 
                     verification_hash = miner_response_data.get("verification_hash")
                     
-                    if token and kerchunk_url and verification_hash:
-                        logger.info(f"[VerifyLogic] Successfully received token, kerchunk URL, and hash for job {job_id} from {miner_hotkey[:12]}.")
+                    if token and zarr_store_url and verification_hash:
+                        logger.info(f"[VerifyLogic] Successfully received token, Zarr store URL, and hash for job {job_id} from {miner_hotkey[:12]}.")
                         try:
                             ip_val = response_dict['ip']
                             port_val = response_dict['port']
@@ -280,9 +280,9 @@ async def _request_fresh_token(task_instance, miner_hotkey: str, job_id: str) ->
 
                             miner_base_url = f"https://{ip_str}:{port_val}"
                             
-                            full_kerchunk_url = f"{miner_base_url}{kerchunk_url}"
-                            logger.info(f"[VerifyLogic] PRE-RETURN SUCCESS: About to return tuple for job {job_id}. Token: {'Yes' if token else 'No'}, URL: {full_kerchunk_url}, Hash: {'Yes' if verification_hash else 'No'}")
-                            return token, full_kerchunk_url, verification_hash
+                            full_zarr_url = f"{miner_base_url}{zarr_store_url}"
+                            logger.info(f"[VerifyLogic] PRE-RETURN SUCCESS: About to return tuple for job {job_id}. Token: {'Yes' if token else 'No'}, URL: {full_zarr_url}, Hash: {'Yes' if verification_hash else 'No'}")
+                            return token, full_zarr_url, verification_hash
                         except Exception as e_inner:
                             logger.error(f"[VerifyLogic] EXCEPTION DURING SUCCESS RETURN PREP for job {job_id}: {e_inner!r}", exc_info=True)
                             return None
@@ -318,7 +318,7 @@ async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_u
         
     try:
         query = """
-        SELECT id as job_id, status, target_netcdf_path, kerchunk_json_path 
+        SELECT id as job_id, status, target_netcdf_path as zarr_store_path
         FROM weather_miner_jobs
         WHERE gfs_init_time_utc = :gfs_init_time
         ORDER BY id DESC
@@ -379,38 +379,38 @@ async def update_job_status(task_instance: 'WeatherTask', job_id: str, status: s
 async def update_job_paths(task_instance: 'WeatherTask', job_id: str, target_netcdf_path: str, kerchunk_json_path: str, verification_hash: str):
     """
     Update the file paths and verification hash for a completed job in the miner's database.
+    Now stores the Zarr path in both target_netcdf_path and kerchunk_json_path fields for compatibility.
     (Intended for Miner-side usage)
     """
     if task_instance.node_type != 'miner':
         logger.error("update_job_paths called on non-miner node.")
         return False
         
-    logger.debug(f"[Job {job_id}] Updating miner job paths.")
+    logger.debug(f"[Job {job_id}] Updating miner job paths with Zarr store path: {target_netcdf_path}")
     try:
         query = """
         UPDATE weather_miner_jobs
-        SET target_netcdf_path = :netcdf_path,
-            kerchunk_json_path = :kerchunk_path,
+        SET target_netcdf_path = :zarr_path,
+            kerchunk_json_path = :zarr_path,
             verification_hash = :hash,
             updated_at = :updated_at
         WHERE id = :job_id
         """
         params = {
             "job_id": job_id,
-            "netcdf_path": target_netcdf_path,
-            "kerchunk_path": kerchunk_json_path,
+            "zarr_path": target_netcdf_path,
             "hash": verification_hash,
             "updated_at": datetime.now(timezone.utc)
         }
         await task_instance.db_manager.execute(query, params)
-        logger.info(f"Updated miner job {job_id} with file paths and verification hash")
+        logger.info(f"Updated miner job {job_id} with Zarr store path and verification hash")
         return True
     except Exception as e:
         logger.error(f"Error updating miner job paths for {job_id}: {e}")
         return False
 
 async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict, response_details: Dict):
-    """Handles fetching Kerchunk info and verifying a single miner response."""
+    """Handles fetching Zarr store info and verifying a single miner response."""
     run_id = run_details['id']
     gfs_init_time = run_details['gfs_init_time_utc']
     response_id = response_details['id']
@@ -425,7 +425,7 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
     logger.info(f"[VerifyLogic] Verifying response {response_id} from {miner_hotkey} (Miner Job ID: {job_id})")
     
     access_token = None
-    full_kerchunk_url = None
+    zarr_store_url = None
     verification_hash_claimed = None
     
     try:
@@ -435,11 +435,11 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
             logger.error(f"[VerifyLogic, Resp {response_id}] _request_fresh_token returned None for {miner_hotkey} (Miner Job: {job_id}).")
             raise ValueError(f"Failed to get access token for {miner_hotkey} job {job_id}")
 
-        access_token, full_kerchunk_url, verification_hash_claimed = token_data_tuple
-        logger.info(f"[VerifyLogic, Resp {response_id}] Successfully unpacked token data tuple. Token: {'Yes' if access_token else 'No'}, URL: {full_kerchunk_url}, Hash: {'Yes' if verification_hash_claimed else 'No'}")
+        access_token, zarr_store_url, verification_hash_claimed = token_data_tuple
+        logger.info(f"[VerifyLogic, Resp {response_id}] Successfully unpacked token data tuple. Token: {'Yes' if access_token else 'No'}, URL: {zarr_store_url}, Hash: {'Yes' if verification_hash_claimed else 'No'}")
             
-        if not all([access_token, full_kerchunk_url, verification_hash_claimed]):
-            logger.error(f"[VerifyLogic, Resp {response_id}] One or more critical items (token, URL, hash) are None/empty after unpacking. Token: {'Set' if access_token else 'Not Set'}, URL: {full_kerchunk_url}, Hash: {'Set' if verification_hash_claimed else 'Not Set'}")
+        if not all([access_token, zarr_store_url, verification_hash_claimed]):
+            logger.error(f"[VerifyLogic, Resp {response_id}] One or more critical items (token, URL, hash) are None/empty after unpacking. Token: {'Set' if access_token else 'Not Set'}, URL: {zarr_store_url}, Hash: {'Set' if verification_hash_claimed else 'Not Set'}")
             raise ValueError("Critical information (token, URL, or hash) missing after token request.")
 
         validator_instance = task_instance.validator 
@@ -452,9 +452,9 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
             UPDATE weather_miner_responses
             SET kerchunk_json_url = :url, verification_hash_claimed = :hash, status = 'verifying_hash'
             WHERE id = :id
-        """, {"id": response_id, "url": full_kerchunk_url, "hash": verification_hash_claimed})
+        """, {"id": response_id, "url": zarr_store_url, "hash": verification_hash_claimed})
 
-        logger.info(f"[VerifyLogic, Resp {response_id}] Verifying hash for URL: {full_kerchunk_url}...")
+        logger.info(f"[VerifyLogic, Resp {response_id}] Verifying hash for Zarr store URL: {zarr_store_url}...")
         from ..utils.hashing import verify_forecast_hash 
         variables_to_check = ALL_EXPECTED_VARIABLES 
         metadata = {"time": [gfs_init_time], "source_model": "aurora", "resolution": 0.25}
@@ -464,9 +464,12 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
         
         verification_result = await asyncio.wait_for(
             verify_forecast_hash(
-                kerchunk_url=full_kerchunk_url, claimed_hash=verification_hash_claimed,
-                metadata=metadata, variables=variables_to_check,
-                timesteps=timesteps, headers=headers
+                zarr_store_url=zarr_store_url,
+                claimed_hash=verification_hash_claimed,
+                metadata=metadata,
+                variables=variables_to_check,
+                timesteps=timesteps,
+                headers=headers
             ),
             timeout=verification_timeout_seconds
         )

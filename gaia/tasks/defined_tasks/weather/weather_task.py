@@ -796,22 +796,23 @@ class WeatherTask(Task):
 
     async def handle_kerchunk_request(self, job_id: str) -> Dict[str, Any]:
         """
-        Handle a request for Kerchunk JSON metadata for a specific forecast job.
+        Handle a request for forecast data for a specific job.
+        Now returns information about the Zarr store directly instead of Kerchunk JSON.
         
         Args:
             job_id: The unique identifier for the job
             
         Returns:
             Dict containing status, message, and if completed:
-            - kerchunk_json_url: URL to access the Kerchunk JSON
+            - zarr_store_url: URL to access the Zarr store
             - verification_hash: Hash to verify forecast integrity
             - access_token: JWT token for accessing forecast files
         """            
-        logger.info(f"Handling kerchunk request for job_id: {job_id}")
+        logger.info(f"Handling forecast data request for job_id: {job_id}")
         
         try:
             query = """
-            SELECT id as job_id, status, target_netcdf_path, kerchunk_json_path, verification_hash, error_message
+            SELECT id as job_id, status, target_netcdf_path, verification_hash, error_message
             FROM weather_miner_jobs
             WHERE id = :job_id 
             """
@@ -822,16 +823,22 @@ class WeatherTask(Task):
                 return {"status": "not_found", "message": f"Job with ID {job_id} not found"}
                 
             if job["status"] == "completed":
-                netcdf_path = job["target_netcdf_path"]
-                kerchunk_path_str = job["kerchunk_json_path"]
+                zarr_path_str = job["target_netcdf_path"]
                 verification_hash = job["verification_hash"]
                 
-                if not netcdf_path or not kerchunk_path_str or not verification_hash:
-                    logger.error(f"Job {job_id} completed but missing required path/hash info.")
+                if not zarr_path_str or not verification_hash:
+                    logger.error(f"Job {job_id} completed but missing required path/hash info. Zarr path: {zarr_path_str}, Hash: {verification_hash}")
                     return {"status": "error", "message": "Job completed but data paths or hash missing"}
-                    
-                filename_for_jwt_claim = os.path.basename(kerchunk_path_str)
                 
+                zarr_path = Path(zarr_path_str)
+                zarr_dir_name = zarr_path.name
+                
+                if not zarr_dir_name.endswith(".zarr"):
+                    logger.error(f"Expected Zarr directory but found: {zarr_dir_name}")
+                    return {"status": "error", "message": "Invalid Zarr store format"}
+
+                logger.info(f"[Job {job_id}] Using Zarr directory for JWT claim: {zarr_dir_name}")
+
                 miner_jwt_secret_key = self.config.get('miner_jwt_secret_key', os.getenv("MINER_JWT_SECRET_KEY"))
                 if not miner_jwt_secret_key:
                     logger.warning("MINER_JWT_SECRET_KEY not set in config or environment. Using default insecure key.")
@@ -841,7 +848,7 @@ class WeatherTask(Task):
                 
                 token_data = {
                     "job_id": job_id,
-                    "file_path": filename_for_jwt_claim,
+                    "file_path": zarr_dir_name,
                     "exp": datetime.now(timezone.utc) + timedelta(minutes=token_expire_minutes)
                 }
                 
@@ -851,12 +858,12 @@ class WeatherTask(Task):
                     algorithm=jwt_algorithm
                 )
                 
-                kerchunk_url_for_response = f"/forecasts/{os.path.basename(kerchunk_path_str)}"
+                zarr_url_for_response = f"/forecasts/{zarr_dir_name}"
                 
                 return {
                     "status": "completed",
                     "message": "Forecast completed and ready for access",
-                    "kerchunk_json_url": kerchunk_url_for_response,
+                    "zarr_store_url": zarr_url_for_response,
                     "verification_hash": verification_hash,
                     "access_token": access_token
                 }
@@ -867,7 +874,7 @@ class WeatherTask(Task):
                 return {"status": "processing", "message": f"Job is currently in status: {job['status']}"}
                 
         except Exception as e:
-            logger.error(f"Error handling kerchunk request for job_id {job_id}: {e}", exc_info=True)
+            logger.error(f"Error handling forecast data request for job_id {job_id}: {e}", exc_info=True)
             return {"status": "error", "message": f"Failed to process request: {str(e)}"}
 
     async def handle_initiate_fetch(self, request_data: 'WeatherInitiateFetchData') -> Dict[str, Any]:
