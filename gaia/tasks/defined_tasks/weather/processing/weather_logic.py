@@ -426,7 +426,8 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
     
     access_token = None
     zarr_store_url = None
-    verification_hash_claimed = None
+    verification_hash_claimed = None # Will be passed but not used for matching in analysis mode
+    analysis_profile_result = None # To store the dict from verify_forecast_hash
     
     try:
         token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, job_id)
@@ -450,44 +451,60 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
 
         await task_instance.db_manager.execute("""
             UPDATE weather_miner_responses
-            SET kerchunk_json_url = :url, verification_hash_claimed = :hash, status = 'verifying_hash'
+            SET kerchunk_json_url = :url, verification_hash_claimed = :hash, status = 'performing_analysis' # Changed status
             WHERE id = :id
         """, {"id": response_id, "url": zarr_store_url, "hash": verification_hash_claimed})
 
-        logger.info(f"[VerifyLogic, Resp {response_id}] Verifying hash for Zarr store URL: {zarr_store_url}...")
+        logger.info(f"[VerifyLogic, Resp {response_id}] Performing analysis for Zarr store URL: {zarr_store_url}...")
         from ..utils.hashing import verify_forecast_hash 
         variables_to_check = ALL_EXPECTED_VARIABLES 
         metadata = {"time": [gfs_init_time], "source_model": "aurora", "resolution": 0.25}
         headers = {"Authorization": f"Bearer {access_token}"}
-        timesteps = list(range(task_instance.config.get('inference_steps', 40)))
+        timesteps = list(range(task_instance.config.get('inference_steps', 40))) # Not directly used by stats hash
         verification_timeout_seconds = task_instance.config.get('verification_timeout_seconds', 120)
         
-        verification_result = await asyncio.wait_for(
+        analysis_profile_result = await asyncio.wait_for(
             verify_forecast_hash(
                 zarr_store_url=zarr_store_url,
-                claimed_hash=verification_hash_claimed,
+                claimed_hash=verification_hash_claimed, # Still passed for API compatibility
                 metadata=metadata,
                 variables=variables_to_check,
-                timesteps=timesteps,
-                headers=headers
+                timesteps=timesteps, 
+                headers=headers,
+                job_id=job_id 
             ),
             timeout=verification_timeout_seconds
         )
         
-        new_status = "verified_success" if verification_result else "verified_failed_hash_mismatch"
+        # In analysis mode, verify_forecast_hash returns a dictionary (the profile or an error dict)
+        analysis_succeeded_bool = False
+        db_status_after_analysis = "analysis_failed_profile_error"
+        error_message_for_db = None
+
+        if isinstance(analysis_profile_result, dict):
+            if analysis_profile_result.get("status") == "analysis_complete":
+                analysis_succeeded_bool = True
+                db_status_after_analysis = "analysis_profile_generated"
+                logger.info(f"[VerifyLogic, Resp {response_id}] Analysis profile generation succeeded.")
+            else:
+                error_message_for_db = analysis_profile_result.get("error", "Unknown error during analysis profile generation.")
+                logger.error(f"[VerifyLogic, Resp {response_id}] Analysis profile generation failed or returned an error. Profile: {analysis_profile_result}")
+        else:
+            error_message_for_db = "Analysis function returned unexpected type."
+            logger.error(f"[VerifyLogic, Resp {response_id}] Analysis function returned unexpected type: {type(analysis_profile_result)}")
+
         await task_instance.db_manager.execute("""
-            UPDATE weather_miner_responses SET verification_passed = :verified, status = :new_status
+            UPDATE weather_miner_responses SET verification_passed = :verified, status = :new_status, error_message = COALESCE(error_message, :err_msg)
             WHERE id = :id
-        """, {"id": response_id, "verified": verification_result, "new_status": new_status})
-        logger.info(f"[VerifyLogic, Resp {response_id}] Hash verification {'succeeded' if verification_result else 'failed'}.")
+        """, {"id": response_id, "verified": analysis_succeeded_bool, "new_status": db_status_after_analysis, "err_msg": error_message_for_db})
         
     except asyncio.TimeoutError:
-        logger.error(f"[VerifyLogic, Resp {response_id}] Verification timed out for {miner_hotkey} (Miner Job: {job_id}).")
-        await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_timeout', error_message = 'Verification process timed out' WHERE id = :id", {"id": response_id})
+        logger.error(f"[VerifyLogic, Resp {response_id}] Analysis/Verification timed out for {miner_hotkey} (Miner Job: {job_id}).")
+        await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_timeout', error_message = 'Analysis process timed out', verification_passed = FALSE WHERE id = :id", {"id": response_id})
     except Exception as err:
-        logger.error(f"[VerifyLogic, Resp {response_id}] Error verifying response from {miner_hotkey} (Miner Job: {job_id}): {err!r}", exc_info=True) 
+        logger.error(f"[VerifyLogic, Resp {response_id}] Error verifying/analyzing response from {miner_hotkey} (Miner Job: {job_id}): {err!r}", exc_info=True) 
         await task_instance.db_manager.execute("""
-            UPDATE weather_miner_responses SET status = 'verification_error', error_message = :msg 
+            UPDATE weather_miner_responses SET status = 'verification_error', error_message = :msg, verification_passed = FALSE
             WHERE id = :id
         """, {"id": response_id, "msg": str(err)})
         

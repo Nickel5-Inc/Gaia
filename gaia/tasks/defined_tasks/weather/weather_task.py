@@ -101,6 +101,10 @@ def _load_config(self):
     config['run_minute_utc'] = int(os.getenv('WEATHER_RUN_MINUTE_UTC', '0'))
     config['validator_hash_wait_minutes'] = int(os.getenv('WEATHER_VALIDATOR_HASH_WAIT_MINUTES', '5'))
 
+    config['miner_jwt_secret_key'] = os.getenv("MINER_JWT_SECRET_KEY", "insecure_default_key_for_development_only")
+    config['jwt_algorithm'] = os.getenv("MINER_JWT_ALGORITHM", "HS256")
+    config['access_token_expire_minutes'] = int(os.getenv('WEATHER_ACCESS_TOKEN_EXPIRE_MINUTES', '120'))
+
     logger.info(f"WeatherTask configuration loaded: {config}")
     return config
 
@@ -844,7 +848,7 @@ class WeatherTask(Task):
                     logger.warning("MINER_JWT_SECRET_KEY not set in config or environment. Using default insecure key.")
                     miner_jwt_secret_key = "insecure_default_key_for_development_only"
                 jwt_algorithm = self.config.get('jwt_algorithm', "HS256")
-                token_expire_minutes = int(self.config.get('access_token_expire_minutes', 15))
+                token_expire_minutes = int(self.config.get('access_token_expire_minutes', 60))
                 
                 token_data = {
                     "job_id": job_id,

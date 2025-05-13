@@ -26,11 +26,12 @@ import warnings
 import xskillscore as xs
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
+import dask.array as da
 
 logger = get_logger(__name__)
 
 NUM_SAMPLES = 1000
-HASH_VERSION = "2.0"
+HASH_VERSION = "3.0-miner_placeholder"  # Reflects minimal miner hash for now
 
 ENABLE_PLOTTING = True
 PLOT_SAVE_DIR = "./verification_plots"
@@ -246,187 +247,45 @@ def canonical_serialization(
 
 
 def compute_verification_hash(
-    data: Dict[str, Dict[str, np.ndarray]],
+    data: Dict[str, Dict[str, np.ndarray]], # Still passed, as final hash will use it
     metadata: Dict[str, Any],
-    variables: List[str],
-    timesteps: List[int]
+    variables: List[str], # Still passed, for consistency with final design
+    timesteps: List[int]  # Still passed, for consistency
 ) -> str:
     """
-    Compute a verification hash for a forecast dataset using efficient statistical profiling
-    with physical relationship checks.
+    (TEMPORARY - MINIMAL HASH FOR DEVELOPMENT)
+    Computes a very basic hash based on metadata. 
+    Actual data-driven hashing logic is to be rebuilt.
     
     Args:
-        data: Dictionary with forecast data in Aurora-compatible format
-        metadata: Dictionary with forecast metadata 
-        variables: List of variables to include in hash
-        timesteps: List of timestep indices to include in hash
+        data: Forecast data (currently unused in this placeholder).
+        metadata: Forecast metadata.
+        variables: List of variables (currently unused).
+        timesteps: List of timestep indices (currently unused).
         
     Returns:
-        Hex string of the SHA-256 hash
+        Hex string of the SHA-256 hash.
     """
     start_time = time.time()
     
+    # Minimal profile for placeholder hash - primarily metadata-based
     profile = {
         "metadata": {
             "date": metadata.get("time")[0].strftime("%Y-%m-%d"),
             "model": metadata.get("source_model", "aurora"),
             "resolution": metadata.get("resolution", 0.25),
-            "hash_version": HASH_VERSION
+            "hash_version": HASH_VERSION 
         },
-        "variables": {},
-        "physical_checks": {}
+        "notes": "Placeholder hash using minimal metadata only during hashing algorithm rebuild."
+        # No complex statistics or physical checks for this placeholder hash
     }
-
-    max_t = max([data[cat][var].shape[1] for cat in data for var in data[cat] if var in variables])
-    profile_timesteps = sorted(list(set([0, max_t // 2, max_t - 1])))
-    profile["timesteps"] = profile_timesteps
-    
-    t_data = data.get("atmos_vars", {}).get("t", None)
-    u_data = data.get("atmos_vars", {}).get("u", None)
-    v_data = data.get("atmos_vars", {}).get("v", None)
-    z_data = data.get("atmos_vars", {}).get("z", None)
-    q_data = data.get("atmos_vars", {}).get("q", None)
-    t2m_data = data.get("surf_vars", {}).get("2t", None)
-    msl_data = data.get("surf_vars", {}).get("msl", None)
-    u10_data = data.get("surf_vars", {}).get("10u", None)
-    v10_data = data.get("surf_vars", {}).get("10v", None)
-    
-    for var_name in sorted(variables):
-
-        var_data = None
-        var_category = None
-
-        if var_name in ["2t", "10u", "10v", "msl"] and "surf_vars" in data:
-            if var_name in data["surf_vars"]:
-                var_data = data["surf_vars"][var_name]
-                var_category = "surf_vars"
-        
-
-        if var_name in ["t", "u", "v", "q", "z"] and "atmos_vars" in data:
-            if var_name in data["atmos_vars"]:
-                var_data = data["atmos_vars"][var_name]
-                var_category = "atmos_vars"
-        
-        if var_data is None:
-            continue
-        
-        var_profile = {
-            "shape": list(var_data.shape),
-            "global_stats": {
-                "mean": float(np.mean(var_data)),
-                "std": float(np.std(var_data)),
-                "min": float(np.min(var_data)),
-                "max": float(np.max(var_data)),
-                "median": float(np.median(var_data)),
-                "percentile_5": float(np.percentile(var_data, 5)),
-                "percentile_95": float(np.percentile(var_data, 95))
-            },
-            "timestep_stats": {}
-        }
-        
-        for t_idx in profile_timesteps:
-            if t_idx < var_data.shape[1]:
-
-                if var_category == "surf_vars":
-                    t_slice = var_data[:, t_idx, :, :]
-                else:
-                    t_slice = var_data[:, t_idx, :, :, :]
-
-                var_profile["timestep_stats"][f"t{t_idx}"] = {
-                    "mean": float(np.mean(t_slice)),
-                    "std": float(np.std(t_slice)),
-                    "min": float(np.min(t_slice)),
-                    "max": float(np.max(t_slice))
-                }
-                
-
-                if var_category == "atmos_vars":
-                    levels = [0, t_slice.shape[1] // 2, t_slice.shape[1] - 1]
-                    level_stats = {}
-                    
-                    for l_idx in levels:
-                        l_slice = t_slice[:, l_idx, :, :]
-                        level_stats[f"l{l_idx}"] = {
-                            "mean": float(np.mean(l_slice)),
-                            "std": float(np.std(l_slice))
-                        }
-                    
-                    var_profile["timestep_stats"][f"t{t_idx}"]["levels"] = level_stats
-
-        profile["variables"][var_name] = var_profile
-
-    if all(x is not None for x in [t_data, u_data, v_data, z_data, q_data]):
-        t_idx = profile_timesteps[1] if len(profile_timesteps) > 1 else profile_timesteps[0]
-        if t_idx < t_data.shape[1]:
-            l_idx = min(6, t_data.shape[2] - 1)
-            
-            try:
-
-                t_mid = t_data[0, t_idx, l_idx, :, :]
-                t_upper = t_data[0, t_idx, max(0, l_idx-2), :, :]
-                u_diff = u_data[0, t_idx, max(0, l_idx-2), :, :] - u_data[0, t_idx, l_idx, :, :]
-                v_diff = v_data[0, t_idx, max(0, l_idx-2), :, :] - v_data[0, t_idx, l_idx, :, :]
-                
-                t_grad_y, t_grad_x = np.gradient(t_mid)
-
-                thermal_wind_corr_u = float(np.corrcoef(t_grad_y.flatten(), u_diff.flatten())[0, 1])
-                thermal_wind_corr_v = float(np.corrcoef(t_grad_x.flatten(), v_diff.flatten())[0, 1])
-
-                z_grad_y, z_grad_x = np.gradient(z_data[0, t_idx, l_idx, :, :])
-                geo_balance_corr_u = float(np.corrcoef(z_grad_y.flatten(), u_data[0, t_idx, l_idx, :, :].flatten())[0, 1])
-                geo_balance_corr_v = float(np.corrcoef(z_grad_x.flatten(), v_data[0, t_idx, l_idx, :, :].flatten())[0, 1])
-                
-
-                if l_idx + 2 < t_data.shape[2]:
-                    lapse_rate = float(np.mean(t_data[0, t_idx, l_idx, :, :] - t_data[0, t_idx, l_idx+2, :, :]))
-                else:
-                    lapse_rate = 0.0
-                
-                q_mid = q_data[0, t_idx, l_idx, :, :]
-                wind_speed = np.sqrt(u_data[0, t_idx, l_idx, :, :]**2 + v_data[0, t_idx, l_idx, :, :]**2)
-                moisture_advection = float(np.corrcoef(q_mid.flatten(), wind_speed.flatten())[0, 1])
-                
-                profile["physical_checks"] = {
-                    "thermal_wind_u": thermal_wind_corr_u,
-                    "thermal_wind_v": thermal_wind_corr_v,
-                    "geostrophic_u": geo_balance_corr_u,
-                    "geostrophic_v": geo_balance_corr_v, 
-                    "lapse_rate": lapse_rate,
-                    "moisture_advection": moisture_advection
-                }
-            except Exception as e:
-                logger.warning(f"Error computing physical checks: {e}")
-                profile["physical_checks"] = {"error": str(e)}
-    
-    if all(x is not None for x in [t2m_data, u10_data, v10_data, msl_data]):
-        try:
-            t_idx = profile_timesteps[1] if len(profile_timesteps) > 1 else profile_timesteps[0]
-            if t_idx < t2m_data.shape[1]:
-                msl_grad_y, msl_grad_x = np.gradient(msl_data[0, t_idx, :, :])
-                surf_geo_u = float(np.corrcoef(msl_grad_y.flatten(), u10_data[0, t_idx, :, :].flatten())[0, 1])
-                surf_geo_v = float(np.corrcoef(msl_grad_x.flatten(), v10_data[0, t_idx, :, :].flatten())[0, 1])
-                
-                t2m_grad_y, t2m_grad_x = np.gradient(t2m_data[0, t_idx, :, :])
-                t2m_wind_u = float(np.corrcoef(t2m_grad_y.flatten(), u10_data[0, t_idx, :, :].flatten())[0, 1])
-                t2m_wind_v = float(np.corrcoef(t2m_grad_x.flatten(), v10_data[0, t_idx, :, :].flatten())[0, 1])
-                
-                profile["physical_checks"].update({
-                    "surface_geostrophic_u": surf_geo_u,
-                    "surface_geostrophic_v": surf_geo_v,
-                    "surface_thermal_u": t2m_wind_u,
-                    "surface_thermal_v": t2m_wind_v
-                })
-        except Exception as e:
-            logger.warning(f"Error computing surface physical checks: {e}")
     
     canonical_json = json.dumps(profile, sort_keys=True)
     hash_obj = hashlib.sha256(canonical_json.encode())
     result_hash = hash_obj.hexdigest()
     
     elapsed_time = time.time() - start_time
-    logger.info(f"Computed verification hash in {elapsed_time:.3f} seconds using statistical profiling with physical checks")
-    logger.info(f"Hash result: {result_hash}")
-    
+    logger.info(f"Miner computed placeholder verification hash in {elapsed_time:.3f}s: {result_hash}")
     return result_hash
 
 
@@ -575,23 +434,171 @@ async def open_remote_zarr_dataset(
         return None
 
 
+def _compute_analysis_profile(current_ds, current_metadata, current_variables, _claimed_hash_unused, current_job_id):
+    inner_start_time = time.time()
+    
+    profile = {
+        "job_id": current_job_id,
+        "zarr_store_url": zarr_store_url,
+        "analysis_timestamp_utc": datetime.now(timezone.utc).isoformat(), 
+        "claimed_hash_received": _claimed_hash_unused, 
+        "metadata": {
+            "date": current_metadata.get("time")[0].strftime("%Y-%m-%d"),
+            "model": current_metadata.get("source_model", "aurora"),
+            "resolution": current_metadata.get("resolution", 0.25),
+            "hash_version": "3.0-perf_test"
+        },
+        "query_performance_tests": [],
+        "status": "performance_test_pending",
+        "notes": "Performing Zarr read performance tests."
+    }
+
+    try:
+        max_t = current_ds.sizes.get("time", 0)
+        if max_t == 0:
+            profile["status"] = "performance_test_error"
+            profile["notes"] = "Dataset has no time dimension."
+            profile["computation_time_seconds"] = time.time() - inner_start_time
+            return profile
+
+        profile_timesteps_indices = sorted(list(set([0, max_t // 2, max_t - 1]))) if max_t > 0 else [0]
+        mid_timestep_idx = profile_timesteps_indices[1] if len(profile_timesteps_indices) > 1 else profile_timesteps_indices[0]
+
+        var_mapping = {}
+        standard_mapping = {
+            "2t": ["2t", "t2m"], "10u": ["10u", "u10"], "10v": ["10v", "v10"], "msl": ["msl"],
+            "t": ["t"], "u": ["u"], "v": ["v"], "q": ["q"], "z": ["z"]
+        }
+        ds_vars = list(current_ds.data_vars)
+        for var_name_map, possible_names in standard_mapping.items():
+            for pn in possible_names:
+                if pn in ds_vars:
+                    var_mapping[var_name_map] = pn
+                    break
+        
+        # === Test Case 1: One variable, one step, one level, full lat/lon ===
+        case1_results = {"case_name": "Case 1: Single Full 2D Slice (t, mid-time, mid-level)"}
+        try:
+            var_to_test_case1 = "t"
+            if var_mapping.get(var_to_test_case1) in current_ds:
+                data_array_case1 = current_ds[var_mapping[var_to_test_case1]]
+                if "pressure_level" in data_array_case1.sizes:
+                    mid_level_idx = data_array_case1.sizes["pressure_level"] // 2
+                    selection_case1 = data_array_case1.isel(time=mid_timestep_idx, pressure_level=mid_level_idx)
+                    
+                    time_start_case1 = time.time()
+                    loaded_slice_case1 = selection_case1.load()
+                    case1_results["time_taken_seconds"] = time.time() - time_start_case1
+                    case1_results["data_loaded_bytes"] = loaded_slice_case1.nbytes
+                    case1_results["slice_shape"] = list(loaded_slice_case1.shape)
+                    case1_results["status"] = "success"
+                else:
+                    case1_results["status"] = "skipped_not_3d_var"
+            else:
+                case1_results["status"] = f"skipped_var_not_found ({var_to_test_case1})"
+        except Exception as e_case1:
+            case1_results["status"] = "error"
+            case1_results["error_message"] = str(e_case1)
+        profile["query_performance_tests"].append(case1_results)
+
+        # === Test Case 2: One chunk only===
+        case2_results = {"case_name": "Case 2: Small Localized 2D Slice (t, mid-time, mid-level, 10x10 window)"}
+        try:
+            var_to_test_case2 = "t"
+            if var_mapping.get(var_to_test_case2) in current_ds:
+                data_array_case2 = current_ds[var_mapping[var_to_test_case2]]
+                if "pressure_level" in data_array_case2.sizes and "lat" in data_array_case2.sizes and "lon" in data_array_case2.sizes:
+                    mid_level_idx = data_array_case2.sizes["pressure_level"] // 2
+                    lat_slice = slice(0, min(10, data_array_case2.sizes["lat"]))
+                    lon_slice = slice(0, min(10, data_array_case2.sizes["lon"]))
+                    selection_case2 = data_array_case2.isel(time=mid_timestep_idx, pressure_level=mid_level_idx, lat=lat_slice, lon=lon_slice)
+                    
+                    time_start_case2 = time.time()
+                    loaded_slice_case2 = selection_case2.load()
+                    case2_results["time_taken_seconds"] = time.time() - time_start_case2
+                    case2_results["data_loaded_bytes"] = loaded_slice_case2.nbytes
+                    case2_results["slice_shape"] = list(loaded_slice_case2.shape)
+                    case2_results["status"] = "success"
+                else:
+                    case2_results["status"] = "skipped_missing_dims_for_small_slice"
+            else:
+                case2_results["status"] = f"skipped_var_not_found ({var_to_test_case2})"
+        except Exception as e_case2:
+            case2_results["status"] = "error"
+            case2_results["error_message"] = str(e_case2)
+        profile["query_performance_tests"].append(case2_results)
+
+        # === Test Case 3: Three variables, three levels (for 3D vars), three steps, full lat/lon ===
+        case3_results = {"case_name": "Case 3: Multi-Var/Time/Level Full Slices (t, u, 2t)"}
+        try:
+            vars_to_test_case3 = ["t", "u", "2t"] # Mix of 3D and 2D
+            data_loaded_bytes_case3 = 0
+            actual_slices_loaded_count = 0
+            time_start_case3 = time.time()
+
+            for var_c3 in vars_to_test_case3:
+                if var_mapping.get(var_c3) in current_ds:
+                    data_array_c3 = current_ds[var_mapping[var_c3]]
+                    is_3d_c3 = "pressure_level" in data_array_c3.sizes
+                    levels_to_load_c3 = [data_array_c3.sizes["pressure_level"] // 2]
+                    if is_3d_c3:
+                        num_levels_c3 = data_array_c3.sizes["pressure_level"]
+                        levels_to_load_c3 = sorted(list(set([0, num_levels_c3 // 2, num_levels_c3 - 1]))) if num_levels_c3 > 0 else [0]
+                    
+                    for t_idx_c3 in profile_timesteps_indices:
+                        if t_idx_c3 < data_array_c3.sizes.get("time",0):
+                            if is_3d_c3:
+                                for l_idx_c3 in levels_to_load_c3:
+                                    if l_idx_c3 < data_array_c3.sizes["pressure_level"]:
+                                        selection_c3 = data_array_c3.isel(time=t_idx_c3, pressure_level=l_idx_c3)
+                                        loaded_slice_c3 = selection_c3.load()
+                                        data_loaded_bytes_case3 += loaded_slice_c3.nbytes
+                                        actual_slices_loaded_count +=1
+                            else: # 2D variable
+                                selection_c3 = data_array_c3.isel(time=t_idx_c3)
+                                loaded_slice_c3 = selection_c3.load()
+                                data_loaded_bytes_case3 += loaded_slice_c3.nbytes
+                                actual_slices_loaded_count +=1
+                else:
+                    logger.warning(f"Case 3: Variable {var_c3} not found, skipping its part.")
+            
+            case3_results["time_taken_seconds"] = time.time() - time_start_case3
+            case3_results["total_data_loaded_bytes"] = data_loaded_bytes_case3
+            case3_results["total_2d_slices_loaded"] = actual_slices_loaded_count
+            case3_results["status"] = "success"
+        except Exception as e_case3:
+            case3_results["status"] = "error"
+            case3_results["error_message"] = str(e_case3)
+        profile["query_performance_tests"].append(case3_results)
+        
+        profile["status"] = "performance_test_complete"
+
+    except Exception as e_inner_fatal:
+        logger.error(f"Fatal error inside _compute_analysis_profile (performance test) for job {current_job_id}: {e_inner_fatal}", exc_info=True)
+        profile["status"] = "performance_test_fatal_error"
+        profile["error"] = str(e_inner_fatal)
+    
+    profile["computation_time_seconds"] = time.time() - inner_start_time
+    return profile 
+
+
 async def verify_forecast_hash(
     zarr_store_url: str,
+    claimed_hash: str, 
     metadata: Dict[str, Any],
     variables: List[str],
-    timesteps: List[int],
+    timesteps: List[int], 
     headers: Optional[Dict[str, str]] = None,
     job_id: Optional[str] = "unknown_job"
-) -> Dict[str, Any]:
+) -> Dict[str, Any]: 
     """
-    (TEMPORARY ANALYSIS MODE) 
-    Fetches data slices, computes statistical profile, physical checks, generates plots,
-    and saves the resulting profile to a JSON file.
-    Returns a dictionary containing the computed profile or an error.
-    All intensive operations run in an executor.
+    (PERFORMANCE TEST MODE)
+    Opens dataset. _compute_analysis_profile performs specific Zarr read tests.
+    Saves the performance profile to a JSON file.
+    Returns a dictionary containing the performance profile or an error.
     """
     start_time_total_verify = time.time()
-    logger.info(f"Starting forecast analysis for job {job_id}: {zarr_store_url}")
+    logger.info(f"Starting Zarr read performance test for job {job_id}: {zarr_store_url}")
     
     storage_options = {}
     if headers:
@@ -603,337 +610,49 @@ async def verify_forecast_hash(
         if ds is None:
             err_msg = f"Dataset open failed for job {job_id} at {zarr_store_url}."
             logger.error(err_msg)
-            return {"error": err_msg, "job_id": job_id, "status": "dataset_open_failed"}
+            return {"error": err_msg, "job_id": job_id, "status": "dataset_open_failed", "zarr_store_url": zarr_store_url}
     except Exception as e:
         err_msg = f"Exception opening dataset for job {job_id} at {zarr_store_url}: {e}"
         logger.error(err_msg, exc_info=True)
-        return {"error": err_msg, "job_id": job_id, "status": "dataset_open_exception"}
+        return {"error": err_msg, "job_id": job_id, "status": "dataset_open_exception", "zarr_store_url": zarr_store_url}
     
-    def _compute_analysis_profile(current_ds, current_metadata, current_variables, current_job_id):
-        inner_start_time = time.time()
-        plot_idx = 0 
-        profile = {
-            "job_id": current_job_id,
-            "zarr_store_url": zarr_store_url, 
-            "analysis_timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "metadata": {
-                "date": current_metadata.get("time")[0].strftime("%Y-%m-%d"),
-                "model": current_metadata.get("source_model", "aurora"),
-                "resolution": current_metadata.get("resolution", 0.25),
-                "hash_version": HASH_VERSION 
-            },
-            "variables": {},
-            "physical_checks": {}
-        }
-        
-        try:
-            max_t = current_ds.sizes.get("time", 0)
-            profile_timesteps_inner = sorted(list(set([0, max_t // 2, max_t - 1]))) if max_t > 0 else [0]
-            profile["profiled_timesteps"] = profile_timesteps_inner 
-            mid_profile_timestep_idx = profile_timesteps_inner[1] if len(profile_timesteps_inner) > 1 else profile_timesteps_inner[0]
-            
-            var_mapping = {}
-            standard_mapping = {
-                "2t": ["2t", "t2m"], "10u": ["10u", "u10"], "10v": ["10v", "v10"], "msl": ["msl"],
-                "t": ["t"], "u": ["u"], "v": ["v"], "q": ["q"], "z": ["z"]
-            }
-            ds_vars = list(current_ds.data_vars)
-            for var_name_map, possible_names in standard_mapping.items():
-                for pn in possible_names:
-                    if pn in ds_vars:
-                        var_mapping[var_name_map] = pn
-                        break
-            
-            for var_name_canonical in sorted(current_variables):
-                if var_name_canonical not in var_mapping or var_mapping[var_name_canonical] not in current_ds:
-                    logger.warning(f"Job {current_job_id}: Variable {var_name_canonical} not found or not mapped in dataset. Skipping.")
-                    continue
-                
-                ds_actual_name = var_mapping[var_name_canonical]
-                var_data_xr = current_ds[ds_actual_name] 
-                is_3d_var = "pressure_level" in var_data_xr.sizes
-                var_profile_data = {"shape": list(var_data_xr.shape), "global_stats": {}}
-                
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", category=RuntimeWarning)
-                    current_global_stats = {
-                        "mean": float(var_data_xr.mean().compute().data),
-                        "std": float(var_data_xr.std().compute().data),
-                        "min": float(var_data_xr.min().compute().data),
-                        "max": float(var_data_xr.max().compute().data)
-                    }
-                    try:
-                        current_global_stats["median"] = float(var_data_xr.median().compute().data)
-                        current_global_stats["p05"] = float(var_data_xr.quantile(0.05).compute().data)
-                        current_global_stats["p95"] = float(var_data_xr.quantile(0.95).compute().data)
-                    except NotImplementedError:
-                        logger.warning(f"Job {current_job_id}: Dask median/quantile not implemented for full array {ds_actual_name}. Setting to NaN.")
-                        current_global_stats["median"] = np.nan; current_global_stats["p05"] = np.nan; current_global_stats["p95"] = np.nan
-                    except Exception as e_stat_detail:
-                        logger.warning(f"Job {current_job_id}: Error computing median/quantiles for {ds_actual_name}: {e_stat_detail}. Setting to NaN.")
-                        current_global_stats["median"] = np.nan; current_global_stats["p05"] = np.nan; current_global_stats["p95"] = np.nan
-                    var_profile_data["global_stats"] = current_global_stats
-                
-                var_profile_data["timestep_stats"] = {}
-                current_t_slice_for_plot = None 
-
-                for t_idx_loop_val in profile_timesteps_inner:
-                    if t_idx_loop_val < current_ds.sizes.get("time", 0):
-                        t_slice_xr = var_data_xr.isel(time=t_idx_loop_val) 
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", category=RuntimeWarning)
-                            var_profile_data["timestep_stats"][f"t{t_idx_loop_val}"] = {
-                                "mean": float(t_slice_xr.mean().compute().data),
-                                "std": float(t_slice_xr.std().compute().data),
-                                "min": float(t_slice_xr.min().compute().data),
-                                "max": float(t_slice_xr.max().compute().data)
-                            }
-                        if is_3d_var:
-                            num_levels_slice = t_slice_xr.sizes["pressure_level"]
-                            levels_to_sample_inner = sorted(list(set([0, num_levels_slice // 2, num_levels_slice - 1])))
-                            level_stats_inner = {}
-                            for l_idx_loop in levels_to_sample_inner:
-                                l_slice_level_xr = t_slice_xr.isel(pressure_level=l_idx_loop) 
-                                with warnings.catch_warnings():
-                                    warnings.simplefilter("ignore", category=RuntimeWarning)
-                                    level_stats_inner[f"l{l_idx_loop}"] = {
-                                        "mean": float(l_slice_level_xr.mean().compute().data),
-                                        "std": float(l_slice_level_xr.std().compute().data)
-                                    }
-                            var_profile_data["timestep_stats"][f"t{t_idx_loop_val}"]["levels"] = level_stats_inner
-                        if t_idx_loop_val == mid_profile_timestep_idx: 
-                            current_t_slice_for_plot = t_slice_xr 
-                profile["variables"][var_name_canonical] = var_profile_data
-
-                if ENABLE_PLOTTING and var_name_canonical in ["2t", "t", "z", "u"] and current_t_slice_for_plot is not None:
-                    try:
-                        plt.figure(figsize=(12, 6))
-                        data_to_plot_base = current_t_slice_for_plot 
-                        plot_data_final_xr = data_to_plot_base.isel(pressure_level=data_to_plot_base.sizes['pressure_level'] // 2).load() if is_3d_var else data_to_plot_base.load()
-                        plot_data_final_np = plot_data_final_xr.data
-                        if len(plot_data_final_np.shape) > 2 and plot_data_final_np.shape[0] == 1: 
-                            plot_data_final_np = plot_data_final_np[0]
-                        lons = plot_data_final_xr.coords.get('lon', np.arange(plot_data_final_np.shape[1]))
-                        lats = plot_data_final_xr.coords.get('lat', np.arange(plot_data_final_np.shape[0]))
-                        min_val, max_val = float(np.nanmin(plot_data_final_np)), float(np.nanmax(plot_data_final_np))
-                        if min_val == max_val: min_val -= 1; max_val +=1
-                        norm = Normalize(vmin=min_val, vmax=max_val)
-                        plt.contourf(lons, lats, plot_data_final_np, cmap='RdBu_r', norm=norm, levels=20, origin='lower')
-                        plt.title(f"Job {current_job_id}: {ds_actual_name} at T={mid_profile_timestep_idx} (Mid Level if 3D)")
-                        plt.colorbar(label=f"{ds_actual_name} units")
-                        plt.xlabel("Longitude"); plt.ylabel("Latitude")
-                        plot_filename = os.path.join(PLOT_SAVE_DIR, f"{current_job_id}_plot{plot_idx}_{ds_actual_name}_T{mid_profile_timestep_idx}.png")
-                        plt.savefig(plot_filename); plt.close(); plot_idx += 1
-                        logger.info(f"Saved plot for job {current_job_id}: {plot_filename}")
-                    except Exception as plot_err:
-                        logger.warning(f"Plotting error for {ds_actual_name} (job {current_job_id}): {plot_err}")
-            
-            phys_vars_present = {v: (v in var_mapping and var_mapping[v] in current_ds) for v in ["t", "u", "v", "z", "q", "2t", "10u", "10v", "msl"]}
-
-            if all(phys_vars_present[v] for v in ["t", "u", "v", "z"]):
-                try:
-                    t_idx_phys_check = mid_profile_timestep_idx
-                    level_dim_name_check = "pressure_level"
-                    t_phys_xr = current_ds[var_mapping["t"]].isel(time=t_idx_phys_check) 
-                    u_phys_xr = current_ds[var_mapping["u"]].isel(time=t_idx_phys_check)
-                    v_phys_xr = current_ds[var_mapping["v"]].isel(time=t_idx_phys_check)
-                    z_phys_xr = current_ds[var_mapping["z"]].isel(time=t_idx_phys_check)
-                    mid_level_idx_phys = t_phys_xr.sizes[level_dim_name_check] // 2
-
-                    if ENABLE_PLOTTING and phys_vars_present["u"] and phys_vars_present["v"] and phys_vars_present["z"]:
-                        try:
-                            u_contour_slice = u_phys_xr.isel({level_dim_name_check: mid_level_idx_phys}).load()
-                            v_contour_slice = v_phys_xr.isel({level_dim_name_check: mid_level_idx_phys}).load()
-                            z_contour_slice = z_phys_xr.isel({level_dim_name_check: mid_level_idx_phys}).load()
-                            u_data_np = u_contour_slice.data; v_data_np = v_contour_slice.data; z_data_np = z_contour_slice.data
-                            if u_data_np.ndim > 2 and u_data_np.shape[0] == 1: u_data_np = u_data_np[0]
-                            if v_data_np.ndim > 2 and v_data_np.shape[0] == 1: v_data_np = v_data_np[0]
-                            if z_data_np.ndim > 2 and z_data_np.shape[0] == 1: z_data_np = z_data_np[0]
-                            lons_contour = z_contour_slice.coords.get('lon', np.arange(z_data_np.shape[1]))
-                            lats_contour = z_contour_slice.coords.get('lat', np.arange(z_data_np.shape[0]))
-                            plt.figure(figsize=(14, 7))
-                            contour_levels_z = np.arange(int(z_data_np.min()/10)*10 - 60, int(z_data_np.max()/10)*10 + 120, 60) 
-                            CS = plt.contour(lons_contour, lats_contour, z_data_np, levels=contour_levels_z, colors='k', linewidths=0.8, origin='lower')
-                            plt.clabel(CS, CS.levels, inline=True, fontsize=8, fmt='%1.0f')
-                            skip_factor = max(1, z_data_np.shape[1] // 72) # Aim for ~72 vectors across longitude
-                            skip = (slice(None, None, skip_factor), slice(None, None, skip_factor)) 
-                            plt.quiver(lons_contour[skip[1]], lats_contour[skip[0]], 
-                                       u_data_np[skip], v_data_np[skip], 
-                                       color='blue', scale_units='inches', scale= (u_data_np.max() / 2.0) if u_data_np.max() > 0 else None, headwidth=4, headlength=5, width=0.003, minshaft=1, minlength=1)
-                            plt.title(f"Job {current_job_id}: Wind Vectors & Geopotential Height at ~500hPa, T={t_idx_phys_check}")
-                            plt.xlabel("Longitude"); plt.ylabel("Latitude")
-                            plot_filename = os.path.join(PLOT_SAVE_DIR, f"{current_job_id}_plot{plot_idx}_wind_geopotential_T{t_idx_phys_check}.png")
-                            plt.savefig(plot_filename); plt.close(); plot_idx +=1;
-                            logger.info(f"Saved Wind/Geopotential plot for job {current_job_id}")
-                        except Exception as plot_err:
-                            logger.warning(f"Wind/Geopotential plot error (job {current_job_id}): {plot_err}")
-
-                    if mid_level_idx_phys > 1:
-                        t_mid_phys_xr = t_phys_xr.isel({level_dim_name_check: mid_level_idx_phys})
-                        u_shear_phys = u_phys_xr.isel({level_dim_name_check: mid_level_idx_phys-2}) - u_phys_xr.isel({level_dim_name_check: mid_level_idx_phys})
-                        v_shear_phys = v_phys_xr.isel({level_dim_name_check: mid_level_idx_phys-2}) - v_phys_xr.isel({level_dim_name_check: mid_level_idx_phys})
-                        t_grad_y_phys, t_grad_x_phys = np.gradient(t_mid_phys_xr.load().data) 
-                        t_grad_y_xr = xr.DataArray(t_grad_y_phys, dims=t_mid_phys_xr.dims, coords=t_mid_phys_xr.coords)
-                        t_grad_x_xr = xr.DataArray(t_grad_x_phys, dims=t_mid_phys_xr.dims, coords=t_mid_phys_xr.coords)
-                        profile["physical_checks"]["thermal_wind_u"] = float(xs.pearson_r(t_grad_y_xr, u_shear_phys.compute(), dim=["lat", "lon"]).compute().data)
-                        profile["physical_checks"]["thermal_wind_v"] = float(xs.pearson_r(t_grad_x_xr, v_shear_phys.compute(), dim=["lat", "lon"]).compute().data)
-                        if ENABLE_PLOTTING: 
-                            try:
-                                fig, axs_tw = plt.subplots(1, 2, figsize=(12, 5))
-                                axs_tw[0].hist2d(t_grad_y_xr.data.flatten(), u_shear_phys.load().data.flatten(), bins=50, norm=Normalize()); axs_tw[0].set_title(f'Job {current_job_id}: dT/dy vs U-Shear')
-                                axs_tw[1].hist2d(t_grad_x_xr.data.flatten(), v_shear_phys.load().data.flatten(), bins=50, norm=Normalize()); axs_tw[1].set_title(f'Job {current_job_id}: dT/dx vs V-Shear')
-                                plt.tight_layout(); plt.savefig(os.path.join(PLOT_SAVE_DIR, f"{current_job_id}_plot{plot_idx}_thermal_wind.png")); plt.close(); plot_idx +=1;
-                                logger.info(f"Saved thermal wind plot for job {current_job_id}")
-                            except Exception as plot_err: logger.warning(f"Plotting thermal wind error (job {current_job_id}): {plot_err}")
-
-                    z_mid_phys_xr = z_phys_xr.isel({level_dim_name_check: mid_level_idx_phys})
-                    u_mid_phys_xr = u_phys_xr.isel({level_dim_name_check: mid_level_idx_phys})
-                    v_mid_phys_xr = v_phys_xr.isel({level_dim_name_check: mid_level_idx_phys})
-                    z_grad_y_phys, z_grad_x_phys = np.gradient(z_mid_phys_xr.load().data)
-                    z_grad_y_xr = xr.DataArray(z_grad_y_phys, dims=z_mid_phys_xr.dims, coords=z_mid_phys_xr.coords)
-                    z_grad_x_xr = xr.DataArray(z_grad_x_phys, dims=z_mid_phys_xr.dims, coords=z_mid_phys_xr.coords)
-                    profile["physical_checks"]["geostrophic_u"] = float(xs.pearson_r(z_grad_y_xr, u_mid_phys_xr.compute(), dim=["lat", "lon"]).compute().data)
-                    profile["physical_checks"]["geostrophic_v"] = float(xs.pearson_r(z_grad_x_xr, v_mid_phys_xr.compute(), dim=["lat", "lon"]).compute().data)
-                    if ENABLE_PLOTTING: 
-                         try:
-                            fig, axs_gb = plt.subplots(1, 2, figsize=(12, 5))
-                            axs_gb[0].hist2d(z_grad_y_xr.data.flatten(), u_mid_phys_xr.load().data.flatten(), bins=50, norm=Normalize()); axs_gb[0].set_title(f'Job {current_job_id}: dZ/dy vs U')
-                            axs_gb[1].hist2d(z_grad_x_xr.data.flatten(), v_mid_phys_xr.load().data.flatten(), bins=50, norm=Normalize()); axs_gb[1].set_title(f'Job {current_job_id}: dZ/dx vs V')
-                            plt.tight_layout(); plt.savefig(os.path.join(PLOT_SAVE_DIR, f"{current_job_id}_plot{plot_idx}_geostrophic.png")); plt.close(); plot_idx +=1;
-                            logger.info(f"Saved geostrophic plot for job {current_job_id}")
-                         except Exception as plot_err: logger.warning(f"Plotting geostrophic error (job {current_job_id}): {plot_err}")
-
-                    if mid_level_idx_phys + 2 < t_phys_xr.sizes[level_dim_name_check]:
-                        t_mid_lev_xr = t_phys_xr.isel({level_dim_name_check: mid_level_idx_phys})
-                        t_lower_phys_xr = t_phys_xr.isel({level_dim_name_check: mid_level_idx_phys+2})
-                        profile["physical_checks"]["lapse_rate"] = float((t_mid_lev_xr - t_lower_phys_xr).mean().compute().data)
-                    
-                    if phys_vars_present["q"]:
-                        q_phys_xr_slice = current_ds[var_mapping["q"]].isel(time=t_idx_phys_check, pressure_level=mid_level_idx_phys)
-                        wind_speed_phys_xr = (u_mid_phys_xr**2 + v_mid_phys_xr**2)**0.5 
-                        profile["physical_checks"]["moisture_advection"] = float(xs.pearson_r(q_phys_xr_slice.compute(), wind_speed_phys_xr.compute(), dim=["lat", "lon"]).compute().data)
-                    
-                    if len(profile_timesteps_inner) > 1:
-                        try:
-                            u_t0_phys = current_ds[var_mapping["u"]].isel(time=profile_timesteps_inner[0], pressure_level=mid_level_idx_phys)
-                            u_t1_phys = current_ds[var_mapping["u"]].isel(time=profile_timesteps_inner[1], pressure_level=mid_level_idx_phys)
-                            v_t0_phys = current_ds[var_mapping["v"]].isel(time=profile_timesteps_inner[0], pressure_level=mid_level_idx_phys)
-                            v_t1_phys = current_ds[var_mapping["v"]].isel(time=profile_timesteps_inner[1], pressure_level=mid_level_idx_phys)
-                            profile["physical_checks"]["temporal_consistency_u"] = float(xs.rmse(u_t0_phys, u_t1_phys, dim=["lat", "lon"]).compute().data)
-                            profile["physical_checks"]["temporal_consistency_v"] = float(xs.rmse(v_t0_phys, v_t1_phys, dim=["lat", "lon"]).compute().data)
-                            if ENABLE_PLOTTING: 
-                                try:
-                                    fig, axs_tc = plt.subplots(1, 2, figsize=(12,5))
-                                    u_t0_np = u_t0_phys.load().data; u_t1_np = u_t1_phys.load().data
-                                    if u_t0_np.ndim > 2 and u_t0_np.shape[0] == 1: u_t0_np = u_t0_np[0]
-                                    if u_t1_np.ndim > 2 and u_t1_np.shape[0] == 1: u_t1_np = u_t1_np[0]
-                                    u_minmax = (min(u_t0_np.min(), u_t1_np.min()), max(u_t0_np.max(), u_t1_np.max()))
-                                    norm_tc = Normalize(vmin=u_minmax[0], vmax=u_minmax[1])
-                                    axs_tc[0].imshow(u_t0_np, cmap='RdBu_r', norm=norm_tc, origin='lower'); axs_tc[0].set_title(f'Job {current_job_id}: U-wind T0 MidLvl')
-                                    axs_tc[1].imshow(u_t1_np, cmap='RdBu_r', norm=norm_tc, origin='lower'); axs_tc[1].set_title(f'Job {current_job_id}: U-wind T1 MidLvl')
-                                    plt.tight_layout(); plt.savefig(os.path.join(PLOT_SAVE_DIR, f"{current_job_id}_plot{plot_idx}_temporal_u.png")); plt.close(); plot_idx +=1;
-                                    logger.info(f"Saved temporal U plot for job {current_job_id}")
-                                except Exception as plot_err: logger.warning(f"Plotting temporal U error (job {current_job_id}): {plot_err}")
-                        except Exception as e_skill_check:
-                            logger.warning(f"Validator error computing temporal consistency (job {current_job_id}): {e_skill_check}")
-                except Exception as e_phys_outer:
-                    logger.warning(f"Validator error computing atmospheric physical checks (job {current_job_id}): {e_phys_outer}")
-                    profile["physical_checks"]["atmos_error"] = str(e_phys_outer)
-            
-            if all(phys_vars_present[v] for v in ["2t", "10u", "10v", "msl"]):
-                try:
-                    t_idx_surf_check = mid_profile_timestep_idx
-                    t2m_surf_xr = current_ds[var_mapping["2t"]].isel(time=t_idx_surf_check)
-                    u10_surf_xr = current_ds[var_mapping["10u"]].isel(time=t_idx_surf_check)
-                    v10_surf_xr = current_ds[var_mapping["10v"]].isel(time=t_idx_surf_check)
-                    msl_surf_xr = current_ds[var_mapping["msl"]].isel(time=t_idx_surf_check)
-                    
-                    msl_grad_y_np, msl_grad_x_np = np.gradient(msl_surf_xr.load().data)
-                    t2m_grad_y_np, t2m_grad_x_np = np.gradient(t2m_surf_xr.load().data)
-                    msl_grad_y_xr = xr.DataArray(msl_grad_y_np, dims=msl_surf_xr.dims, coords=msl_surf_xr.coords)
-                    msl_grad_x_xr = xr.DataArray(msl_grad_x_np, dims=msl_surf_xr.dims, coords=msl_surf_xr.coords)
-                    t2m_grad_y_xr = xr.DataArray(t2m_grad_y_np, dims=t2m_surf_xr.dims, coords=t2m_surf_xr.coords)
-                    t2m_grad_x_xr = xr.DataArray(t2m_grad_x_np, dims=t2m_surf_xr.dims, coords=t2m_surf_xr.coords)
-                    
-                    profile["physical_checks"]["surface_geostrophic_u"] = float(xs.pearson_r(msl_grad_y_xr, u10_surf_xr.compute(), dim=["lat", "lon"]).compute().data)
-                    profile["physical_checks"]["surface_geostrophic_v"] = float(xs.pearson_r(msl_grad_x_xr, v10_surf_xr.compute(), dim=["lat", "lon"]).compute().data)
-                    profile["physical_checks"]["surface_thermal_u"] = float(xs.pearson_r(t2m_grad_y_xr, u10_surf_xr.compute(), dim=["lat", "lon"]).compute().data)
-                    profile["physical_checks"]["surface_thermal_v"] = float(xs.pearson_r(t2m_grad_x_xr, v10_surf_xr.compute(), dim=["lat", "lon"]).compute().data)
-                    
-                    if len(profile_timesteps_inner) > 1:
-                        t2m_t0_surf = current_ds[var_mapping["2t"]].isel(time=profile_timesteps_inner[0])
-                        t2m_t1_surf = current_ds[var_mapping["2t"]].isel(time=profile_timesteps_inner[1])
-                        profile["physical_checks"]["temp_pattern_correlation"] = float(xs.pearson_r(t2m_t0_surf, t2m_t1_surf, dim=["lat", "lon"]).compute().data)
-                        if ENABLE_PLOTTING: 
-                            try:
-                                t2m_plot_data_np = t2m_surf_xr.load().data
-                                if t2m_plot_data_np.ndim > 2 and t2m_plot_data_np.shape[0] == 1: t2m_plot_data_np = t2m_plot_data_np[0]
-                                plt.figure(figsize=(12, 6)); plt.contourf( 
-                                    t2m_surf_xr.coords.get('lon', np.arange(t2m_plot_data_np.shape[1])),
-                                    t2m_surf_xr.coords.get('lat', np.arange(t2m_plot_data_np.shape[0])),
-                                    t2m_plot_data_np, cmap='RdBu_r', levels=20, origin='lower'); 
-                                plt.title(f'Job {current_job_id}: 2m Temperature at T={t_idx_surf_check}'); plt.colorbar(label='2T (K)')
-                                plt.xlabel("Longitude"); plt.ylabel("Latitude")
-                                plt.savefig(os.path.join(PLOT_SAVE_DIR, f"{current_job_id}_plot{plot_idx}_2t_map.png")); plt.close(); plot_idx += 1;
-                                logger.info(f"Saved 2T map for job {current_job_id}")
-
-                                if phys_vars_present["t"]:
-                                    temp_prof_xr = current_ds[var_mapping['t']].isel(time=t_idx_surf_check, lat=current_ds.sizes['lat']//2, lon=current_ds.sizes['lon']//2)
-                                    if level_dim_name_check in temp_prof_xr.sizes:
-                                        temp_prof_np = temp_prof_xr.load().data
-                                        plevels_np = temp_prof_xr[level_dim_name_check].load().data 
-                                        plt.figure(figsize=(6,8)); plt.plot(temp_prof_np, plevels_np); plt.gca().invert_yaxis();
-                                        plt.ylabel('Pressure (hPa)'); plt.xlabel('Temperature (K)'); plt.title(f'Job {current_job_id}: Temp Profile MidLat/Lon T={t_idx_surf_check}')
-                                        plt.savefig(os.path.join(PLOT_SAVE_DIR, f"{current_job_id}_plot{plot_idx}_temp_profile.png")); plt.close(); plot_idx +=1;
-                                        logger.info(f"Saved temp profile plot for job {current_job_id}")
-                            except Exception as plot_err: logger.warning(f"Plotting surface/profile error (job {current_job_id}): {plot_err}")
-                except Exception as e_surf_phys_outer:
-                    logger.warning(f"Validator error computing surface physical checks (job {current_job_id}): {e_surf_phys_outer}")
-                    profile["physical_checks"]["surface_error"] = str(e_surf_phys_outer)
-            
-            profile["status"] = "analysis_complete"
-            profile["computation_time_seconds"] = time.time() - inner_start_time
-            return profile 
-            
-        except Exception as e_inner_fatal:
-            logger.error(f"Fatal error inside _compute_analysis_profile for job {current_job_id}: {e_inner_fatal}", exc_info=True)
-            return {"error": str(e_inner_fatal), "job_id": current_job_id, "status": "fatal_error_in_computation", "computation_time_seconds": time.time() - inner_start_time}
-        finally:
-            plt.close('all')
-
     try:
-        computation_start_time = time.time()
-        loop = asyncio.get_running_loop()
-        analysis_result_profile = await loop.run_in_executor(
+        analysis_result_profile = await asyncio.get_running_loop().run_in_executor(
             None, 
             _compute_analysis_profile, 
-            ds, metadata, variables, job_id 
+            ds, metadata, variables, claimed_hash, job_id 
         )
         
-        if analysis_result_profile:
+        if analysis_result_profile: 
             try:
+                if "zarr_store_url" not in analysis_result_profile:
+                    analysis_result_profile["zarr_store_url"] = zarr_store_url
+                
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                log_filename = os.path.join(ANALYSIS_LOG_DIR, f"job_{job_id}_profile_{ts}.json")
+                log_filename = os.path.join(ANALYSIS_LOG_DIR, f"job_{job_id}_perf_profile_{ts}.json")
                 with open(log_filename, 'w') as f:
                     json.dump(analysis_result_profile, f, indent=4)
-                logger.info(f"Saved analysis profile for job {job_id} to: {log_filename}")
+                logger.info(f"Saved performance test profile for job {job_id} to: {log_filename}")
             except Exception as e_save:
-                logger.error(f"Failed to save analysis profile for job {job_id} to file: {e_save}")
+                logger.error(f"Failed to save performance test profile for job {job_id} to file: {e_save}")
 
-        if analysis_result_profile.get("status") != "analysis_complete":
-            logger.error(f"Analysis profile computation failed for job {job_id} ({zarr_store_url}) with error: {analysis_result_profile.get('error')}")
-            return analysis_result_profile 
-            
-        logger.info(f"Successfully computed analysis profile for job {job_id}.")
-        logger.info(f"Analysis computation (executor part) for job {job_id} took: {analysis_result_profile.get('computation_time_seconds', -1):.3f} seconds")
-        logger.info(f"Total time for verify_forecast_hash (analysis mode) for job {job_id}: {time.time() - start_time_total_verify:.3f} seconds")
+        final_status = analysis_result_profile.get("status", "unknown_error_in_profile")
+        if not final_status.startswith("performance_test") and "error" in analysis_result_profile:
+            logger.error(f"Performance test profile computation failed for job {job_id} ({zarr_store_url}) with error: {analysis_result_profile.get('error')}")
+        elif final_status == "performance_test_complete":
+            logger.info(f"Successfully completed performance tests for job {job_id}.")
+        else:
+            logger.warning(f"Performance tests for job {job_id} finished with status: {final_status}")
+
+        logger.info(f"Performance test (executor part) for job {job_id} took: {analysis_result_profile.get('computation_time_seconds', -1):.3f} seconds")
+        logger.info(f"Total time for verify_forecast_hash (performance test mode) for job {job_id}: {time.time() - start_time_total_verify:.3f} seconds")
         
         return analysis_result_profile 
         
     except Exception as e_executor_call:
-        err_msg = f"Exception calling executor for analysis profile (job {job_id}, {zarr_store_url}): {e_executor_call}"
+        err_msg = f"Exception calling executor for performance test profile (job {job_id}, {zarr_store_url}): {e_executor_call}"
         logger.error(err_msg, exc_info=True)
-        return {"error": err_msg, "job_id": job_id, "status": "executor_call_exception"}
+        return {"error": err_msg, "job_id": job_id, "status": "executor_call_exception", "zarr_store_url": zarr_store_url}
     finally:
         if ds is not None:
             ds.close()
