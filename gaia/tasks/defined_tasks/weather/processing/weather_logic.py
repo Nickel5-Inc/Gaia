@@ -426,8 +426,8 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
     
     access_token = None
     zarr_store_url = None
-    verification_hash_claimed = None # Will be passed but not used for matching in analysis mode
-    analysis_profile_result = None # To store the dict from verify_forecast_hash
+    verification_hash_claimed = None 
+    analysis_profile_result = None 
     
     try:
         token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, job_id)
@@ -451,7 +451,7 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
 
         await task_instance.db_manager.execute("""
             UPDATE weather_miner_responses
-            SET kerchunk_json_url = :url, verification_hash_claimed = :hash, status = 'performing_analysis' # Changed status
+            SET kerchunk_json_url = :url, verification_hash_claimed = :hash, status = 'performing_analysis'
             WHERE id = :id
         """, {"id": response_id, "url": zarr_store_url, "hash": verification_hash_claimed})
 
@@ -460,13 +460,13 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
         variables_to_check = ALL_EXPECTED_VARIABLES 
         metadata = {"time": [gfs_init_time], "source_model": "aurora", "resolution": 0.25}
         headers = {"Authorization": f"Bearer {access_token}"}
-        timesteps = list(range(task_instance.config.get('inference_steps', 40))) # Not directly used by stats hash
+        timesteps = list(range(task_instance.config.get('inference_steps', 40))) 
         verification_timeout_seconds = task_instance.config.get('verification_timeout_seconds', 120)
         
         analysis_profile_result = await asyncio.wait_for(
             verify_forecast_hash(
                 zarr_store_url=zarr_store_url,
-                claimed_hash=verification_hash_claimed, # Still passed for API compatibility
+                claimed_hash=verification_hash_claimed, 
                 metadata=metadata,
                 variables=variables_to_check,
                 timesteps=timesteps, 
@@ -476,7 +476,6 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
             timeout=verification_timeout_seconds
         )
         
-        # In analysis mode, verify_forecast_hash returns a dictionary (the profile or an error dict)
         analysis_succeeded_bool = False
         db_status_after_analysis = "analysis_failed_profile_error"
         error_message_for_db = None

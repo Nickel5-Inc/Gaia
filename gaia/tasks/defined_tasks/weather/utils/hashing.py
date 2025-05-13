@@ -434,12 +434,12 @@ async def open_remote_zarr_dataset(
         return None
 
 
-def _compute_analysis_profile(current_ds, current_metadata, current_variables, _claimed_hash_unused, current_job_id):
+def _compute_analysis_profile(current_ds, current_metadata, current_variables, _claimed_hash_unused, current_job_id, zarr_url_for_profile):
     inner_start_time = time.time()
     
     profile = {
         "job_id": current_job_id,
-        "zarr_store_url": zarr_store_url,
+        "zarr_store_url": zarr_url_for_profile,
         "analysis_timestamp_utc": datetime.now(timezone.utc).isoformat(), 
         "claimed_hash_received": _claimed_hash_unused, 
         "metadata": {
@@ -453,11 +453,27 @@ def _compute_analysis_profile(current_ds, current_metadata, current_variables, _
         "notes": "Performing Zarr read performance tests."
     }
 
+    LEVEL_DIM_NAME = "pressure_level"
     try:
+        logger.info(f"Job {current_job_id}: Dataset keys available: {list(current_ds.data_vars)}")
+        var_mapping_debug = {}
+        standard_mapping_debug = {"2t": ["2t", "t2m"], "t": ["t"]}
+        ds_vars_debug = list(current_ds.data_vars)
+        for var_name_map_debug, possible_names_debug in standard_mapping_debug.items():
+            for pn_debug in possible_names_debug:
+                if pn_debug in ds_vars_debug:
+                    var_mapping_debug[var_name_map_debug] = pn_debug
+                    break
+        actual_t_name_debug = var_mapping_debug.get("t")
+        if actual_t_name_debug and actual_t_name_debug in current_ds:
+            logger.info(f"Job {current_job_id}: Var 't' (as {actual_t_name_debug}) dims: {current_ds[actual_t_name_debug].dims}, sizes: {current_ds[actual_t_name_debug].sizes}")
+        actual_2t_name_debug = var_mapping_debug.get("2t")
+        if actual_2t_name_debug and actual_2t_name_debug in current_ds:
+            logger.info(f"Job {current_job_id}: Var '2t' (as {actual_2t_name_debug}) dims: {current_ds[actual_2t_name_debug].dims}, sizes: {current_ds[actual_2t_name_debug].sizes}")
+
         max_t = current_ds.sizes.get("time", 0)
         if max_t == 0:
-            profile["status"] = "performance_test_error"
-            profile["notes"] = "Dataset has no time dimension."
+            profile["status"] = "performance_test_error"; profile["notes"] = "Dataset has no time dimension."
             profile["computation_time_seconds"] = time.time() - inner_start_time
             return profile
 
@@ -472,111 +488,115 @@ def _compute_analysis_profile(current_ds, current_metadata, current_variables, _
         ds_vars = list(current_ds.data_vars)
         for var_name_map, possible_names in standard_mapping.items():
             for pn in possible_names:
-                if pn in ds_vars:
-                    var_mapping[var_name_map] = pn
-                    break
+                if pn in ds_vars: var_mapping[var_name_map] = pn; break
         
-        # === Test Case 1: One variable, one step, one level, full lat/lon ===
-        case1_results = {"case_name": "Case 1: Single Full 2D Slice (t, mid-time, mid-level)"}
-        try:
-            var_to_test_case1 = "t"
-            if var_mapping.get(var_to_test_case1) in current_ds:
-                data_array_case1 = current_ds[var_mapping[var_to_test_case1]]
-                if "pressure_level" in data_array_case1.sizes:
-                    mid_level_idx = data_array_case1.sizes["pressure_level"] // 2
-                    selection_case1 = data_array_case1.isel(time=mid_timestep_idx, pressure_level=mid_level_idx)
-                    
-                    time_start_case1 = time.time()
-                    loaded_slice_case1 = selection_case1.load()
-                    case1_results["time_taken_seconds"] = time.time() - time_start_case1
-                    case1_results["data_loaded_bytes"] = loaded_slice_case1.nbytes
-                    case1_results["slice_shape"] = list(loaded_slice_case1.shape)
-                    case1_results["status"] = "success"
-                else:
-                    case1_results["status"] = "skipped_not_3d_var"
-            else:
-                case1_results["status"] = f"skipped_var_not_found ({var_to_test_case1})"
-        except Exception as e_case1:
-            case1_results["status"] = "error"
-            case1_results["error_message"] = str(e_case1)
+        # Case 1
+        case1_var_options = ["t", "2t", "msl"]
+        case1_results = {"case_name": "Case 1: Single Full 2D Slice"}
+        executed_case1 = False
+        for var_to_test_c1 in case1_var_options:
+            actual_var_name_c1 = var_mapping.get(var_to_test_c1)
+            if actual_var_name_c1 and actual_var_name_c1 in current_ds:
+                data_array_c1 = current_ds[actual_var_name_c1]
+                is_3d_c1 = LEVEL_DIM_NAME in data_array_c1.sizes
+                selection_c1 = None
+                if is_3d_c1 and var_to_test_c1 == "t": 
+                    mid_level_idx_c1 = data_array_c1.sizes[LEVEL_DIM_NAME] // 2
+                    selection_c1 = data_array_c1.isel(time=mid_timestep_idx, **{LEVEL_DIM_NAME: mid_level_idx_c1})
+                    case1_results["case_name"] += f" ({var_to_test_c1} at mid-level)"
+                elif not is_3d_c1 and var_to_test_c1 in ["2t", "msl"]: 
+                    selection_c1 = data_array_c1.isel(time=mid_timestep_idx)
+                    case1_results["case_name"] += f" ({var_to_test_c1}, surface)"
+                if selection_c1 is not None:
+                    try:
+                        time_start_c1 = time.time()
+                        loaded_slice_c1 = selection_c1.load()
+                        case1_results["time_taken_seconds"] = time.time() - time_start_c1
+                        case1_results["data_loaded_bytes"] = loaded_slice_c1.nbytes
+                        case1_results["slice_shape"] = list(loaded_slice_c1.shape)
+                        case1_results["status"] = "success"
+                        case1_results["variable_tested"] = actual_var_name_c1
+                        executed_case1 = True; break 
+                    except Exception as e_c1_load:
+                        case1_results["status"] = "error_loading_slice"; case1_results["error_message"] = str(e_c1_load)
+                        logger.warning(f"Case 1: Error loading slice for {actual_var_name_c1}: {e_c1_load}"); executed_case1 = True; break 
+            if executed_case1: break
+        if not executed_case1: case1_results["status"] = "skipped_no_suitable_var_found"; case1_results["notes"] = f"Tried: {case1_var_options}"
         profile["query_performance_tests"].append(case1_results)
 
-        # === Test Case 2: One chunk only===
-        case2_results = {"case_name": "Case 2: Small Localized 2D Slice (t, mid-time, mid-level, 10x10 window)"}
-        try:
-            var_to_test_case2 = "t"
-            if var_mapping.get(var_to_test_case2) in current_ds:
-                data_array_case2 = current_ds[var_mapping[var_to_test_case2]]
-                if "pressure_level" in data_array_case2.sizes and "lat" in data_array_case2.sizes and "lon" in data_array_case2.sizes:
-                    mid_level_idx = data_array_case2.sizes["pressure_level"] // 2
-                    lat_slice = slice(0, min(10, data_array_case2.sizes["lat"]))
-                    lon_slice = slice(0, min(10, data_array_case2.sizes["lon"]))
-                    selection_case2 = data_array_case2.isel(time=mid_timestep_idx, pressure_level=mid_level_idx, lat=lat_slice, lon=lon_slice)
-                    
-                    time_start_case2 = time.time()
-                    loaded_slice_case2 = selection_case2.load()
-                    case2_results["time_taken_seconds"] = time.time() - time_start_case2
-                    case2_results["data_loaded_bytes"] = loaded_slice_case2.nbytes
-                    case2_results["slice_shape"] = list(loaded_slice_case2.shape)
-                    case2_results["status"] = "success"
-                else:
-                    case2_results["status"] = "skipped_missing_dims_for_small_slice"
-            else:
-                case2_results["status"] = f"skipped_var_not_found ({var_to_test_case2})"
-        except Exception as e_case2:
-            case2_results["status"] = "error"
-            case2_results["error_message"] = str(e_case2)
-        profile["query_performance_tests"].append(case2_results)
+        # Case 2
+        case2_var_options = ["t", "2t", "msl"]
+        case2_results = {"case_name": "Case 2: Small Localized 2D Slice (10x10 window)"}
+        executed_case2 = False
+        for var_to_test_c2 in case2_var_options:
+            actual_var_name_c2 = var_mapping.get(var_to_test_c2)
+            if actual_var_name_c2 and actual_var_name_c2 in current_ds:
+                data_array_c2 = current_ds[actual_var_name_c2]
+                is_3d_c2 = LEVEL_DIM_NAME in data_array_c2.sizes
+                selection_c2 = None
+                if "lat" in data_array_c2.sizes and "lon" in data_array_c2.sizes:
+                    lat_slice = slice(0, min(10, data_array_c2.sizes["lat"])); lon_slice = slice(0, min(10, data_array_c2.sizes["lon"]))
+                    if is_3d_c2 and var_to_test_c2 == "t":
+                        mid_level_idx_c2 = data_array_c2.sizes[LEVEL_DIM_NAME] // 2
+                        selection_c2 = data_array_c2.isel(time=mid_timestep_idx, **{LEVEL_DIM_NAME: mid_level_idx_c2}, lat=lat_slice, lon=lon_slice)
+                        case2_results["case_name"] += f" ({var_to_test_c2} at mid-level)"
+                    elif not is_3d_c2 and var_to_test_c2 in ["2t", "msl"]:
+                        selection_c2 = data_array_c2.isel(time=mid_timestep_idx, lat=lat_slice, lon=lon_slice)
+                        case2_results["case_name"] += f" ({var_to_test_c2}, surface)"
+                if selection_c2 is not None:
+                    try:
+                        time_start_c2 = time.time()
+                        loaded_slice_c2 = selection_c2.load()
+                        case2_results["time_taken_seconds"] = time.time() - time_start_c2
+                        case2_results["data_loaded_bytes"] = loaded_slice_c2.nbytes
+                        case2_results["slice_shape"] = list(loaded_slice_c2.shape)
+                        case2_results["status"] = "success"; case2_results["variable_tested"] = actual_var_name_c2
+                        executed_case2 = True; break
+                    except Exception as e_c2_load:
+                        case2_results["status"] = "error_loading_slice"; case2_results["error_message"] = str(e_c2_load)
+                        logger.warning(f"Case 2: Error loading slice for {actual_var_name_c2}: {e_c2_load}"); executed_case2 = True; break
+                if executed_case2: break
+            if not executed_case2: case2_results["status"] = "skipped_no_suitable_var_or_dims_found"; case2_results["notes"] = f"Tried: {case2_var_options}"
+            profile["query_performance_tests"].append(case2_results)
 
-        # === Test Case 3: Three variables, three levels (for 3D vars), three steps, full lat/lon ===
+        # Case 3
         case3_results = {"case_name": "Case 3: Multi-Var/Time/Level Full Slices (t, u, 2t)"}
         try:
-            vars_to_test_case3 = ["t", "u", "2t"] # Mix of 3D and 2D
-            data_loaded_bytes_case3 = 0
-            actual_slices_loaded_count = 0
+            vars_to_test_case3 = ["t", "u", "2t"]; data_loaded_bytes_case3 = 0; actual_slices_loaded_count = 0
             time_start_case3 = time.time()
-
             for var_c3 in vars_to_test_case3:
-                if var_mapping.get(var_c3) in current_ds:
-                    data_array_c3 = current_ds[var_mapping[var_c3]]
-                    is_3d_c3 = "pressure_level" in data_array_c3.sizes
-                    levels_to_load_c3 = [data_array_c3.sizes["pressure_level"] // 2]
+                actual_var_name_c3 = var_mapping.get(var_c3)
+                if actual_var_name_c3 and actual_var_name_c3 in current_ds:
+                    data_array_c3 = current_ds[actual_var_name_c3]
+                    is_3d_c3 = LEVEL_DIM_NAME in data_array_c3.sizes
+                    levels_to_iterate_c3 = [None] 
                     if is_3d_c3:
-                        num_levels_c3 = data_array_c3.sizes["pressure_level"]
-                        levels_to_load_c3 = sorted(list(set([0, num_levels_c3 // 2, num_levels_c3 - 1]))) if num_levels_c3 > 0 else [0]
-                    
+                        num_levels_c3 = data_array_c3.sizes.get(LEVEL_DIM_NAME, 0)
+                        if num_levels_c3 > 0: levels_to_iterate_c3 = sorted(list(set([0, num_levels_c3 // 2, num_levels_c3 - 1])))
+                        else: levels_to_iterate_c3 = [] 
                     for t_idx_c3 in profile_timesteps_indices:
                         if t_idx_c3 < data_array_c3.sizes.get("time",0):
                             if is_3d_c3:
-                                for l_idx_c3 in levels_to_load_c3:
-                                    if l_idx_c3 < data_array_c3.sizes["pressure_level"]:
-                                        selection_c3 = data_array_c3.isel(time=t_idx_c3, pressure_level=l_idx_c3)
-                                        loaded_slice_c3 = selection_c3.load()
-                                        data_loaded_bytes_case3 += loaded_slice_c3.nbytes
-                                        actual_slices_loaded_count +=1
-                            else: # 2D variable
+                                for l_idx_c3 in levels_to_iterate_c3:
+                                    if l_idx_c3 is not None and l_idx_c3 < data_array_c3.sizes.get(LEVEL_DIM_NAME,0):
+                                        selection_c3 = data_array_c3.isel(time=t_idx_c3, **{LEVEL_DIM_NAME: l_idx_c3})
+                                        loaded_slice_c3 = selection_c3.load(); data_loaded_bytes_case3 += loaded_slice_c3.nbytes; actual_slices_loaded_count +=1
+                            else: 
                                 selection_c3 = data_array_c3.isel(time=t_idx_c3)
-                                loaded_slice_c3 = selection_c3.load()
-                                data_loaded_bytes_case3 += loaded_slice_c3.nbytes
-                                actual_slices_loaded_count +=1
-                else:
-                    logger.warning(f"Case 3: Variable {var_c3} not found, skipping its part.")
-            
+                                loaded_slice_c3 = selection_c3.load(); data_loaded_bytes_case3 += loaded_slice_c3.nbytes; actual_slices_loaded_count +=1
+                else: logger.warning(f"Case 3: Variable {var_c3} (mapped to {actual_var_name_c3}) not found, skipping its part.")
             case3_results["time_taken_seconds"] = time.time() - time_start_case3
             case3_results["total_data_loaded_bytes"] = data_loaded_bytes_case3
             case3_results["total_2d_slices_loaded"] = actual_slices_loaded_count
             case3_results["status"] = "success"
         except Exception as e_case3:
-            case3_results["status"] = "error"
-            case3_results["error_message"] = str(e_case3)
+            case3_results["status"] = "error"; case3_results["error_message"] = str(e_case3)
         profile["query_performance_tests"].append(case3_results)
         
         profile["status"] = "performance_test_complete"
-
     except Exception as e_inner_fatal:
         logger.error(f"Fatal error inside _compute_analysis_profile (performance test) for job {current_job_id}: {e_inner_fatal}", exc_info=True)
-        profile["status"] = "performance_test_fatal_error"
-        profile["error"] = str(e_inner_fatal)
+        profile["status"] = "performance_test_fatal_error"; profile["error"] = str(e_inner_fatal)
     
     profile["computation_time_seconds"] = time.time() - inner_start_time
     return profile 
@@ -620,14 +640,11 @@ async def verify_forecast_hash(
         analysis_result_profile = await asyncio.get_running_loop().run_in_executor(
             None, 
             _compute_analysis_profile, 
-            ds, metadata, variables, claimed_hash, job_id 
+            ds, metadata, variables, claimed_hash, job_id, zarr_store_url
         )
         
         if analysis_result_profile: 
             try:
-                if "zarr_store_url" not in analysis_result_profile:
-                    analysis_result_profile["zarr_store_url"] = zarr_store_url
-                
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 log_filename = os.path.join(ANALYSIS_LOG_DIR, f"job_{job_id}_perf_profile_{ts}.json")
                 with open(log_filename, 'w') as f:
