@@ -350,58 +350,28 @@ class GaiaValidator:
             
             w.blocks_since_last_update = blocks_since_wrapper
 
-            # Detailed SubstrateInterface Initialization
-            logger.info(f"Attempting to initialize SubstrateInterface with endpoint: {self.subtensor_chain_endpoint}")
+            # Standard SubstrateInterface Initialization
             try:
                 self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
-                logger.info(f"SubstrateInterface initialized. Type: {type(self.substrate)}. Object ID: {id(self.substrate)}")
-                # Test substrate connection (example: get chain name, adapt if method differs)
-                try:
-                    chain_identifier = self.substrate.chain  # Use .chain for a more generic test
-                    logger.info(f"Substrate connection test successful. Chain identifier: {chain_identifier}")
-                    # Use the same method for getting block number as used later in the function
-                    current_block_test = int(self.substrate.get_block()['header']['number'])
-                    logger.info(f"Substrate test query successful. Current block from substrate: {current_block_test}")
-                except Exception as e_query:
-                    logger.error(f"Substrate test query FAILED after initialization with {self.subtensor_chain_endpoint}: {e_query}", exc_info=True)
-                    # This is a strong indicator of a problem with the endpoint interaction.
-                    return False 
+                # Basic connection test (optional, can be removed if too verbose or if init itself is trusted)
+                # self.substrate.node_name # Example, or self.substrate.chain
             except Exception as e_sub_init:
                 logger.error(f"CRITICAL: Failed to initialize SubstrateInterface with endpoint {self.subtensor_chain_endpoint}: {e_sub_init}", exc_info=True)
                 return False
 
-            # Detailed Metagraph Initialization
-            logger.info(f"Attempting to initialize Metagraph with substrate object ID: {id(self.substrate)} and netuid: {self.netuid}")
+            # Standard Metagraph Initialization
             try:
                 self.metagraph = Metagraph(substrate=self.substrate, netuid=self.netuid)
-                logger.info(f"Metagraph initialized. Type: {type(self.metagraph)}. Object ID: {id(self.metagraph)}")
-                if hasattr(self.metagraph, 'nodes_by_uid'):
-                    logger.info("Metagraph instance HAS 'nodes_by_uid' attribute immediately after __init__.")
-                else:
-                    logger.error("CRITICAL: Metagraph instance LACKS 'nodes_by_uid' attribute immediately after __init__.")
-                    return False # Crucial failure point
             except Exception as e_meta_init:
                 logger.error(f"CRITICAL: Failed to initialize Metagraph: {e_meta_init}", exc_info=True)
                 return False
 
-            # Detailed Metagraph Sync
-            logger.info(f"Attempting to sync Metagraph nodes. Metagraph object ID: {id(self.metagraph)}")
+            # Standard Metagraph Sync
             try:
                 self.metagraph.sync_nodes()  # Sync nodes after initialization
-                logger.info(f"Metagraph sync_nodes() completed. Synced {len(self.metagraph.nodes) if self.metagraph.nodes else '0'} nodes from the network.")
-                if hasattr(self.metagraph, 'nodes_by_uid'):
-                    logger.info(f"Metagraph instance HAS 'nodes_by_uid' attribute after sync_nodes(). Length: {len(self.metagraph.nodes_by_uid) if self.metagraph.nodes_by_uid is not None else 'None'}")
-                else:
-                    logger.error("CRITICAL: Metagraph instance LACKS 'nodes_by_uid' attribute after sync_nodes().")
-                    # This would imply sync_nodes or something it calls deletes/corrupts the attribute
-                    return False
+                logger.info(f"Successfully synced {len(self.metagraph.nodes) if self.metagraph.nodes else '0'} nodes from the network.")
             except Exception as e_meta_sync:
                 logger.error(f"CRITICAL: Metagraph sync_nodes() FAILED: {e_meta_sync}", exc_info=True)
-                # Even if sync fails, check if the attribute itself was an issue prior or became one
-                if hasattr(self.metagraph, 'nodes_by_uid'):
-                    logger.info("Metagraph instance still HAS 'nodes_by_uid' attribute even after FAILED sync_nodes().")
-                else:
-                    logger.error("CRITICAL: Metagraph instance LACKS 'nodes_by_uid' attribute after FAILED sync_nodes().")
                 return False # Sync failure is critical for neuron operation
 
             self.current_block = int(self.substrate.get_block()["header"]["number"])
@@ -857,9 +827,20 @@ class GaiaValidator:
             # 1. Fetch Current Metagraph State
             logger.info("Syncing metagraph for stale history check...")
             self.metagraph.sync_nodes()
-            # Correctly build current_nodes_info using nodes_by_uid list
-            current_nodes_info = {uid: node for uid, node in enumerate(self.metagraph.nodes_by_uid) if node is not None}
-            logger.info(f"Found {len(current_nodes_info)} active UIDs in current metagraph.")
+            
+            # Fetch the list of nodes directly since Metagraph object doesn't store a UID-indexed list
+            try:
+                active_nodes_list = get_nodes_for_netuid(self.substrate, self.metagraph.netuid)
+                if active_nodes_list is None:
+                    active_nodes_list = [] # Ensure it's an iterable if None is returned
+                    logger.warning("get_nodes_for_netuid returned None, proceeding with empty list for stale history check.")
+            except Exception as e_fetch_nodes:
+                logger.error(f"Failed to fetch nodes for stale history check: {e_fetch_nodes}", exc_info=True)
+                active_nodes_list = [] # Proceed with empty list to avoid further errors here
+
+            # Build current_nodes_info mapping node_id (UID) to Node object
+            current_nodes_info = {node.node_id: node for node in active_nodes_list}
+            logger.info(f"Built current_nodes_info with {len(current_nodes_info)} active UIDs for stale history check.")
 
             # 2. Fetch Historical Data (Distinct uid, miner_hotkey pairs)
             geo_history_query = "SELECT DISTINCT miner_uid, miner_hotkey FROM geomagnetic_history WHERE miner_hotkey IS NOT NULL;"
@@ -1339,10 +1320,19 @@ class GaiaValidator:
 
                 async with self.miner_table_lock:
                     logger.info("Performing miner hotkey change check and info update...")
+                    
                     # Get current UIDs and hotkeys from the chain's metagraph
-                    # Using enumerate ensures we have the correct UID for each node
-                    # Correctly build chain_nodes_info using nodes_by_uid list
-                    chain_nodes_info = {uid: node for uid, node in enumerate(self.metagraph.nodes_by_uid) if node is not None}
+                    try:
+                        active_nodes_list = get_nodes_for_netuid(self.substrate, self.metagraph.netuid)
+                        if active_nodes_list is None:
+                            active_nodes_list = [] # Ensure it's an iterable
+                            logger.warning("get_nodes_for_netuid returned None in handle_miner_deregistration_loop.")
+                    except Exception as e_fetch_nodes_dereg:
+                        logger.error(f"Failed to fetch nodes in handle_miner_deregistration_loop: {e_fetch_nodes_dereg}", exc_info=True)
+                        active_nodes_list = []
+                    
+                    # Build chain_nodes_info mapping node_id (UID) to Node object
+                    chain_nodes_info = {node.node_id: node for node in active_nodes_list}
 
                     # Get UIDs and hotkeys from our local database
                     db_miner_query = "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL;"
@@ -1672,6 +1662,21 @@ class GaiaValidator:
                 return 1 / (1 + math.exp(-k * (x - x0)))
 
             weights = np.zeros(256)
+            
+            # Fetch active nodes and prepare a UID-indexed list for quick lookup
+            try:
+                active_nodes_list = get_nodes_for_netuid(self.substrate, self.metagraph.netuid)
+                if active_nodes_list is None: active_nodes_list = []
+            except Exception as e_fetch_calc_weights:
+                logger.error(f"Failed to fetch nodes in _calc_task_weights: {e_fetch_calc_weights}", exc_info=True)
+                active_nodes_list = []
+            
+            max_allowed_uid = 256 # Assuming UIDs are 0-255 for a 256-slot subnet
+            validator_nodes_by_uid_list = [None] * max_allowed_uid
+            for node in active_nodes_list:
+                if node.node_id < max_allowed_uid:
+                    validator_nodes_by_uid_list[node.node_id] = node
+            
             for idx in range(256):
                 geomagnetic_score = geomagnetic_scores[idx]
                 soil_score = soil_scores[idx]
@@ -1682,8 +1687,8 @@ class GaiaValidator:
                 if np.isnan(soil_score) or soil_score == 0.0:
                     soil_score = np.nan
                 
-                # Correctly access node by UID using nodes_by_uid
-                current_node_obj = self.metagraph.nodes_by_uid[idx] if idx < len(self.metagraph.nodes_by_uid) else None
+                # Access node by UID from the prepared list
+                current_node_obj = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None
                 current_hotkey_on_chain = current_node_obj.hotkey if current_node_obj else "N/A (UID not active)"
 
                 if np.isnan(geomagnetic_score) and np.isnan(soil_score):
