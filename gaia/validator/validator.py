@@ -350,10 +350,59 @@ class GaiaValidator:
             
             w.blocks_since_last_update = blocks_since_wrapper
 
-            self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
-            self.metagraph = Metagraph(substrate=self.substrate, netuid=self.netuid)
-            self.metagraph.sync_nodes()  # Sync nodes after initialization
-            logger.info(f"Synced {len(self.metagraph.nodes)} nodes from the network")
+            # Detailed SubstrateInterface Initialization
+            logger.info(f"Attempting to initialize SubstrateInterface with endpoint: {self.subtensor_chain_endpoint}")
+            try:
+                self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
+                logger.info(f"SubstrateInterface initialized. Type: {type(self.substrate)}. Object ID: {id(self.substrate)}")
+                # Test substrate connection (example: get chain name, adapt if method differs)
+                try:
+                    chain_identifier = self.substrate.chain  # Use .chain for a more generic test
+                    logger.info(f"Substrate connection test successful. Chain identifier: {chain_identifier}")
+                    # Use the same method for getting block number as used later in the function
+                    current_block_test = int(self.substrate.get_block()['header']['number'])
+                    logger.info(f"Substrate test query successful. Current block from substrate: {current_block_test}")
+                except Exception as e_query:
+                    logger.error(f"Substrate test query FAILED after initialization with {self.subtensor_chain_endpoint}: {e_query}", exc_info=True)
+                    # This is a strong indicator of a problem with the endpoint interaction.
+                    return False 
+            except Exception as e_sub_init:
+                logger.error(f"CRITICAL: Failed to initialize SubstrateInterface with endpoint {self.subtensor_chain_endpoint}: {e_sub_init}", exc_info=True)
+                return False
+
+            # Detailed Metagraph Initialization
+            logger.info(f"Attempting to initialize Metagraph with substrate object ID: {id(self.substrate)} and netuid: {self.netuid}")
+            try:
+                self.metagraph = Metagraph(substrate=self.substrate, netuid=self.netuid)
+                logger.info(f"Metagraph initialized. Type: {type(self.metagraph)}. Object ID: {id(self.metagraph)}")
+                if hasattr(self.metagraph, 'nodes_by_uid'):
+                    logger.info("Metagraph instance HAS 'nodes_by_uid' attribute immediately after __init__.")
+                else:
+                    logger.error("CRITICAL: Metagraph instance LACKS 'nodes_by_uid' attribute immediately after __init__.")
+                    return False # Crucial failure point
+            except Exception as e_meta_init:
+                logger.error(f"CRITICAL: Failed to initialize Metagraph: {e_meta_init}", exc_info=True)
+                return False
+
+            # Detailed Metagraph Sync
+            logger.info(f"Attempting to sync Metagraph nodes. Metagraph object ID: {id(self.metagraph)}")
+            try:
+                self.metagraph.sync_nodes()  # Sync nodes after initialization
+                logger.info(f"Metagraph sync_nodes() completed. Synced {len(self.metagraph.nodes) if self.metagraph.nodes else '0'} nodes from the network.")
+                if hasattr(self.metagraph, 'nodes_by_uid'):
+                    logger.info(f"Metagraph instance HAS 'nodes_by_uid' attribute after sync_nodes(). Length: {len(self.metagraph.nodes_by_uid) if self.metagraph.nodes_by_uid is not None else 'None'}")
+                else:
+                    logger.error("CRITICAL: Metagraph instance LACKS 'nodes_by_uid' attribute after sync_nodes().")
+                    # This would imply sync_nodes or something it calls deletes/corrupts the attribute
+                    return False
+            except Exception as e_meta_sync:
+                logger.error(f"CRITICAL: Metagraph sync_nodes() FAILED: {e_meta_sync}", exc_info=True)
+                # Even if sync fails, check if the attribute itself was an issue prior or became one
+                if hasattr(self.metagraph, 'nodes_by_uid'):
+                    logger.info("Metagraph instance still HAS 'nodes_by_uid' attribute even after FAILED sync_nodes().")
+                else:
+                    logger.error("CRITICAL: Metagraph instance LACKS 'nodes_by_uid' attribute after FAILED sync_nodes().")
+                return False # Sync failure is critical for neuron operation
 
             self.current_block = int(self.substrate.get_block()["header"]["number"])
             logger.info(f"Initial block number type: {type(self.current_block)}, value: {self.current_block}")

@@ -994,16 +994,17 @@ class GeomagneticTask(Task):
                 if self.validator and hasattr(self.validator, 'metagraph') and self.validator.metagraph is not None:
                     # Check if the historical hotkey exists in the current metagraph's nodes dictionary
                     if historical_miner_hotkey in self.validator.metagraph.nodes:
+                        logger.info(f"Historical hotkey {historical_miner_hotkey} found in metagraph")
                         # Retrieve the Node object from the metagraph
                         node_in_metagraph = self.validator.metagraph.nodes[historical_miner_hotkey]
                         # Compare the historical UID with the UID from the metagraph node
-                        if hasattr(node_in_metagraph, 'uid') and str(node_in_metagraph.uid) == str(historical_miner_uid):
+                        if hasattr(node_in_metagraph, 'node_id') and str(node_in_metagraph.node_id) == str(historical_miner_uid):
                             is_valid_in_metagraph = True
                         else:
-                            metagraph_uid_str = getattr(node_in_metagraph, 'uid', '[UID not found]')
-                            logger.warning(f"Metagraph UID mismatch for {historical_miner_hotkey} (Historical): DB UID {historical_miner_uid}, Metagraph Node UID {metagraph_uid_str}. Skipping.")
+                            metagraph_uid_str = getattr(node_in_metagraph, 'node_id', '[UID not found]')
+                            logger.warning(f"Metagraph UID mismatch for {historical_miner_hotkey} (Historical Task): Prediction UID {historical_miner_uid}, Metagraph Node UID {metagraph_uid_str}. Skipping score.")
                     else:
-                        logger.warning(f"Hotkey {historical_miner_hotkey} (Historical UID {historical_miner_uid}) not in current metagraph. Skipping.")
+                        logger.warning(f"Miner hotkey {historical_miner_hotkey} (Historical Task) not found in current metagraph. Prediction UID {historical_miner_uid}. Skipping score.")
                 else:
                     logger.warning("Validator or metagraph not available for validation (historical_tasks). Skipping.")
 
@@ -1031,16 +1032,17 @@ class GeomagneticTask(Task):
                     if self.validator and hasattr(self.validator, 'metagraph') and self.validator.metagraph is not None:
                         # Check if the recent hotkey exists in the current metagraph's nodes dictionary
                         if recent_miner_hotkey in self.validator.metagraph.nodes:
-                             # Retrieve the Node object from the metagraph
+                            logger.info(f"Recent hotkey {recent_miner_hotkey} found in metagraph")
+                            # Retrieve the Node object from the metagraph
                             node_in_metagraph = self.validator.metagraph.nodes[recent_miner_hotkey]
                             # Compare the recent UID with the UID from the metagraph node
-                            if hasattr(node_in_metagraph, 'uid') and str(node_in_metagraph.uid) == str(recent_miner_uid):
+                            if hasattr(node_in_metagraph, 'node_id') and str(node_in_metagraph.node_id) == str(recent_miner_uid):
                                 is_valid_in_metagraph = True
                             else:
-                                metagraph_uid_str = getattr(node_in_metagraph, 'uid', '[UID not found]')
-                                logger.warning(f"Metagraph UID mismatch for {recent_miner_hotkey} (Recent): DB UID {recent_miner_uid}, Metagraph Node UID {metagraph_uid_str}. Skipping.")
+                                metagraph_uid_str = getattr(node_in_metagraph, 'node_id', '[UID not found]')
+                                logger.warning(f"Metagraph UID mismatch for {recent_miner_hotkey} (Recent Task): Prediction UID {recent_miner_uid}, Metagraph Node UID {metagraph_uid_str}. Skipping score.")
                         else:
-                             logger.warning(f"Hotkey {recent_miner_hotkey} (Recent UID {recent_miner_uid}) not in current metagraph. Skipping.")
+                            logger.warning(f"Miner hotkey {recent_miner_hotkey} (Recent Task) not found in current metagraph. Prediction UID {recent_miner_uid}. Skipping score.")
                     else:
                         logger.warning("Validator or metagraph not available for validation (recent_tasks). Skipping.")
 

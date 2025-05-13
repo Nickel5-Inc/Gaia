@@ -1195,10 +1195,10 @@ class SoilMoistureTask(Task):
                                 # Retrieve the Node object from the metagraph
                                 node_in_metagraph = self.validator.metagraph.nodes[miner_hotkey_from_prediction]
                                 # Compare the UID from the prediction with the UID from the metagraph node
-                                if hasattr(node_in_metagraph, 'uid') and str(node_in_metagraph.uid) == str(miner_uid_from_prediction):
+                                if hasattr(node_in_metagraph, 'node_id') and str(node_in_metagraph.node_id) == str(miner_uid_from_prediction):
                                     is_valid_in_metagraph = True
                                 else:
-                                    metagraph_uid_str = getattr(node_in_metagraph, 'uid', '[UID not found]')
+                                    metagraph_uid_str = getattr(node_in_metagraph, 'node_id', '[UID not found]')
                                     logger.warning(f"Metagraph UID mismatch for {miner_hotkey_from_prediction}: Prediction UID {miner_uid_from_prediction}, Metagraph Node UID {metagraph_uid_str}. Skipping score.")
                             else:
                                 logger.warning(f"Miner hotkey {miner_hotkey_from_prediction} not found in current metagraph. Prediction UID {miner_uid_from_prediction}. Skipping score.")
