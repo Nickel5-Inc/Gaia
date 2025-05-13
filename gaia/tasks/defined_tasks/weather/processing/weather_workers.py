@@ -12,6 +12,7 @@ from kerchunk.hdf import SingleHdf5ToZarr
 import pandas as pd
 import shutil
 import time
+import zarr
 
 from fiber.logging_utils import get_logger
 from aurora import Batch
@@ -424,10 +425,11 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                         logger.info(f"[InferenceTask Job {job_id}] DEV_OVERRIDE_SUCCESS: Using data from hardcoded job '{hardcoded_job_id_for_dev_override}'. Zarr_Path: '{zarr_path_override}', HASH: '{hash_override[:10]}...'.")
                         
                         await update_job_paths(
-                            task_instance,
-                            job_id,
-                            zarr_path_override,
-                            hash_override
+                            task_instance=task_instance,
+                            job_id=job_id,
+                            target_netcdf_path=zarr_path_override,
+                            kerchunk_json_path=zarr_path_override,
+                            verification_hash=hash_override
                         )
                         await update_job_status(task_instance, job_id, "completed")
                         logger.info(f"[InferenceTask Job {job_id}] DEV_OVERRIDE: Marked current job '{job_id}' as completed using data from '{hardcoded_job_id_for_dev_override}'.")
@@ -557,6 +559,12 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                     encoding=encoding,
                     consolidated=True
                 )
+                
+                try:
+                    zarr.consolidate_metadata(str(output_zarr_path))
+                    logger.info(f"[InferenceTask Job {job_id}] Explicitly consolidated Zarr metadata")
+                except Exception as e_consolidate:
+                    logger.warning(f"[InferenceTask Job {job_id}] Failed to explicitly consolidate Zarr metadata: {e_consolidate}")
                 
                 logger.info(f"[InferenceTask Job {job_id}] Successfully saved forecast to Zarr store: {output_zarr_path}")
                 from gaia.tasks.defined_tasks.weather.utils.hashing import compute_verification_hash

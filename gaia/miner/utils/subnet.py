@@ -1,6 +1,6 @@
 from functools import partial
-from fastapi import Depends, Request, HTTPException, Header
-from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
+from fastapi import Depends, Request, HTTPException, Header, Path, Query
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse, Response
 from fastapi.routing import APIRouter
 from pydantic import BaseModel, Field
 from fiber.encrypted.miner.dependencies import blacklist_low_stake, verify_request
@@ -22,7 +22,10 @@ import os
 from pathlib import Path
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+import glob
+import urllib.parse
+import base64
 
 from gaia.tasks.defined_tasks.weather.schemas.weather_inputs import (
     WeatherForecastRequest, WeatherKerchunkRequest, WeatherInputData,
@@ -40,8 +43,28 @@ logger = get_logger(__name__)
 current_file_path = Path(__file__).resolve()
 gaia_repo_root = current_file_path.parent.parent.parent.parent 
 
-DEFAULT_FORECAST_DIR = gaia_repo_root / "miner_forecasts_background"
-MINER_FORECAST_DIR = Path(os.getenv("MINER_FORECAST_DIR", str(DEFAULT_FORECAST_DIR))) # Ensure DEFAULT_FORECAST_DIR is str for os.getenv fallback
+def find_forecast_dir():
+    env_dir = os.getenv("MINER_FORECAST_DIR")
+    if env_dir:
+        return Path(env_dir)
+        
+    potential_paths = [
+        gaia_repo_root / "miner_forecasts_background",  # Standard path in repo root
+        Path.cwd() / "miner_forecasts_background",      # Current working directory
+        Path.home() / "Gaia" / "miner_forecasts_background", # Home directory Gaia folder
+    ]
+    
+    for path in potential_paths:
+        if path.exists() and path.is_dir():
+            logger.info(f"Found forecast directory at: {path}")
+            return path
+            
+    default_path = gaia_repo_root / "miner_forecasts_background"
+    logger.info(f"Using default forecast directory: {default_path}")
+    return default_path
+
+DEFAULT_FORECAST_DIR = find_forecast_dir()
+MINER_FORECAST_DIR = Path(os.getenv("MINER_FORECAST_DIR", str(DEFAULT_FORECAST_DIR)))
 MINER_FORECAST_DIR.mkdir(parents=True, exist_ok=True)
 logger.info(f"Serving forecast files from: {MINER_FORECAST_DIR.resolve()}")
 
@@ -195,79 +218,126 @@ def factory_router(miner_instance) -> APIRouter:
             logger.warning(f"Invalid JWT token: {e}")
             raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
-    async def get_forecast_file(filename: str, token_payload: dict = Depends(verify_token)):
-        """Serve forecast file with JWT validation."""
-        try:
-            token_base_claim = token_payload.get("file_path")
-            job_id_claim = token_payload.get("job_id")
-
-            logger.info(f"File request for job '{job_id_claim}': Requested file '{filename}'. Token claim base: '{token_base_claim}'.")
-
-            allow_access = False
-            requested_relative_path_str = filename
-            requested_path = Path(requested_relative_path_str)
-
-            requested_filename_itself = requested_path.name
-            requested_parent_dir_name = requested_path.parent.name
-
-            is_zarr_request = token_base_claim.endswith('.zarr')
+    async def get_forecast_file(request: Request, file_path: str, token: Optional[str] = None):
+        """Serve files from the forecast directory after validating JWT token."""
+        
+        logger.info(f"Received request for file: {file_path}")
+        
+        if token is None:
+            auth_header = request.headers.get("Authorization")
+            if auth_header:
+                if auth_header.startswith("Bearer "):
+                    token = auth_header[7:]
+                else:
+                    token = auth_header
+                logger.info("Found token in Authorization header")
             
-            if is_zarr_request:
-                expected_zarr_dir = token_base_claim
+            elif "token" in request.query_params:
+                token = request.query_params.get("token")
+                logger.info("Found token in query params")
+            
+            elif "?token=" in file_path:
+                path_parts = file_path.split("?token=", 1)
+                if len(path_parts) == 2:
+                    base_path = path_parts[0]
+                    token_part = path_parts[1]
+                    
+                    if "/" in token_part:
+                        token_and_path = token_part.split("/", 1)
+                        token = token_and_path[0]
+                        remaining_path = token_and_path[1]
+                        file_path = f"{base_path}/{remaining_path}"
+                        logger.info(f"Extracted token from path and reconstructed file_path: {file_path}")
+                    else:
+                        token = token_part
+                        logger.info(f"Extracted token from path: {token[:10]}...")
+        
+        forecasts_dir = MINER_FORECAST_DIR
+        if not forecasts_dir.is_absolute():
+            forecasts_dir = forecasts_dir.absolute()
+        
+        file_path = file_path.lstrip('/')
+        
+        if file_path.endswith(".zarr") and not file_path.endswith("/"):
+            file_path = file_path + "/"
+        
+        if token:
+            try:
+                token = token.strip()
+                if token.startswith('"') and token.endswith('"'):
+                    token = token[1:-1]
                 
-                if requested_path == Path(expected_zarr_dir) or requested_path.is_relative_to(Path(expected_zarr_dir)):
-                    allow_access = True
-                    logger.info(f"Authorized access to Zarr store file '{filename}' within '{expected_zarr_dir}'.")
-            else:
-                expected_asset_dir_name = f"{token_base_claim}_kerchunk_assets"
-                expected_nc_filename = f"{token_base_claim}_rechunked.nc"
-
-                if requested_filename_itself == expected_nc_filename and requested_parent_dir_name == "":
-                     allow_access = True
-                     logger.info(f"Authorized access to main data file '{filename}' for base '{token_base_claim}'.")
-                elif requested_filename_itself == expected_asset_dir_name and requested_parent_dir_name == "":
-                     allow_access = True
-                     logger.info(f"Authorized access to asset directory '{filename}' for base '{token_base_claim}'.")
-                elif requested_parent_dir_name == expected_asset_dir_name and requested_filename_itself in ["reference.json", ".zmetadata"]:
-                     allow_access = True
-                     logger.info(f"Authorized access to metadata file '{filename}' within asset dir '{expected_asset_dir_name}' for base '{token_base_claim}'.")
-
-            if not allow_access:
-                logger.warning(f"DEBUG_AUTH Failed: Requested relative file path: {requested_relative_path_str}")
-                logger.warning(f"DEBUG_AUTH Failed: Requested filename: {requested_filename_itself}")
-                logger.warning(f"DEBUG_AUTH Failed: Requested parent dir: '{requested_parent_dir_name}'")
-                logger.warning(f"DEBUG_AUTH Failed: Expected token base: '{token_base_claim}'")
-                logger.warning(f"DEBUG_AUTH Failed: Is Zarr request: {is_zarr_request}")
+                payload = jwt.decode(token, MINER_JWT_SECRET_KEY, algorithms=["HS256"])
+                logger.info("Successfully validated JWT token")
                 
-                logger.warning(f"Access DENIED for '{filename}'. Token for base '{token_base_claim}' (job: {job_id_claim}) not valid for this file request structure.")
-                raise HTTPException(status_code=403, detail="Token not valid for this specific file or its related data bundle")
-
-            if (is_zarr_request and requested_filename_itself == token_base_claim) or \
-               (not is_zarr_request and requested_filename_itself == expected_asset_dir_name and requested_parent_dir_name == ""):
-                return RedirectResponse(url=f"/forecasts/{filename}/", status_code=307)
-
-            file_path = (MINER_FORECAST_DIR / requested_relative_path_str).resolve()
-
-            if not file_path.exists() or MINER_FORECAST_DIR.resolve() not in file_path.parents:
-                logger.warning(f"Forecast file request denied or not found (post-auth check): {filename} (Resolved: {file_path})")
-                raise HTTPException(status_code=404, detail="File not found or outside allowed directory")
-
-            if file_path.is_dir():
-                logger.info(f"Serving directory: {file_path}")
-                return JSONResponse(content={"status": "ok", "type": "directory"})
-
-            logger.info(f"Serving forecast file: {file_path}")
-            return FileResponse(
-                path=str(file_path),
-                filename=file_path.name,
-                media_type='application/octet-stream'
-            )
-
-        except HTTPException as e:
-            raise e
-        except Exception as e:
-            logger.error(f"Error serving forecast file {filename}: {e}", exc_info=True)
-            return JSONResponse(status_code=500, content={"error": f"Internal server error serving file: {str(e)}"})
+                if "file_path" in payload:
+                    token_file_path = payload["file_path"]
+                    if not (file_path.startswith(token_file_path) or 
+                           token_file_path.startswith(file_path.rstrip('/'))):
+                        logger.warning(f"Token path mismatch: {token_file_path} vs {file_path}")
+                        raise HTTPException(status_code=403, detail="Path not authorized by token")
+                else:
+                    logger.warning("Token missing file_path claim")
+                    raise HTTPException(status_code=403, detail="Token missing file_path claim")
+                    
+            except jwt.PyJWTError as jwt_error:
+                logger.warning(f"Invalid JWT token: {str(jwt_error)}")
+                raise HTTPException(status_code=401, detail="Invalid token")
+            except Exception as e:
+                logger.warning(f"Error processing token: {str(e)}")
+                raise HTTPException(status_code=401, detail="Invalid token")
+        
+        zarr_suffix = ".zarr"
+        if file_path.endswith(zarr_suffix) or file_path.endswith(f"{zarr_suffix}/"):
+            zarr_dir_name = file_path.rstrip('/')
+            zarr_path = forecasts_dir / zarr_dir_name
+            
+            if not zarr_path.exists():
+                logger.warning(f"Zarr path not found: {zarr_path}")
+                pattern = str(forecasts_dir / f"{zarr_dir_name.lower().replace(zarr_suffix, '')}*{zarr_suffix}")
+                matches = glob.glob(pattern, case=False)
+                if matches:
+                    zarr_path = Path(matches[0])
+                    logger.info(f"Found case-insensitive match: {zarr_path}")
+            
+            if not zarr_path.exists():
+                logger.error(f"Zarr directory not found: {zarr_path}")
+                raise HTTPException(status_code=404, detail=f"File not found: {zarr_dir_name}")
+            
+            if zarr_path.is_dir():
+                if '/' in file_path.strip('/'):
+                    zarr_base, internal_path = file_path.strip('/').split('/', 1)
+                    full_internal_path = zarr_path / internal_path
+                    
+                    if full_internal_path.exists() and full_internal_path.is_file():
+                        logger.info(f"Returning specific Zarr file: {full_internal_path}")
+                        return FileResponse(path=str(full_internal_path), filename=full_internal_path.name)
+                
+                try:
+                    contents = [item.name for item in zarr_path.iterdir()]
+                    logger.info(f"Listed zarr directory contents: {contents}")
+                    return JSONResponse(content={"files": contents})
+                except Exception as e:
+                    logger.error(f"Error listing zarr directory: {str(e)}")
+                    raise HTTPException(status_code=500, detail=f"Error listing directory: {str(e)}")
+        
+        full_path = forecasts_dir / file_path.rstrip('/')
+        
+        if full_path.is_file():
+            logger.info(f"Returning file: {full_path}")
+            return FileResponse(path=str(full_path), filename=full_path.name)
+        
+        if full_path.is_dir():
+            try:
+                contents = [item.name for item in full_path.iterdir()]
+                logger.info(f"Listed directory contents: {contents}")
+                return JSONResponse(content={"files": contents})
+            except Exception as e:
+                logger.error(f"Error listing directory: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Error listing directory: {str(e)}")
+        
+        logger.error(f"File or directory not found: {full_path}")
+        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
 
     async def weather_forecast_require(
         decrypted_payload: WeatherForecastRequest = Depends(
@@ -494,11 +564,12 @@ def factory_router(miner_instance) -> APIRouter:
         response_class=JSONResponse,
     )
     router.add_api_route(
-        "/forecasts/{filename}",
+        "/forecasts/{file_path:path}",
         get_forecast_file,
         tags=["Weather"],
         methods=["GET", "HEAD"],
-        response_class=FileResponse
+        response_class=Response,
+        response_model=None
     )
     # Route for triggering weather forecast run
     router.add_api_route(
