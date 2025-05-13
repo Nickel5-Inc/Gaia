@@ -790,6 +790,209 @@ class GaiaValidator:
             logger.error(f"Failed to recover {task_name}: {e}")
             logger.error(traceback.format_exc())
 
+    async def cleanup_stale_history_on_startup(self):
+        """
+        Compares historical prediction table hotkeys against the current metagraph
+        and cleans up data for UIDs where hotkeys have changed or the UID is gone.
+        Runs once on validator startup.
+        """
+        logger.info("Starting cleanup of stale miner history based on current metagraph...")
+        try:
+            if not self.metagraph:
+                logger.warning("Metagraph not initialized, cannot perform stale history cleanup.")
+                return
+            if not self.database_manager:
+                logger.warning("Database manager not initialized, cannot perform stale history cleanup.")
+                return
+
+            # 1. Fetch Current Metagraph State
+            logger.info("Syncing metagraph for stale history check...")
+            self.metagraph.sync_nodes()
+            # Correctly build current_nodes_info using nodes_by_uid list
+            current_nodes_info = {uid: node for uid, node in enumerate(self.metagraph.nodes_by_uid) if node is not None}
+            logger.info(f"Found {len(current_nodes_info)} active UIDs in current metagraph.")
+
+            # 2. Fetch Historical Data (Distinct uid, miner_hotkey pairs)
+            geo_history_query = "SELECT DISTINCT miner_uid, miner_hotkey FROM geomagnetic_history WHERE miner_hotkey IS NOT NULL;"
+            soil_history_query = "SELECT DISTINCT miner_uid, miner_hotkey FROM soil_moisture_history WHERE miner_hotkey IS NOT NULL;"
+            
+            all_historical_pairs = set()
+            try:
+                geo_results = await self.database_manager.fetch_all(geo_history_query)
+                all_historical_pairs.update((row['miner_uid'], row['miner_hotkey']) for row in geo_results)
+                logger.info(f"Found {len(geo_results)} distinct (miner_uid, hotkey) pairs in geomagnetic_history.")
+            except Exception as e:
+                logger.warning(f"Could not query geomagnetic_history (may not exist yet): {e}")
+
+            try:
+                soil_results = await self.database_manager.fetch_all(soil_history_query)
+                all_historical_pairs.update((row['miner_uid'], row['miner_hotkey']) for row in soil_results)
+                logger.info(f"Found {len(soil_results)} distinct (miner_uid, hotkey) pairs in soil_moisture_history.")
+            except Exception as e:
+                logger.warning(f"Could not query soil_moisture_history (may not exist yet): {e}")
+
+            if not all_historical_pairs:
+                logger.info("No historical data found to check. Skipping stale history cleanup.")
+                return
+
+            logger.info(f"Found {len(all_historical_pairs)} total distinct historical (miner_uid, hotkey) pairs to check.")
+
+            # 3. Identify Mismatches
+            uids_to_cleanup = defaultdict(set)  # uid -> {stale_historical_hotkey1, stale_historical_hotkey2, ...}
+            
+            # --- DIAGNOSTIC LOGGING START ---
+            current_node_keys = list(current_nodes_info.keys())
+            logger.info(f"Diagnostic: current_nodes_info has {len(current_node_keys)} keys. Sample keys: {current_node_keys[:5]} (Type: {type(current_node_keys[0]) if current_node_keys else 'N/A'})")
+            # --- DIAGNOSTIC LOGGING END ---
+            
+            for hist_uid_str, hist_hotkey in all_historical_pairs:
+                try:
+                    hist_uid = int(hist_uid_str) # Convert hist_uid from string to int
+                except (ValueError, TypeError):
+                    logger.warning(f"Could not convert historical UID '{hist_uid_str}' to int. Skipping.")
+                    continue
+                    
+                # --- DIAGNOSTIC LOGGING START ---
+                logger.info(f"Diagnostic: Checking hist_uid: {hist_uid} (Type: {type(hist_uid)}), hist_hotkey: {hist_hotkey}")
+                # --- DIAGNOSTIC LOGGING END ---
+                current_node = current_nodes_info.get(hist_uid)
+                # We assume if a UID exists in history, it MUST exist in the current metagraph
+                # because slots are typically always filled. The important check is hotkey mismatch.
+                if current_node is None:
+                     # This case is highly unlikely if metagraph slots are always filled.
+                     # Log a warning but don't trigger specific cleanup based on None node.
+                     logger.warning(f"Found historical entry for miner_uid {hist_uid} (Hotkey: {hist_hotkey}), but node is unexpectedly None in current metagraph sync. Skipping direct cleanup based on this, hotkey mismatch check will handle if applicable.")
+                     continue # Skip to next historical pair
+
+                if current_node.hotkey != hist_hotkey:
+                    # Hotkey mismatch: This is the primary condition for cleanup.
+                    logger.warning(f"Mismatch found: miner_uid {hist_uid} historical hotkey {hist_hotkey} != current metagraph hotkey {current_node.hotkey}. Marking for cleanup.")
+                    uids_to_cleanup[hist_uid].add(hist_hotkey)
+
+            if not uids_to_cleanup:
+                logger.info("No stale historical entries found requiring cleanup.")
+                return
+
+            logger.info(f"Identified {len(uids_to_cleanup)} UIDs with stale history/scores.")
+
+            # 4. Perform Cleanup
+            # Get relevant task names for score zeroing
+            distinct_task_names_rows = await self.database_manager.fetch_all("SELECT DISTINCT task_name FROM score_table")
+            all_task_names_in_scores = [row['task_name'] for row in distinct_task_names_rows if row['task_name']]
+            tasks_for_score_cleanup = [
+                name for name in all_task_names_in_scores 
+                if name == 'geomagnetic' or name.startswith('soil_moisture')
+            ]
+            if not tasks_for_score_cleanup:
+                 logger.warning("No relevant task names (geomagnetic, soil_moisture*) found in score_table for cleanup.")
+                 # Proceed with history deletion and node_table update anyway
+
+            async with self.miner_table_lock: # Use lock to coordinate with deregistration loop
+                for uid, stale_hotkeys in uids_to_cleanup.items():
+                    logger.info(f"Cleaning up miner_uid {uid} associated with stale historical hotkeys: {stale_hotkeys}")
+                    current_node = current_nodes_info.get(uid) # Get current info again
+
+                    # Process each stale hotkey individually for precise score zeroing
+                    for stale_hk in stale_hotkeys:
+                        logger.info(f"Processing stale hotkey {stale_hk} for miner_uid {uid}.")
+                        
+                        # 4.1 Determine time window for the stale hotkey
+                        min_ts: Optional[datetime] = None
+                        max_ts: Optional[datetime] = None
+                        timestamps_found = False
+                        
+                        # Query both history tables using 'scored_at'
+                        history_tables_and_ts_cols = {
+                            "geomagnetic_history": "scored_at", # Use scored_at
+                            "soil_moisture_history": "scored_at" # Use scored_at
+                        }
+                        
+                        all_min_ts = []
+                        all_max_ts = []
+                        
+                        for table, ts_col in history_tables_and_ts_cols.items():
+                            try:
+                                ts_query = f"""
+                                    SELECT MIN({ts_col}) as min_ts, MAX({ts_col}) as max_ts 
+                                    FROM {table} 
+                                    WHERE miner_uid = :uid_str AND miner_hotkey = :stale_hk
+                                """
+                                result = await self.database_manager.fetch_one(ts_query, {"uid_str": str(uid), "stale_hk": stale_hk})
+                                
+                                if result and result['min_ts'] is not None and result['max_ts'] is not None:
+                                    all_min_ts.append(result['min_ts'])
+                                    all_max_ts.append(result['max_ts'])
+                                    timestamps_found = True
+                                    logger.info(f"  Found time range in {table} for ({uid}, {stale_hk}): {result['min_ts']} -> {result['max_ts']}")
+                                    
+                            except Exception as e_ts:
+                                logger.warning(f"Could not query timestamps from {table} for miner_uid {uid}, Hotkey {stale_hk}: {e_ts}")
+                        
+                        # Determine overall min/max across tables
+                        if all_min_ts:
+                             min_ts = min(all_min_ts)
+                        if all_max_ts:
+                             max_ts = max(all_max_ts)
+
+                        # 4.2 Delete historical predictions associated with this specific stale hotkey
+                        logger.info(f"  Deleting history entries for ({uid}, {stale_hk})")
+                        try:
+                            await self.database_manager.execute(
+                                "DELETE FROM geomagnetic_history WHERE miner_uid = :uid_str AND miner_hotkey = :stale_hk",
+                                {"uid_str": str(uid), "stale_hk": stale_hk}
+                            )
+                        except Exception as e_del_geo:
+                             logger.warning(f"  Could not delete from geomagnetic_history for miner_uid {uid}, Hotkey {stale_hk}: {e_del_geo}")
+                        try:
+                            await self.database_manager.execute(
+                                "DELETE FROM soil_moisture_history WHERE miner_uid = :uid_str AND miner_hotkey = :stale_hk",
+                                {"uid_str": str(uid), "stale_hk": stale_hk}
+                            )
+                        except Exception as e_del_soil:
+                            logger.warning(f"  Could not delete from soil_moisture_history for miner_uid {uid}, Hotkey {stale_hk}: {e_del_soil}")
+                        
+                        # 4.3 Zero out scores in score_table *only for the determined time window*
+                        if tasks_for_score_cleanup and timestamps_found and min_ts and max_ts:
+                            logger.info(f"  Zeroing scores for miner_uid {uid} in tasks {tasks_for_score_cleanup} within window {min_ts} -> {max_ts}")
+                            await self.database_manager.remove_miner_from_score_tables(
+                                uids=[uid],
+                                task_names=tasks_for_score_cleanup,
+                                filter_start_time=min_ts,
+                                filter_end_time=max_ts
+                            )
+                        elif not timestamps_found:
+                             logger.warning(f"  Skipping score zeroing for miner_uid {uid}, Hotkey {stale_hk} - could not determine time window from history tables.")
+                        elif not tasks_for_score_cleanup:
+                             logger.info(f"  Skipping score zeroing for miner_uid {uid}, Hotkey {stale_hk} - no relevant task names found in score_table.")
+                        else: # Should not happen if timestamps_found is true, but defensive check
+                            logger.warning(f"  Skipping score zeroing for miner_uid {uid}, Hotkey {stale_hk} due to missing min/max timestamps.")
+
+                    # 4.4 Update node_table (Done once per UID after processing all its stale hotkeys)
+                    # Since we only proceed if a mismatch was found, current_node should exist.
+                    current_node_for_update = current_nodes_info.get(uid)
+                    if current_node_for_update:
+                        logger.info(f"Updating node_table info for miner_uid {uid} to match current metagraph hotkey {current_node_for_update.hotkey}.")
+                        try:
+                            await self.database_manager.update_miner_info(
+                                index=uid, hotkey=current_node_for_update.hotkey, coldkey=current_node_for_update.coldkey,
+                                ip=current_node_for_update.ip, ip_type=str(current_node_for_update.ip_type), port=current_node_for_update.port,
+                                incentive=float(current_node_for_update.incentive), stake=float(current_node_for_update.stake),
+                                trust=float(current_node_for_update.trust), vtrust=float(current_node_for_update.vtrust),
+                                protocol=str(current_node_for_update.protocol)
+                            )
+                        except Exception as e_update:
+                             logger.error(f"Failed to update node_table for miner_uid {uid}: {e_update}")
+                    else:
+                        # This case should now be extremely unlikely given the check adjustments above.
+                        logger.error(f"Critical inconsistency: Attempted cleanup for miner_uid {uid}, but node became None before final update. Skipping node_table update.")
+                        # We avoid calling clear_miner_info here as the state is unexpected.
+
+            logger.info("Completed cleanup of stale miner history.")
+
+        except Exception as e:
+            logger.error(f"Error during stale history cleanup: {e}")
+            logger.error(traceback.format_exc())
+
     async def main(self):
         """Main execution loop for the validator."""
         try:
@@ -814,6 +1017,9 @@ class GaiaValidator:
             #logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
             await handle_db_wipe(self.database_manager)
             
+            # Perform startup history cleanup AFTER db init and wipe check
+            await self.cleanup_stale_history_on_startup()
+
             # Lock storage to prevent any writes
             self.database_manager._storage_locked = False
             if self.database_manager._storage_locked:
@@ -840,10 +1046,6 @@ class GaiaValidator:
                 logger.info("Created new API client")
             logger.info("HTTP clients ready.")
 
-            logger.info("Updating miner table...")
-            await self.update_miner_table()
-            logger.info("Miner table updated.")
-
             logger.info("Starting watchdog...")
             await self.start_watchdog()
             logger.info("Watchdog started.")
@@ -858,8 +1060,8 @@ class GaiaValidator:
                 lambda: self.status_logger(),
                 lambda: self.main_scoring(),
                 lambda: self.handle_miner_deregistration_loop(),
-                #lambda: self.miner_score_sender.run_async(),
-                lambda: self.check_for_updates(),
+                lambda: self.miner_score_sender.run_async(),
+                #lambda: self.check_for_updates(),
                 lambda: self.manage_earthdata_token()
             ]
             
@@ -1067,148 +1269,172 @@ class GaiaValidator:
             finally:
                 await asyncio.sleep(60)
 
-    async def update_miner_table(self):
-        """Update the miner table with the latest miner information from the metagraph."""
-        try:
-            if self.metagraph is None:
-                logger.error("Metagraph not initialized")
-                return
-
-            async with self.miner_table_lock:
-                self.metagraph.sync_nodes()
-                total_nodes = len(self.metagraph.nodes)
-                logger.info(f"Synced {total_nodes} nodes from the network")
-
-                # Process miners in chunks of 32 to prevent memory bloat
-                chunk_size = 32
-                nodes_items = list(self.metagraph.nodes.items())
-
-                for chunk_start in range(0, total_nodes, chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, total_nodes)
-                    chunk = nodes_items[chunk_start:chunk_end]
-                    
-                    try:
-                        for index, (hotkey, node) in enumerate(chunk, start=chunk_start):
-                            await self.database_manager.update_miner_info(
-                                index=index,
-                                hotkey=node.hotkey,
-                                coldkey=node.coldkey,
-                                ip=node.ip,
-                                ip_type=str(node.ip_type),
-                                port=node.port,
-                                incentive=float(node.incentive),
-                                stake=float(node.stake),
-                                trust=float(node.trust),
-                                vtrust=float(node.vtrust),
-                                protocol=str(node.protocol),
-                            )
-                            self.nodes[index] = {"hotkey": node.hotkey, "uid": index}
-                            logger.debug(f"Updated information for node {index}")
-                        
-                        logger.info(f"Processed nodes {chunk_start} to {chunk_end-1}")
-                        
-                        # Small delay between chunks to prevent overwhelming the database
-                        await asyncio.sleep(0.1)
-                        
-                    except Exception as chunk_error:
-                        logger.error(f"Error processing chunk {chunk_start}-{chunk_end}: {str(chunk_error)}")
-                        logger.error(traceback.format_exc())
-                        # Continue with next chunk instead of failing completely
-                        continue
-
-                logger.info("Successfully updated miner table and in-memory state")
-
-        except Exception as e:
-            logger.error(f"Error updating miner table: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
-
     async def handle_miner_deregistration_loop(self) -> None:
-        logger.info("Starting deregistration loop")
+        logger.info("Starting miner state synchronization loop (handles hotkey changes, new miners, and info updates)")
         
         while True:
+            processed_uids = set() # Keep track of UIDs processed in this cycle
             try:
+                await asyncio.sleep(120) # Run every 2 minutes
+
                 # Ensure metagraph is up to date
-                if not self.metagraph or not self.metagraph.nodes:
-                    logger.info("Metagraph not ready, syncing nodes...")
-                    self.metagraph.sync_nodes()
+                if not self.metagraph:
+                    logger.warning("Metagraph object not initialized, cannot sync miner state.")
+                    continue # Wait for metagraph to be initialized
+                
+                logger.info("Syncing metagraph for miner state update...")
+                self.metagraph.sync_nodes()
+                if not self.metagraph.nodes:
+                    logger.warning("Metagraph empty after sync, skipping miner state update.")
+                    continue
 
                 async with self.miner_table_lock:
-                    # Get set of all active hotkeys on chain
-                    chain_hotkeys = {node.hotkey for node in self.metagraph.nodes.values()}
-                    
-                    # Get miners from our local state
-                    query = "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL;"
-                    rows = await self.database_manager.fetch_all(query)
-                    db_hotkeys = {row["hotkey"] for row in rows}
-                    
-                    # Get in-memory state hotkeys
-                    memory_hotkeys = {data["hotkey"] for data in self.nodes.values() if "hotkey" in data}
-                    
-                    # Check sync status
-                    chain_count = len(chain_hotkeys)
-                    db_count = len(db_hotkeys)
-                    memory_count = len(memory_hotkeys)
-                    
-                    # Find any differences between states
-                    db_not_in_chain = db_hotkeys - chain_hotkeys
-                    memory_not_in_chain = memory_hotkeys - chain_hotkeys
-                    memory_not_in_db = memory_hotkeys - db_hotkeys
-                    
-                    if not any([db_not_in_chain, memory_not_in_chain, memory_not_in_db]):
-                        logger.info(f"All states in sync! Chain: {chain_count}, DB: {db_count}, Memory: {memory_count} miners")
-                    else:
-                        if db_not_in_chain:
-                            logger.info(f"Found {len(db_not_in_chain)} miners in DB not on chain")
-                        if memory_not_in_chain:
-                            logger.info(f"Found {len(memory_not_in_chain)} miners in memory not on chain")
-                        if memory_not_in_db:
-                            logger.info(f"Found {len(memory_not_in_db)} miners in memory not in DB")
-                    
-                    # Find miners in our DB that are no longer on chain
-                    for row in rows:
-                        uid = row["uid"]
-                        hotkey = row["hotkey"]
-                        if hotkey not in chain_hotkeys:
-                            logger.info(f"Detected deregistered miner: UID={uid}, hotkey={hotkey}")
-                            try:
-                                success = await self.database_manager.clear_miner_info(uid)
-                                if success:
-                                    logger.info(f"Cleared info for deregistered miner {uid} (hotkey: {hotkey})")
-                                    # Update in-memory state to reflect removal
-                                    if uid in self.nodes:
-                                        del self.nodes[uid]
+                    logger.info("Performing miner hotkey change check and info update...")
+                    # Get current UIDs and hotkeys from the chain's metagraph
+                    # Using enumerate ensures we have the correct UID for each node
+                    # Correctly build chain_nodes_info using nodes_by_uid list
+                    chain_nodes_info = {uid: node for uid, node in enumerate(self.metagraph.nodes_by_uid) if node is not None}
+
+                    # Get UIDs and hotkeys from our local database
+                    db_miner_query = "SELECT uid, hotkey FROM node_table WHERE hotkey IS NOT NULL;"
+                    db_miners_rows = await self.database_manager.fetch_all(db_miner_query)
+                    db_miners_info = {row["uid"]: row["hotkey"] for row in db_miners_rows}
+
+                    uids_to_clear_and_update = {} # uid: new_chain_node
+                    uids_to_update_info = {} # uid: new_chain_node (for existing miners with potentially changed info)
+
+                    # --- Step 1: Check existing DB miners against the chain --- 
+                    for db_uid, db_hotkey in db_miners_info.items():
+                        processed_uids.add(db_uid) # Mark as processed
+                        chain_node_for_uid = chain_nodes_info.get(db_uid)
+
+                        if chain_node_for_uid is None:
+                            # This case *shouldn't* happen if metagraph always fills slots,
+                            # but handle defensively. Might indicate UID truly removed.
+                            logger.warning(f"UID {db_uid} (DB hotkey: {db_hotkey}) not found in current metagraph sync. Potential deregistration missed? Skipping.")
+                            # Consider adding to a separate cleanup list if this persists.
+                            continue 
+                            
+                        if chain_node_for_uid.hotkey != db_hotkey:
+                            # Hotkey for this UID has changed!
+                            logger.info(f"UID {db_uid} hotkey changed. DB: {db_hotkey}, Chain: {chain_node_for_uid.hotkey}. Marking for data cleanup and update.")
+                            uids_to_clear_and_update[db_uid] = chain_node_for_uid
+                        else:
+                            # Hotkey matches, but other info might have changed. Mark for potential update.
+                            uids_to_update_info[db_uid] = chain_node_for_uid
+
+                    # --- Step 2: Process UIDs with changed hotkeys ---
+                    if uids_to_clear_and_update:
+                        logger.info(f"Cleaning old data and updating hotkeys for UIDs: {list(uids_to_clear_and_update.keys())}")
+                        for uid_to_process, new_chain_node_data in uids_to_clear_and_update.items():
+                            original_hotkey = db_miners_info.get(uid_to_process) # Get the old hotkey from DB cache
+                            if not original_hotkey:
+                                logger.warning(f"Could not find original hotkey in DB cache for UID {uid_to_process}. Skipping cleanup for this UID.")
+                                continue
                                 
-                                # Update with chain's truth for this index
-                                node = self.metagraph.nodes.get(uid)
-                                if node:
-                                    await self.database_manager.update_miner_info(
-                                        index=uid,
-                                        hotkey=node.hotkey,
-                                        coldkey=node.coldkey,
-                                        ip=node.ip,
-                                        ip_type=str(node.ip_type),
-                                        port=node.port,
-                                        incentive=float(node.incentive),
-                                        stake=float(node.stake),
-                                        trust=float(node.trust),
-                                        vtrust=float(node.vtrust),
-                                        protocol=str(node.protocol),
+                            logger.info(f"Processing hotkey change for UID {uid_to_process}: Old={original_hotkey}, New={new_chain_node_data.hotkey}")
+                            try:
+                                # 1. Delete from prediction tables by UID
+                                prediction_tables_by_uid = ["geomagnetic_predictions", "soil_moisture_predictions"]
+                                for table_name in prediction_tables_by_uid:
+                                    try:
+                                        table_exists_res = await self.database_manager.fetch_one(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{table_name}')")
+                                        if table_exists_res and table_exists_res['exists']:
+                                            # Delete using the original hotkey associated with the UID
+                                            await self.database_manager.execute(f"DELETE FROM {table_name} WHERE miner_hotkey = :hotkey", {"hotkey": original_hotkey})
+                                            logger.info(f"  Deleted from {table_name} for old hotkey {original_hotkey} (UID {uid_to_process}) due to hotkey change.")
+                                        # No else needed, if table doesn't exist, we just skip
+                                    except Exception as e_pred_del:
+                                        logger.warning(f"  Could not clear {table_name} for UID {uid_to_process}: {e_pred_del}")
+
+                                # 2. Delete from history tables by OLD hotkey
+                                history_tables_by_hotkey = ["geomagnetic_history", "soil_moisture_history"]
+                                for table_name in history_tables_by_hotkey:
+                                    try:
+                                        table_exists_res = await self.database_manager.fetch_one(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{table_name}')")
+                                        if table_exists_res and table_exists_res['exists']:
+                                            await self.database_manager.execute(f"DELETE FROM {table_name} WHERE miner_hotkey = :hotkey", {"hotkey": original_hotkey})
+                                            logger.info(f"  Deleted from {table_name} for old hotkey {original_hotkey} (UID {uid_to_process}) due to hotkey change.")
+                                    except Exception as e_hist_del:
+                                         logger.warning(f"  Could not clear {table_name} for old hotkey {original_hotkey}: {e_hist_del}")
+
+                                # 3. Zero out ALL scores for the UID in score_table
+                                distinct_task_names_rows = await self.database_manager.fetch_all("SELECT DISTINCT task_name FROM score_table")
+                                all_task_names_in_scores = [row['task_name'] for row in distinct_task_names_rows if row['task_name']]
+                                if all_task_names_in_scores:
+                                    logger.info(f"  Zeroing all scores in score_table for UID {uid_to_process} across tasks: {all_task_names_in_scores}")
+                                    await self.database_manager.remove_miner_from_score_tables(
+                                        uids=[uid_to_process],
+                                        task_names=all_task_names_in_scores,
+                                        filter_start_time=None, filter_end_time=None # Affect all history
                                     )
-                                    if node.hotkey in chain_hotkeys:
-                                        self.nodes[uid] = {"hotkey": node.hotkey, "uid": uid}
-                                        logger.info(f"Updated index {uid} with new chain info")
+                                else:
+                                    logger.info(f"  No task names found in score_table to zero-out for UID {uid_to_process}.")
+
+                                # 4. Update node_table with NEW info
+                                logger.info(f"  Updating node_table info for UID {uid_to_process} with new hotkey {new_chain_node_data.hotkey}.")
+                                await self.database_manager.update_miner_info(
+                                    index=uid_to_process, hotkey=new_chain_node_data.hotkey, coldkey=new_chain_node_data.coldkey,
+                                    ip=new_chain_node_data.ip, ip_type=str(new_chain_node_data.ip_type), port=new_chain_node_data.port,
+                                    incentive=float(new_chain_node_data.incentive), stake=float(new_chain_node_data.stake),
+                                    trust=float(new_chain_node_data.trust), vtrust=float(new_chain_node_data.vtrust),
+                                    protocol=str(new_chain_node_data.protocol)
+                                )
+                                
+                                # Update in-memory state as well
+                                if uid_to_process in self.nodes:
+                                     del self.nodes[uid_to_process] # Remove old entry if exists
+                                self.nodes[uid_to_process] = {"hotkey": new_chain_node_data.hotkey, "uid": uid_to_process}
+                                logger.info(f"Successfully processed hotkey change for UID {uid_to_process}.")
+                                
                             except Exception as e:
-                                logger.error(f"Error clearing miner {uid}: {str(e)}")
-                                logger.error(traceback.format_exc())
+                                logger.error(f"Error processing hotkey change for UID {uid_to_process}: {str(e)}", exc_info=True)
 
-                # Periodic sleep (5 minutes)
-                await asyncio.sleep(300)
+                    # --- Step 3: Update info for existing miners where hotkey didn't change ---
+                    if uids_to_update_info:
+                        logger.info(f"Updating potentially changed info (stake, IP, etc.) for {len(uids_to_update_info)} existing UIDs...")
+                        for uid_to_update, chain_node_data in uids_to_update_info.items():
+                            # Skip if it was just processed in the clear_and_update step
+                            if uid_to_update in uids_to_clear_and_update: continue 
+                            try:
+                                await self.database_manager.update_miner_info(
+                                    index=uid_to_update, hotkey=chain_node_data.hotkey, coldkey=chain_node_data.coldkey,
+                                    ip=chain_node_data.ip, ip_type=str(chain_node_data.ip_type), port=chain_node_data.port,
+                                    incentive=float(chain_node_data.incentive), stake=float(chain_node_data.stake),
+                                    trust=float(chain_node_data.trust), vtrust=float(chain_node_data.vtrust),
+                                    protocol=str(chain_node_data.protocol)
+                                )
+                                # Also update in-memory state
+                                self.nodes[uid_to_update] = {"hotkey": chain_node_data.hotkey, "uid": uid_to_update}
+                                logger.debug(f"Successfully updated info for existing UID {uid_to_update}.")
+                            except Exception as e:
+                                logger.error(f"Error updating info for existing UID {uid_to_update}: {str(e)}", exc_info=True)
 
-            except Exception as e:
-                logger.error(f"Error in deregistration loop: {str(e)}")
-                logger.error(traceback.format_exc())
-                await asyncio.sleep(60)
+                    # --- Step 4: Check for new miners on chain not yet processed ---
+                    new_miners_detected = 0
+                    for chain_uid, chain_node in chain_nodes_info.items():
+                        if chain_uid not in processed_uids: # Check if UID was seen in Step 1
+                            logger.info(f"New miner detected on chain: UID {chain_uid}, Hotkey {chain_node.hotkey}. Adding to DB.")
+                            try:
+                                await self.database_manager.update_miner_info(
+                                    index=chain_uid, hotkey=chain_node.hotkey, coldkey=chain_node.coldkey,
+                                    ip=chain_node.ip, ip_type=str(chain_node.ip_type), port=chain_node.port,
+                                    incentive=float(chain_node.incentive), stake=float(chain_node.stake),
+                                    trust=float(chain_node.trust), vtrust=float(chain_node.vtrust),
+                                    protocol=str(chain_node.protocol)
+                                )
+                                self.nodes[chain_uid] = {"hotkey": chain_node.hotkey, "uid": chain_uid}
+                                new_miners_detected +=1
+                                processed_uids.add(chain_uid) # Mark as processed
+                            except Exception as e:
+                                logger.error(f"Error adding new miner UID {chain_uid} (Hotkey: {chain_node.hotkey}): {str(e)}", exc_info=True)
+                    if new_miners_detected > 0:
+                        logger.info(f"Added {new_miners_detected} new miners to the database.")
+
+                    logger.info("Miner state synchronization cycle completed.")
+
+            except asyncio.CancelledError:
+                logger.info("Miner state synchronization loop cancelled.")
 
     async def _calc_task_weights(self):
         """Calculate weights based on recent task scores."""
@@ -1406,6 +1632,10 @@ class GaiaValidator:
                     geomagnetic_score = np.nan
                 if np.isnan(soil_score) or soil_score == 0.0:
                     soil_score = np.nan
+                
+                # Correctly access node by UID using nodes_by_uid
+                current_node_obj = self.metagraph.nodes_by_uid[idx] if idx < len(self.metagraph.nodes_by_uid) else None
+                current_hotkey_on_chain = current_node_obj.hotkey if current_node_obj else "N/A (UID not active)"
 
                 if np.isnan(geomagnetic_score) and np.isnan(soil_score):
                     weights[idx] = 0.0
@@ -1416,9 +1646,9 @@ class GaiaValidator:
                 else:
                     weights[idx] = 0.40 * sigmoid(geomagnetic_score, k=20, x0=0.93) + 0.60 * soil_score
 
-                logger.info(f"UID {idx}: geo={geomagnetic_score} ({geo_counts[idx]} scores), soil={soil_score} ({soil_counts[idx]} scores), weight={weights[idx]}")
+                logger.info(f"UID {idx} (CurrentHotKey: {current_hotkey_on_chain}): geo={geomagnetic_score} ({geo_counts[idx]} scores), soil={soil_score} ({soil_counts[idx]} scores), weight={weights[idx]:.4f}")
 
-            logger.info(f"Weights before normalization: {weights}")
+            logger.info(f"Weights before normalization: {weights.tolist()}")
 
             # generalized logistic curve
             non_zero_mask = weights != 0.0

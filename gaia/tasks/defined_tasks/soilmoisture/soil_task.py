@@ -1181,15 +1181,38 @@ class SoilMoistureTask(Task):
                     logger.info(f"Processing scores for region {region_id}")
                     
                     for prediction in task.get("predictions", []):
-                        miner_id = prediction.get("miner_id")
-                        if miner_id is None:
+                        miner_uid_from_prediction = prediction.get("miner_id")
+                        miner_hotkey_from_prediction = prediction.get("miner_hotkey")
+
+                        if miner_uid_from_prediction is None or miner_hotkey_from_prediction is None:
+                            logger.warning(f"Skipping prediction due to missing UID or Hotkey: UID {miner_uid_from_prediction}, Hotkey {miner_hotkey_from_prediction}")
+                            continue
+                        
+                        is_valid_in_metagraph = False
+                        if self.validator and hasattr(self.validator, 'metagraph') and self.validator.metagraph is not None:
+                            # Check if the hotkey exists in the metagraph's nodes dictionary
+                            if miner_hotkey_from_prediction in self.validator.metagraph.nodes:
+                                # Retrieve the Node object from the metagraph
+                                node_in_metagraph = self.validator.metagraph.nodes[miner_hotkey_from_prediction]
+                                # Compare the UID from the prediction with the UID from the metagraph node
+                                if hasattr(node_in_metagraph, 'uid') and str(node_in_metagraph.uid) == str(miner_uid_from_prediction):
+                                    is_valid_in_metagraph = True
+                                else:
+                                    metagraph_uid_str = getattr(node_in_metagraph, 'uid', '[UID not found]')
+                                    logger.warning(f"Metagraph UID mismatch for {miner_hotkey_from_prediction}: Prediction UID {miner_uid_from_prediction}, Metagraph Node UID {metagraph_uid_str}. Skipping score.")
+                            else:
+                                logger.warning(f"Miner hotkey {miner_hotkey_from_prediction} not found in current metagraph. Prediction UID {miner_uid_from_prediction}. Skipping score.")
+                        else:
+                            logger.warning("Validator or metagraph not available for validation. Cannot confirm miner registration. Skipping score.")
+                            
+                        if not is_valid_in_metagraph:
                             continue
                             
                         if isinstance(task_score.get("total_score"), (int, float)):
                             score_value = float(task_score["total_score"])
-                            miner_scores[miner_id].append(score_value)
-                            region_counts[miner_id].add(region_id)
-                            logger.info(f"Added score {score_value:.4f} for miner_id {miner_id} in region {region_id}")
+                            miner_scores[miner_uid_from_prediction].append(score_value)
+                            region_counts[miner_uid_from_prediction].add(region_id)
+                            logger.info(f"Added score {score_value:.4f} for miner_id {miner_uid_from_prediction} in region {region_id}")
 
                 for miner_id, scores_list in miner_scores.items():
                     if scores_list:

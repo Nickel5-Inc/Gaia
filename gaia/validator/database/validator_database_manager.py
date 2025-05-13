@@ -720,66 +720,6 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             logger.error(f"Error updating miner info for index {index}: {str(e)}")
             raise DatabaseError(f"Failed to update miner info: {str(e)}")
 
-    @track_operation('write')
-    async def clear_miner_info(
-        self,
-        index: int
-    ) -> bool:
-        """
-        Clear all information for a miner from the database, treating every change as a
-        full deregistration. Delete the node's hotkey/coldkey/metadata, remove historical
-        geomagnetic and soil moisture data, and update scores in the score tables.
-
-        Args:
-            index (int): The miner UID (0–255).
-
-        Returns:
-            bool: True on success, False on failure.
-        """
-        try:
-            # First, read the current hotkey for logging purposes
-            original_info = await self.get_miner_info(index)
-            original_hotkey = original_info["hotkey"] if original_info else None
-
-            # Clear node_table entry
-            node_query = """
-            UPDATE node_table 
-            SET hotkey = NULL, coldkey = NULL, ip = NULL, ip_type = NULL, port = NULL,
-                incentive = NULL, stake = NULL, trust = NULL, vtrust = NULL, protocol = NULL
-            WHERE uid = :index
-            """
-            await self.execute(node_query, {"index": index})
-
-            # Delete geomagnetic and soil moisture history if the miner had a hotkey
-            if original_hotkey:
-                geo_history_query = """
-                DELETE FROM geomagnetic_history 
-                WHERE miner_hotkey = :old_hotkey
-                """
-                await self.execute(geo_history_query, {"old_hotkey": original_hotkey})
-
-                soil_history_query = """
-                DELETE FROM soil_moisture_history 
-                WHERE miner_hotkey = :old_hotkey
-                """
-                await self.execute(soil_history_query, {"old_hotkey": original_hotkey})
-
-            # After clearing, treat as a full deregistration and update score tables
-            await self.remove_miner_from_score_tables(
-                uids=[index],
-                task_names=["soil_moisture", "geomagnetic"],
-                window_days=1  # Adjust the window as needed
-            )
-            logger.info(f"Partially removed UID {index} from existing daily score rows for all tasks")
-
-            logger.info(f"Successfully cleared miner info for UID {index}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error clearing miner info for UID {index}: {str(e)}")
-            logger.error(traceback.format_exc())
-            return False
-
     @track_operation('read')
     async def get_miner_info(self, index: int):
         """
@@ -827,48 +767,61 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         self,
         uids: List[int],
         task_names: List[str],
-        window_days: int = 1
+        filter_start_time: Optional[datetime] = None,
+        filter_end_time: Optional[datetime] = None
     ) -> None:
         """
-        Partially remove specified miners from daily 'score_table' rows for given task types,
-        preserving data for all other miners. Sets the departing miners' array values to NaN.
-    
+        Partially remove specified miners from 'score_table' rows for given task types,
+        preserving data for all other miners. Sets the departing miners' array values to 0.0.
+        Filters by a time window if filter_start_time and filter_end_time are provided.
+
         Args:
             uids (List[int]): List of miner UIDs to be zeroed out.
             task_names (List[str]): List of task names to apply the removal.
-            window_days (int): Number of days to look back for score rows.
+            filter_start_time (Optional[datetime]): If provided, only process rows where task_id >= this time.
+            filter_end_time (Optional[datetime]): If provided, only process rows where task_id <= this time.
         """
         if not uids:
             return
 
-        str_uids = [str(uid) for uid in uids]
-        current_time = datetime.now(timezone.utc)
-        history_window = current_time - timedelta(days=window_days)
-        logger.info(f"Removing scores for UIDs {uids} from {history_window} to {current_time}")
+        log_message_parts = [f"Zeroing out scores for UIDs {uids}"]
+        if filter_start_time:
+            log_message_parts.append(f"from {filter_start_time.isoformat()}")
+        if filter_end_time:
+            log_message_parts.append(f"to {filter_end_time.isoformat()}")
+        logger.info(" ".join(log_message_parts))
 
         total_rows_updated = 0
         for task_name in task_names:
             try:
-                # 1) Select daily score rows in the specified time window
-                query = """
+                # 1) Select score rows, potentially filtered by time
+                query_base = """
                     SELECT task_id, score
                     FROM score_table
                     WHERE task_name = :task_name
-                      AND task_id::float >= :start_timestamp
-                      AND task_id::float <= :end_timestamp
                 """
-                params = {
-                    "task_name": task_name,
-                    "start_timestamp": history_window.timestamp(),
-                    "end_timestamp": current_time.timestamp(),
-                }
+                params = {"task_name": task_name}
+
+                time_conditions = []
+                if filter_start_time:
+                    time_conditions.append("task_id::float >= :start_timestamp")
+                    params["start_timestamp"] = filter_start_time.timestamp()
+                if filter_end_time:
+                    time_conditions.append("task_id::float <= :end_timestamp")
+                    params["end_timestamp"] = filter_end_time.timestamp()
+
+                if time_conditions:
+                    query = query_base + " AND " + " AND ".join(time_conditions)
+                else:
+                    query = query_base # No time filter
+
                 rows = await self.fetch_all(query, params)
 
                 if not rows:
-                    logger.info(f"No '{task_name}' score rows found to update.")
+                    logger.info(f"No '{task_name}' score rows found to update for the given criteria.")
                     continue
 
-                logger.info(f"Found {len(rows)} {task_name} score rows in time window")
+                logger.info(f"Found {len(rows)} {task_name} score rows to process.")
                 rows_updated = 0
                 scores_updated = 0
 
@@ -885,10 +838,12 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                         for uid in uids:
                             if 0 <= uid < len(all_scores):
                                 current_score = all_scores[uid]
-                                is_nan = isinstance(current_score, str) or (isinstance(current_score, float) and math.isnan(current_score))
-                                logger.debug(f"Score for UID {uid} in row {row['task_id']}: {current_score} (is_nan: {is_nan})")
-                                if not is_nan:
-                                    all_scores[uid] = float("nan")
+                                # Check if current score is NOT 0.0 or NaN (represented as string or float)
+                                is_nan_or_zero = (isinstance(current_score, str) or 
+                                                 (isinstance(current_score, float) and (math.isnan(current_score) or current_score == 0.0)))
+                                logger.debug(f"Score for UID {uid} in row {row['task_id']}: {current_score} (is_nan_or_zero: {is_nan_or_zero})")
+                                if not is_nan_or_zero:
+                                    all_scores[uid] = 0.0 # Set to 0.0 instead of NaN
                                     changed = True
                                     changes_in_row += 1
 
@@ -916,20 +871,20 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
                     except Exception as e:
                         logger.error(
-                            f"Error removing miner from '{task_name}' score row with task_id {row['task_id']}: {e}"
+                            f"Error zeroing out miner scores in '{task_name}' score row with task_id {row['task_id']}: {e}"
                         )
                         logger.error(traceback.format_exc())
 
                 total_rows_updated += rows_updated
                 logger.info(
-                    f"Task {task_name}: Updated {scores_updated} scores across {rows_updated} rows"
+                    f"Task {task_name}: Zeroed out {scores_updated} scores across {rows_updated} rows"
                 )
 
             except Exception as e:
                 logger.error(f"Error in remove_miner_from_score_tables for task '{task_name}': {e}")
                 logger.error(traceback.format_exc())
 
-        logger.info(f"Score removal complete. Total rows updated: {total_rows_updated}")
+        logger.info(f"Score zeroing complete. Total rows updated: {total_rows_updated}")
 
     @track_operation('ddl')
     async def create_baseline_predictions_table(self, session: AsyncSession):

@@ -19,7 +19,8 @@ nodes.json
 # Miscellaneous
 data/
 
-gaia.egg-info/
+gaia.egg-info/*
+
 
 # Cache directories
 **/smap_cache/
@@ -27,3 +28,12 @@ smap_cache/
 
 db_wipe_trigger
 db_wipe_trigger.executed.*
+
+metric_plots/*
+logs/*
+gaia.egg-info/*
+gaia/models/checkpoints/*
+analysis.py 
+miner.log
+parse_soil_metrics.py
+extended_metrics.log

@@ -966,14 +966,13 @@ class GeomagneticTask(Task):
             # Get mapping of hotkeys to UIDs from node_table
             query = """
             SELECT uid, hotkey FROM node_table 
-            WHERE hotkey IS NOT NULL
             """
             miner_mappings = await self.db_manager.fetch_all(query)
             hotkey_to_uid = {row["hotkey"]: row["uid"] for row in miner_mappings}
 
             # Check historical table for any tasks in this time period
             historical_query = """
-            SELECT miner_hotkey, score
+            SELECT miner_uid, miner_hotkey, score
             FROM geomagnetic_history
             WHERE query_time = :prediction_time
             """
@@ -984,18 +983,75 @@ class GeomagneticTask(Task):
 
             # Process historical tasks
             for task in historical_tasks:
-                miner_hotkey = task["miner_hotkey"]
-                if miner_hotkey in hotkey_to_uid:
-                    uid = hotkey_to_uid[miner_hotkey]
-                    scores[uid] = task["score"]
+                historical_miner_uid = task["miner_uid"]
+                historical_miner_hotkey = task["miner_hotkey"]
+
+                if historical_miner_uid is None or historical_miner_hotkey is None:
+                    logger.warning(f"Skipping historical task due to missing UID/Hotkey: {task}")
+                    continue
+
+                is_valid_in_metagraph = False
+                if self.validator and hasattr(self.validator, 'metagraph') and self.validator.metagraph is not None:
+                    # Check if the historical hotkey exists in the current metagraph's nodes dictionary
+                    if historical_miner_hotkey in self.validator.metagraph.nodes:
+                        # Retrieve the Node object from the metagraph
+                        node_in_metagraph = self.validator.metagraph.nodes[historical_miner_hotkey]
+                        # Compare the historical UID with the UID from the metagraph node
+                        if hasattr(node_in_metagraph, 'uid') and str(node_in_metagraph.uid) == str(historical_miner_uid):
+                            is_valid_in_metagraph = True
+                        else:
+                            metagraph_uid_str = getattr(node_in_metagraph, 'uid', '[UID not found]')
+                            logger.warning(f"Metagraph UID mismatch for {historical_miner_hotkey} (Historical): DB UID {historical_miner_uid}, Metagraph Node UID {metagraph_uid_str}. Skipping.")
+                    else:
+                        logger.warning(f"Hotkey {historical_miner_hotkey} (Historical UID {historical_miner_uid}) not in current metagraph. Skipping.")
+                else:
+                    logger.warning("Validator or metagraph not available for validation (historical_tasks). Skipping.")
+
+                if not is_valid_in_metagraph:
+                    continue
+                
+                # If valid, use historical_miner_uid to place the score.
+                try:
+                    scores[int(historical_miner_uid)] = task["score"]
+                except (ValueError, IndexError, TypeError) as e:
+                    logger.error(f"Failed to assign score for historical task, UID: {historical_miner_uid}, Score: {task.get('score')}, Error: {e}")
+
 
             # Process recent tasks (overwrite historical scores if exists)
             if recent_tasks:
                 for task in recent_tasks:
-                    miner_hotkey = task["miner_hotkey"]
-                    if miner_hotkey in hotkey_to_uid:
-                        uid = hotkey_to_uid[miner_hotkey]
-                        scores[uid] = task.get("score", float("nan"))
+                    recent_miner_uid = task["miner_uid"]
+                    recent_miner_hotkey = task["miner_hotkey"]
+
+                    if recent_miner_uid is None or recent_miner_hotkey is None:
+                        logger.warning(f"Skipping recent task due to missing UID/Hotkey: {task}")
+                        continue
+
+                    is_valid_in_metagraph = False
+                    if self.validator and hasattr(self.validator, 'metagraph') and self.validator.metagraph is not None:
+                        # Check if the recent hotkey exists in the current metagraph's nodes dictionary
+                        if recent_miner_hotkey in self.validator.metagraph.nodes:
+                             # Retrieve the Node object from the metagraph
+                            node_in_metagraph = self.validator.metagraph.nodes[recent_miner_hotkey]
+                            # Compare the recent UID with the UID from the metagraph node
+                            if hasattr(node_in_metagraph, 'uid') and str(node_in_metagraph.uid) == str(recent_miner_uid):
+                                is_valid_in_metagraph = True
+                            else:
+                                metagraph_uid_str = getattr(node_in_metagraph, 'uid', '[UID not found]')
+                                logger.warning(f"Metagraph UID mismatch for {recent_miner_hotkey} (Recent): DB UID {recent_miner_uid}, Metagraph Node UID {metagraph_uid_str}. Skipping.")
+                        else:
+                             logger.warning(f"Hotkey {recent_miner_hotkey} (Recent UID {recent_miner_uid}) not in current metagraph. Skipping.")
+                    else:
+                        logger.warning("Validator or metagraph not available for validation (recent_tasks). Skipping.")
+
+                    if not is_valid_in_metagraph:
+                        continue
+
+                    # If valid, use recent_miner_uid to place the score.
+                    try:
+                        scores[int(recent_miner_uid)] = task.get("score", float("nan"))
+                    except (ValueError, IndexError, TypeError) as e:
+                        logger.error(f"Failed to assign score for recent task, UID: {recent_miner_uid}, Score: {task.get('score')}, Error: {e}")
 
             # Create score row using verification time as task_id
             score_row = {

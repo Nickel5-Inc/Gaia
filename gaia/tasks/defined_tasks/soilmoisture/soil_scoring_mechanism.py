@@ -14,6 +14,7 @@ from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import (
     download_smap_data,
     get_smap_data_for_sentinel_bounds,
 )
+from gaia.tasks.defined_tasks.soilmoisture.utils.evaluation_metrics import calculate_all_metrics
 from pydantic import Field
 from fiber.logging_utils import get_logger
 import os
@@ -24,8 +25,23 @@ import glob
 import asyncio
 import psutil
 import gc
+import logging
+import json
 
 logger = get_logger(__name__)
+
+os.makedirs('logs', exist_ok=True)
+metrics_logger = logging.getLogger('ExtendedMetricsLogger')
+metrics_logger.setLevel(logging.INFO)
+metrics_logger.propagate = False
+
+file_handler = logging.FileHandler('logs/extended_metrics.log')
+file_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s|%(levelname)s|%(message)s')
+file_handler.setFormatter(formatter)
+
+if not metrics_logger.handlers:
+    metrics_logger.addHandler(file_handler)
 
 
 class SoilScoringMechanism(ScoringMechanism):
@@ -394,6 +410,23 @@ class SoilScoringMechanism(ScoringMechanism):
                         kernel_size=9,
                     ))
                     results["validation_metrics"]["rootzone_ssim"] = rootzone_ssim.item()
+
+            try:
+                pred_surface_np = model_predictions[0, 0].cpu().numpy()
+                pred_rootzone_np = model_predictions[0, 1].cpu().numpy() 
+                truth_surface_np = surface_sm_11x11[0, 0].cpu().numpy()
+                truth_rootzone_np = rootzone_sm_11x11[0, 0].cpu().numpy()
+
+                if surface_mask_11x11.any():
+                    surface_metrics = calculate_all_metrics(pred_surface_np, truth_surface_np)
+                    metrics_logger.info(f"METRICS|{miner_id}|{target_date}|surface|{json.dumps(surface_metrics)}")
+
+                if rootzone_mask_11x11.any():
+                    rootzone_metrics = calculate_all_metrics(pred_rootzone_np, truth_rootzone_np)
+                    metrics_logger.info(f"METRICS|{miner_id}|{target_date}|rootzone|{json.dumps(rootzone_metrics)}")
+            except Exception as e:
+                logger.error(f"Error calculating extended metrics: {str(e)}")
+                logger.debug(traceback.format_exc())
 
             if miner_id == "baseline":
                 self._last_baseline_metrics = results
