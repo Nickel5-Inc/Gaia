@@ -37,3 +37,4 @@ analysis.py
 miner.log
 parse_soil_metrics.py
 extended_metrics.log
+pm2_validator.log

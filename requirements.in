@@ -34,3 +34,5 @@ torchmetrics
 tqdm
 uvicorn
 xarray
+netcdf4
+h5netcdf

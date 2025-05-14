@@ -11,10 +11,12 @@ gaia.egg-info/dependency_links.txt
 gaia.egg-info/requires.txt
 gaia.egg-info/top_level.txt
 gaia/database/__init__.py
+gaia/database/constants.py
 gaia/database/database_manager.py
 gaia/miner/__init__.py
 gaia/miner/miner.py
 gaia/miner/utils/__init__.py
+gaia/miner/utils/health_check_miner.py
 gaia/miner/utils/subnet.py
 gaia/models/__init__.py
 gaia/models/geomag_basemodel.py
@@ -31,6 +33,7 @@ gaia/tasks/base/components/preprocessing.py
 gaia/tasks/base/components/scoring_mechanism.py
 gaia/tasks/defined_tasks/__init__.py
 gaia/validator/__init__.py
+gaia/validator/basemodel_evaluator.py
 gaia/validator/validator.py
 gaia/validator/database/__init__.py
 gaia/validator/database/validator_database_manager.py

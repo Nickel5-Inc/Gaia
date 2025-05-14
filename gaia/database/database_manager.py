@@ -49,9 +49,9 @@ class BaseDatabaseManager(ABC):
     _lock = asyncio.Lock()
 
     # Default timeouts
-    DEFAULT_QUERY_TIMEOUT = 30  # 30 seconds
+    DEFAULT_QUERY_TIMEOUT = 60  # 60 seconds
     DEFAULT_TRANSACTION_TIMEOUT = 180  # 3 minutes
-    DEFAULT_CONNECTION_TIMEOUT = 10  # 10 seconds
+    DEFAULT_CONNECTION_TIMEOUT = 60  # 10 seconds
 
     # Operation constants
     DEFAULT_BATCH_SIZE = 1000
@@ -65,6 +65,10 @@ class BaseDatabaseManager(ABC):
     # Circuit breaker settings
     CIRCUIT_BREAKER_THRESHOLD = 5
     CIRCUIT_BREAKER_RECOVERY_TIME = 60  # seconds
+
+    # New timeout constants for finer control
+    CONNECTION_TEST_TIMEOUT = 10  # More aggressive timeout for simple SELECT 1 in _test_connection
+    ENGINE_COMMAND_TIMEOUT = 15   # Default command timeout for asyncpg, affects pool_pre_ping
 
     # Operation statuses
     STATUS_PENDING = 'pending'
@@ -334,8 +338,8 @@ class BaseDatabaseManager(ABC):
                 pool_use_lifo=True,  # Use LIFO to better reuse connections
                 echo=False,
                 connect_args={
-                    "command_timeout": self.DEFAULT_QUERY_TIMEOUT,
-                    "timeout": self.DEFAULT_CONNECTION_TIMEOUT,
+                    "command_timeout": self.ENGINE_COMMAND_TIMEOUT,  # Use new constant
+                    "timeout": self.DEFAULT_CONNECTION_TIMEOUT, # Consider reducing this too, e.g., to 30s
                 },
             )
 
@@ -526,7 +530,7 @@ class BaseDatabaseManager(ABC):
                         f"{caller.filename}:{caller.lineno}: {e}"
                     )
 
-    @with_timeout(DEFAULT_QUERY_TIMEOUT)
+    @with_timeout(CONNECTION_TEST_TIMEOUT)
     async def _test_connection(self, session: AsyncSession) -> bool:
         """Test database connection"""
         await session.execute(text("SELECT 1"))
