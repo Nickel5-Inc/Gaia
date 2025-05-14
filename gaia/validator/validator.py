@@ -1090,7 +1090,7 @@ class GaiaValidator:
                 lambda: self.status_logger(),
                 lambda: self.main_scoring(),
                 lambda: self.handle_miner_deregistration_loop(),
-                lambda: self.miner_score_sender.run_async(),
+                #lambda: self.miner_score_sender.run_async(),
                 lambda: self.check_for_updates(),
                 lambda: self.manage_earthdata_token()
             ]
