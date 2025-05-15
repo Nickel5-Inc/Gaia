@@ -47,19 +47,19 @@ class MinerScoreSender:
 
     async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
         # First clean up NaN values from history
-        cleanup_query = """
-            DELETE FROM geomagnetic_history 
-            WHERE miner_hotkey = :miner_hotkey 
-            AND (
-                predicted_value IS NULL 
-                OR ground_truth_value IS NULL 
-                OR score IS NULL
-                OR predicted_value::text = 'NaN'
-                OR ground_truth_value::text = 'NaN'
-                OR score::text = 'NaN'
-            )
-        """
-        await self.db_manager.execute(cleanup_query, {"miner_hotkey": miner_hotkey})
+        # cleanup_query = """
+        #     DELETE FROM geomagnetic_history 
+        #     WHERE miner_hotkey = :miner_hotkey 
+        #     AND (
+        #         predicted_value IS NULL 
+        #         OR ground_truth_value IS NULL 
+        #         OR score IS NULL
+        #         OR predicted_value::text = 'NaN'
+        #         OR ground_truth_value::text = 'NaN'
+        #         OR score::text = 'NaN'
+        #     )
+        # """
+        # await self.db_manager.execute(cleanup_query, {"miner_hotkey": miner_hotkey})
 
         # Then fetch valid records
         query = """
@@ -167,58 +167,63 @@ class MinerScoreSender:
                     logger.warning("| MinerScoreSender | No active miners found.")
                     return
 
-                batch_size = 10
-                total_batches = (len(active_miners) + batch_size - 1) // batch_size
-                semaphore = asyncio.Semaphore(3)
+                # Semaphore to limit concurrent miner data processing (DB heavy)
+                miner_processing_semaphore = asyncio.Semaphore(5)
 
-                async def process_miner(miner):
-                    try:
-                        geo_history, soil_history = await asyncio.gather(
-                            self.fetch_geomagnetic_history(miner["hotkey"]),
-                            self.fetch_soil_moisture_history(miner["hotkey"])
-                        )
-                        return {
-                            "minerHotKey": miner["hotkey"],
-                            "minerColdKey": miner["coldkey"],
-                            "geomagneticPredictions": geo_history or [],
-                            "soilMoisturePredictions": soil_history or []
-                        }
-                    except Exception as e:
-                        logger.error(f"Error processing miner {miner['hotkey']}: {str(e)}")
-                        return None
-
-                async def process_batch(batch):
-                    async with semaphore:
+                async def process_miner_with_semaphore(miner):
+                    async with miner_processing_semaphore:
                         try:
-                            miner_tasks = [process_miner(miner) for miner in batch]
-                            results = await asyncio.gather(*miner_tasks, return_exceptions=True)
-                            valid_payloads = [r for r in results if r is not None]
-                            for payload in valid_payloads:
-                                try:
-                                    await asyncio.wait_for(
-                                        gaia_communicator.send_data(data=payload),
-                                        timeout=30
-                                    )
-                                    logger.debug(f"Successfully processed miner {payload['minerHotKey']}")
-                                except asyncio.TimeoutError:
-                                    logger.error(f"Timeout sending data for miner {payload['minerHotKey']}")
-                                except Exception as e:
-                                    logger.error(f"Error sending data for miner {payload['minerHotKey']}: {str(e)}")
+                            logger.debug(f"Processing miner {miner['hotkey']} under semaphore")
+                            geo_history, soil_history = await asyncio.gather(
+                                self.fetch_geomagnetic_history(miner["hotkey"]),
+                                self.fetch_soil_moisture_history(miner["hotkey"])
+                            )
+                            logger.debug(f"Fetched history for miner {miner['hotkey']}")
+                            return {
+                                "minerHotKey": miner["hotkey"],
+                                "minerColdKey": miner["coldkey"],
+                                "geomagneticPredictions": geo_history or [],
+                                "soilMoisturePredictions": soil_history or []
+                            }
                         except Exception as e:
-                            logger.error(f"Error processing batch: {str(e)}")
+                            logger.error(f"Error processing miner {miner['hotkey']} under semaphore: {str(e)}\n{traceback.format_exc()}")
+                            return None
 
-                batch_tasks = []
-                for i in range(0, len(active_miners), batch_size):
-                    batch = active_miners[i:i + batch_size]
-                    current_batch = (i // batch_size) + 1
-                    logger.info(f"Processing batch {current_batch} of {total_batches}")
-                    batch_tasks.append(process_batch(batch))
+                # Gather all processed miner data
+                logger.info(f"Starting to process data for {len(active_miners)} active miners.")
+                miner_data_tasks = [process_miner_with_semaphore(miner) for miner in active_miners]
+                all_miner_payloads = await asyncio.gather(*miner_data_tasks, return_exceptions=True)
 
-                await asyncio.gather(*batch_tasks)
-                logger.info("Completed processing all miners")
+                valid_payloads = [p for p in all_miner_payloads if p is not None and not isinstance(p, Exception)]
+                logger.info(f"Successfully processed data for {len(valid_payloads)} miners.")
+
+                # Send data to Gaia API in batches or sequentially
+                # For simplicity, sending one by one with timeout, can be batched if API supports batch endpoints
+                # or with another semaphore if sending concurrently is desired.
+                successful_sends = 0
+                failed_sends = 0
+                for i, payload in enumerate(valid_payloads):
+                    try:
+                        logger.debug(f"Sending data for miner {payload['minerHotKey']} ({i+1}/{len(valid_payloads)})")
+                        await asyncio.wait_for(
+                            gaia_communicator.send_data(data=payload),
+                            timeout=30 # Timeout for individual API call
+                        )
+                        logger.debug(f"Successfully sent data for miner {payload['minerHotKey']}")
+                        successful_sends += 1
+                    except asyncio.TimeoutError:
+                        logger.error(f"Timeout sending API data for miner {payload['minerHotKey']}")
+                        failed_sends += 1
+                    except Exception as e:
+                        logger.error(f"Error sending API data for miner {payload['minerHotKey']}: {str(e)}\n{traceback.format_exc()}")
+                        failed_sends += 1
+                    finally:
+                        await asyncio.sleep(0.2) # Add a small delay to avoid rate limiting
+                
+                logger.info(f"Completed sending data to Gaia API. Successful: {successful_sends}, Failed: {failed_sends}")
 
         except Exception as e:
-            logger.error(f"Error in send_to_gaia: {str(e)}")
+            logger.error(f"Error in send_to_gaia: {str(e)}\n{traceback.format_exc()}")
             raise
 
     async def run_async(self):

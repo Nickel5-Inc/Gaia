@@ -50,6 +50,12 @@ from gaia.validator.basemodel_evaluator import BaseModelEvaluator
 from gaia.validator.utils.db_wipe import handle_db_wipe
 from gaia.validator.utils.earthdata_tokens import ensure_valid_earthdata_token
 
+# New imports for DB Sync
+from gaia.validator.sync.azure_blob_utils import get_azure_blob_manager_for_db_sync, AzureBlobManager
+from gaia.validator.sync.backup_manager import get_backup_manager, BackupManager
+from gaia.validator.sync.restore_manager import get_restore_manager, RestoreManager
+import random # for staggering db sync tasks
+
 logger = get_logger(__name__)
 
 
@@ -216,6 +222,16 @@ class GaiaValidator:
         )
         logger.info("BaseModelEvaluator initialized")
         
+        # DB Sync components
+        self.azure_blob_manager_for_sync: AzureBlobManager | None = None
+        self.backup_manager: BackupManager | None = None
+        self.restore_manager: RestoreManager | None = None
+        
+        self.is_source_validator_for_db_sync = os.getenv("IS_SOURCE_VALIDATOR_FOR_DB_SYNC", "False").lower() == "true"
+        self.db_sync_interval_hours = int(os.getenv("DB_SYNC_INTERVAL_HOURS", "1")) # Default to 1 hour
+        if self.db_sync_interval_hours <= 0 : # Ensure positive interval
+            logger.warning(f"DB_SYNC_INTERVAL_HOURS is {self.db_sync_interval_hours}, defaulting to 1 hour for safety.")
+            self.db_sync_interval_hours = 1
 
 
     def _signal_handler(self, signum, frame):
@@ -1044,6 +1060,9 @@ class GaiaValidator:
             await self.database_manager.initialize_database()
             logger.info("Database tables initialized.")
             
+            # Initialize DB Sync Components - AFTER DB init
+            await self._initialize_db_sync_components()
+
             #logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
             await handle_db_wipe(self.database_manager)
             
@@ -1090,11 +1109,29 @@ class GaiaValidator:
                 lambda: self.status_logger(),
                 lambda: self.main_scoring(),
                 lambda: self.handle_miner_deregistration_loop(),
-                #lambda: self.miner_score_sender.run_async(),
+                # The MinerScoreSender task will be added conditionally below
                 lambda: self.check_for_updates(),
                 lambda: self.manage_earthdata_token()
             ]
+
+            # Add DB Sync tasks conditionally
+            if self.is_source_validator_for_db_sync and self.backup_manager:
+                logger.info(f"Adding DB Sync Backup task (interval: {self.db_sync_interval_hours}h).")
+                # Using insert to make it one of the earlier tasks, but order might not be critical.
+                tasks.insert(0, lambda: self.backup_manager.start_periodic_backups(self.db_sync_interval_hours))
+            elif not self.is_source_validator_for_db_sync and self.restore_manager:
+                logger.info(f"Adding DB Sync Restore task (interval: {self.db_sync_interval_hours}h).")
+                tasks.insert(0, lambda: self.restore_manager.start_periodic_restores(self.db_sync_interval_hours))
+            else:
+                logger.info("DB Sync is not active for this node (either source or replica manager failed to init, not configured, or Azure manager failed).")
+
             
+            # Conditionally add miner_score_sender task
+            score_sender_on_str = os.getenv("SCORE_SENDER_ON", "False")
+            if score_sender_on_str.lower() == "true":
+                logger.info("SCORE_SENDER_ON is True, enabling MinerScoreSender task.")
+                tasks.insert(5, lambda: self.miner_score_sender.run_async())
+
             try:
                 running_tasks = []
                 while not self._shutdown_event.is_set():
@@ -1816,10 +1853,41 @@ class GaiaValidator:
                 else:
                     logger.warning("Earthdata token check failed or no token available.")
 
-                await asyncio.sleep(86400)
+                await asyncio.sleep(86400) # Check daily
 
             except asyncio.CancelledError:
                 logger.info("Earthdata token management task cancelled.")
+            except Exception as e:
+                logger.error(f"Error in Earthdata token management task: {e}", exc_info=True)
+                await asyncio.sleep(3600) # Retry in an hour if there was an error
+
+    async def _initialize_db_sync_components(self):
+        logger.info("Attempting to initialize DB Sync components...")
+        
+        db_sync_enabled_str = os.getenv("DB_SYNC_ENABLED", "True") # Default to True if not set
+        if db_sync_enabled_str.lower() != "true":
+            logger.info("DB_SYNC_ENABLED is not 'true'. Database synchronization feature will be disabled.")
+            self.azure_blob_manager_for_sync = None
+            self.backup_manager = None
+            self.restore_manager = None
+            return
+
+        self.azure_blob_manager_for_sync = await get_azure_blob_manager_for_db_sync()
+        if not self.azure_blob_manager_for_sync:
+            logger.error("Failed to initialize AzureBlobManager for DB Sync. DB Sync will be disabled.")
+            return
+
+        if self.is_source_validator_for_db_sync:
+            logger.info("This node is configured as the SOURCE for DB Sync.")
+            self.backup_manager = await get_backup_manager(self.azure_blob_manager_for_sync)
+            if not self.backup_manager:
+                logger.error("Failed to initialize BackupManager. DB Sync (source) will be disabled.")
+        else:
+            logger.info("This node is configured as a REPLICA for DB Sync.")
+            self.restore_manager = await get_restore_manager(self.azure_blob_manager_for_sync)
+            if not self.restore_manager:
+                logger.error("Failed to initialize RestoreManager. DB Sync (replica) will be disabled.")
+        logger.info("DB Sync components initialization attempt finished.")
 
 
 if __name__ == "__main__":

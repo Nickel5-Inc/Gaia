@@ -67,8 +67,8 @@ class BaseDatabaseManager(ABC):
     CIRCUIT_BREAKER_RECOVERY_TIME = 60  # seconds
 
     # New timeout constants for finer control
-    CONNECTION_TEST_TIMEOUT = 10  # More aggressive timeout for simple SELECT 1 in _test_connection
-    ENGINE_COMMAND_TIMEOUT = 15   # Default command timeout for asyncpg, affects pool_pre_ping
+    CONNECTION_TEST_TIMEOUT = 20  # More aggressive timeout for simple SELECT 1 in _test_connection
+    ENGINE_COMMAND_TIMEOUT = 20   # Default command timeout for asyncpg, affects pool_pre_ping
 
     # Operation statuses
     STATUS_PENDING = 'pending'
@@ -331,28 +331,29 @@ class BaseDatabaseManager(ABC):
             self._engine = create_async_engine(
                 self.db_url,
                 pool_pre_ping=True,
-                pool_size=5,
+                pool_size=self.MAX_CONNECTIONS,
                 max_overflow=10,
                 pool_timeout=self.DEFAULT_CONNECTION_TIMEOUT,
                 pool_recycle=300,  # Recycle connections every 5 minutes
                 pool_use_lifo=True,  # Use LIFO to better reuse connections
                 echo=False,
                 connect_args={
-                    "command_timeout": self.ENGINE_COMMAND_TIMEOUT,  # Use new constant
-                    "timeout": self.DEFAULT_CONNECTION_TIMEOUT, # Consider reducing this too, e.g., to 30s
+                    "command_timeout": self.ENGINE_COMMAND_TIMEOUT,
+                    "timeout": self.DEFAULT_CONNECTION_TIMEOUT,
                 },
             )
 
             # Test connection immediately
             async with self._engine.connect() as conn:
-                await conn.execute(text("SELECT 1"))
+                await asyncio.wait_for(conn.execute(text("SELECT 1")), timeout=self.CONNECTION_TEST_TIMEOUT)
 
             # Initialize session factory
             self._session_factory = async_sessionmaker(
-                self._engine, class_=AsyncSession, expire_on_commit=False
+                self._engine, class_=AsyncSession, expire_on_commit=False, autobegin=False
             )
 
             logger.info("Database engine initialized successfully")
+            self._engine_initialized = True
             return True
 
         except Exception as e:
@@ -360,6 +361,7 @@ class BaseDatabaseManager(ABC):
             logger.error(traceback.format_exc())
             self._engine = None
             self._session_factory = None
+            self._engine_initialized = False
             return False
 
     async def _ensure_pool(self) -> bool:
@@ -466,68 +468,59 @@ class BaseDatabaseManager(ABC):
             AsyncSession: Database session
         """
         await self.ensure_engine_initialized()
-        
+        if not self._engine or not self._session_factory:
+            logger.error("Database engine or session factory not initialized. Cannot create session.")
+            raise DatabaseConnectionError("Engine/Session factory not initialized")
+
         if not await self._check_circuit_breaker():
             raise CircuitBreakerError("Circuit breaker is open")
             
-        if not await self._check_pool_health():
-            raise DatabaseConnectionError("Database pool is unhealthy")
-
-        session = None
+        session_instance: Optional[AsyncSession] = None
         start_time = time.time()
         caller = traceback.extract_stack()[-3]  # Get calling frame
-        session_id = None
+        session_id_str = "unassigned"
         
         try:
-            async with self._pool_semaphore:
-                async with self._session_lock:
-                    session = self._session_factory()
-                    session_id = id(session)
-                    # logger.debug(
-                    #     f"Creating new session {session_id} from "
-                    #     f"{caller.filename}:{caller.lineno} ({caller.name})"
-                    # )
-                    self._active_sessions.add(session)
-                    self._active_operations += 1
+            session_instance = self._session_factory()
+            session_id_str = str(id(session_instance))
+
+            async with self._session_lock:
+                self._active_sessions.add(session_instance)
+                self._active_operations += 1
+            
+            yield session_instance
                 
-                async with session.begin():
-                    await self._test_connection(session)
-                    yield session
-                
-                # Update circuit breaker on success
-                await self._update_circuit_breaker(True)
+            await self._update_circuit_breaker(True)
                 
         except Exception as e:
             await self._update_circuit_breaker(False)
             logger.error(
-                f"Session error in {session_id} from "
-                f"{caller.filename}:{caller.lineno}: {str(e)}"
+                f"Session error in {session_id_str} from "
+                f"{caller.filename}:{caller.lineno} ({caller.name}): {str(e)}"
             )
-            raise DatabaseConnectionError(f"Session error: {str(e)}")
+            if isinstance(e, (DatabaseError, SQLAlchemyError)):
+                raise
+            raise DatabaseConnectionError(f"Session error for {session_id_str}: {str(e)}") from e
         
         finally:
-            if session:
+            if session_instance:
                 try:
                     async with self._session_lock:
-                        self._active_sessions.remove(session)
-                        self._active_operations -= 1
-                    await session.close()
-                    # logger.debug(
-                    #     f"Closed session {session_id} from "
-                    #     f"{caller.filename}:{caller.lineno}"
-                    # )
+                        if session_instance in self._active_sessions:
+                            self._active_sessions.remove(session_instance)
+                            self._active_operations -= 1
+                    await session_instance.close()
                     
-                    # Log long-running sessions
                     duration = time.time() - start_time
                     if duration > self.DEFAULT_QUERY_TIMEOUT / 2:
                         logger.warning(
-                            f"Long-running session {session_id} detected: "
-                            f"{duration:.2f}s from {caller.filename}:{caller.lineno}"
+                            f"Long-running session {session_id_str} usage detected: "
+                            f"{duration:.2f}s from {caller.filename}:{caller.lineno} ({caller.name})"
                         )
                 except Exception as e:
                     logger.error(
-                        f"Error cleaning up session {session_id} from "
-                        f"{caller.filename}:{caller.lineno}: {e}"
+                        f"Error cleaning up session {session_id_str} from "
+                        f"{caller.filename}:{caller.lineno} ({caller.name}): {e}"
                     )
 
     @with_timeout(CONNECTION_TEST_TIMEOUT)
@@ -579,8 +572,9 @@ class BaseDatabaseManager(ABC):
             # Create new transaction if not in one
             async with self.session() as session:
                 try:
-                    result = await session.execute(text(query), params or {})
-                    row = result.first()
+                    async with session.begin(): # Ensure transaction is started
+                        result = await session.execute(text(query), params or {})
+                    row = result.first() # result is available after transaction block
                     
                     # Log slow queries
                     duration = time.time() - start_time
@@ -642,8 +636,9 @@ class BaseDatabaseManager(ABC):
             # Create new transaction if not in one
             async with self.session() as session:
                 try:
-                    result = await session.execute(text(query), params or {})
-                    rows = result.all()
+                    async with session.begin(): # Ensure transaction is started
+                        result = await session.execute(text(query), params or {})
+                    rows = result.all() # result is available after transaction block
                     
                     # Log large result sets
                     if len(rows) > 1000:
@@ -997,19 +992,24 @@ class BaseDatabaseManager(ABC):
             logger.error(f"Error during database cleanup: {e}")
             raise DatabaseError(f"Failed to cleanup database resources: {str(e)}")
 
+    @staticmethod
     def with_transaction():
         """
-        Decorator that wraps a function in a session.
-        The decorated function must accept a session parameter.
+        Decorator that wraps a function in a session with an active transaction.
+        The decorated function must accept a 'session: AsyncSession' parameter as its first argument after 'self'.
         
         Returns:
-            Callable: Decorated function with session handling
+            Callable: Decorated function with session and transaction handling
         """
         def decorator(func: Callable[..., T]) -> Callable[..., T]:
             @wraps(func)
-            async def wrapper(self, *args, **kwargs) -> T:
-                async with self.session() as session:
-                    return await func(self, session, *args, **kwargs)
+            async def wrapper(self: 'BaseDatabaseManager', *args, **kwargs) -> T:
+                # Note: The decorated function 'func' is expected to have 'session' as its first arg after self.
+                # Example: async def some_method(self, session: AsyncSession, other_arg: str)
+                async with self.session() as session: # Get a session from the pool
+                    async with session.begin(): # Start a transaction
+                        # Pass the session with an active transaction to the wrapped function
+                        return await func(self, session, *args, **kwargs)
             return wrapper
         return decorator
 
