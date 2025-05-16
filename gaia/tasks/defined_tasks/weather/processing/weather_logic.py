@@ -19,9 +19,7 @@ from ..utils.remote_access import open_verified_remote_zarr_dataset
 from ..utils.era5_api import fetch_era5_data
 from ..utils.gfs_api import fetch_gfs_analysis_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
 from ..utils.hashing import _compute_analysis_profile, ANALYSIS_LOG_DIR
-from ..weather_scoring.ensemble import _open_dataset_lazily, ALL_EXPECTED_VARIABLES
 from ..weather_scoring.metrics import calculate_rmse
-from ..weather_scoring_mechanism import calculate_era5_ensemble_score
 from ..schemas.weather_outputs import WeatherKerchunkResponseData
 from fiber.logging_utils import get_logger
 

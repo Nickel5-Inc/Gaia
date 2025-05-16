@@ -79,7 +79,7 @@ async def evaluate_miner_forecast_day1(
             raise ValueError(f"Critical forecast access info missing for {miner_hotkey} (Job: {job_id})")
 
         logger.info(f"[Day1Score] Opening VERIFIED Zarr store for {miner_hotkey}: {zarr_store_url}")
-        storage_options = {"headers": {"Authorization": f"Bearer {access_token}"}, "ssl": False
+        storage_options = {"headers": {"Authorization": f"Bearer {access_token}"}, "ssl": False}
         
         verification_timeout_seconds = task_instance.config.get('verification_timeout_seconds', 300) / 2
 

@@ -46,7 +46,6 @@ from .processing.weather_logic import (
 )
 from .processing.weather_workers import (
     initial_scoring_worker, 
-    ensemble_worker, 
     finalize_scores_worker, 
     run_inference_background,
     fetch_and_hash_gfs_task
@@ -252,7 +251,7 @@ class WeatherTask(Task):
                     logger.info("ERA5 climatology loaded successfully.")
                 except Exception as e:
                     logger.error(f"Failed to load ERA5 climatology from {climatology_path}: {e}", exc_info=True)
-                    self.era5_climatology_ds = None\
+                    self.era5_climatology_ds = None
             else:
                 logger.error("WEATHER_ERA5_CLIMATOLOGY_PATH not configured. Cannot load climatology for ACC calculation.")
         return self.era5_climatology_ds

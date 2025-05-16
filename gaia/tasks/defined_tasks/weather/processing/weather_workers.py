@@ -33,7 +33,7 @@ from ..utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
 from ..utils.era5_api import fetch_era5_data
 from ..utils.hashing import compute_verification_hash, compute_input_data_hash, CANONICAL_VARS_FOR_HASHING
 from ..weather_scoring.metrics import calculate_rmse
-from ..weather_scoring_mechanism import calculate_era5_miner_score, evaluate_miner_forecast_day1
+from ..weather_scoring_mechanism import evaluate_miner_forecast_day1
 logger = get_logger(__name__)
 
 VALIDATOR_ENSEMBLE_DIR = Path("./validator_ensembles/")
@@ -46,11 +46,10 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
     and prepares the batch before running the model.
     """
     logger.info(f"[InferenceTask Job {job_id}] Starting background inference task...")
-    # Initial checks for db_manager and inference_runner (if not using a broader dev skip)
     if task_instance.db_manager is None:
          logger.error(f"[InferenceTask Job {job_id}] DB manager not available. Aborting.")
          return
-    if task_instance.inference_runner is None: # Assuming normal operation initially
+    if task_instance.inference_runner is None:
         logger.error(f"[InferenceTask Job {job_id}] Inference runner not available. Aborting.")
         await update_job_status(task_instance, job_id, "error", "Inference runner missing")
         return
