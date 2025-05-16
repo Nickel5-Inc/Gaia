@@ -1,16 +1,5 @@
 import logging
 import sys
-
-# # Basic, safe logging config BEFORE fiber.logging_utils is imported/used
-# logging.basicConfig(
-#     level=logging.INFO, # Let's use INFO to see Alembic's own INFO messages
-#     stream=sys.stdout,
-#     format='%(asctime)s | %(levelname)-5.5s | [%(name)s] %(message)s',
-#     datefmt='%Y-%m-%d %H:%M:%S.%f'
-# )
-# # Optionally, quiet down very verbose loggers if they become an issue later
-# # logging.getLogger('some_very_chatty_library').setLevel(logging.WARNING)
-
 from datetime import datetime, timezone, timedelta
 import os
 import time
@@ -19,16 +8,13 @@ import concurrent.futures
 import glob
 import signal
 import sys
-
-# <<< Try importing psutil >>>
 try:
     import psutil
     PSUTIL_AVAILABLE = True
 except ImportError:
-    psutil = None # Ensure psutil is defined even if import fails
+    psutil = None 
     PSUTIL_AVAILABLE = False
     print("psutil not found, memory logging will be skipped.") # Use print for early feedback
-# <<< End psutil import >>>
 
 os.environ["NODE_TYPE"] = "validator"
 import asyncio

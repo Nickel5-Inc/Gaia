@@ -15,8 +15,10 @@ import ipaddress
 from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple
 if TYPE_CHECKING:
     from ..weather_task import WeatherTask
+from ..utils.remote_access import open_verified_remote_zarr_dataset
 from ..utils.era5_api import fetch_era5_data
 from ..utils.gfs_api import fetch_gfs_analysis_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
+from ..utils.hashing import _compute_analysis_profile, ANALYSIS_LOG_DIR
 from ..weather_scoring.ensemble import _open_dataset_lazily, ALL_EXPECTED_VARIABLES
 from ..weather_scoring.metrics import calculate_rmse
 from ..weather_scoring_mechanism import calculate_era5_ensemble_score
@@ -221,91 +223,35 @@ async def _trigger_initial_scoring(task_instance: 'WeatherTask', run_id: int):
     await task_instance.initial_scoring_queue.put(run_id)
     await _update_run_status(task_instance, run_id, "initial_scoring_queued")
 
-async def _request_fresh_token(task_instance, miner_hotkey: str, job_id: str) -> Optional[Tuple[str, str, str]]:
-    """Requests a fresh JWT from the miner for a given job_id."""
-    logger.info(f"[VerifyLogic] Requesting fresh token for job {job_id} from miner {miner_hotkey[:12]}...")
-                                                          
-    forecast_request_payload = {
-        "nonce": str(uuid.uuid4()),
-        "data": {"job_id": job_id} 
-    }
+async def _request_fresh_token(task_instance: 'WeatherTask', miner_hotkey: str, job_id: str) -> Optional[Tuple[str, str, str]]:
+    """Requests a fresh JWT, Zarr URL, and manifest_content_hash from the miner."""
+    logger.info(f"[VerifyLogic] Requesting fresh token/manifest_hash for job {job_id} from miner {miner_hotkey[:12]}...")
+    forecast_request_payload = {"nonce": str(uuid.uuid4()), "data": {"job_id": job_id} }
     endpoint_to_call = "/weather-kerchunk-request"
-
     try:
         all_responses = await task_instance.validator.query_miners(
-            payload=forecast_request_payload,
-            endpoint=endpoint_to_call
+            payload=forecast_request_payload, endpoint=endpoint_to_call
         )
-        
         response_dict = all_responses.get(miner_hotkey)
-
-        if not response_dict:
-            logger.error(f"[VerifyLogic] No response from {miner_hotkey[:12]} for token request for job {job_id} via query_miners.")
-            return None
-
+        if not response_dict: return None
         if response_dict.get("status_code") == 200:
-            try:
-                miner_response_data = json.loads(response_dict['text'])
-                if miner_response_data.get("status") == "completed":
-                    token = miner_response_data.get("access_token")
-                    zarr_store_url = miner_response_data.get("zarr_store_url") 
-                    verification_hash = miner_response_data.get("verification_hash")
-                    
-                    if token and zarr_store_url and verification_hash:
-                        logger.info(f"[VerifyLogic] Successfully received token, Zarr store URL, and hash for job {job_id} from {miner_hotkey[:12]}.")
-                        try:
-                            ip_val = response_dict['ip']
-                            port_val = response_dict['port']
-                            
-                            ip_str: str
-                            if isinstance(ip_val, int):
-                                ip_str = str(ipaddress.ip_address(ip_val))
-                                logger.info(f"[VerifyLogic] Converted integer IP {ip_val} to string '{ip_str}' for miner {miner_hotkey[:12]}.")
-                            elif isinstance(ip_val, str):
-                                try:
-                                    ip_as_int = int(ip_val)
-                                    ip_str = str(ipaddress.ip_address(ip_as_int))
-                                    logger.info(f"[VerifyLogic] Converted string-integer IP '{ip_val}' to string '{ip_str}' for miner {miner_hotkey[:12]}.")
-                                except ValueError:
-                                    try:
-                                        _ = ipaddress.ip_address(ip_val) 
-                                        ip_str = ip_val 
-                                        logger.info(f"[VerifyLogic] Using provided IP string '{ip_val}' for miner {miner_hotkey[:12]}.")
-                                    except ValueError:
-                                        logger.warning(f"[VerifyLogic] IP value '{ip_val}' for miner {miner_hotkey[:12]} is not a standard IP format. Assuming it's a resolvable hostname.")
-                                        ip_str = ip_val 
-                            else:
-                                logger.error(f"[VerifyLogic] Miner {miner_hotkey[:12]} has unexpected IP type: {type(ip_val)}. Cannot form base URL.")
-                                return None
-
-                            miner_base_url = f"https://{ip_str}:{port_val}"
-                            
-                            full_zarr_url = f"{miner_base_url}{zarr_store_url}"
-                            logger.info(f"[VerifyLogic] PRE-RETURN SUCCESS: About to return tuple for job {job_id}. Token: {'Yes' if token else 'No'}, URL: {full_zarr_url}, Hash: {'Yes' if verification_hash else 'No'}")
-                            return token, full_zarr_url, verification_hash
-                        except Exception as e_inner:
-                            logger.error(f"[VerifyLogic] EXCEPTION DURING SUCCESS RETURN PREP for job {job_id}: {e_inner!r}", exc_info=True)
-                            return None
-                    else:
-                        logger.error(f"[VerifyLogic] Miner {miner_hotkey[:12]} response for job {job_id} missing token, URL, or hash. Data: {miner_response_data}")
-                        return None
-                elif miner_response_data.get("status") == "processing":
-                     logger.warning(f"[VerifyLogic] Miner {miner_hotkey[:12]} is still processing job {job_id}. Token not yet available. Response: {miner_response_data}")
-                     return None
-                else: 
-                    logger.error(f"[VerifyLogic] Miner {miner_hotkey[:12]} returned non-completed status for job {job_id} token request. Response: {miner_response_data}")
-                    return None
-            except json.JSONDecodeError:
-                logger.error(f"[VerifyLogic] Failed to decode JSON response from {miner_hotkey[:12]} for job {job_id}. Raw text: {response_dict.get('text')[:200]}")
-                return None
-        else:
-            logger.error(f"[VerifyLogic] Miner {miner_hotkey[:12]} returned error status {response_dict.get('status_code')} for job {job_id} token request. Response text: {response_dict.get('text')[:200]}")
-            return None
-
-    except Exception as e:
-        logger.error(f"[VerifyLogic] UNHANDLED EXCEPTION in _request_fresh_token for job {job_id} from {miner_hotkey[:12]}: {e!r}")
-        logger.debug(traceback.format_exc())
-        return None
+            miner_response_data = json.loads(response_dict['text'])
+            if miner_response_data.get("status") == "completed":
+                token = miner_response_data.get("access_token")
+                zarr_store_relative_url = miner_response_data.get("zarr_store_url") 
+                manifest_content_hash = miner_response_data.get("verification_hash") 
+                if token and zarr_store_relative_url and manifest_content_hash:
+                    ip_val = response_dict['ip']
+                    port_val = response_dict['port']
+                    ip_str = str(ipaddress.ip_address(int(ip_val))) if isinstance(ip_val, (str, int)) and str(ip_val).isdigit() else ip_val
+                    try: ipaddress.ip_address(ip_str) 
+                    except ValueError: logger.warning(f"Miner IP {ip_str} not standard, assuming hostname.")
+                    miner_base_url = f"https://{ip_str}:{port_val}"
+                    full_zarr_url = miner_base_url.rstrip('/') + "/" + zarr_store_relative_url.lstrip('/')
+                    logger.info(f"[VerifyLogic] Success: Token, URL: {full_zarr_url}, ManifestHash: {manifest_content_hash[:10]}...")
+                    return token, full_zarr_url, manifest_content_hash
+    except Exception as e: logger.error(f"Unhandled exception in _request_fresh_token: {e!r}", exc_info=True)
+    return None
 
 async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_utc: datetime) -> Optional[Dict[str, Any]]:
     """
@@ -410,100 +356,125 @@ async def update_job_paths(task_instance: 'WeatherTask', job_id: str, target_net
         return False
 
 async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict, response_details: Dict):
-    """Handles fetching Zarr store info and verifying a single miner response."""
+    """Handles fetching Zarr store info and verifying a single miner response's manifest integrity."""
     run_id = run_details['id']
-    gfs_init_time = run_details['gfs_init_time_utc']
     response_id = response_details['id']
-    miner_hotkey = response_details['miner_hotkey']
+    miner_hotkey = response_details['miner_hotkey'] 
     job_id = response_details.get('job_id') 
     
     if not job_id: 
-        logger.error(f"[VerifyLogic, Resp {response_id}] Missing job_id in response_details for miner {miner_hotkey}. Cannot verify.")
-        await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Internal: Missing job_id for verification' WHERE id = :id", {"id": response_id})
+        logger.error(f"[VerifyLogic, Resp {response_id}] Missing job_id for miner {miner_hotkey}. Cannot verify.")
+        await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Internal: Missing job_id' WHERE id = :id", {"id": response_id})
         return 
 
     logger.info(f"[VerifyLogic] Verifying response {response_id} from {miner_hotkey} (Miner Job ID: {job_id})")
     
     access_token = None
     zarr_store_url = None
-    verification_hash_claimed = None 
-    analysis_profile_result = None 
+    claimed_manifest_content_hash = None 
+    verified_dataset: Optional[xr.Dataset] = None
     
     try:
         token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, job_id)
- 
         if token_data_tuple is None: 
-            logger.error(f"[VerifyLogic, Resp {response_id}] _request_fresh_token returned None for {miner_hotkey} (Miner Job: {job_id}).")
-            raise ValueError(f"Failed to get access token for {miner_hotkey} job {job_id}")
+            raise ValueError(f"Failed to get access token/manifest details for {miner_hotkey} job {job_id}")
 
-        access_token, zarr_store_url, verification_hash_claimed = token_data_tuple
-        logger.info(f"[VerifyLogic, Resp {response_id}] Successfully unpacked token data tuple. Token: {'Yes' if access_token else 'No'}, URL: {zarr_store_url}, Hash: {'Yes' if verification_hash_claimed else 'No'}")
+        access_token, zarr_store_url, claimed_manifest_content_hash = token_data_tuple
+        logger.info(f"[VerifyLogic, Resp {response_id}] Unpacked token data. URL: {zarr_store_url}, Manifest Hash: {claimed_manifest_content_hash[:10] if claimed_manifest_content_hash else 'N/A'}...")
             
-        if not all([access_token, zarr_store_url, verification_hash_claimed]):
-            logger.error(f"[VerifyLogic, Resp {response_id}] One or more critical items (token, URL, hash) are None/empty after unpacking. Token: {'Set' if access_token else 'Not Set'}, URL: {zarr_store_url}, Hash: {'Set' if verification_hash_claimed else 'Not Set'}")
-            raise ValueError("Critical information (token, URL, or hash) missing after token request.")
-
-        validator_instance = task_instance.validator 
-        if not validator_instance or not hasattr(validator_instance, 'metagraph') or not validator_instance.metagraph:
-             logger.error(f"[VerifyLogic, Resp {response_id}] Validator instance or its metagraph is not available.")
-             await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_error', error_message = 'Validator metagraph unavailable' WHERE id = :id", {"id": response_id})
-             return 
+        if not all([access_token, zarr_store_url, claimed_manifest_content_hash]):
+            err_details = f"Token:Set='{bool(access_token)}', URL:'{zarr_store_url}', ManifestHash:Set='{bool(claimed_manifest_content_hash)}'"
+            raise ValueError(f"Critical information missing after token request: {err_details}")
 
         await task_instance.db_manager.execute("""
             UPDATE weather_miner_responses
-            SET kerchunk_json_url = :url, verification_hash_claimed = :hash, status = 'performing_analysis'
+            SET kerchunk_json_url = :url, verification_hash_claimed = :hash, status = 'verifying_manifest'
             WHERE id = :id
-        """, {"id": response_id, "url": zarr_store_url, "hash": verification_hash_claimed})
+        """, {"id": response_id, "url": zarr_store_url, "hash": claimed_manifest_content_hash})
 
-        logger.info(f"[VerifyLogic, Resp {response_id}] Performing analysis for Zarr store URL: {zarr_store_url}...")
-        from ..utils.hashing import verify_forecast_hash 
-        variables_to_check = ALL_EXPECTED_VARIABLES 
-        metadata = {"time": [gfs_init_time], "source_model": "aurora", "resolution": 0.25}
-        headers = {"Authorization": f"Bearer {access_token}"}
-        timesteps = list(range(task_instance.config.get('inference_steps', 40))) 
-        verification_timeout_seconds = task_instance.config.get('verification_timeout_seconds', 120)
+        logger.info(f"[VerifyLogic, Resp {response_id}] Attempting to open VERIFIED Zarr store: {zarr_store_url}...")
         
-        analysis_profile_result = await asyncio.wait_for(
-            verify_forecast_hash(
+        storage_opts = {"headers": {"Authorization": f"Bearer {access_token}"}, "ssl": False}
+        verification_timeout_seconds = task_instance.config.get('verification_timeout_seconds', 300) 
+        
+        verified_dataset = await asyncio.wait_for(
+            open_verified_remote_zarr_dataset(
                 zarr_store_url=zarr_store_url,
-                claimed_hash=verification_hash_claimed, 
-                metadata=metadata,
-                variables=variables_to_check,
-                timesteps=timesteps, 
-                headers=headers,
+                claimed_manifest_content_hash=claimed_manifest_content_hash, 
+                miner_hotkey_ss58=miner_hotkey,
+                storage_options=storage_opts,
                 job_id=job_id 
             ),
-            timeout=verification_timeout_seconds
+            timeout=verification_timeout_seconds 
         )
         
-        analysis_succeeded_bool = False
-        db_status_after_analysis = "analysis_failed_profile_error"
+        verification_succeeded_bool = verified_dataset is not None
+        db_status_after_verification = ""
         error_message_for_db = None
 
-        if isinstance(analysis_profile_result, dict):
-            if analysis_profile_result.get("status") == "analysis_complete":
-                analysis_succeeded_bool = True
-                db_status_after_analysis = "analysis_profile_generated"
-                logger.info(f"[VerifyLogic, Resp {response_id}] Analysis profile generation succeeded.")
-            else:
-                error_message_for_db = analysis_profile_result.get("error", "Unknown error during analysis profile generation.")
-                logger.error(f"[VerifyLogic, Resp {response_id}] Analysis profile generation failed or returned an error. Profile: {analysis_profile_result}")
-        else:
-            error_message_for_db = "Analysis function returned unexpected type."
-            logger.error(f"[VerifyLogic, Resp {response_id}] Analysis function returned unexpected type: {type(analysis_profile_result)}")
+        if verification_succeeded_bool:
+            db_status_after_verification = "verified_manifest_store_opened"
+            logger.info(f"[VerifyLogic, Resp {response_id}] Manifest verified & Zarr store opened with on-read checks.")
+            try:
+                logger.debug(f"[VerifyLogic, Resp {response_id}] Verified dataset keys: {list(verified_dataset.keys()) if verified_dataset else 'N/A'}")
+                
+                if verified_dataset:
+                    logger.info(f"[VerifyLogic, Resp {response_id}] Running performance profile for verified dataset from miner {miner_hotkey} (Job {job_id}).")
+                    
+                    profile_metadata = {
+                        "time": [run_details.get('gfs_init_time_utc', datetime.now(timezone.utc))], 
+                        "source_model": f"miner_verified_{miner_hotkey[:12]}",
+                        "resolution": verified_dataset.attrs.get("resolution", 0.25) 
+                    }
+                    profile_variables = list(verified_dataset.data_vars.keys()) if verified_dataset.data_vars else []
 
-        await task_instance.db_manager.execute("""
-            UPDATE weather_miner_responses SET verification_passed = :verified, status = :new_status, error_message = COALESCE(error_message, :err_msg)
+                    profile_job_id = f"resp_{response_id}_job_{job_id}"
+
+                    try:
+                        loop = asyncio.get_running_loop()
+                        analysis_log_dict = await loop.run_in_executor(
+                            None, 
+                            _compute_analysis_profile,
+                            verified_dataset,
+                            profile_metadata,
+                            profile_variables,
+                            claimed_manifest_content_hash, 
+                            profile_job_id, 
+                            zarr_store_url 
+                        )
+                        if analysis_log_dict:
+                             logger.info(f"[VerifyLogic, Resp {response_id}] Performance profile completed. Log status: {analysis_log_dict.get('status')}, saved to {ANALYSIS_LOG_DIR}")
+                        else:
+                             logger.warning(f"[VerifyLogic, Resp {response_id}] Performance profile call returned None or empty.")
+                    except Exception as e_profile:
+                        logger.error(f"[VerifyLogic, Resp {response_id}] Error during _compute_analysis_profile for {miner_hotkey} (Job {job_id}): {e_profile}", exc_info=True)
+            except Exception as e_ds_ops:
+                logger.warning(f"[VerifyLogic, Resp {response_id}] Minor error during initial ops on verified dataset or profiling: {e_ds_ops}")
+                if error_message_for_db: error_message_for_db += f"; Post-verify op error: {e_ds_ops}"
+                else: error_message_for_db = f"Post-manifest op error: {e_ds_ops}"
+        else:
+            db_status_after_verification = "failed_manifest_verification"
+            error_message_for_db = "Manifest verification failed. See verification_logs for details."
+            logger.error(f"[VerifyLogic, Resp {response_id}] Manifest verification failed or could not open verified Zarr store.")
+
+        await task_instance.db_manager.execute(""" 
+            UPDATE weather_miner_responses 
+            SET verification_passed = :verified, status = :new_status, error_message = COALESCE(:err_msg, error_message)
             WHERE id = :id
-        """, {"id": response_id, "verified": analysis_succeeded_bool, "new_status": db_status_after_analysis, "err_msg": error_message_for_db})
+        """, {"id": response_id, "verified": verification_succeeded_bool, "new_status": db_status_after_verification, "err_msg": error_message_for_db})
         
     except asyncio.TimeoutError:
-        logger.error(f"[VerifyLogic, Resp {response_id}] Analysis/Verification timed out for {miner_hotkey} (Miner Job: {job_id}).")
-        await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_timeout', error_message = 'Analysis process timed out', verification_passed = FALSE WHERE id = :id", {"id": response_id})
+        logger.error(f"[VerifyLogic, Resp {response_id}] Verified open process timed out for {miner_hotkey} (Job: {job_id}).")
+        await task_instance.db_manager.execute("UPDATE weather_miner_responses SET status = 'verification_timeout', error_message = 'Verified open process timed out', verification_passed = FALSE WHERE id = :id", {"id": response_id})
     except Exception as err:
-        logger.error(f"[VerifyLogic, Resp {response_id}] Error verifying/analyzing response from {miner_hotkey} (Miner Job: {job_id}): {err!r}", exc_info=True) 
+        logger.error(f"[VerifyLogic, Resp {response_id}] Error verifying response from {miner_hotkey} (Job: {job_id}): {err!r}", exc_info=True) 
         await task_instance.db_manager.execute("""
             UPDATE weather_miner_responses SET status = 'verification_error', error_message = :msg, verification_passed = FALSE
             WHERE id = :id
-        """, {"id": response_id, "msg": str(err)})
+        """, {"id": response_id, "msg": f"Outer verify_miner_response error: {str(err)}"})
+    finally:
+        if verified_dataset is not None:
+            try: verified_dataset.close()
+            except Exception: pass
+        gc.collect()
         

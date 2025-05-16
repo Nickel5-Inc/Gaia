@@ -31,7 +31,7 @@ import httpx
 
 from .utils.era5_api import fetch_era5_data
 from .utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
-from .utils.hashing import compute_verification_hash, verify_forecast_hash, compute_input_data_hash
+from .utils.hashing import compute_verification_hash, compute_input_data_hash
 from .utils.kerchunk_utils import generate_kerchunk_json_from_local_file
 from .utils.data_prep import create_aurora_batch_from_gfs
 from .schemas.weather_metadata import WeatherMetadata
