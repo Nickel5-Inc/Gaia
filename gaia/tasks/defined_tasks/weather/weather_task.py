@@ -37,7 +37,6 @@ from .utils.data_prep import create_aurora_batch_from_gfs
 from .schemas.weather_metadata import WeatherMetadata
 from .schemas.weather_inputs import WeatherInputs, WeatherForecastRequest, WeatherInputData, WeatherInitiateFetchData, WeatherGetInputStatusData, WeatherStartInferenceData
 from .schemas.weather_outputs import WeatherOutputs, WeatherKerchunkResponseData
-from .weather_scoring.ensemble import create_physics_aware_ensemble, ALL_EXPECTED_VARIABLES, _open_dataset_lazily
 from .weather_scoring.metrics import calculate_rmse
 from .processing.weather_miner_preprocessing import prepare_miner_batch_from_payload
 from .processing.weather_logic import (
@@ -75,16 +74,13 @@ def _load_config(self):
         return default_list
         
     # Worker/Run Parameters
-    config['min_ensemble_members'] = int(os.getenv('WEATHER_MIN_ENSEMBLE_MEMBERS', '3'))
-    config['top_k_ensemble'] = int(os.getenv('WEATHER_TOP_K_ENSEMBLE', '0')) # 0 or less means use all
-    if config['top_k_ensemble'] <= 0: config['top_k_ensemble'] = None
     config['max_concurrent_inferences'] = int(os.getenv('WEATHER_MAX_CONCURRENT_INFERENCES', '1'))
     config['inference_steps'] = int(os.getenv('WEATHER_INFERENCE_STEPS', '40'))
     config['forecast_step_hours'] = int(os.getenv('WEATHER_FORECAST_STEP_HOURS', '6'))
-    config['forecast_duration_hours'] = config['inference_steps'] * config['forecast_step_hours'] # Calculate based on steps
+    config['forecast_duration_hours'] = config['inference_steps'] * config['forecast_step_hours']
     
     # Scoring Parameters
-    config['initial_scoring_lead_hours'] = parse_int_list('WEATHER_INITIAL_SCORING_LEAD_HOURS', [24, 72]) # Day 1, 3
+    config['initial_scoring_lead_hours'] = parse_int_list('WEATHER_INITIAL_SCORING_LEAD_HOURS', [6, 12]) # Day 0.25, 0.5
     config['final_scoring_lead_hours'] = parse_int_list('WEATHER_FINAL_SCORING_LEAD_HOURS', [120, 168]) # Day 5, 7
     config['verification_wait_minutes'] = int(os.getenv('WEATHER_VERIFICATION_WAIT_MINUTES', '30'))
     config['verification_timeout_seconds'] = int(os.getenv('WEATHER_VERIFICATION_TIMEOUT_SECONDS', '3600')) # Default to 600s (10 minutes)
@@ -105,6 +101,57 @@ def _load_config(self):
     config['jwt_algorithm'] = os.getenv("MINER_JWT_ALGORITHM", "HS256")
     config['access_token_expire_minutes'] = int(os.getenv('WEATHER_ACCESS_TOKEN_EXPIRE_MINUTES', '120'))
 
+    config['era5_climatology_path'] = os.getenv(
+        'WEATHER_ERA5_CLIMATOLOGY_PATH', 
+        'gs://weatherbench2/datasets/era5-hourly-climatology/1990-2019_6h_1440x721.zarr'
+    )
+
+    # Day-1 Scoring Specific Configurations
+    default_day1_vars_levels = [
+        {"name": "z", "level": 500, "standard_name": "geopotential"},
+        {"name": "t", "level": 850, "standard_name": "temperature"},
+        {"name": "2t", "level": None, "standard_name": "2m_temperature"},
+        {"name": "msl", "level": None, "standard_name": "mean_sea_level_pressure"}
+    ]
+    try:
+        day1_vars_levels_json = os.getenv('WEATHER_DAY1_VARIABLES_LEVELS_JSON')
+        config['day1_variables_levels_to_score'] = json.loads(day1_vars_levels_json) if day1_vars_levels_json else default_day1_vars_levels
+    except json.JSONDecodeError:
+        logger.warning("Invalid JSON for WEATHER_DAY1_VARIABLES_LEVELS_JSON. Using default.")
+        config['day1_variables_levels_to_score'] = default_day1_vars_levels
+
+    default_day1_clim_bounds = {
+        "2t": (180, 340), "msl": (90000, 110000),
+        "t500": (200, 300), "t850": (220, 320),
+        "z500": (4000, 6000)
+    }
+    try:
+        day1_clim_bounds_json = os.getenv('WEATHER_DAY1_CLIMATOLOGY_BOUNDS_JSON')
+        config['day1_climatology_bounds'] = json.loads(day1_clim_bounds_json) if day1_clim_bounds_json else default_day1_clim_bounds
+    except json.JSONDecodeError:
+        logger.warning("Invalid JSON for WEATHER_DAY1_CLIMATOLOGY_BOUNDS_JSON. Using default.")
+        config['day1_climatology_bounds'] = default_day1_clim_bounds
+
+    config['day1_pattern_correlation_threshold'] = float(os.getenv('WEATHER_DAY1_PATTERN_CORR_THRESHOLD', '0.3'))
+    config['day1_acc_lower_bound'] = float(os.getenv('WEATHER_DAY1_ACC_LOWER_BOUND', '0.6'))
+    config['day1_alpha_skill'] = float(os.getenv('WEATHER_DAY1_ALPHA_SKILL', '0.6'))
+    config['day1_beta_acc'] = float(os.getenv('WEATHER_DAY1_BETA_ACC', '0.4'))
+
+    # Quality Control Config
+    config['day1_clone_penalty_gamma'] = float(os.getenv('WEATHER_DAY1_CLONE_PENALTY_GAMMA', '1.0'))
+    default_clone_delta_thresholds = {
+        "2t": 0.01,  # (0.1K)^2
+        "msl": 250000, # (500Pa)^2 placeholder, needs tuning
+        "z500": 100,   # (10m)^2 for geopotential height, may adjust to m2/s2 for geopotential
+        "t850": 0.25    # (0.5K)^2 placeholder, needs tuning
+    }
+    try:
+        clone_delta_json = os.getenv('WEATHER_DAY1_CLONE_DELTA_THRESHOLDS_JSON')
+        config['day1_clone_delta_thresholds'] = json.loads(clone_delta_json) if clone_delta_json else default_clone_delta_thresholds
+    except json.JSONDecodeError:
+        logger.warning("Invalid JSON for WEATHER_DAY1_CLONE_DELTA_THRESHOLDS_JSON. Using default.")
+        config['day1_clone_delta_thresholds'] = default_clone_delta_thresholds
+
     logger.info(f"WeatherTask configuration loaded: {config}")
     return config
 
@@ -112,6 +159,7 @@ class WeatherTask(Task):
     db_manager: Union[ValidatorDatabaseManager, MinerDatabaseManager]
     node_type: str = Field(default="validator")
     test_mode: bool = Field(default=False)
+    era5_climatology_ds: Optional[xr.Dataset] = Field(default=None, exclude=True) # Exclude from Pydantic model
  
     model_config = ConfigDict(
         extra = 'allow',
@@ -139,10 +187,8 @@ class WeatherTask(Task):
         self.test_mode = test_mode
         self.config = loaded_config 
         self.validator = data.get('validator')
+        self.era5_climatology_ds = None
 
-        self.ensemble_task_queue = asyncio.Queue()
-        self.ensemble_worker_running = False
-        self.ensemble_workers = []
         self.initial_scoring_queue = asyncio.Queue()
         self.initial_scoring_worker_running = False
         self.initial_scoring_workers = []
@@ -194,6 +240,103 @@ class WeatherTask(Task):
     # Validator methods
     ############################################################
 
+    async def _get_or_load_era5_climatology(self) -> Optional[xr.Dataset]:
+        if self.era5_climatology_ds is None:
+            climatology_path = self.config.get("era5_climatology_path")
+            if climatology_path:
+                try:
+                    logger.info(f"Loading ERA5 climatology from: {climatology_path}")
+                    self.era5_climatology_ds = await asyncio.to_thread(
+                        xr.open_zarr, climatology_path, consolidated=True 
+                    )
+                    logger.info("ERA5 climatology loaded successfully.")
+                except Exception as e:
+                    logger.error(f"Failed to load ERA5 climatology from {climatology_path}: {e}", exc_info=True)
+                    self.era5_climatology_ds = None\
+            else:
+                logger.error("WEATHER_ERA5_CLIMATOLOGY_PATH not configured. Cannot load climatology for ACC calculation.")
+        return self.era5_climatology_ds
+
+    async def build_score_row(self, run_id: int, gfs_init_time: datetime, evaluation_results: List[Dict], task_name_prefix: str):
+        """
+        Builds the score row for a given run and stores it in the score_table.
+        evaluation_results is a list of dicts, each from an evaluation function (e.g., evaluate_miner_forecast_day1).
+        task_name_prefix is used to form the task_name in score_table (e.g., 'weather_day1_qc', 'weather_era5_final').
+        """
+        logger.info(f"[BuildScoreRow] Building {task_name_prefix} score row for run_id: {run_id}")
+        all_miner_scores_for_run: Dict[int, float] = {}
+
+        for eval_result in evaluation_results:
+            if isinstance(eval_result, Exception) or not isinstance(eval_result, dict):
+                logger.warning(f"[BuildScoreRow] Skipping invalid evaluation result for {task_name_prefix}: {type(eval_result)}")
+                continue
+            
+            miner_uid = eval_result.get("miner_uid")
+            overall_score = eval_result.get("overall_day1_score") 
+
+            if miner_uid is not None and overall_score is not None and np.isfinite(overall_score):
+                # Score is expected to be 0-1 normalized from the evaluation function
+                all_miner_scores_for_run[miner_uid] = float(overall_score)
+            elif miner_uid is not None:
+                all_miner_scores_for_run[miner_uid] = 0.0 
+            else:
+                logger.warning(f"[BuildScoreRow] Missing miner_uid for {task_name_prefix} in evaluation result: {eval_result.get('miner_hotkey')}")
+
+        final_scores_list = [float("nan")] * 256
+        try:
+            active_miners_query = "SELECT DISTINCT uid FROM node_table WHERE hotkey IS NOT NULL AND uid IS NOT NULL AND uid >= 0 AND uid < 256"
+            active_miner_uids_records = await self.db_manager.fetch_all(active_miners_query)
+            active_miner_uids = {rec['uid'] for rec in active_miner_uids_records if isinstance(rec['uid'], int)}
+
+            for uid_int in active_miner_uids:
+                # If an active UID has a score, use it. Otherwise, it gets 0.0 (participated but failed/no score).
+                # UIDs not in active_miner_uids will remain NaN.
+                final_scores_list[uid_int] = all_miner_scores_for_run.get(uid_int, 0.0)
+        except Exception as e_node_table:
+            logger.error(f"[BuildScoreRow] Error fetching UIDs from node_table for {task_name_prefix}, run {run_id}: {e_node_table}. Score row might be incomplete.")
+            for uid_val, score_val in all_miner_scores_for_run.items():
+                if 0 <= uid_val < 256:
+                    final_scores_list[uid_val] = score_val
+
+        score_row_data = {
+            "task_name": task_name_prefix,
+            "task_id": str(run_id),
+            "score_json_list": json.dumps(final_scores_list),
+            "status": f"{task_name_prefix}_scores_compiled",
+            "run_timestamp": gfs_init_time
+        }
+
+        try:
+            score_table_entry_exists_query = "SELECT id FROM score_table WHERE task_name = :task_name AND task_id = :task_id"
+            existing_score_entry = await self.db_manager.fetch_one(score_table_entry_exists_query, 
+                                                                   {"task_name": score_row_data["task_name"], "task_id": score_row_data["task_id"]})
+
+            db_params_score_table = {
+                "task_name": score_row_data["task_name"],
+                "task_id": score_row_data["task_id"],
+                "score": score_row_data["score_json_list"],
+                "status": score_row_data["status"],
+                "run_timestamp": score_row_data["run_timestamp"]
+            }
+
+            if existing_score_entry:
+                update_score_table_query = """
+                    UPDATE score_table SET score = :score, status = :status, run_timestamp = :run_timestamp
+                    WHERE id = :id
+                """
+                db_params_score_table["id"] = existing_score_entry['id']
+                await self.db_manager.execute(update_score_table_query, db_params_score_table)
+                logger.info(f"[BuildScoreRow] Updated score_table entry for {task_name_prefix}, run_id: {run_id}")
+            else:
+                insert_score_table_query = """
+                    INSERT INTO score_table (task_name, task_id, score, status, run_timestamp)
+                    VALUES (:task_name, :task_id, :score, :status, :run_timestamp)
+                """
+                await self.db_manager.execute(insert_score_table_query, db_params_score_table)
+                logger.info(f"[BuildScoreRow] Inserted new score_table entry for {task_name_prefix}, run_id: {run_id}")
+        except Exception as e_db_score_table:
+            logger.error(f"[BuildScoreRow] DB error storing {task_name_prefix} score row for run {run_id}: {e_db_score_table}", exc_info=True)
+
     async def validator_prepare_subtasks(self):
         """
         Prepares data needed for a forecast run (e.g., identifying GFS data).
@@ -214,10 +357,6 @@ class WeatherTask(Task):
         self.validator = validator
         logger.info("Starting WeatherTask validator execution loop...")
         
-        # Start ensemble workers
-        await self.start_ensemble_workers()
-        logger.info("Started ensemble workers for asynchronous processing")
-
         run_hour_utc = self.config.get('run_hour_utc', 12) # Default to 12 if not in config for some reason
         run_minute_utc = self.config.get('run_minute_utc', 0)
         logger.info(f"Validator execute loop configured to run around {run_hour_utc:02d}:{run_minute_utc:02d} UTC.")
@@ -663,23 +802,18 @@ class WeatherTask(Task):
             verified_count_result = await self.db_manager.fetch_one(verified_responses_query, {"run_id": run_id})
             verified_count = verified_count_result["count"] if verified_count_result else 0
             
-            min_ensemble_members = self.config.get('min_ensemble_members', 3)
-            
             current_run_status_rec_after_verify = await self.db_manager.fetch_one("SELECT status FROM weather_forecast_runs WHERE id = :run_id", {"run_id": run_id})
             current_run_status_after_verify = current_run_status_rec_after_verify['status'] if current_run_status_rec_after_verify else 'unknown'
             
             if current_run_status_after_verify == 'verifying_miner_forecasts':
-                if verified_count >= min_ensemble_members:
-                    logger.info(f"[Run {run_id}] {verified_count} verified responses meeting/exceeding minimum {min_ensemble_members}. Triggering initial scoring.")
+                if verified_count >= 1:
+                    logger.info(f"[Run {run_id}] {verified_count} verified response(s). Triggering Day-1 QC scoring.")
                     await _trigger_initial_scoring(self, run_id)
                 elif num_attempted_verification > 0: 
-                     if verified_count > 0: # Some passed, but not enough for full ensemble
-                         logger.info(f"[Run {run_id}] {verified_count} verified responses, (less than {min_ensemble_members} minimum). Status: partially_verified_ready_for_scoring.")
-                         await _update_run_status(self, run_id, "partially_verified_ready_for_scoring")
-                     else: # None passed verification out of those attempted
+                     if verified_count == 0:
                          logger.warning(f"[Run {run_id}] No responses passed verification out of {num_attempted_verification} attempted. Status: all_forecasts_failed_verification.")
                          await _update_run_status(self, run_id, "all_forecasts_failed_verification")
-                else: # num_attempted_verification == 0: No 'inference_triggered' responses were found for this run.
+                else:
                     logger.warning(f"[Run {run_id}] Run was '{current_run_status_after_verify}' but no 'inference_triggered' miner responses found to verify. Setting status to 'stalled_no_valid_forecasts'.")
                     await _update_run_status(self, run_id, "stalled_no_valid_forecasts")
             else:
@@ -1013,46 +1147,9 @@ class WeatherTask(Task):
         in case of errors or shutdowns.
         """
         logger.info("Cleaning up weather task resources...")
-        
-        if self.ensemble_worker_running:
-            await self.stop_ensemble_workers()
-            
-        if not self.ensemble_task_queue.empty():
-            logger.info("Waiting for pending ensemble tasks to complete...")
-            try:
-                await asyncio.wait_for(self.ensemble_task_queue.join(), timeout=10.0)
-                logger.info("All pending ensemble tasks completed")
-            except asyncio.TimeoutError:
-                logger.warning("Timed out waiting for ensemble tasks to complete")
-                
+
         logger.info("Weather task cleanup completed")
        
-    async def start_ensemble_workers(self, num_workers=1):
-        """Start background workers for ensemble processing."""
-        if self.ensemble_worker_running:
-            logger.info("Ensemble workers already running")
-            return
-            
-        self.ensemble_worker_running = True
-        for _ in range(num_workers):
-            worker = asyncio.create_task(ensemble_worker(self)) 
-            self.ensemble_workers.append(worker)
-            
-        logger.info(f"Started {num_workers} ensemble workers")
-        
-    async def stop_ensemble_workers(self):
-        """Stop all background ensemble workers."""
-        if not self.ensemble_worker_running:
-            return
-            
-        self.ensemble_worker_running = False
-        logger.info("Stopping ensemble workers...")
-        for worker in self.ensemble_workers:
-            worker.cancel()
-                        
-        self.ensemble_workers = []
-        logger.info("Stopped all ensemble workers")
-
     async def start_initial_scoring_workers(self, num_workers=1):
         """Start background workers for initial scoring processing."""
         if self.initial_scoring_worker_running:
@@ -1132,15 +1229,13 @@ class WeatherTask(Task):
         
     async def start_background_workers(self, num_ensemble_workers=1, num_initial_scoring_workers=1, num_final_scoring_workers=1, num_cleanup_workers=1):
          """Starts all background worker types."""
-         await self.start_ensemble_workers(num_ensemble_workers)
          await self.start_initial_scoring_workers(num_initial_scoring_workers)
          await self.start_final_scoring_workers(num_final_scoring_workers)
          await self.start_cleanup_workers(num_cleanup_workers)
          
     async def stop_background_workers(self):
         """Stops all background worker types."""
-        try: await self.stop_ensemble_workers()
-        except Exception as e: logger.error(f"Error stopping ensemble workers: {e}")
+
         try: await self.stop_initial_scoring_workers()
         except Exception as e: logger.error(f"Error stopping initial scoring workers: {e}")
         try: await self.stop_final_scoring_workers()

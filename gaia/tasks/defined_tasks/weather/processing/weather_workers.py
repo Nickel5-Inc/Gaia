@@ -13,6 +13,7 @@ import pandas as pd
 import shutil
 import time
 import zarr
+from typing import Dict
 
 from fiber.logging_utils import get_logger
 from aurora import Batch
@@ -28,254 +29,15 @@ from .weather_logic import (
     get_ground_truth_data
 )
 
-from ..utils.gfs_api import fetch_gfs_analysis_data
+from ..utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
 from ..utils.era5_api import fetch_era5_data
 from ..utils.hashing import compute_verification_hash, compute_input_data_hash, CANONICAL_VARS_FOR_HASHING
-from ..weather_scoring.ensemble import (
-    create_physics_aware_ensemble,
-    _open_dataset_lazily,
-    ALL_EXPECTED_VARIABLES,
-    AURORA_FUNDAMENTAL_SURFACE_VARIABLES,
-    AURORA_FUNDAMENTAL_ATMOS_VARIABLES,
-    AURORA_DERIVED_VARIABLES
-)
 from ..weather_scoring.metrics import calculate_rmse
-from ..weather_scoring_mechanism import calculate_gfs_score_and_weight, calculate_era5_miner_score
+from ..weather_scoring_mechanism import calculate_era5_miner_score, evaluate_miner_forecast_day1
 logger = get_logger(__name__)
 
 VALIDATOR_ENSEMBLE_DIR = Path("./validator_ensembles/")
 MINER_FORECAST_DIR_BG = Path("./miner_forecasts_background/")
-
-
-async def ensemble_worker(self):
-    """Background worker that processes ensemble tasks using the advanced method."""
-    while self.ensemble_worker_running:
-        run_id = None
-        ensemble_id = None
-        try:
-            try:
-                run_id = await asyncio.wait_for(self.ensemble_task_queue.get(), timeout=5.0)
-            except asyncio.TimeoutError:
-                continue
-
-            logger.info(f"[EnsembleWorker] Processing ensemble for run {run_id}")
-
-            query = """
-            SELECT 
-                mr.miner_hotkey,
-                mr.kerchunk_json_url,
-                mr.job_id,  -- Need job_id for token requests
-                fr.gfs_init_time_utc,
-                ef.id as ensemble_id, 
-                COALESCE(
-                    (SELECT weight FROM weather_historical_weights 
-                        WHERE miner_hotkey = mr.miner_hotkey 
-                        ORDER BY last_updated DESC LIMIT 1),
-                    0.5 -- Default weight if none found
-                ) as miner_weight
-            FROM 
-                weather_miner_responses mr
-            JOIN
-                weather_forecast_runs fr ON mr.run_id = fr.id
-            JOIN
-                weather_ensemble_forecasts ef ON ef.forecast_run_id = fr.id
-            WHERE 
-                mr.run_id = :run_id
-                AND mr.verification_passed = TRUE
-                AND mr.status = 'verified'
-            """
-            responses = await self.db_manager.fetch_all(query, {"run_id": run_id})
-
-            if not responses or len(responses) < 3:
-                logger.warning(f"[EnsembleWorker] Not enough verified responses ({len(responses)}) for run {run_id} to create ensemble. Min required: {self.config.get('min_ensemble_members', 3)}")
-                await self.db_manager.execute(
-                    "UPDATE weather_ensemble_forecasts SET status = 'failed', error_message = :msg WHERE id = :eid",
-                    {"eid": ensemble_id, "msg": "Insufficient verified members"}
-                )
-                self.ensemble_task_queue.task_done()
-                continue
-                
-            ensemble_id = responses[0]['ensemble_id']
-            gfs_init_time = responses[0]['gfs_init_time_utc']
-
-            miner_forecast_refs = {}
-            miner_weights = {}
-            skipped_miners = []
-
-            async def _get_miner_ref(response):
-                miner_id = response['miner_hotkey']
-                job_id = response['job_id']
-                kerchunk_url = response['kerchunk_json_url']
-                weight = float(response['miner_weight'])
-                
-                token_response = await self._request_fresh_token(miner_id, job_id)
-                if not token_response or 'access_token' not in token_response:
-                    logger.warning(f"[EnsembleWorker] Could not get access token for miner {miner_id}, job {job_id}. Skipping for ensemble.")
-                    return None, miner_id
-                    
-                access_token = token_response['access_token']
-                ref_spec = {
-                    'url': kerchunk_url,
-                    'protocol': 'http',
-                    'options': {
-                        'headers': {
-                            'Authorization': f'Bearer {access_token}'
-                        }
-                    }
-                }
-                return (miner_id, ref_spec, weight), None
-
-            tasks = [_get_miner_ref(resp) for resp in responses]
-            results = await asyncio.gather(*tasks)
-
-            for result, skipped_miner_id in results:
-                    if skipped_miner_id:
-                        skipped_miners.append(skipped_miner_id)
-                    elif result:
-                        miner_id, ref_spec, weight = result
-                        miner_forecast_refs[miner_id] = ref_spec
-                        miner_weights[miner_id] = weight
-
-            if len(miner_forecast_refs) < self.config.get('min_ensemble_members', 3):
-                logger.warning(f"[EnsembleWorker] Not enough valid miners ({len(miner_forecast_refs)}) after token requests for run {run_id}. Min required: {self.config.get('min_ensemble_members', 3)}")
-                await self.db_manager.execute(
-                    "UPDATE weather_ensemble_forecasts SET status = 'failed', error_message = :msg WHERE id = :eid",
-                    {"eid": ensemble_id, "msg": "Insufficient members after token fetch"}
-                )
-                self.ensemble_task_queue.task_done()
-                continue
-
-            top_k = self.config.get('top_k_ensemble', None)
-            ensemble_ds = await create_physics_aware_ensemble(
-                miner_forecast_refs=miner_forecast_refs,
-                miner_weights=miner_weights,
-                top_k=top_k
-                #variables_to_process=... # optional subset
-                #consistency_checks=... # optional override default
-            )
-
-            if ensemble_ds:
-                logger.info(f"[EnsembleWorker] Successfully created ensemble dataset for run {run_id}")
-                
-                time_str = gfs_init_time.strftime('%Y%m%d%H')
-                ensemble_nc_filename = f"ensemble_run_{run_id}_{time_str}.nc"
-                ensemble_path = VALIDATOR_ENSEMBLE_DIR / ensemble_nc_filename
-                try:
-                    encoding = {var: {'zlib': True, 'complevel': 5} for var in ensemble_ds.data_vars}
-                    await asyncio.to_thread(ensemble_ds.to_netcdf, path=str(ensemble_path), encoding=encoding)
-                    logger.info(f"[EnsembleWorker] Saved ensemble NetCDF: {ensemble_path}")
-                except Exception as e_save:
-                        logger.error(f"[EnsembleWorker] Failed to save ensemble NetCDF for run {run_id}: {e_save}", exc_info=True)
-                        await self.db_manager.execute(
-                        "UPDATE weather_ensemble_forecasts SET status = 'failed', error_message = :msg WHERE id = :eid",
-                        {"eid": ensemble_id, "msg": f"Failed to save NetCDF: {e_save}"}
-                        )
-                        await self._update_run_status(run_id, "ensemble_failed", error_message=f"Failed to save NetCDF")
-                        self.ensemble_task_queue.task_done()
-                        continue
-
-                kerchunk_filename = f"{os.path.splitext(ensemble_nc_filename)[0]}.json"
-                kerchunk_path = VALIDATOR_ENSEMBLE_DIR / kerchunk_filename
-                try:
-                    h5chunks = SingleHdf5ToZarr(str(ensemble_path), inline_threshold=0)
-                    kerchunk_metadata = h5chunks.translate()
-                    with open(kerchunk_path, 'w') as f:
-                        json.dump(kerchunk_metadata, f)
-                    logger.info(f"[EnsembleWorker] Generated ensemble Kerchunk JSON: {kerchunk_path}")
-                except Exception as e_kc:
-                    logger.error(f"[EnsembleWorker] Failed to generate Kerchunk JSON for run {run_id}: {e_kc}", exc_info=True)
-                    kerchunk_path = None
-
-                verification_hash = None
-                try:
-                    ensemble_metadata_for_hash = {
-                        "time": [gfs_init_time],
-                        "source_model": "physics_aware_ensemble",
-                        "resolution": ensemble_ds.attrs.get('resolution', 0.25)
-                    }
-                    variables_to_hash = [v for v in ensemble_ds.data_vars if v in ALL_EXPECTED_VARIABLES]
-                    
-                    data_for_hash = {"surf_vars": {}, "atmos_vars": {}}
-                    for var in variables_to_hash:
-                        var_data = ensemble_ds[var].values
-                        if var in AURORA_FUNDAMENTAL_SURFACE_VARIABLES + AURORA_DERIVED_VARIABLES:
-                            data_for_hash["surf_vars"][var] = var_data
-                        elif var in AURORA_FUNDAMENTAL_ATMOS_VARIABLES:
-                            data_for_hash["atmos_vars"][var] = var_data
-
-                    if not data_for_hash["surf_vars"] and not data_for_hash["atmos_vars"]:
-                         logger.warning(f"[EnsembleWorker] No variables categorized for hashing in ensemble for run {run_id}. Hash set to None.")
-                         verification_hash = None
-                    else:
-                        logger.debug(f"[EnsembleWorker] Data prepared for hashing. Computing hash...")
-                        verification_hash = compute_verification_hash(
-                            data=data_for_hash,
-                            metadata=ensemble_metadata_for_hash,
-                            variables=list(data_for_hash["surf_vars"].keys()) + list(data_for_hash["atmos_vars"].keys()),
-                            timesteps=list(range(len(ensemble_ds.time)))
-                        )
-                        if verification_hash:
-                            logger.info(f"[EnsembleWorker] Computed ensemble verification hash for run {run_id}: {verification_hash[:10]}..."
-                        )
-                        else:
-                            logger.warning(f"[EnsembleWorker] compute_verification_hash returned None for run {run_id}")
-                
-                except Exception as e_hash:
-                     logger.error(f"[EnsembleWorker] Failed during hash preparation/computation for run {run_id}: {e_hash}", exc_info=True)
-                     verification_hash = None
-
-                update_params = {
-                    "eid": ensemble_id,
-                    "status": "completed",
-                    "path": str(ensemble_path),
-                    "kpath": str(kerchunk_path) if kerchunk_path else None,
-                    "hash": verification_hash,
-                    "end_time": datetime.now(timezone.utc)
-                }
-                update_query = """
-                UPDATE weather_ensemble_forecasts
-                SET status = :status, 
-                    ensemble_path = :path,
-                    ensemble_kerchunk_path = :kpath,
-                    ensemble_verification_hash = :hash,
-                    processing_end_time = :end_time,
-                    error_message = NULL
-                WHERE id = :eid
-                """
-                await self.db_manager.execute(update_query, update_params)
-                await self._update_run_status(run_id, "completed")
-                logger.info(f"[EnsembleWorker] Successfully completed and recorded ensemble for run {run_id}")
-
-            else:
-                logger.error(f"[EnsembleWorker] create_physics_aware_ensemble failed for run {run_id}")
-                await self.db_manager.execute(
-                    "UPDATE weather_ensemble_forecasts SET status = 'failed', error_message = :msg WHERE id = :eid",
-                    {"eid": ensemble_id, "msg": "Ensemble creation function returned None"}
-                )
-                await self._update_run_status(run_id, "ensemble_failed", error_message="Ensemble function failed")
-
-            self.ensemble_task_queue.task_done()
-
-        except asyncio.CancelledError:
-            logger.info("[EnsembleWorker] Worker cancelled")
-            if run_id is not None and self.ensemble_task_queue._unfinished_tasks > 0:
-                    self.ensemble_task_queue.task_done()
-            break
-
-        except Exception as e:
-            logger.error(f"[EnsembleWorker] Unexpected error processing run {run_id}: {e}", exc_info=True)
-            if run_id and ensemble_id:
-                try:
-                    await self.db_manager.execute(
-                        "UPDATE weather_ensemble_forecasts SET status = 'error', error_message = :msg WHERE id = :eid",
-                        {"eid": ensemble_id, "msg": f"Worker error: {e}"}
-                    )
-                    await self._update_run_status(run_id, "ensemble_failed", error_message=f"Worker error: {e}")
-                except Exception as db_err:
-                        logger.error(f"[EnsembleWorker] Failed to update DB on error: {db_err}")
-            if run_id is not None and self.ensemble_task_queue._unfinished_tasks > 0:
-                    self.ensemble_task_queue.task_done()
-            await asyncio.sleep(1)
 
 async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
     """
@@ -634,175 +396,201 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
             except Exception: pass
 
 async def initial_scoring_worker(self):
-    """Background worker to calculate initial scores/weights vs GFS analysis."""
+    """Background worker to calculate Day-1 QC scores vs GFS analysis & GFS reference.
+       This replaces the old initial GFS MAE-based weighting.
+    """
     while self.initial_scoring_worker_running:
         run_id = None
-        gfs_analysis_ds = None
+        gfs_analysis_ds_for_run = None
+        gfs_reference_ds_for_run = None
+        era5_climatology_ds = None
+        processed_a_run = False
+
         try:
             try:
                 run_id = await asyncio.wait_for(self.initial_scoring_queue.get(), timeout=5.0)
+                processed_a_run = True
             except asyncio.TimeoutError:
-                    continue 
-                    
-            logger.info(f"[InitialScoringWorker] Processing initial scores for run {run_id}")
-            await self._update_run_status(run_id, "initial_scoring")
+                continue 
             
-            responses_query = """
+            logger.info(f"[Day1ScoringWorker] Processing Day-1 QC scores for run {run_id}")
+            await self._update_run_status(run_id, "day1_scoring_started")
+            
+            run_details_query = "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id"
+            run_record = await self.db_manager.fetch_one(run_details_query, {"run_id": run_id})
+            if not run_record:
+                logger.error(f"[Day1ScoringWorker] Run {run_id}: Details not found. Skipping.")
+                self.initial_scoring_queue.task_done()
+                continue
+
+            gfs_init_time = run_record['gfs_init_time_utc']
+
+            responses_query = """    
             SELECT 
-                mr.id as response_id, 
+                mr.id, 
                 mr.miner_hotkey, 
-                mr.kerchunk_json_url, 
+                mr.miner_uid, -- Added miner_uid
                 mr.job_id,
                 mr.run_id,
-                fr.gfs_init_time_utc
+                mr.kerchunk_json_url, 
+                mr.verification_hash_claimed 
             FROM weather_miner_responses mr
-            JOIN weather_forecast_runs fr ON mr.run_id = fr.id
-            WHERE mr.run_id = :run_id AND mr.verification_passed = TRUE AND mr.status = 'verified'
+            WHERE mr.run_id = :run_id AND mr.verification_passed = TRUE 
+            AND mr.status = 'verified_manifest_store_opened' 
             """
             responses = await self.db_manager.fetch_all(responses_query, {"run_id": run_id})
             
-            if self.test_mode and (not responses or len(responses) < self.config.get('min_ensemble_members', 3)):
-                wait_count = 0
-                max_wait_attempts = 3
-                while wait_count < max_wait_attempts and (not responses or len(responses) < self.config.get('min_ensemble_members', 3)):
-                    logger.info(f"[InitialScoringWorker] TEST MODE: Only {len(responses) if responses else 0} verified responses found. Waiting 10s before checking again. Attempt {wait_count+1}/{max_wait_attempts}")
-                    await asyncio.sleep(10)
-                    responses = await self.db_manager.fetch_all(responses_query, {"run_id": run_id})
-                    wait_count += 1
-
-            min_members = self.config.get('min_ensemble_members', 3)
-            if not responses or len(responses) < min_members:
-                logger.warning(f"[InitialScoringWorker] Run {run_id}: Insufficient verified responses ({len(responses)} < {min_members}) found for initial scoring.")
-                await self._update_run_status(run_id, "initial_scoring_failed", error_message="Insufficient verified members")
+            min_members_for_scoring = 1
+            if not responses or len(responses) < min_members_for_scoring:
+                logger.warning(f"[Day1ScoringWorker] Run {run_id}: No verified responses found for Day-1 scoring.")
+                await self._update_run_status(run_id, "day1_scoring_failed", error_message="No verified members with opened stores")
                 self.initial_scoring_queue.task_done()
                 continue
                 
-            gfs_init_time = responses[0]['gfs_init_time_utc']
-            logger.info(f"[InitialScoringWorker] Run {run_id}: Found {len(responses)} verified responses. Init time: {gfs_init_time}")
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: Found {len(responses)} verified responses. Init time: {gfs_init_time}")
             
-            sparse_lead_hours = self.config.get('initial_scoring_lead_hours', [24, 72])
-            target_datetimes = [gfs_init_time + timedelta(hours=h) for h in sparse_lead_hours]
-            logger.info(f"[InitialScoringWorker] Run {run_id}: Fetching GFS analysis for initial scoring at lead hours: {sparse_lead_hours}.")
+            # GFS Analysis, GFS Reference, and ERA5 Climatology
+            day1_lead_hours = self.config.get('initial_scoring_lead_hours', [6, 12])
+            valid_times_for_gfs = [gfs_init_time + timedelta(hours=h) for h in day1_lead_hours]
             
-            gfs_cache = Path(self.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
-            gfs_analysis_ds = await fetch_gfs_analysis_data(target_times=target_datetimes, cache_dir=gfs_cache)
-            
-            if gfs_analysis_ds is None:
-                logger.error(f"[InitialScoringWorker] Run {run_id}: Failed to fetch GFS analysis data. Aborting initial scoring.")
-                await self._update_run_status(run_id, "initial_scoring_failed", error_message="GFS analysis fetch failed")
-                self.initial_scoring_queue.task_done()
-                continue
-                    
-            logger.info(f"[InitialScoringWorker] Run {run_id}: GFS analysis data fetched/loaded.")
-            
-            preliminary_weights = {}
-            gfs_mae_scores = {}
-            scored_miners_count = 0
-            tasks = []
-            num_verified_miners_in_run = len(responses)
+            gfs_cache_dir = Path(self.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
+            gfs_analysis_ds_for_run = await fetch_gfs_analysis_data(target_times=valid_times_for_gfs, cache_dir=gfs_cache_dir)
+            if gfs_analysis_ds_for_run is None:
+                raise ValueError(f"Failed to fetch GFS analysis data for run {run_id}")
 
-            for resp in responses:
-                 tasks.append(calculate_gfs_score_and_weight(self, resp, target_datetimes, gfs_analysis_ds, num_verified_miners_in_run))
-                     
-            scoring_results = await asyncio.gather(*tasks)
+            gfs_reference_ds_for_run = await fetch_gfs_data(run_time=gfs_init_time, lead_hours=day1_lead_hours) # No cache for this one yet
+            if gfs_reference_ds_for_run is None:
+                raise ValueError(f"Failed to fetch GFS reference forecast data for run {run_id}")
+
+            era5_climatology_ds = await self._get_or_load_era5_climatology()
+            if era5_climatology_ds is None:
+                raise ValueError(f"Failed to load ERA5 climatology for run {run_id}")
             
-            valid_prelim_weights = []
-            for hotkey, prelim_weight, gfs_mae in scoring_results:
-                 if prelim_weight is not None and gfs_mae is not None:
-                     preliminary_weights[hotkey] = prelim_weight
-                     gfs_mae_scores[hotkey] = gfs_mae
-                     valid_prelim_weights.append(prelim_weight)
-                     scored_miners_count += 1
-                 else:
-                     logger.warning(f"[InitialScoringWorker] Miner {hotkey} failed prelim weight/score calculation.")
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: GFS Analysis, GFS Reference, and ERA5 Climatology prepared.")
             
-            final_initial_weights = {}
-            total_prelim_weight = sum(valid_prelim_weights)
-            if scored_miners_count >= min_members and total_prelim_weight > 1e-9:
-                logger.info(f"[InitialScoringWorker] Normalizing preliminary weights (Sum: {total_prelim_weight:.4f}) for {scored_miners_count} miners.")
-                for hotkey, prelim_weight in preliminary_weights.items():
-                    final_initial_weights[hotkey] = prelim_weight / total_prelim_weight
-            elif scored_miners_count >= min_members:
-                logger.warning(f"[InitialScoringWorker] Total preliminary weight is near zero. Assigning equal weights to {scored_miners_count} scored miners.")
-                equal_weight = 1.0 / scored_miners_count
-                for hotkey in preliminary_weights.keys():
-                    final_initial_weights[hotkey] = equal_weight
-            else:
-                # normalization not possible/needed
-                pass
+            # Day-1 Scoring Parameters from self.config
+            day1_scoring_config = {
+                "lead_times_hours": self.config.get('initial_scoring_lead_hours', [6, 12]),
+                "variables_levels_to_score": self.config.get('day1_variables_levels_to_score', [
+                    {"name": "z", "level": 500, "standard_name": "geopotential"},
+                    {"name": "t", "level": 850, "standard_name": "temperature"},
+                    {"name": "2t", "level": None, "standard_name": "2m_temperature"},
+                    {"name": "msl", "level": None, "standard_name": "mean_sea_level_pressure"}
+                ]),
+                "climatology_bounds": self.config.get('day1_climatology_bounds', {
+                    "2t": (180, 340), "msl": (90000, 110000),
+                    "t500": (200, 300), "t850": (220, 320),
+                    "z500": (4000, 6000)
+                }),
+                "pattern_correlation_threshold": self.config.get("day1_pattern_correlation_threshold", 0.3),
+                "acc_lower_bound_d1": self.config.get("day1_acc_lower_bound", 0.6),
+                "alpha_skill": self.config.get("day1_alpha_skill", 0.6),
+                "beta_acc": self.config.get("day1_beta_acc", 0.4),
+                "clone_penalty_gamma": self.config.get("day1_clone_penalty_gamma", 1.0),
+                "clone_delta_thresholds": self.config.get("day1_clone_delta_thresholds", {
+                    "2t": 0.01, "msl": 250000, "z500": 100, "t850": 0.25
+                })
+            }
 
-            store_tasks = []
-            for hotkey, final_weight in final_initial_weights.items():
-                gfs_mae = gfs_mae_scores.get(hotkey)
-                if gfs_mae is None: continue
+            scoring_tasks = []
+            for miner_response_rec in responses:
+                scoring_tasks.append(
+                    evaluate_miner_forecast_day1(
+                        self, 
+                        miner_response_rec,
+                        gfs_analysis_ds_for_run,
+                        gfs_reference_ds_for_run,
+                        era5_climatology_ds,
+                        day1_scoring_config,
+                        gfs_init_time
+                    )
+                )
+            
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: Created {len(scoring_tasks)} scoring tasks.")
+            evaluation_results = await asyncio.gather(*scoring_tasks, return_exceptions=True)
+            
+            successful_scores = 0
+            db_update_tasks = []
+            for result in evaluation_results:
+                if isinstance(result, Exception):
+                    logger.error(f"[Day1ScoringWorker] Run {run_id}: A Day-1 scoring task failed: {result}", exc_info=result)
+                    continue
+                
+                if result and isinstance(result, dict):
+                    resp_id = result.get("response_id")
+                    overall_score = result.get("overall_day1_score")
+                    qc_passed = result.get("qc_passed_all_vars_leads")
+                    error_msg = result.get("error_message")
+                    lead_scores_json = json.dumps(result.get("lead_time_scores"), default=str) # For DB storage
 
-                insert_mae_query = """
-                    INSERT INTO weather_historical_weights 
-                    (miner_hotkey, run_id, score_type, score, last_updated)
-                    VALUES (:hk, :rid, 'gfs_mae', :score, :ts)
-                    ON CONFLICT (miner_hotkey, run_id, score_type) DO UPDATE SET
-                    score = EXCLUDED.score, last_updated = EXCLUDED.last_updated
-                """
-                store_tasks.append(self.db_manager.execute(insert_mae_query, {
-                    "hk": hotkey, "rid": run_id, "score": gfs_mae, "ts": datetime.now(timezone.utc)
-                }))
-
-                insert_weight_query = """
-                    INSERT INTO weather_historical_weights 
-                    (miner_hotkey, run_id, score_type, weight, last_updated)
-                    VALUES (:hk, :rid, 'initial_ensemble_weight', :weight, :ts)
-                    ON CONFLICT (miner_hotkey, run_id, score_type) DO UPDATE SET
-                    weight = EXCLUDED.weight, last_updated = EXCLUDED.last_updated
-                """
-                store_tasks.append(self.db_manager.execute(insert_weight_query, {
-                    "hk": hotkey, "rid": run_id, "weight": final_weight, "ts": datetime.now(timezone.utc)
-                }))
-                logger.debug(f"[InitialScoringWorker] Storing GFS MAE ({gfs_mae:.4f}) and Initial Weight ({final_weight:.4f}) for {hotkey}, run {run_id}")
-
-            if store_tasks:
+                    if resp_id is not None:
+                        db_update_tasks.append(self.db_manager.execute(
+                            """INSERT INTO weather_miner_scores 
+                               (response_id, run_id, score_type, score, metrics, calculation_time, error_message)
+                               VALUES (:resp_id, :run_id, 'day1_qc_score', :score, :metrics, :ts, :err)                            
+                               ON CONFLICT (response_id, score_type) DO UPDATE SET
+                               score = EXCLUDED.score, metrics = EXCLUDED.metrics, 
+                               calculation_time = EXCLUDED.calculation_time, error_message = EXCLUDED.error_message
+                            """,
+                            {
+                                "resp_id": resp_id, "run_id": run_id, 
+                                "score": overall_score if np.isfinite(overall_score) else -9999.0, # Store a marker for invalid score
+                                "metrics": lead_scores_json,
+                                "ts": datetime.now(timezone.utc),
+                                "err": error_msg
+                            }
+                        ))
+                        if error_msg:
+                             logger.warning(f"[Day1ScoringWorker] Miner {result.get('miner_hotkey')} Day-1 scoring for resp {resp_id} completed with error: {error_msg}")
+                        elif overall_score is not None and np.isfinite(overall_score):
+                            successful_scores += 1
+                            logger.info(f"[Day1ScoringWorker] Miner {result.get('miner_hotkey')} Day-1 Score (Resp {resp_id}): {overall_score:.4f}, QC Overall: {qc_passed}")
+                        else:
+                            logger.warning(f"[Day1ScoringWorker] Miner {result.get('miner_hotkey')} Day-1 scoring for resp {resp_id} resulted in invalid score: {overall_score}")
+            
+            if db_update_tasks:
                 try:
-                    await asyncio.gather(*store_tasks)
-                    logger.info(f"[InitialScoringWorker] Stored initial scores/weights for {len(final_initial_weights)} miners.")
-                except Exception as db_err:
-                     logger.error(f"[InitialScoringWorker] Run {run_id}: Failed during bulk DB storage of initial scores/weights: {db_err}")
+                    await asyncio.gather(*db_update_tasks)
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Stored Day-1 QC scores for {len(db_update_tasks)} responses.")
+                except Exception as db_store_err:
+                    logger.error(f"[Day1ScoringWorker] Run {run_id}: Error storing Day-1 QC scores to DB: {db_store_err}", exc_info=True)
 
-            logger.info(f"[InitialScoringWorker] Run {run_id}: Successfully processed GFS scores for {scored_miners_count}/{len(responses)} miners.")
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: Successfully processed Day-1 QC for {successful_scores}/{len(responses)} miner responses.")
             
-            if len(final_initial_weights) >= min_members:
-                 logger.info(f"[InitialScoringWorker] Run {run_id}: Initial scoring complete ({len(final_initial_weights)} weighted miners). Triggering ensemble creation.")
-                 await self.ensemble_task_queue.put(run_id)
-                 await self._update_run_status(run_id, "processing_ensemble")
+            if evaluation_results:
+                await self.build_score_row(run_id, gfs_init_time, evaluation_results, task_name_prefix="weather_day1_qc")
             else:
-                 logger.warning(f"[InitialScoringWorker] Run {run_id}: Only {scored_miners_count} miners successfully scored (min {min_members}). Cannot proceed to ensemble.")
-                 await self._update_run_status(run_id, "initial_scoring_failed", error_message=f"Scored {scored_miners_count}/{min_members} needed")
-                 self.initial_scoring_queue.task_done()
-                 continue
+                logger.warning(f"[Day1ScoringWorker] Run {run_id}: No evaluation results to build score row. Skipping score_table update.")
+
+            await self._update_run_status(run_id, "day1_scoring_complete")
             
             self.initial_scoring_queue.task_done()
             
         except asyncio.CancelledError:
-            logger.info("[InitialScoringWorker] Worker cancelled")
-            if run_id:
-                    self.initial_scoring_queue.task_done()
+            logger.info("[Day1ScoringWorker] Worker cancelled")
+            if processed_a_run:
+                self.initial_scoring_queue.task_done()
             break
             
         except Exception as e:
-            logger.error(f"[InitialScoringWorker] Unexpected error processing run {run_id}: {e}", exc_info=True)
+            logger.error(f"[Day1ScoringWorker] Unexpected error processing run {run_id}: {e}", exc_info=True)
             if run_id:
                 try:
-                    await self._update_run_status(run_id, "initial_scoring_failed", error_message=f"Worker error: {e}")
+                    await self._update_run_status(run_id, "day1_scoring_failed", error_message=f"Day1 Worker error: {e}")
                 except Exception as db_err:
-                    logger.error(f"[InitialScoringWorker] Failed to update DB status on error: {db_err}")
-                if self.initial_scoring_queue._unfinished_tasks > 0:
-                    self.initial_scoring_queue.task_done()
+                    logger.error(f"[Day1ScoringWorker] Failed to update DB status on error: {db_err}")
+            if processed_a_run:
+                if self.initial_scoring_queue._unfinished_tasks > 0 :
+                     self.initial_scoring_queue.task_done()
             await asyncio.sleep(1)
         finally:
-                if gfs_analysis_ds:
-                    try:
-                        gfs_analysis_ds.close()
-                    except Exception:
-                        pass
-                gc.collect()
+            if gfs_analysis_ds_for_run and hasattr(gfs_analysis_ds_for_run, 'close'):
+                try: gfs_analysis_ds_for_run.close()
+                except Exception: pass
+            if gfs_reference_ds_for_run and hasattr(gfs_reference_ds_for_run, 'close'):
+                try: gfs_reference_ds_for_run.close()
+                except Exception: pass
+            gc.collect()
 
 async def finalize_scores_worker(self):
     """Background worker to calculate final scores against ERA5 after delay."""

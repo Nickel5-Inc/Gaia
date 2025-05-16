@@ -15,406 +15,281 @@ from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple
 if TYPE_CHECKING:
     from ..weather_task import WeatherTask 
 
-from .weather_scoring.metrics import calculate_rmse, calculate_mae_dict
-from .weather_scoring.ensemble import _open_dataset_lazily, ALL_EXPECTED_VARIABLES
+from .weather_scoring.metrics import (
+    calculate_bias_corrected_forecast,
+    calculate_mse_skill_score,
+    calculate_acc,
+    perform_sanity_checks,
+    _calculate_latitude_weights,
+)
 
 logger = get_logger(__name__)
 
-#TODO: Placeholder for future OpenData API
-async def fetch_ecmwf_open_data_forecast(target_datetimes: List[datetime]) -> Optional[xr.Dataset]:
-    logger.debug("Placeholder: Fetching ECMWF Open Data forecast...")
-    await asyncio.sleep(0.1)
-    return None
+# Constants for Day-1 Scoring
+# DEFAULT_DAY1_ALPHA_SKILL = 0.5
+# DEFAULT_DAY1_BETA_ACC = 0.5
+# DEFAULT_DAY1_PATTERN_CORR_THRESHOLD = 0.3
+# DEFAULT_DAY1_ACC_LOWER_BOUND = 0.6 # For a specific lead like +12h
 
-DEFAULT_INITIAL_WEIGHT_FLOOR = 0.1
-DEFAULT_INITIAL_WEIGHT_CAP = 1.2
-DEFAULT_MAE_THRESHOLD_FOR_PENALTY = 10.0 # Example threshold - needs tuning
-TARGET_QC_LEVELS = [850, 500, 250]
-
-async def calculate_gfs_score_and_weight(task_instance: 'WeatherTask', 
-                                        response: Dict, 
-                                        target_datetimes: List[datetime], 
-                                        gfs_analysis_ds: xr.Dataset,
-                                        num_verified_miners: int
-                                        ) -> Tuple[str, Optional[float], Optional[float]]:
+async def evaluate_miner_forecast_day1(
+    task_instance: 'WeatherTask',
+    miner_response_db_record: Dict,
+    gfs_analysis_data_for_run: xr.Dataset,
+    gfs_reference_forecast_for_run: xr.Dataset,
+    era5_climatology: xr.Dataset,
+    day1_scoring_config: Dict, # Passed from initial_scoring_worker
+    run_gfs_init_time: datetime # GFS 00Z init time for the current run
+) -> Dict:
     """
-    Calculates initial preliminary weight for a single miner response for the ensemble.
-    Uses historical performance (ERA5 > Initial) and QC vs GFS & OpenData.
-
-    Args:
-        task_instance: The WeatherTask instance.
-        response: DB row containing miner response details.
-        target_datetimes: List of specific datetimes to score against.
-        gfs_analysis_ds: Pre-loaded xarray Dataset of GFS analysis.
-        num_verified_miners: Total number of verified miners in this run (for default weight).
-
-    Returns:
-        Tuple: (miner_hotkey, preliminary_unnormalized_weight, gfs_mae_score). 
-               Weight and score are None on failure.
+    Performs Day-1 scoring for a single miner's forecast.
+    Uses GFS analysis as truth and GFS forecast as reference.
+    Calculates bias-corrected skill scores and ACC for specified variables and lead times.
     """
-    response_id = response['response_id']
-    miner_hotkey = response['miner_hotkey']
-    kerchunk_url = response.get('kerchunk_json_url')
-    job_id = response.get('job_id')
-    run_id = response.get('run_id')
-    miner_sparse_ds = None
-    miner_ds_lazy = None
-    gfs_mae_score = None
-    prelim_weight = None 
+    response_id = miner_response_db_record['id']
+    miner_hotkey = miner_response_db_record['miner_hotkey']
+    job_id = miner_response_db_record.get('job_id')
+    run_id = miner_response_db_record.get('run_id')
+    miner_uid = miner_response_db_record.get('miner_uid')
+
+    logger.info(f"[Day1Score] Starting for miner {miner_hotkey} (Resp: {response_id}, Run: {run_id}, Job: {job_id}, UID: {miner_uid})")
+
+    day1_results = {
+        "response_id": response_id,
+        "miner_hotkey": miner_hotkey,
+        "miner_uid": miner_uid,
+        "run_id": run_id,
+        "overall_day1_score": None,
+        "qc_passed_all_vars_leads": True, # Assume pass until a failure
+        "lead_time_scores": {}, # {lead_hour: {variable_level: {skill, acc, sanity_status}}}
+        "error_message": None
+    }
+
+    miner_forecast_ds: Optional[xr.Dataset] = None
 
     try:
-        logger.debug(f"[InitialWeight] Calculating for miner {miner_hotkey} (Resp: {response_id}, Run: {run_id})")
-        
-        # Fetch Historical Weight 
-        historical_weight = None
-        weight_source = "None"
-        try:
-            # ERA5-based weight primary source, need task runs to populate this
-            era5_weight_query = """
-                SELECT weight FROM weather_historical_weights
-                WHERE miner_hotkey = :hk AND score_type = 'era5_weight' 
-                ORDER BY last_updated DESC LIMIT 1
-            """ # TODO: Define 'era5_weight' as the type stored by final scoring
-            era5_result = await task_instance.db_manager.fetch_one(era5_weight_query, {"hk": miner_hotkey})
-            if era5_result and era5_result['weight'] is not None:
-                historical_weight = float(era5_result['weight'])
-                weight_source = "ERA5 History"
-            else:
-                # Fallback to previous initial weight if no ERA5 history
-                initial_weight_query = """
-                    SELECT weight FROM weather_historical_weights
-                    WHERE miner_hotkey = :hk AND score_type = 'initial_ensemble_weight'
-                    ORDER BY last_updated DESC LIMIT 1
-                """
-                initial_result = await task_instance.db_manager.fetch_one(initial_weight_query, {"hk": miner_hotkey})
-                if initial_result and initial_result['weight'] is not None:
-                    historical_weight = float(initial_result['weight'])
-                    weight_source = "Initial History"
-
-            if historical_weight is not None:
-                logger.debug(f"[InitialWeight] Found historical weight for {miner_hotkey}: {historical_weight:.4f} (Source: {weight_source})")
-            else:
-                logger.debug(f"[InitialWeight] No historical weight found for {miner_hotkey}. Will use default.")
-                weight_source = "Default"
-                # Default weight is handled later based on normalization, starting point is 1.0 before QC.
-
-        except Exception as e_hist:
-            logger.warning(f"[InitialWeight] Error fetching historical weight for {miner_hotkey}: {e_hist}. Using default.")
-            weight_source = "Default (Error)"
-
-        # Miner Forecast & QC References
-        if not kerchunk_url or not job_id:
-             logger.warning(f"[InitialWeight] Missing kerchunk_url/job_id for {miner_hotkey}. Cannot calculate weight.")
-             return miner_hotkey, None, None
-
         from ..processing.weather_logic import _request_fresh_token
-        token_response = await _request_fresh_token(task_instance, miner_hotkey, job_id)
-        if not token_response or 'access_token' not in token_response:
-            logger.warning(f"[InitialWeight] Could not get token for {miner_hotkey}. Cannot score.")
-            return miner_hotkey, None, None
-            
-        ref_spec = {
-            'url': kerchunk_url,
-            'protocol': 'http',
-            'options': {'headers': {'Authorization': f'Bearer {token_response["access_token"]}'}}
-        }
         
-        miner_ds_lazy = await _open_dataset_lazily(ref_spec)
-        if miner_ds_lazy is None:
-             logger.warning(f"[InitialWeight] Failed to open lazy dataset for {miner_hotkey}. Cannot score.")
-             return miner_hotkey, None, None
-             
-        target_times_np = np.array(target_datetimes, dtype='datetime64[ns]')
-        miner_sparse_ds = await asyncio.to_thread(
-            lambda: miner_ds_lazy.sel(time=target_times_np, method='nearest').load()
-        )
-        gfs_sparse_ds = gfs_analysis_ds.sel(time=target_times_np, method='nearest')
-        
-        #TODO: Placeholder for OpenData
-        ecmwf_sparse_ds = await fetch_ecmwf_open_data_forecast(target_datetimes)
-        if ecmwf_sparse_ds is not None:
-            ecmwf_sparse_ds = ecmwf_sparse_ds.sel(time=target_times_np, method='nearest')
-            logger.debug(f"[InitialWeight] Placeholder: ECMWF Open Data fetched for {miner_hotkey}.")
-        else:
-            logger.debug(f"[InitialWeight] Placeholder: ECMWF Open Data not available for {miner_hotkey}.")
+        token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, job_id)
+        if token_data_tuple is None:
+            raise ValueError(f"Failed to get fresh access token/URL/manifest_hash for {miner_hotkey} job {job_id}")
 
-        # QC & Calculate Factor
-        common_vars_gfs = [v for v in ALL_EXPECTED_VARIABLES if v in miner_sparse_ds and v in gfs_sparse_ds]
-        if not common_vars_gfs:
-             logger.warning(f"[InitialWeight] Miner {miner_hotkey}: No common vars with GFS. Cannot calculate QC score.")
-             return miner_hotkey, None, None
+        access_token, zarr_store_url, claimed_manifest_content_hash = token_data_tuple
         
-        # selecting only target levels for atmospheric vars
-        miner_dict_gfs = {}
-        gfs_dict = {}
+        if not all([access_token, zarr_store_url, claimed_manifest_content_hash]):
+            raise ValueError(f"Critical forecast access info missing for {miner_hotkey} (Job: {job_id})")
+
+        logger.info(f"[Day1Score] Opening VERIFIED Zarr store for {miner_hotkey}: {zarr_store_url}")
+        storage_options = {"headers": {"Authorization": f"Bearer {access_token}"}, "ssl": False
         
-        level_coord_name = None
-        if 'level' in miner_sparse_ds.coords: level_coord_name = 'level'
-        elif 'pressure_level' in miner_sparse_ds.coords: level_coord_name = 'pressure_level'
-            
-        for var in common_vars_gfs:
+        verification_timeout_seconds = task_instance.config.get('verification_timeout_seconds', 300) / 2
+
+        miner_forecast_ds = await asyncio.wait_for(
+            open_verified_remote_zarr_dataset(
+                zarr_store_url=zarr_store_url,
+                claimed_manifest_content_hash=claimed_manifest_content_hash,
+                miner_hotkey_ss58=miner_hotkey,
+                storage_options=storage_options,
+                job_id=f"{job_id}_day1_score"
+            ),
+            timeout=verification_timeout_seconds
+        )
+
+        if miner_forecast_ds is None:
+            raise ConnectionError(f"Failed to open verified Zarr dataset for miner {miner_hotkey}")
+
+        # Prepare latitude weights
+        lat_coord_name = None
+        if 'latitude' in miner_forecast_ds.coords: lat_coord_name = 'latitude'
+        elif 'lat' in miner_forecast_ds.coords: lat_coord_name = 'lat'
+        
+        if not lat_coord_name:
+            raise ValueError("Latitude coordinate ('latitude' or 'lat') not found in miner's forecast dataset.")
+        lat_weights = _calculate_latitude_weights(miner_forecast_ds[lat_coord_name])
+
+        lead_times_to_score_hours: List[int] = day1_scoring_config.get('lead_times_hours', [6, 12])
+        variables_to_score: List[Dict] = day1_scoring_config.get('variables_levels_to_score', [])
+        
+        aggregated_skill_scores = []
+        aggregated_acc_scores = []
+        
+        for lead_h in lead_times_to_score_hours:
+            valid_time_dt = run_gfs_init_time + timedelta(hours=lead_h)
+            valid_time_np = np.datetime64(valid_time_dt)
+            logger.info(f"[Day1Score] Processing Lead: {lead_h}h (Valid Time: {valid_time_dt})")
+            day1_results["lead_time_scores"][lead_h] = {}
+
+            # Select truth and reference data for this lead time
             try:
-                miner_var_da = miner_sparse_ds[var]
-                gfs_var_da = gfs_sparse_ds[var]
-                
-                is_atmospheric = level_coord_name is not None and level_coord_name in miner_var_da.dims
-                
-                if is_atmospheric:
-                    available_levels_miner = miner_var_da[level_coord_name].values
-                    available_levels_gfs = gfs_var_da[level_coord_name].values
-                    
-                    target_levels_present_miner = [l for l in TARGET_QC_LEVELS if l in available_levels_miner]
-                    target_levels_present_gfs = [l for l in TARGET_QC_LEVELS if l in available_levels_gfs]
-                    
-                    common_target_levels = sorted(list(set(target_levels_present_miner) & set(target_levels_present_gfs)))
-                    
-                    if not common_target_levels:
-                        logger.warning(f"[InitialWeight] Skipping var '{var}' for {miner_hotkey}: No common target QC levels ({TARGET_QC_LEVELS}) found.")
-                        continue
-                        
-                    miner_dict_gfs[var] = miner_var_da.sel({level_coord_name: common_target_levels}).values
-                    gfs_dict[var] = gfs_var_da.sel({level_coord_name: common_target_levels}).values
-                    logger.debug(f"[InitialWeight] Selected levels {common_target_levels} for var '{var}'")
-                else:
-                    miner_dict_gfs[var] = miner_var_da.values
-                    gfs_dict[var] = gfs_var_da.values
-            except Exception as e_var_prep:
-                logger.warning(f"[InitialWeight] Error preparing var '{var}' for MAE calculation for {miner_hotkey}: {e_var_prep}")
-                if var in miner_dict_gfs: del miner_dict_gfs[var]
-                if var in gfs_dict: del gfs_dict[var]
+                gfs_analysis_lead = gfs_analysis_data_for_run.sel(time=valid_time_np, method="nearest")
+                gfs_reference_lead = gfs_reference_forecast_for_run.sel(time=valid_time_np, method="nearest")
+
+                if abs(gfs_analysis_lead.time.item() - valid_time_np) > np.timedelta64(1, 'h'):
+                    logger.warning(f"GFS Analysis for {valid_time_dt} not found. Skipping lead {lead_h}h.")
+                    continue
+                if abs(gfs_reference_lead.time.item() - valid_time_np) > np.timedelta64(1, 'h'):
+                    logger.warning(f"GFS Reference for {valid_time_dt} not found. Skipping lead {lead_h}h.")
+                    continue
+            except Exception as e_sel:
+                logger.warning(f"Could not select GFS data for lead {lead_h}h (valid time {valid_time_dt}): {e_sel}. Skipping lead.")
+                continue
+            
+            miner_forecast_lead = miner_forecast_ds.sel(time=valid_time_np, method="nearest")
+            if abs(miner_forecast_lead.time.item() - valid_time_np) > np.timedelta64(1, 'h'):
+                logger.warning(f"Miner forecast for {valid_time_dt} not found. Skipping lead {lead_h}h.")
                 continue
 
-        if not miner_dict_gfs:
-             logger.warning(f"[InitialWeight] Miner {miner_hotkey}: No variables prepared for MAE calculation after level selection/error handling.")
-             return miner_hotkey, None, None
+            for var_config in variables_to_score:
+                var_name = var_config['name']
+                level = var_config.get('level')
+                standard_name_for_clim = var_config.get('standard_name', var_name)
+                var_key = f"{var_name}{level}" if level else var_name
+                logger.debug(f"[Day1Score] Scoring Var: {var_key} at Lead: {lead_h}h")
 
-        # MAE for QC score vs GFS
-        common_keys_for_mae = list(set(miner_dict_gfs.keys()) & set(gfs_dict.keys()))
-        if not common_keys_for_mae:
-            logger.warning(f"[InitialWeight] Miner {miner_hotkey}: No common variables left after preparation for MAE calculation.")
-            return miner_hotkey, None, None
-            
-        final_miner_dict = {k: miner_dict_gfs[k] for k in common_keys_for_mae}
-        final_gfs_dict = {k: gfs_dict[k] for k in common_keys_for_mae}
+                day1_results["lead_time_scores"][lead_h][var_key] = {
+                    "skill_score": None, "acc": None, "sanity_checks": {},
+                    "clone_distance_mse": None, "clone_penalty_applied": None
+                }
+
+                try:
+                    miner_var_da_raw = miner_forecast_lead[var_name]
+                    truth_var_da = gfs_analysis_lead[var_name]
+                    ref_var_da = gfs_reference_lead[var_name]
+                    
+                    if level:
+                        miner_var_da_raw = miner_var_da_raw.sel(pressure_level=level, method="nearest")
+                        truth_var_da = truth_var_da.sel(pressure_level=level, method="nearest")
+                        ref_var_da = ref_var_da.sel(pressure_level=level, method="nearest")
+                        if abs(truth_var_da.pressure_level.item() - level) > 10:
+                             logger.warning(f"Truth data for {var_key} level {level} too far ({truth_var_da.pressure_level.item()}). Skipping.")
+                             continue
+                        if abs(miner_var_da_raw.pressure_level.item() - level) > 10:
+                             logger.warning(f"Miner data for {var_key} level {level} too far ({miner_var_da_raw.pressure_level.item()}). Skipping.")
+                             continue
+                        if abs(ref_var_da.pressure_level.item() - level) > 10:
+                             logger.warning(f"GFS Ref data for {var_key} level {level} too far ({ref_var_da.pressure_level.item()}). Skipping.")
+                             continue
+
+                    clone_distance_mse = await asyncio.to_thread(
+                        xs.mse, miner_var_da_raw, ref_var_da, dim=[d for d in miner_var_da_raw.dims if d.lower() in ('latitude', 'longitude', 'lat', 'lon')], weights=lat_weights, skipna=True
+                    )
+                    day1_results["lead_time_scores"][lead_h][var_key]["clone_distance_mse"] = float(clone_distance_mse.item())
+
+                    delta_thresholds_config = day1_scoring_config.get('clone_delta_thresholds', {})
+                    delta_for_var = delta_thresholds_config.get(var_key)
+                    clone_penalty = 0.0
+
+                    if delta_for_var is not None and clone_distance_mse < delta_for_var:
+                        gamma = day1_scoring_config.get('clone_penalty_gamma', 1.0)
+                        clone_penalty = gamma * (1.0 - (clone_distance_mse / delta_for_var))
+                        clone_penalty = max(0.0, clone_penalty)
+                        logger.warning(f"[Day1Score] GFS Clone Suspect: {var_key} at {lead_h}h for {miner_hotkey}. "
+                                     f"Distance MSE {clone_distance_mse.item():.4f} < Delta {delta_for_var:.4f}. Penalty: {clone_penalty:.4f}")
+                        day1_results["qc_passed_all_vars_leads"] = False
+                    day1_results["lead_time_scores"][lead_h][var_key]["clone_penalty_applied"] = clone_penalty
+
+                    # Select climatology for this variable, valid_time dayofyear and hour
+                    clim_dayofyear = pd.Timestamp(valid_time_dt).dayofyear
+                    clim_hour = valid_time_dt.hour 
+                    
+                    clim_hour_rounded = (clim_hour // 6) * 6 
+                    
+                    clim_var_da = era5_climatology[standard_name_for_clim].sel(
+                        dayofyear=clim_dayofyear, 
+                        hour=clim_hour_rounded,
+                        method="nearest"
+                    )
+                    if level and 'pressure_level' in clim_var_da.dims:
+                        clim_var_da = clim_var_da.sel(pressure_level=level, method="nearest")
+                    
+                    sanity_results = await perform_sanity_checks(
+                        forecast_da=miner_var_da_raw,
+                        reference_da_for_corr=ref_var_da,
+                        variable_name=var_key, 
+                        climatology_bounds_config=day1_scoring_config.get('climatology_bounds', {}),
+                        pattern_corr_threshold=day1_scoring_config.get('pattern_correlation_threshold', 0.3),
+                        lat_weights=lat_weights
+                    )
+                    day1_results["lead_time_scores"][lead_h][var_key]["sanity_checks"] = sanity_results
+
+                    if not sanity_results.get("climatology_passed") or \
+                       not sanity_results.get("pattern_correlation_passed"):
+                        logger.warning(f"[Day1Score] Sanity check failed for {var_key} at {lead_h}h. Skipping metrics.")
+                        day1_results["qc_passed_all_vars_leads"] = False
+                        continue # Skip scoring this variable if QC fails
+
+                    # Bias Correction
+                    forecast_bc_da = await calculate_bias_corrected_forecast(miner_var_da_raw, truth_var_da)
+
+                    # MSE Skill Score (uses bias-corrected forecast)
+                    skill_score = await calculate_mse_skill_score(forecast_bc_da, truth_var_da, ref_var_da, lat_weights)
+                    
+                    # clone penalty
+                    skill_score_after_penalty = skill_score - clone_penalty
+                    day1_results["lead_time_scores"][lead_h][var_key]["skill_score"] = skill_score_after_penalty
+
+                    if np.isfinite(skill_score_after_penalty): aggregated_skill_scores.append(skill_score_after_penalty)
+
+                    # ACC (uses raw miner data for anomalies)
+                    acc_score = await calculate_acc(miner_var_da_raw, truth_var_da, clim_var_da, lat_weights)
+                    day1_results["lead_time_scores"][lead_h][var_key]["acc"] = acc_score
+                    if np.isfinite(acc_score): aggregated_acc_scores.append(acc_score)
+                    
+                    # ACC Lower Bound Check
+                    if lead_h == 12 and np.isfinite(acc_score) and acc_score < day1_scoring_config.get("acc_lower_bound_d1", 0.6):
+                        logger.warning(f"[Day1Score] ACC for {var_key} at 12h ({acc_score:.3f}) is below threshold.")
+
+                except Exception as e_var:
+                    logger.error(f"[Day1Score] Error scoring {var_key} at {lead_h}h: {e_var}", exc_info=True)
+                    day1_results["lead_time_scores"][lead_h][var_key]["error"] = str(e_var)
+                    day1_results["qc_passed_all_vars_leads"] = False
+
+
+        clipped_skill_scores = [max(0.0, s) for s in aggregated_skill_scores if np.isfinite(s)]
+        scaled_acc_scores = [(a + 1.0) / 2.0 for a in aggregated_acc_scores if np.isfinite(a)]
+
+        avg_clipped_skill = np.mean(clipped_skill_scores) if clipped_skill_scores else 0.0
+        avg_scaled_acc = np.mean(scaled_acc_scores) if scaled_acc_scores else 0.0
         
-        gfs_mae_score = await calculate_mae_dict(final_miner_dict, final_gfs_dict)
-        if gfs_mae_score is None or not np.isfinite(gfs_mae_score):
-             logger.warning(f"[InitialWeight] Miner {miner_hotkey}: Invalid MAE score vs GFS ({gfs_mae_score}). Cannot calculate weight factor.")
-             return miner_hotkey, None, None
+        if not np.isfinite(avg_clipped_skill): avg_clipped_skill = 0.0
+        if not np.isfinite(avg_scaled_acc): avg_scaled_acc = 0.0
 
-        logger.debug(f"[InitialWeight] Miner {miner_hotkey}: MAE vs GFS = {gfs_mae_score:.4f}")
-
-        #TODO: QC vs OpenData
-        qc_vs_opendata_passed = True
-        if ecmwf_sparse_ds is not None:
-            common_vars_ecmwf = [v for v in ALL_EXPECTED_VARIABLES if v in miner_sparse_ds and v in ecmwf_sparse_ds]
-            if common_vars_ecmwf:
-                miner_dict_ecmwf = {var: miner_sparse_ds[var].values for var in common_vars_ecmwf}
-                ecmwf_dict = {var: ecmwf_sparse_ds[var].values for var in common_vars_ecmwf}
-                ecmwf_mae_score = await calculate_mae_dict(miner_dict_ecmwf, ecmwf_dict)
-                logger.debug(f"[InitialWeight] Placeholder: Miner {miner_hotkey}: MAE vs OpenData = {ecmwf_mae_score:.4f}")
-                # I need to add a logic here to set qc_vs_opendata_passed = False if MAE too high
-            else:
-                logger.warning(f"[InitialWeight] Miner {miner_hotkey}: No common vars with OpenData.")
-                
-        # QC Adjustment Factor Logic
-        qc_adjustment_factor = 1.0
-        mae_penalty_threshold = task_instance.config.get("qc_mae_penalty_threshold", DEFAULT_MAE_THRESHOLD_FOR_PENALTY)
-        
-        if gfs_mae_score > mae_penalty_threshold:
-            logger.warning(f"[InitialWeight] Miner {miner_hotkey}: MAE vs GFS ({gfs_mae_score:.4f}) exceeds threshold ({mae_penalty_threshold:.4f}). Applying penalty.")
-            qc_adjustment_factor *= max(0.1, 1.0 - (gfs_mae_score - mae_penalty_threshold) / mae_penalty_threshold) 
-            
-        if not qc_vs_opendata_passed:
-            logger.warning(f"[InitialWeight] Miner {miner_hotkey}: Failed OpenData QC check. Applying penalty.")
-            qc_adjustment_factor *= 0.7
-
-        weight_floor = task_instance.config.get("initial_weight_floor", DEFAULT_INITIAL_WEIGHT_FLOOR)
-        weight_cap = task_instance.config.get("initial_weight_cap", DEFAULT_INITIAL_WEIGHT_CAP)
-        qc_adjustment_factor = max(weight_floor, min(weight_cap, qc_adjustment_factor))
-        logger.debug(f"[InitialWeight] Miner {miner_hotkey}: QC Adjustment Factor = {qc_adjustment_factor:.4f}")
-
-        base_weight = 1.0 # Normalization happens in worker
-        if weight_source == "ERA5 History" and historical_weight is not None:
-            prelim_weight = historical_weight * qc_adjustment_factor 
-            logger.debug(f"[InitialWeight] Using ERA5 history ({historical_weight:.4f}) * QC factor ({qc_adjustment_factor:.4f}) = {prelim_weight:.4f}")
-        elif weight_source == "Initial History" and historical_weight is not None:
-             prelim_weight = historical_weight * qc_adjustment_factor
-             logger.debug(f"[InitialWeight] Using Initial history ({historical_weight:.4f}) * QC factor ({qc_adjustment_factor:.4f}) = {prelim_weight:.4f}")
+        if not aggregated_skill_scores and not aggregated_acc_scores:
+            logger.warning(f"[Day1Score] No valid skill or ACC scores to aggregate for {miner_hotkey}. Setting overall score to 0.")
+            day1_results["overall_day1_score"] = 0.0
+            day1_results["qc_passed_all_vars_leads"] = False
         else:
-            prelim_weight = base_weight * qc_adjustment_factor
-            logger.debug(f"[InitialWeight] Using Default base ({base_weight:.4f}) * QC factor ({qc_adjustment_factor:.4f}) = {prelim_weight:.4f}")
+            alpha = day1_scoring_config.get('alpha_skill', 0.5)
+            beta = day1_scoring_config.get('beta_acc', 0.5)
+            
+            if not np.isclose(alpha + beta, 1.0):
+                logger.warning(f"[Day1Score] Alpha ({alpha}) + Beta ({beta}) does not equal 1. Score may not be 0-1 bounded as intended.")
+            
+            normalized_score = alpha * avg_clipped_skill + beta * avg_scaled_acc
+            day1_results["overall_day1_score"] = normalized_score 
+            logger.info(f"[Day1Score] Miner {miner_hotkey}: AvgClippedSkill={avg_clipped_skill:.3f}, AvgScaledACC={avg_scaled_acc:.3f}, Overall Day1 Score={normalized_score:.3f}")
 
-        prelim_weight = max(0.0, prelim_weight) 
-
-        logger.info(f"[InitialWeight] Miner {miner_hotkey} (Resp: {response_id}): GFS MAE={gfs_mae_score:.4f}, Prelim Weight={prelim_weight:.4f}")
-        # (unnormalized) weight and the GFS MAE score
-        return miner_hotkey, prelim_weight, gfs_mae_score 
-        
-    except Exception as e_calc:
-        logger.error(f"[InitialWeight] Error calculating initial weight for {miner_hotkey} (Resp: {response_id}): {e_calc}", exc_info=True)
-        return miner_hotkey, None, None
+    except ConnectionError as e_conn:
+        logger.error(f"[Day1Score] Connection error for miner {miner_hotkey} (Job {job_id}): {e_conn}")
+        day1_results["error_message"] = f"ConnectionError: {str(e_conn)}"
+        day1_results["overall_day1_score"] = -np.inf 
+        day1_results["qc_passed_all_vars_leads"] = False
+    except asyncio.TimeoutError:
+        logger.error(f"[Day1Score] Timeout opening dataset for miner {miner_hotkey} (Job {job_id}).")
+        day1_results["error_message"] = "TimeoutError: Opening dataset timed out."
+        day1_results["overall_day1_score"] = -np.inf
+        day1_results["qc_passed_all_vars_leads"] = False
+    except Exception as e_main:
+        logger.error(f"[Day1Score] Main error for miner {miner_hotkey} (Resp: {response_id}): {e_main}", exc_info=True)
+        day1_results["error_message"] = str(e_main)
+        day1_results["overall_day1_score"] = -np.inf # Penalize on error
+        day1_results["qc_passed_all_vars_leads"] = False
     finally:
-        if miner_ds_lazy: miner_ds_lazy.close()
-        if miner_sparse_ds is not None: del miner_sparse_ds
-        if 'ecmwf_sparse_ds' in locals() and ecmwf_sparse_ds is not None and hasattr(ecmwf_sparse_ds, 'close'): 
-            try: ecmwf_sparse_ds.close()
-            except Exception: pass
+        if miner_forecast_ds:
+            try:
+                miner_forecast_ds.close()
+            except Exception:
+                pass
         gc.collect()
 
-
-async def calculate_era5_miner_score(task_instance: 'WeatherTask', 
-                                     response: Dict, 
-                                     target_datetimes: List[datetime], 
-                                     era5_ds: xr.Dataset
-                                     ) -> bool:
-    """
-    Calculates final score (vs ERA5) for a single miner and stores it.
-
-    Args:
-        task_instance: The WeatherTask instance.
-        response: DB row containing miner response details (response_id, miner_hotkey, kerchunk_json_url, job_id, run_id).
-        target_datetimes: List of specific datetimes to score against.
-        era5_ds: Pre-loaded xarray Dataset of ERA5 analysis for target_datetimes.
-
-    Returns:
-        True if scoring was successful and stored, False otherwise.
-    """
-    response_id = response['response_id']
-    miner_hotkey = response['miner_hotkey']
-    kerchunk_url = response.get('kerchunk_json_url')
-    job_id = response.get('job_id')
-    run_id = response.get('run_id') 
-    miner_sparse_ds = None
-    miner_ds_lazy = None
-    local_score = None
-
-    if run_id is None:
-         logger.error(f"[ScoringMech] Missing run_id in response data for miner {miner_hotkey}, resp_id {response_id}. Cannot store score.")
-         return False
-         
-    try:
-        logger.debug(f"[ScoringMech] Final ERA5 scoring for miner {miner_hotkey} (Resp: {response_id})")
-        if not kerchunk_url or not job_id: 
-            logger.warning(f"[ScoringMech] Missing kerchunk_url or job_id for {miner_hotkey} (Resp: {response_id}). Skipping final score.")
-            return False
-            
-        from ..processing.weather_logic import _request_fresh_token
-        token_response = await _request_fresh_token(task_instance, miner_hotkey, job_id)
-        if not token_response or 'access_token' not in token_response: 
-            logger.warning(f"[ScoringMech] Could not get token for {miner_hotkey} (Resp: {response_id}) for final scoring. Skipping.")
-            return False
-            
-        ref_spec = {'url': kerchunk_url, 'protocol': 'http', 'options': {'headers': {'Authorization': f'Bearer {token_response["access_token"]}'}}}
-        miner_ds_lazy = await _open_dataset_lazily(ref_spec)
-        if miner_ds_lazy is None: return False
-             
-        target_times_np = np.array(target_datetimes, dtype='datetime64[ns]')
-        miner_sparse_ds = await asyncio.to_thread(
-            lambda: miner_ds_lazy.sel(time=target_times_np, method='nearest').load()
-        )
-        era5_sparse_ds = era5_ds.sel(time=target_times_np, method='nearest')
-
-        common_vars = [v for v in ALL_EXPECTED_VARIABLES if v in miner_sparse_ds and v in era5_sparse_ds]
-        if not common_vars: 
-            logger.warning(f"[ScoringMech] Miner {miner_hotkey} (Resp: {response_id}): No common vars with ERA5. Skipping final score.")
-            return False
-        
-        miner_dict = {var: miner_sparse_ds[var].values for var in common_vars}
-        era5_dict = {var: era5_sparse_ds[var].values for var in common_vars}
-        
-        local_score = await calculate_rmse(miner_dict, gfs_dict=era5_dict) # Use ERA5 here!
-        if local_score is None or not np.isfinite(local_score): 
-            logger.warning(f"[ScoringMech] Miner {miner_hotkey} (Resp: {response_id}): Invalid ERA5 score calculated ({local_score}).")
-            return False
-        
-        await task_instance.db_manager.execute("""
-            INSERT INTO weather_miner_scores (response_id, run_id, score_type, score, calculation_time)
-            VALUES (:resp_id, :run_id, 'era5_rmse', :score, :ts)
-            ON CONFLICT (response_id, score_type) DO UPDATE SET 
-            score = EXCLUDED.score, calculation_time = EXCLUDED.calculation_time
-        """, {
-            "resp_id": response_id, "run_id": run_id, "score": local_score, "ts": datetime.now(timezone.utc)
-        })
-        logger.info(f"[ScoringMech] Stored final ERA5 score ({local_score:.4f}) for miner {miner_hotkey} (Resp ID: {response_id})")
-        return True
-        
-    except Exception as e_score:
-        logger.error(f"[ScoringMech] Error during final ERA5 scoring for {miner_hotkey} (Resp: {response_id}): {e_score}", exc_info=False)
-        logger.debug(traceback.format_exc())
-        return False
-    finally:
-        if miner_ds_lazy: miner_ds_lazy.close()
-        if miner_sparse_ds is not None: del miner_sparse_ds
-        gc.collect()
-
-
-async def calculate_era5_ensemble_score(task_instance: 'WeatherTask', 
-                                        ensemble_details: Dict, 
-                                        target_datetimes: List[datetime], 
-                                        ground_truth_ds: xr.Dataset
-                                        ) -> Optional[float]:
-    """
-    Calculates final score (vs ERA5) for a completed ensemble forecast.
-
-    Args:
-        task_instance: The WeatherTask instance.
-        ensemble_details: DB row with ensemble info (ensemble_path, ensemble_kerchunk_path).
-        target_datetimes: List of specific datetimes to score against.
-        ground_truth_ds: Pre-loaded xarray Dataset of ERA5 analysis for target_datetimes.
-
-    Returns:
-        Calculated score (float) or None if scoring fails.
-    """
-    ensemble_score = None
-    ensemble_ds = None
-    
-    try:
-        ensemble_path = ensemble_details.get('ensemble_path')
-        ensemble_kerchunk_path = ensemble_details.get('ensemble_kerchunk_path')
-        
-        if ensemble_kerchunk_path:
-            logger.debug(f"[ScoringMech] Loading ensemble via Kerchunk: {ensemble_kerchunk_path}")
-            ref_spec = {'url': ensemble_kerchunk_path, 'protocol': 'file'}
-            ensemble_ds = await _open_dataset_lazily(ref_spec)
-            if ensemble_ds: ensemble_ds = await asyncio.to_thread(ensemble_ds.load)
-        elif ensemble_path and os.path.exists(ensemble_path):
-            logger.debug(f"[ScoringMech] Loading ensemble via NetCDF: {ensemble_path}")
-            ensemble_ds = await asyncio.to_thread(xr.open_dataset, ensemble_path)
-        else:
-            logger.warning(f"[ScoringMech] Ensemble file path/kerchunk missing/invalid: Path='{ensemble_path}', Kerchunk='{ensemble_kerchunk_path}'")
-            return None
-
-        if ensemble_ds:
-            logger.info("[ScoringMech] Calculating final ensemble score vs ERA5...")
-            target_times_np = np.array(target_datetimes, dtype='datetime64[ns]')
-            common_vars = [v for v in ALL_EXPECTED_VARIABLES if v in ensemble_ds and v in ground_truth_ds]
-            
-            if not common_vars:
-                 logger.warning(f"[ScoringMech] No common vars between ensemble and ERA5.")
-                 return None
-                 
-            ensemble_subset = ensemble_ds[common_vars].sel(time=target_times_np, method='nearest')
-            ground_truth_aligned = ground_truth_ds[common_vars].sel(time=target_times_np, method='nearest')
-            
-            ensemble_dict = {var: ensemble_subset[var].values for var in common_vars}
-            ground_truth_dict = {var: ground_truth_aligned[var].values for var in common_vars}
-            
-            calculated_score = await calculate_rmse(ensemble_dict, ground_truth_dict)
-            
-            if calculated_score is not None and np.isfinite(calculated_score):
-                ensemble_score = float(calculated_score) 
-                logger.info(f"[ScoringMech] Calculated final ensemble score (RMSE): {ensemble_score:.4f}")
-            else:
-                 logger.warning(f"[ScoringMech] Invalid ensemble score calculated ({calculated_score}).")
-                 
-        else:
-            logger.warning("[ScoringMech] Failed to load ensemble dataset.")
-
-    except Exception as score_err:
-        logger.error(f"[ScoringMech] Error scoring ensemble: {score_err}", exc_info=True)
-    finally:
-            if ensemble_ds and hasattr(ensemble_ds, 'close'): ensemble_ds.close()
-            gc.collect()
-            
-    return ensemble_score
+    logger.info(f"[Day1Score] Completed for {miner_hotkey}. Final score: {day1_results['overall_day1_score']}, QC Passed: {day1_results['qc_passed_all_vars_leads']}")
+    return day1_results

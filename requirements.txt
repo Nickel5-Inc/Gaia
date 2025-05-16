@@ -39,6 +39,7 @@ filelock==3.16.1
 fonttools==4.55.0
 frozenlist==1.5.0
 fsspec==2024.10.0
+gcsfs
 h11==0.14.0
 h3==4.1.2
 h5netcdf==1.4.1

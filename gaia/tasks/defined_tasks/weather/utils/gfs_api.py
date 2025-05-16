@@ -319,9 +319,10 @@ async def fetch_gfs_analysis_data(
                 try:
                     # --- MODIFICATION FOR TESTING ---
                     # Subtract 24 hours from the target_time to fetch older data
-                    modified_target_time = target_time - timedelta(hours=24) 
-                    logger.warning(f"MODIFIED FOR TESTING: Original target_time {target_time}, fetching for {modified_target_time}")
+                    # modified_target_time = target_time - timedelta(hours=24) 
+                    # logger.warning(f"MODIFIED FOR TESTING: Original target_time {target_time}, fetching for {modified_target_time}")
                     # --- END MODIFICATION ---
+                    modified_target_time = target_time # Reverted: Use actual target_time
                     
                     base_url = _get_gfs_cycle_url(modified_target_time)
                     if not base_url:
