@@ -492,7 +492,7 @@ class BaseDatabaseManager(ABC):
                     self._active_operations += 1
                 
                 async with session.begin():
-                    await self._test_connection(session)
+                    # await self._test_connection(session) # Temporarily disabled for testing
                     yield session
                 
                 # Update circuit breaker on success

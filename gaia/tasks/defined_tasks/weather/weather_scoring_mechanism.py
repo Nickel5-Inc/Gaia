@@ -9,11 +9,15 @@ import uuid
 import numpy as np
 import xarray as xr
 import pandas as pd
+import xskillscore as xs
 
 from fiber.logging_utils import get_logger
 from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple
 if TYPE_CHECKING:
     from ..weather_task import WeatherTask 
+
+from .processing.weather_logic import _request_fresh_token
+from .utils.remote_access import open_verified_remote_zarr_dataset
 
 from .weather_scoring.metrics import (
     calculate_bias_corrected_forecast,
@@ -37,8 +41,8 @@ async def evaluate_miner_forecast_day1(
     gfs_analysis_data_for_run: xr.Dataset,
     gfs_reference_forecast_for_run: xr.Dataset,
     era5_climatology: xr.Dataset,
-    day1_scoring_config: Dict, # Passed from initial_scoring_worker
-    run_gfs_init_time: datetime # GFS 00Z init time for the current run
+    day1_scoring_config: Dict,
+    run_gfs_init_time: datetime
 ) -> Dict:
     """
     Performs Day-1 scoring for a single miner's forecast.
@@ -59,15 +63,15 @@ async def evaluate_miner_forecast_day1(
         "miner_uid": miner_uid,
         "run_id": run_id,
         "overall_day1_score": None,
-        "qc_passed_all_vars_leads": True, # Assume pass until a failure
-        "lead_time_scores": {}, # {lead_hour: {variable_level: {skill, acc, sanity_status}}}
+        "qc_passed_all_vars_leads": True,
+        "lead_time_scores": {},
         "error_message": None
     }
 
     miner_forecast_ds: Optional[xr.Dataset] = None
 
     try:
-        from ..processing.weather_logic import _request_fresh_token
+        from .processing.weather_logic import _request_fresh_token
         
         token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, job_id)
         if token_data_tuple is None:
@@ -97,150 +101,261 @@ async def evaluate_miner_forecast_day1(
         if miner_forecast_ds is None:
             raise ConnectionError(f"Failed to open verified Zarr dataset for miner {miner_hotkey}")
 
-        # Prepare latitude weights
-        lat_coord_name = None
-        if 'latitude' in miner_forecast_ds.coords: lat_coord_name = 'latitude'
-        elif 'lat' in miner_forecast_ds.coords: lat_coord_name = 'lat'
-        
-        if not lat_coord_name:
-            raise ValueError("Latitude coordinate ('latitude' or 'lat') not found in miner's forecast dataset.")
-        lat_weights = _calculate_latitude_weights(miner_forecast_ds[lat_coord_name])
+        hardcoded_valid_times: Optional[List[datetime]] = day1_scoring_config.get("hardcoded_valid_times_for_eval")
+        if hardcoded_valid_times:
+            logger.warning(f"[Day1Score] USING HARDCODED VALID TIMES FOR EVALUATION: {hardcoded_valid_times}")
+            times_to_evaluate = hardcoded_valid_times
+        else:
+            lead_times_to_score_hours: List[int] = day1_scoring_config.get('lead_times_hours', task_instance.config.get('initial_scoring_lead_hours', [6,12]))
+            times_to_evaluate = [run_gfs_init_time + timedelta(hours=h) for h in lead_times_to_score_hours]
+            logger.info(f"[Day1Score] Using lead_hours {lead_times_to_score_hours} relative to GFS init {run_gfs_init_time} for evaluation.")
 
-        lead_times_to_score_hours: List[int] = day1_scoring_config.get('lead_times_hours', [6, 12])
         variables_to_score: List[Dict] = day1_scoring_config.get('variables_levels_to_score', [])
         
         aggregated_skill_scores = []
         aggregated_acc_scores = []
         
-        for lead_h in lead_times_to_score_hours:
-            valid_time_dt = run_gfs_init_time + timedelta(hours=lead_h)
-            valid_time_np = np.datetime64(valid_time_dt)
-            logger.info(f"[Day1Score] Processing Lead: {lead_h}h (Valid Time: {valid_time_dt})")
-            day1_results["lead_time_scores"][lead_h] = {}
+        for valid_time_dt in times_to_evaluate:
+            effective_lead_h = int((valid_time_dt - run_gfs_init_time).total_seconds() / 3600)
 
-            # Select truth and reference data for this lead time
+            valid_time_np = np.datetime64(valid_time_dt)
+            logger.info(f"[Day1Score] Processing Valid Time: {valid_time_dt} (Effective Lead: {effective_lead_h}h from {run_gfs_init_time})")
+
+            time_key_for_results = effective_lead_h 
+            day1_results["lead_time_scores"][time_key_for_results] = {}
+
             try:
                 gfs_analysis_lead = gfs_analysis_data_for_run.sel(time=valid_time_np, method="nearest")
                 gfs_reference_lead = gfs_reference_forecast_for_run.sel(time=valid_time_np, method="nearest")
 
-                if abs(gfs_analysis_lead.time.item() - valid_time_np) > np.timedelta64(1, 'h'):
-                    logger.warning(f"GFS Analysis for {valid_time_dt} not found. Skipping lead {lead_h}h.")
+                selected_time_gfs_analysis = np.datetime64(gfs_analysis_lead.time.data.item(), 'ns')
+                if abs(selected_time_gfs_analysis - valid_time_np) > np.timedelta64(1, 'h'):
+                    logger.warning(f"GFS Analysis time {selected_time_gfs_analysis} too far from target {valid_time_np} for lead {effective_lead_h}h. Skipping lead.")
                     continue
-                if abs(gfs_reference_lead.time.item() - valid_time_np) > np.timedelta64(1, 'h'):
-                    logger.warning(f"GFS Reference for {valid_time_dt} not found. Skipping lead {lead_h}h.")
+                
+                selected_time_gfs_reference = np.datetime64(gfs_reference_lead.time.data.item(), 'ns')
+                if abs(selected_time_gfs_reference - valid_time_np) > np.timedelta64(1, 'h'):
+                    logger.warning(f"GFS Reference time {selected_time_gfs_reference} too far from target {valid_time_np} for lead {effective_lead_h}h. Skipping lead.")
                     continue
+
             except Exception as e_sel:
-                logger.warning(f"Could not select GFS data for lead {lead_h}h (valid time {valid_time_dt}): {e_sel}. Skipping lead.")
+                logger.warning(f"Could not select GFS data for lead {effective_lead_h}h (valid time {valid_time_dt}): {e_sel}. Skipping lead.")
                 continue
             
-            miner_forecast_lead = miner_forecast_ds.sel(time=valid_time_np, method="nearest")
-            if abs(miner_forecast_lead.time.item() - valid_time_np) > np.timedelta64(1, 'h'):
-                logger.warning(f"Miner forecast for {valid_time_dt} not found. Skipping lead {lead_h}h.")
+            valid_time_np_ns = np.datetime64(valid_time_dt, 'ns')
+
+            selection_label_for_miner = valid_time_np_ns
+            if np.issubdtype(miner_forecast_ds.time.dtype, np.integer):
+                logger.warning(f"[Day1Score] Miner forecast time coordinate is integer type ({miner_forecast_ds.time.dtype}). Attempting to cast selection label.")
+                try:
+                    selection_label_for_miner = valid_time_np_ns.astype(np.int64)
+                    logger.info(f"[Day1Score] Casting valid_time_np_ns to int64 for miner selection: {selection_label_for_miner}")
+                except Exception as e_cast:
+                    logger.error(f"[Day1Score] Failed to cast datetime64[ns] to int64 for miner selection: {e_cast}. Skipping lead.")
+                    continue
+            elif miner_forecast_ds.time.dtype != valid_time_np_ns.dtype:
+                 logger.warning(f"[Day1Score] Miner forecast time dtype ({miner_forecast_ds.time.dtype}) differs from selection label dtype ({valid_time_np_ns.dtype}). Proceeding with caution for .sel().")
+
+            try:
+                miner_forecast_lead = miner_forecast_ds.sel(time=selection_label_for_miner, method="nearest")
+            except TypeError as te_sel_miner:
+                logger.error(f"[Day1Score] TypeError during miner_forecast_ds.sel(): {te_sel_miner}. This often indicates incompatible time coordinate types. Miner time dtype: {miner_forecast_ds.time.dtype}, Selection label type: {type(selection_label_for_miner)}, value: {selection_label_for_miner}. Skipping lead.")
+                continue
+            except Exception as e_sel_miner:
+                logger.error(f"[Day1Score] Error selecting from miner_forecast_ds: {e_sel_miner}. Skipping lead.")
+                continue
+
+            if abs(miner_forecast_lead.time.item() - selection_label_for_miner) > np.timedelta64(1, 'h') if not np.issubdtype(miner_forecast_ds.time.dtype, np.integer) else False:
+                logger.warning(f"Miner forecast for {valid_time_dt} (selected time: {miner_forecast_lead.time.data}) not found or too far. Skipping lead {effective_lead_h}h.")
                 continue
 
             for var_config in variables_to_score:
                 var_name = var_config['name']
-                level = var_config.get('level')
+                var_level = var_config.get('level')
                 standard_name_for_clim = var_config.get('standard_name', var_name)
-                var_key = f"{var_name}{level}" if level else var_name
-                logger.debug(f"[Day1Score] Scoring Var: {var_key} at Lead: {lead_h}h")
+                var_key = f"{var_name}{var_level}" if var_level else var_name
+                logger.debug(f"[Day1Score] Scoring Var: {var_key} at Valid Time: {valid_time_dt}")
 
-                day1_results["lead_time_scores"][lead_h][var_key] = {
+                day1_results["lead_time_scores"][time_key_for_results][var_key] = {
                     "skill_score": None, "acc": None, "sanity_checks": {},
                     "clone_distance_mse": None, "clone_penalty_applied": None
                 }
 
                 try:
-                    miner_var_da_raw = miner_forecast_lead[var_name]
-                    truth_var_da = gfs_analysis_lead[var_name]
-                    ref_var_da = gfs_reference_lead[var_name]
-                    
-                    if level:
-                        miner_var_da_raw = miner_var_da_raw.sel(pressure_level=level, method="nearest")
-                        truth_var_da = truth_var_da.sel(pressure_level=level, method="nearest")
-                        ref_var_da = ref_var_da.sel(pressure_level=level, method="nearest")
-                        if abs(truth_var_da.pressure_level.item() - level) > 10:
-                             logger.warning(f"Truth data for {var_key} level {level} too far ({truth_var_da.pressure_level.item()}). Skipping.")
-                             continue
-                        if abs(miner_var_da_raw.pressure_level.item() - level) > 10:
-                             logger.warning(f"Miner data for {var_key} level {level} too far ({miner_var_da_raw.pressure_level.item()}). Skipping.")
-                             continue
-                        if abs(ref_var_da.pressure_level.item() - level) > 10:
-                             logger.warning(f"GFS Ref data for {var_key} level {level} too far ({ref_var_da.pressure_level.item()}). Skipping.")
-                             continue
+                    miner_var_da_unaligned = miner_forecast_lead[var_name]
+                    truth_var_da_unaligned = gfs_analysis_lead[var_name]
+                    ref_var_da_unaligned = gfs_reference_lead[var_name]
 
-                    clone_distance_mse = await asyncio.to_thread(
-                        xs.mse, miner_var_da_raw, ref_var_da, dim=[d for d in miner_var_da_raw.dims if d.lower() in ('latitude', 'longitude', 'lat', 'lon')], weights=lat_weights, skipna=True
+                    if var_level:
+                        miner_var_da_selected = miner_var_da_unaligned.sel(pressure_level=var_level, method="nearest")
+                        truth_var_da_selected = truth_var_da_unaligned.sel(pressure_level=var_level, method="nearest")
+                        ref_var_da_selected = ref_var_da_unaligned.sel(pressure_level=var_level, method="nearest")
+                        
+                        if abs(truth_var_da_selected.pressure_level.item() - var_level) > 10:
+                             logger.warning(f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected.pressure_level.item()}). Skipping.")
+                             continue
+                        if abs(miner_var_da_selected.pressure_level.item() - var_level) > 10:
+                             logger.warning(f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected.pressure_level.item()}). Skipping.")
+                             continue
+                        if abs(ref_var_da_selected.pressure_level.item() - var_level) > 10:
+                             logger.warning(f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected.pressure_level.item()}). Skipping.")
+                             continue
+                    else:
+                        miner_var_da_selected = miner_var_da_unaligned
+                        truth_var_da_selected = truth_var_da_unaligned
+                        ref_var_da_selected = ref_var_da_unaligned
+
+                    target_grid_da = truth_var_da_selected 
+                    temp_spatial_dims = [d for d in target_grid_da.dims if d.lower() in ('latitude', 'longitude', 'lat', 'lon')]
+                    actual_lat_dim_in_target_for_ordering = next((d for d in temp_spatial_dims if d.lower() in ('latitude', 'lat')), None)
+
+                    if actual_lat_dim_in_target_for_ordering:
+                        lat_coord_values = target_grid_da[actual_lat_dim_in_target_for_ordering].values
+                        if len(lat_coord_values) > 1 and lat_coord_values[0] < lat_coord_values[-1]:
+                            logger.info(f"[Day1Score] Latitude coordinate '{actual_lat_dim_in_target_for_ordering}' in target_grid_da is ascending. Flipping to descending order for consistency.")
+                            target_grid_da = target_grid_da.isel({actual_lat_dim_in_target_for_ordering: slice(None, None, -1)})
+                        else:
+                            logger.debug(f"[Day1Score] Latitude coordinate '{actual_lat_dim_in_target_for_ordering}' in target_grid_da is already descending or has too few points to determine order.")
+                    else:
+                        logger.warning("[Day1Score] Could not determine latitude dimension in target_grid_da to check/ensure descending order.")
+
+                    def _standardize_spatial_dims(data_array: xr.DataArray) -> xr.DataArray:
+                        if not isinstance(data_array, xr.DataArray): return data_array
+                        rename_dict = {}
+                        for dim_name in data_array.dims:
+                            if dim_name.lower() in ('latitude', 'lat_0'): rename_dict[dim_name] = 'lat'
+                            elif dim_name.lower() in ('longitude', 'lon_0'): rename_dict[dim_name] = 'lon'
+                        if rename_dict:
+                            logger.debug(f"[Day1Score] Standardizing spatial dims for variable {var_key}: Renaming {rename_dict}")
+                            return data_array.rename(rename_dict)
+                        return data_array
+
+                    miner_var_da_selected_std = _standardize_spatial_dims(miner_var_da_selected)
+                    target_grid_da_std = _standardize_spatial_dims(target_grid_da)
+                    ref_var_da_selected_std = _standardize_spatial_dims(ref_var_da_selected)
+
+
+                    miner_var_da_aligned = miner_var_da_selected_std.interp_like(
+                        target_grid_da_std, method="linear", kwargs={"fill_value": None}
                     )
-                    day1_results["lead_time_scores"][lead_h][var_key]["clone_distance_mse"] = float(clone_distance_mse.item())
+                    truth_var_da_final = target_grid_da_std
+                    
+                    ref_var_da_aligned = ref_var_da_selected_std.interp_like(
+                        target_grid_da_std, method="linear", kwargs={"fill_value": None}
+                    )
+                    
+
+                    broadcasted_weights_final = None
+                    spatial_dims_for_metric = [d for d in truth_var_da_final.dims if d in ('lat', 'lon')]
+                    
+                    actual_lat_dim_in_target = 'lat' if 'lat' in truth_var_da_final.dims else None
+
+
+                    if actual_lat_dim_in_target:
+                        try:
+                            target_lat_coord = truth_var_da_final[actual_lat_dim_in_target]
+                            one_d_lat_weights_target = _calculate_latitude_weights(target_lat_coord)
+                            _, broadcasted_weights_final = xr.broadcast(truth_var_da_final, one_d_lat_weights_target)
+                            logger.debug(f"[Day1Score] For {var_key}, using target_grid_da_std derived weights. Broadcasted weights dims: {broadcasted_weights_final.dims}, shape: {broadcasted_weights_final.shape}")
+                        except Exception as e_broadcast_weights:
+                            logger.error(f"[Day1Score] Failed to create/broadcast latitude weights based on target_grid_da_std for {var_key}: {e_broadcast_weights}. Proceeding without weights for this variable.")
+                            broadcasted_weights_final = None
+                    else:
+                        logger.warning(f"[Day1Score] For {var_key}, 'lat' dimension not found in truth_var_da_final (dims: {truth_var_da_final.dims}). No weights applied.")
+                    
+                    def _get_metric_scalar_value(metric_fn, *args, **kwargs):
+                        res = metric_fn(*args, **kwargs)
+                        if hasattr(res, 'compute'):
+                            res = res.compute()
+                        return float(res.item())
+
+                    clone_distance_mse_val = await asyncio.to_thread(
+                        _get_metric_scalar_value,
+                        xs.mse, 
+                        miner_var_da_aligned, 
+                        ref_var_da_aligned, 
+                        dim=spatial_dims_for_metric, 
+                        weights=broadcasted_weights_final, 
+                        skipna=True
+                    )
+                    day1_results["lead_time_scores"][time_key_for_results][var_key]["clone_distance_mse"] = clone_distance_mse_val
 
                     delta_thresholds_config = day1_scoring_config.get('clone_delta_thresholds', {})
                     delta_for_var = delta_thresholds_config.get(var_key)
                     clone_penalty = 0.0
 
-                    if delta_for_var is not None and clone_distance_mse < delta_for_var:
+                    if delta_for_var is not None and clone_distance_mse_val < delta_for_var:
                         gamma = day1_scoring_config.get('clone_penalty_gamma', 1.0)
-                        clone_penalty = gamma * (1.0 - (clone_distance_mse / delta_for_var))
+                        clone_penalty = gamma * (1.0 - (clone_distance_mse_val / delta_for_var))
                         clone_penalty = max(0.0, clone_penalty)
-                        logger.warning(f"[Day1Score] GFS Clone Suspect: {var_key} at {lead_h}h for {miner_hotkey}. "
-                                     f"Distance MSE {clone_distance_mse.item():.4f} < Delta {delta_for_var:.4f}. Penalty: {clone_penalty:.4f}")
+                        logger.warning(f"[Day1Score] GFS Clone Suspect: {var_key} at {effective_lead_h}h for {miner_hotkey}. "
+                                     f"Distance MSE {clone_distance_mse_val:.4f} < Delta {delta_for_var:.4f}. Penalty: {clone_penalty:.4f}")
                         day1_results["qc_passed_all_vars_leads"] = False
-                    day1_results["lead_time_scores"][lead_h][var_key]["clone_penalty_applied"] = clone_penalty
+                    day1_results["lead_time_scores"][time_key_for_results][var_key]["clone_penalty_applied"] = clone_penalty
 
-                    # Select climatology for this variable, valid_time dayofyear and hour
                     clim_dayofyear = pd.Timestamp(valid_time_dt).dayofyear
                     clim_hour = valid_time_dt.hour 
                     
                     clim_hour_rounded = (clim_hour // 6) * 6 
                     
-                    clim_var_da = era5_climatology[standard_name_for_clim].sel(
+                    clim_var_da_raw = era5_climatology[standard_name_for_clim].sel(
                         dayofyear=clim_dayofyear, 
                         hour=clim_hour_rounded,
                         method="nearest"
                     )
-                    if level and 'pressure_level' in clim_var_da.dims:
-                        clim_var_da = clim_var_da.sel(pressure_level=level, method="nearest")
+                    clim_var_da_raw_std = _standardize_spatial_dims(clim_var_da_raw)
+
+                    clim_var_to_interpolate = clim_var_da_raw_std
+                    if var_level and 'pressure_level' in clim_var_to_interpolate.dims:
+                        clim_var_to_interpolate = clim_var_to_interpolate.sel(pressure_level=var_level, method="nearest")
+                        if abs(clim_var_to_interpolate.pressure_level.item() - var_level) > 10:
+                            logger.warning(f"[Day1Score] Climatology for {var_key} at target level {var_level} was found at {clim_var_to_interpolate.pressure_level.item()}. Using this nearest level data.")
                     
+                    clim_var_da_aligned = clim_var_to_interpolate.interp_like(
+                        truth_var_da_final, method="linear", kwargs={"fill_value": None}
+                    )
+                    
+
                     sanity_results = await perform_sanity_checks(
-                        forecast_da=miner_var_da_raw,
-                        reference_da_for_corr=ref_var_da,
+                        forecast_da=miner_var_da_aligned,
+                        reference_da_for_corr=ref_var_da_aligned,
                         variable_name=var_key, 
                         climatology_bounds_config=day1_scoring_config.get('climatology_bounds', {}),
                         pattern_corr_threshold=day1_scoring_config.get('pattern_correlation_threshold', 0.3),
-                        lat_weights=lat_weights
+                        lat_weights=broadcasted_weights_final
                     )
-                    day1_results["lead_time_scores"][lead_h][var_key]["sanity_checks"] = sanity_results
+                    day1_results["lead_time_scores"][time_key_for_results][var_key]["sanity_checks"] = sanity_results
 
                     if not sanity_results.get("climatology_passed") or \
                        not sanity_results.get("pattern_correlation_passed"):
-                        logger.warning(f"[Day1Score] Sanity check failed for {var_key} at {lead_h}h. Skipping metrics.")
+                        logger.warning(f"[Day1Score] Sanity check failed for {var_key} at {effective_lead_h}h. Skipping metrics.")
                         day1_results["qc_passed_all_vars_leads"] = False
-                        continue # Skip scoring this variable if QC fails
+                        continue
 
                     # Bias Correction
-                    forecast_bc_da = await calculate_bias_corrected_forecast(miner_var_da_raw, truth_var_da)
+                    forecast_bc_da = await calculate_bias_corrected_forecast(miner_var_da_aligned, truth_var_da_final)
 
-                    # MSE Skill Score (uses bias-corrected forecast)
-                    skill_score = await calculate_mse_skill_score(forecast_bc_da, truth_var_da, ref_var_da, lat_weights)
+                    # MSE Skill Score
+                    skill_score = await calculate_mse_skill_score(forecast_bc_da, truth_var_da_final, ref_var_da_aligned, broadcasted_weights_final)
                     
                     # clone penalty
                     skill_score_after_penalty = skill_score - clone_penalty
-                    day1_results["lead_time_scores"][lead_h][var_key]["skill_score"] = skill_score_after_penalty
+                    day1_results["lead_time_scores"][time_key_for_results][var_key]["skill_score"] = skill_score_after_penalty
 
                     if np.isfinite(skill_score_after_penalty): aggregated_skill_scores.append(skill_score_after_penalty)
-
-                    # ACC (uses raw miner data for anomalies)
-                    acc_score = await calculate_acc(miner_var_da_raw, truth_var_da, clim_var_da, lat_weights)
-                    day1_results["lead_time_scores"][lead_h][var_key]["acc"] = acc_score
+                    
+                    # ACC
+                    acc_score = await calculate_acc(miner_var_da_aligned, truth_var_da_final, clim_var_da_aligned, broadcasted_weights_final)
+                    day1_results["lead_time_scores"][time_key_for_results][var_key]["acc"] = acc_score
                     if np.isfinite(acc_score): aggregated_acc_scores.append(acc_score)
                     
                     # ACC Lower Bound Check
-                    if lead_h == 12 and np.isfinite(acc_score) and acc_score < day1_scoring_config.get("acc_lower_bound_d1", 0.6):
-                        logger.warning(f"[Day1Score] ACC for {var_key} at 12h ({acc_score:.3f}) is below threshold.")
+                    if effective_lead_h == 12 and np.isfinite(acc_score) and acc_score < day1_scoring_config.get("acc_lower_bound_d1", 0.6):
+                        logger.warning(f"[Day1Score] ACC for {var_key} at valid time {valid_time_dt} (Eff. Lead 12h) ({acc_score:.3f}) is below threshold.")
 
                 except Exception as e_var:
-                    logger.error(f"[Day1Score] Error scoring {var_key} at {lead_h}h: {e_var}", exc_info=True)
-                    day1_results["lead_time_scores"][lead_h][var_key]["error"] = str(e_var)
+                    logger.error(f"[Day1Score] Error scoring {var_key} at {valid_time_dt}: {e_var}", exc_info=True)
+                    day1_results["lead_time_scores"][time_key_for_results][var_key]["error"] = str(e_var)
                     day1_results["qc_passed_all_vars_leads"] = False
 
 

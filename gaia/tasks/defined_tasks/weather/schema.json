@@ -102,6 +102,12 @@
                 "on_delete": "CASCADE"
             }
         ],
+        "unique_constraints": [
+            {
+                "name": "uq_weather_miner_scores_response_id_score_type",
+                "columns": ["response_id", "score_type"]
+            }
+        ],
         "comment": "Stores calculated scores (e.g., gfs_rmse, era5_rmse) for each miner response."
     },
     "weather_ensemble_forecasts": {

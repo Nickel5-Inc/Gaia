@@ -92,7 +92,6 @@ async def fetch_era5_data(
         'date': dates,
         'time': times,
         'grid': '0.25/0.25', # 0.25 degree resolution
-        # 'area': [90, -180, -90, 180], # Global coverage
     }
 
     single_level_request = common_request.copy()
@@ -135,8 +134,15 @@ async def fetch_era5_data(
             ds_sl = xr.open_dataset(temp_sl_file)
             ds_pl = xr.open_dataset(temp_pl_file)
 
+            logger.info(f"Original ds_sl variables: {list(ds_sl.variables)}")
+            logger.info(f"Original ds_sl data_vars: {list(ds_sl.data_vars)}")
+            logger.info(f"Original ds_sl coords: {list(ds_sl.coords)}")
+
             ds_sl_renamed = ds_sl.rename({k: v for k, v in ERA5_SINGLE_LEVEL_VARS.items() if k in ds_sl})
             ds_pl_renamed = ds_pl.rename({k: v for k, v in ERA5_PRESSURE_LEVEL_VARS.items() if k in ds_pl})
+            
+            logger.info(f"Renamed ds_sl_renamed data_vars: {list(ds_sl_renamed.data_vars)}")
+            logger.info(f"Renamed ds_pl_renamed data_vars: {list(ds_pl_renamed.data_vars)}")
             
             ds_combined = xr.merge([ds_sl_renamed, ds_pl_renamed])
 
@@ -181,7 +187,7 @@ async def fetch_era5_data(
 
         except Exception as e:
             logger.error(f"Error during ERA5 sync fetch/process: {e}")
-            logger.debug(traceback.format_exc())
+            logger.info(traceback.format_exc())
             return None
         finally:
             if temp_sl_file and temp_sl_file.exists():

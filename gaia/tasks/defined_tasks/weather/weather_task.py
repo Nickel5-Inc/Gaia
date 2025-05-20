@@ -47,6 +47,7 @@ from .processing.weather_logic import (
 from .processing.weather_workers import (
     initial_scoring_worker, 
     finalize_scores_worker, 
+    cleanup_worker,
     run_inference_background,
     fetch_and_hash_gfs_task
 )
@@ -92,7 +93,7 @@ def _load_config(self):
     config['era5_cache_retention_days'] = int(os.getenv('WEATHER_ERA5_CACHE_RETENTION_DAYS', '30'))
     config['ensemble_retention_days'] = int(os.getenv('WEATHER_ENSEMBLE_RETENTION_DAYS', '14'))
     config['db_run_retention_days'] = int(os.getenv('WEATHER_DB_RUN_RETENTION_DAYS', '90'))
-    config['run_hour_utc'] = int(os.getenv('WEATHER_RUN_HOUR_UTC', '1')) # Example: 1 UTC
+    config['run_hour_utc'] = int(os.getenv('WEATHER_RUN_HOUR_UTC', '1'))
     config['run_minute_utc'] = int(os.getenv('WEATHER_RUN_MINUTE_UTC', '0'))
     config['validator_hash_wait_minutes'] = int(os.getenv('WEATHER_VALIDATOR_HASH_WAIT_MINUTES', '5'))
 
@@ -120,9 +121,10 @@ def _load_config(self):
         config['day1_variables_levels_to_score'] = default_day1_vars_levels
 
     default_day1_clim_bounds = {
-        "2t": (180, 340), "msl": (90000, 110000),
-        "t500": (200, 300), "t850": (220, 320),
-        "z500": (4000, 6000)
+        "2t": (180, 340),                             # Kelvin
+        "msl": (90000, 110000),                       # Pascals
+        "t850": (220, 320),                           # Kelvin for 850hPa Temperature
+        "z500": (45000, 60000)                        # m^2/s^2 for Geopotential at 500hPa (approx 4500-6000 gpm)
     }
     try:
         day1_clim_bounds_json = os.getenv('WEATHER_DAY1_CLIMATOLOGY_BOUNDS_JSON')
@@ -136,13 +138,13 @@ def _load_config(self):
     config['day1_alpha_skill'] = float(os.getenv('WEATHER_DAY1_ALPHA_SKILL', '0.6'))
     config['day1_beta_acc'] = float(os.getenv('WEATHER_DAY1_BETA_ACC', '0.4'))
 
-    # Quality Control Config
+    # Quality Control Config - I need to tune these values
     config['day1_clone_penalty_gamma'] = float(os.getenv('WEATHER_DAY1_CLONE_PENALTY_GAMMA', '1.0'))
     default_clone_delta_thresholds = {
-        "2t": 0.01,  # (0.1K)^2
-        "msl": 250000, # (500Pa)^2 placeholder, needs tuning
-        "z500": 100,   # (10m)^2 for geopotential height, may adjust to m2/s2 for geopotential
-        "t850": 0.25    # (0.5K)^2 placeholder, needs tuning
+        "2t": 0.01,  # (RMSE 0.1K)^2
+        "msl": 20000, # (RMSE 100Pa or 1hPa)^2
+        "z500": 10000,   # (RMSE 100 m^2/s^2)^2 for geopotential
+        "t850": 0.25    # (RMSE 0.5K)^2 
     }
     try:
         clone_delta_json = os.getenv('WEATHER_DAY1_CLONE_DELTA_THRESHOLDS_JSON')
@@ -195,6 +197,9 @@ class WeatherTask(Task):
         self.final_scoring_workers = []
         self.cleanup_worker_running = False
         self.cleanup_workers = []
+        
+        self.test_mode_run_scored_event = asyncio.Event()
+        self.last_test_mode_run_id = None
         
         self.gpu_semaphore = asyncio.Semaphore(self.config.get('max_concurrent_inferences', 1))
         
@@ -274,7 +279,7 @@ class WeatherTask(Task):
             overall_score = eval_result.get("overall_day1_score") 
 
             if miner_uid is not None and overall_score is not None and np.isfinite(overall_score):
-                # Score is expected to be 0-1 normalized from the evaluation function
+                # Score is 0-1 normalized from the evaluation
                 all_miner_scores_for_run[miner_uid] = float(overall_score)
             elif miner_uid is not None:
                 all_miner_scores_for_run[miner_uid] = 0.0 
@@ -289,7 +294,6 @@ class WeatherTask(Task):
 
             for uid_int in active_miner_uids:
                 # If an active UID has a score, use it. Otherwise, it gets 0.0 (participated but failed/no score).
-                # UIDs not in active_miner_uids will remain NaN.
                 final_scores_list[uid_int] = all_miner_scores_for_run.get(uid_int, 0.0)
         except Exception as e_node_table:
             logger.error(f"[BuildScoreRow] Error fetching UIDs from node_table for {task_name_prefix}, run {run_id}: {e_node_table}. Score row might be incomplete.")
@@ -300,39 +304,32 @@ class WeatherTask(Task):
         score_row_data = {
             "task_name": task_name_prefix,
             "task_id": str(run_id),
-            "score_json_list": json.dumps(final_scores_list),
+            "score": final_scores_list,
             "status": f"{task_name_prefix}_scores_compiled",
-            "run_timestamp": gfs_init_time
+            "gfs_init_time_for_table": gfs_init_time
         }
 
         try:
-            score_table_entry_exists_query = "SELECT id FROM score_table WHERE task_name = :task_name AND task_id = :task_id"
-            existing_score_entry = await self.db_manager.fetch_one(score_table_entry_exists_query, 
-                                                                   {"task_name": score_row_data["task_name"], "task_id": score_row_data["task_id"]})
-
+            upsert_score_table_query = """
+                INSERT INTO score_table (task_name, task_id, score, status, created_at)
+                VALUES (:task_name, :task_id, :score, :status, :created_at_val)
+                ON CONFLICT (task_name, task_id) DO UPDATE SET
+                    score = EXCLUDED.score,
+                    status = EXCLUDED.status,
+                    created_at = EXCLUDED.created_at
+            """
+            
             db_params_score_table = {
                 "task_name": score_row_data["task_name"],
                 "task_id": score_row_data["task_id"],
-                "score": score_row_data["score_json_list"],
+                "score": score_row_data["score"],
                 "status": score_row_data["status"],
-                "run_timestamp": score_row_data["run_timestamp"]
+                "created_at_val": score_row_data["gfs_init_time_for_table"]
             }
 
-            if existing_score_entry:
-                update_score_table_query = """
-                    UPDATE score_table SET score = :score, status = :status, run_timestamp = :run_timestamp
-                    WHERE id = :id
-                """
-                db_params_score_table["id"] = existing_score_entry['id']
-                await self.db_manager.execute(update_score_table_query, db_params_score_table)
-                logger.info(f"[BuildScoreRow] Updated score_table entry for {task_name_prefix}, run_id: {run_id}")
-            else:
-                insert_score_table_query = """
-                    INSERT INTO score_table (task_name, task_id, score, status, run_timestamp)
-                    VALUES (:task_name, :task_id, :score, :status, :run_timestamp)
-                """
-                await self.db_manager.execute(insert_score_table_query, db_params_score_table)
-                logger.info(f"[BuildScoreRow] Inserted new score_table entry for {task_name_prefix}, run_id: {run_id}")
+            await self.db_manager.execute(upsert_score_table_query, db_params_score_table)
+            logger.info(f"[BuildScoreRow] Upserted score_table entry for {task_name_prefix}, run_id (task_id): {run_id}")
+
         except Exception as e_db_score_table:
             logger.error(f"[BuildScoreRow] DB error storing {task_name_prefix} score row for run {run_id}: {e_db_score_table}", exc_info=True)
 
@@ -356,6 +353,10 @@ class WeatherTask(Task):
         self.validator = validator
         logger.info("Starting WeatherTask validator execution loop...")
         
+        if not self.initial_scoring_worker_running:
+            await self.start_background_workers(num_initial_scoring_workers=1, num_final_scoring_workers=1, num_cleanup_workers=1)
+            logger.info("Started background workers for scoring and cleanup.")
+
         run_hour_utc = self.config.get('run_hour_utc', 12) # Default to 12 if not in config for some reason
         run_minute_utc = self.config.get('run_minute_utc', 0)
         logger.info(f"Validator execute loop configured to run around {run_hour_utc:02d}:{run_minute_utc:02d} UTC.")
@@ -717,8 +718,19 @@ class WeatherTask(Task):
                 await self.validator_score()
 
                 if self.test_mode:
-                     logger.info("TEST MODE: Exiting validator loop after one successful attempt or error within the attempt.")
-                     break
+                    logger.info(f"TEST MODE: validator_execute iteration for run {run_id} complete.")
+                    if hasattr(self, 'last_test_mode_run_id') and self.last_test_mode_run_id == run_id: 
+                        logger.info(f"TEST MODE: Waiting for Day-1 scoring of run {run_id} to complete...")
+                        try:
+                            await asyncio.wait_for(self.test_mode_run_scored_event.wait(), timeout=600.0) # 10 min timeout
+                            logger.info(f"TEST MODE: Day-1 scoring for run {run_id} event received.")
+                        except asyncio.TimeoutError:
+                            logger.error(f"TEST MODE: Timeout waiting for Day-1 scoring of run {run_id}.")
+                        self.test_mode_run_scored_event.clear() 
+                    else:
+                        logger.info(f"TEST MODE: Not waiting for scoring event as run_id ({run_id}) doesn't match last_test_mode_run_id ({getattr(self, 'last_test_mode_run_id', None)}).")
+                    logger.info("TEST MODE: Exiting validator loop after one successful attempt or error within the attempt.")
+                    break
 
             except Exception as loop_err:
                  logger.error(f"Error in validator_execute main loop: {loop_err}", exc_info=True)
@@ -1208,7 +1220,7 @@ class WeatherTask(Task):
             
         self.cleanup_worker_running = True
         for _ in range(num_workers):
-            worker = asyncio.create_task(self._cleanup_worker())
+            worker = asyncio.create_task(cleanup_worker(self))
             self.cleanup_workers.append(worker)
             
         logger.info(f"Started {num_workers} cleanup workers")

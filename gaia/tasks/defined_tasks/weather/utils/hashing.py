@@ -388,7 +388,7 @@ def _compute_analysis_profile(current_ds: xr.Dataset, current_metadata: Dict, cu
         "claimed_hash_received": _claimed_hash_unused,
         "dataset_info": {
             "variables": list(current_ds.data_vars),
-            "dims": dict(current_ds.dims),
+            "dims": dict(current_ds.sizes),
             "coords": {str(k): list(map(str, v.values))[:5] + (["..."] if len(v.values) > 5 else []) for k, v in current_ds.coords.items()}, # Show first 5 coord values
         },
         "metadata_param": {

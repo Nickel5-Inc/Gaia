@@ -26,7 +26,9 @@ from .weather_logic import (
     update_job_status,
     update_job_paths,
     build_score_row,
-    get_ground_truth_data
+    get_ground_truth_data,
+    calculate_era5_miner_score,
+    _calculate_and_store_aggregated_era5_score
 )
 
 from ..utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
@@ -413,7 +415,7 @@ async def initial_scoring_worker(self):
                 continue 
             
             logger.info(f"[Day1ScoringWorker] Processing Day-1 QC scores for run {run_id}")
-            await self._update_run_status(run_id, "day1_scoring_started")
+            await _update_run_status(self, run_id, "day1_scoring_started")
             
             run_details_query = "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id"
             run_record = await self.db_manager.fetch_one(run_details_query, {"run_id": run_id})
@@ -423,7 +425,8 @@ async def initial_scoring_worker(self):
                 continue
 
             gfs_init_time = run_record['gfs_init_time_utc']
-
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: gfs_init_time: {gfs_init_time}")
+            
             responses_query = """    
             SELECT 
                 mr.id, 
@@ -442,34 +445,103 @@ async def initial_scoring_worker(self):
             min_members_for_scoring = 1
             if not responses or len(responses) < min_members_for_scoring:
                 logger.warning(f"[Day1ScoringWorker] Run {run_id}: No verified responses found for Day-1 scoring.")
-                await self._update_run_status(run_id, "day1_scoring_failed", error_message="No verified members with opened stores")
+                await _update_run_status(self, run_id, "day1_scoring_failed", error_message="No verified members with opened stores")
                 self.initial_scoring_queue.task_done()
                 continue
                 
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Found {len(responses)} verified responses. Init time: {gfs_init_time}")
             
             # GFS Analysis, GFS Reference, and ERA5 Climatology
-            day1_lead_hours = self.config.get('initial_scoring_lead_hours', [6, 12])
-            valid_times_for_gfs = [gfs_init_time + timedelta(hours=h) for h in day1_lead_hours]
+            # --- HARDCODED Timesteps for Specific Testing ---
+            logger.warning("[Day1ScoringWorker] USING HARDCODED VALID TIMES FOR TESTING: 2025-05-10 12:00 UTC and 2025-05-11 00:00 UTC")
+            valid_times_for_gfs = [
+                datetime(2025, 5, 10, 12, 0, tzinfo=timezone.utc),
+                datetime(2025, 5, 11, 0, 0, tzinfo=timezone.utc)
+            ]
+            hardcoded_gfs_reference_run_time = datetime(2025, 5, 10, 0, 0, tzinfo=timezone.utc)
+            hardcoded_gfs_reference_lead_hours = [12, 24]
+            # --- END HARDCODED Timesteps ---
+            
+            # day1_lead_hours = self.config.get('initial_scoring_lead_hours', [6, 12]) # Original
+            # valid_times_for_gfs = [gfs_init_time + timedelta(hours=h) for h in day1_lead_hours] # Original
             
             gfs_cache_dir = Path(self.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
-            gfs_analysis_ds_for_run = await fetch_gfs_analysis_data(target_times=valid_times_for_gfs, cache_dir=gfs_cache_dir)
+
+            day1_config_vars_to_score = self.config.get('day1_variables_levels_to_score', [])
+            target_surface_vars_gfs_day1 = []
+            target_atmos_vars_gfs_day1 = []
+            target_pressure_levels_hpa_day1_set = set()
+
+            aurora_to_gfs_var_map = {
+                '2t': 'tmp2m',
+                '10u': 'ugrd10m',
+                '10v': 'vgrd10m',
+                'msl': 'prmslmsl',
+                't': 'tmpprs',
+                'u': 'ugrdprs',
+                'v': 'vgrdprs',
+                'q': 'spfhprs',
+                'z': 'hgtprs',
+                'z_height': 'hgtprs'
+            }
+
+            for var_info in day1_config_vars_to_score:
+                aurora_name = var_info['name']
+                level = var_info.get('level')
+                gfs_name = aurora_to_gfs_var_map.get(aurora_name)
+
+                if not gfs_name:
+                    logger.warning(f"[Day1ScoringWorker] Run {run_id}: Unknown Aurora variable name '{aurora_name}' in day1_variables_levels_to_score. Skipping for GFS fetch.")
+                    continue
+
+                if level is None:
+                    if gfs_name not in target_surface_vars_gfs_day1:
+                        target_surface_vars_gfs_day1.append(gfs_name)
+                else:
+                    if gfs_name not in target_atmos_vars_gfs_day1:
+                        target_atmos_vars_gfs_day1.append(gfs_name)
+                    target_pressure_levels_hpa_day1_set.add(int(level))
+            
+            target_pressure_levels_list_day1 = sorted(list(target_pressure_levels_hpa_day1_set)) if target_pressure_levels_hpa_day1_set else None
+
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: Targeting GFS fetch for Day-1. Surface vars: {target_surface_vars_gfs_day1}, Atmos vars: {target_atmos_vars_gfs_day1}, Levels: {target_pressure_levels_list_day1}")
+
+            gfs_analysis_ds_for_run = await fetch_gfs_analysis_data(
+                target_times=valid_times_for_gfs, 
+                cache_dir=gfs_cache_dir,
+                target_surface_vars=target_surface_vars_gfs_day1,
+                target_atmos_vars=target_atmos_vars_gfs_day1,
+                target_pressure_levels_hpa=target_pressure_levels_list_day1
+            )
             if gfs_analysis_ds_for_run is None:
+                logger.error(f"[Day1ScoringWorker] Run {run_id}: fetch_gfs_analysis_data returned None.")
                 raise ValueError(f"Failed to fetch GFS analysis data for run {run_id}")
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: GFS Analysis data loaded.")
 
-            gfs_reference_ds_for_run = await fetch_gfs_data(run_time=gfs_init_time, lead_hours=day1_lead_hours) # No cache for this one yet
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: Attempting to fetch GFS reference forecast...")
+            gfs_reference_ds_for_run = await fetch_gfs_data(
+                run_time=hardcoded_gfs_reference_run_time,
+                lead_hours=hardcoded_gfs_reference_lead_hours,
+                target_surface_vars=target_surface_vars_gfs_day1,
+                target_atmos_vars=target_atmos_vars_gfs_day1,
+                target_pressure_levels_hpa=target_pressure_levels_list_day1
+            )
             if gfs_reference_ds_for_run is None:
+                logger.error(f"[Day1ScoringWorker] Run {run_id}: fetch_gfs_data for reference forecast returned None.")
                 raise ValueError(f"Failed to fetch GFS reference forecast data for run {run_id}")
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: GFS Reference forecast data loaded.")
 
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: Attempting to load ERA5 climatology...")
             era5_climatology_ds = await self._get_or_load_era5_climatology()
             if era5_climatology_ds is None:
+                logger.error(f"[Day1ScoringWorker] Run {run_id}: _get_or_load_era5_climatology returned None.")
                 raise ValueError(f"Failed to load ERA5 climatology for run {run_id}")
             
             logger.info(f"[Day1ScoringWorker] Run {run_id}: GFS Analysis, GFS Reference, and ERA5 Climatology prepared.")
             
             # Day-1 Scoring Parameters from self.config
             day1_scoring_config = {
-                "lead_times_hours": self.config.get('initial_scoring_lead_hours', [6, 12]),
+                "hardcoded_valid_times_for_eval": valid_times_for_gfs,
                 "variables_levels_to_score": self.config.get('day1_variables_levels_to_score', [
                     {"name": "z", "level": 500, "standard_name": "geopotential"},
                     {"name": "t", "level": 850, "standard_name": "temperature"},
@@ -491,8 +563,13 @@ async def initial_scoring_worker(self):
                 })
             }
 
+            day1_scoring_config["variables_levels_to_score"] = day1_config_vars_to_score
+
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: Configured. Starting evaluation for {len(responses)} miners.")
+
             scoring_tasks = []
             for miner_response_rec in responses:
+                logger.debug(f"[Day1ScoringWorker] Run {run_id}: Creating scoring task for miner {miner_response_rec.get('miner_hotkey')}")
                 scoring_tasks.append(
                     evaluate_miner_forecast_day1(
                         self, 
@@ -508,6 +585,7 @@ async def initial_scoring_worker(self):
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Created {len(scoring_tasks)} scoring tasks.")
             evaluation_results = await asyncio.gather(*scoring_tasks, return_exceptions=True)
             
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: evaluation_results count: {len(evaluation_results)}")
             successful_scores = 0
             db_update_tasks = []
             for result in evaluation_results:
@@ -520,24 +598,30 @@ async def initial_scoring_worker(self):
                     overall_score = result.get("overall_day1_score")
                     qc_passed = result.get("qc_passed_all_vars_leads")
                     error_msg = result.get("error_message")
-                    lead_scores_json = json.dumps(result.get("lead_time_scores"), default=str) # For DB storage
+                    lead_scores_json = json.dumps(result.get("lead_time_scores"), default=str)
+                    miner_uid_from_result = result.get("miner_uid")
+                    miner_hotkey_from_result = result.get("miner_hotkey")
 
                     if resp_id is not None:
+                        db_params = {
+                            "resp_id": resp_id, 
+                            "run_id": run_id, 
+                            "miner_uid": miner_uid_from_result, 
+                            "miner_hotkey": miner_hotkey_from_result, 
+                            "score": overall_score if np.isfinite(overall_score) else -9999.0, 
+                            "metrics": lead_scores_json,
+                            "ts": datetime.now(timezone.utc),
+                            "err": error_msg
+                        }
                         db_update_tasks.append(self.db_manager.execute(
                             """INSERT INTO weather_miner_scores 
-                               (response_id, run_id, score_type, score, metrics, calculation_time, error_message)
-                               VALUES (:resp_id, :run_id, 'day1_qc_score', :score, :metrics, :ts, :err)                            
+                               (response_id, run_id, miner_uid, miner_hotkey, score_type, score, metrics, calculation_time, error_message)
+                               VALUES (:resp_id, :run_id, :miner_uid, :miner_hotkey, 'day1_qc_score', :score, :metrics, :ts, :err)                            
                                ON CONFLICT (response_id, score_type) DO UPDATE SET
-                               score = EXCLUDED.score, metrics = EXCLUDED.metrics, 
+                               score = EXCLUDED.score, metrics = EXCLUDED.metrics, miner_uid = EXCLUDED.miner_uid, miner_hotkey = EXCLUDED.miner_hotkey,
                                calculation_time = EXCLUDED.calculation_time, error_message = EXCLUDED.error_message
                             """,
-                            {
-                                "resp_id": resp_id, "run_id": run_id, 
-                                "score": overall_score if np.isfinite(overall_score) else -9999.0, # Store a marker for invalid score
-                                "metrics": lead_scores_json,
-                                "ts": datetime.now(timezone.utc),
-                                "err": error_msg
-                            }
+                            db_params
                         ))
                         if error_msg:
                              logger.warning(f"[Day1ScoringWorker] Miner {result.get('miner_hotkey')} Day-1 scoring for resp {resp_id} completed with error: {error_msg}")
@@ -557,13 +641,19 @@ async def initial_scoring_worker(self):
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Successfully processed Day-1 QC for {successful_scores}/{len(responses)} miner responses.")
             
             if evaluation_results:
+                logger.info(f"[Day1ScoringWorker] Run {run_id}: Attempting to build score row.")
                 await self.build_score_row(run_id, gfs_init_time, evaluation_results, task_name_prefix="weather_day1_qc")
             else:
                 logger.warning(f"[Day1ScoringWorker] Run {run_id}: No evaluation results to build score row. Skipping score_table update.")
 
-            await self._update_run_status(run_id, "day1_scoring_complete")
+            await _update_run_status(self, run_id, "day1_scoring_complete")
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: Marked as day1_scoring_complete.")
             
             self.initial_scoring_queue.task_done()
+
+            if self.test_mode and run_id == self.last_test_mode_run_id:
+                logger.info(f"[Day1ScoringWorker] TEST MODE: Signaling scoring completion for run {run_id}.")
+                self.test_mode_run_scored_event.set()
             
         except asyncio.CancelledError:
             logger.info("[Day1ScoringWorker] Worker cancelled")
@@ -575,7 +665,7 @@ async def initial_scoring_worker(self):
             logger.error(f"[Day1ScoringWorker] Unexpected error processing run {run_id}: {e}", exc_info=True)
             if run_id:
                 try:
-                    await self._update_run_status(run_id, "day1_scoring_failed", error_message=f"Day1 Worker error: {e}")
+                    await _update_run_status(self, run_id, "day1_scoring_failed", error_message=f"Day1 Worker error: {e}")
                 except Exception as db_err:
                     logger.error(f"[Day1ScoringWorker] Failed to update DB status on error: {db_err}")
             if processed_a_run:
@@ -595,41 +685,53 @@ async def finalize_scores_worker(self):
     """Background worker to calculate final scores against ERA5 after delay."""
     CHECK_INTERVAL_SECONDS = 30 if self.test_mode else int(self.config.get('final_scoring_check_interval_seconds', 3600))
     ERA5_DELAY_DAYS = int(self.config.get('era5_delay_days', 5))
-    FORECAST_DURATION_HOURS = int(self.config.get('forecast_duration_hours', 240)) # 10 days
+    FORECAST_DURATION_HOURS = int(self.config.get('forecast_duration_hours', 240))
 
     while self.final_scoring_worker_running:
         run_id = None
         era5_ds = None
         processed_run_ids = set()
+        era5_climatology_ds_for_cycle = None
 
         try:
             logger.info("[FinalizeWorker] Checking for runs ready for final ERA5 scoring...")
 
+            if era5_climatology_ds_for_cycle is None:
+                era5_climatology_ds_for_cycle = await self._get_or_load_era5_climatology()
+            
+            if era5_climatology_ds_for_cycle is None:
+                logger.error("[FinalizeWorker] ERA5 Climatology not available. Cannot proceed with final scoring cycle. Will retry.")
+                await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+                continue
+
             now_utc = datetime.now(timezone.utc)
-           
+            sparse_lead_hours_config = self.config.get('final_scoring_lead_hours', [120, 168]) # Used for cutoff and passed later
+            max_final_lead_hour = 0
+            if sparse_lead_hours_config:
+                max_final_lead_hour = max(sparse_lead_hours_config)
+
             if self.test_mode:
                 logger.info("[FinalizeWorker] TEST MODE: Ignoring ERA5 delay, checking all runs for final scoring")
                 runs_to_score_query = """
                 SELECT id, gfs_init_time_utc
                 FROM weather_forecast_runs
-                WHERE status IN ('completed', 'awaiting_inference_results', 'ensemble_created')
+                WHERE status IN ('day1_scoring_complete', 'ensemble_created', 'completed', 'all_forecasts_failed_verification', 'stalled_no_valid_forecasts', 'initial_scoring_failed', 'final_scoring_failed', 'scored')
                 AND final_scoring_attempted_time IS NULL
                 ORDER BY gfs_init_time_utc ASC
                 LIMIT 10
                 """
                 ready_runs = await self.db_manager.fetch_all(runs_to_score_query, {})
             else:
-                forecast_end_cutoff = now_utc - timedelta(days=ERA5_DELAY_DAYS)
-                init_time_cutoff = forecast_end_cutoff - timedelta(hours=FORECAST_DURATION_HOURS)
+                init_time_cutoff = now_utc - timedelta(days=ERA5_DELAY_DAYS) - timedelta(hours=max_final_lead_hour)
                 
                 runs_to_score_query = """
                 SELECT id, gfs_init_time_utc
                 FROM weather_forecast_runs
-                WHERE status IN ('processing_ensemble', 'completed', 'initial_scoring_failed', 'ensemble_failed', 'final_scoring_failed', 'scored')
+                WHERE status IN ('processing_ensemble', 'completed', 'initial_scoring_failed', 'ensemble_failed', 'final_scoring_failed', 'scored', 'day1_scoring_complete') 
                 AND (final_scoring_attempted_time IS NULL OR final_scoring_attempted_time < :retry_cutoff)
-                AND gfs_init_time_utc < :init_time_cutoff
+                AND gfs_init_time_utc < :init_time_cutoff 
                 ORDER BY gfs_init_time_utc ASC
-                LIMIT 10 -- Process in batches
+                LIMIT 10
                 """
                 retry_cutoff_time = now_utc - timedelta(hours=6)
                 
@@ -656,48 +758,105 @@ async def finalize_scores_worker(self):
                         {"now": now_utc, "rid": run_id}
                 )
 
-                sparse_lead_hours = self.config.get('final_scoring_lead_hours', [120, 168]) # Day 5, Day 7 defaults
-                target_datetimes = [gfs_init_time + timedelta(hours=h) for h in sparse_lead_hours]
+                target_datetimes = [gfs_init_time + timedelta(hours=h) for h in sparse_lead_hours_config]
 
                 if self.test_mode:
-                    adjustment = now_utc - (gfs_init_time + timedelta(hours=sparse_lead_hours[-1])) - timedelta(days=ERA5_DELAY_DAYS+1)
+                    adjustment = now_utc - (gfs_init_time + timedelta(hours=sparse_lead_hours_config[-1] if sparse_lead_hours_config else 0)) - timedelta(days=ERA5_DELAY_DAYS+1)
                     logger.info(f"[FinalizeWorker] TEST MODE: Adjusting target dates by {adjustment} to ensure ERA5 data availability")
-                    target_datetimes = [dt + adjustment for dt in target_datetimes]
-                    logger.info(f"[FinalizeWorker] TEST MODE: Adjusted target dates to {target_datetimes}")
+                    
+                    adjusted_target_datetimes_raw = [dt + adjustment for dt in target_datetimes]
+                    
+                    target_datetimes_rounded_to_6h = []
+                    for dt_adj_raw in adjusted_target_datetimes_raw:
+                        rounded_hour = (dt_adj_raw.hour // 6) * 6
+                        dt_rounded = dt_adj_raw.replace(hour=rounded_hour, minute=0, second=0, microsecond=0)
+                        target_datetimes_rounded_to_6h.append(dt_rounded)
+                    target_datetimes = target_datetimes_rounded_to_6h
+                    
+                    logger.info(f"[FinalizeWorker] TEST MODE: Rounded adjusted target dates to 6-hourly: {target_datetimes}")
 
-                logger.info(f"[FinalizeWorker] Run {run_id}: Fetching ERA5 analysis for final scoring at lead hours: {sparse_lead_hours}.")
+                logger.info(f"[FinalizeWorker] Run {run_id}: Fetching ERA5 analysis for final scoring at lead hours: {sparse_lead_hours_config}.")
 
                 era5_cache = Path(self.config.get('era5_cache_dir', './era5_cache'))
                 era5_ds = await fetch_era5_data(target_times=target_datetimes, cache_dir=era5_cache)
 
                 if era5_ds is None:
                     logger.error(f"[FinalizeWorker] Run {run_id}: Failed to fetch ERA5 data. Aborting final scoring for this run.")
-                    await self._update_run_status(run_id, "final_scoring_failed", error_message="ERA5 fetch failed")
+                    await _update_run_status(self, run_id, "final_scoring_failed", error_message="ERA5 fetch failed")
                     processed_run_ids.add(run_id)
                     continue
 
                 logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 data fetched/loaded.")
+
+                responses_query = """    
+                SELECT 
+                    mr.id, 
+                    mr.miner_hotkey, 
+                    mr.miner_uid,
+                    mr.job_id,
+                    mr.run_id
+                FROM weather_miner_responses mr
+                WHERE mr.run_id = :run_id AND mr.verification_passed = TRUE
+                """
+                verified_responses = await self.db_manager.fetch_all(responses_query, {"run_id": run_id})
+
+                if not verified_responses:
+                    logger.warning(f"[FinalizeWorker] Run {run_id}: No verified responses found for final scoring. Skipping miner scoring for this run.")
+                    await _update_run_status(self, run_id, "final_scoring_skipped_no_verified_miners")
+                    processed_run_ids.add(run_id)
+                    continue
 
                 logger.info(f"[FinalizeWorker] Run {run_id}: Found {len(verified_responses)} verified miner responses for final scoring.")
                 tasks = []
                 
                 for resp in verified_responses:
                      resp_with_run_id = resp.copy()
-                     resp_with_run_id['run_id'] = run_id 
-                     tasks.append(calculate_era5_miner_score(self, resp_with_run_id, target_datetimes, era5_ds))
+                     tasks.append(calculate_era5_miner_score(
+                         self, 
+                         resp_with_run_id, 
+                         target_datetimes, 
+                         era5_ds,
+                         era5_climatology_ds_for_cycle
+                        ))
                          
                 miner_scoring_results = await asyncio.gather(*tasks)
-                successful_miner_scores = sum(1 for success in miner_scoring_results if success)
-                logger.info(f"[FinalizeWorker] Run {run_id}: Completed final scoring attempts for {successful_miner_scores}/{len(verified_responses)} miners.")
+
+                successful_final_scores = 0
+                for i, miner_score_task_succeeded in enumerate(miner_scoring_results):
+                    resp_rec = verified_responses[i]
+                    if miner_score_task_succeeded: 
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Detailed ERA5 metrics stored for UID {resp_rec['miner_uid']}. Now calculating aggregated score.")
+                        
+                        final_vars_levels_cfg = self.config.get('final_scoring_variables_levels', self.config.get('day1_variables_levels_to_score'))
+
+
+                        agg_score = await _calculate_and_store_aggregated_era5_score(
+                            task_instance=self, 
+                            run_id=run_id,
+                            miner_uid=resp_rec['miner_uid'],
+                            miner_hotkey=resp_rec['miner_hotkey'],
+                            response_id=resp_rec['id'], 
+                            lead_hours_scored=sparse_lead_hours_config, 
+                            vars_levels_scored=final_vars_levels_cfg
+                        )
+                        if agg_score is not None:
+                            successful_final_scores += 1
+                            logger.info(f"[FinalizeWorker] Run {run_id}: Aggregated ERA5 score for UID {resp_rec['miner_uid']}: {agg_score:.4f}")
+                        else:
+                            logger.warning(f"[FinalizeWorker] Run {run_id}: Failed to calculate/store aggregated ERA5 score for UID {resp_rec['miner_uid']}.")
+                    else:
+                        logger.warning(f"[FinalizeWorker] Run {run_id}: Skipping aggregated score for UID {resp_rec['miner_uid']} as detailed scoring (calculate_era5_miner_score) failed.")
+
+                logger.info(f"[FinalizeWorker] Run {run_id}: Completed final scoring attempts for {successful_final_scores}/{len(verified_responses)} miners with aggregated scores.")
                 
-                if successful_miner_scores > 0: 
+                if successful_final_scores > 0: 
                     logger.info(f"[FinalizeWorker] Run {run_id}: Building final score row using available ERA5 scores..." )
                     await build_score_row(self, run_id, ground_truth_ds=era5_ds)
-                    await self._update_run_status(run_id, "scored")
+                    await _update_run_status(self, run_id, "scored")
                     logger.info(f"[FinalizeWorker] Run {run_id}: Final scoring process completed.")
                 else:
                      logger.warning(f"[FinalizeWorker] Run {run_id}: No miners successfully scored against ERA5. Skipping score row build.")
-                     await self._update_run_status(run_id, "final_scoring_failed", error_message="No miners scored vs ERA5")
+                     await _update_run_status(self, run_id, "final_scoring_failed", error_message="No miners scored vs ERA5")
                 processed_run_ids.add(run_id)
 
         except asyncio.CancelledError:
@@ -708,7 +867,7 @@ async def finalize_scores_worker(self):
             logger.error(f"[FinalizeWorker] Unexpected error in main loop (Last run_id: {run_id}): {e}", exc_info=True)
             if run_id:
                 try:
-                    await self._update_run_status(run_id, "final_scoring_failed", error_message=f"Worker loop error: {e}")
+                    await _update_run_status(self, run_id, "final_scoring_failed", error_message=f"Worker loop error: {e}")
                 except Exception as db_err:
                     logger.error(f"[FinalizeWorker] Failed to update DB status on error: {db_err}")
         finally:

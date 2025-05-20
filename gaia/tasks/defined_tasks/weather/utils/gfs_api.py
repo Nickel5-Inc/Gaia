@@ -23,13 +23,15 @@ warnings.filterwarnings('ignore',
                        message='numpy.core.numeric is deprecated',
                        category=DeprecationWarning)
 
-# --- Constants --- 
 DODS_BASE_URL = "https://nomads.ncep.noaa.gov/dods/gfs_0p25/gfs"
 AURORA_PRESSURE_LEVELS_HPA = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
 GFS_SURFACE_VARS = ["tmp2m", "ugrd10m", "vgrd10m", "prmslmsl"]
 GFS_ATMOS_VARS = ["tmpprs", "ugrdprs", "vgrdprs", "spfhprs", "hgtprs"]
 
-async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: Optional[str] = None) -> xr.Dataset:
+async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: Optional[str] = None,
+                         target_surface_vars: Optional[List[str]] = None,
+                         target_atmos_vars: Optional[List[str]] = None,
+                         target_pressure_levels_hpa: Optional[List[int]] = None) -> xr.Dataset:
     """
     Fetch GFS data asynchronously for the given run_time and lead_hours using OPeNDAP.
 
@@ -37,13 +39,20 @@ async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: 
         run_time: The model run datetime (e.g., 2023-08-01 00:00)
         lead_hours: List of forecast lead times in hours to retrieve
         output_dir: Optional directory to save NetCDF output (if None, don't save files)
+        target_surface_vars: Optional list of GFS surface variable names to fetch.
+        target_atmos_vars: Optional list of GFS atmospheric variable names to fetch.
+        target_pressure_levels_hpa: Optional list of pressure levels (in hPa) for atmospheric variables.
 
     Returns:
         xr.Dataset: Dataset containing all required variables, processed for Aurora.
     """
     logger.info(f"Asynchronously fetching GFS data for run time: {run_time}, lead hours: {lead_hours}")
 
-    def _sync_fetch_and_process():
+    def _sync_fetch_and_process(
+        target_surface_vars: Optional[List[str]] = None,
+        target_atmos_vars: Optional[List[str]] = None,
+        target_pressure_levels_hpa: Optional[List[int]] = None
+    ):
         """Synchronous function containing the blocking xarray/OPeNDAP logic."""
         logger.debug(f"Executing synchronous fetch for {run_time} in thread.")
         date_str = run_time.strftime('%Y%m%d')
@@ -53,11 +62,41 @@ async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: 
         base_url = f"{dods_base}{date_str}/gfs_0p25_{cycle_str}z"
         logger.info(f"Using OPeNDAP URL: {base_url}")
 
-        aurora_pressure_levels = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
-        aurora_level_indices = [22, 20, 19, 18, 17, 16, 14, 12, 10, 8, 5, 3, 0]
+        aurora_pressure_levels_const = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+        aurora_level_indices_const = [22, 20, 19, 18, 17, 16, 14, 12, 10, 8, 5, 3, 0]
 
-        surface_vars = ["tmp2m", "ugrd10m", "vgrd10m", "prmslmsl"]
-        atmos_vars = ["tmpprs", "ugrdprs", "vgrdprs", "spfhprs", "hgtprs"]
+        surface_vars_to_fetch = GFS_SURFACE_VARS
+        if target_surface_vars is not None:
+            surface_vars_to_fetch = [var for var in target_surface_vars if var in GFS_SURFACE_VARS]
+            logger.info(f"Fetching targeted surface variables: {surface_vars_to_fetch}")
+
+        atmos_vars_to_fetch = GFS_ATMOS_VARS
+        if target_atmos_vars is not None:
+            atmos_vars_to_fetch = [var for var in target_atmos_vars if var in GFS_ATMOS_VARS]
+            logger.info(f"Fetching targeted atmospheric variables: {atmos_vars_to_fetch}")
+
+        level_indices_to_fetch = aurora_level_indices_const
+        actual_pressure_levels_to_fetch_hpa = aurora_pressure_levels_const
+
+        if target_pressure_levels_hpa is not None:
+            valid_target_levels = [lvl for lvl in target_pressure_levels_hpa if lvl in aurora_pressure_levels_const]
+            if not valid_target_levels:
+                logger.warning(f"Target pressure levels {target_pressure_levels_hpa} have no overlap with available GFS pressure levels {aurora_pressure_levels_const} via configured indices. Atmospheric data might be empty.")
+                level_indices_to_fetch = []
+                actual_pressure_levels_to_fetch_hpa = []
+            else:
+                level_indices_to_fetch = []
+                actual_pressure_levels_to_fetch_hpa = []
+                for level_hpa in valid_target_levels:
+                    try:
+                        idx_in_const_list = aurora_pressure_levels_const.index(level_hpa)
+                        level_indices_to_fetch.append(aurora_level_indices_const[idx_in_const_list])
+                        actual_pressure_levels_to_fetch_hpa.append(level_hpa)
+                    except ValueError:
+                        logger.warning(f"Level {level_hpa} unexpectedly not found in aurora_pressure_levels_const.")
+                logger.info(f"Fetching targeted pressure levels (hPa): {actual_pressure_levels_to_fetch_hpa} using indices: {level_indices_to_fetch}")
+        else:
+            logger.info(f"Fetching default pressure levels (hPa): {actual_pressure_levels_to_fetch_hpa} using indices: {level_indices_to_fetch}")
 
         valid_times = [run_time + timedelta(hours=h) for h in lead_hours]
 
@@ -90,19 +129,35 @@ async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: 
 
                 time_indices = sorted(list(set(time_indices)))
                 logger.info(f"Selected time indices: {time_indices}")
-                logger.info(f"Loading surface variables: {surface_vars} at selected times.")
-                surface_ds = full_ds[surface_vars].isel(time=time_indices).load()
-                logger.info("Surface variables loaded.")
+                logger.info(f"Loading surface variables: {surface_vars_to_fetch} at selected times.")
+                if surface_vars_to_fetch:
+                    surface_ds = full_ds[surface_vars_to_fetch].isel(time=time_indices).load()
+                    logger.info("Surface variables loaded.")
+                else:
+                    surface_ds = xr.Dataset()
+                    logger.info("No surface variables targeted for fetching.")
 
                 atmos_ds_list = []
-                for var in atmos_vars:
-                    logger.info(f"Loading atmospheric variable: {var} at selected times and levels.")
-                    if var in full_ds:
-                        var_ds = full_ds[[var]].isel(time=time_indices, lev=aurora_level_indices).load()
-                        logger.debug(f"Loaded {var}, shape: {var_ds[var].shape}")
-                        atmos_ds_list.append(var_ds)
-                    else:
-                        logger.warning(f"Atmospheric variable {var} not found in dataset.")
+                if atmos_vars_to_fetch and level_indices_to_fetch:
+                    for var in atmos_vars_to_fetch:
+                        logger.info(f"Loading atmospheric variable: {var} at selected times and levels.")
+                        if var in full_ds:
+                            if 'lev' in full_ds[var].coords:
+                                var_ds = full_ds[[var]].isel(time=time_indices, lev=level_indices_to_fetch).load()
+                                logger.debug(f"Loaded {var}, shape: {var_ds[var].shape}")
+                                atmos_ds_list.append(var_ds)
+                            elif not level_indices_to_fetch:
+                                logger.warning(f"Atmospheric variable {var} does not have 'lev' coordinate, but levels were specified. Check GFS_ATMOS_VARS.")
+                            else:
+                                var_ds = full_ds[[var]].isel(time=time_indices).load()
+                                logger.debug(f"Loaded {var} (all levels as none specific requested/applicable), shape: {var_ds[var].shape}")
+                                atmos_ds_list.append(var_ds)
+                        else:
+                            logger.warning(f"Atmospheric variable {var} not found in dataset.")
+                elif not atmos_vars_to_fetch:
+                    logger.info("No atmospheric variables targeted for fetching.")
+                elif not level_indices_to_fetch:
+                    logger.info("No pressure levels targeted for atmospheric variables.")
 
                 if atmos_ds_list:
                     atmos_ds = xr.merge(atmos_ds_list)
@@ -137,7 +192,10 @@ async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: 
             raise
 
     try:
-        result_dataset = await asyncio.to_thread(_sync_fetch_and_process)
+        result_dataset = await asyncio.to_thread(_sync_fetch_and_process,
+                                                 target_surface_vars=target_surface_vars,
+                                                 target_atmos_vars=target_atmos_vars,
+                                                 target_pressure_levels_hpa=target_pressure_levels_hpa)
         return result_dataset
     except Exception as e:
         logger.error(f"Async fetch GFS data failed: {e}")
@@ -188,8 +246,18 @@ def process_opendap_dataset(ds: xr.Dataset) -> xr.Dataset:
     elif 'z' not in new_ds:
         logger.warning("Geopotential Height (hgtprs/z_height) not found, cannot calculate Geopotential (z).")
 
+    coord_rename_map = {}
+    if 'lev' in new_ds.coords:
+        coord_rename_map['lev'] = 'pressure_level'
+    if 'latitude' in new_ds.coords:
+        coord_rename_map['latitude'] = 'lat'
+    if 'longitude' in new_ds.coords:
+        coord_rename_map['longitude'] = 'lon'
+    
+    if coord_rename_map:
+        new_ds = new_ds.rename(coord_rename_map)
+        logger.info(f"Renamed coordinates: {coord_rename_map}")
 
-    # Units 
     default_units = {
         '2t': 'K', '10u': 'm s-1', '10v': 'm s-1', 'msl': 'Pa',
         't': 'K', 'u': 'm s-1', 'v': 'm s-1', 'q': 'kg kg-1', 'z': 'm2 s-2'
@@ -253,7 +321,10 @@ def _get_gfs_cycle_url(target_time: datetime) -> Optional[str]:
 
 async def fetch_gfs_analysis_data(
     target_times: List[datetime],
-    cache_dir: Path = Path("./gfs_analysis_cache")
+    cache_dir: Path = Path("./gfs_analysis_cache"),
+    target_surface_vars: Optional[List[str]] = None,
+    target_atmos_vars: Optional[List[str]] = None,
+    target_pressure_levels_hpa: Optional[List[int]] = None
 ) -> Optional[xr.Dataset]:
     """
     Fetches GFS ANALYSIS data (T+0h) asynchronously for multiple specific times.
@@ -263,6 +334,9 @@ async def fetch_gfs_analysis_data(
         target_times: List of exact datetime objects for which to fetch analysis.
                       Each time MUST correspond to a GFS cycle time (00, 06, 12, 18 UTC).
         cache_dir: Directory for caching processed analysis files.
+        target_surface_vars: Optional list of surface variable names to fetch.
+        target_atmos_vars: Optional list of atmospheric variable names to fetch.
+        target_pressure_levels_hpa: Optional list of pressure levels (in hPa) for atmospheric variables.
 
     Returns:
         xr.Dataset: Combined dataset of processed analysis variables for target times, or None.
@@ -317,12 +391,13 @@ async def fetch_gfs_analysis_data(
             for target_time in target_times:
                 full_ds = None
                 try:
-                    # --- MODIFICATION FOR TESTING ---
-                    # Subtract 24 hours from the target_time to fetch older data
-                    # modified_target_time = target_time - timedelta(hours=24) 
-                    # logger.warning(f"MODIFIED FOR TESTING: Original target_time {target_time}, fetching for {modified_target_time}")
-                    # --- END MODIFICATION ---
-                    modified_target_time = target_time # Reverted: Use actual target_time
+                    now_utc = datetime.now(timezone.utc)
+                    if target_time > (now_utc - timedelta(days=5)):
+                        modified_target_time = target_time - timedelta(hours=24) 
+                        logger.warning(f"MODIFIED FOR RECENT DATA: Original target_time {target_time} (within last 5 days), fetching for {modified_target_time}")
+                    else:
+                        modified_target_time = target_time
+                        logger.info(f"Using actual target_time {target_time} (older than 5 days) for GFS analysis fetch.")
                     
                     base_url = _get_gfs_cycle_url(modified_target_time)
                     if not base_url:
@@ -340,12 +415,17 @@ async def fetch_gfs_analysis_data(
                         logger.error(f"Nearest time found ({analysis_slice.time.values}) is too far from requested analysis time {modified_target_time} for cycle {modified_target_time}. Skipping.")
                         continue
 
-                    vars_to_load = [v for v in GFS_SURFACE_VARS + GFS_ATMOS_VARS if v in full_ds]
-                    if not vars_to_load:
-                         logger.warning(f"No expected GFS variables found in dataset for cycle {target_time}. Skipping analysis for this time.")
+                    current_surface_vars = target_surface_vars if target_surface_vars is not None else GFS_SURFACE_VARS
+                    current_atmos_vars = target_atmos_vars if target_atmos_vars is not None else GFS_ATMOS_VARS
+                    
+                    vars_to_load_final = [v for v in current_surface_vars + current_atmos_vars if v in full_ds]
+                    
+                    if not vars_to_load_final:
+                         logger.warning(f"No targeted GFS variables found in dataset for cycle {target_time} (modified {modified_target_time}). Surface tried: {current_surface_vars}, Atmos tried: {current_atmos_vars}. Skipping analysis for this time.")
                          continue
+                    logger.info(f"For cycle {target_time} (modified {modified_target_time}), attempting to load variables: {vars_to_load_final}")
                          
-                    loaded_slice = analysis_slice[vars_to_load].load()
+                    loaded_slice = analysis_slice[vars_to_load_final].load()
                     loaded_slice = loaded_slice.expand_dims(dim='time', axis=0)
                     loaded_slice['time'] = [np.datetime64(target_time)] 
                     
@@ -427,10 +507,11 @@ async def fetch_gfs_analysis_data(
                   logger.warning(f"Pressure level units '{current_units}' are not Pa, hPa, or millibar. Proceeding without conversion.")
 
              try:
-                  processed_ds = processed_ds.sel(pressure_level=AURORA_PRESSURE_LEVELS_HPA)
-                  logger.info(f"Selected standard pressure levels: {AURORA_PRESSURE_LEVELS_HPA}")
+                  pressure_levels_for_selection = target_pressure_levels_hpa if target_pressure_levels_hpa is not None else AURORA_PRESSURE_LEVELS_HPA
+                  processed_ds = processed_ds.sel(pressure_level=pressure_levels_for_selection)
+                  logger.info(f"Selected pressure levels: {pressure_levels_for_selection}")
              except Exception as e_sel_p:
-                  logger.warning(f"Could not select standard pressure levels after unit processing: {e_sel_p}")
+                  logger.warning(f"Could not select pressure levels after unit processing: {e_sel_p}")
 
         default_units = {
             '2t': 'K', '10u': 'm s-1', '10v': 'm s-1', 'msl': 'Pa',

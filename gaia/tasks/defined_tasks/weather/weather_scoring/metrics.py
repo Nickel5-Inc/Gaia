@@ -13,6 +13,23 @@ This module provides implementations of common metrics for
 evaluating weather forecasts, including RMSE, MAE, bias, correlation,
 """
 
+def _compute_metric_to_scalar_array(metric_fn, *args, **kwargs):
+    res = metric_fn(*args, **kwargs)
+    if hasattr(res, 'compute'):
+        res = res.compute()
+    return res
+
+def _get_metric_as_float(metric_fn, *args, **kwargs):
+    computed_array = _compute_metric_to_scalar_array(metric_fn, *args, **kwargs)
+    if computed_array.ndim == 0:
+        return float(computed_array.item())
+    elif computed_array.ndim == 1:
+        logger.debug(f"Metric returned 1D array (shape: {computed_array.shape}), taking mean for scalar result.")
+        mean_val = computed_array.mean()
+        return float(mean_val.item())
+    else:
+        raise ValueError(f"Metric calculation resulted in an array with unexpected dimensions: {computed_array.shape}. Cannot convert to single float.")
+
 def _calculate_latitude_weights(lat_da: xr.DataArray) -> xr.DataArray:
     return np.cos(np.deg2rad(lat_da)).where(np.isfinite(lat_da), 0)
 
@@ -32,9 +49,14 @@ async def calculate_bias_corrected_forecast(
             return forecast_da
 
         error = forecast_da - truth_da
-        bias = await asyncio.to_thread(error.mean, dim=spatial_dims)
+        bias_uncomputed = error.mean(dim=spatial_dims) 
+        if hasattr(bias_uncomputed, 'compute'):
+            bias = await asyncio.to_thread(bias_uncomputed.compute)
+        else:
+            bias = bias_uncomputed
+            
         forecast_bc_da = forecast_da - bias
-        logger.debug(f"Bias correction calculated. Mean bias: {bias.values}")
+        logger.info(f"Bias correction calculated. Mean bias: {bias.values}")
         return forecast_bc_da
     except Exception as e:
         logger.error(f"Error in calculate_bias_corrected_forecast: {e}", exc_info=True)
@@ -53,20 +75,20 @@ async def calculate_mse_skill_score(
             logger.error("No spatial dimensions (lat/lon) found for MSE skill score.")
             return -np.inf
 
-        mse_forecast = await asyncio.to_thread(
-            xs.mse, forecast_bc_da, truth_da, dim=spatial_dims, weights=lat_weights, skipna=True
+        mse_forecast_scalar = await asyncio.to_thread(
+            _compute_metric_to_scalar_array, xs.mse, forecast_bc_da, truth_da, dim=spatial_dims, weights=lat_weights, skipna=True
         )
-        mse_reference = await asyncio.to_thread(
-            xs.mse, reference_da, truth_da, dim=spatial_dims, weights=lat_weights, skipna=True
+        mse_reference_scalar = await asyncio.to_thread(
+            _compute_metric_to_scalar_array, xs.mse, reference_da, truth_da, dim=spatial_dims, weights=lat_weights, skipna=True
         )
 
-        if mse_reference == 0:
-            if mse_forecast == 0:
+        if mse_reference_scalar == 0:
+            if mse_forecast_scalar == 0:
                 return 1.0
             return -np.inf
         
-        skill_score = 1.0 - (mse_forecast / mse_reference)
-        logger.debug(f"MSE Skill Score: 1.0 - ({mse_forecast.item():.4f} / {mse_reference.item():.4f}) = {skill_score.item():.4f}")
+        skill_score = 1.0 - (mse_forecast_scalar / mse_reference_scalar)
+        logger.info(f"MSE Skill Score: 1.0 - ({mse_forecast_scalar.item():.4f} / {mse_reference_scalar.item():.4f}) = {skill_score.item():.4f}")
         return float(skill_score.item())
     except Exception as e:
         logger.error(f"Error in calculate_mse_skill_score: {e}", exc_info=True)
@@ -88,11 +110,19 @@ async def calculate_acc(
         forecast_anom = forecast_da - climatology_da
         truth_anom = truth_da - climatology_da
 
-        acc_value = await asyncio.to_thread(
-            xs.pearson_r, forecast_anom, truth_anom, dim=spatial_dims, weights=lat_weights, skipna=True
+        logger.info(f"[calculate_acc] forecast_anom shape: {forecast_anom.shape}, dims: {forecast_anom.dims}, type: {type(forecast_anom.data)}")
+        logger.info(f"[calculate_acc] truth_anom shape: {truth_anom.shape}, dims: {truth_anom.dims}, type: {type(truth_anom.data)}")
+        if lat_weights is not None:
+            logger.info(f"[calculate_acc] lat_weights shape: {lat_weights.shape}, dims: {lat_weights.dims}, type: {type(lat_weights.data)}")
+        else:
+            logger.info("[calculate_acc] lat_weights is None")
+        logger.info(f"[calculate_acc] spatial_dims for pearson_r: {spatial_dims}")
+
+        acc_float = await asyncio.to_thread(
+            _get_metric_as_float, xs.pearson_r, forecast_anom, truth_anom, dim=spatial_dims, weights=lat_weights, skipna=True
         )
-        logger.debug(f"ACC calculated: {acc_value.item():.4f}")
-        return float(acc_value.item())
+        logger.info(f"ACC calculated: {acc_float:.4f}")
+        return acc_float
     except Exception as e:
         logger.error(f"Error in calculate_acc: {e}", exc_info=True)
         return -np.inf
@@ -119,20 +149,32 @@ async def perform_sanity_checks(
     spatial_dims = [d for d in forecast_da.dims if d.lower() in ('latitude', 'longitude', 'lat', 'lon')]
 
     try:
-        actual_min = float(forecast_da.min().item())
-        actual_max = float(forecast_da.max().item())
+        min_val_uncomputed = forecast_da.min()
+        if hasattr(min_val_uncomputed, 'compute'):
+            actual_min_scalar = await asyncio.to_thread(min_val_uncomputed.compute)
+        else:
+            actual_min_scalar = min_val_uncomputed
+        actual_min = float(actual_min_scalar.item())
+
+        max_val_uncomputed = forecast_da.max()
+        if hasattr(max_val_uncomputed, 'compute'):
+            actual_max_scalar = await asyncio.to_thread(max_val_uncomputed.compute)
+        else:
+            actual_max_scalar = max_val_uncomputed
+        actual_max = float(actual_max_scalar.item())
+        
         results["climatology_min_actual"] = actual_min
         results["climatology_max_actual"] = actual_max
 
         passed_general_bounds = True
         bounds = climatology_bounds_config.get(variable_name)
         if bounds:
-            min_val, max_val = bounds
-            if not (actual_min >= min_val and actual_max <= max_val):
+            min_bound, max_bound = bounds
+            if not (actual_min >= min_bound and actual_max <= max_bound):
                 passed_general_bounds = False
                 logger.warning(f"Climatology check FAILED for {variable_name}. Expected: {bounds}, Got: ({actual_min:.2f}, {actual_max:.2f})")
         else:
-            logger.debug(f"No general climatology bounds configured for {variable_name}. Skipping general bounds part of check.")
+            logger.info(f"No general climatology bounds configured for {variable_name}. Skipping general bounds part of check.")
 
         passed_specific_physical_checks = True
         if variable_name.startswith('q'):
@@ -148,11 +190,11 @@ async def perform_sanity_checks(
             logger.warning(f"No spatial dimensions for pattern correlation on {variable_name}. Skipping.")
             results["pattern_correlation_passed"] = True
         else:
-            correlation = await asyncio.to_thread(
-                xs.pearson_r, forecast_da, reference_da_for_corr, dim=spatial_dims, weights=lat_weights, skipna=True
+            correlation_float = await asyncio.to_thread(
+                _get_metric_as_float, xs.pearson_r, forecast_da, reference_da_for_corr, dim=spatial_dims, weights=lat_weights, skipna=True
             )
-            results["pattern_correlation_value"] = float(correlation.item())
-            if results["pattern_correlation_value"] >= pattern_corr_threshold:
+            results["pattern_correlation_value"] = correlation_float
+            if correlation_float >= pattern_corr_threshold:
                 results["pattern_correlation_passed"] = True
             else:
                 results["pattern_correlation_passed"] = False
@@ -163,7 +205,7 @@ async def perform_sanity_checks(
         if results["climatology_passed"] is None: results["climatology_passed"] = False
         if results["pattern_correlation_passed"] is None: results["pattern_correlation_passed"] = False
         
-    logger.debug(f"Sanity check results for {variable_name}: {results}")
+    logger.info(f"Sanity check results for {variable_name}: {results}")
     return results
 
 

@@ -30,6 +30,7 @@ score_table = sa.Table('score_table', validator_metadata,
     sa.Column('score', postgresql.ARRAY(sa.Float), nullable=True, comment="Array of scores, typically per UID"),
     sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False, comment="Timestamp of score creation"),
     sa.Column('status', sa.VARCHAR(50), server_default=sa.text("'pending'"), nullable=True, comment="Status of the scoring process"),
+    sa.UniqueConstraint('task_name', 'task_id', name='uq_score_table_task_name_task_id'),
     # Indexes will be defined in Alembic migration if not implicitly created by PK/FK, or for specific performance needs.
     # Example: sa.Index('idx_score_created_at', 'created_at') # Can be added here too
     comment="Table to store scores for various tasks."
