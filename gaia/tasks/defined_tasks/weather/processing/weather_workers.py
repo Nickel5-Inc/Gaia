@@ -19,6 +19,7 @@ from fiber.logging_utils import get_logger
 from aurora import Batch
 
 from ..utils.data_prep import create_aurora_batch_from_gfs
+from ..utils.variable_maps import AURORA_TO_GFS_VAR_MAP
 
 from .weather_logic import (
     _request_fresh_token,
@@ -31,7 +32,7 @@ from .weather_logic import (
     _calculate_and_store_aggregated_era5_score
 )
 
-from ..utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
+from ..utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
 from ..utils.era5_api import fetch_era5_data
 from ..utils.hashing import compute_verification_hash, compute_input_data_hash, CANONICAL_VARS_FOR_HASHING
 from ..weather_scoring.metrics import calculate_rmse
@@ -450,21 +451,14 @@ async def initial_scoring_worker(self):
                 continue
                 
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Found {len(responses)} verified responses. Init time: {gfs_init_time}")
-            
-            # GFS Analysis, GFS Reference, and ERA5 Climatology
-            # --- HARDCODED Timesteps for Specific Testing ---
-            logger.warning("[Day1ScoringWorker] USING HARDCODED VALID TIMES FOR TESTING: 2025-05-10 12:00 UTC and 2025-05-11 00:00 UTC")
-            valid_times_for_gfs = [
-                datetime(2025, 5, 10, 12, 0, tzinfo=timezone.utc),
-                datetime(2025, 5, 11, 0, 0, tzinfo=timezone.utc)
-            ]
-            hardcoded_gfs_reference_run_time = datetime(2025, 5, 10, 0, 0, tzinfo=timezone.utc)
-            hardcoded_gfs_reference_lead_hours = [12, 24]
-            # --- END HARDCODED Timesteps ---
-            
-            # day1_lead_hours = self.config.get('initial_scoring_lead_hours', [6, 12]) # Original
-            # valid_times_for_gfs = [gfs_init_time + timedelta(hours=h) for h in day1_lead_hours] # Original
-            
+                        
+            day1_lead_hours = self.config.get('initial_scoring_lead_hours', [6, 12])
+            valid_times_for_gfs = [gfs_init_time + timedelta(hours=h) for h in day1_lead_hours]
+            gfs_reference_run_time = gfs_init_time
+            gfs_reference_lead_hours = day1_lead_hours
+
+            logger.info(f"[Day1ScoringWorker] Run {run_id}: Using Day-1 lead hours {day1_lead_hours} relative to GFS init {gfs_init_time}. Valid times for GFS: {valid_times_for_gfs}")
+
             gfs_cache_dir = Path(self.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
 
             day1_config_vars_to_score = self.config.get('day1_variables_levels_to_score', [])
@@ -472,23 +466,10 @@ async def initial_scoring_worker(self):
             target_atmos_vars_gfs_day1 = []
             target_pressure_levels_hpa_day1_set = set()
 
-            aurora_to_gfs_var_map = {
-                '2t': 'tmp2m',
-                '10u': 'ugrd10m',
-                '10v': 'vgrd10m',
-                'msl': 'prmslmsl',
-                't': 'tmpprs',
-                'u': 'ugrdprs',
-                'v': 'vgrdprs',
-                'q': 'spfhprs',
-                'z': 'hgtprs',
-                'z_height': 'hgtprs'
-            }
-
             for var_info in day1_config_vars_to_score:
                 aurora_name = var_info['name']
                 level = var_info.get('level')
-                gfs_name = aurora_to_gfs_var_map.get(aurora_name)
+                gfs_name = AURORA_TO_GFS_VAR_MAP.get(aurora_name)
 
                 if not gfs_name:
                     logger.warning(f"[Day1ScoringWorker] Run {run_id}: Unknown Aurora variable name '{aurora_name}' in day1_variables_levels_to_score. Skipping for GFS fetch.")
@@ -520,8 +501,8 @@ async def initial_scoring_worker(self):
 
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Attempting to fetch GFS reference forecast...")
             gfs_reference_ds_for_run = await fetch_gfs_data(
-                run_time=hardcoded_gfs_reference_run_time,
-                lead_hours=hardcoded_gfs_reference_lead_hours,
+                run_time=gfs_reference_run_time,
+                lead_hours=gfs_reference_lead_hours,
                 target_surface_vars=target_surface_vars_gfs_day1,
                 target_atmos_vars=target_atmos_vars_gfs_day1,
                 target_pressure_levels_hpa=target_pressure_levels_list_day1
@@ -539,9 +520,9 @@ async def initial_scoring_worker(self):
             
             logger.info(f"[Day1ScoringWorker] Run {run_id}: GFS Analysis, GFS Reference, and ERA5 Climatology prepared.")
             
-            # Day-1 Scoring Parameters from self.config
             day1_scoring_config = {
-                "hardcoded_valid_times_for_eval": valid_times_for_gfs,
+
+                "evaluation_valid_times": valid_times_for_gfs,
                 "variables_levels_to_score": self.config.get('day1_variables_levels_to_score', [
                     {"name": "z", "level": 500, "standard_name": "geopotential"},
                     {"name": "t", "level": 850, "standard_name": "temperature"},
@@ -641,10 +622,16 @@ async def initial_scoring_worker(self):
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Successfully processed Day-1 QC for {successful_scores}/{len(responses)} miner responses.")
             
             if evaluation_results:
-                logger.info(f"[Day1ScoringWorker] Run {run_id}: Attempting to build score row.")
+                logger.info(f"[Day1ScoringWorker] Run {run_id}: Attempting to build Day-1 QC score row.")
                 await self.build_score_row(run_id, gfs_init_time, evaluation_results, task_name_prefix="weather_day1_qc")
             else:
-                logger.warning(f"[Day1ScoringWorker] Run {run_id}: No evaluation results to build score row. Skipping score_table update.")
+                logger.warning(f"[Day1ScoringWorker] Run {run_id}: No Day-1 evaluation results to build score row. Skipping score_table update for weather_day1_qc.")
+
+            try:
+                logger.info(f"[Day1ScoringWorker] Run {run_id}: Triggering update of combined weather scores.")
+                await self.update_combined_weather_scores(run_id_trigger=run_id)
+            except Exception as e_comb_score:
+                logger.error(f"[Day1ScoringWorker] Run {run_id}: Error triggering combined score update: {e_comb_score}", exc_info=True)
 
             await _update_run_status(self, run_id, "day1_scoring_complete")
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Marked as day1_scoring_complete.")
@@ -850,13 +837,16 @@ async def finalize_scores_worker(self):
                 logger.info(f"[FinalizeWorker] Run {run_id}: Completed final scoring attempts for {successful_final_scores}/{len(verified_responses)} miners with aggregated scores.")
                 
                 if successful_final_scores > 0: 
-                    logger.info(f"[FinalizeWorker] Run {run_id}: Building final score row using available ERA5 scores..." )
-                    await build_score_row(self, run_id, ground_truth_ds=era5_ds)
+                    logger.info(f"[FinalizeWorker] Run {run_id}: Final ERA5 scoring process completed and run marked as 'scored'." )
                     await _update_run_status(self, run_id, "scored")
-                    logger.info(f"[FinalizeWorker] Run {run_id}: Final scoring process completed.")
+                    
+                    try:
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Triggering update of combined weather scores after ERA5.")
+                        await self.update_combined_weather_scores(run_id_trigger=run_id)
+                    except Exception as e_comb_score:
+                        logger.error(f"[FinalizeWorker] Run {run_id}: Error triggering combined score update after ERA5: {e_comb_score}", exc_info=True)
                 else:
-                     logger.warning(f"[FinalizeWorker] Run {run_id}: No miners successfully scored against ERA5. Skipping score row build.")
-                     await _update_run_status(self, run_id, "final_scoring_failed", error_message="No miners scored vs ERA5")
+                     logger.warning(f"[FinalizeWorker] Run {run_id}: No miners successfully scored against ERA5. Skipping combined score update.")
                 processed_run_ids.add(run_id)
 
         except asyncio.CancelledError:

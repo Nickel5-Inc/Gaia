@@ -18,7 +18,8 @@ if TYPE_CHECKING:
     from ..weather_task import WeatherTask
 from ..utils.remote_access import open_verified_remote_zarr_dataset
 from ..utils.era5_api import fetch_era5_data
-from ..utils.gfs_api import fetch_gfs_analysis_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
+from ..utils.gfs_api import fetch_gfs_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
+from ..utils.variable_maps import AURORA_TO_GFS_VAR_MAP
 from ..utils.hashing import _compute_analysis_profile, ANALYSIS_LOG_DIR
 from ..weather_scoring.metrics import calculate_rmse, calculate_mse_skill_score, calculate_acc, calculate_bias_corrected_forecast, _calculate_latitude_weights, perform_sanity_checks
 from fiber.logging_utils import get_logger
@@ -27,7 +28,7 @@ from ..weather_scoring.scoring import VARIABLE_WEIGHTS
 logger = get_logger(__name__)
 async def _update_run_status(task_instance: 'WeatherTask', run_id: int, status: str, error_message: Optional[str] = None, gfs_metadata: Optional[dict] = None):
     """Helper to update the forecast run status and optionally other fields."""
-    logger.debug(f"[Run {run_id}] Updating run status to '{status}'.")
+    logger.info(f"[Run {run_id}] Updating run status to '{status}'.")
     update_fields = ["status = :status"]
     params = {"run_id": run_id, "status": status}
 
@@ -294,7 +295,7 @@ async def update_job_status(task_instance: 'WeatherTask', job_id: str, status: s
         logger.error("update_job_status called on non-miner node.")
         return False
         
-    logger.debug(f"[Job {job_id}] Updating miner job status to '{status}'.")
+    logger.info(f"[Job {job_id}] Updating miner job status to '{status}'.")
     try:
         update_fields = ["status = :status", "updated_at = :updated_at"]
         params = {
@@ -337,7 +338,7 @@ async def update_job_paths(task_instance: 'WeatherTask', job_id: str, netcdf_pat
         logger.error("update_job_paths called on non-miner node.")
         return False
         
-    logger.debug(f"[Job {job_id}] Updating miner job paths with Zarr store path: {netcdf_path}")
+    logger.info(f"[Job {job_id}] Updating miner job paths with Zarr store path: {netcdf_path}")
     try:
         query = """
         UPDATE weather_miner_jobs
@@ -421,7 +422,7 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
             db_status_after_verification = "verified_manifest_store_opened"
             logger.info(f"[VerifyLogic, Resp {response_id}] Manifest verified & Zarr store opened with on-read checks.")
             try:
-                logger.debug(f"[VerifyLogic, Resp {response_id}] Verified dataset keys: {list(verified_dataset.keys()) if verified_dataset else 'N/A'}")
+                logger.info(f"[VerifyLogic, Resp {response_id}] Verified dataset keys: {list(verified_dataset.keys()) if verified_dataset else 'N/A'}")
                 
                 if verified_dataset:
                     logger.info(f"[VerifyLogic, Resp {response_id}] Running performance profile for verified dataset from miner {miner_hotkey} (Job {job_id}).")
@@ -551,14 +552,46 @@ async def calculate_era5_miner_score(
         if miner_forecast_ds is None:
             raise ConnectionError(f"Failed to open verified Zarr dataset for miner {miner_hotkey}")
 
+        gfs_operational_fcst_ds = None
+        if gfs_init_time_of_run:
+            try:
+                unique_lead_hours_for_gfs_fetch = sorted(list(set([
+                    int((vt - gfs_init_time_of_run).total_seconds() / 3600) for vt in target_datetimes
+                ])))
+
+                gfs_vars_to_request = list(set(AURORA_TO_GFS_VAR_MAP.get(vc['name']) 
+                                               for vc in final_scoring_config["variables_levels_to_score"] 
+                                               if AURORA_TO_GFS_VAR_MAP.get(vc['name']))) # Get GFS names
+                
+                gfs_surface_vars_req = [v for v in gfs_vars_to_request if v in GFS_SURFACE_VARS]
+                gfs_atmos_vars_req = [v for v in gfs_vars_to_request if v in GFS_ATMOS_VARS]
+                pressure_levels_req = list(set(vc.get('level') 
+                                              for vc in final_scoring_config["variables_levels_to_score"] 
+                                              if vc.get('level') is not None))
+                if not pressure_levels_req:
+                    pressure_levels_req = None 
+
+                logger.info(f"[FinalScore] Fetching GFS operational reference: Init={gfs_init_time_of_run}, Leads={unique_lead_hours_for_gfs_fetch}, PSurf={gfs_surface_vars_req}, PAtm={gfs_atmos_vars_req}, PLevels={pressure_levels_req}")
+                gfs_operational_fcst_ds = await fetch_gfs_data(
+                    run_time=gfs_init_time_of_run,
+                    lead_hours=unique_lead_hours_for_gfs_fetch,
+                    target_surface_vars=gfs_surface_vars_req if gfs_surface_vars_req else None,
+                    target_atmos_vars=gfs_atmos_vars_req if gfs_atmos_vars_req else None,
+                    target_pressure_levels_hpa=pressure_levels_req
+                )
+            except Exception as e_fetch_gfs_ref:
+                logger.error(f"[FinalScore] Miner {miner_hotkey}: Error fetching GFS operational reference forecast: {e_fetch_gfs_ref}", exc_info=True)
+                gfs_operational_fcst_ds = None
+
+        if gfs_operational_fcst_ds is None:
+            logger.warning(f"[FinalScore] Miner {miner_hotkey}: Failed to fetch/process GFS operational reference forecast. Skill score vs GFS will not be available.")
+
         for valid_time_dt in target_datetimes:
             logger.info(f"[FinalScore] Miner {miner_hotkey}: Processing Valid Time: {valid_time_dt}")
             miner_forecast_lead_slice = None
             era5_truth_lead_slice = None
 
             try:
-
-
                 if np.issubdtype(miner_forecast_ds.time.dtype, np.integer):
                     selection_label_miner = int(valid_time_dt.timestamp() * 1_000_000_000)
                 elif str(miner_forecast_ds.time.dtype) == 'datetime64[ns]':
@@ -573,9 +606,9 @@ async def calculate_era5_miner_score(
                 else:
                     selection_label_era5 = valid_time_dt
 
-                logger.debug(f"[FinalScore Debug] Miner time dtype: {miner_forecast_ds.time.dtype}, ERA5 time dtype: {era5_truth_ds.time.dtype}")
-                logger.debug(f"[FinalScore Debug] Using selection_label_miner: {selection_label_miner} (type: {type(selection_label_miner)}) for miner_forecast_ds")
-                logger.debug(f"[FinalScore Debug] Using selection_label_era5: {selection_label_era5} (type: {type(selection_label_era5)}) for era5_truth_ds")
+                logger.info(f"[FinalScore info] Miner time dtype: {miner_forecast_ds.time.dtype}, ERA5 time dtype: {era5_truth_ds.time.dtype}")
+                logger.info(f"[FinalScore info] Using selection_label_miner: {selection_label_miner} (type: {type(selection_label_miner)}) for miner_forecast_ds")
+                logger.info(f"[FinalScore info] Using selection_label_era5: {selection_label_era5} (type: {type(selection_label_era5)}) for era5_truth_ds")
 
                 miner_forecast_lead_slice = miner_forecast_ds.sel(time=selection_label_miner, method="nearest")
                 era5_truth_lead_slice = era5_truth_ds.sel(time=selection_label_era5, method="nearest")
@@ -619,6 +652,21 @@ async def calculate_era5_miner_score(
                 logger.error(log_msg)
                 continue
 
+            gfs_op_lead_slice = None
+            if gfs_operational_fcst_ds is not None:
+                try:
+                    selection_label_gfs_op = valid_time_dt
+                    if np.issubdtype(gfs_operational_fcst_ds.time.dtype, np.integer):
+                        selection_label_gfs_op = int(valid_time_dt.timestamp() * 1_000_000_000)
+                    elif str(gfs_operational_fcst_ds.time.dtype) == 'datetime64[ns]':
+                        selection_label_gfs_op = valid_time_dt.replace(tzinfo=None)
+                    
+                    gfs_op_lead_slice = gfs_operational_fcst_ds.sel(time=selection_label_gfs_op, method="nearest").squeeze(drop=True)
+
+                except Exception as e_gfs_sel:
+                    logger.warning(f"[FinalScore] Miner {miner_hotkey}: Could not select from GFS operational forecast for {valid_time_dt}: {e_gfs_sel}. Skill vs GFS will be impacted.")
+                    gfs_op_lead_slice = None
+
             for var_config in final_scoring_config["variables_levels_to_score"]:
                 var_name = var_config['name']
                 var_level = var_config.get('level')
@@ -634,7 +682,7 @@ async def calculate_era5_miner_score(
                 }
 
                 try:
-                    logger.debug(f"[FinalScore] Miner {miner_hotkey}: Scoring {var_key} at {valid_time_dt} (Lead: {lead_hours}h)")
+                    logger.info(f"[FinalScore] Miner {miner_hotkey}: Scoring {var_key} at {valid_time_dt} (Lead: {lead_hours}h)")
                     
                     miner_var_da_unaligned = miner_forecast_lead_slice[var_name]
                     truth_var_da_unaligned = era5_truth_lead_slice[var_name]
@@ -682,12 +730,10 @@ async def calculate_era5_miner_score(
                     
                     climatology_da_aligned = clim_var_to_interpolate.interp_like(truth_var_da_final, method="linear", kwargs={"fill_value": None})
 
-                    # --- DEBUGGING METRIC INPUTS ---
-                    logger.debug(f"[FinalScore Debug Metric Input] Var: {var_key}, Level: {var_level}")
-                    logger.debug(f"[FinalScore Debug Metric Input] truth_var_da_final -> Shape: {truth_var_da_final.shape}, Dims: {truth_var_da_final.dims}, Coords: {list(truth_var_da_final.coords.keys())}")
-                    logger.debug(f"[FinalScore Debug Metric Input] miner_var_da_aligned -> Shape: {miner_var_da_aligned.shape}, Dims: {miner_var_da_aligned.dims}, Coords: {list(miner_var_da_aligned.coords.keys())}")
-                    logger.debug(f"[FinalScore Debug Metric Input] climatology_da_aligned -> Shape: {climatology_da_aligned.shape}, Dims: {climatology_da_aligned.dims}, Coords: {list(climatology_da_aligned.coords.keys())}")
-                    # --- END DEBUGGING ---
+                    logger.info(f"[FinalScore info Metric Input] Var: {var_key}, Level: {var_level}")
+                    logger.info(f"[FinalScore info Metric Input] truth_var_da_final -> Shape: {truth_var_da_final.shape}, Dims: {truth_var_da_final.dims}, Coords: {list(truth_var_da_final.coords.keys())}")
+                    logger.info(f"[FinalScore info Metric Input] miner_var_da_aligned -> Shape: {miner_var_da_aligned.shape}, Dims: {miner_var_da_aligned.dims}, Coords: {list(miner_var_da_aligned.coords.keys())}")
+                    logger.info(f"[FinalScore info Metric Input] climatology_da_aligned -> Shape: {climatology_da_aligned.shape}, Dims: {climatology_da_aligned.dims}, Coords: {list(climatology_da_aligned.coords.keys())}")
 
                     lat_weights = None
                     if 'lat' in truth_var_da_final.dims:
@@ -713,15 +759,34 @@ async def calculate_era5_miner_score(
                     acc_metric_row = {**db_metric_row_base, "metrics": current_metrics.copy(), "score_type": f"era5_acc_{var_key}_{int(lead_hours)}h", "score": acc_val}
                     all_metrics_for_db.append(acc_metric_row)
 
-                    mse_climatology_ref_op = xs.mse(climatology_da_aligned, truth_var_da_final, dim=[d for d in truth_var_da_final.dims if d in ('lat', 'lon')], weights=lat_weights, skipna=True)
-                    mse_climatology_ref_val = float((await asyncio.to_thread(mse_climatology_ref_op.compute) if hasattr(mse_climatology_ref_op, 'compute') else mse_climatology_ref_op).item())
-                    
-                    skill_score_val = 1.0 - (raw_mse_val / mse_climatology_ref_val) if mse_climatology_ref_val != 0 else (1.0 if raw_mse_val == 0 else -np.inf)
-                    current_metrics["skill_score_vs_clim"] = skill_score_val
-                    skill_metric_row = {**db_metric_row_base, "metrics": current_metrics.copy(), "score_type": f"era5_skill_clim_{var_key}_{int(lead_hours)}h", "score": skill_score_val}
-                    all_metrics_for_db.append(skill_metric_row)
+                    skill_score_val = None
+                    skill_score_type_gfs = f"era5_skill_gfs_{var_key}_{lead_hours}h"
+                    skill_rec_gfs = await task_instance.db_manager.fetch_one(
+                        "SELECT score FROM weather_miner_scores WHERE response_id = :resp_id AND score_type = :stype",
+                        {"resp_id": response_id, "stype": skill_score_type_gfs}
+                    )
+                    if skill_rec_gfs and skill_rec_gfs['score'] is not None and np.isfinite(skill_rec_gfs['score']):
+                        skill_score_val = skill_rec_gfs['score']
+                        logger.info(f"[FinalScore] UID {miner_uid} - Using GFS-based skill for {var_key} L{lead_hours}h: {skill_score_val:.4f}")
+                    else:
+                        skill_score_type_clim = f"era5_skill_clim_{var_key}_{lead_hours}h"
+                        skill_rec_clim = await task_instance.db_manager.fetch_one(
+                            "SELECT score FROM weather_miner_scores WHERE response_id = :resp_id AND score_type = :stype",
+                            {"resp_id": response_id, "stype": skill_score_type_clim}
+                        )
+                        if skill_rec_clim and skill_rec_clim['score'] is not None and np.isfinite(skill_rec_clim['score']):
+                            skill_score_val = skill_rec_clim['score']
+                            logger.info(f"[FinalScore] UID {miner_uid} - Using CLIM-based skill for {var_key} L{lead_hours}h: {skill_score_val:.4f} (GFS-based not found/valid)")
+                        else:
+                            logger.warning(f"[FinalScore] UID {miner_uid} - No valid GFS or CLIM skill score found for {var_key} L{lead_hours}h.")
 
-                    logger.info(f"[FinalScore] Miner {miner_hotkey} V:{var_key} L:{int(lead_hours)}h RMSE:{current_metrics['rmse']:.2f} ACC:{acc_val:.3f} SKILL:{skill_score_val:.3f}")
+                    skill_metric_row = {**db_metric_row_base, 
+                                        "metrics": current_metrics.copy(), 
+                                        "score_type": f"era5_skill_clim_{var_key}_{int(lead_hours)}h", 
+                                        "score": skill_score_val
+                                       }
+                    all_metrics_for_db.append(skill_metric_row)
+                    logger.info(f"[FinalScore] Miner {miner_hotkey} V:{var_key} L:{int(lead_hours)}h RMSE:{current_metrics.get('rmse', np.nan):.2f} ACC:{current_metrics.get('acc', np.nan):.3f} SKILL(clim):{skill_score_val:.3f}")
 
                 except Exception as e_var_score:
                     logger.error(f"[FinalScore] Miner {miner_hotkey}: Error scoring {var_key} at {valid_time_dt}: {e_var_score}", exc_info=True)
@@ -806,16 +871,27 @@ async def _calculate_and_store_aggregated_era5_score(
             if rmse_rec and rmse_rec['score'] is not None and np.isfinite(rmse_rec['score']):
                 rmse_score_val = rmse_rec['score']
 
-            # Fetch Skill Score (vs Climatology)
-            skill_score_type = f"era5_skill_clim_{var_key}_{lead_h}h"
-            skill_rec = await task_instance.db_manager.fetch_one(
+            skill_score_val = None
+            skill_score_type_gfs = f"era5_skill_gfs_{var_key}_{lead_h}h"
+            skill_rec_gfs = await task_instance.db_manager.fetch_one(
                 "SELECT score FROM weather_miner_scores WHERE response_id = :resp_id AND score_type = :stype",
-                {"resp_id": response_id, "stype": skill_score_type}
+                {"resp_id": response_id, "stype": skill_score_type_gfs}
             )
-            if skill_rec and skill_rec['score'] is not None and np.isfinite(skill_rec['score']):
-                skill_score_val = skill_rec['score']
+            if skill_rec_gfs and skill_rec_gfs['score'] is not None and np.isfinite(skill_rec_gfs['score']):
+                skill_score_val = skill_rec_gfs['score']
+                logger.info(f"[AggFinalScore] UID {miner_uid} - Using GFS-based skill for {var_key} L{lead_h}h: {skill_score_val:.4f}")
+            else:
+                skill_score_type_clim = f"era5_skill_clim_{var_key}_{lead_h}h"
+                skill_rec_clim = await task_instance.db_manager.fetch_one(
+                    "SELECT score FROM weather_miner_scores WHERE response_id = :resp_id AND score_type = :stype",
+                    {"resp_id": response_id, "stype": skill_score_type_clim}
+                )
+                if skill_rec_clim and skill_rec_clim['score'] is not None and np.isfinite(skill_rec_clim['score']):
+                    skill_score_val = skill_rec_clim['score']
+                    logger.info(f"[AggFinalScore] UID {miner_uid} - Using CLIM-based skill for {var_key} L{lead_h}h: {skill_score_val:.4f} (GFS-based not found/valid)")
+                else:
+                    logger.warning(f"[AggFinalScore] UID {miner_uid} - No valid GFS or CLIM skill score found for {var_key} L{lead_h}h.")
             
-            # Fetch ACC
             acc_score_type = f"era5_acc_{var_key}_{lead_h}h"
             acc_rec = await task_instance.db_manager.fetch_one(
                 "SELECT score FROM weather_miner_scores WHERE response_id = :resp_id AND score_type = :stype",
@@ -825,7 +901,6 @@ async def _calculate_and_store_aggregated_era5_score(
                 acc_score_val = acc_rec['score']
 
             
-            # Skill/Error Component
             normalized_skill_error_item = 0.0
             if skill_score_val is not None:
                 normalized_skill_error_item = max(0.0, skill_score_val)

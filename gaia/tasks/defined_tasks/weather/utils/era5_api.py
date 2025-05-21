@@ -68,7 +68,9 @@ async def fetch_era5_data(
         try:
             logger.info(f"Loading cached ERA5 data from: {cache_filename}")
             ds_combined = xr.open_dataset(cache_filename)
-            if all(np.datetime64(t) in ds_combined.time for t in target_times):
+            # Convert target_times to np.datetime64[ns] for robust comparison
+            target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
+            if all(t_np_ns in ds_combined.time.values for t_np_ns in target_times_np_ns):
                 logger.info("Cache hit is valid.")
                 return ds_combined
             else:
@@ -171,8 +173,9 @@ async def fetch_era5_data(
                 ds_combined = ds_combined.sortby(ds_combined.lon)
 
             if 'time' in ds_combined.coords:
-                target_times_np = [np.datetime64(t) for t in target_times]
-                ds_combined = ds_combined.sel(time=target_times_np, method='nearest')
+                # Ensure target_times are np.datetime64[ns] for selection
+                target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
+                ds_combined = ds_combined.sel(time=target_times_np_ns, method='nearest')
                 logger.info("Selected target time steps.")
             else:
                 logger.error("Processed dataset missing 'time' coordinate after potential rename. Cannot select times.")
