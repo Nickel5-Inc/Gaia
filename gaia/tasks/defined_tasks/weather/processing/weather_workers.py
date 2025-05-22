@@ -8,11 +8,11 @@ from pathlib import Path
 import uuid
 import numpy as np
 import xarray as xr
-from kerchunk.hdf import SingleHdf5ToZarr
 import pandas as pd
 import shutil
 import time
 import zarr
+import numcodecs
 from typing import Dict
 
 from fiber.logging_utils import get_logger
@@ -26,7 +26,6 @@ from .weather_logic import (
     _update_run_status,
     update_job_status,
     update_job_paths,
-    build_score_row,
     get_ground_truth_data,
     calculate_era5_miner_score,
     _calculate_and_store_aggregated_era5_score
@@ -285,43 +284,46 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                 gfs_time_str = gfs_init_time_utc.strftime('%Y%m%d%H')
                 unique_suffix = job_id.split('-')[0]
                 
-                dirname_zarr = f"weather_forecast_{gfs_time_str}_miner_hk_{unique_suffix}.zarr"
+                dirname_zarr = f"weather_forecast_{gfs_time_str}_miner_hk_{miner_hotkey_for_filename[:10]}_{unique_suffix}.zarr"
                 output_zarr_path = MINER_FORECAST_DIR_BG / dirname_zarr
-
-                time_chunk_size = 1
-                level_chunk_size = 1
-                lat_chunk_size = 180  # 720/4 = 180
-                lon_chunk_size = 360  # 1440/4 = 360
 
                 encoding = {}
                 for var_name, da in combined_forecast_ds.data_vars.items():
-                    var_chunks = {}
-                    dims = da.dims
+                    chunks_for_var = {}
                     
-                    if 'time' in dims:
-                        var_chunks['time'] = time_chunk_size
-                    if 'pressure_level' in dims:
-                        var_chunks['pressure_level'] = level_chunk_size
-                    if 'lat' in dims:
-                        var_chunks['lat'] = lat_chunk_size
-                    if 'lon' in dims:
-                        var_chunks['lon'] = lon_chunk_size
+                    time_dim_in_var = next((d for d in da.dims if d.lower() == 'time'), None)
+                    level_dim_in_var = next((d for d in da.dims if d.lower() in ('pressure_level', 'level', 'plev', 'isobaricinhpa')), None)
+                    lat_dim_in_var = next((d for d in da.dims if d.lower() in ('lat', 'latitude')), None)
+                    lon_dim_in_var = next((d for d in da.dims if d.lower() in ('lon', 'longitude')), None)
+
+                    if time_dim_in_var:
+                        chunks_for_var[time_dim_in_var] = 1
+                    if level_dim_in_var:
+                        chunks_for_var[level_dim_in_var] = 1 
+                    if lat_dim_in_var:
+                        chunks_for_var[lat_dim_in_var] = combined_forecast_ds.dims[lat_dim_in_var]
+                    if lon_dim_in_var:
+                        chunks_for_var[lon_dim_in_var] = combined_forecast_ds.dims[lon_dim_in_var]
+                    
+                    ordered_chunks_list = []
+                    for dim_name_in_da in da.dims:
+                        ordered_chunks_list.append(chunks_for_var.get(dim_name_in_da, combined_forecast_ds.dims[dim_name_in_da]))
                     
                     encoding[var_name] = {
-                        'chunks': var_chunks,
-                        'compressor': {'id': 'blosc', 'cname': 'zstd', 'clevel': 3, 'shuffle': 2}
+                        'chunks': tuple(ordered_chunks_list),
+                        'compressor': numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
                     }
                 
-                logger.info(f"[InferenceTask Job {job_id}] Saving forecast to Zarr store with chunking. Path: {output_zarr_path}")
+                logger.info(f"[InferenceTask Job {job_id}] Saving forecast to Zarr store with chunking. Example encoding for {list(encoding.keys())[0] if encoding else 'N/A'}: {list(encoding.values())[0] if encoding else 'N/A'}")
                 
                 if os.path.exists(output_zarr_path):
-                    import shutil
                     shutil.rmtree(output_zarr_path)
                 
                 combined_forecast_ds.to_zarr(
                     output_zarr_path,
                     encoding=encoding,
-                    consolidated=True
+                    consolidated=True,
+                    compute=True
                 )
                 
                 try:
@@ -331,28 +333,26 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                     logger.warning(f"[InferenceTask Job {job_id}] Failed to explicitly consolidate Zarr metadata: {e_consolidate}")
                 
                 logger.info(f"[InferenceTask Job {job_id}] Successfully saved forecast to Zarr store: {output_zarr_path}")
-                from gaia.tasks.defined_tasks.weather.utils.hashing import compute_verification_hash
                 output_metadata = {
                     "time": [base_time],
                     "source_model": "aurora",
                     "resolution": 0.25
                 }
                 data_for_hash = {"surf_vars": {}, "atmos_vars": {}}
-                for var_name in combined_forecast_ds.data_vars:
-                     if var_name in CANONICAL_VARS_FOR_HASHING:
-                          is_surface = len(combined_forecast_ds[var_name].dims) == 3 
-                          is_atmos = len(combined_forecast_ds[var_name].dims) == 4 
-                          if is_surface:
-                               data_for_hash["surf_vars"][var_name] = combined_forecast_ds[var_name].values[np.newaxis, ...]
-                          elif is_atmos:
-                               data_for_hash["atmos_vars"][var_name] = combined_forecast_ds[var_name].values[np.newaxis, ...]
+                for var_name_hash in combined_forecast_ds.data_vars:
+                     if var_name_hash in CANONICAL_VARS_FOR_HASHING:
+                          da_for_hash = combined_forecast_ds[var_name_hash]
+                          if len(da_for_hash.dims) == 3: # surf_vars: time, lat, lon
+                               data_for_hash["surf_vars"][var_name_hash] = da_for_hash.values[np.newaxis, ...]
+                          elif len(da_for_hash.dims) == 4: # atmos_vars: time, pressure_level, lat, lon
+                               data_for_hash["atmos_vars"][var_name_hash] = da_for_hash.values[np.newaxis, ...]
 
                 variables_to_hash = list(data_for_hash["surf_vars"].keys()) + list(data_for_hash["atmos_vars"].keys())
                 timesteps_to_hash = list(range(len(combined_forecast_ds.time)))
                 
+                verification_hash = None
                 if not variables_to_hash:
                     logger.warning(f"[InferenceTask Job {job_id}] No variables found/categorized for output hashing!")
-                    verification_hash = None
                 else:
                     verification_hash = compute_verification_hash(
                         data=data_for_hash,

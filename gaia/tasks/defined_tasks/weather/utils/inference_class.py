@@ -63,11 +63,10 @@ class WeatherInferenceRunner:
         try:
             with torch.inference_mode():
                 for step_index, pred_batch_device in enumerate(rollout(self.model, batch_on_device, steps=steps)):
-                    if step_index % 2 != 0:
-                        logger.debug(f"Keeping prediction for step {step_index} (T+{(step_index + 1) * 6}h)")
-                        selected_predictions.append(pred_batch_device.to("cpu"))
+                    logger.debug(f"Keeping prediction for step {step_index+1} (T+{(step_index + 1) * 6}h)")
+                    selected_predictions.append(pred_batch_device.to("cpu"))
 
-            logger.info(f"Finished multi-step inference. Selected {len(selected_predictions)} predictions.")
+            logger.info(f"Finished multi-step inference. Selected {len(selected_predictions)} predictions (all steps).")
 
         except Exception as e:
              logger.error(f"Error during rollout inference: {e}", exc_info=True)
@@ -145,13 +144,10 @@ class WeatherInferenceRunner:
             logger.info("Waiting for prediction results from Foundry...")
             for step_idx, pred_batch in enumerate(prediction_iterator):
                 logger.debug(f"Retrieved prediction step {step_idx + 1}/{steps} from Foundry.")
-                if step_idx % 2 != 0:
-                    logger.info(f"Keeping prediction step {step_idx + 1}/{steps} (T+{(step_idx + 1) * 6}h)")
-                    predictions_list.append(pred_batch)
-                else:
-                    logger.debug(f"Skipping prediction step {step_idx + 1}/{steps}")
+                logger.info(f"Keeping prediction step {step_idx + 1}/{steps} (T+{(step_idx + 1) * 6}h)")
+                predictions_list.append(pred_batch)
 
-            logger.info(f"Successfully retrieved and selected {len(predictions_list)} prediction steps from Azure AI Foundry.")
+            logger.info(f"Successfully retrieved and selected {len(predictions_list)} prediction steps (all steps) from Azure AI Foundry.")
 
         except ImportError as e:
             logger.error(f"ImportError during Foundry inference: {e}. Is aurora.foundry installed?")

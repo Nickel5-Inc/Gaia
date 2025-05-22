@@ -68,7 +68,6 @@ async def fetch_era5_data(
         try:
             logger.info(f"Loading cached ERA5 data from: {cache_filename}")
             ds_combined = xr.open_dataset(cache_filename)
-            # Convert target_times to np.datetime64[ns] for robust comparison
             target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
             if all(t_np_ns in ds_combined.time.values for t_np_ns in target_times_np_ns):
                 logger.info("Cache hit is valid.")
@@ -173,7 +172,6 @@ async def fetch_era5_data(
                 ds_combined = ds_combined.sortby(ds_combined.lon)
 
             if 'time' in ds_combined.coords:
-                # Ensure target_times are np.datetime64[ns] for selection
                 target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
                 ds_combined = ds_combined.sel(time=target_times_np_ns, method='nearest')
                 logger.info("Selected target time steps.")

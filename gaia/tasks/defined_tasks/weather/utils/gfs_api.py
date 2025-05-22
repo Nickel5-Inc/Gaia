@@ -367,7 +367,6 @@ async def fetch_gfs_analysis_data(
         try:
             logger.info(f"Loading cached GFS analysis data from: {cache_filename}")
             ds_cached = xr.open_dataset(cache_filename)
-            # Convert target_times to np.datetime64[ns] for robust comparison
             target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
             if all(t_np_ns in ds_cached.time.values for t_np_ns in target_times_np_ns):
                 logger.info("GFS Analysis cache hit is valid.")
