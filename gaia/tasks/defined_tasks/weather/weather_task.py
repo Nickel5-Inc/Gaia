@@ -153,6 +153,10 @@ def _load_config(self):
         logger.warning("Invalid JSON for WEATHER_DAY1_CLONE_DELTA_THRESHOLDS_JSON. Using default.")
         config['day1_clone_delta_thresholds'] = default_clone_delta_thresholds
 
+    config['weather_score_day1_weight'] = float(os.getenv('WEATHER_SCORE_DAY1_WEIGHT', '0.2'))
+    config['weather_score_era5_weight'] = float(os.getenv('WEATHER_SCORE_ERA5_WEIGHT', '0.8'))
+    config['weather_bonus_value_add'] = float(os.getenv('WEATHER_BONUS_VALUE_ADD', '0.05')) # Value to add for winning a bonus category
+
     logger.info(f"WeatherTask configuration loaded: {config}")
     return config
 
@@ -820,94 +824,124 @@ class WeatherTask(Task):
                  logger.info(f"[Run {run_id}] Status changed from 'verifying_miner_forecasts' to '{current_run_status_after_verify}' during verification logic. No further status update needed here.")
 
     async def update_combined_weather_scores(self, run_id_trigger: Optional[int] = None):
-        """
-        Fetches the latest Day-1 QC scores and final ERA5 scores for all miners,
-        combines them with an 80/20 ERA5/Day-1 weighting, and updates the score_table
-        with a 'weather_combined_score'.
-        run_id_trigger is optional, for logging purposes, indicating which run triggered this update.
-        """
         logger.info(f"[CombinedWeatherScore] Updating combined weather scores (triggered by run {run_id_trigger if run_id_trigger else 'periodic/manual call'}).")
 
-        latest_day1_scores_array = np.full(256, 0.0) 
-        latest_era5_scores_array = np.full(256, 0.0) 
+        latest_day1_scores_array = np.full(256, 0.0)
+        latest_era5_composite_scores_array = np.full(256, 0.0)
         
         day1_qc_task_name = "weather_day1_qc"
         query_day1 = """
-            SELECT score, created_at, task_id 
-            FROM score_table
-            WHERE task_name = :task_name
-            ORDER BY created_at DESC
-            LIMIT 1
+            SELECT score, created_at, task_id FROM score_table
+            WHERE task_name = :task_name ORDER BY created_at DESC LIMIT 1
         """
-        timestamp_for_combined_score_row = datetime.now(timezone.utc) 
+        timestamp_for_combined_score_row = datetime.now(timezone.utc)
         day1_run_id_for_log = "N/A"
-
         day1_result = await self.db_manager.fetch_one(query_day1, {"task_name": day1_qc_task_name})
-
         if day1_result and day1_result['score']:
             scores_from_db = day1_result['score']
-            day1_run_id_for_log = day1_result.get('task_id', "N/A") 
+            day1_run_id_for_log = day1_result.get('task_id', "N/A")
             if len(scores_from_db) == 256:
                 latest_day1_scores_array = np.array([
                     float(s) if s is not None and not (isinstance(s, float) and np.isnan(s)) else 0.0 
-                    for s in scores_from_db
-                ], dtype=float)
-                logger.info(f"[CombinedWeatherScore] Fetched latest Day-1 QC scores (from run_id/task_id {day1_run_id_for_log} created at {day1_result['created_at']}). Example UID 0: {latest_day1_scores_array[0] if len(latest_day1_scores_array)>0 else 'N/A'}")
-                timestamp_for_combined_score_row = day1_result['created_at'] 
-            else:
-                logger.warning(f"[CombinedWeatherScore] Day-1 QC score array from DB (run_id/task_id {day1_run_id_for_log}) has incorrect length: {len(scores_from_db)}. Using zeros.")
-        else:
-            logger.warning("[CombinedWeatherScore] No Day-1 QC scores found in score_table. Using zeros for Day-1 component.")
+                    for s in scores_from_db], dtype=float)
+                timestamp_for_combined_score_row = day1_result['created_at']
+                logger.info(f"[CombinedWeatherScore] Fetched Day-1 QC scores (run_id/task_id {day1_run_id_for_log}).")
+            else: logger.warning(f"[CombinedWeatherScore] Day-1 QC score array from DB has incorrect length.")
+        else: logger.warning("[CombinedWeatherScore] No Day-1 QC scores found.")
 
-        active_miners_query = "SELECT DISTINCT uid FROM node_table WHERE hotkey IS NOT NULL AND uid IS NOT NULL AND uid >= 0 AND uid < 256"
+        active_miners_query = "SELECT DISTINCT uid FROM node_table WHERE hotkey IS NOT NULL AND uid >= 0 AND uid < 256"
         active_miner_uids_records = await self.db_manager.fetch_all(active_miners_query)
-        
-        era5_score_type = "era5_final_composite_score"
-        query_era5_latest = """
-            SELECT score FROM weather_miner_scores
-            WHERE miner_uid = :miner_uid AND score_type = :score_type
-            ORDER BY calculation_time DESC
-            LIMIT 1
+        active_uids = {rec['uid'] for rec in active_miner_uids_records}
+
+        era5_composite_score_type = "era5_final_composite_score"
+        query_era5_composite = """
+            SELECT score FROM weather_miner_scores WHERE miner_uid = :miner_uid AND score_type = :score_type
+            ORDER BY calculation_time DESC LIMIT 1
         """
-        found_era5_scores_count = 0
-        for miner_rec in active_miner_uids_records:
-            uid = miner_rec['uid']
-            if 0 <= uid < 256: 
-                era5_score_result = await self.db_manager.fetch_one(query_era5_latest, {"miner_uid": uid, "score_type": era5_score_type})
-                if era5_score_result and era5_score_result['score'] is not None and np.isfinite(era5_score_result['score']):
-                    latest_era5_scores_array[uid] = float(era5_score_result['score'])
-                    found_era5_scores_count += 1
+        for uid in active_uids:
+            res = await self.db_manager.fetch_one(query_era5_composite, {"miner_uid": uid, "score_type": era5_composite_score_type})
+            if res and res['score'] is not None and np.isfinite(res['score']):
+                latest_era5_composite_scores_array[uid] = float(res['score'])
+        logger.info(f"[CombinedWeatherScore] Fetched ERA5 composite scores for {len(active_uids)} active UIDs.")
+
+        W_day1 = self.config.get('weather_score_day1_weight', 0.2)
+        W_era5 = self.config.get('weather_score_era5_weight', 0.8)
+        proportional_weather_scores = (latest_day1_scores_array * W_day1) + (latest_era5_composite_scores_array * W_era5)
+        logger.info(f"[CombinedWeatherScore] Calculated proportional scores.")
+
+        miner_bonuses_applied = np.zeros(256)
+        bonus_value_add = self.config.get('weather_bonus_value_add', 0.05)
         
-        logger.info(f"[CombinedWeatherScore] Fetched latest ERA5 composite scores for {found_era5_scores_count} UIDs. Example UID 0: {latest_era5_scores_array[0] if len(latest_era5_scores_array)>0 else 'N/A'}")
+        # Bonus Definitions
+        bonus_metric_definitions = [
+            {"id": "best_z500_acc_120h", "metric_score_type": "era5_acc_z500_120h", "higher_is_better": True, "min_threshold": 0.5},
+            {"id": "lowest_t2m_rmse_120h", "metric_score_type": "era5_rmse_2t_120h", "higher_is_better": False, "min_threshold": 3.0},
+            {"id": "best_msl_skill_gfs_168h", "metric_score_type": "era5_skill_gfs_msl_168h", "higher_is_better": True, "min_threshold": 0.1},
+        ]
 
-        W_day1 = 0.20
-        W_era5 = 0.80
-        combined_scores_array = (latest_day1_scores_array * W_day1) + (latest_era5_scores_array * W_era5)
-        logger.info(f"[CombinedWeatherScore] Calculated combined scores. Example UID 0: {combined_scores_array[0] if len(combined_scores_array)>0 else 'N/A'}")
+        for category in bonus_metric_definitions:
+            metric_to_query = category["metric_score_type"]
+            higher_is_better = category["higher_is_better"]
+            min_thresh = category.get("min_threshold")
 
+            query_bonus_metric = """ 
+                SELECT miner_uid, score FROM weather_miner_scores
+                WHERE score_type = :score_type AND miner_uid = :miner_uid AND score IS NOT NULL
+                ORDER BY calculation_time DESC LIMIT 1
+            """
+            candidate_scores_for_category = []
+            for uid in active_uids:
+                metric_res = await self.db_manager.fetch_one(query_bonus_metric, {"score_type": metric_to_query, "miner_uid": uid})
+                if metric_res and metric_res['score'] is not None and np.isfinite(metric_res['score']):
+                    score = float(metric_res['score'])
+                    eligible = True
+                    if min_thresh is not None:
+                        if higher_is_better and score < min_thresh:
+                            eligible = False
+                        elif not higher_is_better and score > min_thresh:
+                            eligible = False
+                    if eligible:
+                        candidate_scores_for_category.append((score, uid))
+            
+            if not candidate_scores_for_category:
+                logger.info(f"[CombinedWeatherScore] No eligible miners for bonus: {category['id']}")
+                continue
+
+            candidate_scores_for_category.sort(key=lambda x: x[0], reverse=higher_is_better)
+            best_score = candidate_scores_for_category[0][0]
+            winners = [uid for score, uid in candidate_scores_for_category if score == best_score]
+
+            if 1 <= len(winners) <= 2:
+                bonus_per_winner = bonus_value_add / len(winners)
+                for winner_uid in winners:
+                    miner_bonuses_applied[winner_uid] += bonus_per_winner
+                    logger.info(f"[CombinedWeatherScore] Bonus for {category['id']} awarded to UID {winner_uid} (value: {bonus_per_winner:.3f}). Winning score: {best_score:.4f}")
+            elif len(winners) > 2:
+                logger.info(f"[CombinedWeatherScore] Bonus for {category['id']} skipped: too many winners ({len(winners)}) with score {best_score:.4f}.")
+        
+        final_weather_scores_for_table = np.clip(proportional_weather_scores + miner_bonuses_applied, 0.0, 1.1)
+        logger.info(f"[CombinedWeatherScore] Applied bonuses. Max combined score: {np.max(final_weather_scores_for_table):.4f}")
+        
         mock_evaluation_results = []
         for uid_idx in range(256):
             mock_evaluation_results.append({
                 "miner_uid": uid_idx,
-                "final_score_for_uid": combined_scores_array[uid_idx]
+                "final_score_for_uid": final_weather_scores_for_table[uid_idx]
             })
         
-        id_for_combined_score_table_entry = 0 
-        if run_id_trigger is not None:
-            id_for_combined_score_table_entry = run_id_trigger
+        id_for_combined_row = 0
+        if run_id_trigger is not None: id_for_combined_row = run_id_trigger
         elif day1_run_id_for_log != "N/A":
-            try:
-                id_for_combined_score_table_entry = int(day1_run_id_for_log)
-            except ValueError:
-                logger.warning(f"[CombinedWeatherScore] Could not parse day1_run_id_for_log ('{day1_run_id_for_log}') as int. Using 0 for combined score's task_id.")
+            try: id_for_combined_row = int(day1_run_id_for_log)
+            except ValueError: logger.warning(f"[CombinedWeatherScore] Could not parse day1_run_id_for_log ('{day1_run_id_for_log}') as int for task_id.")
         
         await self.build_score_row(
-            run_id = id_for_combined_score_table_entry, 
+            run_id = id_for_combined_row, 
             gfs_init_time = timestamp_for_combined_score_row,
             evaluation_results = mock_evaluation_results,
             task_name_prefix = "weather_combined_score"
         )
-        logger.info(f"[CombinedWeatherScore] update_combined_weather_scores completed and called build_score_row for 'weather_combined_score' with task_id {id_for_combined_score_table_entry}.")
+        logger.info(f"[CombinedWeatherScore] Update completed for 'weather_combined_score' (task_id: {id_for_combined_row}).")
 
     ############################################################
     # Miner methods
