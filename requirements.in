@@ -36,4 +36,13 @@ uvicorn
 xarray
 netcdf4
 h5netcdf
+yarl
+xskillscore
+metpy
+microsoft-aurora
+pyjwt
+kerchunk
+cdsapipip 
 azure-storage-blob
+piptools
+
