@@ -71,6 +71,12 @@ from gaia.validator.sync.backup_manager import get_backup_manager, BackupManager
 from gaia.validator.sync.restore_manager import get_restore_manager, RestoreManager
 import random # for staggering db sync tasks
 
+# New imports for DB Sync
+from gaia.validator.sync.azure_blob_utils import get_azure_blob_manager_for_db_sync, AzureBlobManager
+from gaia.validator.sync.backup_manager import get_backup_manager, BackupManager
+from gaia.validator.sync.restore_manager import get_restore_manager, RestoreManager
+import random # for staggering db sync tasks
+
 logger = get_logger(__name__)
 
 

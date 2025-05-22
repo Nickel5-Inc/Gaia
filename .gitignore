@@ -21,6 +21,8 @@ data/
 
 gaia.egg-info/*
 
+gaia.egg-info/*
+
 
 # Cache directories
 **/smap_cache/
