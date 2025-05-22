@@ -1603,8 +1603,19 @@ class GaiaValidator:
             AND created_at >= :start_time
             ORDER BY created_at DESC
             """
+            weather_query = """
+            SELECT score, created_at 
+            FROM score_table 
+            WHERE task_name = :task_name
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+            weather_results = await self.database_manager.fetch_all(
+                weather_query, {"task_name": "weather"}
+            )
+            logger.info(f"Found {len(weather_results)} weather score row (latest only)")
             
-            # Fetch and analyze geomagnetic scores
+            # Fetch geomagnetic scores
             geomagnetic_results = await self.database_manager.fetch_all(
                 query, {"task_name": "geomagnetic", "start_time": one_day_ago}
             )
@@ -1617,7 +1628,7 @@ class GaiaValidator:
             logger.info(f"Found {len(soil_results)} soil moisture score rows")
             
             # If no scores exist yet, return equal weights for all active nodes
-            if not geomagnetic_results and not soil_results:
+            if not weather_results and not geomagnetic_results and not soil_results:
                 logger.info("No scores found in database - initializing equal weights for active nodes")
                 try:
                     # Get active nodes from metagraph
@@ -1643,12 +1654,21 @@ class GaiaValidator:
                     return None
 
             # Initialize score arrays
+            weather_scores = np.full(256, np.nan)
             geomagnetic_scores = np.full(256, np.nan)
             soil_scores = np.full(256, np.nan)
 
             # Count raw scores per UID
+            weather_counts = [0] * 256
             geo_counts = [0] * 256
             soil_counts = [0] * 256
+            
+            if weather_results:
+                for result in weather_results:
+                    scores = result['score']
+                    for uid in range(256):
+                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                            weather_counts[uid] += 1
             
             if geomagnetic_results:
                 for result in geomagnetic_results:
@@ -1722,6 +1742,23 @@ class GaiaValidator:
                 
                 logger.info(f"Geomagnetic masked array processing: {zeros_after} UIDs have zero final score")
 
+            if weather_results:
+                latest_result = weather_results[0]
+                scores = latest_result['score']
+                score_age_days = (now - latest_result['created_at']).total_seconds() / (24 * 3600)
+                logger.info(f"Using latest weather score from {latest_result['created_at']} ({score_age_days:.1f} days ago)")
+                
+                for uid in range(256):
+                    if isinstance(scores[uid], str) or np.isnan(scores[uid]):
+                        weather_scores[uid] = 0.0
+                    else:
+                        weather_scores[uid] = scores[uid]
+                        if scores[uid] != 0.0:
+                            weather_counts[uid] = 1
+                
+                zero_count = sum(1 for s in weather_scores if s == 0.0)
+                logger.info(f"Weather scores: {zero_count} UIDs have zero score in latest evaluation")
+
             if soil_results:
                 soil_scores_by_uid = [[] for _ in range(256)]
                 for result in soil_results:
@@ -1793,29 +1830,51 @@ class GaiaValidator:
                     validator_nodes_by_uid_list[node.node_id] = node
             
             for idx in range(256):
+                weather_score = weather_scores[idx]
                 geomagnetic_score = geomagnetic_scores[idx]
                 soil_score = soil_scores[idx]
 
                 # Treat 0.0 scores the same as NaN
+                if np.isnan(weather_score) or weather_score == 0.0:
+                    weather_score = np.nan
                 if np.isnan(geomagnetic_score) or geomagnetic_score == 0.0:
                     geomagnetic_score = np.nan
                 if np.isnan(soil_score) or soil_score == 0.0:
                     soil_score = np.nan
-                
-                # Access node by UID from the prepared list
+
                 current_node_obj = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None
                 current_hotkey_on_chain = current_node_obj.hotkey if current_node_obj else "N/A (UID not active)"
 
-                if np.isnan(geomagnetic_score) and np.isnan(soil_score):
+                # 70% weather, 15% soil, 15% geo split
+                if np.isnan(weather_score) and np.isnan(geomagnetic_score) and np.isnan(soil_score):
                     weights[idx] = 0.0
-                elif np.isnan(geomagnetic_score):
-                    weights[idx] = 0.60 * soil_score
-                elif np.isnan(soil_score):
-                    weights[idx] = 0.40 * sigmoid(geomagnetic_score, k=20, x0=0.93)
                 else:
-                    weights[idx] = 0.40 * sigmoid(geomagnetic_score, k=20, x0=0.93) + 0.60 * soil_score
+                    weather_component = 0.0
+                    geo_component = 0.0
+                    soil_component = 0.0
+                    
+                    if not np.isnan(weather_score):
+                        weather_component = 0.70 * weather_score
+                    if not np.isnan(geomagnetic_score):
+                        geo_component = 0.15 * sigmoid(geomagnetic_score, k=20, x0=0.93)
+                    if not np.isnan(soil_score):
+                        soil_component = 0.15 * soil_score
+                    
+                    total_weight_available = 0.0
+                    if not np.isnan(weather_score):
+                        total_weight_available += 0.70
+                    if not np.isnan(geomagnetic_score):
+                        total_weight_available += 0.15
+                    if not np.isnan(soil_score):
+                        total_weight_available += 0.15
+                    
+                    if total_weight_available > 0:
+                        scaling_factor = 1.0 / total_weight_available
+                        weights[idx] = (weather_component + geo_component + soil_component) * scaling_factor
+                    else:
+                        weights[idx] = 0.0
 
-                logger.info(f"UID {idx} (CurrentHotKey: {current_hotkey_on_chain}): geo={geomagnetic_score} ({geo_counts[idx]} scores), soil={soil_score} ({soil_counts[idx]} scores), weight={weights[idx]:.4f}")
+                logger.info(f"UID {idx} (CurrentHotKey: {current_hotkey_on_chain}): weather={weather_score} ({weather_counts[idx]} scores), geo={geomagnetic_score} ({geo_counts[idx]} scores), soil={soil_score} ({soil_counts[idx]} scores), weight={weights[idx]:.4f}")
 
             logger.info(f"Weights before normalization: {weights.tolist()}")
 

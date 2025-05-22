@@ -47,8 +47,8 @@ if not metrics_logger.handlers:
 class SoilScoringMechanism(ScoringMechanism):
     """Scoring mechanism for soil moisture predictions."""
 
-    alpha: float = Field(default=10, description="Sigmoid steepness parameter")
-    beta: float = Field(default=0.1, description="Sigmoid midpoint parameter")
+    alpha: float = Field(default=3, description="Sigmoid steepness parameter")
+    beta: float = Field(default=0.15, description="Sigmoid midpoint parameter")
     baseline_rmse: float = Field(default=50, description="Baseline RMSE value")
     db_manager: Any = Field(default=None)
     task: Any = Field(default=None, description="Reference to the parent task")
