@@ -25,7 +25,7 @@ pip install -e .
 ```
 
 ## Miners
-[Quicklink](docs/MINER.md)
+[Quicklink - Mining Guide](docs/MINER.md)
 
 Miners develop models to understand future events. These events currently include soil moisture and geomagnetic readings at the equator. Miners will receive data from validators for the models that we have in place. They are also free to gather their own data from other resources. The tasks are consistent in design and in timing; this predictability allows miners the flexibility to retrieve any data that their model requires. 
 
@@ -37,7 +37,7 @@ The incentive split was previously 50:50, but has been adjusted to favor higher-
 
 
 ## Validators
-[Quicklink](docs/VALIDATOR.md)
+[Quicklink - Validating Guide](docs/VALIDATOR.md)
 
 Validators will connect to a few API's to provide miners with the data they need to run models.
 

@@ -19,7 +19,8 @@ nodes.json
 # Miscellaneous
 data/
 
-gaia.egg-info/
+gaia.egg-info/*
+
 
 # Cache directories
 **/smap_cache/
@@ -37,3 +38,15 @@ ecosystem.config.js
 fiber_debug.log
 
 gaia/models/geomagnetic_model.pkl
+
+metric_plots/*
+logs/*
+gaia.egg-info/* 
+gaia/models/checkpoints/*
+analysis.py 
+miner.log
+parse_soil_metrics.py
+extended_metrics.log
+pm2_validator.log
+generate_miner_manifest.py
+make_zarr_dir.py
