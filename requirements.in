@@ -42,7 +42,7 @@ metpy
 microsoft-aurora
 pyjwt
 kerchunk
-cdsapipip 
+cdsapi
 azure-storage-blob
-piptools
+pip-tools
 
