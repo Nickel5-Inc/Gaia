@@ -41,7 +41,7 @@ class WeatherInferenceRunner:
 
     def run_multistep_inference(self, initial_batch: Batch, steps: int) -> List[Batch]:
         """
-        Runs multi-step inference using rollout and returns selected steps (every other).
+        Runs multi-step inference using rollout and returns selected steps.
 
         Args:
             initial_batch: The initial aurora.Batch object (should be on CPU).
