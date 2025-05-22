@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 python-dotenv
 PyYAML
+httpx
 
 # Add your project-specific dependencies here, for example:
 # xarray

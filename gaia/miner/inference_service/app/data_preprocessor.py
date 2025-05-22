@@ -1,147 +1,112 @@
 import base64
+import json
 import pickle
-import traceback
+import logging
 from typing import Any, Dict, Optional
 
-# import xarray as xr # No longer needed here for GFS processing
-# from ..utils.data_prep import create_aurora_batch_from_gfs # No longer needed here
-
-_AURORA_AVAILABLE = False
+# Conditional import for Batch type hint
 try:
     from aurora import Batch
     _AURORA_AVAILABLE = True
 except ImportError:
-    Batch = Any  # type: ignore
-    pass
+    Batch = Any # type: ignore
+    _AURORA_AVAILABLE = False
+    logging.warning("Aurora SDK not found. Batch type is Any. Functionality might be limited if Batch objects are expected.")
 
-class LoggerPlaceholder:
-    def info(self, msg): print(f"INFO: {msg}")
-    def error(self, msg): print(f"ERROR: {msg}")
-    def warning(self, msg): print(f"WARNING: {msg}")
-    def debug(self, msg): print(f"DEBUG: {msg}")
+logger = logging.getLogger(__name__)
 
-logger = LoggerPlaceholder()
-
-# create_aurora_batch_from_gfs is removed as batch creation now happens on the miner side.
-
-async def prepare_input_batch_from_payload(
-    payload_data: Dict[str, Any],
-    # config: Dict[str, Any] # Config might not be needed here anymore, or only for specific parts
-) -> Optional[Batch]:
+async def prepare_input_batch_from_payload(payload_str: str, config: Dict[str, Any]) -> Optional[Batch]:
     """
-    Deserializes the input payload, expecting a serialized Aurora Batch object.
-
-    Args:
-        payload_data: Dictionary containing the raw payload,
-                      expected to have 'serialized_aurora_batch'
-                      containing a base64 encoded pickled aurora.Batch object.
-        # config: Application configuration (if needed for any part of this).
-
-    Returns:
-        An aurora.Batch object ready for model inference, or None if deserialization fails.
+    Deserializes a base64 encoded, pickled Aurora Batch object from a JSON payload string.
+    The payload_str is expected to be a JSON string containing a "serialized_aurora_batch" field.
     """
-    if not payload_data:
-        logger.error("No data provided to prepare_input_batch_from_payload.")
+    try:
+        payload_dict = json.loads(payload_str)
+        if "serialized_aurora_batch" not in payload_dict:
+            logger.error("'serialized_aurora_batch' field missing in the JSON payload.")
+            return None
+
+        serialized_batch_b64 = payload_dict["serialized_aurora_batch"]
+        if not isinstance(serialized_batch_b64, str):
+            logger.error("'serialized_aurora_batch' must be a base64 encoded string.")
+            return None
+
+        logger.debug("Decoding base64 serialized batch...")
+        pickled_batch_bytes = base64.b64decode(serialized_batch_b64)
+
+        logger.debug("Unpickling batch data...")
+        deserialized_batch = pickle.loads(pickled_batch_bytes)
+
+        if _AURORA_AVAILABLE:
+            if not isinstance(deserialized_batch, Batch): # type: ignore
+                logger.error(f"Deserialized object is not an Aurora Batch. Type: {type(deserialized_batch)}")
+                return None
+        elif deserialized_batch is None: # Basic check if Aurora not available
+            logger.error("Deserialized batch is None.")
+            return None
+
+        logger.info("Successfully deserialized input Aurora Batch.")
+        return deserialized_batch
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in payload: {e}")
+        return None
+    except base64.binascii.Error as e:
+        logger.error(f"Base64 decoding error: {e}")
+        return None
+    except pickle.UnpicklingError as e:
+        logger.error(f"Unpickling error: {e}")
+        return None
+    except TypeError as e: # Catches potential errors if data isn't bytes for b64decode or pickle.loads
+        logger.error(f"Type error during deserialization: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error in prepare_input_batch_from_payload: {e}", exc_info=True)
+        return None
+
+async def serialize_prediction_step(
+    prediction_step: Batch,
+    step_index: int,
+    config: Dict[str, Any]
+) -> Optional[str]:
+    """
+    Serializes a single prediction step (Aurora Batch object) into a JSON string.
+    The batch is pickled, then base64 encoded.
+    Includes metadata like step index and forecast hours.
+    """
+    if _AURORA_AVAILABLE and not isinstance(prediction_step, Batch): # type: ignore
+        logger.error(f"Object to serialize is not an Aurora Batch. Type: {type(prediction_step)}. Skipping step {step_index}.")
+        return None
+    elif prediction_step is None: # Basic check if Aurora not available
+        logger.error(f"Prediction_step is None for step_index {step_index}. Skipping.")
         return None
 
     try:
-        logger.info("Starting input data deserialization...")
+        logger.debug(f"Pickling prediction step {step_index}...")
+        pickled_prediction = pickle.dumps(prediction_step)
 
-        if 'serialized_aurora_batch' not in payload_data:
-            logger.error("Missing 'serialized_aurora_batch' in input data.")
-            return None
+        logger.debug(f"Base64 encoding pickled prediction step {step_index}...")
+        serialized_data_b64 = base64.b64encode(pickled_prediction).decode('utf-8')
 
-        try:
-            logger.debug("Decoding and unpickling serialized_aurora_batch")
-            batch_bytes = base64.b64decode(payload_data['serialized_aurora_batch'])
-            aurora_batch = pickle.loads(batch_bytes)
+        model_config = config.get('model', {})
+        data_proc_config = config.get('data_processing', {})
 
-            if _AURORA_AVAILABLE and Batch != Any:
-                if not isinstance(aurora_batch, Batch):
-                    raise TypeError(f"Deserialized object is not an Aurora Batch. Type was {type(aurora_batch)}")
-            elif not _AURORA_AVAILABLE and aurora_batch is None: # Basic check if Aurora not available
-                 raise TypeError("Deserialized object is None, expected a Batch-like structure.")
+        output_dict = {
+            "step_index": step_index,
+            "forecast_step_hours": (step_index + 1) * model_config.get('forecast_step_hours', 6),
+            "serialized_prediction": serialized_data_b64,
+            "format": data_proc_config.get('serialization_format', 'pickle_base64')
+        }
 
+        logger.info(f"Successfully serialized prediction step {step_index}.")
+        return json.dumps(output_dict)
 
-        except (TypeError, pickle.UnpicklingError, base64.binascii.Error) as deserialize_err:
-            logger.error(f"Failed to decode/unpickle Aurora Batch data: {deserialize_err}")
-            logger.error(traceback.format_exc())
-            return None
-        
-        logger.info("Successfully deserialized Aurora Batch.")
-        return aurora_batch
-
-    except Exception as e:
-        logger.error(f"Unhandled error in prepare_input_batch_from_payload: {e}")
-        logger.error(traceback.format_exc())
+    except pickle.PicklingError as e:
+        logger.error(f"Pickling error for step {step_index}: {e}")
         return None
-
-# Example of how to serialize forecast data (you'll need to adapt this)
-# This will depend heavily on what `selected_predictions_cpu` from your original code contains
-# and how the miner application expects to receive it.
-
-# For now, this is a very basic placeholder.
-# You will need to implement the actual serialization of your model's output (likely xarray Datasets or similar)
-# into a format that can be sent over JSON (e.g., base64 encoded pickles, or structured numerical data).
-
-def serialize_forecast_data(predictions: Any) -> Dict[str, Any]:
-    """
-    Serializes the forecast data (model output) into a dictionary.
-    This is a placeholder and needs to be implemented based on your model output format.
-    """
-    logger.info("Serializing forecast data...")
-    if predictions is None:
-        logger.warning("No predictions to serialize.")
-        return {"error": "No predictions generated"}
-
-    # Example: If predictions are a list of xarray Datasets (like in some weather models)
-    # You might pickle and base64 encode each, or extract key data.
-    # This is highly dependent on the structure of `selected_predictions_cpu`
-    serialized_output = {}
-    try:
-        # This is a naive example. Your actual Aurora Batch / model output will be more complex.
-        # If `predictions` is a list of Batch objects:
-        if _AURORA_AVAILABLE and isinstance(predictions, list) and all(isinstance(p, Batch) for p in predictions):
-            # You need to decide how to convert Batch objects to a serializable format.
-            # This might involve extracting tensors, converting to numpy, then to lists, or pickling.
-            logger.warning("Actual serialization for list of Aurora Batch objects is not implemented.")
-            serialized_output["message"] = "Forecast generated, but serialization of Batch list is a placeholder."
-            serialized_output["num_steps"] = len(predictions)
-            # Example: pickle and base64 encode each batch in the list
-            # serialized_steps = []
-            # for i, step_batch in enumerate(predictions):
-            #     try:
-            #         pickled_batch = pickle.dumps(step_batch)
-            #         b64_encoded_batch = base64.b64encode(pickled_batch).decode('utf-8')
-            #         serialized_steps.append(b64_encoded_batch)
-            #     except Exception as e_step:
-            #         logger.error(f"Error serializing step {i} of Aurora Batch list: {e_step}")
-            #         serialized_steps.append({"error": f"Failed to serialize step {i}"})
-            # serialized_output["serialized_batch_steps"] = serialized_steps
-
-        # If the output is a single xarray.Dataset (e.g. a combined forecast)
-        # This was commented out from the original, but might be relevant depending on your model output
-        # elif isinstance(predictions, xr.Dataset): 
-        #     pickled_ds = pickle.dumps(predictions)
-        #     b64_encoded_ds = base64.b64encode(pickled_ds).decode('utf-8')
-        #     serialized_output["forecast_dataset_b64"] = b64_encoded_ds
-        #     logger.info("Serialized xarray.Dataset output.")
-        else:
-            # Fallback for unknown prediction format
-            logger.warning(f"Predictions are of an unexpected type: {type(predictions)}. Basic serialization attempt.")
-            # Ensure it's JSON serializable. This might fail for complex objects.
-            try:
-                # Attempt to directly use in dict if simple, otherwise convert to string
-                # This part is risky and depends on `predictions` structure
-                serialized_output["raw_predictions"] = predictions # or str(predictions)
-            except TypeError:
-                 serialized_output["raw_predictions_str"] = str(predictions)
-
-
+    except TypeError as e: # Catches errors like trying to b64encode non-bytes
+        logger.error(f"Type error during serialization for step {step_index}: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Error during forecast data serialization: {e}")
-        logger.error(traceback.format_exc())
-        return {"error": f"Failed to serialize forecast data: {e}"}
-
-    logger.info("Forecast data serialization complete.")
-    return serialized_output 
+        logger.error(f"Unexpected error in serialize_prediction_step for step {step_index}: {e}", exc_info=True)
+        return None 

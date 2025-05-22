@@ -1,191 +1,223 @@
 import asyncio
 import traceback
+import logging
 from typing import Any, Dict, Optional, List
 
 import torch
-# The following try-except block handles conditional import of Aurora and Batch
-# This is important if the aurora SDK might not be present in all environments
-# where this code is type-checked or partially run.
 
-# Define LoggerPlaceholder early if it's to be used in except blocks below
-class LoggerPlaceholder:
-    def info(self, msg): print(f"INFO: {msg}")
-    def error(self, msg): print(f"ERROR: {msg}")
-    def warning(self, msg): print(f"WARNING: {msg}")
-
-logger = LoggerPlaceholder() # Instantiate it
-
+# --- Aurora and Batch Type Handling ---
+# Attempt to import Aurora-specific types for type checking and runtime validation.
+# If Aurora SDK is not available, use 'Any' and log a warning.
 _AURORA_AVAILABLE = False
-Aurora: Any # Pre-declare so the name exists; will be Any if import fails
-Batch: Any  # Pre-declare so the name exists; will be Any if import fails
+AuroraModelType: Any
+BatchType: Any
 
 try:
     from aurora import Aurora as AuroraActual, Batch as BatchActual
-    Aurora = AuroraActual
-    Batch = BatchActual
+    AuroraModelType = AuroraActual
+    BatchType = BatchActual
     _AURORA_AVAILABLE = True
-    logger.info("Successfully imported Aurora and Batch from aurora SDK.")
+    logging.info("Successfully imported Aurora and Batch from aurora SDK for type hinting.")
 except ImportError:
-    logger.warning("Aurora SDK (aurora) not found. Using 'Any' for Aurora and Batch types. Full functionality may be affected.")
-    # Aurora and Batch remain typing.Any as pre-declared
-    _AURORA_AVAILABLE = False
+    AuroraModelType = Any
+    BatchType = Any
+    logging.warning(
+        "Aurora SDK (aurora.py) not found. Using 'Any' for Aurora and Batch types. "
+        "Full model loading and type checking for these objects will be bypassed. "
+        "Ensure the SDK is available in the environment for full functionality."
+    )
+
+logger = logging.getLogger(__name__)
 
 class InferenceModel:
-    """Placeholder for your actual inference model wrapper."""
+    """
+    Manages the lifecycle and execution of the Aurora weather forecasting model.
+    """
     def __init__(self, config: Dict[str, Any]):
-        self.config = config.get('model', {}) # Get the 'model' sub-config
-        self.model: Optional['Aurora'] = None # Changed to string literal
+        self.model_config = config.get('model', {}) # Get the 'model' sub-config
+        self.model: Optional[AuroraModelType] = None
         self.device: Optional[torch.device] = None
-        self.load_model()
+        self._load_model_and_device()
 
-    def load_model(self):
-        model_repo = self.config.get('model_repo', "microsoft/aurora")
-        checkpoint = self.config.get('checkpoint', "aurora-0.25-pretrained.ckpt")
-        # use_lora = self.config.get('use_lora', False) # Assuming not used for pretrained, can be added to config
-        use_lora = False # Defaulting to False as per WeatherInferenceRunner for pretrained
-        
+    def _load_model_and_device(self):
+        """
+        Loads the Aurora model onto the appropriate device (CPU or GPU)
+        based on the provided configuration and system availability.
+        """
+        model_repo = self.model_config.get('model_repo', "microsoft/aurora")
+        checkpoint = self.model_config.get('checkpoint', "aurora-0.25-pretrained.ckpt")
+        # use_lora = self.model_config.get('use_lora', False) # Not currently used for pretrained Aurora
+        use_lora = False
+
         # Determine device from config, defaulting to cuda if available, else cpu
-        config_device_str = self.config.get('device', 'auto').lower()
-        if config_device_str == "cuda" and torch.cuda.is_available():
-            self.device = torch.device("cuda")
+        config_device_str = self.model_config.get('device', 'auto').lower()
+        if config_device_str == "cuda":
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            else:
+                logger.warning("CUDA specified in config but not available. Falling back to CPU.")
+                self.device = torch.device("cpu")
         elif config_device_str == "cpu":
             self.device = torch.device("cpu")
-        else: # auto or invalid value
+        else: # 'auto' or invalid value
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         logger.info(f"Initializing InferenceModel. Attempting to use device: {self.device}")
 
+        if not _AURORA_AVAILABLE:
+            logger.error(
+                "Aurora SDK is not available. Cannot load the Aurora model. "
+                "Inference functionality will be disabled."
+            )
+            self.model = None
+            return
+
         try:
             logger.info(f"Creating Aurora model instance (use_lora={use_lora})...")
-            self.model = Aurora(use_lora=use_lora)
+            # Ensure AuroraModelType is the actual class if available
+            self.model = AuroraModelType(use_lora=use_lora) # type: ignore
             logger.info(f"Loading checkpoint '{checkpoint}' from repository '{model_repo}'...")
-            # The Aurora model internally handles downloading from HuggingFace Hub if not found locally
-            # or loading from a local path if model_repo is a path.
-            self.model.load_checkpoint(model_repo, checkpoint)
-            self.model.eval() # Set to evaluation mode
-            self.model = self.model.to(self.device) # Move model to the selected device
+            # The Aurora model internally handles downloading from HuggingFace Hub
+            # or loading from a local path if model_repo is a local directory path.
+            self.model.load_checkpoint(model_repo, checkpoint) # type: ignore
+            self.model.eval() # type: ignore # Set to evaluation mode
+            self.model = self.model.to(self.device) # type: ignore # Move model to the selected device
             logger.info(f"Aurora model '{checkpoint}' loaded successfully from '{model_repo}' and moved to {self.device}.")
 
         except FileNotFoundError as fnf_error:
             logger.error(f"Checkpoint file not found for model {model_repo}/{checkpoint}. Error: {fnf_error}", exc_info=True)
             logger.error("Please ensure the model_repo and checkpoint are correct in settings.yaml, ")
-            logger.error("or that the checkpoint exists at the specified path if model_repo is a local directory.")
-            self.model = None
+            logger.error("or that the checkpoint exists at the specified path if model_repo is a local directory (and copied into the container).")
+            self.model = None # Ensure model is None if loading fails
         except Exception as e:
             logger.error(f"Failed to load Aurora model: {e}", exc_info=True)
-            self.model = None
+            self.model = None # Ensure model is None if loading fails
 
-    async def run_inference(self, input_batch: 'Batch', steps: int) -> Optional[List['Batch']]: # Changed to string literals
+    async def run_inference(self, input_batch: BatchType, steps: int) -> Optional[List[BatchType]]:
         """
-        Runs multi-step inference.
-        Adapts logic from WeatherInferenceRunner.run_multistep_inference.
+        Runs multi-step inference using the loaded Aurora model.
+        This method is designed to be non-blocking by offloading the potentially
+        CPU/GPU-bound rollout operation to a separate thread.
         """
         if self.model is None:
             logger.error("Model not loaded. Cannot run inference.")
             return None
-        if not _AURORA_AVAILABLE and input_batch is None:
-            logger.warning("Aurora not available and input_batch is None, cannot run placeholder inference.")
+        if not _AURORA_AVAILABLE:
+            logger.error("Aurora SDK not available. Cannot run inference.")
             return None
-        if _AURORA_AVAILABLE and not isinstance(input_batch, BatchActual if _AURORA_AVAILABLE else Any):
+        if not isinstance(input_batch, BatchType if _AURORA_AVAILABLE else Any): # type: ignore
              logger.error(f"Expected Aurora Batch, got {type(input_batch)}")
-             return None 
+             return None
 
         logger.info(f"Running inference for {steps} steps on device {self.device}...")
         
-        selected_predictions: List['Batch'] = [] # Changed to string literal
         # Ensure input_batch is on the correct device before passing to the model
-        batch_on_device = input_batch.to(self.device)
-
         try:
-            # Mimic torch.inference_mode() for safety, though Aurora's rollout might handle it.
-            # Actual rollout function is imported from aurora package
-            # from aurora import rollout # This should be at the top of the file if not already
-            
-            # The original code uses `asyncio.to_thread` for `run_multistep_inference` 
-            # because `rollout` can be blocking. We should do the same here.
-            def _blocking_rollout():
-                results = []
-                with torch.inference_mode(): 
-                    for step_index, pred_batch_device in enumerate(torch.rollout(self.model, batch_on_device, steps=steps)):
-                        logger.debug(f"Prediction for step {step_index+1} (T+{(step_index + 1) * self.config.get('forecast_step_hours', 6)}h)")
-                        results.append(pred_batch_device.to("cpu")) # Move to CPU before storing
-                return results
+            batch_on_device = input_batch.to(self.device) # type: ignore
+        except Exception as e:
+            logger.error(f"Failed to move input batch to device {self.device}: {e}", exc_info=True)
+            return None
 
-            selected_predictions = await asyncio.to_thread(_blocking_rollout)
-            logger.info(f"Finished multi-step inference. Generated {len(selected_predictions)} prediction steps.")
+        def _blocking_rollout_operation() -> List[BatchType]:
+            """Synchronous part of the inference to be run in a thread."""
+            results: List[BatchType] = []
+            with torch.inference_mode(): # Essential for performance and correct behavior
+                # torch.rollout is assumed to be available if Aurora is
+                for step_index, pred_batch_device in enumerate(torch.rollout(self.model, batch_on_device, steps=steps)):
+                    logger.debug(f"Prediction for step {step_index+1} (T+{(step_index + 1) * self.model_config.get('forecast_step_hours', 6)}h)")
+                    # Move predictions to CPU before storing/returning to avoid GPU memory accumulation
+                    # and to make them accessible for CPU-based serialization later.
+                    results.append(pred_batch_device.to("cpu"))
+            return results
 
+        selected_predictions: Optional[List[BatchType]] = None
+        try:
+            selected_predictions = await asyncio.to_thread(_blocking_rollout_operation)
+            logger.info(f"Finished multi-step inference. Generated {len(selected_predictions) if selected_predictions else 0} prediction steps.")
         except RuntimeError as e:
-            if "out of memory" in str(e).lower() and self.device == torch.device("cuda"):
+            if "out of memory" in str(e).lower() and self.device and self.device.type == "cuda":
                 logger.error(f"CUDA out of memory during inference: {e}. Try reducing batch size or model size if possible.", exc_info=True)
             else:
                 logger.error(f"Runtime error during inference: {e}", exc_info=True)
-            raise # Re-raise to be caught by the main handler
+            # Do not re-raise here, allow finally block to run, return None will indicate failure
         except Exception as e:
              logger.error(f"Error during rollout inference: {e}", exc_info=True)
-             raise # Re-raise
+             # Do not re-raise here, allow finally block to run, return None will indicate failure
         finally:
-             del batch_on_device # Free memory for the batch on device
-             if self.device == torch.device("cuda"):
-                 torch.cuda.empty_cache() # Clear CUDA cache
+            # Explicitly delete the on-device batch to free GPU memory as soon as possible.
+            del batch_on_device
+            if self.device and self.device.type == "cuda":
+                torch.cuda.empty_cache() # Attempt to clear CUDA cache
 
         return selected_predictions
 
-# Global inference runner instance (or manage it within FastAPI app state)
-# This instance will be created when the module is loaded.
-# Ensure your config loading is handled before this, or pass it during app startup.
-
-# To be initialized in main.py after loading config
+# --- Global Inference Runner Instance ---
+# This instance will be initialized during FastAPI application startup.
 INFERENCE_RUNNER: Optional[InferenceModel] = None
 
 async def initialize_inference_runner(app_config: Dict[str, Any]):
+    """
+    Initializes the global INFERENCE_RUNNER instance.
+    This should be called during application startup (e.g., FastAPI lifespan event).
+    """
     global INFERENCE_RUNNER
     if INFERENCE_RUNNER is None:
-        logger.info("Initializing inference runner...")
+        logger.info("Initializing global inference runner...")
         INFERENCE_RUNNER = InferenceModel(config=app_config)
-        # You might want to run a dummy inference pass here to ensure the model is truly ready
-        logger.info("Inference runner initialized.")
+        if INFERENCE_RUNNER.model is None:
+            logger.error("Inference runner initialized, but model FAILED to load. Inference will not be available.")
+        else:
+            logger.info("Global inference runner initialized and model loaded successfully.")
     else:
-        logger.info("Inference runner already initialized.")
+        logger.info("Global inference runner already initialized.")
 
 async def get_inference_runner() -> Optional[InferenceModel]:
+    """
+    Provides access to the global INFERENCE_RUNNER instance.
+    """
     if INFERENCE_RUNNER is None:
         logger.error("Inference runner accessed before initialization.")
-        # In a real scenario, you might want to raise an error or wait for initialization
+        # In a robust application, you might raise an error or have a retry mechanism.
     return INFERENCE_RUNNER
 
 async def run_model_inference(
-    prepared_batch: 'Batch',  
-    config: Dict[str, Any] # Pass the main APP_CONFIG here
-) -> Optional[List[Any]]: # Return type here is List[Any] which is fine, or could be List['Batch']
+    prepared_batch: BatchType,
+    config: Dict[str, Any] # Main application config
+) -> Optional[List[BatchType]]:
     """
-    Main function to trigger inference using the global runner.
+    High-level function to execute model inference using the global runner.
     """
     runner = await get_inference_runner()
     if not runner:
-        logger.error("Inference runner not available.")
+        logger.error("Inference runner not available. Cannot run inference.")
         return None
-    if runner.model is None: # Added check here for more direct feedback before calling run_inference
+    if runner.model is None:
         logger.error("Inference runner's model is not loaded. Cannot run inference.")
         return None
 
     try:
-        inference_steps = config.get('model', {}).get('inference_steps', 40)
-        forecast_step_hours = config.get('model', {}).get('forecast_step_hours', 6) # For logging in run_inference
-        runner.config['forecast_step_hours'] = forecast_step_hours # Pass to runner for its logging
+        model_settings = config.get('model', {})
+        inference_steps = model_settings.get('inference_steps', 40)
+        
+        # The forecast_step_hours is already part of runner.model_config,
+        # but ensuring it's clear what's being used.
         
         predictions = await runner.run_inference(
-            input_batch=prepared_batch, 
+            input_batch=prepared_batch,
             steps=inference_steps
         )
         
-        if predictions is None or not predictions:
-            logger.warning("Inference did not return any predictions.")
+        if predictions is None: # run_inference itself will log errors
+            logger.warning("Inference execution returned None (likely due to an error).")
             return None
+        if not predictions: # Empty list of predictions
+            logger.warning("Inference execution completed but returned no prediction steps.")
+            return [] # Return empty list rather than None if inference ran but produced nothing
         
-        logger.info(f"Inference successful, received {len(predictions)} steps.")
+        logger.info(f"Inference processing successful, received {len(predictions)} steps.")
         return predictions
 
     except Exception as e:
-        logger.error(f"Error during model inference: {e}")
+        logger.error(f"Unexpected error during run_model_inference: {e}")
         logger.error(traceback.format_exc())
         return None 

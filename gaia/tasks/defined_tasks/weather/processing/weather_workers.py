@@ -14,6 +14,8 @@ import time
 import zarr
 import numcodecs
 from typing import Dict
+import base64
+import pickle
 
 from fiber.logging_utils import get_logger
 from aurora import Batch
@@ -139,6 +141,79 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                      )
                      logger.info(f"[InferenceTask Job {job_id}] Foundry inference completed. Received {len(predictions_list if predictions_list else [])} steps.")
                      selected_predictions_cpu = predictions_list 
+                 elif inference_type == "http_service":
+                    logger.info(f"[InferenceTask Job {job_id}] Using HTTP inference service (type: {inference_type})...")
+                    service_url = os.getenv("WEATHER_INFERENCE_SERVICE_URL")
+                    api_key = os.getenv("MINER_API_KEY_FOR_INFRA_SERVICE")
+
+                    if not service_url:
+                        logger.error(f"[InferenceTask Job {job_id}] WEATHER_INFERENCE_SERVICE_URL not set. Aborting HTTP inference.")
+                        await update_job_status(task_instance, job_id, "error", "HTTP service URL not configured")
+                        return
+
+                    try:
+                        import httpx # Ensure httpx is available
+                        import gzip
+
+                        logger.debug(f"[{job_id}] Serializing Aurora Batch for HTTP service...")
+                        pickled_batch = pickle.dumps(prepared_batch)
+                        base64_encoded_batch = base64.b64encode(pickled_batch).decode('utf-8')
+                        payload_json_str = json.dumps({"serialized_aurora_batch": base64_encoded_batch})
+                        gzipped_payload = gzip.compress(payload_json_str.encode('utf-8'))
+
+                        headers = {
+                            "Content-Type": "application/json",
+                            "Content-Encoding": "gzip",
+                            "Accept": "application/x-ndjson" # Expecting NDJSON stream
+                        }
+                        if api_key:
+                            headers["X-API-Key"] = api_key
+                        else:
+                            logger.warning(f"[{job_id}] MINER_API_KEY_FOR_INFRA_SERVICE not set. Sending request without API key.")
+
+                        async with httpx.AsyncClient(timeout=None) as client: # Timeout None for potentially long streaming
+                            logger.info(f"[{job_id}] Sending request to HTTP inference service: {service_url}")
+                            response_steps_data = []
+                            async with client.stream("POST", service_url, content=gzipped_payload, headers=headers) as response:
+                                if response.status_code == 200:
+                                    logger.info(f"[{job_id}] Successfully connected to service. Streaming responses...")
+                                    async for line in response.aiter_lines():
+                                        if line.strip():
+                                            try:
+                                                step_data = json.loads(line)
+                                                if step_data.get("error"):
+                                                    logger.error(f"[{job_id}] Error from service for step {step_data.get('step_index', 'unknown')}: {step_data.get('detail', step_data['error'])}")
+                                                    # Depending on policy, could raise error or collect errors
+                                                    continue # or break, or raise
+                                                
+                                                serialized_prediction = step_data.get("serialized_prediction")
+                                                if serialized_prediction:
+                                                    decoded_prediction = base64.b64decode(serialized_prediction)
+                                                    unpickled_batch_step = pickle.loads(decoded_prediction)
+                                                    response_steps_data.append(unpickled_batch_step)
+                                                    logger.debug(f"[{job_id}] Deserialized prediction step {step_data.get('step_index')}")
+                                                else:
+                                                    logger.warning(f"[{job_id}] Received step data without 'serialized_prediction' for step {step_data.get('step_index')}")
+                                            except json.JSONDecodeError as e_json:
+                                                logger.error(f"[{job_id}] Failed to decode JSON line from stream: '{line}'. Error: {e_json}")
+                                            except (pickle.UnpicklingError, base64.binascii.Error, TypeError) as e_deserialize:
+                                                logger.error(f"[{job_id}] Failed to deserialize prediction step from stream: {e_deserialize}")
+                                    logger.info(f"[{job_id}] Finished streaming. Received {len(response_steps_data)} steps from service.")
+                                    selected_predictions_cpu = response_steps_data
+                                else:
+                                    error_content = await response.aread()
+                                    logger.error(f"[{job_id}] HTTP inference service request failed with status {response.status_code}: {error_content.decode()}")
+                                    await update_job_status(task_instance, job_id, "error", f"HTTP service error {response.status_code}: {error_content.decode()[:200]}")
+                                    return
+
+                    except ImportError:
+                        logger.error(f"[InferenceTask Job {job_id}] httpx or gzip library not found. Please install it. Aborting HTTP inference.")
+                        await update_job_status(task_instance, job_id, "error", "Missing httpx/gzip for HTTP service")
+                        return
+                    except Exception as http_err:
+                        logger.error(f"[InferenceTask Job {job_id}] Error during HTTP service inference: {http_err}", exc_info=True)
+                        await update_job_status(task_instance, job_id, "error", f"HTTP service communication error: {http_err}")
+                        return
                  
                  elif inference_type == "local":
                      logger.info(f"[InferenceTask Job {job_id}] Using local runner for inference (type: {inference_type})...")
