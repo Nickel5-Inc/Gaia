@@ -48,8 +48,8 @@ class WeatherInferenceRunner:
             steps: The total number of 6-hour steps to simulate (e.g., 40 for 10 days).
 
         Returns:
-            A list containing aurora.Batch objects for every other prediction step
-            (T+12h, T+24h, T+36h, etc.), moved to CPU.
+            A list containing aurora.Batch objects for every prediction step
+            (T+6h, T+12h, T+18h, etc.), moved to CPU.
         """
         if self.model is None:
              logger.error("Model is not loaded, cannot run inference.")
