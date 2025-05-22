@@ -205,8 +205,6 @@ jmespath==1.0.1
     # via
     #   boto3
     #   botocore
-kerchunk==0.2.8
-    # via -r requirements.in
 kiwisolver==1.4.8
     # via matplotlib
 lazy-loader==0.4
@@ -360,8 +358,6 @@ pillow==11.2.1
     #   torchvision
 pint==0.24.4
     # via metpy
-pip-tools==7.4.1
-    # via -r requirements.in
 platformdirs==4.3.8
     # via
     #   pint
