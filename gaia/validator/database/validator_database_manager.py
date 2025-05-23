@@ -56,58 +56,16 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
     Database manager specifically for validator nodes.
     Handles all validator-specific database operations.
     """
-    
+    _instance = None # For ValidatorDatabaseManager's own singleton instance tracking
+
     def __new__(cls, *args, **kwargs) -> 'ValidatorDatabaseManager':
-        if not hasattr(cls, '_instance'):
-            cls._instance = super().__new__(cls, node_type="validator")
-            cls._instance._initialized = False
-            cls._instance._storage_locked = False  # Add storage lock flag
-            
-            # Initialize all required base class attributes
-            cls._instance._circuit_breaker = {
-                'failures': 0,
-                'last_failure_time': 0,
-                'status': 'closed'  # 'closed', 'open', 'half-open'
-            }
-            
-            # Connection management
-            cls._instance._active_sessions = set()
-            cls._instance._active_operations = 0
-            cls._instance._operation_lock = asyncio.Lock()
-            cls._instance._session_lock = asyncio.Lock()
-            cls._instance._pool_semaphore = asyncio.Semaphore(cls.MAX_CONNECTIONS)
-            
-            # Pool health monitoring
-            cls._instance._last_pool_check = 0
-            cls._instance._pool_health_status = True
-            cls._instance._pool_recovery_lock = asyncio.Lock()
-            
-            # Resource monitoring
-            cls._instance._resource_stats = {
-                'cpu_percent': 0,
-                'memory_rss': 0,
-                'open_files': 0,
-                'connections': 0,
-                'last_check': 0
-            }
-            
-            # Operation statistics
-            cls._instance._operation_stats = {
-                'ddl_operations': 0,
-                'read_operations': 0,
-                'write_operations': 0,
-                'long_running_queries': []
-            }
-            
-            # Initialize engine placeholders
-            cls._instance._engine = None
-            cls._instance._session_factory = None
-            
-            # Initialize database connection parameters with defaults
-            cls._instance.db_url = None
-            cls._instance.VALIDATOR_QUERY_TIMEOUT = 60  # 1 minute
-            cls._instance.VALIDATOR_TRANSACTION_TIMEOUT = 300  # 5 minutes
-            
+        if cls._instance is None:
+            # BaseDatabaseManager.__new__ handles singleton logic based on node_type.
+            # This call will return an instance of ValidatorDatabaseManager, managed
+            # as a singleton for node_type="validator" by the base class.
+            instance = super().__new__(cls, node_type="validator", *args, **kwargs)
+            cls._instance = instance
+            # Defer actual attribute initialization to __init__
         return cls._instance
 
     def __init__(
@@ -119,8 +77,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         password: str = "postgres",
     ) -> None:
         """Initialize the validator database manager."""
-        if not hasattr(self, '_initialized') or not self._initialized:
-            # Call base class init first to set up necessary attributes
+        # Check if this specific singleton instance has already been initialized.
+        if not getattr(self, '_validator_db_manager_initialized', False):
+            # Call base class init first to set up common attributes like db_url,
+            # _active_sessions, _engine, _engine_initialized flag, etc.
             super().__init__(
                 node_type="validator",
                 database=database,
@@ -130,17 +90,30 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 password=password,
             )
             
-            # Store database name
-            self.database = database
+            # ValidatorDatabaseManager-specific attributes
+            self.database = database # Store database name for convenience
             
-            # Set database URL
-            self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
-            
+            # db_url is set by super().__init__ based on the provided parameters.
+            # If Validator needs a different db_url construction, it can be overridden here,
+            # but the current BaseDatabaseManager.__init__ seems to construct it correctly.
+            # self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}" # This would override base if needed
+
             # Custom timeouts for validator operations
             self.VALIDATOR_QUERY_TIMEOUT = 60  # 1 minute
             self.VALIDATOR_TRANSACTION_TIMEOUT = 300  # 5 minutes
             
-            self._initialized = True
+            # Operation statistics, specific to ValidatorDatabaseManager
+            self._operation_stats = {
+                'ddl_operations': 0,
+                'read_operations': 0,
+                'write_operations': 0,
+                'long_running_queries': []
+            }
+            
+            self._storage_locked = False  # Validator-specific storage lock flag
+            
+            # Mark this ValidatorDatabaseManager instance as initialized.
+            self._validator_db_manager_initialized = True
 
     async def _initialize_validator_database(self) -> None:
         """Initialize validator-specific database schema and columns."""
@@ -153,70 +126,74 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 if table_schema.get("database_type") != "validator":
                     continue
 
-                exists_query = """
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_schema = 'public' 
-                        AND table_name = :table_name
-                    )
-                """
-                result = await self.fetch_one(exists_query, {"table_name": table_name})
-                table_exists = result["exists"] if result else False
-
-                if not table_exists:
-                    columns = []
-                    for col_name, col_type in table_schema["columns"].items():
-                        columns.append(f"{col_name} {col_type}")
-
-                    if "foreign_keys" in table_schema:
-                        for fk in table_schema["foreign_keys"]:
-                            fk_def = f"FOREIGN KEY ({fk['column']}) REFERENCES {fk['references']}"
-                            if "on_delete" in fk:
-                                fk_def += f" ON DELETE {fk['on_delete']}"
-                            columns.append(fk_def)
-
-                    create_table_sql = f"""
-                        CREATE TABLE IF NOT EXISTS {table_schema['table_name']} (
-                            {', '.join(columns)}
-                        );
-                    """
-                    await self.execute(create_table_sql)
-                    logger.info(f"Created table {table_name}")
-
-                    if "indexes" in table_schema:
-                        for index in table_schema["indexes"]:
-                            index_name = f"{table_name}_{index['column']}_idx"
-                            unique = "UNIQUE" if index.get("unique", False) else ""
-                            create_index_sql = f"""
-                                CREATE INDEX IF NOT EXISTS {index_name}
-                                ON {table_name} ({index['column']})
-                                {unique};
-                            """
-                            await self.execute(create_index_sql)
-                        logger.info(f"Created indexes for {table_name}")
-                else:
-                    for col_name, col_type in table_schema["columns"].items():
-                        check_column_sql = """
+                # Use a single session for all operations within this loop iteration
+                async with self.session() as session:
+                    async with session.begin(): # Start a transaction
+                        exists_query = """
                             SELECT EXISTS (
-                                SELECT 1 
-                                FROM information_schema.columns 
-                                WHERE table_name = :table_name 
-                                AND column_name = :column_name
+                                SELECT FROM information_schema.tables 
+                                WHERE table_schema = 'public' 
+                                AND table_name = :table_name
                             )
                         """
-                        result = await self.fetch_one(
-                            check_column_sql, 
-                            {"table_name": table_name, "column_name": col_name}
-                        )
-                        column_exists = result["exists"] if result else False
+                        result = await self.fetch_one(exists_query, {"table_name": table_name}, session=session)
+                        table_exists = result["exists"] if result else False
 
-                        if not column_exists:
-                            add_column_sql = f"""
-                                ALTER TABLE {table_name} 
-                                ADD COLUMN {col_name} {col_type};
+                        if not table_exists:
+                            columns = []
+                            for col_name, col_type in table_schema["columns"].items():
+                                columns.append(f"{col_name} {col_type}")
+
+                            if "foreign_keys" in table_schema:
+                                for fk in table_schema["foreign_keys"]:
+                                    fk_def = f"FOREIGN KEY ({fk['column']}) REFERENCES {fk['references']}"
+                                    if "on_delete" in fk:
+                                        fk_def += f" ON DELETE {fk['on_delete']}"
+                                    columns.append(fk_def)
+
+                            create_table_sql = f"""
+                                CREATE TABLE IF NOT EXISTS {table_schema['table_name']} (
+                                    {', '.join(columns)}
+                                );
                             """
-                            await self.execute(add_column_sql)
-                            logger.info(f"Added column {col_name} to {table_name}")
+                            await self.execute(create_table_sql, session=session)
+                            logger.info(f"Created table {table_name}")
+
+                            if "indexes" in table_schema:
+                                for index in table_schema["indexes"]:
+                                    index_name = f"{table_name}_{index['column']}_idx"
+                                    unique = "UNIQUE" if index.get("unique", False) else ""
+                                    create_index_sql = f"""
+                                        CREATE INDEX IF NOT EXISTS {index_name}
+                                        ON {table_name} ({index['column']})
+                                        {unique};
+                                    """
+                                    await self.execute(create_index_sql, session=session)
+                                logger.info(f"Created indexes for {table_name}")
+                        else:
+                            for col_name, col_type in table_schema["columns"].items():
+                                check_column_sql = """
+                                    SELECT EXISTS (
+                                        SELECT 1 
+                                        FROM information_schema.columns 
+                                        WHERE table_name = :table_name 
+                                        AND column_name = :column_name
+                                    )
+                                """
+                                result = await self.fetch_one(
+                                    check_column_sql, 
+                                    {"table_name": table_name, "column_name": col_name},
+                                    session=session
+                                )
+                                column_exists = result["exists"] if result else False
+
+                                if not column_exists:
+                                    add_column_sql = f"""
+                                        ALTER TABLE {table_name} 
+                                        ADD COLUMN {col_name} {col_type};
+                                    """
+                                    await self.execute(add_column_sql, session=session)
+                                    logger.info(f"Added column {col_name} to {table_name}")
 
             logger.info("Validator database initialization completed")
             
@@ -240,6 +217,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         """Initialize database engine and session factory with validator-specific settings."""
         try:
             if not self.db_url:
+                # self.db_url is initialized in BaseDatabaseManager.__init__
                 raise DatabaseError("Database URL not initialized")
             
             # First create a connection to default postgres database to check/create our database
@@ -288,8 +266,12 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 await conn.execute(text("SELECT 1"))
             
             logger.info(f"Successfully initialized database engine for {self.node_type}")
+            self._engine_initialized = True # Ensure flag is set on success
         except Exception as e:
             logger.error(f"Failed to initialize database engine: {str(e)}")
+            self._engine = None # Clear engine state on failure
+            self._session_factory = None # Clear session factory on failure
+            self._engine_initialized = False # Ensure flag is set to False on failure
             raise DatabaseError(f"Failed to initialize database engine: {str(e)}")
 
     @track_operation('ddl')
@@ -300,22 +282,24 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             # Initialize engine first
             await self._initialize_engine()
             
-            # Create core tables
+            # Create core tables using the provided session
             await self._create_node_table(session)
             await self._create_trigger_function(session)
             await self._create_trigger(session)
             await self._initialize_rows(session)
             await self.create_score_table(session)
             
-            # Create baseline predictions table
+            # Create baseline predictions table using the provided session
             await self.create_baseline_predictions_table(session)
             
             logger.info("Successfully created core tables")
             
-            # Initialize validator-specific tables from task schemas
-            await self._initialize_validator_database()
+            # Initialize validator-specific tables from task schemas.
+            # _initialize_validator_database now manages its own sessions internally
+            # as it iterates and performs checks.
+            await self._initialize_validator_database() 
             
-            # Initialize task tables
+            # Initialize task tables using the provided session
             task_schemas = await self.load_task_schemas()
             await self.initialize_task_tables(task_schemas, session)
             logger.info("Successfully initialized task tables")
@@ -386,7 +370,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 raise DatabaseError(f"Failed to initialize table for schema {schema_name}: {str(e)}")
 
     @track_operation('ddl')
-    async def create_index(self, table_name: str, column_name: str, unique: bool = False):
+    async def create_index(self, table_name: str, column_name: str, unique: bool = False, session: Optional[AsyncSession] = None):
         """Create an index on a specific column in a table."""
         try:
             index_name = f"idx_{table_name}_{column_name}"
@@ -395,7 +379,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 CREATE {unique_str} INDEX IF NOT EXISTS {index_name}
                 ON {table_name} ({column_name});
             """
-            await self.execute(query)
+            await self.execute(query, session=session)
         except Exception as e:
             logger.error(f"Error creating index on {table_name}.{column_name}: {str(e)}")
             raise DatabaseError(f"Failed to create index: {str(e)}")
@@ -793,96 +777,101 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
         total_rows_updated = 0
         for task_name in task_names:
-            try:
-                # 1) Select score rows, potentially filtered by time
-                query_base = """
-                    SELECT task_id, score
-                    FROM score_table
-                    WHERE task_name = :task_name
-                """
-                params = {"task_name": task_name}
-
-                time_conditions = []
-                if filter_start_time:
-                    time_conditions.append("task_id::float >= :start_timestamp")
-                    params["start_timestamp"] = filter_start_time.timestamp()
-                if filter_end_time:
-                    time_conditions.append("task_id::float <= :end_timestamp")
-                    params["end_timestamp"] = filter_end_time.timestamp()
-
-                if time_conditions:
-                    query = query_base + " AND " + " AND ".join(time_conditions)
-                else:
-                    query = query_base # No time filter
-
-                rows = await self.fetch_all(query, params)
-
-                if not rows:
-                    logger.info(f"No '{task_name}' score rows found to update for the given criteria.")
-                    continue
-
-                logger.info(f"Found {len(rows)} {task_name} score rows to process.")
-                rows_updated = 0
-                scores_updated = 0
-
-                for row in rows:
+            # Each task_name can be processed in its own transaction for atomicity per task.
+            async with self.session() as session: # Get a session instance
+                async with session.begin(): # Start a transaction for this session
                     try:
-                        # 2) Parse the score array JSON (or however it's stored)
-                        all_scores = row["score"]
-                        if not isinstance(all_scores, list):
-                            logger.warning(f"Score field is not a list for score_row with task_id {row['task_id']}")
+                        # 1) Select score rows, potentially filtered by time
+                        query_base = """
+                            SELECT task_id, score
+                            FROM score_table
+                            WHERE task_name = :task_name
+                        """
+                        params = {"task_name": task_name}
+
+                        time_conditions = []
+                        if filter_start_time:
+                            time_conditions.append("task_id::float >= :start_timestamp")
+                            params["start_timestamp"] = filter_start_time.timestamp()
+                        if filter_end_time:
+                            time_conditions.append("task_id::float <= :end_timestamp")
+                            params["end_timestamp"] = filter_end_time.timestamp()
+
+                        if time_conditions:
+                            query = query_base + " AND " + " AND ".join(time_conditions)
+                        else:
+                            query = query_base # No time filter
+
+                        rows = await self.fetch_all(query, params, session=session)
+
+                        if not rows:
+                            logger.info(f"No '{task_name}' score rows found to update for the given criteria.")
                             continue
 
-                        changed = False
-                        changes_in_row = 0
-                        for uid in uids:
-                            if 0 <= uid < len(all_scores):
-                                current_score = all_scores[uid]
-                                # Check if current score is NOT 0.0 or NaN (represented as string or float)
-                                is_nan_or_zero = (isinstance(current_score, str) or 
-                                                 (isinstance(current_score, float) and (math.isnan(current_score) or current_score == 0.0)))
-                                logger.debug(f"Score for UID {uid} in row {row['task_id']}: {current_score} (is_nan_or_zero: {is_nan_or_zero})")
-                                if not is_nan_or_zero:
-                                    all_scores[uid] = 0.0 # Set to 0.0 instead of NaN
-                                    changed = True
-                                    changes_in_row += 1
+                        logger.info(f"Found {len(rows)} {task_name} score rows to process.")
+                        rows_updated_for_task = 0
+                        scores_updated_for_task = 0
 
-                        if changed:
-                            # 3) Update the score array in place using task_id
-                            update_sql = """
-                                UPDATE score_table
-                                SET score = :score
-                                WHERE task_name = :task_name
-                                  AND task_id = :task_id
-                            """
-                            await self.execute(
-                                update_sql,
-                                {
-                                    "score": all_scores,
-                                    "task_name": task_name,
-                                    "task_id": row["task_id"]
-                                },
-                            )
-                            rows_updated += 1
-                            scores_updated += changes_in_row
-                            logger.debug(
-                                f"Updated {changes_in_row} scores in {task_name} row with task_id {row['task_id']}"
-                            )
+                        for row in rows:
+                            try:
+                                # 2) Parse the score array JSON (or however it's stored)
+                                all_scores = row["score"]
+                                if not isinstance(all_scores, list):
+                                    logger.warning(f"Score field is not a list for score_row with task_id {row['task_id']}")
+                                    continue
 
-                    except Exception as e:
-                        logger.error(
-                            f"Error zeroing out miner scores in '{task_name}' score row with task_id {row['task_id']}: {e}"
+                                changed = False
+                                changes_in_row = 0
+                                for uid_to_zero in uids: # Renamed uid to uid_to_zero to avoid conflict
+                                    if 0 <= uid_to_zero < len(all_scores):
+                                        current_score = all_scores[uid_to_zero]
+                                        # Check if current score is NOT 0.0 or NaN (represented as string or float)
+                                        is_nan_or_zero = (isinstance(current_score, str) or 
+                                                         (isinstance(current_score, float) and (math.isnan(current_score) or current_score == 0.0)))
+                                        logger.debug(f"Score for UID {uid_to_zero} in row {row['task_id']}: {current_score} (is_nan_or_zero: {is_nan_or_zero})")
+                                        if not is_nan_or_zero:
+                                            all_scores[uid_to_zero] = 0.0 # Set to 0.0 instead of NaN
+                                            changed = True
+                                            changes_in_row += 1
+
+                                if changed:
+                                    # 3) Update the score array in place using task_id
+                                    update_sql = """
+                                        UPDATE score_table
+                                        SET score = :score
+                                        WHERE task_name = :task_name
+                                          AND task_id = :task_id
+                                    """
+                                    await self.execute(
+                                        update_sql,
+                                        {
+                                            "score": all_scores,
+                                            "task_name": task_name,
+                                            "task_id": row["task_id"]
+                                        },
+                                        session=session
+                                    )
+                                    rows_updated_for_task += 1
+                                    scores_updated_for_task += changes_in_row
+                                    logger.debug(
+                                        f"Updated {changes_in_row} scores in {task_name} row with task_id {row['task_id']}"
+                                    )
+
+                            except Exception as e_inner: # Renamed e to e_inner
+                                logger.error(
+                                    f"Error zeroing out miner scores in '{task_name}' score row with task_id {row['task_id']}: {e_inner}"
+                                )
+                                logger.error(traceback.format_exc())
+                        
+                        total_rows_updated += rows_updated_for_task
+                        logger.info(
+                            f"Task {task_name}: Zeroed out {scores_updated_for_task} scores across {rows_updated_for_task} rows"
                         )
+
+                    except Exception as e_outer: # Renamed e to e_outer
+                        logger.error(f"Error in remove_miner_from_score_tables for task '{task_name}': {e_outer}")
                         logger.error(traceback.format_exc())
-
-                total_rows_updated += rows_updated
-                logger.info(
-                    f"Task {task_name}: Zeroed out {scores_updated} scores across {rows_updated} rows"
-                )
-
-            except Exception as e:
-                logger.error(f"Error in remove_miner_from_score_tables for task '{task_name}': {e}")
-                logger.error(traceback.format_exc())
+                        # The transaction will be rolled back by the context manager by session.begin()
 
         logger.info(f"Score zeroing complete. Total rows updated: {total_rows_updated}")
 
@@ -917,7 +906,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             raise DatabaseError(f"Failed to create baseline_predictions table: {str(e)}")
             
     @track_operation('write')
+    @BaseDatabaseManager.with_transaction()
     async def store_baseline_prediction(self, 
+                                       session: AsyncSession, # Added session parameter due to decorator
                                        task_name: str, 
                                        task_id: str, 
                                        timestamp: datetime, 
@@ -925,8 +916,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                                        region_id: Optional[str] = None) -> bool:
         """
         Store a baseline model prediction in the database.
+        This method is wrapped in a transaction.
         
         Args:
+            session: The active database session (provided by decorator).
             task_name: Name of the task (e.g., 'geomagnetic', 'soil_moisture')
             task_id: ID of the specific task execution
             timestamp: Timestamp for when the prediction was made
@@ -943,12 +936,13 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 WHERE table_name = 'baseline_predictions'
             );
             """
-            result = await self.fetch_one(table_check_sql)
+            # Use the provided session for all DB operations within this method
+            result = await self.fetch_one(table_check_sql, session=session)
             
-            if result is None or (isinstance(result, (list, tuple)) and (len(result) == 0 or not result[0])):
+            if result is None or (isinstance(result, (list, tuple)) and (len(result) == 0 or not result[0])) or not result['exists']:
                 logger.info("Creating baseline_predictions table...")
-                async with self.session() as session:
-                    await self.create_baseline_predictions_table(session)
+                # The create_baseline_predictions_table already uses the session passed to it.
+                await self.create_baseline_predictions_table(session=session)
             
             if isinstance(prediction, (int, float)):
                 logger.info(f"DB: Storing {task_name} prediction: {prediction} (region={region_id})")
@@ -963,12 +957,12 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             try:
                 prediction_json = json.dumps(prediction, default=self._json_serializer)
                 logger.info(f"DB: Serialized prediction: {prediction_json[:100]}..." if len(prediction_json) > 100 else prediction_json)
-            except Exception as e:
-                logger.error(f"JSON serialization error: {e}")
+            except Exception as e_serialize: # Renamed e to e_serialize
+                logger.error(f"JSON serialization error: {e_serialize}")
                 logger.error(f"Failed to serialize prediction of type {type(prediction)}")
-                if hasattr(e, '__traceback__'):
-                    logger.error(traceback.format_tb(e.__traceback__))
-                return False
+                if hasattr(e_serialize, '__traceback__'):
+                    logger.error(traceback.format_tb(e_serialize.__traceback__))
+                return False # Propagate failure
             
             insert_sql = """
             INSERT INTO baseline_predictions 
@@ -985,21 +979,21 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             }
             
             try:
-                await self.execute(insert_sql, params)
+                await self.execute(insert_sql, params, session=session)
                 logger.info(f"DB: Successfully stored {task_name} prediction")
                 return True
             except Exception as db_error:
                 logger.error(f"DB insert error: {db_error}")
                 if hasattr(db_error, '__traceback__'):
                     logger.error(traceback.format_tb(db_error.__traceback__))
-                return False
+                return False # Propagate failure
             
-        except Exception as e:
-            logger.error(f"DB: Error storing prediction: {e}")
+        except Exception as e_outer: # Renamed e to e_outer
+            logger.error(f"DB: Error storing prediction: {e_outer}")
             logger.error(f"Prediction value type: {type(prediction)}")
-            if hasattr(e, '__traceback__'):
-                logger.error(traceback.format_tb(e.__traceback__))
-            return False
+            if hasattr(e_outer, '__traceback__'):
+                logger.error(traceback.format_tb(e_outer.__traceback__))
+            return False # Propagate failure
             
     @track_operation('read')
     async def get_baseline_prediction(self, 
@@ -1017,6 +1011,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         Returns:
             Optional[Dict]: The prediction data or None if not found
         """
+        # This is a read operation, so it's okay for fetch_one to manage its own session if not in a transaction.
         try:
             query = """
             SELECT * FROM baseline_predictions 
@@ -1035,7 +1030,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             
             query += " ORDER BY created_at DESC LIMIT 1"
             
-            result = await self.fetch_one(query, params)
+            result = await self.fetch_one(query, params) # fetch_one will handle session if not provided
             
             if not result:
                 logger.warning(f"No baseline prediction found for {task_name}, task_id: {task_id}, region: {region_id}")

@@ -33,6 +33,8 @@ asyncstdlib==3.13.1
 attrs==25.3.0
     # via
     #   aiohttp
+    #   cfgrib
+    #   eccodes
     #   rasterio
 azure-core==1.34.0
     # via azure-storage-blob
@@ -67,13 +69,17 @@ certifi==2025.4.26
 cffi==1.17.1
     # via
     #   cryptography
+    #   eccodes
     #   pynacl
+cfgrib==0.9.15.0
+    # via -r requirements.in
 cftime==1.6.4.post1
     # via netcdf4
 charset-normalizer==3.4.2
     # via requests
 click==8.2.0
     # via
+    #   cfgrib
     #   click-plugins
     #   cligj
     #   rasterio
@@ -98,6 +104,8 @@ cycler==0.12.1
     # via matplotlib
 cytoolz==1.0.1
     # via eth-utils
+eccodes==2.41.0
+    # via cfgrib
 ecdsa==0.19.1
     # via substrate-interface
 eth-hash==0.7.1
@@ -125,6 +133,8 @@ filelock==3.18.0
     # via
     #   huggingface-hub
     #   torch
+findlibs==0.1.1
+    # via eccodes
 fonttools==4.58.0
     # via matplotlib
 frozenlist==1.6.0
@@ -211,9 +221,11 @@ networkx==3.4.2
 numpy==2.2.5
     # via
     #   -r requirements.in
+    #   cfgrib
     #   cftime
     #   cmdstanpy
     #   contourpy
+    #   eccodes
     #   h5py
     #   imageio
     #   matplotlib

@@ -11,6 +11,7 @@ import numpy as np
 import rasterio
 import xarray as xr
 from aiohttp import ClientSession, BasicAuth
+from fiber.logging_utils import get_logger
 from aiohttp.client_exceptions import ClientResponseError
 from dotenv import load_dotenv
 from pyproj import Transformer
@@ -29,6 +30,7 @@ EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
 EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 
 EARTHDATA_AUTH = BasicAuth(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
+logger = get_logger(__name__)
 
 class SessionWithHeaderRedirection(requests.Session):
     AUTH_HOST = 'urs.earthdata.nasa.gov'
@@ -556,6 +558,12 @@ async def process_global_ifs(grib_paths, timesteps, output_path):
                     ds = ds.expand_dims("time")
                     ds["time"] = [step]
                     timestep_datasets.append(ds)
+                except ValueError as ve:
+                    if "unrecognized engine 'cfgrib'" in str(ve):
+                        print("CRITICAL ERROR: xarray engine 'cfgrib' not found. Please install cfgrib and its dependencies (e.g., eccodes). See xarray documentation for installation help.")
+                        # Potentially re-raise or return a specific error code/object
+                        return False # Stop processing if essential engine is missing
+                    print(f"Error loading {var_name} with xarray (ValueError): {str(ve)}")
                 except Exception as e:
                     print(f"Error loading {var_name}: {str(e)}")
 
@@ -677,6 +685,10 @@ async def get_soil_data(bbox, datetime_obj=None):
     if datetime_obj is None:
         datetime_obj = datetime.now(timezone.utc)
 
+    output_file = None # Ensure output_file is defined in all paths
+    sentinel_bounds = None
+    sentinel_crs = None
+
     try:
         print(f"\n=== Starting Data Collection ===")
         sentinel_data = []
@@ -687,7 +699,7 @@ async def get_soil_data(bbox, datetime_obj=None):
         sentinel_paths = await fetch_hls_b4_b8(bbox, datetime_obj)
         if not sentinel_paths:
             print("Failed to fetch Sentinel data")
-            return None
+            return None, None, None
 
         sentinel_transform = None
 
@@ -714,6 +726,10 @@ async def get_soil_data(bbox, datetime_obj=None):
             sentinel_crs = crs  # Assuming all bands have the same CRS
             sentinel_transform = transform  # Assuming all bands have the same transform
 
+        if not sentinel_data: # Check if sentinel_data list is empty or processing failed
+            print("Critical: Sentinel data processing resulted in no usable bands.")
+            return None, None, None
+
         srtm_array, srtm_file, srtm_transform, srtm_crs = await fetch_srtm(
             bbox,
             sentinel_bounds=sentinel_bounds,
@@ -729,14 +745,22 @@ async def get_soil_data(bbox, datetime_obj=None):
             sentinel_shape=(222, 222),
         )
 
+        if ifs_data is None:
+            print("Critical: IFS data is None, cannot proceed with combining TIFFs.")
+            return None, None, None
+        
+        if not sentinel_data : # Should be caught earlier, but as a safeguard
+            print("Critical: Sentinel data is None or empty before profile creation.")
+            return None, None, None
+
         profile = {
             "driver": "GTiff",
             "height": 222,
             "width": 222,
-            "count": len(sentinel_data) + len(ifs_data) + 2,
+            "count": len(sentinel_data) + len(ifs_data) + 2, # +2 for SRTM and NDVI (already in sentinel_data count if NDVI added there)
             "dtype": "float32",
-            "crs": srtm_crs,
-            "transform": srtm_transform,
+            "crs": srtm_crs if srtm_crs else sentinel_crs, # Fallback to sentinel_crs if srtm_crs is None
+            "transform": srtm_transform if srtm_transform else sentinel_transform, # Fallback
             "sentinel_transform": sentinel_transform,
             "compress": "lzw",
             "tiled": True,

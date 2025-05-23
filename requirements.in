@@ -37,3 +37,4 @@ xarray
 netcdf4
 h5netcdf
 azure-storage-blob
+cfgrib

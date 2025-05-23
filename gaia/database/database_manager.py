@@ -51,7 +51,7 @@ class BaseDatabaseManager(ABC):
     # Default timeouts
     DEFAULT_QUERY_TIMEOUT = 60  # 60 seconds
     DEFAULT_TRANSACTION_TIMEOUT = 180  # 3 minutes
-    DEFAULT_CONNECTION_TIMEOUT = 60  # 10 seconds
+    DEFAULT_CONNECTION_TIMEOUT = 600  # 600 seconds (10 minutes)
 
     # Operation constants
     DEFAULT_BATCH_SIZE = 1000
@@ -68,7 +68,7 @@ class BaseDatabaseManager(ABC):
 
     # New timeout constants for finer control
     CONNECTION_TEST_TIMEOUT = 20  # More aggressive timeout for simple SELECT 1 in _test_connection
-    ENGINE_COMMAND_TIMEOUT = 20   # Default command timeout for asyncpg, affects pool_pre_ping
+    ENGINE_COMMAND_TIMEOUT = 600   # Default command timeout for asyncpg, 600 seconds (10 minutes)
 
     # Operation statuses
     STATUS_PENDING = 'pending'
@@ -102,7 +102,6 @@ class BaseDatabaseManager(ABC):
             self._active_operations = 0
             self._operation_lock = asyncio.Lock()
             self._session_lock = asyncio.Lock()
-            self._pool_semaphore = asyncio.Semaphore(self.MAX_CONNECTIONS)
             
             # Pool health monitoring
             self._last_pool_check = 0
@@ -472,16 +471,30 @@ class BaseDatabaseManager(ABC):
             logger.error("Database engine or session factory not initialized. Cannot create session.")
             raise DatabaseConnectionError("Engine/Session factory not initialized")
 
+        # ADDED: Log pool status
+        if self._engine and hasattr(self._engine.pool, 'status'):
+            logger.debug(f"Pool status at session entry: {self._engine.pool.status()}")
+        # END ADDED
+
         if not await self._check_circuit_breaker():
             raise CircuitBreakerError("Circuit breaker is open")
             
         session_instance: Optional[AsyncSession] = None
-        start_time = time.time()
+        start_time = time.time() # This is overall session time
         caller = traceback.extract_stack()[-3]  # Get calling frame
         session_id_str = "unassigned"
         
         try:
+            # ADDED: Log pool status just before session creation
+            if self._engine and hasattr(self._engine.pool, 'status'):
+                logger.debug(f"Pool status before _session_factory() call: {self._engine.pool.status()}")
+            # END ADDED
+            
+            t_before_session_factory = time.time()
             session_instance = self._session_factory()
+            t_after_session_factory = time.time()
+            logger.debug(f"Session factory call for {id(session_instance)} took: {t_after_session_factory - t_before_session_factory:.4f}s")
+            
             session_id_str = str(id(session_instance))
 
             async with self._session_lock:
@@ -529,12 +542,12 @@ class BaseDatabaseManager(ABC):
         await session.execute(text("SELECT 1"))
         return True
 
-    @with_timeout(DEFAULT_QUERY_TIMEOUT)
     async def fetch_one(
         self, 
         query: str, 
         params: Optional[Dict] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
+        session: Optional[AsyncSession] = None
     ) -> Optional[Dict]:
         """
         Fetch a single row from the database.
@@ -545,117 +558,100 @@ class BaseDatabaseManager(ABC):
             query (str): SQL query to execute
             params (Optional[Dict]): Query parameters
             timeout (Optional[float]): Operation timeout in seconds
+            session (Optional[AsyncSession]): Optional existing session to use
             
         Returns:
             Optional[Dict]: Single row result or None
         """
         start_time = time.time()
         
-        # Check if we're already in a transaction
-        if hasattr(self, '_in_transaction') and self._in_transaction:
-            # Get the current session from the active transaction
-            session = next(iter(self._active_sessions))
-            try:
-                result = await session.execute(text(query), params or {})
+        current_session: AsyncSession
+        try:
+            if session:
+                current_session = session
+                # Caller manages the transaction for a provided session
+                result = await current_session.execute(text(query), params or {})
                 row = result.first()
-                
-                # Log slow queries
-                duration = time.time() - start_time
-                if duration > self.DEFAULT_QUERY_TIMEOUT / 2:
-                    logger.warning(f"Slow query detected: {duration:.2f}s\nQuery: {query}")
-                
-                return dict(row._mapping) if row else None
-            except SQLAlchemyError as e:
-                logger.error(f"Database error in fetch_one: {str(e)}\nQuery: {query}")
-                raise DatabaseError(f"Error executing query: {str(e)}")
-        else:
-            # Create new transaction if not in one
-            async with self.session() as session:
-                try:
-                    async with session.begin(): # Ensure transaction is started
-                        result = await session.execute(text(query), params or {})
+            else:
+                async with self.session() as new_session:
+                    current_session = new_session
+                    # For read-only, begin() is not strictly necessary for some DBs,
+                    # but good practice for consistency or if query might have side effects.
+                    async with current_session.begin():
+                        result = await current_session.execute(text(query), params or {})
                     row = result.first() # result is available after transaction block
-                    
-                    # Log slow queries
-                    duration = time.time() - start_time
-                    if duration > self.DEFAULT_QUERY_TIMEOUT / 2:
-                        logger.warning(f"Slow query detected: {duration:.2f}s\nQuery: {query}")
-                    
-                    return dict(row._mapping) if row else None
-                except SQLAlchemyError as e:
-                    logger.error(f"Database error in fetch_one: {str(e)}\nQuery: {query}")
-                    raise DatabaseError(f"Error executing query: {str(e)}")
+
+            # Log slow queries
+            duration = time.time() - start_time
+            if duration > (timeout or self.DEFAULT_QUERY_TIMEOUT) / 2: # Use provided timeout if available
+                logger.warning(f"Slow query detected: {duration:.2f}s\\nQuery: {query}")
+            
+            return dict(row._mapping) if row else None
+        except SQLAlchemyError as e:
+            logger.error(f"Database error in fetch_one: {str(e)}\\nQuery: {query}")
+            raise DatabaseError(f"Error executing query: {str(e)}")
 
     @with_timeout(DEFAULT_QUERY_TIMEOUT)
     async def fetch_all(
         self, 
         query: str, 
         params: Optional[Dict] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None, # This timeout param is not used by the decorator
+        session: Optional[AsyncSession] = None
     ) -> List[Dict]:
-        """
-        Fetch all rows from the database.
-        If called within a transaction context, uses the existing transaction.
-        Otherwise, creates a new transaction.
+        overall_start_time = time.time() # For fetch_all total duration
         
-        Args:
-            query (str): SQL query to execute
-            params (Optional[Dict]): Query parameters
-            timeout (Optional[float]): Operation timeout in seconds
-            
-        Returns:
-            List[Dict]: List of result rows
-        """
-        start_time = time.time()
-        
-        # Check if we're already in a transaction
-        if hasattr(self, '_in_transaction') and self._in_transaction:
-            # Get the current session from the active transaction
-            session = next(iter(self._active_sessions))
-            try:
-                result = await session.execute(text(query), params or {})
+        current_session: AsyncSession
+        try:
+            if session:
+                current_session = session
+                # Caller manages the transaction for a provided session
+                result = await current_session.execute(text(query), params or {})
                 rows = result.all()
-                
-                # Log large result sets
-                if len(rows) > 1000:
-                    logger.warning(
-                        f"Large result set: {len(rows)} rows\n"
-                        f"Query: {query}"
-                    )
-                
-                # Log slow queries
-                duration = time.time() - start_time
-                if duration > self.DEFAULT_QUERY_TIMEOUT / 2:
-                    logger.warning(f"Slow query detected: {duration:.2f}s\nQuery: {query}")
-                
-                return [dict(row._mapping) for row in rows]
-            except SQLAlchemyError as e:
-                logger.error(f"Database error in fetch_all: {str(e)}\nQuery: {query}")
-                raise DatabaseError(f"Error executing query: {str(e)}")
-        else:
-            # Create new transaction if not in one
-            async with self.session() as session:
-                try:
-                    async with session.begin(): # Ensure transaction is started
-                        result = await session.execute(text(query), params or {})
-                    rows = result.all() # result is available after transaction block
-                    
-                    # Log large result sets
-                    if len(rows) > 1000:
-                        logger.warning(
-                            f"Large result set: {len(rows)} rows\n"
-                            f"Query: {query}"
-                        )
-                    
-                    # Log slow queries
-                    duration = time.time() - start_time
-                    if duration > self.DEFAULT_QUERY_TIMEOUT / 2:
-                        logger.warning(f"Slow query detected: {duration:.2f}s\nQuery: {query}")
-                    
-                    return [dict(row._mapping) for row in rows]
-                except SQLAlchemyError as e:
-                    logger.error(f"Database error in fetch_all: {str(e)}\nQuery: {query}")
-                    raise DatabaseError(f"Error executing query: {str(e)}")
+            else:
+                # Create new transaction if not in one
+                logger.debug(f"fetch_all for query (first 100 chars): {query[:100]} - entering 'new session' block.")
+                async with self.session() as new_session: # Session timing for the warning in logs starts here
+                    current_session = new_session
+                    session_id = id(current_session)
+                    logger.debug(f"fetch_all (session {session_id}): Acquired session. Beginning transaction.")
+                    t_before_begin = time.time()
+                    # For read-only, begin() is not strictly necessary for some DBs,
+                    # but good practice for consistency or if query might have side effects.
+                    async with current_session.begin(): 
+                        t_after_begin = time.time()
+                        logger.debug(f"fetch_all (session {session_id}): Transaction began in {t_after_begin - t_before_begin:.4f}s. Executing query.")
+                        
+                        t_before_execute = time.time()
+                        result = await current_session.execute(text(query), params or {})
+                        t_after_execute = time.time()
+                        logger.debug(f"fetch_all (session {session_id}): session.execute took {t_after_execute - t_before_execute:.4f}s.")
+
+                    # result is available after transaction block
+                    t_before_fetchall = time.time()
+                    rows = result.all() 
+                    t_after_fetchall = time.time()
+                    logger.debug(f"fetch_all (session {session_id}): result.all() took {t_after_fetchall - t_before_fetchall:.4f}s. Rows: {len(rows)}")
+
+            # Log large result sets
+            if len(rows) > 1000:
+                logger.warning(
+                    f"Large result set (session {id(current_session)}): {len(rows)} rows\\n"
+                    f"Query: {query}"
+                )
+            
+            # Log slow queries (this is overall time for this path)
+            duration = time.time() - overall_start_time 
+            if duration > (timeout or self.DEFAULT_QUERY_TIMEOUT) / 2: # Use provided timeout if available
+                logger.warning(f"Slow fetch_all path (session {id(current_session)}) detected: {duration:.2f}s for query (first 100): {query[:100]}")
+            
+            return [dict(row._mapping) for row in rows]
+        except Exception as e: 
+            current_session_id_val = id(current_session) if 'current_session' in locals() and current_session else "unknown"
+            logger.error(f"Database error in fetch_all (session {current_session_id_val} path): {str(e)}\\nQuery: {query}", exc_info=True)
+            if isinstance(e, (DatabaseError, SQLAlchemyError, asyncio.CancelledError)):
+                raise
+            raise DatabaseError(f"Error executing query in fetch_all (session {current_session_id_val}): {str(e)}") from e
 
     @with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
     async def execute(
@@ -702,7 +698,8 @@ class BaseDatabaseManager(ABC):
         query: str, 
         params_list: List[Dict],
         timeout: Optional[float] = None,
-        batch_size: Optional[int] = None
+        batch_size: Optional[int] = None,
+        session: Optional[AsyncSession] = None
     ) -> None:
         """
         Execute multiple operations in batches.
@@ -714,6 +711,7 @@ class BaseDatabaseManager(ABC):
             params_list (List[Dict]): List of parameter dictionaries
             timeout (Optional[float]): Operation timeout in seconds
             batch_size (Optional[int]): Size of batches for processing
+            session (Optional[AsyncSession]): Optional existing session to use
         """
         if not params_list:
             return
@@ -723,108 +721,79 @@ class BaseDatabaseManager(ABC):
         total_items = len(params_list)
         
         # Adaptive batch sizing based on data size
-        avg_param_size = sum(len(str(p)) for p in params_list[:100]) / min(100, total_items)
+        # Ensure total_items is not zero before division
+        avg_param_size_divisor = min(100, total_items) if total_items > 0 else 1
+        avg_param_size = sum(len(str(p)) for p in params_list[:100]) / avg_param_size_divisor
         if avg_param_size > 1000:  # Large parameters
             batch_size = min(batch_size, 100)
         
         start_time = time.time()
         
-        # Check if we're already in a transaction
-        if hasattr(self, '_in_transaction') and self._in_transaction:
-            # Get the current session from the active transaction
-            session = next(iter(self._active_sessions))
-            try:
+        current_session: AsyncSession
+        try:
+            if session:
+                current_session = session
+                # Caller manages the transaction for a provided session
+                # session.commit() should not be called here.
                 for i in range(0, total_items, batch_size):
                     batch = params_list[i:i + batch_size]
-                    batch_start = time.time()
-                    
-                    # Execute batch
-                    await session.execute(text(query), batch)
-                    
-                    # Log progress and timing
-                    batch_duration = time.time() - batch_start
-                    if batch_duration > 5:  # Log slow batches
-                        logger.warning(
-                            f"Slow batch detected: {batch_duration:.2f}s "
-                            f"(Items {i}-{i+len(batch)})"
-                        )
-                    
-                    # Log progress periodically
+                    batch_start_time_loop = time.time()
+                    await current_session.execute(text(query), batch)
+                    # Log progress and timing (similar to the 'else' block)
+                    batch_duration = time.time() - batch_start_time_loop
+                    if batch_duration > 5:
+                        logger.warning(f"Slow batch (provided session) detected: {batch_duration:.2f}s (Items {i}-{i+len(batch)})")
                     if i > 0 and i % (batch_size * 10) == 0:
                         progress = (i / total_items) * 100
                         elapsed = time.time() - start_time
                         rate = i / elapsed if elapsed > 0 else 0
-                        logger.info(
-                            f"Batch progress: {progress:.1f}% "
-                            f"({i}/{total_items}) "
-                            f"Rate: {rate:.1f} items/s"
-                        )
-                        
-                        # Monitor resources during long operations
+                        logger.info(f"Batch progress (provided session): {progress:.1f}% ({i}/{total_items}) Rate: {rate:.1f} items/s")
                         await self._monitor_resources()
-                
-                # Log final statistics
-                total_duration = time.time() - start_time
-                logger.info(
-                    f"Batch operation completed: {total_items} items "
-                    f"in {total_duration:.2f}s "
-                    f"({total_items/total_duration:.1f} items/s)"
-                )
-                
-            except SQLAlchemyError as e:
-                logger.error(
-                    f"Batch operation failed at item {i}: {str(e)}\n"
-                    f"Query: {query}"
-                )
-                raise DatabaseError(f"Error executing batch query: {str(e)}")
-        else:
-            # Create new transaction if not in one
-            async with self.transaction() as session:
-                try:
-                    for i in range(0, total_items, batch_size):
-                        batch = params_list[i:i + batch_size]
-                        batch_start = time.time()
-                        
-                        # Execute batch
-                        await session.execute(text(query), batch)
-                        await session.commit()
-                        
-                        # Log progress and timing
-                        batch_duration = time.time() - batch_start
-                        if batch_duration > 5:  # Log slow batches
-                            logger.warning(
-                                f"Slow batch detected: {batch_duration:.2f}s "
-                                f"(Items {i}-{i+len(batch)})"
-                            )
-                        
-                        # Log progress periodically
-                        if i > 0 and i % (batch_size * 10) == 0:
-                            progress = (i / total_items) * 100
-                            elapsed = time.time() - start_time
-                            rate = i / elapsed if elapsed > 0 else 0
-                            logger.info(
-                                f"Batch progress: {progress:.1f}% "
-                                f"({i}/{total_items}) "
-                                f"Rate: {rate:.1f} items/s"
-                            )
+            else:
+                # Create new transaction if not in one
+                async with self.session() as new_session:
+                    current_session = new_session
+                    async with current_session.begin(): # Handles commit/rollback
+                        for i in range(0, total_items, batch_size):
+                            batch = params_list[i:i + batch_size]
+                            batch_start_time_loop = time.time()
                             
-                            # Monitor resources during long operations
-                            await self._monitor_resources()
-                    
-                    # Log final statistics
-                    total_duration = time.time() - start_time
-                    logger.info(
-                        f"Batch operation completed: {total_items} items "
-                        f"in {total_duration:.2f}s "
-                        f"({total_items/total_duration:.1f} items/s)"
-                    )
-                    
-                except SQLAlchemyError as e:
-                    logger.error(
-                        f"Batch operation failed at item {i}: {str(e)}\n"
-                        f"Query: {query}"
-                    )
-                    raise DatabaseError(f"Error executing batch query: {str(e)}")
+                            await current_session.execute(text(query), batch)
+                            # No explicit commit here, session.begin() handles it.
+                            
+                            batch_duration = time.time() - batch_start_time_loop
+                            if batch_duration > 5:
+                                logger.warning(f"Slow batch (new session) detected: {batch_duration:.2f}s (Items {i}-{i+len(batch)})")
+                            if i > 0 and i % (batch_size * 10) == 0:
+                                progress = (i / total_items) * 100
+                                elapsed = time.time() - start_time
+                                rate = i / elapsed if elapsed > 0 else 0
+                                logger.info(f"Batch progress (new session): {progress:.1f}% ({i}/{total_items}) Rate: {rate:.1f} items/s")
+                                await self._monitor_resources()
+            
+            total_duration = time.time() - start_time
+            logger.info(
+                f"Batch operation completed: {total_items} items "
+                f"in {total_duration:.2f}s "
+                f"({total_items/total_duration if total_duration > 0 else 0:.1f} items/s)"
+            )
+
+        except SQLAlchemyError as e:
+            # Determine current item index 'i' if possible for logging
+            current_item_index_str = ""
+            if 'i' in locals():
+                 current_item_index_str = f"at item {locals()['i']}"
+            logger.error(
+                f"Batch operation failed {current_item_index_str}: {str(e)}\\n"
+                f"Query: {query}"
+            )
+            raise DatabaseError(f"Error executing batch query: {str(e)}")
+        except Exception as e: # Catch other potential errors
+            current_item_index_str = ""
+            if 'i' in locals():
+                 current_item_index_str = f"at item {locals()['i']}"
+            logger.error(f"Unexpected error in execute_many {current_item_index_str}: {e}", exc_info=True)
+            raise DatabaseError(f"Unexpected error in execute_many: {str(e)}")
 
     async def execute_with_retry(
         self, 

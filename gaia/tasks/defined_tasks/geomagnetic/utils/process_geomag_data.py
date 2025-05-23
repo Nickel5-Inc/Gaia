@@ -112,4 +112,4 @@ async def get_latest_geomag_data(include_historical=False):
     except Exception as e:
         logger.error(f"Error fetching geomagnetic data: {e}")
         logger.error(f"{traceback.format_exc()}")
-        return "N/A", "N/A", None
+        return "N/A", "N/A"
