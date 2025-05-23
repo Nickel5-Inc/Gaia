@@ -129,6 +129,7 @@ class BaseDatabaseManager(ABC):
             self._engine = None
             self._engine_initialized = False
             self.initialized = True
+            self.db_loop = None
 
     async def ensure_engine_initialized(self):
         """Ensure the engine is initialized before use."""
@@ -323,9 +324,10 @@ class BaseDatabaseManager(ABC):
             raise DatabaseError("Database URL not initialized")
 
         try:
+            current_loop = asyncio.get_running_loop()
             # Log initialization with masked credentials
             masked_url = str(self.db_url).replace(self.db_url.split('@')[0], '***')
-            logger.info(f"Initializing database engine with URL: {masked_url}")
+            logger.info(f"Initializing database engine with URL: {masked_url} on loop {current_loop}")
 
             # Configure engine with connection pooling settings
             self._engine = create_async_engine(
@@ -352,7 +354,8 @@ class BaseDatabaseManager(ABC):
                 self._engine, class_=AsyncSession, expire_on_commit=False, autobegin=False
             )
 
-            logger.info("Database engine initialized successfully")
+            self.db_loop = current_loop
+            logger.info(f"Database engine initialized successfully on loop {self.db_loop}")
             self._engine_initialized = True
             return True
 
@@ -476,6 +479,18 @@ class BaseDatabaseManager(ABC):
         if not self._engine or not self._session_factory:
             logger.error("Database engine or session factory not initialized. Cannot create session.")
             raise DatabaseConnectionError("Engine/Session factory not initialized")
+
+        current_loop = asyncio.get_running_loop()
+        if self.db_loop is not None and self.db_loop is not current_loop:
+            logger.critical(
+                f"CRITICAL: Attempting to create a database session from a different event loop. "
+                f"Engine initialized on loop {self.db_loop}, current session requested from loop {current_loop}."
+            )
+            raise DatabaseError(
+                f"Database session requested from loop {current_loop}, but engine is bound to loop {self.db_loop}. "
+                "This can lead to 'Task attached to a different loop' errors. "
+                "Ensure database operations occur on the same event loop where the engine was initialized."
+            )
 
         if not await self._check_circuit_breaker():
             raise CircuitBreakerError("Circuit breaker is open")
@@ -672,7 +687,7 @@ class BaseDatabaseManager(ABC):
     ) -> Any:
         """
         Execute a single database operation.
-        If session is provided, uses it. Otherwise creates a new session.
+        If session is provided, uses it. Otherwise creates a new session and transaction.
         
         Args:
             query (str): SQL query to execute
@@ -684,22 +699,22 @@ class BaseDatabaseManager(ABC):
             Any: Query result
         """
         if session is not None:
-            # Use existing session
+
             try:
                 result = await session.execute(text(query), params or {})
                 return result
             except SQLAlchemyError as e:
-                logger.error(f"Database error in execute: {str(e)}\nQuery: {query}")
-                raise DatabaseError(f"Error executing query: {str(e)}")
+                logger.error(f"Database error in execute (with existing session): {str(e)}\nQuery: {query}")
+                raise DatabaseError(f"Error executing query (with existing session): {str(e)}")
         else:
-            # Create new session for single operation
-            async with self.session() as session:
+            async with self.session() as new_session:
                 try:
-                    result = await session.execute(text(query), params or {})
+                    async with new_session.begin():
+                        result = await new_session.execute(text(query), params or {})
                     return result
                 except SQLAlchemyError as e:
-                    logger.error(f"Database error in execute: {str(e)}\nQuery: {query}")
-                    raise DatabaseError(f"Error executing query: {str(e)}")
+                    logger.error(f"Database error in execute (new session): {str(e)}\nQuery: {query}")
+                    raise DatabaseError(f"Error executing query (new session): {str(e)}")
 
     @with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
     async def execute_many(

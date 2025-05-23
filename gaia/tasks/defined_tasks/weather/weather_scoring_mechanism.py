@@ -165,8 +165,24 @@ async def evaluate_miner_forecast_day1(
                 logger.error(f"[Day1Score] Error selecting from miner_forecast_ds: {e_sel_miner}. Skipping lead.")
                 continue
 
-            if abs(miner_forecast_lead.time.item() - selection_label_for_miner) > np.timedelta64(1, 'h') if not np.issubdtype(miner_forecast_ds.time.dtype, np.integer) else False:
-                logger.warning(f"Miner forecast for {valid_time_dt} (selected time: {miner_forecast_lead.time.data}) not found or too far. Skipping lead {effective_lead_h}h.")
+            time_diff_too_large = False
+            miner_time_value_from_sel = miner_forecast_lead.time.item()
+
+            if not np.issubdtype(miner_forecast_ds.time.dtype, np.integer):
+                try:
+                    miner_time_dt64 = np.datetime64(miner_time_value_from_sel, 'ns')
+                    if abs(miner_time_dt64 - selection_label_for_miner) > np.timedelta64(1, 'h'):
+                        time_diff_too_large = True
+                except Exception as e_conv_dt64:
+                    logger.warning(f"[Day1Score] Could not convert/compare miner time {miner_time_value_from_sel} with {selection_label_for_miner}: {e_conv_dt64}. Assuming time difference is too large.")
+                    time_diff_too_large = True
+            else:
+                hour_in_nanos = np.timedelta64(1, 'h').astype('timedelta64[ns]').astype(np.int64)
+                if abs(miner_time_value_from_sel - selection_label_for_miner) > hour_in_nanos:
+                    time_diff_too_large = True
+            
+            if time_diff_too_large:
+                logger.warning(f"Miner forecast for {valid_time_dt} (selected time value: {miner_time_value_from_sel}, target label: {selection_label_for_miner}) not found or too far. Skipping lead {effective_lead_h}h.")
                 continue
 
             for var_config in variables_to_score:

@@ -391,28 +391,20 @@ async def fetch_gfs_analysis_data(
             for target_time in target_times:
                 full_ds = None
                 try:
-                    now_utc = datetime.now(timezone.utc)
-                    if target_time > (now_utc - timedelta(days=5)):
-                        modified_target_time = target_time - timedelta(hours=24) 
-                        logger.warning(f"MODIFIED FOR RECENT DATA: Original target_time {target_time} (within last 5 days), fetching for {modified_target_time}")
-                    else:
-                        modified_target_time = target_time
-                        logger.info(f"Using actual target_time {target_time} (older than 5 days) for GFS analysis fetch.")
-                    
-                    base_url = _get_gfs_cycle_url(modified_target_time)
+                    base_url = _get_gfs_cycle_url(target_time)
                     if not base_url:
-                        logger.error(f"Could not get URL for GFS cycle based on original {target_time} (modified to {modified_target_time}). Skipping.")
+                        logger.error(f"Could not get URL for GFS cycle {target_time}. Skipping.")
                         continue
                         
-                    logger.info(f"Opening GFS cycle {modified_target_time} (original was {target_time}) from {base_url} for analysis (T+0h)...")
+                    logger.info(f"Opening GFS cycle {target_time} from {base_url} for analysis (T+0h)...")
                     full_ds = xr.open_dataset(base_url, decode_times=True, chunks={})
 
-                    analysis_select_time_np = np.datetime64(modified_target_time.replace(tzinfo=None))
+                    analysis_select_time_np = np.datetime64(target_time.replace(tzinfo=None))
 
                     analysis_slice = full_ds.sel(time=analysis_select_time_np, method='nearest')
                     
                     if abs(analysis_slice.time.values - analysis_select_time_np) > np.timedelta64(1, 'h'):
-                        logger.error(f"Nearest time found ({analysis_slice.time.values}) is too far from requested analysis time {modified_target_time} for cycle {modified_target_time}. Skipping.")
+                        logger.error(f"Nearest time found ({analysis_slice.time.values}) is too far from requested analysis time {target_time} for cycle {target_time}. Skipping.")
                         continue
 
                     current_surface_vars = target_surface_vars if target_surface_vars is not None else GFS_SURFACE_VARS
@@ -421,21 +413,20 @@ async def fetch_gfs_analysis_data(
                     vars_to_load_final = [v for v in current_surface_vars + current_atmos_vars if v in full_ds]
                     
                     if not vars_to_load_final:
-                         logger.warning(f"No targeted GFS variables found in dataset for cycle {target_time} (modified {modified_target_time}). Surface tried: {current_surface_vars}, Atmos tried: {current_atmos_vars}. Skipping analysis for this time.")
+                         logger.warning(f"No targeted GFS variables found in dataset for cycle {target_time}. Surface tried: {current_surface_vars}, Atmos tried: {current_atmos_vars}. Skipping analysis for this time.")
                          continue
-                    logger.info(f"For cycle {target_time} (modified {modified_target_time}), attempting to load variables: {vars_to_load_final}")
+                    logger.info(f"For cycle {target_time}, attempting to load variables: {vars_to_load_final}")
                          
                     loaded_slice = analysis_slice[vars_to_load_final].load()
                     loaded_slice = loaded_slice.expand_dims(dim='time', axis=0)
-                    # Ensure time is set with nanosecond precision and as naive UTC
                     target_time_utc_naive = target_time.replace(tzinfo=None)
                     loaded_slice['time'] = [np.datetime64(target_time_utc_naive, 'ns')]
                     
-                    logger.info(f"Loaded analysis slice for original target {target_time} (fetched for {modified_target_time})")
+                    logger.info(f"Loaded analysis slice for original target {target_time}")
                     analysis_slices.append(loaded_slice)
 
                 except Exception as e:
-                    logger.error(f"Failed to fetch/process analysis for original target {target_time} (attempted {modified_target_time}): {e}", exc_info=True)
+                    logger.error(f"Failed to fetch/process analysis for original target {target_time}: {e}", exc_info=True)
                 finally:
                     if full_ds:
                         try: full_ds.close()

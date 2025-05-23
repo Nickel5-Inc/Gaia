@@ -265,8 +265,8 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                         await update_job_paths(
                             task_instance=task_instance,
                             job_id=job_id,
-                            target_netcdf_path=zarr_path_override,
-                            kerchunk_json_path=zarr_path_override,
+                            netcdf_path=zarr_path_override,
+                            kerchunk_path=zarr_path_override,
                             verification_hash=hash_override
                         )
                         await update_job_status(task_instance, job_id, "completed")
@@ -447,8 +447,8 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
             await update_job_paths(
                 task_instance=task_instance,
                 job_id=job_id,
-                target_netcdf_path=zarr_path,
-                kerchunk_json_path=zarr_path,
+                netcdf_path=zarr_path,
+                kerchunk_path=zarr_path,
                 verification_hash=v_hash
             )
             await update_job_status(task_instance, job_id, "completed")

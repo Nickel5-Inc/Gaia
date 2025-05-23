@@ -129,6 +129,7 @@ sa.Index('idx_wfr_run_init_time', weather_forecast_runs_table.c.run_initiation_t
 sa.Index('idx_wfr_target_forecast_time', weather_forecast_runs_table.c.target_forecast_time_utc)
 sa.Index('idx_wfr_gfs_init_time', weather_forecast_runs_table.c.gfs_init_time_utc)
 sa.Index('idx_wfr_status', weather_forecast_runs_table.c.status)
+sa.Index('idx_wfr_status_init_time', weather_forecast_runs_table.c.status, weather_forecast_runs_table.c.run_initiation_time)
 
 weather_miner_responses_table = sa.Table('weather_miner_responses', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True), # SERIAL PRIMARY KEY
