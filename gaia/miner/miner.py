@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 import asyncio
 import ipaddress
 from typing import Optional
+import warnings
 
 # Imports for Alembic check
 from alembic.config import Config # Add Alembic import
@@ -95,16 +96,6 @@ class Miner:
         logger.info(f" Hotkey Name: {self.hotkey}")
 
         self.database_manager = MinerDatabaseManager()
-        async def init_db():
-            await self.database_manager.ensure_engine_initialized()
-            await self.database_manager.initialize_database() 
-            
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(init_db()) 
-        else:
-            loop.run_until_complete(init_db())
-        
         self.geomagnetic_task = GeomagneticTask(
             node_type="miner",
             db_manager=self.database_manager
@@ -240,10 +231,24 @@ class Miner:
                 self.logger.warning("Miner public base URL could not be determined. Kerchunk JSONs may use relative paths.")
 
             self.logger.info("Starting miner server...")
+            
             app = server.factory_app(debug=True)
-
-            # Configure app to handle larger requests
             app.body_limit = MAX_REQUEST_SIZE
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*on_event is deprecated.*")
+                
+                @app.on_event("startup")
+                async def startup_event():
+                    self.logger.info("Initializing database on FastAPI startup...")
+                    try:
+                        await self.database_manager.ensure_engine_initialized()
+                        await self.database_manager.initialize_database()
+                        self.logger.info("Database initialization completed successfully")
+                    except Exception as e:
+                        self.logger.error(f"Failed to initialize database during startup: {e}", exc_info=True)
+                        import sys
+                        sys.exit(1)
 
             app.include_router(factory_router(self))
 
@@ -309,11 +314,6 @@ class Miner:
             self.logger.error(f"Error starting miner: {e}")
             self.logger.error(traceback.format_exc())
             raise e
-
-        while True:
-            # Main miner loop for processing tasks
-            # Listen to routes for new tasks and process them
-            pass
 
 
 if __name__ == "__main__":

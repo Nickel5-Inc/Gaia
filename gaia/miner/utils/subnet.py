@@ -120,11 +120,13 @@ def factory_router(miner_instance) -> APIRouter:
         try:
             if decrypted_payload.data:
                 response_data = decrypted_payload.model_dump()
-                db_manager = MinerDatabaseManager()
-                geomagnetic_task = GeomagneticTask(db_manager=db_manager, node_type="miner")
+                
+                if not hasattr(miner_instance, 'geomagnetic_task'):
+                    logger.error("Miner instance is missing the 'geomagnetic_task' attribute.")
+                    return JSONResponse(status_code=500, content={"error": "Miner not configured for geomagnetic task"})
+                
                 logger.info(f"Miner executing geomagnetic prediction ...")
-
-                result = geomagnetic_task.miner_execute(response_data, miner_instance)
+                result = miner_instance.geomagnetic_task.miner_execute(response_data, miner_instance)
                 logger.info(f"Miner execution completed: {result}")
 
                 if result:
@@ -171,11 +173,11 @@ def factory_router(miner_instance) -> APIRouter:
         ),
     ):
         try:
-            db_manager = MinerDatabaseManager()
-            soil_task = SoilMoistureTask(db_manager=db_manager, node_type="miner")
+            if not hasattr(miner_instance, 'soil_task'):
+                logger.error("Miner instance is missing the 'soil_task' attribute.")
+                return JSONResponse(status_code=500, content={"error": "Miner not configured for soil moisture task"})
 
-            # Execute miner task
-            result = await soil_task.miner_execute(
+            result = await miner_instance.soil_task.miner_execute(
                 decrypted_payload.model_dump(), miner_instance
             )
 
