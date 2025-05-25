@@ -15,6 +15,7 @@ import time
 from functools import wraps
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 import torch
+import os # Import os module
 
 
 
@@ -112,30 +113,43 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
     def __init__(
         self,
-        database: str = "validator_db",
-        host: str = "localhost",
-        port: int = 5432,
-        user: str = "postgres",
-        password: str = "postgres",
+        database: Optional[str] = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
     ) -> None:
         """Initialize the validator database manager."""
         if not hasattr(self, '_initialized') or not self._initialized:
+            # Fetch configuration from environment variables, with fallbacks to original defaults
+            db_name_env = os.getenv('DB_NAME', "validator_db")
+            db_host_env = os.getenv('DB_HOST', "/var/run/postgresql")
+            db_port_env = int(os.getenv('DB_PORT', "5432")) # Ensure port is int
+            db_user_env = os.getenv('DB_USER', "postgres")
+            db_password_env = os.getenv('DB_PASSWORD', "postgres")
+
+            # Log the source of the database configuration
+            logger.info(f"DB_NAME: {db_name_env} (Source: {'Env' if os.getenv('DB_NAME') else 'Default'})")
+            logger.info(f"DB_HOST: {db_host_env} (Source: {'Env' if os.getenv('DB_HOST') else 'Default'})")
+            logger.info(f"DB_PORT: {db_port_env} (Source: {'Env' if os.getenv('DB_PORT') else 'Default'})")
+            logger.info(f"DB_USER: {db_user_env} (Source: {'Env' if os.getenv('DB_USER') else 'Default'})")
+            logger.info(f"DB_PASSWORD: (Source: {'Env' if os.getenv('DB_PASSWORD') else 'Default'})") # Avoid logging password value
+
             # Call base class init first to set up necessary attributes
+            # The base class __init__ will then handle the Unix socket path detection for db_host_env
             super().__init__(
                 node_type="validator",
-                database=database,
-                host=host,
-                port=port,
-                user=user,
-                password=password,
+                database=db_name_env,
+                host=db_host_env,
+                port=db_port_env,
+                user=db_user_env,
+                password=db_password_env,
             )
             
             # Store database name (might still be useful for logging/config)
-            self.database = database
-            
-            # Set database URL (crucial)
-            self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
-            
+            # self.database is now set by the super().__init__ call if it uses its 'database' param correctly
+            # self.db_url is also now set by the super().__init__ call
+
             # Custom timeouts for validator operations
             self.VALIDATOR_QUERY_TIMEOUT = 60  # 1 minute
             self.VALIDATOR_TRANSACTION_TIMEOUT = 300  # 5 minutes

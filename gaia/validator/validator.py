@@ -77,6 +77,9 @@ from gaia.validator.sync.backup_manager import get_backup_manager, BackupManager
 from gaia.validator.sync.restore_manager import get_restore_manager, RestoreManager
 import random # for staggering db sync tasks
 
+# Import database exceptions
+from gaia.database.database_manager import DatabaseError, DatabaseTimeout, DatabaseConnectionError
+
 logger = get_logger(__name__)
 
 
@@ -328,7 +331,7 @@ class GaiaValidator:
         Set up the neuron with necessary configurations and connections.
         """
         try:
-            load_dotenv(".env")
+            # load_dotenv(".env") # Moved to __main__ block
             self.netuid = (
                 self.args.netuid if self.args.netuid else int(os.getenv("NETUID", 237))
             )
@@ -2026,6 +2029,77 @@ class GaiaValidator:
                 logger.error("Failed to initialize RestoreManager. DB Sync (replica) will be disabled.")
         logger.info("DB Sync components initialization attempt finished.")
 
+    async def database_monitor(self):
+        """Periodically query and log database statistics."""
+        logger.info("Starting database monitor task...")
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(60) # Check every 60 seconds
+
+            stats = {
+                "connection_states": None,
+                "lock_modes": None,
+                "wait_events": None,
+                "error": None
+            }
+
+            try:
+                # Query connection states
+                conn_query = "SELECT state, count(*) FROM pg_stat_activity GROUP BY state;"
+                stats["connection_states"] = await self.database_manager.fetch_all(conn_query, timeout=15.0)
+
+                # Query lock modes
+                lock_query = "SELECT mode, count(*) FROM pg_locks GROUP BY mode;"
+                stats["lock_modes"] = await self.database_manager.fetch_all(lock_query, timeout=15.0)
+
+                # Query top 5 wait events for active queries
+                wait_query = """
+                    SELECT wait_event_type, wait_event, count(*)
+                    FROM pg_stat_activity
+                    WHERE state = 'active' AND wait_event IS NOT NULL
+                    GROUP BY wait_event_type, wait_event
+                    ORDER BY count(*) DESC
+                    LIMIT 5;
+                """
+                stats["wait_events"] = await self.database_manager.fetch_all(wait_query, timeout=15.0)
+
+            except (DatabaseError, DatabaseTimeout, DatabaseConnectionError) as db_err:
+                stats["error"] = f"Database query failed: {type(db_err).__name__} - {db_err}"
+                logger.warning(f"Database monitor failed: {stats['error']}")
+            except asyncio.TimeoutError:
+                stats["error"] = "Database query timed out (asyncio)"
+                logger.warning(f"Database monitor failed: {stats['error']}")
+            except Exception as e:
+                stats["error"] = f"Unexpected error: {type(e).__name__} - {e}"
+                logger.error(f"Database monitor encountered an unexpected error: {e}", exc_info=True)
+
+            # Format and log the stats
+            log_message = "[DB Monitor] Stats:\n"
+            if stats["connection_states"]:
+                conns = ", ".join([f"{row['state'] or 'NULL'}: {row['count']}" for row in stats["connection_states"]])
+                log_message += f"  Connections: [{conns}]\n"
+            else:
+                log_message += "  Connections: [Query Failed or No Data]\n"
+
+            if stats["lock_modes"]:
+                locks = ", ".join([f"{row['mode']}: {row['count']}" for row in stats["lock_modes"]])
+                log_message += f"  Locks: [{locks}]\n"
+            else:
+                log_message += "  Locks: [Query Failed or No Data]\n"
+
+            if stats["wait_events"]:
+                waits = [f"{row['wait_event_type']}/{row['wait_event']}: {row['count']}" for row in stats["wait_events"]]
+                if waits:
+                    log_message += f"  Top Waits: [{', '.join(waits)}]\n"
+                else:
+                    log_message += "  Top Waits: [None]\n"
+            else:
+                 log_message += "  Top Waits: [Query Failed or No Data]\n"
+
+            if stats["error"]:
+                log_message += f"  Error: {stats['error']}\n"
+
+            logger.info(log_message.strip())
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -2046,6 +2120,21 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # Load .env file as early as possible, overriding any existing env vars
+    # Determine the directory of the current script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Assume .env file is in the parent directory of the script's directory (e.g., project root)
+    project_root = os.path.dirname(script_dir) 
+    dotenv_path = os.path.join(project_root, '.env')
+
+    if os.path.exists(dotenv_path):
+        load_dotenv(dotenv_path=dotenv_path, override=True)
+        logger.info(f".env file loaded from {dotenv_path}, overriding existing env vars.")
+    else:
+        # Fallback to default .env location if the above path doesn't exist, still with override
+        load_dotenv(".env", override=True) 
+        logger.info(".env file loaded from default location (if present), overriding existing env vars.")
 
     # --- Run Alembic check synchronously BEFORE starting the application --- 
     try:

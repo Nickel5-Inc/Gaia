@@ -65,6 +65,57 @@ source ../.gaia/bin/activate
 pip install "git+https://github.com/rayonlabs/fiber.git@production#egg=fiber[full]"
 ```
 
+### PostgreSQL Configuration for Local Connections
+
+If you are running the validator and PostgreSQL on the same machine and intend to use the default database user (`postgres`), you might encounter a "Peer authentication failed" error. This typically happens if the validator application is run as an OS user different from `postgres` (e.g., as `root` via `pm2`).
+
+To resolve this and enable password authentication for the `postgres` user via local Unix domain sockets (recommended for security over `peer` when OS users don't match):
+
+1.  **Locate your `pg_hba.conf` file.**
+    This file is critical for PostgreSQL's client authentication. Common locations include:
+    *   `/etc/postgresql/<YOUR_PG_VERSION>/main/pg_hba.conf`
+    *   `/var/lib/pgsql/data/pg_hba.conf`
+    You can find its exact location by connecting to `psql` and running `SHOW hba_file;`.
+
+2.  **Edit `pg_hba.conf` with `sudo` privileges.**
+    Open the file using a text editor, for example:
+    ```bash
+    sudo nano /path/to/your/pg_hba.conf 
+    ```
+    (Replace `/path/to/your/pg_hba.conf` with the actual path).
+
+3.  **Modify the `local` connection rule for the `postgres` user.**
+    Look for a line similar to:
+    ```
+    # TYPE  DATABASE        USER            ADDRESS                 METHOD
+    local   all             postgres                                peer
+    ```
+    Change `peer` to `md5`. The line should now look like:
+    ```
+    # TYPE  DATABASE        USER            ADDRESS                 METHOD
+    local   all             postgres                                md5
+    ```
+    If you have a more general rule like `local all all peer`, you can either change that to `md5` (which will require passwords for all local users) or add the more specific line for `postgres` *before* the general `peer` rule.
+
+4.  **Save the `pg_hba.conf` file.**
+
+5.  **Reload the PostgreSQL configuration.**
+    For the changes to take effect, PostgreSQL needs to reload its configuration:
+    ```bash
+    sudo systemctl reload postgresql
+    # Or, for older systems:
+    # sudo service postgresql reload
+    ```
+
+6.  **Ensure Environment Variables are Set.**
+    Make sure your `.env` file (or your environment configuration method for `pm2`) correctly sets:
+    *   `DB_USER=postgres`
+    *   `DB_PASSWORD=your_actual_postgres_password`
+    *   `DB_HOST=/var/run/postgresql` (or your correct Unix socket directory)
+    *   `DB_NAME=your_database_name` (e.g., `validator_db`)
+    *   `DB_PORT` (will be ignored if `DB_HOST` is a Unix socket path, but good to have)
+
+After these steps, your validator should be able to connect to the local PostgreSQL server using the `postgres` user and its password. For enhanced security in production, consider creating a dedicated, less-privileged PostgreSQL user for the validator application.
 
 #### Register miner and/or validator on subnet
 ```bash

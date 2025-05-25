@@ -95,7 +95,17 @@ class BaseDatabaseManager(ABC):
         """Initialize database connection parameters and engine."""
         if not hasattr(self, "initialized"):
             self.node_type = node_type
-            self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
+            
+            # Check if the host parameter looks like a path (for Unix socket)
+            if host and host.startswith("/"):
+                # For Unix socket, host is the socket directory path, port is omitted
+                # Example: postgresql+asyncpg://user:password@/database?host=/path/to/socket/dir
+                self.db_url = f"postgresql+asyncpg://{user}:{password}@/{database}?host={host}"
+                logger.info(f"Configuring database for Unix socket connection via: {host}")
+            else:
+                # Standard TCP/IP connection
+                self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
+                logger.info(f"Configuring database for TCP/IP connection to: {host}:{port}")
             
             # Connection management
             self._active_sessions = set()
@@ -388,6 +398,7 @@ class BaseDatabaseManager(ABC):
             return True
         except Exception as e:
             logger.error(f"Error ensuring pool: {e}")
+            logger.error(traceback.format_exc())
             return False
         finally:
             if conn:
