@@ -252,5 +252,6 @@ geomagnetic_history_table = sa.Table('geomagnetic_history', validator_metadata,
 # TODO for user: Review all nullable=True/False, server_defaults, and CHAR/VARCHAR lengths.
 # TODO for user: Review primary key definitions, especially for weather_historical_weights if a composite PK is desired.
 
-
-# ... (rest of the file, if any) ... 
+sa.Index('idx_node_table_uid', node_table.c.uid)
+sa.Index('idx_node_table_uid_last_updated', node_table.c.uid, node_table.c.last_updated)
+sa.Index('idx_score_table_task_name_created_at_desc', score_table.c.task_name, sa.text('created_at DESC'))
