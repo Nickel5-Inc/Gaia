@@ -1192,7 +1192,8 @@ class GaiaValidator:
                 lambda: self.handle_miner_deregistration_loop(),
                 # The MinerScoreSender task will be added conditionally below
                 lambda: self.check_for_updates(),
-                lambda: self.manage_earthdata_token()
+                lambda: self.manage_earthdata_token(),
+                lambda: self.database_monitor()
             ]
 
             # Add DB Sync tasks conditionally
