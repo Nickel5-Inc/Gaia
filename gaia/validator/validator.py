@@ -77,9 +77,6 @@ from gaia.validator.sync.backup_manager import get_backup_manager, BackupManager
 from gaia.validator.sync.restore_manager import get_restore_manager, RestoreManager
 import random # for staggering db sync tasks
 
-# Import database exceptions
-from gaia.database.database_manager import DatabaseError, DatabaseTimeout, DatabaseConnectionError
-
 logger = get_logger(__name__)
 
 
@@ -331,7 +328,7 @@ class GaiaValidator:
         Set up the neuron with necessary configurations and connections.
         """
         try:
-            # load_dotenv(".env") # Moved to __main__ block
+            load_dotenv(".env")
             self.netuid = (
                 self.args.netuid if self.args.netuid else int(os.getenv("NETUID", 237))
             )
@@ -1192,8 +1189,7 @@ class GaiaValidator:
                 lambda: self.handle_miner_deregistration_loop(),
                 # The MinerScoreSender task will be added conditionally below
                 lambda: self.check_for_updates(),
-                lambda: self.manage_earthdata_token(),
-                lambda: self.database_monitor()
+                lambda: self.manage_earthdata_token()
             ]
 
             # Add DB Sync tasks conditionally
@@ -1551,43 +1547,83 @@ class GaiaValidator:
                     # --- Step 3: Update info for existing miners where hotkey didn't change ---
                     if uids_to_update_info:
                         logger.info(f"Updating potentially changed info (stake, IP, etc.) for {len(uids_to_update_info)} existing UIDs...")
+                        
+                        batch_updates = []
                         for uid_to_update, chain_node_data in uids_to_update_info.items():
-                            # Skip if it was just processed in the clear_and_update step
-                            if uid_to_update in uids_to_clear_and_update: continue 
+                            if uid_to_update in uids_to_clear_and_update: 
+                                continue
+                                
+                            batch_updates.append({
+                                "index": uid_to_update,
+                                "hotkey": chain_node_data.hotkey,
+                                "coldkey": chain_node_data.coldkey,
+                                "ip": chain_node_data.ip,
+                                "ip_type": str(chain_node_data.ip_type),
+                                "port": chain_node_data.port,
+                                "incentive": float(chain_node_data.incentive),
+                                "stake": float(chain_node_data.stake),
+                                "trust": float(chain_node_data.trust),
+                                "vtrust": float(chain_node_data.vtrust),
+                                "protocol": str(chain_node_data.protocol)
+                            })
+                            
+                            self.nodes[uid_to_update] = {"hotkey": chain_node_data.hotkey, "uid": uid_to_update}
+                        
+                        if batch_updates:
                             try:
-                                await self.database_manager.update_miner_info(
-                                    index=uid_to_update, hotkey=chain_node_data.hotkey, coldkey=chain_node_data.coldkey,
-                                    ip=chain_node_data.ip, ip_type=str(chain_node_data.ip_type), port=chain_node_data.port,
-                                    incentive=float(chain_node_data.incentive), stake=float(chain_node_data.stake),
-                                    trust=float(chain_node_data.trust), vtrust=float(chain_node_data.vtrust),
-                                    protocol=str(chain_node_data.protocol)
-                                )
-                                # Also update in-memory state
-                                self.nodes[uid_to_update] = {"hotkey": chain_node_data.hotkey, "uid": uid_to_update}
-                                logger.debug(f"Successfully updated info for existing UID {uid_to_update}.")
+                                await self.database_manager.batch_update_miners(batch_updates)
+                                logger.info(f"Successfully batch updated {len(batch_updates)} existing miners")
                             except Exception as e:
-                                logger.error(f"Error updating info for existing UID {uid_to_update}: {str(e)}", exc_info=True)
+                                logger.error(f"Error in batch update of existing miners: {str(e)}")
+                                for update_data in batch_updates:
+                                    try:
+                                        uid = update_data["index"]
+                                        await self.database_manager.update_miner_info(**update_data)
+                                        logger.debug(f"Successfully updated info for existing UID {uid} (fallback)")
+                                    except Exception as individual_e:
+                                        logger.error(f"Error updating info for existing UID {uid}: {str(individual_e)}", exc_info=True)
 
-                    # --- Step 4: Check for new miners on chain not yet processed ---
                     new_miners_detected = 0
+                    new_miner_updates = []
+                    
                     for chain_uid, chain_node in chain_nodes_info.items():
-                        if chain_uid not in processed_uids: # Check if UID was seen in Step 1
+                        if chain_uid not in processed_uids:
                             logger.info(f"New miner detected on chain: UID {chain_uid}, Hotkey {chain_node.hotkey}. Adding to DB.")
-                            try:
-                                await self.database_manager.update_miner_info(
-                                    index=chain_uid, hotkey=chain_node.hotkey, coldkey=chain_node.coldkey,
-                                    ip=chain_node.ip, ip_type=str(chain_node.ip_type), port=chain_node.port,
-                                    incentive=float(chain_node.incentive), stake=float(chain_node.stake),
-                                    trust=float(chain_node.trust), vtrust=float(chain_node.vtrust),
-                                    protocol=str(chain_node.protocol)
-                                )
-                                self.nodes[chain_uid] = {"hotkey": chain_node.hotkey, "uid": chain_uid}
-                                new_miners_detected +=1
-                                processed_uids.add(chain_uid) # Mark as processed
-                            except Exception as e:
-                                logger.error(f"Error adding new miner UID {chain_uid} (Hotkey: {chain_node.hotkey}): {str(e)}", exc_info=True)
-                    if new_miners_detected > 0:
-                        logger.info(f"Added {new_miners_detected} new miners to the database.")
+                            
+                            new_miner_updates.append({
+                                "index": chain_uid,
+                                "hotkey": chain_node.hotkey,
+                                "coldkey": chain_node.coldkey,
+                                "ip": chain_node.ip,
+                                "ip_type": str(chain_node.ip_type),
+                                "port": chain_node.port,
+                                "incentive": float(chain_node.incentive),
+                                "stake": float(chain_node.stake),
+                                "trust": float(chain_node.trust),
+                                "vtrust": float(chain_node.vtrust),
+                                "protocol": str(chain_node.protocol)
+                            })
+                            
+                            self.nodes[chain_uid] = {"hotkey": chain_node.hotkey, "uid": chain_uid}
+                            new_miners_detected += 1
+                            processed_uids.add(chain_uid)
+                    
+                    if new_miner_updates:
+                        try:
+                            await self.database_manager.batch_update_miners(new_miner_updates)
+                            logger.info(f"Successfully batch added {new_miners_detected} new miners to the database")
+                        except Exception as e:
+                            logger.error(f"Error in batch update of new miners: {str(e)}")
+                            successful_adds = 0
+                            for update_data in new_miner_updates:
+                                try:
+                                    uid = update_data["index"]
+                                    await self.database_manager.update_miner_info(**update_data)
+                                    successful_adds += 1
+                                except Exception as individual_e:
+                                    logger.error(f"Error adding new miner UID {uid} (Hotkey: {update_data['hotkey']}): {str(individual_e)}", exc_info=True)
+                            if successful_adds > 0:
+                                logger.info(f"Added {successful_adds} new miners to the database (fallback)")
 
                     logger.info("Miner state synchronization cycle completed.")
 
@@ -2030,77 +2066,6 @@ class GaiaValidator:
                 logger.error("Failed to initialize RestoreManager. DB Sync (replica) will be disabled.")
         logger.info("DB Sync components initialization attempt finished.")
 
-    async def database_monitor(self):
-        """Periodically query and log database statistics."""
-        logger.info("Starting database monitor task...")
-        while not self._shutdown_event.is_set():
-            await asyncio.sleep(60) # Check every 60 seconds
-
-            stats = {
-                "connection_states": None,
-                "lock_modes": None,
-                "wait_events": None,
-                "error": None
-            }
-
-            try:
-                # Query connection states
-                conn_query = "SELECT state, count(*) FROM pg_stat_activity GROUP BY state;"
-                stats["connection_states"] = await self.database_manager.fetch_all(conn_query, timeout=15.0)
-
-                # Query lock modes
-                lock_query = "SELECT mode, count(*) FROM pg_locks GROUP BY mode;"
-                stats["lock_modes"] = await self.database_manager.fetch_all(lock_query, timeout=15.0)
-
-                # Query top 5 wait events for active queries
-                wait_query = """
-                    SELECT wait_event_type, wait_event, count(*)
-                    FROM pg_stat_activity
-                    WHERE state = 'active' AND wait_event IS NOT NULL
-                    GROUP BY wait_event_type, wait_event
-                    ORDER BY count(*) DESC
-                    LIMIT 5;
-                """
-                stats["wait_events"] = await self.database_manager.fetch_all(wait_query, timeout=15.0)
-
-            except (DatabaseError, DatabaseTimeout, DatabaseConnectionError) as db_err:
-                stats["error"] = f"Database query failed: {type(db_err).__name__} - {db_err}"
-                logger.warning(f"Database monitor failed: {stats['error']}")
-            except asyncio.TimeoutError:
-                stats["error"] = "Database query timed out (asyncio)"
-                logger.warning(f"Database monitor failed: {stats['error']}")
-            except Exception as e:
-                stats["error"] = f"Unexpected error: {type(e).__name__} - {e}"
-                logger.error(f"Database monitor encountered an unexpected error: {e}", exc_info=True)
-
-            # Format and log the stats
-            log_message = "[DB Monitor] Stats:\n"
-            if stats["connection_states"]:
-                conns = ", ".join([f"{row['state'] or 'NULL'}: {row['count']}" for row in stats["connection_states"]])
-                log_message += f"  Connections: [{conns}]\n"
-            else:
-                log_message += "  Connections: [Query Failed or No Data]\n"
-
-            if stats["lock_modes"]:
-                locks = ", ".join([f"{row['mode']}: {row['count']}" for row in stats["lock_modes"]])
-                log_message += f"  Locks: [{locks}]\n"
-            else:
-                log_message += "  Locks: [Query Failed or No Data]\n"
-
-            if stats["wait_events"]:
-                waits = [f"{row['wait_event_type']}/{row['wait_event']}: {row['count']}" for row in stats["wait_events"]]
-                if waits:
-                    log_message += f"  Top Waits: [{', '.join(waits)}]\n"
-                else:
-                    log_message += "  Top Waits: [None]\n"
-            else:
-                 log_message += "  Top Waits: [Query Failed or No Data]\n"
-
-            if stats["error"]:
-                log_message += f"  Error: {stats['error']}\n"
-
-            logger.info(log_message.strip())
-
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -2122,44 +2087,21 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Load .env file as early as possible, overriding any existing env vars
-    # Determine the directory of the current script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Assume .env file is in the parent directory of the script's directory (e.g., project root)
-    project_root = os.path.dirname(script_dir) 
-    dotenv_path = os.path.join(project_root, '.env')
-
-    if os.path.exists(dotenv_path):
-        load_dotenv(dotenv_path=dotenv_path, override=True)
-        logger.info(f".env file loaded from {dotenv_path}, overriding existing env vars.")
-    else:
-        # Fallback to default .env location if the above path doesn't exist, still with override
-        load_dotenv(".env", override=True) 
-        logger.info(".env file loaded from default location (if present), overriding existing env vars.")
-
-    # --- Run Alembic check synchronously BEFORE starting the application --- 
     try:
-        # Or configure application logging before this check if preferred.
-        # logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
-        # alembic_logger = logging.getLogger('alembic')
-        # alembic_logger.setLevel(logging.INFO)
-        
+
         print("[Startup] Checking database schema version using Alembic...") # Use print as logger might not be fully setup
         alembic_cfg = Config("alembic.ini") 
         command.upgrade(alembic_cfg, "head")
         print("[Startup] Database schema is up-to-date.")
     except CommandError as e:
-         # Use print here as well
          print(f"[Startup] ERROR: Alembic command failed during startup check: {e}")
          print("[Startup] ERROR: Please ensure the database is accessible and migrations are correct.")
-         sys.exit("Database migration/check failed.") # Exit directly
+         sys.exit("Database migration/check failed.")
     except Exception as e:
         print(f"[Startup] ERROR: Failed to check/upgrade database schema during startup: {e}")
-        traceback.print_exc() # Print full traceback for unexpected errors
+        traceback.print_exc()
         sys.exit("Database schema check failed.")
-    # --- End Alembic check --- 
 
-    # Now proceed with application setup and launch
     validator = GaiaValidator(args)
     try:
         asyncio.run(validator.main())
@@ -2168,10 +2110,8 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Unhandled exception in main loop: {e}", exc_info=True)
     finally:
-        # Ensure cleanup runs even if main loop crashes
         if hasattr(validator, '_cleanup_done') and not validator._cleanup_done:
              try:
-                 # Ensure a loop exists for final cleanup if needed
                  loop = asyncio.get_event_loop()
                  if loop.is_closed():
                      loop = asyncio.new_event_loop()

@@ -790,19 +790,10 @@ async def compute_input_data_hash(
     cache_dir: Path
 ) -> Optional[str]:
     """
-    Fetches the required GFS analysis data subsets (T=0h, T=-6h),
-    creates a canonical byte representation, and computes its SHA-256 hash.
-
-    Args:
-        t0_run_time: The datetime for the T=0h GFS analysis.
-        t_minus_6_run_time: The datetime for the T=-6h GFS analysis.
-        cache_dir: Path object for the GFS analysis cache directory.
-
-    Returns:
-        SHA-256 hash hex digest, or None if fetching/processing fails.
+    Computes a canonical hash for GFS input data (T0 and T-6).
+    Ensures that the potentially CPU-bound part (_get_canonical_bytes) is run in a thread.
     """
     logger.info(f"Computing input data hash for T0={t0_run_time}, T-6={t_minus_6_run_time}")
-
     ds_t0 = None
     ds_t_minus_6 = None
     try:
@@ -810,47 +801,36 @@ async def compute_input_data_hash(
         ds_t_minus_6 = await fetch_gfs_analysis_data([t_minus_6_run_time], cache_dir=cache_dir)
 
         if ds_t0 is None or ds_t_minus_6 is None:
-            logger.error("Failed to fetch one or both GFS analysis datasets needed for hashing.")
+            logger.error("Failed to fetch GFS data for hash computation.")
             return None
 
-        t0_run_time_np = np.datetime64(t0_run_time.replace(tzinfo=None))
-        t_minus_6_run_time_np = np.datetime64(t_minus_6_run_time.replace(tzinfo=None))
-
-        if (t0_run_time_np not in ds_t0.time.values or
-            t_minus_6_run_time_np not in ds_t_minus_6.time.values):
-             logger.error("Fetched datasets do not contain the exact requested time coordinates.")
-             logger.debug(f"Expected T0: {t0_run_time_np}, Got: {ds_t0.time.values if ds_t0 else 'None'}")
-             logger.debug(f"Expected T-6: {t_minus_6_run_time_np}, Got: {ds_t_minus_6.time.values if ds_t_minus_6 else 'None'}")
-             return None
-
-        canonical_bytes = _get_canonical_bytes(ds_t0, ds_t_minus_6)
+        canonical_bytes = await asyncio.to_thread(
+            _get_canonical_bytes, 
+            ds_t0.copy(deep=True),
+            ds_t_minus_6.copy(deep=True)
+        )
 
         if canonical_bytes is None:
-            logger.error("Failed to generate canonical byte representation.")
+            logger.error("Failed to get canonical byte representation of GFS data.")
             return None
-        else:
-            hasher = hashlib.sha256()
-            hasher.update(canonical_bytes)
-            hex_digest = hasher.hexdigest()
-            logger.info(f"Computed input data SHA-256 hash: {hex_digest}")
-            return hex_digest
 
+        input_hash = hashlib.sha256(canonical_bytes).hexdigest()
+        logger.info(f"Computed input data hash: {input_hash}")
+        return input_hash
     except Exception as e:
-        logger.error(f"Error during input data hash computation: {e}", exc_info=True)
+        logger.error(f"Error in compute_input_data_hash: {e}", exc_info=True)
         return None
     finally:
         if ds_t0 is not None and hasattr(ds_t0, 'close'):
             try:
                 ds_t0.close()
-                logger.debug("Closed ds_t0 dataset.")
-            except Exception as close_err:
-                 logger.warning(f"Exception closing ds_t0: {close_err}")
+            except Exception:
+                pass
         if ds_t_minus_6 is not None and hasattr(ds_t_minus_6, 'close'):
             try:
                 ds_t_minus_6.close()
-                logger.debug("Closed ds_t_minus_6 dataset.")
-            except Exception as close_err:
-                 logger.warning(f"Exception closing ds_t_minus_6: {close_err}")
+            except Exception:
+                pass
 
 
 def _get_data_shape_from_xarray_dataset(

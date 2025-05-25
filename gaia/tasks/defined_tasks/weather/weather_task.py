@@ -829,29 +829,35 @@ class WeatherTask(Task):
         latest_day1_scores_array = np.full(256, 0.0)
         latest_era5_composite_scores_array = np.full(256, 0.0)
         
-        day1_qc_task_name = "weather_day1_qc"
-        query_day1 = """
-            SELECT score, created_at, task_id FROM score_table
-            WHERE task_name = :task_name ORDER BY created_at DESC LIMIT 1
-        """
-        timestamp_for_combined_score_row = datetime.now(timezone.utc)
-        day1_run_id_for_log = "N/A"
-        day1_result = await self.db_manager.fetch_one(query_day1, {"task_name": day1_qc_task_name})
-        if day1_result and day1_result['score']:
-            scores_from_db = day1_result['score']
-            day1_run_id_for_log = day1_result.get('task_id', "N/A")
-            if len(scores_from_db) == 256:
-                latest_day1_scores_array = np.array([
-                    float(s) if s is not None and not (isinstance(s, float) and np.isnan(s)) else 0.0 
-                    for s in scores_from_db], dtype=float)
-                timestamp_for_combined_score_row = day1_result['created_at']
-                logger.info(f"[CombinedWeatherScore] Fetched Day-1 QC scores (run_id/task_id {day1_run_id_for_log}).")
-            else: logger.warning(f"[CombinedWeatherScore] Day-1 QC score array from DB has incorrect length.")
-        else: logger.warning("[CombinedWeatherScore] No Day-1 QC scores found.")
+        active_uids = set()
+        async with self.db_manager.session() as session:
+            active_miners_query = "SELECT DISTINCT uid FROM node_table WHERE hotkey IS NOT NULL AND uid >= 0 AND uid < 256"
+            result = await session.execute(text(active_miners_query))
+            active_miner_uids_records = result.fetchall()
+            active_uids = {rec['uid'] for rec in active_miner_uids_records}
 
-        active_miners_query = "SELECT DISTINCT uid FROM node_table WHERE hotkey IS NOT NULL AND uid >= 0 AND uid < 256"
-        active_miner_uids_records = await self.db_manager.fetch_all(active_miners_query)
-        active_uids = {rec['uid'] for rec in active_miner_uids_records}
+        day1_qc_score_type = "day1_qc_score"
+        query_day1_miner_scores = """
+            SELECT score, calculation_time FROM weather_miner_scores 
+            WHERE miner_uid = :miner_uid AND score_type = :score_type
+            ORDER BY calculation_time DESC LIMIT 1
+        """
+        latest_day1_timestamp = None
+
+        for uid in active_uids:
+            async with self.db_manager.session() as session:
+                result = await session.execute(text(query_day1_miner_scores), {"miner_uid": uid, "score_type": day1_qc_score_type})
+                res_day1 = result.fetchone()
+                if res_day1 and res_day1['score'] is not None and np.isfinite(res_day1['score']):
+                    latest_day1_scores_array[uid] = float(res_day1['score'])
+                    if latest_day1_timestamp is None or res_day1['calculation_time'] > latest_day1_timestamp:
+                        latest_day1_timestamp = res_day1['calculation_time']
+        
+        if latest_day1_timestamp:
+            logger.info(f"[CombinedWeatherScore] Fetched latest Day-1 QC scores for {len(active_uids)} active UIDs, latest timestamp: {latest_day1_timestamp}.")
+        else:
+            logger.warning("[CombinedWeatherScore] No Day-1 QC scores found in weather_miner_scores for active UIDs.")
+            latest_day1_timestamp = datetime.now(timezone.utc) 
 
         era5_composite_score_type = "era5_final_composite_score"
         query_era5_composite = """
@@ -859,9 +865,11 @@ class WeatherTask(Task):
             ORDER BY calculation_time DESC LIMIT 1
         """
         for uid in active_uids:
-            res = await self.db_manager.fetch_one(query_era5_composite, {"miner_uid": uid, "score_type": era5_composite_score_type})
-            if res and res['score'] is not None and np.isfinite(res['score']):
-                latest_era5_composite_scores_array[uid] = float(res['score'])
+            async with self.db_manager.session() as session:
+                result = await session.execute(text(query_era5_composite), {"miner_uid": uid, "score_type": era5_composite_score_type})
+                res_era5 = result.fetchone()
+                if res_era5 and res_era5['score'] is not None and np.isfinite(res_era5['score']):
+                    latest_era5_composite_scores_array[uid] = float(res_era5['score'])
         logger.info(f"[CombinedWeatherScore] Fetched ERA5 composite scores for {len(active_uids)} active UIDs.")
 
         W_day1 = self.config.get('weather_score_day1_weight', 0.2)
@@ -929,19 +937,16 @@ class WeatherTask(Task):
                 "final_score_for_uid": final_weather_scores_for_table[uid_idx]
             })
         
-        id_for_combined_row = 0
-        if run_id_trigger is not None: id_for_combined_row = run_id_trigger
-        elif day1_run_id_for_log != "N/A":
-            try: id_for_combined_row = int(day1_run_id_for_log)
-            except ValueError: logger.warning(f"[CombinedWeatherScore] Could not parse day1_run_id_for_log ('{day1_run_id_for_log}') as int for task_id.")
+        id_for_combined_row = "final_weather_scores"
+        timestamp_for_combined_score_row = datetime.now(timezone.utc)
         
         await self.build_score_row(
-            run_id = id_for_combined_row, 
+            run_id = id_for_combined_row,
             gfs_init_time = timestamp_for_combined_score_row,
             evaluation_results = mock_evaluation_results,
-            task_name_prefix = "weather_combined_score"
+            task_name_prefix = "weather"
         )
-        logger.info(f"[CombinedWeatherScore] Update completed for 'weather_combined_score' (task_id: {id_for_combined_row}).")
+        logger.info(f"[CombinedWeatherScore] Update completed for 'weather' (task_id: {id_for_combined_row}).")
 
     ############################################################
     # Miner methods

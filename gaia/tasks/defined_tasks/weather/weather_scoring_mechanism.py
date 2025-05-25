@@ -118,10 +118,15 @@ async def evaluate_miner_forecast_day1(
         for valid_time_dt in times_to_evaluate:
             effective_lead_h = int((valid_time_dt - run_gfs_init_time).total_seconds() / 3600)
 
-            valid_time_np = np.datetime64(valid_time_dt)
+            if valid_time_dt.tzinfo is None or valid_time_dt.tzinfo.utcoffset(valid_time_dt) is None:
+                valid_time_dt = valid_time_dt.replace(tzinfo=timezone.utc) 
+            else:
+                valid_time_dt = valid_time_dt.astimezone(timezone.utc)
+            
+            valid_time_np = np.datetime64(valid_time_dt.replace(tzinfo=None))
             logger.info(f"[Day1Score] Processing Valid Time: {valid_time_dt} (Effective Lead: {effective_lead_h}h from {run_gfs_init_time})")
 
-            time_key_for_results = effective_lead_h 
+            time_key_for_results = effective_lead_h
             day1_results["lead_time_scores"][time_key_for_results] = {}
 
             try:
@@ -142,7 +147,12 @@ async def evaluate_miner_forecast_day1(
                 logger.warning(f"Could not select GFS data for lead {effective_lead_h}h (valid time {valid_time_dt}): {e_sel}. Skipping lead.")
                 continue
             
-            valid_time_np_ns = np.datetime64(valid_time_dt, 'ns')
+            if valid_time_dt.tzinfo is None or valid_time_dt.tzinfo.utcoffset(valid_time_dt) is None:
+                valid_time_dt_aware = valid_time_dt.replace(tzinfo=timezone.utc)
+            else:
+                valid_time_dt_aware = valid_time_dt.astimezone(timezone.utc)
+            
+            valid_time_np_ns = np.datetime64(valid_time_dt_aware.replace(tzinfo=None), 'ns')
 
             selection_label_for_miner = valid_time_np_ns
             if np.issubdtype(miner_forecast_ds.time.dtype, np.integer):
@@ -251,12 +261,14 @@ async def evaluate_miner_forecast_day1(
                     ref_var_da_selected_std = _standardize_spatial_dims(ref_var_da_selected)
 
 
-                    miner_var_da_aligned = miner_var_da_selected_std.interp_like(
+                    miner_var_da_aligned = await asyncio.to_thread(
+                        miner_var_da_selected_std.interp_like,
                         target_grid_da_std, method="linear", kwargs={"fill_value": None}
                     )
                     truth_var_da_final = target_grid_da_std
                     
-                    ref_var_da_aligned = ref_var_da_selected_std.interp_like(
+                    ref_var_da_aligned = await asyncio.to_thread(
+                        ref_var_da_selected_std.interp_like,
                         target_grid_da_std, method="linear", kwargs={"fill_value": None}
                     )
                     
@@ -270,8 +282,8 @@ async def evaluate_miner_forecast_day1(
                     if actual_lat_dim_in_target:
                         try:
                             target_lat_coord = truth_var_da_final[actual_lat_dim_in_target]
-                            one_d_lat_weights_target = _calculate_latitude_weights(target_lat_coord)
-                            _, broadcasted_weights_final = xr.broadcast(truth_var_da_final, one_d_lat_weights_target)
+                            one_d_lat_weights_target = await asyncio.to_thread(_calculate_latitude_weights, target_lat_coord)
+                            _, broadcasted_weights_final = await asyncio.to_thread(xr.broadcast, truth_var_da_final, one_d_lat_weights_target)
                             logger.debug(f"[Day1Score] For {var_key}, using target_grid_da_std derived weights. Broadcasted weights dims: {broadcasted_weights_final.dims}, shape: {broadcasted_weights_final.shape}")
                         except Exception as e_broadcast_weights:
                             logger.error(f"[Day1Score] Failed to create/broadcast latitude weights based on target_grid_da_std for {var_key}: {e_broadcast_weights}. Proceeding without weights for this variable.")
@@ -323,11 +335,12 @@ async def evaluate_miner_forecast_day1(
 
                     clim_var_to_interpolate = clim_var_da_raw_std
                     if var_level and 'pressure_level' in clim_var_to_interpolate.dims:
-                        clim_var_to_interpolate = clim_var_to_interpolate.sel(pressure_level=var_level, method="nearest")
+                        clim_var_to_interpolate = await asyncio.to_thread(clim_var_to_interpolate.sel, pressure_level=var_level, method="nearest")
                         if abs(clim_var_to_interpolate.pressure_level.item() - var_level) > 10:
                             logger.warning(f"[Day1Score] Climatology for {var_key} at target level {var_level} was found at {clim_var_to_interpolate.pressure_level.item()}. Using this nearest level data.")
                     
-                    clim_var_da_aligned = clim_var_to_interpolate.interp_like(
+                    clim_var_da_aligned = await asyncio.to_thread(
+                        clim_var_to_interpolate.interp_like,
                         truth_var_da_final, method="linear", kwargs={"fill_value": None}
                     )
                     

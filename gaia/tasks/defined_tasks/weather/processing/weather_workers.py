@@ -696,12 +696,6 @@ async def initial_scoring_worker(self):
 
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Successfully processed Day-1 QC for {successful_scores}/{len(responses)} miner responses.")
             
-            if evaluation_results:
-                logger.info(f"[Day1ScoringWorker] Run {run_id}: Attempting to build Day-1 QC score row.")
-                await self.build_score_row(run_id, gfs_init_time, evaluation_results, task_name_prefix="weather_day1_qc")
-            else:
-                logger.warning(f"[Day1ScoringWorker] Run {run_id}: No Day-1 evaluation results to build score row. Skipping score_table update for weather_day1_qc.")
-
             try:
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: Triggering update of combined weather scores.")
                 await self.update_combined_weather_scores(run_id_trigger=run_id)
@@ -962,53 +956,56 @@ async def cleanup_worker(task_instance: 'WeatherTask'):
     era5_cache_dir = Path(task_instance.config.get('era5_cache_dir', './era5_cache'))
     ensemble_dir = VALIDATOR_ENSEMBLE_DIR
     
+    def _blocking_cleanup_directory(dir_path_str: str, retention_days: int, pattern: str, current_time_ts: float):
+        dir_path = Path(dir_path_str)
+        if not dir_path.is_dir():
+            logger.debug(f"[CleanupWorker] Directory not found, skipping: {dir_path}")
+            return 0
+            
+        cutoff_time = current_time_ts - (retention_days * 24 * 3600)
+        deleted_count = 0
+        try:
+            for filepath in dir_path.glob(pattern):
+                try:
+                    if filepath.is_file():
+                        file_mod_time = filepath.stat().st_mtime
+                        if file_mod_time < cutoff_time:
+                            filepath.unlink()
+                            logger.debug(f"[CleanupWorker] Deleted old file: {filepath}")
+                            deleted_count += 1
+                except FileNotFoundError:
+                    continue
+                except Exception as e_file:
+                    logger.warning(f"[CleanupWorker] Error processing file {filepath} for deletion: {e_file}")
+            
+            if pattern != "*" and "*" in pattern:
+                 for item in dir_path.iterdir(): 
+                      if item.is_dir():
+                           try:
+                                if not any(item.iterdir()):
+                                     item.rmdir()
+                                     logger.debug(f"[CleanupWorker] Removed empty directory: {item}")
+                           except OSError as e_dir:
+                                logger.warning(f"[CleanupWorker] Error removing empty dir {item}: {e_dir}")
+                                
+        except Exception as e_glob:
+             logger.error(f"[CleanupWorker] Error processing directory {dir_path}: {e_glob}")
+        logger.info(f"[CleanupWorker] Deleted {deleted_count} files older than {retention_days} days from {dir_path} matching {pattern}.")
+        return deleted_count
+
     while task_instance.cleanup_worker_running:
         try:
             now_ts = time.time()
             now_dt_utc = datetime.now(timezone.utc)
             logger.info("[CleanupWorker] Starting cleanup cycle...")
 
-            async def cleanup_directory(dir_path: Path, retention_days: int, pattern: str = "*.nc"):
-                if not dir_path.is_dir():
-                    logger.debug(f"[CleanupWorker] Directory not found, skipping: {dir_path}")
-                    return 0
-                    
-                cutoff_time = now_ts - (retention_days * 24 * 3600)
-                deleted_count = 0
-                try:
-                    for filepath in dir_path.glob(pattern):
-                        try:
-                            if filepath.is_file():
-                                file_mod_time = filepath.stat().st_mtime
-                                if file_mod_time < cutoff_time:
-                                    filepath.unlink()
-                                    logger.debug(f"[CleanupWorker] Deleted old file: {filepath}")
-                                    deleted_count += 1
-                        except FileNotFoundError:
-                            continue
-                        except Exception as e_file:
-                            logger.warning(f"[CleanupWorker] Error deleting file {filepath}: {e_file}")
-                    if pattern == "*.json":
-                         for item in dir_path.iterdir(): 
-                              if item.is_dir() and not any(item.iterdir()):
-                                   try:
-                                        item.rmdir()
-                                        logger.debug(f"[CleanupWorker] Removed empty directory: {item}")
-                                   except OSError as e_dir:
-                                        logger.warning(f"[CleanupWorker] Error removing empty dir {item}: {e_dir}")
-                                        
-                except Exception as e_glob:
-                     logger.error(f"[CleanupWorker] Error processing directory {dir_path}: {e_glob}")
-                logger.info(f"[CleanupWorker] Deleted {deleted_count} files older than {retention_days} days from {dir_path} matching {pattern}.")
-                return deleted_count
-
             logger.info("[CleanupWorker] Cleaning up GFS cache...")
-            await cleanup_directory(gfs_cache_dir, GFS_CACHE_RETENTION_DAYS, "*.nc")
+            await asyncio.to_thread(_blocking_cleanup_directory, str(gfs_cache_dir), GFS_CACHE_RETENTION_DAYS, "*.nc", now_ts)
             logger.info("[CleanupWorker] Cleaning up ERA5 cache...")
-            await cleanup_directory(era5_cache_dir, ERA5_CACHE_RETENTION_DAYS, "*.nc")
+            await asyncio.to_thread(_blocking_cleanup_directory, str(era5_cache_dir), ERA5_CACHE_RETENTION_DAYS, "*.nc", now_ts)
             logger.info("[CleanupWorker] Cleaning up Ensemble files...")
-            await cleanup_directory(ensemble_dir, ENSEMBLE_RETENTION_DAYS, "*.nc")
-            await cleanup_directory(ensemble_dir, ENSEMBLE_RETENTION_DAYS, "*.json")
+            await asyncio.to_thread(_blocking_cleanup_directory, str(ensemble_dir), ENSEMBLE_RETENTION_DAYS, "*.nc", now_ts)
+            await asyncio.to_thread(_blocking_cleanup_directory, str(ensemble_dir), ENSEMBLE_RETENTION_DAYS, "*.json", now_ts)
 
             logger.info("[CleanupWorker] Cleaning up old database records...")
             db_cutoff_time = now_dt_utc - timedelta(days=DB_RUN_RETENTION_DAYS)

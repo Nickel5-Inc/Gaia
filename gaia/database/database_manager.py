@@ -95,17 +95,7 @@ class BaseDatabaseManager(ABC):
         """Initialize database connection parameters and engine."""
         if not hasattr(self, "initialized"):
             self.node_type = node_type
-            
-            # Check if the host parameter looks like a path (for Unix socket)
-            if host and host.startswith("/"):
-                # For Unix socket, host is the socket directory path, port is omitted
-                # Example: postgresql+asyncpg://user:password@/database?host=/path/to/socket/dir
-                self.db_url = f"postgresql+asyncpg://{user}:{password}@/{database}?host={host}"
-                logger.info(f"Configuring database for Unix socket connection via: {host}")
-            else:
-                # Standard TCP/IP connection
-                self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
-                logger.info(f"Configuring database for TCP/IP connection to: {host}:{port}")
+            self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
             
             # Connection management
             self._active_sessions = set()
@@ -346,12 +336,15 @@ class BaseDatabaseManager(ABC):
                 pool_size=self.MAX_CONNECTIONS,
                 max_overflow=10,
                 pool_timeout=self.DEFAULT_CONNECTION_TIMEOUT,
-                pool_recycle=300,  # Recycle connections every 5 minutes
-                pool_use_lifo=True,  # Use LIFO to better reuse connections
+                pool_recycle=3600,
+                pool_use_lifo=True,
                 echo=False,
                 connect_args={
                     "command_timeout": self.ENGINE_COMMAND_TIMEOUT,
                     "timeout": self.DEFAULT_CONNECTION_TIMEOUT,
+                    "server_settings": {
+                        "jit": "off"
+                    },
                 },
             )
 
@@ -398,7 +391,6 @@ class BaseDatabaseManager(ABC):
             return True
         except Exception as e:
             logger.error(f"Error ensuring pool: {e}")
-            logger.error(traceback.format_exc())
             return False
         finally:
             if conn:
@@ -476,6 +468,31 @@ class BaseDatabaseManager(ABC):
                     raise DatabaseTimeout(f"Operation {func.__name__} timed out after {effective_timeout}s")
             return wrapper
         return decorator
+
+    @asynccontextmanager
+    async def lightweight_session(self):
+        await self.ensure_engine_initialized()
+        if not self._engine or not self._session_factory:
+            raise DatabaseConnectionError("Engine/Session factory not initialized")
+
+        session_instance: Optional[AsyncSession] = None
+        
+        try:
+            session_instance = self._session_factory()
+            yield session_instance
+                
+        except Exception as e:
+            logger.error(f"Lightweight session error: {str(e)}")
+            if isinstance(e, (DatabaseError, SQLAlchemyError)):
+                raise
+            raise DatabaseConnectionError(f"Session error: {str(e)}") from e
+        
+        finally:
+            if session_instance:
+                try:
+                    await session_instance.close()
+                except Exception as e:
+                    logger.error(f"Error closing lightweight session: {e}")
 
     @asynccontextmanager
     async def session(self):

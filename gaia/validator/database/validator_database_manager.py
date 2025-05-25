@@ -15,7 +15,7 @@ import time
 from functools import wraps
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 import torch
-import os # Import os module
+import os
 
 
 
@@ -28,27 +28,62 @@ def track_operation(operation_type: str):
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         async def wrapper(self: 'ValidatorDatabaseManager', *args, **kwargs) -> T:
+            query_text_for_log = "N/A"
+            if args:
+                if isinstance(args[0], str):
+                    query_text_for_log = args[0][:200].replace('\n', ' ') + "..."
+                elif hasattr(args[0], '__str__'):
+                    query_text_for_log = str(args[0])[:200].replace('\n', ' ') + "..."
+            
+            if query_text_for_log == "N/A" and kwargs.get('query'):
+                 if isinstance(kwargs['query'], str):
+                    query_text_for_log = kwargs['query'][:200].replace('\n', ' ') + "..."
+                 elif hasattr(kwargs['query'], '__str__'):
+                    query_text_for_log = str(kwargs['query'])[:200].replace('\n', ' ') + "..."
+
+            if func.__name__ == "batch_update_miners":
+                query_text_for_log = "Batch operation (see function logs for individual queries)"
+            elif func.__name__ == "update_miner_info" and args:
+                query_text_for_log = f"UPDATE node_table SET ... WHERE uid={args[0] if args else 'N/A'}"
+
+
+            op_id = random.randint(10000, 99999)
+            
+            overall_start_time = time.perf_counter()
+            logger.info(f"[DBTrack {op_id}] ENTERING {operation_type} op: {func.__name__}, Query: {query_text_for_log}")
+            
+            db_call_start_time = 0.0
+            db_call_duration = 0.0
+            result = None
+
             try:
-                start_time = time.time()
+                db_call_start_time = time.perf_counter()
                 result = await func(self, *args, **kwargs)
-                duration = time.time() - start_time
+                db_call_duration = time.perf_counter() - db_call_start_time
                 
-                # Track operation
                 self._operation_stats[f'{operation_type}_operations'] += 1
                 
-                # Track long-running queries
-                if duration > self.VALIDATOR_QUERY_TIMEOUT / 2:
+                if db_call_duration > self.VALIDATOR_QUERY_TIMEOUT / 2:
                     self._operation_stats['long_running_queries'].append({
                         'operation': func.__name__,
-                        'duration': duration,
-                        'timestamp': start_time
+                        'query_snippet': query_text_for_log,
+                        'duration': db_call_duration,
+                        'timestamp': time.time()
                     })
-                    logger.warning(f"Long-running {operation_type} operation detected: {duration:.2f}s")
-                
-                return result
+                    logger.warning(f"[DBTrack {op_id}] Long-running DB call for {operation_type} op: {func.__name__} detected: {db_call_duration:.4f}s. Query: {query_text_for_log}")
+                else:
+                    pass
+
             except Exception as e:
-                logger.error(f"Error in {operation_type} operation: {str(e)}")
+                db_call_duration = time.perf_counter() - db_call_start_time
+                logger.error(f"[DBTrack {op_id}] ERROR in {operation_type} op: {func.__name__} after {db_call_duration:.4f}s in DB call. Query: {query_text_for_log}. Error: {str(e)}", exc_info=True)
                 raise
+            finally:
+                overall_duration = time.perf_counter() - overall_start_time
+                if abs(overall_duration - db_call_duration) > 0.1 or db_call_duration > self.VALIDATOR_QUERY_TIMEOUT / 4:
+                    logger.info(f"[DBTrack {op_id}] EXITING {operation_type} op: {func.__name__}. DB call: {db_call_duration:.4f}s, Total in wrapper: {overall_duration:.4f}s. Query: {query_text_for_log}")
+            
+            return result
         return wrapper
     return decorator
 
@@ -113,30 +148,20 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
     def __init__(
         self,
-        database: Optional[str] = None,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        user: Optional[str] = None,
-        password: Optional[str] = None,
+        database: str = "validator_db",
+        host: str = "localhost",
+        port: int = 5432,
+        user: str = "postgres",
+        password: str = "postgres",
     ) -> None:
         """Initialize the validator database manager."""
         if not hasattr(self, '_initialized') or not self._initialized:
-            # Fetch configuration from environment variables, with fallbacks to original defaults
-            db_name_env = os.getenv('DB_NAME', "validator_db")
-            db_host_env = os.getenv('DB_HOST', "/var/run/postgresql")
-            db_port_env = int(os.getenv('DB_PORT', "5432")) # Ensure port is int
-            db_user_env = os.getenv('DB_USER', "postgres")
-            db_password_env = os.getenv('DB_PASSWORD', "postgres")
+            db_name_env = os.getenv("DB_NAME", "validator_db")
+            db_host_env = os.getenv("DB_HOST", "localhost")
+            db_port_env = int(os.getenv("DB_PORT", 5432))
+            db_user_env = os.getenv("DB_USER", "postgres")
+            db_password_env = os.getenv("DB_PASSWORD", "postgres")
 
-            # Log the source of the database configuration
-            logger.info(f"DB_NAME: {db_name_env} (Source: {'Env' if os.getenv('DB_NAME') else 'Default'})")
-            logger.info(f"DB_HOST: {db_host_env} (Source: {'Env' if os.getenv('DB_HOST') else 'Default'})")
-            logger.info(f"DB_PORT: {db_port_env} (Source: {'Env' if os.getenv('DB_PORT') else 'Default'})")
-            logger.info(f"DB_USER: {db_user_env} (Source: {'Env' if os.getenv('DB_USER') else 'Default'})")
-            logger.info(f"DB_PASSWORD: (Source: {'Env' if os.getenv('DB_PASSWORD') else 'Default'})") # Avoid logging password value
-
-            # Call base class init first to set up necessary attributes
-            # The base class __init__ will then handle the Unix socket path detection for db_host_env
             super().__init__(
                 node_type="validator",
                 database=db_name_env,
@@ -382,6 +407,74 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         except Exception as e:
             logger.error(f"Error updating miner info for index {index}: {str(e)}")
             raise DatabaseError(f"Failed to update miner info: {str(e)}")
+
+    @track_operation('write')
+    async def batch_update_miners(self, miners_data: List[Dict[str, Any]]) -> None:
+        """
+        Update multiple miners.
+        Args:
+            miners_data: List of dictionaries containing miner update data.
+                        Each dict should have 'index' and other miner fields.
+        """
+        if not miners_data:
+            return
+            
+        valid_miners_to_update = []
+        for miner_data in miners_data:
+            index = miner_data.get('index')
+            if index is None or not (0 <= index < 256):
+                logger.warning(f"Skipping invalid miner index: {index}")
+                continue
+            valid_miners_to_update.append(miner_data)
+        
+        if not valid_miners_to_update:
+            logger.warning("No valid miners to update after filtering")
+            return
+
+        updated_count = 0
+        try:
+            async with self.lightweight_session() as session:
+                async with session.begin():
+                    for miner_data in valid_miners_to_update:
+                        query = text("""
+                        UPDATE node_table 
+                        SET 
+                            hotkey = :hotkey,
+                            coldkey = :coldkey,
+                            ip = :ip,
+                            ip_type = :ip_type,
+                            port = :port,
+                            incentive = :incentive,
+                            stake = :stake,
+                            trust = :trust,
+                            vtrust = :vtrust,
+                            protocol = :protocol,
+                            last_updated = CURRENT_TIMESTAMP
+                        WHERE uid = :index
+                        """)
+                        params = {
+                            "index": miner_data['index'],
+                            "hotkey": miner_data.get('hotkey'),
+                            "coldkey": miner_data.get('coldkey'),
+                            "ip": miner_data.get('ip'),
+                            "ip_type": miner_data.get('ip_type'),
+                            "port": miner_data.get('port'),
+                            "incentive": miner_data.get('incentive'),
+                            "stake": miner_data.get('stake'),
+                            "trust": miner_data.get('trust'),
+                            "vtrust": miner_data.get('vtrust'),
+                            "protocol": miner_data.get('protocol')
+                        }
+                        result = await session.execute(query, params)
+                        if result.rowcount > 0:
+                            updated_count += result.rowcount
+                            
+            logger.info(f"Successfully batch updated {updated_count} miners (executed {len(valid_miners_to_update)} individual updates in one transaction).")
+                        
+        except Exception as e:
+            logger.error(f"Error in batch_update_miners: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise DatabaseError(f"Failed to batch update miners: {str(e)}")
 
     @track_operation('read')
     async def get_miner_info(self, index: int):
