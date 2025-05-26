@@ -385,30 +385,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             # This check can be debated; for a pure UPDATE it's not strictly necessary if we assume UIDs 0-255 exist.
             # However, it was in the original code, so keeping it for now.
             exists_query = text("SELECT 1 FROM node_table WHERE uid = :uid_val")
-            async with self.session() as session:
-                async with session.begin(): # Start a transaction for the check and update
-                    result = await session.execute(exists_query, {"uid_val": index})
-                    if not result.scalar_one_or_none():
-                        logger.error(f"No row exists in node_table for UID {index}. Cannot update.")
-                        # Consider initializing the row here if that's desired, or raise specific error.
-                        # For now, matching original behavior of logging and raising generic DatabaseError later.
-                        # Raising a more specific error here might be better.
-                        raise ValueError(f"No row exists for UID {index} in node_table.")
-
-                    await session.execute(stmt)
-                    # No need to await session.commit() if autobegin=True on sessionmaker (default is False)
-                    # or if the session context manager handles commit on exit without error.
-                    # Given the explicit session.begin(), an explicit session.commit() is good practice here.
-                    # However, the `execute` method itself might handle the transaction if we call `self.execute(stmt)`
-                    # Let's use self.execute for consistency with other methods.
-            
-            # Re-thinking the session management based on `self.execute` structure:
-            # The `self.execute` method handles its own session and transaction if one isn't passed.
-            # So, we don't need to manage the session here directly for the update itself.
-            # The existence check should use its own session or be part of the same transaction.
-            # For simplicity and to ensure atomicity of check + update, let's perform this within one transaction.
-
-            async with self.session() as s:
+            async with self.session(operation_name=f"update_miner_info_uid_{index}") as s:
                 async with s.begin(): # Ensure check and update are atomic
                     exists_check_stmt = text("SELECT 1 FROM node_table WHERE uid = :uid_val")
                     exists_result = await s.execute(exists_check_stmt, {"uid_val": index})
@@ -419,7 +396,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     await s.execute(stmt)
                     # Commit will happen automatically by the async with s.begin() context manager on successful exit
 
-            # logger.debug(f"Successfully updated miner info for UID {index}") # Optional success log
+            logger.debug(f"Successfully updated miner info for UID {index}") # Optional success log
 
         except ValueError as ve:
             logger.error(f"ValueError updating miner info for UID {index}: {str(ve)}")
@@ -802,7 +779,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             else:
                 # Create a new session and manage the transaction explicitly
                 # BaseDatabaseManager.session() now ensures a transaction is started on new_session.
-                async with self.session() as new_session:
+                async with self.session(operation_name=f"execute_new_session_query_snippet_{query[:30]}") as new_session:
                     try:
                         # No longer need new_session.begin() here.
                         result = await new_session.execute(text(query), params or {})

@@ -830,7 +830,7 @@ class WeatherTask(Task):
         latest_era5_composite_scores_array = np.full(256, 0.0)
         
         active_uids = set()
-        async with self.db_manager.session() as session:
+        async with self.db_manager.session(operation_name="fetch_active_miner_uids_for_combined_score") as session:
             active_miners_query = "SELECT DISTINCT uid FROM node_table WHERE hotkey IS NOT NULL AND uid >= 0 AND uid < 256"
             result = await session.execute(text(active_miners_query))
             active_miner_uids_records = result.fetchall()
@@ -845,7 +845,7 @@ class WeatherTask(Task):
         latest_day1_timestamp = None
 
         for uid in active_uids:
-            async with self.db_manager.session() as session:
+            async with self.db_manager.session(operation_name="fetch_latest_day1_score_for_uid") as session:
                 result = await session.execute(text(query_day1_miner_scores), {"miner_uid": uid, "score_type": day1_qc_score_type})
                 res_day1 = result.fetchone()
                 if res_day1 and res_day1['score'] is not None and np.isfinite(res_day1['score']):
@@ -865,7 +865,7 @@ class WeatherTask(Task):
             ORDER BY calculation_time DESC LIMIT 1
         """
         for uid in active_uids:
-            async with self.db_manager.session() as session:
+            async with self.db_manager.session(operation_name="fetch_latest_era5_composite_score_for_uid") as session:
                 result = await session.execute(text(query_era5_composite), {"miner_uid": uid, "score_type": era5_composite_score_type})
                 res_era5 = result.fetchone()
                 if res_era5 and res_era5['score'] is not None and np.isfinite(res_era5['score']):

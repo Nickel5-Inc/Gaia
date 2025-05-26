@@ -348,6 +348,10 @@ class BaseDatabaseManager(ABC):
         self._active_operations += 1
         return self._active_operations
 
+    def _decrement_active_sessions(self) -> int:
+        self._active_operations = max(0, self._active_operations - 1) # Ensure it doesn't go below 0
+        return self._active_operations
+
     async def _mark_operation_failed(self):
         await self._update_circuit_breaker(False)
 
@@ -449,153 +453,164 @@ class BaseDatabaseManager(ABC):
     async def session(self, operation_name: str = "Unnamed Session", operation_type: str = "read", provided_session: Optional[AsyncSession] = None):
         await self.ensure_engine_initialized() # Ensure engine is ready
 
-        start_time = time.monotonic()
+        overall_start_time = time.monotonic()
         session_id_str = "provided" if provided_session else "new"
+        specific_op_name = operation_name # Keep original operation_name for top_long_sessions
+
+        actual_session_instance: Optional[AsyncSession] = None
+        session_acquired_time = 0.0
+        yield_start_time = 0.0
+        yield_end_time = 0.0
+        session_init_duration = 0.0
         
         # Attempt to get a more specific operation name if it's a query
-        if operation_name.startswith("fetch_") or operation_name.startswith("execute"):
+        if ":" not in specific_op_name and (specific_op_name.startswith("fetch_") or specific_op_name.startswith("execute")):
             try:
                 # Simplified extraction, assuming format like "fetch_all:SELECT ..." or "execute:UPDATE ..."
-                parts = operation_name.split(":", 1)
-                if len(parts) > 1:
-                    query_preview = parts[1].strip()[:50].replace('\\n', ' ') + "..."
-                    specific_op_name = f"{parts[0]}:{query_preview}"
-                else:
-                    specific_op_name = operation_name
-            except: # Fallback if parsing fails
-                specific_op_name = operation_name
-        else:
-            specific_op_name = operation_name
+                # This part is usually handled by the calling methods like fetch_one, execute
+                pass # No change here, specific_op_name is already good for top_long_sessions
+            except Exception as e_op_name:
+                logger.warning(f"Session (raw_op:{operation_name}): Error trying to refine op_name: {e_op_name}")
 
-        session_instance: Optional[AsyncSession] = None
         transaction_started_here = False
         acquired_at_iso_str = datetime.now(timezone.utc).isoformat()
-        e = None # Initialize e to None
+        e_outer = None # Initialize e_outer to None
 
         try:
             if provided_session:
-                session_instance = provided_session
-                session_id_str = f"provided_{id(session_instance)}"
-                # logger.debug(f"Using provided session {id(session_instance)} for {specific_op_name}")
-                if not session_instance.in_transaction() and not session_instance.is_active: # type: ignore
-                    # This typically means the session was closed or rolled back by an outer manager
-                    # For safety, we might want to begin a new transaction or raise an error
-                    # For now, let's assume if provided, it's managed externally or ready.
-                    # However, if it's not in_transaction AND not active, it's problematic.
-                    # Let's try to begin one if it's not active.
-                    logger.warning(f"Provided session {id(session_instance)} for {specific_op_name} is not in transaction and not active. Attempting to begin.")
-                    try:
-                        logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Attempting to begin new transaction on provided (but inactive) session.")
-                        await session_instance.begin()
-                        transaction_started_here = True
-                        logger.debug(f"Session {id(session_instance)} ({specific_op_name}): New transaction started successfully on provided session.")
-                    except Exception as e_begin_provided:
-                        logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to begin new transaction on provided session: {e_begin_provided}", exc_info=True)
-                        raise # Re-raise if we can't even begin
+                actual_session_instance = provided_session
+                session_id_for_log = f"provided_{id(actual_session_instance)}"
+                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Using provided session.")
             else:
-                if not self._engine or not self._session_factory:
-                    logger.error("Database engine or session factory not initialized before acquiring session.")
-                    raise DatabaseConnectionError("Engine/Session factory not initialized")
-                
-                session_instance = self._session_factory()
-                session_id_str = f"new_{id(session_instance)}"
-                self._operation_stats['total_sessions_acquired'] += 1
-                # logger.debug(f"Acquired new session {id(session_instance)} for {specific_op_name}")
+                acquire_start_time = time.monotonic()
+                if not self._session_factory:
+                    logger.error(f"Session (op:{specific_op_name}): Session factory not initialized!")
+                    raise DatabaseConnectionError("Session factory not initialized for new session.")
+                actual_session_instance = self._session_factory()
+                session_init_duration = (time.monotonic() - acquire_start_time) * 1000
+                session_id_for_log = f"new_{id(actual_session_instance)}"
+                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): New session acquired from factory in {session_init_duration:.2f}ms.")
 
-            # Ensure a transaction is started if not already active (and not using a provided session that might manage its own tx)
-            # Or if it IS a provided session, but we detected it was inactive and started one above.
-            if not session_instance.in_transaction(): # type: ignore
-                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Not in transaction. Attempting to begin.")
-                try:
-                    await session_instance.begin() # type: ignore
-                    transaction_started_here = True
-                    logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Transaction started successfully.")
-                except Exception as e_begin:
-                    logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to begin transaction: {e_begin}", exc_info=True)
-                    # If begin fails, we might not want to proceed, or yield a non-transacting session.
-                    # For now, let's re-raise as it's fundamental.
-                    if session_instance and not provided_session: # Only close if newly acquired
-                        await session_instance.close()
-                    raise
+            session_acquired_time = time.monotonic()
+            session_id_str = session_id_for_log # For active session tracking
+
+            if not actual_session_instance: # Should not happen if factory worked or session provided
+                 logger.error(f"Session ({specific_op_name}): Failed to obtain a session instance.")
+                 raise DatabaseConnectionError("Failed to obtain session instance.")
+
+            # Transaction management
+            if not actual_session_instance.in_transaction(): # type: ignore
+                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Beginning new transaction.")
+                # The `begin()` call itself returns a new AsyncTransaction object if not nested.
+                # We don't typically need to assign this to a variable unless managing nested transactions manually.
+                await actual_session_instance.begin() # type: ignore
+                transaction_started_here = True
             else:
-                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Already in transaction.")
+                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Already in transaction.")
 
-            self._active_sessions.add(session_id_str) # Add to set before incrementing general counter
-            active_sessions_count = self._increment_active_sessions()
-            logger.debug(f"Session {id(session_instance)} ({specific_op_name}) ready. Active sessions: {active_sessions_count} (Set size: {len(self._active_sessions)})")
+            self._active_sessions.add(session_id_str) 
+            active_sessions_count = self._increment_active_sessions() # This just increments a counter, doesn't use session_id_str
+            logger.debug(f"Session {session_id_for_log} ({specific_op_name}) ready. Active sessions: {active_sessions_count} (Set size: {len(self._active_sessions)})")
 
-            yield session_instance
+            yield_start_time = time.monotonic()
+            yield actual_session_instance
+            yield_end_time = time.monotonic()
 
-            # If we started the transaction here, we are responsible for committing it.
-            if transaction_started_here and session_instance and session_instance.in_transaction(): # type: ignore
-                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Attempting to commit transaction.")
-                try:
-                    await session_instance.commit() # type: ignore
-                    logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Transaction committed successfully.")
-                except Exception as e_commit:
-                    logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to commit transaction: {e_commit}", exc_info=True)
-                    # Attempt to rollback if commit failed
-                    try:
-                        logger.warning(f"Session {id(session_instance)} ({specific_op_name}): Commit failed, attempting rollback.")
-                        await session_instance.rollback()
-                        logger.info(f"Session {id(session_instance)} ({specific_op_name}): Rollback successful after failed commit.")
-                    except Exception as e_rollback_after_commit_fail:
-                        logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to rollback after failed commit: {e_rollback_after_commit_fail}", exc_info=True)
-                    raise # Re-raise the original commit error
-            elif transaction_started_here and session_instance and not session_instance.in_transaction(): # type: ignore
-                logger.warning(f"Session {id(session_instance)} ({specific_op_name}): Transaction was started here, but session is no longer in transaction before explicit commit. (Potentially committed or rolled back by yielded code).")
-            elif not transaction_started_here and session_instance and session_instance.in_transaction(): #type: ignore
-                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Transaction was not started here, not attempting commit. (External transaction management).")
-
-
+            if transaction_started_here:
+                commit_start_time = time.monotonic()
+                await actual_session_instance.commit() # type: ignore
+                commit_duration = (time.monotonic() - commit_start_time) * 1000
+                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Transaction committed in {commit_duration:.2f}ms (normal exit).")
+            
         except asyncio.CancelledError:
-            logger.warning(f"Session {id(session_instance)} ({specific_op_name}): Operation cancelled.")
-            if session_instance and session_instance.in_transaction(): # type: ignore
-                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Attempting rollback due to cancellation.")
+            e_outer = asyncio.CancelledError("Session cancelled")
+            logger.warning(f"Session {session_id_for_log} ({specific_op_name}): Operation cancelled.")
+            if transaction_started_here and actual_session_instance and actual_session_instance.in_transaction(): # type: ignore
+                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Attempting rollback due to cancellation.")
                 try:
-                    await session_instance.rollback() # type: ignore
-                    logger.info(f"Session {id(session_instance)} ({specific_op_name}): Rollback successful due to cancellation.")
-                except Exception as e_rollback_cancel:
-                    logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to rollback due to cancellation: {e_rollback_cancel}", exc_info=True)
+                    rollback_start_time = time.monotonic()
+                    await actual_session_instance.rollback() # type: ignore
+                    rollback_duration = (time.monotonic() - rollback_start_time) * 1000
+                    logger.info(f"Session {session_id_for_log} ({specific_op_name}): Transaction rolled back in {rollback_duration:.2f}ms due to cancellation.")
+                except Exception as r_err:
+                    logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error during rollback after cancellation: {r_err}", exc_info=True)
             self._operation_stats.setdefault('cancelled_operations', 0)
             self._operation_stats['cancelled_operations'] += 1
-            await self._mark_operation_failed()
+            await self._mark_operation_failed() 
             raise
         except Exception as e:
-            logger.error(f"Session {id(session_instance)} ({specific_op_name}): Error during session: {str(e)}", exc_info=True)
-            if session_instance and session_instance.in_transaction(): # type: ignore
-                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Attempting rollback due to exception: {str(e)}.")
+            e_outer = e
+            logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error during session: {str(e_outer)}", exc_info=True)
+            if transaction_started_here and actual_session_instance and actual_session_instance.in_transaction(): # type: ignore
+                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Attempting rollback due to exception: {str(e_outer)}.")
                 try:
-                    await session_instance.rollback() # type: ignore
-                    logger.info(f"Session {id(session_instance)} ({specific_op_name}): Rollback successful due to exception.")
-                except Exception as e_rollback_exception:
-                    logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to rollback due to exception: {e_rollback_exception}", exc_info=True)
-            await self._mark_operation_failed()
+                    rollback_start_time = time.monotonic()
+                    await actual_session_instance.rollback() # type: ignore
+                    rollback_duration = (time.monotonic() - rollback_start_time) * 1000
+                    logger.info(f"Session {session_id_for_log} ({specific_op_name}): Transaction rolled back in {rollback_duration:.2f}ms due to exception.")
+                except Exception as r_err:
+                    logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error during rollback after exception: {r_err}", exc_info=True)
+            
+            await self._mark_operation_failed() # Mark failure for circuit breaker
             raise
         finally:
-            session_release_time = time.perf_counter()
-            session_duration_ms = (session_release_time - start_time) * 1000
+            session_release_start_time = time.monotonic()
+            if actual_session_instance and not provided_session:
+                try:
+                    # Check if session is still active and in a transaction due to an unhandled scenario
+                    # This is a safeguard; ideally, commit/rollback should have happened.
+                    if actual_session_instance.is_active and actual_session_instance.in_transaction() and transaction_started_here: # type: ignore
+                        logger.error(f"Session {session_id_for_log} ({specific_op_name}): Session being closed but still in transaction started here! Forcing rollback. Exception was: {e_outer}")
+                        try:
+                            await actual_session_instance.rollback() # type: ignore
+                            logger.info(f"Session {session_id_for_log} ({specific_op_name}): Defensive rollback executed in finally.")
+                        except Exception as rb_finally_err:
+                            logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error during defensive rollback in finally: {rb_finally_err}")
+                    
+                    await actual_session_instance.close() # type: ignore
+                    logger.debug(f"Session {session_id_for_log} ({specific_op_name}): New session closed.")
+                except Exception as close_err:
+                    logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error closing new session: {close_err}", exc_info=True)
 
-            self._operation_stats['total_session_time_ms'] += session_duration_ms
+            self._active_sessions.discard(session_id_str)
+            active_sessions_count_after = self._decrement_active_sessions() # This just decrements a counter
+            
+            total_duration_ms = (time.monotonic() - overall_start_time) * 1000
+            time_in_yield_ms = (yield_end_time - yield_start_time) * 1000 if yield_start_time > 0 and yield_end_time > 0 else 0.0
+            
+            self._operation_stats['total_sessions_acquired'] += 1
+            self._operation_stats['total_session_time_ms'] += total_duration_ms
+            self._operation_stats['max_session_time_ms'] = max(self._operation_stats['max_session_time_ms'], total_duration_ms)
+            if total_duration_ms < self._operation_stats['min_session_time_ms']:
+                self._operation_stats['min_session_time_ms'] = total_duration_ms if total_duration_ms > 0 else self._operation_stats.get('min_session_time_ms', float('inf'))
+
             if self._operation_stats['total_sessions_acquired'] > 0:
                 self._operation_stats['avg_session_time_ms'] = self._operation_stats['total_session_time_ms'] / self._operation_stats['total_sessions_acquired']
-            if session_duration_ms > self._operation_stats['max_session_time_ms']:
-                self._operation_stats['max_session_time_ms'] = session_duration_ms
-            if session_duration_ms < self._operation_stats['min_session_time_ms']:
-                self._operation_stats['min_session_time_ms'] = session_duration_ms
+            
+            self._update_top_long_sessions(total_duration_ms, specific_op_name, acquired_at_iso_str)
 
-            logger.debug(f"Session {id(session_instance)} ({specific_op_name}) held for {session_duration_ms:.2f}ms")
-            self._update_top_long_sessions(session_duration_ms, specific_op_name, acquired_at_iso_str)
+            # Circuit breaker update logic
+            current_time = time.monotonic()
+            if e_outer and not isinstance(e_outer, asyncio.CancelledError): # Success, or handled error
+                # If an error occurred and was handled (e.g. rolled back), still counts as a "use" for half-open
+                if self._circuit_breaker['status'] == 'half-open':
+                    logger.info(f"Circuit breaker: Successful operation in half-open state. Closing breaker. ({specific_op_name})")
+                    self._circuit_breaker['status'] = 'closed'
+                    self._circuit_breaker['failures'] = 0
+            # If e_outer is None (no exception), it's a success, which also resets/confirms 'closed' or 'half-open' success
+            elif not e_outer and self._circuit_breaker['status'] == 'half-open':
+                 logger.info(f"Circuit breaker: Successful operation in half-open state. Closing breaker. ({specific_op_name})")
+                 self._circuit_breaker['status'] = 'closed'
+                 self._circuit_breaker['failures'] = 0
+
+
+            session_release_duration_ms = (time.monotonic() - session_release_start_time) * 1000
+            logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Released. Total time: {total_duration_ms:.2f}ms, Factory init: {session_init_duration:.2f}ms, In yield: {time_in_yield_ms:.2f}ms, Release code: {session_release_duration_ms:.2f}ms. Active now: {active_sessions_count_after} (Set size: {len(self._active_sessions)})")
             
-            if session_id_str in self._active_sessions: 
-                self._active_sessions.remove(session_id_str)
-                logger.debug(f"Session {session_id_str} released ({specific_op_name}). Active sessions: {len(self._active_sessions)}")
-            
-            self._active_operations -= 1
-            if transaction_started_here and session_instance and not session_instance.in_transaction() and not isinstance(e, BaseException):
-                await self._update_circuit_breaker(True)
-            elif not transaction_started_here and not isinstance(e, BaseException):
-                await self._update_circuit_breaker(True)
+            # This is a bit verbose, but can be useful for diagnosing where time is spent outside `yield`
+            overhead_ms = total_duration_ms - time_in_yield_ms
+            if overhead_ms > 50 and total_duration_ms > 100: # Log if overhead is significant
+                logger.info(f"Session {session_id_for_log} ({specific_op_name}): Significant overhead detected. Total: {total_duration_ms:.2f}ms, Yield: {time_in_yield_ms:.2f}ms, Overhead: {overhead_ms:.2f}ms")
 
     @with_timeout(CONNECTION_TEST_TIMEOUT)
     async def _test_connection(self, session: AsyncSession) -> bool:
