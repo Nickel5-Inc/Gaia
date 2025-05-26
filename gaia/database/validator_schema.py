@@ -171,13 +171,20 @@ weather_miner_scores_table = sa.Table('weather_miner_scores', validator_metadata
     sa.Column('metrics', postgresql.JSONB, nullable=True),
     sa.Column('score', sa.Float, nullable=True),
     sa.Column('error_message', sa.Text, nullable=True),
-    comment="Stores calculated scores (e.g., gfs_rmse, era5_rmse) for each miner response."
+    sa.Column('lead_hours', sa.Integer(), nullable=True),
+    sa.Column('variable_level', sa.String(length=50), nullable=True),
+    sa.Column('valid_time_utc', sa.TIMESTAMP(timezone=True), nullable=True),
+    sa.UniqueConstraint('response_id', 'score_type', 'lead_hours', 'variable_level', 'valid_time_utc', name='uq_wms_response_scoretype_lead_var_time'),
+    comment="Stores calculated scores (e.g., gfs_rmse, era5_rmse) for each miner response, detailed by lead time and variable."
 )
 sa.Index('idx_wms_run_id', weather_miner_scores_table.c.run_id)
 sa.Index('idx_wms_miner_uid', weather_miner_scores_table.c.miner_uid)
 sa.Index('idx_wms_miner_hotkey', weather_miner_scores_table.c.miner_hotkey)
 sa.Index('idx_wms_calculation_time', weather_miner_scores_table.c.calculation_time)
 sa.Index('idx_wms_score_type', weather_miner_scores_table.c.score_type)
+sa.Index('idx_wms_lead_hours', weather_miner_scores_table.c.lead_hours)
+sa.Index('idx_wms_variable_level', weather_miner_scores_table.c.variable_level)
+sa.Index('idx_wms_valid_time_utc', weather_miner_scores_table.c.valid_time_utc)
 
 weather_ensemble_forecasts_table = sa.Table('weather_ensemble_forecasts', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True), # SERIAL PRIMARY KEY
