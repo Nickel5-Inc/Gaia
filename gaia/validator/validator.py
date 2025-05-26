@@ -1220,41 +1220,86 @@ class GaiaValidator:
                 logger.info("SCORE_SENDER_ON is True, enabling MinerScoreSender task.")
                 tasks.insert(5, lambda: self.miner_score_sender.run_async())
 
+            active_service_tasks = []  # Define here for access in except CancelledError
+            shutdown_waiter = None # Define here for access in except CancelledError
             try:
-                running_tasks = []
+                logger.info(f"Creating {len(tasks)} main service tasks...")
+                active_service_tasks = [asyncio.create_task(t()) for t in tasks]
+                logger.info(f"All {len(active_service_tasks)} main service tasks created.")
+
+                shutdown_waiter = asyncio.create_task(self._shutdown_event.wait())
+                
+                # Tasks to monitor are all service tasks plus the shutdown_waiter
+                all_tasks_being_monitored = active_service_tasks + [shutdown_waiter]
+
                 while not self._shutdown_event.is_set():
-                    running_tasks = [asyncio.create_task(t()) for t in tasks]
+                    # Filter out already completed tasks from the list we pass to asyncio.wait
+                    current_wait_list = [t for t in all_tasks_being_monitored if not t.done()]
                     
-                    # Wait for either shutdown event or task completion
+                    if not current_wait_list: 
+                        # This means all tasks (services + shutdown_waiter) are done.
+                        logger.info("All monitored tasks have completed.")
+                        if not self._shutdown_event.is_set():
+                             logger.warning("All tasks completed but shutdown event was not explicitly set. Setting it now to ensure proper cleanup.")
+                             self._shutdown_event.set() # Ensure shutdown is triggered
+                        break # Exit the while loop
+
                     done, pending = await asyncio.wait(
-                        running_tasks + [asyncio.create_task(self._shutdown_event.wait())],
+                        current_wait_list,
                         return_when=asyncio.FIRST_COMPLETED
                     )
                     
-                    # If shutdown event is set, cancel remaining tasks
-                    if self._shutdown_event.is_set():
-                        logger.info("Shutdown event detected in main loop")
-                        for task in running_tasks:
-                            if not task.done():
-                                task.cancel()
-                        # Wait for tasks to cancel
-                        await asyncio.gather(*running_tasks, return_exceptions=True)
-                        break
+                    # If shutdown_event is set (e.g. by signal handler) or shutdown_waiter completed, break the loop.
+                    if self._shutdown_event.is_set() or shutdown_waiter.done():
+                        logger.info("Shutdown signaled or shutdown_waiter completed. Breaking main monitoring loop.")
+                        break 
+
+                    # If we are here, one of the active_service_tasks completed. Log it.
+                    for task in done:
+                        if task in active_service_tasks: # Check if it's one of our main service tasks
+                            try:
+                                result = task.result() # Access result to raise exception if task failed
+                                logger.warning(f"Main service task {task.get_name()} completed unexpectedly with result: {result}. It will not be automatically restarted by this loop.")
+                            except asyncio.CancelledError:
+                                logger.info(f"Main service task {task.get_name()} was cancelled.")
+                            except Exception as e:
+                                logger.error(f"Main service task {task.get_name()} failed with exception: {e}", exc_info=True)
                 
-                # Cleanup after loop exit
-                logger.info("Main loop exited, initiating cleanup")
-                await self._initiate_shutdown()
+                # --- After the while loop (either by break or _shutdown_event being set before loop start) ---
+                logger.info("Main monitoring loop finished. Initiating cancellation of any remaining active tasks for shutdown.")
+                
+                # Cancel all original service tasks if not already done
+                for task_to_cancel in active_service_tasks:
+                    if not task_to_cancel.done():
+                        logger.info(f"Cancelling service task: {task_to_cancel.get_name()}")
+                        task_to_cancel.cancel()
+                
+                # Cancel shutdown_waiter if not done
+                # (e.g., if loop broke because all service tasks finished before shutdown_event was set)
+                if shutdown_waiter and not shutdown_waiter.done():
+                    logger.info("Cancelling shutdown_waiter task.")
+                    shutdown_waiter.cancel()
+                
+                # Await all of them to ensure they are properly cleaned up
+                await asyncio.gather(*(active_service_tasks + ([shutdown_waiter] if shutdown_waiter else [])), return_exceptions=True)
+                logger.info("All main service tasks and the shutdown waiter have been processed (awaited/cancelled).")
                 
             except asyncio.CancelledError:
-                logger.info("Tasks cancelled, proceeding with cleanup")
-                if not self._cleanup_done:
-                    await self._initiate_shutdown()
-            except Exception as e:
-                logger.error(f"Error in main task loop: {e}")
-                logger.error(traceback.format_exc())
-                if not self._cleanup_done:
-                    await self._initiate_shutdown()
+                logger.info("Main task execution block was cancelled. Ensuring child tasks are also cancelled.")
+                # This block handles if validator.main() itself is cancelled from outside.
+                tasks_to_ensure_cancelled = []
+                if 'active_service_tasks' in locals(): # Check if list was initialized
+                    tasks_to_ensure_cancelled.extend(active_service_tasks)
+                if 'shutdown_waiter' in locals() and shutdown_waiter: # Check if waiter was initialized
+                    tasks_to_ensure_cancelled.append(shutdown_waiter)
                 
+                for task_to_cancel in tasks_to_ensure_cancelled:
+                    if task_to_cancel and not task_to_cancel.done():
+                        logger.info(f"Cancelling task due to main cancellation: {task_to_cancel.get_name()}")
+                        task_to_cancel.cancel()
+                await asyncio.gather(*tasks_to_ensure_cancelled, return_exceptions=True)
+                logger.info("Child tasks cancellation process completed due to main cancellation.")
+
         except Exception as e:
             logger.error(f"Error in main: {e}")
             logger.error(traceback.format_exc())

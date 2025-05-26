@@ -1280,27 +1280,26 @@ class WeatherTask(Task):
         logger.info("Weather task cleanup completed")
        
     async def start_initial_scoring_workers(self, num_workers=1):
-        """Start background workers for initial scoring processing."""
-        if self.initial_scoring_worker_running:
-            logger.info("Initial scoring workers already running")
+        if self.node_type != "validator":
             return
-            
-        self.initial_scoring_worker_running = True
-        for _ in range(num_workers):
-            worker = asyncio.create_task(initial_scoring_worker(self))
-            self.initial_scoring_workers.append(worker)
-        logger.info(f"Started {num_workers} initial scoring workers")
+        logger.info(f"[WeatherTask] Attempting to start {num_workers} initial scoring worker(s). Currently {len(self.initial_scoring_workers)} active.")
+        if self.initial_scoring_worker_running and len(self.initial_scoring_workers) >= num_workers:
+            logger.info(f"[WeatherTask] Initial scoring worker(s) already running ({len(self.initial_scoring_workers)}/{num_workers}). Not starting more.")
+            return
         
+        self.initial_scoring_worker_running = True
+        needed_workers = num_workers - len(self.initial_scoring_workers)
+        for i in range(needed_workers):
+            worker_task = asyncio.create_task(initial_scoring_worker(self))
+            self.initial_scoring_workers.append(worker_task)
+            logger.info(f"[WeatherTask] Started initial_scoring_worker task {i+1}/{needed_workers} (Total active: {len(self.initial_scoring_workers)}). Task ID: {id(worker_task)}")
+
     async def stop_initial_scoring_workers(self):
-        """Stop all background initial scoring workers."""
-        if not self.initial_scoring_worker_running:
+        if self.node_type != "validator":
             return
-            
-        self.initial_scoring_worker_running = False
         logger.info("Stopping initial scoring workers...")
         for worker in self.initial_scoring_workers:
             worker.cancel()
-            
             
         self.initial_scoring_workers = []
         logger.info("Stopped all initial scoring workers")

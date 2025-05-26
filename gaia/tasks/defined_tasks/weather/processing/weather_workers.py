@@ -472,11 +472,18 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
             try: ds_t_minus_6.close()
             except Exception: pass
 
-async def initial_scoring_worker(self):
-    """Background worker to calculate Day-1 QC scores vs GFS analysis & GFS reference.
-       This replaces the old initial GFS MAE-based weighting.
+async def initial_scoring_worker(task_instance: 'WeatherTask'):
     """
-    while self.initial_scoring_worker_running:
+    Continuously checks for new forecast runs that need initial scoring (Day-1 QC).
+    """
+    worker_id = str(uuid.uuid4())[:8]
+    logger.info(f"[InitialScoringWorker-{worker_id}] Starting up at {datetime.now(timezone.utc).isoformat()}")
+    if task_instance.db_manager is None:
+        logger.error(f"[InitialScoringWorker-{worker_id}] DB manager not available. Aborting.")
+        task_instance.initial_scoring_worker_running = False # Ensure flag is reset
+        return
+
+    while task_instance.initial_scoring_worker_running:
         run_id = None
         gfs_analysis_ds_for_run = None
         gfs_reference_ds_for_run = None
@@ -485,19 +492,19 @@ async def initial_scoring_worker(self):
 
         try:
             try:
-                run_id = await asyncio.wait_for(self.initial_scoring_queue.get(), timeout=5.0)
+                run_id = await asyncio.wait_for(task_instance.initial_scoring_queue.get(), timeout=5.0)
                 processed_a_run = True
             except asyncio.TimeoutError:
                 continue 
             
             logger.info(f"[Day1ScoringWorker] Processing Day-1 QC scores for run {run_id}")
-            await _update_run_status(self, run_id, "day1_scoring_started")
+            await _update_run_status(task_instance, run_id, "day1_scoring_started")
             
             run_details_query = "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id"
-            run_record = await self.db_manager.fetch_one(run_details_query, {"run_id": run_id})
+            run_record = await task_instance.db_manager.fetch_one(run_details_query, {"run_id": run_id})
             if not run_record:
                 logger.error(f"[Day1ScoringWorker] Run {run_id}: Details not found. Skipping.")
-                self.initial_scoring_queue.task_done()
+                task_instance.initial_scoring_queue.task_done()
                 continue
 
             gfs_init_time = run_record['gfs_init_time_utc']
@@ -516,27 +523,27 @@ async def initial_scoring_worker(self):
             WHERE mr.run_id = :run_id AND mr.verification_passed = TRUE 
             AND mr.status = 'verified_manifest_store_opened' 
             """
-            responses = await self.db_manager.fetch_all(responses_query, {"run_id": run_id})
+            responses = await task_instance.db_manager.fetch_all(responses_query, {"run_id": run_id})
             
             min_members_for_scoring = 1
             if not responses or len(responses) < min_members_for_scoring:
                 logger.warning(f"[Day1ScoringWorker] Run {run_id}: No verified responses found for Day-1 scoring.")
-                await _update_run_status(self, run_id, "day1_scoring_failed", error_message="No verified members with opened stores")
-                self.initial_scoring_queue.task_done()
+                await _update_run_status(task_instance, run_id, "day1_scoring_failed", error_message="No verified members with opened stores")
+                task_instance.initial_scoring_queue.task_done()
                 continue
                 
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Found {len(responses)} verified responses. Init time: {gfs_init_time}")
                         
-            day1_lead_hours = self.config.get('initial_scoring_lead_hours', [6, 12])
+            day1_lead_hours = task_instance.config.get('initial_scoring_lead_hours', [6, 12])
             valid_times_for_gfs = [gfs_init_time + timedelta(hours=h) for h in day1_lead_hours]
             gfs_reference_run_time = gfs_init_time
             gfs_reference_lead_hours = day1_lead_hours
 
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Using Day-1 lead hours {day1_lead_hours} relative to GFS init {gfs_init_time}. Valid times for GFS: {valid_times_for_gfs}")
 
-            gfs_cache_dir = Path(self.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
+            gfs_cache_dir = Path(task_instance.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
 
-            day1_config_vars_to_score = self.config.get('day1_variables_levels_to_score', [])
+            day1_config_vars_to_score = task_instance.config.get('day1_variables_levels_to_score', [])
             target_surface_vars_gfs_day1 = []
             target_atmos_vars_gfs_day1 = []
             target_pressure_levels_hpa_day1_set = set()
@@ -588,7 +595,7 @@ async def initial_scoring_worker(self):
             logger.info(f"[Day1ScoringWorker] Run {run_id}: GFS Reference forecast data loaded.")
 
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Attempting to load ERA5 climatology...")
-            era5_climatology_ds = await self._get_or_load_era5_climatology()
+            era5_climatology_ds = await task_instance._get_or_load_era5_climatology()
             if era5_climatology_ds is None:
                 logger.error(f"[Day1ScoringWorker] Run {run_id}: _get_or_load_era5_climatology returned None.")
                 raise ValueError(f"Failed to load ERA5 climatology for run {run_id}")
@@ -598,23 +605,23 @@ async def initial_scoring_worker(self):
             day1_scoring_config = {
 
                 "evaluation_valid_times": valid_times_for_gfs,
-                "variables_levels_to_score": self.config.get('day1_variables_levels_to_score', [
+                "variables_levels_to_score": task_instance.config.get('day1_variables_levels_to_score', [
                     {"name": "z", "level": 500, "standard_name": "geopotential"},
                     {"name": "t", "level": 850, "standard_name": "temperature"},
                     {"name": "2t", "level": None, "standard_name": "2m_temperature"},
                     {"name": "msl", "level": None, "standard_name": "mean_sea_level_pressure"}
                 ]),
-                "climatology_bounds": self.config.get('day1_climatology_bounds', {
+                "climatology_bounds": task_instance.config.get('day1_climatology_bounds', {
                     "2t": (180, 340), "msl": (90000, 110000),
                     "t500": (200, 300), "t850": (220, 320),
                     "z500": (4000, 6000)
                 }),
-                "pattern_correlation_threshold": self.config.get("day1_pattern_correlation_threshold", 0.3),
-                "acc_lower_bound_d1": self.config.get("day1_acc_lower_bound", 0.6),
-                "alpha_skill": self.config.get("day1_alpha_skill", 0.6),
-                "beta_acc": self.config.get("day1_beta_acc", 0.4),
-                "clone_penalty_gamma": self.config.get("day1_clone_penalty_gamma", 1.0),
-                "clone_delta_thresholds": self.config.get("day1_clone_delta_thresholds", {
+                "pattern_correlation_threshold": task_instance.config.get("day1_pattern_correlation_threshold", 0.3),
+                "acc_lower_bound_d1": task_instance.config.get("day1_acc_lower_bound", 0.6),
+                "alpha_skill": task_instance.config.get("day1_alpha_skill", 0.6),
+                "beta_acc": task_instance.config.get("day1_beta_acc", 0.4),
+                "clone_penalty_gamma": task_instance.config.get("day1_clone_penalty_gamma", 1.0),
+                "clone_delta_thresholds": task_instance.config.get("day1_clone_delta_thresholds", {
                     "2t": 0.01, "msl": 250000, "z500": 100, "t850": 0.25
                 })
             }
@@ -628,7 +635,7 @@ async def initial_scoring_worker(self):
                 logger.debug(f"[Day1ScoringWorker] Run {run_id}: Creating scoring task for miner {miner_response_rec.get('miner_hotkey')}")
                 scoring_tasks.append(
                     evaluate_miner_forecast_day1(
-                        self, 
+                        task_instance, 
                         miner_response_rec,
                         gfs_analysis_ds_for_run,
                         gfs_reference_ds_for_run,
@@ -669,7 +676,7 @@ async def initial_scoring_worker(self):
                             "ts": datetime.now(timezone.utc),
                             "err": error_msg
                         }
-                        db_update_tasks.append(self.db_manager.execute(
+                        db_update_tasks.append(task_instance.db_manager.execute(
                             """INSERT INTO weather_miner_scores 
                                (response_id, run_id, miner_uid, miner_hotkey, score_type, score, metrics, calculation_time, error_message)
                                VALUES (:resp_id, :run_id, :miner_uid, :miner_hotkey, 'day1_qc_score', :score, :metrics, :ts, :err)                            
@@ -698,35 +705,35 @@ async def initial_scoring_worker(self):
             
             try:
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: Triggering update of combined weather scores.")
-                await self.update_combined_weather_scores(run_id_trigger=run_id)
+                await task_instance.update_combined_weather_scores(run_id_trigger=run_id)
             except Exception as e_comb_score:
                 logger.error(f"[Day1ScoringWorker] Run {run_id}: Error triggering combined score update: {e_comb_score}", exc_info=True)
 
-            await _update_run_status(self, run_id, "day1_scoring_complete")
+            await _update_run_status(task_instance, run_id, "day1_scoring_complete")
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Marked as day1_scoring_complete.")
             
-            self.initial_scoring_queue.task_done()
+            task_instance.initial_scoring_queue.task_done()
 
-            if self.test_mode and run_id == self.last_test_mode_run_id:
+            if task_instance.test_mode and run_id == task_instance.last_test_mode_run_id:
                 logger.info(f"[Day1ScoringWorker] TEST MODE: Signaling scoring completion for run {run_id}.")
-                self.test_mode_run_scored_event.set()
+                task_instance.test_mode_run_scored_event.set()
             
         except asyncio.CancelledError:
             logger.info("[Day1ScoringWorker] Worker cancelled")
             if processed_a_run:
-                self.initial_scoring_queue.task_done()
+                task_instance.initial_scoring_queue.task_done()
             break
             
         except Exception as e:
             logger.error(f"[Day1ScoringWorker] Unexpected error processing run {run_id}: {e}", exc_info=True)
             if run_id:
                 try:
-                    await _update_run_status(self, run_id, "day1_scoring_failed", error_message=f"Day1 Worker error: {e}")
+                    await _update_run_status(task_instance, run_id, "day1_scoring_failed", error_message=f"Day1 Worker error: {e}")
                 except Exception as db_err:
                     logger.error(f"[Day1ScoringWorker] Failed to update DB status on error: {db_err}")
             if processed_a_run:
-                if self.initial_scoring_queue._unfinished_tasks > 0 :
-                     self.initial_scoring_queue.task_done()
+                if task_instance.initial_scoring_queue._unfinished_tasks > 0 :
+                     task_instance.initial_scoring_queue.task_done()
             await asyncio.sleep(1)
         finally:
             if gfs_analysis_ds_for_run and hasattr(gfs_analysis_ds_for_run, 'close'):
