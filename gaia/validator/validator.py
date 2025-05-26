@@ -2082,10 +2082,29 @@ class GaiaValidator:
                 "idle_in_transaction_details": "[Query Failed or No Data]",
                 "lock_details": "[Query Failed or No Data]",
                 "active_query_wait_events": "[Query Failed or No Data]",
+                "session_manager_stats": "[Query Failed or No Data]", # New key for our session stats
                 "error": None
             }
 
             try:
+                # Fetch general operation/session stats from DatabaseManager
+                try:
+                    dm_stats = await self.database_manager.get_operation_stats() # This includes session stats now
+                    # For clarity, we can separate them or add them under a specific key if preferred.
+                    # For now, let's assume get_operation_stats() returns everything needed, including session stats.
+                    # If get_session_stats() is separate and preferred:
+                    session_manager_specific_stats = self.database_manager.get_session_stats()
+                    stats["session_manager_stats"] = session_manager_specific_stats
+                    # Optionally, merge other stats from get_operation_stats() if needed
+                    # E.g., stats["db_operation_counts"] = {
+                    #    k: v for k, v in dm_stats.items() 
+                    #    if k not in ['total_sessions_acquired', 'total_session_time_ms', 'max_session_time_ms', 'min_session_time_ms', 'avg_session_time_ms']
+                    # }
+
+                except Exception as e:
+                    stats["session_manager_stats"] = f"[Error fetching session manager stats: {type(e).__name__}]"
+                    logger.warning(f"[DB Monitor] Error fetching session manager stats: {e}")
+
                 # Query overall connection summary
                 conn_summary_query = "SELECT state, count(*) FROM pg_stat_activity GROUP BY state;"
                 try:

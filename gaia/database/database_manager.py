@@ -122,11 +122,35 @@ class BaseDatabaseManager(ABC):
                 'last_check': 0
             }
             
+            # Operation statistics
+            self._operation_stats = {
+                'ddl_operations': 0,
+                'read_operations': 0,
+                'write_operations': 0,
+                'long_running_queries': [],
+                # Session statistics
+                'total_sessions_acquired': 0,
+                'total_session_time_ms': 0.0,
+                'max_session_time_ms': 0.0,
+                'min_session_time_ms': float('inf'),
+                'avg_session_time_ms': 0.0
+            }
+            
             # Engine will be initialized when first needed
             self._engine = None
             self._engine_initialized = False
             self.initialized = True
             self.db_loop = None
+
+    def get_session_stats(self) -> Dict[str, Any]:
+        """Returns a dictionary of current session statistics."""
+        return {
+            'total_sessions_acquired': self._operation_stats.get('total_sessions_acquired', 0),
+            'total_session_time_ms': self._operation_stats.get('total_session_time_ms', 0.0),
+            'max_session_time_ms': self._operation_stats.get('max_session_time_ms', 0.0),
+            'min_session_time_ms': self._operation_stats.get('min_session_time_ms', float('inf')),
+            'avg_session_time_ms': self._operation_stats.get('avg_session_time_ms', 0.0)
+        }
 
     async def ensure_engine_initialized(self):
         """Ensure the engine is initialized before use."""
@@ -513,19 +537,24 @@ class BaseDatabaseManager(ABC):
         
         session_instance: Optional[AsyncSession] = None
         success = False
+        session_acquire_time = time.perf_counter() # Record session acquisition time
+        session_id_for_log = "N/A"
+
         try:
             # Directly use the session factory from SQLAlchemy
             async with self._session_factory() as session_instance:
-                self._active_sessions.add(id(session_instance))
-                logger.debug(f"Session {id(session_instance)} acquired. Active sessions: {len(self._active_sessions)}")
+                session_id_for_log = str(id(session_instance))
+                self._active_sessions.add(session_id_for_log)
+                self._operation_stats['total_sessions_acquired'] += 1
+                logger.debug(f"Session {session_id_for_log} acquired. Active sessions: {len(self._active_sessions)}")
                 yield session_instance
                 success = True # Assume success if no exception before this point
         except asyncio.CancelledError:
-            logger.warning(f"Session usage cancelled for session {id(session_instance) if session_instance else 'N/A'}")
+            logger.warning(f"Session usage cancelled for session {session_id_for_log}")
             success = False # Mark as not successful if cancelled
             raise
         except OperationalError as e: # Catch SQLAlchemy operational errors (includes connection issues)
-            logger.error(f"Database operational error during session usage: {e}")
+            logger.error(f"Database operational error during session usage ({session_id_for_log}): {e}")
             success = False
             await self._update_circuit_breaker(False)
             # Attempt to reset pool if it's a connection issue
@@ -534,27 +563,40 @@ class BaseDatabaseManager(ABC):
                 asyncio.create_task(self.reset_pool()) # Non-blocking reset
             raise DatabaseConnectionError(f"Database operational error: {e}") from e
         except SQLAlchemyError as e: # Catch other SQLAlchemy errors
-            logger.error(f"SQLAlchemy error during session usage: {e}")
+            logger.error(f"SQLAlchemy error during session usage ({session_id_for_log}): {e}")
             success = False
             await self._update_circuit_breaker(False)
             raise DatabaseError(f"SQLAlchemy error: {e}") from e
         except Exception as e:
-            logger.error(f"Unexpected error during session usage: {e}")
+            logger.error(f"Unexpected error during session usage ({session_id_for_log}): {e}")
             success = False
             # Do not update circuit breaker for truly unexpected errors here,
             # let the specific operation's error handling do that if appropriate.
-            raise DatabaseError(f"Unexpected error in session: {e}") from e
+            raise DatabaseError(f"Unexpected error in session ({session_id_for_log}): {e}") from e
         finally:
-            if session_instance and id(session_instance) in self._active_sessions:
+            session_release_time = time.perf_counter()
+            session_duration_ms = (session_release_time - session_acquire_time) * 1000
+
+            self._operation_stats['total_session_time_ms'] += session_duration_ms
+            if self._operation_stats['total_sessions_acquired'] > 0:
+                self._operation_stats['avg_session_time_ms'] = self._operation_stats['total_session_time_ms'] / self._operation_stats['total_sessions_acquired']
+            if session_duration_ms > self._operation_stats['max_session_time_ms']:
+                self._operation_stats['max_session_time_ms'] = session_duration_ms
+            if session_duration_ms < self._operation_stats['min_session_time_ms']:
+                self._operation_stats['min_session_time_ms'] = session_duration_ms
+
+            logger.debug(f"Session {session_id_for_log} held for {session_duration_ms:.2f}ms.")
+
+            if session_instance and session_id_for_log in self._active_sessions: # Check using session_id_for_log
                 if session_instance.is_active and session_instance.in_transaction():
-                    logger.error(f"CRITICAL_BASE_SESSION: Session {id(session_instance)} is being released from BaseDatabaseManager.session() while still in_transaction! Forcing rollback.")
+                    logger.error(f"CRITICAL_BASE_SESSION: Session {session_id_for_log} is being released from BaseDatabaseManager.session() while still in_transaction! Forcing rollback.")
                     try:
                         await session_instance.rollback()
-                        logger.info(f"CRITICAL_BASE_SESSION: Forced rollback for session {id(session_instance)} was successful.")
+                        logger.info(f"CRITICAL_BASE_SESSION: Forced rollback for session {session_id_for_log} was successful.")
                     except Exception as e_base_rollback:
-                        logger.error(f"CRITICAL_BASE_SESSION: Forced rollback for session {id(session_instance)} FAILED: {e_base_rollback}")
-                self._active_sessions.remove(id(session_instance))
-                logger.debug(f"Session {id(session_instance)} released. Active sessions: {len(self._active_sessions)}")
+                        logger.error(f"CRITICAL_BASE_SESSION: Forced rollback for session {session_id_for_log} FAILED: {e_base_rollback}")
+                self._active_sessions.remove(session_id_for_log)
+                logger.debug(f"Session {session_id_for_log} released. Active sessions: {len(self._active_sessions)}")
             
             self._active_operations -= 1
             # No _pool_semaphore to release
@@ -564,7 +606,7 @@ class BaseDatabaseManager(ABC):
             if success is not None: # Only update if success was determined
                  await self._update_circuit_breaker(success)
                  if not success:
-                    logger.warning(f"Operation within session {id(session_instance) if session_instance else 'N/A'} marked as failed for circuit breaker.")
+                    logger.warning(f"Operation within session {session_id_for_log} marked as failed for circuit breaker.")
 
     @with_timeout(CONNECTION_TEST_TIMEOUT)
     async def _test_connection(self, session: AsyncSession) -> bool:

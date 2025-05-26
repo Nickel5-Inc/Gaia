@@ -2,7 +2,7 @@ import math
 import traceback
 import gc
 import numpy as np
-from sqlalchemy import text
+from sqlalchemy import text, update
 import asyncio
 import json
 from pathlib import Path
@@ -16,7 +16,7 @@ from functools import wraps
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 import torch
 import os
-
+from gaia.database.validator_schema import node_table
 
 
 logger = get_logger(__name__)
@@ -179,6 +179,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             self.VALIDATOR_QUERY_TIMEOUT = 60  # 1 minute
             self.VALIDATOR_TRANSACTION_TIMEOUT = 300  # 5 minutes
             
+            self.node_table = node_table
             self._initialized = True
 
     async def get_operation_stats(self) -> Dict[str, Any]:
@@ -344,70 +345,89 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         vtrust: Optional[float] = None,
         protocol: Optional[str] = None,
     ):
-        """
-        Update miner information at a specific index.
+        """Update node information in the node_table for a specific UID."""
+        if not (0 <= index < 256):
+            logger.error(f"Invalid index {index} for update_miner_info. Must be between 0 and 255.")
+            raise ValueError(f"Invalid index {index}. Must be between 0 and 255")
 
-        Args:
-            index (int): Index in the table (0-255)
-            hotkey (str): Miner's hotkey
-            coldkey (str): Miner's coldkey
-            ip (str, optional): Miner's IP address
-            ip_type (str, optional): Type of IP address
-            port (int, optional): Port number
-            incentive (float, optional): Miner's incentive
-            stake (float, optional): Miner's stake
-            trust (float, optional): Miner's trust score
-            vtrust (float, optional): Miner's vtrust score
-            protocol (str, optional): Protocol used
+        update_values = {
+            "hotkey": hotkey,
+            "coldkey": coldkey,
+            "ip": ip,
+            "ip_type": ip_type,
+            "port": port,
+            "incentive": incentive,
+            "stake": stake,
+            "trust": trust,
+            "vtrust": vtrust,
+            "protocol": protocol,
+            "last_updated": datetime.now(timezone.utc)  # Ensure last_updated is always set
+        }
 
-        Raises:
-            ValueError: If index is not between 0 and 255
-            DatabaseError: If database operation fails
-        """
+        # Filter out None values to avoid overwriting existing data with NULLs if not intended
+        # However, if a field is explicitly passed as None, it WILL be set to NULL.
+        # If a field is not in kwargs (i.e., not passed to the function), it's not included here.
+        # This behavior is slightly different from the old raw query which would set to NULL if param was None.
+        # Consider if this is the desired behavior or if explicit NULLs should be handled differently.
+        
+        # For this refactor, we'll keep the behavior closer to the original:
+        # if a parameter is None, it will be set as None (NULL) in the DB.
+        # The `update_values` dict above already includes all parameters.
+
+        stmt = (
+            update(self.node_table)  # Assuming self.node_table is the SQLAlchemy Table object
+            .where(self.node_table.c.uid == index)
+            .values(**update_values)
+        )
+
         try:
-            # Validate index is within bounds
-            if not (0 <= index < 256):
-                raise ValueError(f"Invalid index {index}. Must be between 0 and 255")
+            # First, check if the row exists. This also helps ensure node_table is initialized.
+            # This check can be debated; for a pure UPDATE it's not strictly necessary if we assume UIDs 0-255 exist.
+            # However, it was in the original code, so keeping it for now.
+            exists_query = text("SELECT 1 FROM node_table WHERE uid = :uid_val")
+            async with self.session() as session:
+                async with session.begin(): # Start a transaction for the check and update
+                    result = await session.execute(exists_query, {"uid_val": index})
+                    if not result.scalar_one_or_none():
+                        logger.error(f"No row exists in node_table for UID {index}. Cannot update.")
+                        # Consider initializing the row here if that's desired, or raise specific error.
+                        # For now, matching original behavior of logging and raising generic DatabaseError later.
+                        # Raising a more specific error here might be better.
+                        raise ValueError(f"No row exists for UID {index} in node_table.")
 
-            # Check if row exists
-            exists_query = "SELECT 1 FROM node_table WHERE uid = :index"
-            result = await self.fetch_one(exists_query, {"index": index})
-            if not result:
-                raise ValueError(f"No row exists for index {index}. The node table must be properly initialized with 256 rows.")
+                    await session.execute(stmt)
+                    # No need to await session.commit() if autobegin=True on sessionmaker (default is False)
+                    # or if the session context manager handles commit on exit without error.
+                    # Given the explicit session.begin(), an explicit session.commit() is good practice here.
+                    # However, the `execute` method itself might handle the transaction if we call `self.execute(stmt)`
+                    # Let's use self.execute for consistency with other methods.
+            
+            # Re-thinking the session management based on `self.execute` structure:
+            # The `self.execute` method handles its own session and transaction if one isn't passed.
+            # So, we don't need to manage the session here directly for the update itself.
+            # The existence check should use its own session or be part of the same transaction.
+            # For simplicity and to ensure atomicity of check + update, let's perform this within one transaction.
 
-            query = """
-            UPDATE node_table 
-            SET 
-                hotkey = :hotkey,
-                coldkey = :coldkey,
-                ip = :ip,
-                ip_type = :ip_type,
-                port = :port,
-                incentive = :incentive,
-                stake = :stake,
-                trust = :trust,
-                vtrust = :vtrust,
-                protocol = :protocol,
-                last_updated = CURRENT_TIMESTAMP
-            WHERE uid = :index
-            """
-            params = {
-                "index": index,
-                "hotkey": hotkey,
-                "coldkey": coldkey,
-                "ip": ip,
-                "ip_type": ip_type,
-                "port": port,
-                "incentive": incentive,
-                "stake": stake,
-                "trust": trust,
-                "vtrust": vtrust,
-                "protocol": protocol,
-            }
-            await self.execute(query, params)
+            async with self.session() as s:
+                async with s.begin(): # Ensure check and update are atomic
+                    exists_check_stmt = text("SELECT 1 FROM node_table WHERE uid = :uid_val")
+                    exists_result = await s.execute(exists_check_stmt, {"uid_val": index})
+                    if not exists_result.scalar_one_or_none():
+                        logger.error(f"Attempted to update non-existent UID {index} in node_table.")
+                        raise ValueError(f"Cannot update UID {index}: does not exist in node_table.")
+
+                    await s.execute(stmt)
+                    # Commit will happen automatically by the async with s.begin() context manager on successful exit
+
+            # logger.debug(f"Successfully updated miner info for UID {index}") # Optional success log
+
+        except ValueError as ve:
+            logger.error(f"ValueError updating miner info for UID {index}: {str(ve)}")
+            raise # Re-raise ValueError to be more specific than generic DatabaseError
         except Exception as e:
-            logger.error(f"Error updating miner info for index {index}: {str(e)}")
-            raise DatabaseError(f"Failed to update miner info: {str(e)}")
+            logger.error(f"Error updating miner info for UID {index} using SQLAlchemy update: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise DatabaseError(f"Failed to update miner info for UID {index}: {str(e)}") from e
 
     @track_operation('write')
     async def batch_update_miners(self, miners_data: List[Dict[str, Any]]) -> None:
@@ -434,43 +454,41 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
         updated_count = 0
         try:
-            async with self.lightweight_session() as session:
-                async with session.begin():
+            async with self.lightweight_session() as session: # Assuming lightweight_session provides an AsyncSession
+                async with session.begin(): # Manage transaction for the whole batch
                     for miner_data in valid_miners_to_update:
-                        query = text("""
-                        UPDATE node_table 
-                        SET 
-                            hotkey = :hotkey,
-                            coldkey = :coldkey,
-                            ip = :ip,
-                            ip_type = :ip_type,
-                            port = :port,
-                            incentive = :incentive,
-                            stake = :stake,
-                            trust = :trust,
-                            vtrust = :vtrust,
-                            protocol = :protocol,
-                            last_updated = CURRENT_TIMESTAMP
-                        WHERE uid = :index
-                        """)
-                        params = {
-                            "index": miner_data['index'],
-                            "hotkey": miner_data.get('hotkey'),
-                            "coldkey": miner_data.get('coldkey'),
-                            "ip": miner_data.get('ip'),
-                            "ip_type": miner_data.get('ip_type'),
-                            "port": miner_data.get('port'),
-                            "incentive": miner_data.get('incentive'),
-                            "stake": miner_data.get('stake'),
-                            "trust": miner_data.get('trust'),
-                            "vtrust": miner_data.get('vtrust'),
-                            "protocol": miner_data.get('protocol')
-                        }
-                        result = await session.execute(query, params)
-                        if result.rowcount > 0:
+                        index_val = miner_data['index']
+                        
+                        values_to_set = {}
+                        if 'hotkey' in miner_data: values_to_set['hotkey'] = miner_data['hotkey']
+                        if 'coldkey' in miner_data: values_to_set['coldkey'] = miner_data['coldkey']
+                        if 'ip' in miner_data: values_to_set['ip'] = miner_data['ip']
+                        if 'ip_type' in miner_data: values_to_set['ip_type'] = miner_data['ip_type']
+                        if 'port' in miner_data: values_to_set['port'] = miner_data['port']
+                        if 'incentive' in miner_data: values_to_set['incentive'] = miner_data['incentive']
+                        if 'stake' in miner_data: values_to_set['stake'] = miner_data['stake']
+                        if 'trust' in miner_data: values_to_set['trust'] = miner_data['trust']
+                        if 'vtrust' in miner_data: values_to_set['vtrust'] = miner_data['vtrust']
+                        if 'protocol' in miner_data: values_to_set['protocol'] = miner_data['protocol']
+                        
+                        # Always update last_updated
+                        values_to_set['last_updated'] = datetime.now(timezone.utc)
+
+                        if not values_to_set: # Should not happen if last_updated is always set
+                            logger.warning(f"No values to update for miner index {index_val}. Skipping.")
+                            continue
+
+                        stmt = (
+                            update(self.node_table)
+                            .where(self.node_table.c.uid == index_val)
+                            .values(**values_to_set)
+                        )
+                        
+                        result = await session.execute(stmt)
+                        if result.rowcount is not None and result.rowcount > 0:
                             updated_count += result.rowcount
                             
-            logger.info(f"Successfully batch updated {updated_count} miners (executed {len(valid_miners_to_update)} individual updates in one transaction).")
+            logger.info(f"Successfully batch updated {updated_count} miners (executed {len(valid_miners_to_update)} individual SQLAlchemy updates in one transaction).")
                         
         except Exception as e:
             logger.error(f"Error in batch_update_miners: {str(e)}")
