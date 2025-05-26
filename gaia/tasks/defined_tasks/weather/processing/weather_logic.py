@@ -975,7 +975,7 @@ async def _calculate_and_store_aggregated_era5_score(
         "response_id": response_id, "run_id": run_id, "miner_uid": miner_uid, "miner_hotkey": miner_hotkey,
         "score_type": agg_score_type, 
         "score": final_score_val if np.isfinite(final_score_val) else 0.0,
-        "metrics": json.dumps(metrics_for_agg_score, default=str), 
+        "metrics_json": json.dumps(metrics_for_agg_score, default=str),
         "calculation_time": datetime.now(timezone.utc),
         "error_message": None,
         "lead_hours": None, 
@@ -987,7 +987,7 @@ async def _calculate_and_store_aggregated_era5_score(
         INSERT INTO weather_miner_scores 
         (response_id, run_id, miner_uid, miner_hotkey, score_type, score, metrics, calculation_time, error_message, lead_hours, variable_level, valid_time_utc)
         VALUES (:response_id, :run_id, :miner_uid, :miner_hotkey, :score_type, :score, :metrics_json, :calculation_time, :error_message, :lead_hours, :variable_level, :valid_time_utc)
-        ON CONFLICT (response_id, score_type) DO UPDATE SET 
+        ON CONFLICT (response_id, score_type, lead_hours, variable_level, valid_time_utc) DO UPDATE SET 
         score = EXCLUDED.score, metrics = EXCLUDED.metrics, calculation_time = EXCLUDED.calculation_time, error_message = EXCLUDED.error_message,
         run_id = EXCLUDED.run_id, miner_uid = EXCLUDED.miner_uid, miner_hotkey = EXCLUDED.miner_hotkey
     """

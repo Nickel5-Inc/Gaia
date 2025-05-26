@@ -723,16 +723,7 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 
                 if result and isinstance(result, dict):
                     resp_id = result.get("response_id")
-                    # json.dumps can be slow for large dicts
-                    lead_scores_json_str = await asyncio.to_thread(json.dumps, result.get("lead_time_scores"), default=str)
-                    
-                    # ... rest of the score processing ...
-                    # This part is mostly dict lookups and DB prep, likely fine.
-                    # json.dumps can be slow for large dicts
-                    lead_scores_json_str = await asyncio.to_thread(json.dumps, result.get("lead_time_scores"), default=str)
-                    
-                    # ... rest of the score processing ...
-                    # This part is mostly dict lookups and DB prep, likely fine.
+                    lead_scores_json = await asyncio.to_thread(json.dumps, result.get("lead_time_scores"), default=str)
                     overall_score = result.get("overall_day1_score")
                     qc_passed = result.get("qc_passed_all_vars_leads")
                     error_msg = result.get("error_message")
@@ -745,16 +736,20 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                             "run_id": run_id, 
                             "miner_uid": miner_uid_from_result, 
                             "miner_hotkey": miner_hotkey_from_result, 
+                            "score_type": 'day1_qc_score', 
                             "score": overall_score if np.isfinite(overall_score) else -9999.0, 
-                            "metrics": lead_scores_json_str, # Use the threaded result
+                            "metrics": lead_scores_json,
                             "ts": datetime.now(timezone.utc),
-                            "err": error_msg
+                            "err": error_msg,
+                            "lead_hours_val": None,
+                            "variable_level_val": "overall_day1",
+                            "valid_time_utc_val": run_record['gfs_init_time_utc'] if run_record else None
                         }
                         db_update_tasks.append(task_instance.db_manager.execute(
                             """INSERT INTO weather_miner_scores 
-                               (response_id, run_id, miner_uid, miner_hotkey, score_type, score, metrics, calculation_time, error_message)
-                               VALUES (:resp_id, :run_id, :miner_uid, :miner_hotkey, 'day1_qc_score', :score, :metrics, :ts, :err)                            
-                               ON CONFLICT (response_id, score_type) DO UPDATE SET
+                               (response_id, run_id, miner_uid, miner_hotkey, score_type, score, metrics, calculation_time, error_message, lead_hours, variable_level, valid_time_utc)
+                               VALUES (:resp_id, :run_id, :miner_uid, :miner_hotkey, :score_type, :score, :metrics, :ts, :err, :lead_hours_val, :variable_level_val, :valid_time_utc_val)                            
+                               ON CONFLICT (response_id, score_type, lead_hours, variable_level, valid_time_utc) DO UPDATE SET
                                score = EXCLUDED.score, metrics = EXCLUDED.metrics, miner_uid = EXCLUDED.miner_uid, miner_hotkey = EXCLUDED.miner_hotkey,
                                calculation_time = EXCLUDED.calculation_time, error_message = EXCLUDED.error_message
                             """,
@@ -810,9 +805,9 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 except Exception as db_err:
                     logger.error(f"[Day1ScoringWorker] Failed to update DB status on error: {db_err}")
             if processed_a_run:
-                if task_instance.initial_scoring_queue._unfinished_tasks > 0 : # Check if task_done was already called
+                if task_instance.initial_scoring_queue._unfinished_tasks > 0 :
                      task_instance.initial_scoring_queue.task_done()
-            await asyncio.sleep(1) # Prevent rapid looping on persistent error
+            await asyncio.sleep(1)
         finally:
             if gfs_analysis_ds_for_run and hasattr(gfs_analysis_ds_for_run, 'close'):
                 try: gfs_analysis_ds_for_run.close()
@@ -820,10 +815,9 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
             if gfs_reference_ds_for_run and hasattr(gfs_reference_ds_for_run, 'close'):
                 try: gfs_reference_ds_for_run.close()
                 except Exception: pass
-            # era5_climatology_ds is managed by WeatherTask instance, not closed here
             gc.collect()
 
-async def finalize_scores_worker(self): # `self` is task_instance
+async def finalize_scores_worker(self):
     """Background worker to calculate final scores against ERA5 after delay."""
     CHECK_INTERVAL_SECONDS = 30 if self.test_mode else int(self.config.get('final_scoring_check_interval_seconds', 3600))
     ERA5_DELAY_DAYS = int(self.config.get('era5_delay_days', 5))
@@ -886,15 +880,15 @@ async def finalize_scores_worker(self): # `self` is task_instance
             else:
                 logger.info(f"[FinalizeWorker] Found {len(ready_runs)} runs potentially ready for final scoring.")
 
-            for i_run, run_record_db in enumerate(ready_runs): # Iterate over runs for this cycle
-                run_id = run_record_db['id']
-                if run_id in processed_run_ids: continue # Already processed in this cycle
+            for run in ready_runs:
+                run_id = run['id']
+                if run_id in processed_run_ids: continue
 
-                gfs_init_time = run_record_db['gfs_init_time_utc']
-                era5_ds_for_run = None # Specific to this run
+                gfs_init_time = run['gfs_init_time_utc']
+                era5_ds_for_run = None
 
                 logger.info(f"[FinalizeWorker] Processing final scores for run {run_id} (Init: {gfs_init_time}).")
-                await self.db_manager.execute( # Mark attempt time
+                await self.db_manager.execute(
                         "UPDATE weather_forecast_runs SET final_scoring_attempted_time = :now WHERE id = :rid",
                         {"now": now_utc, "rid": run_id}
                 )
@@ -936,14 +930,13 @@ async def finalize_scores_worker(self): # `self` is task_instance
                     logger.warning(f"[FinalizeWorker] Run {run_id}: No verified responses. Skipping miner scoring.")
                     await _update_run_status(self, run_id, "final_scoring_skipped_no_verified_miners")
                     processed_run_ids.add(run_id)
-                    if era5_ds_for_run: era5_ds_for_run.close() # Close dataset if not used
+                    if era5_ds_for_run: era5_ds_for_run.close()
                     continue
 
                 logger.info(f"[FinalizeWorker] Run {run_id}: Found {len(verified_responses_for_run)} verified miner responses.")
                 scoring_execution_tasks = []
                 
-                for resp_rec in verified_responses_for_run: # Loop over miners for this run
-                     # CRITICAL: calculate_era5_miner_score must be internally async-friendly or wrapped.
+                for resp_rec in verified_responses_for_run:
                      scoring_execution_tasks.append(calculate_era5_miner_score(
                          self, resp_rec, target_datetimes_for_run, era5_ds_for_run, era5_climatology_ds_for_cycle
                         ))
@@ -959,7 +952,6 @@ async def finalize_scores_worker(self): # `self` is task_instance
                         logger.info(f"[FinalizeWorker] Run {run_id}: Detailed ERA5 metrics stored for UID {resp_rec_inner['miner_uid']}. Calculating aggregated score.")
                         final_vars_levels_cfg = self.config.get('final_scoring_variables_levels', self.config.get('day1_variables_levels_to_score'))
                         
-                        # CRITICAL: _calculate_and_store_aggregated_era5_score must be internally async-friendly or wrapped.
                         agg_score = await _calculate_and_store_aggregated_era5_score(
                             task_instance=self, run_id=run_id, miner_uid=resp_rec_inner['miner_uid'],
                             miner_hotkey=resp_rec_inner['miner_hotkey'], response_id=resp_rec_inner['id'], 
@@ -986,28 +978,19 @@ async def finalize_scores_worker(self): # `self` is task_instance
                     except Exception as e_comb_score:
                         logger.error(f"[FinalizeWorker] Run {run_id}: Error triggering combined score update: {e_comb_score}", exc_info=True)
                 else:
-                     logger.warning(f"[FinalizeWorker] Run {run_id}: No miners successfully scored. Skipping combined score update.")
-                
+                     logger.warning(f"[FinalizeWorker] Run {run_id}: No miners successfully scored against ERA5. Skipping combined score update.")
                 processed_run_ids.add(run_id)
-                if era5_ds_for_run: # Close dataset for this run
-                    try: era5_ds_for_run.close()
-                    except Exception: pass
-                
-                if len(ready_runs) > 5 and i_run % 5 == 4 : # Yield if processing many runs in this cycle
-                    await asyncio.sleep(0)
-
 
         except asyncio.CancelledError:
             logger.info("[FinalizeWorker] Worker cancelled")
             break
         except Exception as e:
             logger.error(f"[FinalizeWorker] Unexpected error (Last run_id: {run_id}): {e}", exc_info=True)
-            if run_id: # If error happened mid-run processing
+            if run_id:
                 try: await _update_run_status(self, run_id, "final_scoring_failed", error_message=f"Worker loop error: {e}")
-                except Exception: pass # Avoid error in error handling
+                except Exception: pass
         finally:
-            # era5_climatology_ds_for_cycle is kept for next cycle, not closed here
-            if 'era5_ds_for_run' in locals() and era5_ds_for_run is not None: # Ensure it's closed if loop exited early
+            if 'era5_ds_for_run' in locals() and era5_ds_for_run is not None:
                 try: era5_ds_for_run.close()
                 except Exception: pass
             gc.collect()
@@ -1022,8 +1005,6 @@ async def finalize_scores_worker(self): # `self` is task_instance
 async def cleanup_worker(task_instance: 'WeatherTask'):
     """Periodically cleans up old cache files, ensemble files, and DB records."""
     CHECK_INTERVAL_SECONDS = int(task_instance.config.get('cleanup_check_interval_seconds', 6 * 3600))
-    # ... (rest of cleanup_worker is mostly fine as it uses to_thread for directory cleanup) ...
-    # Ensure DB deletion is also efficient if it becomes a problem.
     GFS_CACHE_RETENTION_DAYS = int(task_instance.config.get('gfs_cache_retention_days', 7))
     ERA5_CACHE_RETENTION_DAYS = int(task_instance.config.get('era5_cache_retention_days', 30))
     ENSEMBLE_RETENTION_DAYS = int(task_instance.config.get('ensemble_retention_days', 14))
@@ -1031,7 +1012,7 @@ async def cleanup_worker(task_instance: 'WeatherTask'):
     
     gfs_cache_dir = Path(task_instance.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
     era5_cache_dir = Path(task_instance.config.get('era5_cache_dir', './era5_cache'))
-    ensemble_dir = VALIDATOR_ENSEMBLE_DIR # Assuming this is defined elsewhere like MINER_FORECAST_DIR_BG
+    ensemble_dir = VALIDATOR_ENSEMBLE_DIR
     
     def _blocking_cleanup_directory(dir_path_str: str, retention_days: int, pattern: str, current_time_ts: float):
         dir_path = Path(dir_path_str)
@@ -1042,31 +1023,25 @@ async def cleanup_worker(task_instance: 'WeatherTask'):
         cutoff_time = current_time_ts - (retention_days * 24 * 3600)
         deleted_count = 0
         try:
-            # Iterate over items and check if they match the pattern and are files/dirs as appropriate
             for item_path in dir_path.glob(pattern):
                 try:
-                    if item_path.is_file(): # For patterns like "*.nc"
+                    if item_path.is_file():
                         file_mod_time = item_path.stat().st_mtime
                         if file_mod_time < cutoff_time:
                             item_path.unlink()
                             logger.debug(f"[CleanupWorker] Deleted old file: {item_path}")
                             deleted_count += 1
-                    # Add elif item_path.is_dir(): for directory patterns if needed
-                except FileNotFoundError: # Can happen if file deleted between glob and stat
+                except FileNotFoundError:
                     continue 
                 except Exception as e_file:
                     logger.warning(f"[CleanupWorker] Error processing item {item_path} for deletion: {e_file}")
-            
-            # Attempt to remove empty directories after file cleanup
-            # This part is a bit more complex if pattern is not just for files.
-            # A simpler approach is to run this separately or ensure pattern targets files first.
-            if pattern == "*" or "*" in pattern: # Be cautious with broad patterns
+
+            if pattern == "*" or "*" in pattern:
                  for item in dir_path.iterdir(): 
                       if item.is_dir():
                            try:
-                                # Check if directory is empty before removing
-                                if not any(item.iterdir()): # More robust check for emptiness
-                                     shutil.rmtree(item) # Use shutil.rmtree for potentially non-empty on error, or item.rmdir() if strictly empty
+                                if not any(item.iterdir()):
+                                     shutil.rmtree(item)
                                      logger.debug(f"[CleanupWorker] Removed empty/old directory: {item}")
                            except OSError as e_dir:
                                 logger.warning(f"[CleanupWorker] Error removing dir {item}: {e_dir}")
@@ -1092,7 +1067,6 @@ async def cleanup_worker(task_instance: 'WeatherTask'):
             await asyncio.to_thread(_blocking_cleanup_directory, str(ensemble_dir), ENSEMBLE_RETENTION_DAYS, "*.nc", now_ts)
             await asyncio.to_thread(_blocking_cleanup_directory, str(ensemble_dir), ENSEMBLE_RETENTION_DAYS, "*.json", now_ts)
             
-            # Cleanup for MINER_FORECAST_DIR_BG (Zarr stores)
             logger.info("[CleanupWorker] Cleaning up Miner Forecast Zarr stores...")
             await asyncio.to_thread(_blocking_cleanup_directory, str(MINER_FORECAST_DIR_BG), ENSEMBLE_RETENTION_DAYS, "*.zarr", now_ts)
 
@@ -1100,10 +1074,9 @@ async def cleanup_worker(task_instance: 'WeatherTask'):
             logger.info("[CleanupWorker] Cleaning up old database records...")
             db_cutoff_time = now_dt_utc - timedelta(days=DB_RUN_RETENTION_DAYS)
             try:
-                # Ensure cascade delete is set up in DB or delete related records manually
                 delete_runs_query = "DELETE FROM weather_forecast_runs WHERE run_initiation_time < :cutoff"
                 result = await task_instance.db_manager.execute(delete_runs_query, {"cutoff": db_cutoff_time})
-                if result and hasattr(result, 'rowcount'): # rowcount might not be available for all drivers/statements
+                if result and hasattr(result, 'rowcount'):
                     logger.info(f"[CleanupWorker] Deleted {result.rowcount} old runs (and related data via cascade) older than {db_cutoff_time}.")
                 else:
                      logger.info(f"[CleanupWorker] Executed old run deletion query (actual rowcount might not be available from driver).")
@@ -1147,13 +1120,7 @@ async def fetch_and_hash_gfs_task(
         gfs_cache_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"[FetchHashTask Job {job_id}] Calling compute_input_data_hash...")
-        # CRITICAL: compute_input_data_hash is async. If its *internal* CPU-bound parts
-        # (actual hashing algorithm over bytes) are not run in a thread pool by itself,
-        # this will block.
-        # Assuming compute_input_data_hash is internally well-behaved (uses to_thread for sync crypto).
-        # If not, it needs to be modified or called as:
-        # computed_hash = await asyncio.to_thread(sync_version_of_compute_input_data_hash, ...)
-        computed_hash = await compute_input_data_hash( # This is from .utils.hashing
+        computed_hash = await compute_input_data_hash(
             t0_run_time=t0_run_time,
             t_minus_6_run_time=t_minus_6_run_time,
             cache_dir=gfs_cache_dir
