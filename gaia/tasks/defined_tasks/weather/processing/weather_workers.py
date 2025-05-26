@@ -18,6 +18,8 @@ import base64
 import pickle
 import httpx # Ensure httpx is available
 import gzip # Ensure gzip is available
+import httpx # Ensure httpx is available
+import gzip # Ensure gzip is available
 
 from fiber.logging_utils import get_logger
 from aurora import Batch
@@ -40,10 +42,21 @@ from ..utils.era5_api import fetch_era5_data
 from ..utils.hashing import compute_verification_hash, compute_input_data_hash, CANONICAL_VARS_FOR_HASHING
 from ..weather_scoring.metrics import calculate_rmse
 from ..weather_scoring_mechanism import evaluate_miner_forecast_day1 # Assuming this is async def
+from ..weather_scoring_mechanism import evaluate_miner_forecast_day1 # Assuming this is async def
 logger = get_logger(__name__)
 
 VALIDATOR_ENSEMBLE_DIR = Path("./validator_ensembles/")
 MINER_FORECAST_DIR_BG = Path("./miner_forecasts_background/")
+
+
+# Helper for HTTP inference serialization
+def _prepare_http_payload_sync(prepared_batch_for_http: Batch) -> bytes:
+    logger.debug(f"SYNC: Serializing Aurora Batch for HTTP service...")
+    pickled_batch = pickle.dumps(prepared_batch_for_http)
+    base64_encoded_batch = base64.b64encode(pickled_batch).decode('utf-8')
+    payload_json_str = json.dumps({"serialized_aurora_batch": base64_encoded_batch})
+    gzipped_payload = gzip.compress(payload_json_str.encode('utf-8'))
+    return gzipped_payload
 
 
 # Helper for HTTP inference serialization
@@ -123,6 +136,14 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
             gfs_concat_data_for_batch_prep = await asyncio.to_thread(_prepare_gfs_concat_sync, local_ds_t0, local_ds_t_minus_6)
 
             logger.info(f"[InferenceTask Job {job_id}] Preparing Aurora Batch from fetched datasets...")
+            
+            # This part (concat, sortby) can be CPU intensive if datasets are large
+            def _prepare_gfs_concat_sync(ds_t0_sync, ds_t_minus_6_sync):
+                return xr.concat([ds_t_minus_6_sync, ds_t0_sync], dim='time').sortby('time')
+
+            gfs_concat_data_for_batch_prep = await asyncio.to_thread(_prepare_gfs_concat_sync, local_ds_t0, local_ds_t_minus_6)
+
+            logger.info(f"[InferenceTask Job {job_id}] Preparing Aurora Batch from fetched datasets...")
             prepared_batch = await asyncio.to_thread(
                 create_aurora_batch_from_gfs, 
                 gfs_data=gfs_concat_data_for_batch_prep # Use the threaded result
@@ -140,6 +161,8 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
             if local_ds_t_minus_6 and hasattr(local_ds_t_minus_6, 'close'): local_ds_t_minus_6.close()
             if gfs_concat_data_for_batch_prep and hasattr(gfs_concat_data_for_batch_prep, 'close'): gfs_concat_data_for_batch_prep.close()
 
+            if gfs_concat_data_for_batch_prep and hasattr(gfs_concat_data_for_batch_prep, 'close'): gfs_concat_data_for_batch_prep.close()
+
 
         await update_job_status(task_instance, job_id, "running_inference")
         logger.info(f"[InferenceTask Job {job_id}] Waiting for GPU semaphore...")
@@ -147,8 +170,9 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
         async with task_instance.gpu_semaphore:
             logger.info(f"[InferenceTask Job {job_id}] Acquired GPU semaphore, running inference...")
             original_inference_error_for_dev_skip = None 
+            original_inference_error_for_dev_skip = None 
             try:
-                 inference_type = task_instance.config.get("weather_inference_type", "local").lower()
+                 inference_type = task_instance.config.get("weather_inference_type", "local").lower() 
                  if task_instance.inference_runner is None: 
                      raise RuntimeError("Inference runner is None before attempting inference call.")
 
@@ -173,6 +197,8 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                     try:
                         gzipped_payload = await asyncio.to_thread(_prepare_http_payload_sync, prepared_batch)
                         
+                        gzipped_payload = await asyncio.to_thread(_prepare_http_payload_sync, prepared_batch)
+                        
                         headers = {
                             "Content-Type": "application/json",
                             "Content-Encoding": "gzip",
@@ -183,6 +209,7 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                         else:
                             logger.warning(f"[{job_id}] MINER_API_KEY_FOR_INFRA_SERVICE not set. Sending request without API key.")
 
+                        
                         async with httpx.AsyncClient(timeout=None) as client: 
                             logger.info(f"[{job_id}] Sending request to HTTP inference service: {service_url}")
                             response_steps_data = []
@@ -196,8 +223,13 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                                                 # but breaking it down further is very complex with aiter_lines.
                                                 # Focus on server sending reasonably sized chunks.
                                                 step_data = json.loads(line) 
+                                                # Deserialization can still be a bit heavy if chunks are large
+                                                # but breaking it down further is very complex with aiter_lines.
+                                                # Focus on server sending reasonably sized chunks.
+                                                step_data = json.loads(line) 
                                                 if step_data.get("error"):
                                                     logger.error(f"[{job_id}] Error from service for step {step_data.get('step_index', 'unknown')}: {step_data.get('detail', step_data['error'])}")
+                                                    continue 
                                                     continue 
                                                 
                                                 serialized_prediction = step_data.get("serialized_prediction")
@@ -480,6 +512,10 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
             try: gfs_concat_data_for_batch_prep.close()
             except Exception: pass
 
+        if 'gfs_concat_data_for_batch_prep' in locals() and gfs_concat_data_for_batch_prep is not None and hasattr(gfs_concat_data_for_batch_prep, 'close'):
+            try: gfs_concat_data_for_batch_prep.close()
+            except Exception: pass
+
 
 async def initial_scoring_worker(task_instance: 'WeatherTask'):
     """
@@ -553,12 +589,21 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
 
             gfs_cache_dir = Path(task_instance.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
 
-            day1_config_vars_to_score = task_instance.config.get('day1_variables_levels_to_score', [])
+            # Consolidate the definition of variables to score for Day-1.
+            # This list will be used for both GFS data fetching parameters and the scoring configuration.
+            resolved_day1_variables_levels_to_score = task_instance.config.get('day1_variables_levels_to_score', [
+                {"name": "z", "level": 500, "standard_name": "geopotential"},
+                {"name": "t", "level": 850, "standard_name": "temperature"},
+                {"name": "2t", "level": None, "standard_name": "2m_temperature"},
+                {"name": "msl", "level": None, "standard_name": "mean_sea_level_pressure"}
+            ])
+
             target_surface_vars_gfs_day1 = []
             target_atmos_vars_gfs_day1 = []
             target_pressure_levels_hpa_day1_set = set()
 
-            for var_info in day1_config_vars_to_score: # This loop is likely fine, config data is small
+            # Use the resolved list to determine GFS fetch parameters.
+            for var_info in resolved_day1_variables_levels_to_score:
                 aurora_name = var_info['name']
                 level = var_info.get('level')
                 gfs_name = AURORA_TO_GFS_VAR_MAP.get(aurora_name)
@@ -579,6 +624,7 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
 
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Targeting GFS fetch for Day-1. Surface vars: {target_surface_vars_gfs_day1}, Atmos vars: {target_atmos_vars_gfs_day1}, Levels: {target_pressure_levels_list_day1}")
 
+            # Ensure these fetch functions are internally using to_thread for heavy sync parts
             # Ensure these fetch functions are internally using to_thread for heavy sync parts
             gfs_analysis_ds_for_run = await fetch_gfs_analysis_data(
                 target_times=valid_times_for_gfs, 
@@ -615,8 +661,12 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
             
             day1_scoring_config = {
                 "evaluation_valid_times": valid_times_for_gfs,
-                "variables_levels_to_score": task_instance.config.get('day1_variables_levels_to_score', []),
-                "climatology_bounds": task_instance.config.get('day1_climatology_bounds', {}),
+                "variables_levels_to_score": resolved_day1_variables_levels_to_score, # Use the consolidated list
+                "climatology_bounds": task_instance.config.get('day1_climatology_bounds', {
+                    "2t": (180, 340), "msl": (90000, 110000),
+                    "t500": (200, 300), "t850": (220, 320),
+                    "z500": (4000, 6000)
+                }),
                 "pattern_correlation_threshold": task_instance.config.get("day1_pattern_correlation_threshold", 0.3),
                 "acc_lower_bound_d1": task_instance.config.get("day1_acc_lower_bound", 0.6),
                 "alpha_skill": task_instance.config.get("day1_alpha_skill", 0.6),
@@ -624,13 +674,17 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 "clone_penalty_gamma": task_instance.config.get("day1_clone_penalty_gamma", 1.0),
                 "clone_delta_thresholds": task_instance.config.get("day1_clone_delta_thresholds", {})
             }
-            day1_scoring_config["variables_levels_to_score"] = day1_config_vars_to_score # Ensure latest used
 
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Configured. Starting evaluation for {len(responses)} miners.")
 
             scoring_tasks = []
+            
             for miner_response_rec in responses: # Loop over potentially many miners
                 logger.debug(f"[Day1ScoringWorker] Run {run_id}: Creating scoring task for miner {miner_response_rec.get('miner_hotkey')}")
+                # CRITICAL: evaluate_miner_forecast_day1 must be internally async-friendly
+                # or the call itself wrapped in to_thread if it's a blocking sync function.
+                # Given it's awaited in gather, it's likely an async def.
+                # Its internal CPU-bound parts are the concern.
                 # CRITICAL: evaluate_miner_forecast_day1 must be internally async-friendly
                 # or the call itself wrapped in to_thread if it's a blocking sync function.
                 # Given it's awaited in gather, it's likely an async def.
@@ -650,6 +704,10 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 # But if it has some initial sync setup before its first await, and responses is large:
                 if len(responses) > 10 and len(scoring_tasks) % 10 == 0:
                     await asyncio.sleep(0) 
+                # If evaluate_miner_forecast_day1 is truly async and yields, no sleep(0) needed here often.
+                # But if it has some initial sync setup before its first await, and responses is large:
+                if len(responses) > 10 and len(scoring_tasks) % 10 == 0:
+                    await asyncio.sleep(0) 
             
             logger.info(f"[Day1ScoringWorker] Run {run_id}: Created {len(scoring_tasks)} scoring tasks.")
             evaluation_results = await asyncio.gather(*scoring_tasks, return_exceptions=True)
@@ -657,6 +715,7 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
             logger.info(f"[Day1ScoringWorker] Run {run_id}: evaluation_results count: {len(evaluation_results)}")
             successful_scores = 0
             db_update_tasks = []
+            
             for i, result in enumerate(evaluation_results): # Loop over results
                 if isinstance(result, Exception):
                     logger.error(f"[Day1ScoringWorker] Run {run_id}: A Day-1 scoring task failed: {result}", exc_info=result)
@@ -664,6 +723,11 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 
                 if result and isinstance(result, dict):
                     resp_id = result.get("response_id")
+                    # json.dumps can be slow for large dicts
+                    lead_scores_json_str = await asyncio.to_thread(json.dumps, result.get("lead_time_scores"), default=str)
+                    
+                    # ... rest of the score processing ...
+                    # This part is mostly dict lookups and DB prep, likely fine.
                     # json.dumps can be slow for large dicts
                     lead_scores_json_str = await asyncio.to_thread(json.dumps, result.get("lead_time_scores"), default=str)
                     
@@ -703,6 +767,8 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                             logger.info(f"[Day1ScoringWorker] Miner {result.get('miner_hotkey')} Day-1 Score (Resp {resp_id}): {overall_score:.4f}, QC Overall: {qc_passed}")
                         else:
                             logger.warning(f"[Day1ScoringWorker] Miner {result.get('miner_hotkey')} Day-1 scoring for resp {resp_id} resulted in invalid score: {overall_score}")
+                if len(evaluation_results) > 20 and i % 20 == 19:
+                    await asyncio.sleep(0) # Yield if processing many results
                 if len(evaluation_results) > 20 and i % 20 == 19:
                     await asyncio.sleep(0) # Yield if processing many results
             
@@ -822,7 +888,7 @@ async def finalize_scores_worker(self): # `self` is task_instance
 
             for i_run, run_record_db in enumerate(ready_runs): # Iterate over runs for this cycle
                 run_id = run_record_db['id']
-                if run_id in processed_run_ids_in_cycle: continue # Already processed in this cycle
+                if run_id in processed_run_ids: continue # Already processed in this cycle
 
                 gfs_init_time = run_record_db['gfs_init_time_utc']
                 era5_ds_for_run = None # Specific to this run
@@ -854,7 +920,7 @@ async def finalize_scores_worker(self): # `self` is task_instance
                 if era5_ds_for_run is None:
                     logger.error(f"[FinalizeWorker] Run {run_id}: Failed to fetch ERA5 data. Aborting final scoring for this run.")
                     await _update_run_status(self, run_id, "final_scoring_failed", error_message="ERA5 fetch failed")
-                    processed_run_ids_in_cycle.add(run_id)
+                    processed_run_ids.add(run_id)
                     continue
 
                 logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 data fetched/loaded.")
@@ -869,7 +935,7 @@ async def finalize_scores_worker(self): # `self` is task_instance
                 if not verified_responses_for_run:
                     logger.warning(f"[FinalizeWorker] Run {run_id}: No verified responses. Skipping miner scoring.")
                     await _update_run_status(self, run_id, "final_scoring_skipped_no_verified_miners")
-                    processed_run_ids_in_cycle.add(run_id)
+                    processed_run_ids.add(run_id)
                     if era5_ds_for_run: era5_ds_for_run.close() # Close dataset if not used
                     continue
 
@@ -922,7 +988,7 @@ async def finalize_scores_worker(self): # `self` is task_instance
                 else:
                      logger.warning(f"[FinalizeWorker] Run {run_id}: No miners successfully scored. Skipping combined score update.")
                 
-                processed_run_ids_in_cycle.add(run_id)
+                processed_run_ids.add(run_id)
                 if era5_ds_for_run: # Close dataset for this run
                     try: era5_ds_for_run.close()
                     except Exception: pass

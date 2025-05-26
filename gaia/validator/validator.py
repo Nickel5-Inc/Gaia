@@ -267,6 +267,7 @@ class GaiaValidator:
         self.db_monitor_history_lock = asyncio.Lock()
         self.DB_MONITOR_HISTORY_MAX_SIZE = 120 # e.g., 2 hours of data if monitor runs every minute
 
+        self.validator_uid = None
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -428,6 +429,13 @@ class GaiaValidator:
             logger.info(f"Initial block number type: {type(self.current_block)}, value: {self.current_block}")
             self.last_set_weights_block = self.current_block - 300
 
+            if self.validator_uid is None:
+                self.validator_uid = self.substrate.query(
+                    "SubtensorModule", 
+                    "Uids", 
+                    [self.netuid, self.keypair.ss58_address]
+                ).value
+            validator_uid = self.validator_uid
 
             return True
         except Exception as e:
@@ -1370,16 +1378,22 @@ class GaiaValidator:
                 
                 async def scoring_cycle():
                     try:
-                        validator_uid = self.substrate.query(
-                            "SubtensorModule", 
-                            "Uids", 
-                            [self.netuid, self.keypair.ss58_address]
-                        ).value
+                        validator_uid = self.validator_uid
                         
                         if validator_uid is None:
-                            logger.error("Validator not found on chain")
-                            await self.update_task_status('scoring', 'error')
-                            return False
+                            try:
+                                self.validator_uid = self.substrate.query(
+                                    "SubtensorModule", 
+                                    "Uids", 
+                                    [self.netuid, self.keypair.ss58_address]
+                                ).value
+                                validator_uid = int(self.validator_uid)
+                            except Exception as e:
+                                logger.error(f"Error getting validator UID: {e}")
+                                logger.error(traceback.format_exc())
+                                await self.update_task_status('scoring', 'error')
+                                return False
+                            
 
                         validator_uid = int(validator_uid)
                         last_updated_value = self.substrate.query(
@@ -1406,6 +1420,7 @@ class GaiaValidator:
                         if current_block - self.last_set_weights_block < min_interval:
                             logger.info(f"Recently set weights {current_block - self.last_set_weights_block} blocks ago")
                             await self.update_task_status('scoring', 'idle', 'waiting')
+                            await asyncio.sleep(60)
                             return True
 
                         # Only enter weight_setting state when actually setting weights
