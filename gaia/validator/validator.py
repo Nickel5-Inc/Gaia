@@ -1,3 +1,4 @@
+import gc
 import logging
 import sys
 from datetime import datetime, timezone, timedelta
@@ -8,6 +9,8 @@ import concurrent.futures
 import glob
 import signal
 import sys
+
+from gaia.database.database_manager import DatabaseTimeout
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -1188,8 +1191,9 @@ class GaiaValidator:
                 lambda: self.main_scoring(),
                 lambda: self.handle_miner_deregistration_loop(),
                 # The MinerScoreSender task will be added conditionally below
-                lambda: self.check_for_updates(),
-                lambda: self.manage_earthdata_token()
+                #lambda: self.check_for_updates(),
+                lambda: self.manage_earthdata_token(),
+                lambda: self.database_monitor()
             ]
 
             # Add DB Sync tasks conditionally
@@ -2065,6 +2069,156 @@ class GaiaValidator:
             if not self.restore_manager:
                 logger.error("Failed to initialize RestoreManager. DB Sync (replica) will be disabled.")
         logger.info("DB Sync components initialization attempt finished.")
+
+    async def database_monitor(self):
+        """Periodically query and log database statistics."""
+        logger.info("Starting database monitor task...")
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(60) # Check every 60 seconds
+
+            stats = {
+                "connection_summary": "[Query Failed or No Data]",
+                "null_state_connection_details": "[Query Failed or No Data for NULL state details]",
+                "idle_in_transaction_details": "[Query Failed or No Data]",
+                "lock_details": "[Query Failed or No Data]",
+                "active_query_wait_events": "[Query Failed or No Data]",
+                "error": None
+            }
+
+            try:
+                # Query overall connection summary
+                conn_summary_query = "SELECT state, count(*) FROM pg_stat_activity GROUP BY state;"
+                try:
+                    stats["connection_summary"] = await self.database_manager.fetch_all(conn_summary_query, timeout=45.0) # Increased timeout
+                except DatabaseTimeout:
+                    stats["connection_summary"] = "[Query Timed Out]"
+                    logger.warning("[DB Monitor] Timeout fetching connection summary.")
+                except Exception as e:
+                    stats["connection_summary"] = f"[Query Error: {type(e).__name__}]"
+                    logger.warning(f"[DB Monitor] Error fetching connection summary: {e}")
+
+                # Query details for NULL state connections
+                null_state_query = """
+                SELECT pid, usename, application_name, client_addr, backend_start, state, backend_type, query
+                FROM pg_stat_activity 
+                WHERE state IS NULL;
+                """
+                try:
+                    stats["null_state_connection_details"] = await self.database_manager.fetch_all(null_state_query, timeout=45.0) # Increased timeout
+                except DatabaseTimeout:
+                    stats["null_state_connection_details"] = "[Query Timed Out for NULL state details]"
+                    logger.warning("[DB Monitor] Timeout fetching NULL state connection details.")
+                except Exception as e:
+                    stats["null_state_connection_details"] = f"[Query Error for NULL state details: {type(e).__name__}]"
+                    logger.warning(f"[DB Monitor] Error fetching NULL state connection details: {e}")
+                
+                # Query details for 'idle in transaction' connections
+                idle_in_transaction_query = """
+                SELECT pid, usename, application_name, client_addr, backend_start, state_change, query_start, query 
+                FROM pg_stat_activity 
+                WHERE state = 'idle in transaction' 
+                ORDER BY state_change ASC;
+                """
+                try:
+                    stats["idle_in_transaction_details"] = await self.database_manager.fetch_all(idle_in_transaction_query, timeout=45.0) # Increased timeout
+                except DatabaseTimeout:
+                    stats["idle_in_transaction_details"] = "[Query Timed Out]"
+                    logger.warning("[DB Monitor] Timeout fetching idle in transaction details.")
+                except Exception as e:
+                    stats["idle_in_transaction_details"] = f"[Query Error: {type(e).__name__}]"
+                    logger.warning(f"[DB Monitor] Error fetching idle in transaction details: {e}")
+
+                # Query for lock contention
+                lock_details_query = """
+                SELECT
+                    activity.pid,
+                    activity.usename,
+                    activity.query,
+                    blocking_locks.locktype AS blocking_locktype,
+                    blocking_activity.query AS blocking_query,
+                    blocking_activity.pid AS blocking_pid,
+                    blocking_activity.usename AS blocking_usename,
+                    age(now(), activity.query_start) as query_age
+                FROM pg_stat_activity AS activity
+                JOIN pg_locks AS blocking_locks ON blocking_locks.pid = activity.pid AND NOT blocking_locks.granted
+                JOIN pg_locks AS granted_locks ON granted_locks.locktype = blocking_locks.locktype AND granted_locks.pid != activity.pid AND granted_locks.granted
+                JOIN pg_stat_activity AS blocking_activity ON blocking_activity.pid = granted_locks.pid
+                WHERE activity.wait_event_type = 'Lock';
+                """
+                try:
+                    stats["lock_details"] = await self.database_manager.fetch_all(lock_details_query, timeout=45.0) # Increased timeout
+                except DatabaseTimeout:
+                    stats["lock_details"] = "[Query Timed Out]"
+                    logger.warning("[DB Monitor] Timeout fetching lock details.")
+                except Exception as e:
+                    stats["lock_details"] = f"[Query Error: {type(e).__name__}]"
+                    logger.warning(f"[DB Monitor] Error fetching lock details: {e}")
+
+                # Query for top active queries by wait events (excluding background workers and idle)
+                active_query_wait_events_query = """
+                SELECT 
+                    pid, 
+                    usename, 
+                    application_name,
+                    query, 
+                    wait_event_type, 
+                    wait_event,
+                    age(now(), query_start) as query_age,
+                    state
+                FROM pg_stat_activity 
+                WHERE state = 'active'
+                  AND backend_type = 'client backend'
+                  AND pid != pg_backend_pid()
+                ORDER BY query_start ASC;
+                """
+                try:
+                    stats["active_query_wait_events"] = await self.database_manager.fetch_all(active_query_wait_events_query, timeout=45.0) # Increased timeout
+                except DatabaseTimeout:
+                    stats["active_query_wait_events"] = "[Query Timed Out]"
+                    logger.warning("[DB Monitor] Timeout fetching active query wait events.")
+                except Exception as e:
+                    stats["active_query_wait_events"] = f"[Query Error: {type(e).__name__}]"
+                    logger.warning(f"[DB Monitor] Error fetching active query wait events: {e}")
+
+            except Exception as e_outer:
+                stats["error"] = f"Outer error in database_monitor: {str(e_outer)}"
+                logger.error(f"[DB Monitor] Outer error: {e_outer}")
+                logger.error(traceback.format_exc())
+            
+            # Log all collected stats
+            log_output = "[DB Monitor] Stats:\n"
+            for key, value in stats.items():
+                if key == "error" and value is None: # Don't print error key if no error
+                    continue
+                try:
+                    # Pretty print if it's a list of dicts (likely query results)
+                    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+                        log_output += f"  {key.replace('_', ' ').title()}:\n"
+                        if not value: # Empty list
+                             log_output += "  []\n"
+                        else:
+                            for item_dict in value:
+                                log_output += "  {\n"
+                                for k_item, v_item in item_dict.items():
+                                    if isinstance(v_item, datetime):
+                                        v_item_str = v_item.isoformat()
+                                    else:
+                                        v_item_str = str(v_item)
+                                    log_output += f"    {k_item}: {v_item_str}\n"
+                                log_output += "  }\n"
+                            if len(value) > 1 : log_output += "  ...\n" # Indicate if more items not shown in detail for brevity if needed
+                        if isinstance(value, list) and len(value) > 0 and not all(isinstance(item, dict) for item in value): # list of non-dicts
+                             log_output += f"  {json.dumps(value, indent=2, default=str)}\n"
+                    elif isinstance(value, str) and (value.startswith("[Query Timed Out") or value.startswith("[Query Error") or value.startswith("[Query Failed")):
+                        log_output += f"  {key.replace('_', ' ').title()}: {value}\n"
+
+                    else: # For simple values or non-list-of-dict structures
+                        log_output += f"  {key.replace('_', ' ').title()}: {json.dumps(value, indent=2, default=str)}\n"
+                except Exception as e_log:
+                    log_output += f"  Error formatting log for {key}: {e_log}\n"
+            
+            logger.info(log_output)
+            gc.collect()
 
 
 if __name__ == "__main__":

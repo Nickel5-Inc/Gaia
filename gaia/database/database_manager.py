@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, TypeVar, Callable
 from functools import wraps
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, OperationalError
 from contextlib import asynccontextmanager
 from fiber.logging_utils import get_logger
 try:
@@ -100,9 +100,6 @@ class BaseDatabaseManager(ABC):
             # Connection management
             self._active_sessions = set()
             self._active_operations = 0
-            self._operation_lock = asyncio.Lock()
-            self._session_lock = asyncio.Lock()
-            self._pool_semaphore = asyncio.Semaphore(self.MAX_CONNECTIONS)
             
             # Pool health monitoring
             self._last_pool_check = 0
@@ -274,14 +271,13 @@ class BaseDatabaseManager(ABC):
                             logger.info(f"Recovery attempt {attempt + 1}/{self.POOL_RECOVERY_ATTEMPTS}")
                             
                             # Close all active sessions first
-                            async with self._session_lock:
-                                for session in self._active_sessions.copy():
-                                    try:
-                                        await session.close()
-                                    except Exception as e:
-                                        logger.error(f"Error closing session: {e}")
-                                self._active_sessions.clear()
-                                self._active_operations = 0
+                            for session in self._active_sessions.copy():
+                                try:
+                                    await session.close()
+                                except Exception as e:
+                                    logger.error(f"Error closing session: {e}")
+                            self._active_sessions.clear()
+                            self._active_operations = 0
 
                             # Dispose of the engine
                             if self._engine:
@@ -497,79 +493,78 @@ class BaseDatabaseManager(ABC):
     @asynccontextmanager
     async def session(self):
         """
-        Context manager for database sessions.
-        Handles connection pooling and cleanup.
-        
-        Yields:
-            AsyncSession: Database session
+        Provide a SQLAlchemy AsyncSession from the managed pool.
+        Handles circuit breaker logic and session lifecycle.
         """
         await self.ensure_engine_initialized()
-        if not self._engine or not self._session_factory:
-            logger.error("Database engine or session factory not initialized. Cannot create session.")
-            raise DatabaseConnectionError("Engine/Session factory not initialized")
-
-        current_loop = asyncio.get_running_loop()
-        if self.db_loop is not None and self.db_loop is not current_loop:
-            logger.critical(
-                f"CRITICAL: Attempting to create a database session from a different event loop. "
-                f"Engine initialized on loop {self.db_loop}, current session requested from loop {current_loop}."
-            )
-            raise DatabaseError(
-                f"Database session requested from loop {current_loop}, but engine is bound to loop {self.db_loop}. "
-                "This can lead to 'Task attached to a different loop' errors. "
-                "Ensure database operations occur on the same event loop where the engine was initialized."
-            )
 
         if not await self._check_circuit_breaker():
+            logger.error("Circuit breaker is open. Database operation aborted.")
             raise CircuitBreakerError("Circuit breaker is open")
-            
-        session_instance: Optional[AsyncSession] = None
-        start_time = time.time()
-        caller = traceback.extract_stack()[-3]  # Get calling frame
-        session_id_str = "unassigned"
-        
-        try:
-            session_instance = self._session_factory()
-            session_id_str = str(id(session_instance))
 
-            async with self._session_lock:
-                self._active_sessions.add(session_instance)
-                self._active_operations += 1
-            
-            yield session_instance
-                
-            await self._update_circuit_breaker(True)
-                
-        except Exception as e:
-            await self._update_circuit_breaker(False)
-            logger.error(
-                f"Session error in {session_id_str} from "
-                f"{caller.filename}:{caller.lineno} ({caller.name}): {str(e)}"
-            )
-            if isinstance(e, (DatabaseError, SQLAlchemyError)):
-                raise
-            raise DatabaseConnectionError(f"Session error for {session_id_str}: {str(e)}") from e
+        # if not await self._check_pool_health(): # Temporarily disable for focused debugging
+        #     logger.error("Database pool health check failed. Operation aborted.")
+        #     raise DatabaseConnectionError("Database pool is unhealthy")
+
+        # Increment active operations (still useful for monitoring)
+        # Consider if a separate lock for this counter is truly needed if _session_lock is gone.
+        # For now, let's assume _operation_lock handles this if it exists, or it's atomic enough.
+        self._active_operations += 1
         
+        session_instance: Optional[AsyncSession] = None
+        success = False
+        try:
+            # Directly use the session factory from SQLAlchemy
+            async with self._session_factory() as session_instance:
+                self._active_sessions.add(id(session_instance))
+                logger.debug(f"Session {id(session_instance)} acquired. Active sessions: {len(self._active_sessions)}")
+                yield session_instance
+                success = True # Assume success if no exception before this point
+        except asyncio.CancelledError:
+            logger.warning(f"Session usage cancelled for session {id(session_instance) if session_instance else 'N/A'}")
+            success = False # Mark as not successful if cancelled
+            raise
+        except OperationalError as e: # Catch SQLAlchemy operational errors (includes connection issues)
+            logger.error(f"Database operational error during session usage: {e}")
+            success = False
+            await self._update_circuit_breaker(False)
+            # Attempt to reset pool if it's a connection issue
+            if "connection" in str(e).lower() or "pool" in str(e).lower():
+                logger.warning("Attempting to reset database pool due to operational error.")
+                asyncio.create_task(self.reset_pool()) # Non-blocking reset
+            raise DatabaseConnectionError(f"Database operational error: {e}") from e
+        except SQLAlchemyError as e: # Catch other SQLAlchemy errors
+            logger.error(f"SQLAlchemy error during session usage: {e}")
+            success = False
+            await self._update_circuit_breaker(False)
+            raise DatabaseError(f"SQLAlchemy error: {e}") from e
+        except Exception as e:
+            logger.error(f"Unexpected error during session usage: {e}")
+            success = False
+            # Do not update circuit breaker for truly unexpected errors here,
+            # let the specific operation's error handling do that if appropriate.
+            raise DatabaseError(f"Unexpected error in session: {e}") from e
         finally:
-            if session_instance:
-                try:
-                    async with self._session_lock:
-                        if session_instance in self._active_sessions:
-                            self._active_sessions.remove(session_instance)
-                            self._active_operations -= 1
-                    await session_instance.close()
-                    
-                    duration = time.time() - start_time
-                    if duration > self.DEFAULT_QUERY_TIMEOUT / 2:
-                        logger.warning(
-                            f"Long-running session {session_id_str} usage detected: "
-                            f"{duration:.2f}s from {caller.filename}:{caller.lineno} ({caller.name})"
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"Error cleaning up session {session_id_str} from "
-                        f"{caller.filename}:{caller.lineno} ({caller.name}): {e}"
-                    )
+            if session_instance and id(session_instance) in self._active_sessions:
+                if session_instance.is_active and session_instance.in_transaction():
+                    logger.error(f"CRITICAL_BASE_SESSION: Session {id(session_instance)} is being released from BaseDatabaseManager.session() while still in_transaction! Forcing rollback.")
+                    try:
+                        await session_instance.rollback()
+                        logger.info(f"CRITICAL_BASE_SESSION: Forced rollback for session {id(session_instance)} was successful.")
+                    except Exception as e_base_rollback:
+                        logger.error(f"CRITICAL_BASE_SESSION: Forced rollback for session {id(session_instance)} FAILED: {e_base_rollback}")
+                self._active_sessions.remove(id(session_instance))
+                logger.debug(f"Session {id(session_instance)} released. Active sessions: {len(self._active_sessions)}")
+            
+            self._active_operations -= 1
+            # No _pool_semaphore to release
+
+            # Update circuit breaker based on whether the session usage block completed without known DB errors
+            # This might need refinement if success=True even when an inner operation failed but didn't bubble up as SQLAlchemyError
+            if success is not None: # Only update if success was determined
+                 await self._update_circuit_breaker(success)
+                 if not success:
+                    logger.warning(f"Operation within session {id(session_instance) if session_instance else 'N/A'} marked as failed for circuit breaker.")
 
     @with_timeout(CONNECTION_TEST_TIMEOUT)
     async def _test_connection(self, session: AsyncSession) -> bool:
@@ -969,18 +964,13 @@ class BaseDatabaseManager(ABC):
             logger.info("Starting database pool reset")
             
             # First close all active sessions
-            async with self._session_lock:
-                active_session_count = len(self._active_sessions)
-                if active_session_count > 0:
-                    logger.warning(f"Closing {active_session_count} active sessions")
-                    
-                for session in self._active_sessions.copy():
-                    try:
-                        await session.close()
-                    except Exception as e:
-                        logger.error(f"Error closing session during pool reset: {e}")
-                self._active_sessions.clear()
-                self._active_operations = 0
+            for session in self._active_sessions.copy():
+                try:
+                    await session.close()
+                except Exception as e:
+                    logger.error(f"Error closing session during pool reset: {e}")
+            self._active_sessions.clear()
+            self._active_operations = 0
 
             # Dispose of the engine if it exists
             if self._engine:
@@ -1024,14 +1014,13 @@ class BaseDatabaseManager(ABC):
     async def close(self) -> None:
         """Close all database connections and cleanup resources."""
         try:
-            async with self._session_lock:
-                for session in self._active_sessions.copy():
-                    try:
-                        await session.close()
-                    except Exception as e:
-                        logger.error(f"Error closing session during cleanup: {e}")
-                self._active_sessions.clear()
-                self._active_operations = 0
+            for session in self._active_sessions.copy():
+                try:
+                    await session.close()
+                except Exception as e:
+                    logger.error(f"Error closing session during cleanup: {e}")
+            self._active_sessions.clear()
+            self._active_operations = 0
 
             if self._engine:
                 await self._engine.dispose()

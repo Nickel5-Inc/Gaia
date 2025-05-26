@@ -48,7 +48,13 @@ async def _update_run_status(task_instance: 'WeatherTask', run_id: int, status: 
         WHERE id = :run_id
     """
     try:
+        query_preview = query[:200].replace('\n', ' ')
+        logger.info(f"[Run {run_id}] ABOUT TO EXECUTE update status to '{status}'. Query: {query_preview}")
         await task_instance.db_manager.execute(query, params)
+        logger.info(f"[Run {run_id}] SUCCESSFULLY EXECUTED update status to '{status}'.")
+    except asyncio.CancelledError:
+        logger.warning(f"[Run {run_id}] UPDATE RUN STATUS CANCELLED while trying to set status to '{status}'.")
+        raise
     except Exception as db_err:
         logger.error(f"[Run {run_id}] Failed to update run status to '{status}': {db_err}", exc_info=True)
 

@@ -224,6 +224,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 connect_args={
                     "command_timeout": self.VALIDATOR_QUERY_TIMEOUT, # Use validator timeout
                     "timeout": self.DEFAULT_CONNECTION_TIMEOUT, # Use base class connection timeout
+                    "server_settings": {"application_name": f"gaia_validator_{os.getpid()}"} # Explicitly set application_name
                 }
             )
             
@@ -777,14 +778,52 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 return None
                 
             if session:
+                # If an external session is passed, assume the caller manages the transaction
                 result = await session.execute(text(query), params or {})
                 return result
             else:
+                # Create a new session and manage the transaction explicitly
                 async with self.session() as new_session:
-                    async with new_session.begin():
+                    transaction_started = False
+                    try:
+                        await new_session.begin()
+                        transaction_started = True
                         result = await new_session.execute(text(query), params or {})
-                    return result
+                        # If execute was successful, try to commit
+                        await new_session.commit()
+                        logger.debug(f"Transaction committed successfully for session {id(new_session)} after query: {query[:100]}...")
+                        return result
+                    except asyncio.CancelledError:
+                        logger.warning(f"Execute operation cancelled for session {id(new_session)} query: {query[:100]}...")
+                        if transaction_started and new_session.is_active: # Only rollback if begin succeeded and session active
+                            logger.warning(f"Attempting rollback for session {id(new_session)} due to cancellation.")
+                            try:
+                                await new_session.rollback()
+                                logger.info(f"Rollback successful for session {id(new_session)} due to cancellation.")
+                            except Exception as e_rollback_cancel:
+                                logger.error(f"Rollback attempt FAILED for session {id(new_session)} after cancellation: {e_rollback_cancel}")
+                        raise # Re-raise CancelledError
+                    except Exception as e_inner:
+                        logger.error(f"Error during query transaction for session {id(new_session)} (query: {query[:100]}...): {e_inner}. Attempting rollback.")
+                        if transaction_started and new_session.is_active: # Only rollback if begin succeeded and session active
+                            logger.warning(f"Attempting rollback for session {id(new_session)} due to error: {e_inner}.")
+                            try:
+                                await new_session.rollback()
+                                logger.info(f"Rollback successful for session {id(new_session)} due to error: {e_inner}")
+                            except Exception as e_rollback_inner:
+                                logger.error(f"Rollback attempt FAILED for session {id(new_session)} after error: {e_rollback_inner}")
+                        raise # Re-raise the original query execution error
+                    finally:
+                        if transaction_started and new_session.is_active and new_session.in_transaction():
+                            logger.error(f"CRITICAL: Session {id(new_session)} exiting 'execute' method still in transaction. This should not happen. Forcing rollback.")
+                            try:
+                                await new_session.rollback()
+                                logger.info(f"Forced rollback in finally block for session {id(new_session)} was successful.")
+                            except Exception as e_final_rollback:
+                                logger.error(f"Forced rollback in finally block for session {id(new_session)} FAILED: {e_final_rollback}")
         except Exception as e:
-            logger.error(f"Error executing query: {str(e)}")
-            logger.error(traceback.format_exc())
+            # Avoid re-logging if already logged by the inner exception block
+            if not isinstance(e, DatabaseError): # Assuming DatabaseError is raised by self.session() or explicitly
+                 logger.error(f"Error executing query (outer): {str(e)}")
+                 logger.error(traceback.format_exc())
             raise DatabaseError(f"Failed to execute query: {str(e)}")
