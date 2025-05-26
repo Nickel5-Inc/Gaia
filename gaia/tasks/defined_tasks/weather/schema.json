@@ -81,14 +81,20 @@
             "calculation_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
             "metrics": "JSONB",
             "score": "FLOAT",
-            "error_message": "TEXT"
+            "error_message": "TEXT",
+            "lead_hours": "INTEGER",
+            "variable_level": "VARCHAR(50)",
+            "valid_time_utc": "TIMESTAMP WITH TIME ZONE"
         },
         "indexes": [
             {"column": "run_id", "unique": false},
             {"column": "miner_uid", "unique": false},
             {"column": "miner_hotkey", "unique": false},
             {"column": "calculation_time", "unique": false},
-            {"column": "score_type", "unique": false}
+            {"column": "score_type", "unique": false},
+            {"column": "lead_hours", "unique": false},
+            {"column": "variable_level", "unique": false},
+            {"column": "valid_time_utc", "unique": false}
         ],
         "foreign_keys": [
             {
@@ -104,11 +110,11 @@
         ],
         "unique_constraints": [
             {
-                "name": "uq_weather_miner_scores_response_id_score_type",
-                "columns": ["response_id", "score_type"]
+                "name": "uq_wms_response_scoretype_lead_var_time",
+                "columns": ["response_id", "score_type", "lead_hours", "variable_level", "valid_time_utc"]
             }
         ],
-        "comment": "Stores calculated scores (e.g., gfs_rmse, era5_rmse) for each miner response."
+        "comment": "Stores calculated scores (e.g., gfs_rmse, era5_rmse) for each miner response, detailed by lead time and variable."
     },
     "weather_ensemble_forecasts": {
         "table_name": "weather_ensemble_forecasts",

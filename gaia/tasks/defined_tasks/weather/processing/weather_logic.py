@@ -843,7 +843,7 @@ async def calculate_era5_miner_score(
     insert_query = """
         INSERT INTO weather_miner_scores 
         (response_id, run_id, miner_uid, miner_hotkey, score_type, score, metrics, calculation_time, error_message, lead_hours, variable_level, valid_time_utc)
-        VALUES (:response_id, :run_id, :miner_uid, :miner_hotkey, :score_type, :score, :metrics_json::jsonb, :calculation_time, :error_message, :lead_hours, :variable_level, :valid_time_utc)
+        VALUES (:response_id, :run_id, :miner_uid, :miner_hotkey, :score_type, :score, :metrics_json, :calculation_time, :error_message, :lead_hours, :variable_level, :valid_time_utc)
         ON CONFLICT (response_id, score_type, lead_hours, variable_level, valid_time_utc) DO UPDATE SET 
         score = EXCLUDED.score, metrics = EXCLUDED.metrics, calculation_time = EXCLUDED.calculation_time, error_message = EXCLUDED.error_message,
         miner_uid = EXCLUDED.miner_uid, miner_hotkey = EXCLUDED.miner_hotkey, run_id = EXCLUDED.run_id 
@@ -986,7 +986,7 @@ async def _calculate_and_store_aggregated_era5_score(
     insert_agg_query = """
         INSERT INTO weather_miner_scores 
         (response_id, run_id, miner_uid, miner_hotkey, score_type, score, metrics, calculation_time, error_message, lead_hours, variable_level, valid_time_utc)
-        VALUES (:response_id, :run_id, :miner_uid, :miner_hotkey, :score_type, :score, :metrics_json::jsonb, :calculation_time, :error_message, :lead_hours, :variable_level, :valid_time_utc)
+        VALUES (:response_id, :run_id, :miner_uid, :miner_hotkey, :score_type, :score, :metrics_json, :calculation_time, :error_message, :lead_hours, :variable_level, :valid_time_utc)
         ON CONFLICT (response_id, score_type) DO UPDATE SET 
         score = EXCLUDED.score, metrics = EXCLUDED.metrics, calculation_time = EXCLUDED.calculation_time, error_message = EXCLUDED.error_message,
         run_id = EXCLUDED.run_id, miner_uid = EXCLUDED.miner_uid, miner_hotkey = EXCLUDED.miner_hotkey
