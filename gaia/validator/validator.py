@@ -446,24 +446,58 @@ class GaiaValidator:
             }
         raise TypeError(f"Type {type(obj)} not serializable")
 
-    async def query_miners(self, payload: Dict, endpoint: str) -> Dict:
+    async def query_miners(self, payload: Dict, endpoint: str, hotkeys: Optional[List[str]] = None) -> Dict:
         """Query miners with the given payload in parallel."""
         try:
-            logger.info(f"Querying miners with payload size: {len(str(payload))} bytes")
+            logger.info(f"Querying miners for endpoint {endpoint} with payload size: {len(str(payload))} bytes. Specified hotkeys: {hotkeys if hotkeys else 'All/Default'}")
             if "data" in payload and "combined_data" in payload["data"]:
                 logger.debug(f"TIFF data size before serialization: {len(payload['data']['combined_data'])} bytes")
                 if isinstance(payload["data"]["combined_data"], bytes):
                     logger.debug(f"TIFF header before serialization: {payload['data']['combined_data'][:4]}")
 
             responses = {}
-            self.metagraph.sync_nodes()
+            
+            current_time = time.time()
+            if self.metagraph is None or current_time - self.last_metagraph_sync > self.metagraph_sync_interval:
+                logger.info(f"Metagraph not initialized or sync interval ({self.metagraph_sync_interval}s) exceeded. Syncing metagraph before querying miners. Last sync: {current_time - self.last_metagraph_sync if self.metagraph else 'Never'}s ago.")
+                try:
+                    await asyncio.wait_for(self._sync_metagraph(), timeout=60.0) 
+                except asyncio.TimeoutError:
+                    logger.error("Metagraph sync timed out within query_miners. Proceeding with potentially stale metagraph.")
+                except Exception as e_sync:
+                    logger.error(f"Error during metagraph sync in query_miners: {e_sync}. Proceeding with potentially stale metagraph.")
+            else:
+                logger.debug(f"Metagraph recently synced. Skipping sync for this query_miners call. Last sync: {current_time - self.last_metagraph_sync:.2f}s ago.")
 
-            # In test mode, select 10 random miners
-            miners_to_query = self.metagraph.nodes
-            if self.args.test and len(miners_to_query) > 10:
-                hotkeys = list(miners_to_query.keys())[:10]
-                miners_to_query = {k: miners_to_query[k] for k in hotkeys}
-                logger.info(f"Test mode: Selected the first {len(miners_to_query)} miners to query")
+            if not self.metagraph or not self.metagraph.nodes:
+                logger.error("Metagraph not available or no nodes in metagraph after sync attempt. Cannot query miners.")
+                return {}
+
+            nodes_to_consider = self.metagraph.nodes
+            miners_to_query = {}
+
+            if hotkeys:
+                logger.info(f"Targeting specific hotkeys: {hotkeys}")
+                for hk in hotkeys:
+                    if hk in nodes_to_consider:
+                        miners_to_query[hk] = nodes_to_consider[hk]
+                    else:
+                        logger.warning(f"Specified hotkey {hk} not found in current metagraph. Skipping.")
+                if not miners_to_query:
+                    logger.warning(f"No specified hotkeys found in metagraph. Querying will be empty for endpoint: {endpoint}")
+                    return {}
+            else:
+                miners_to_query = nodes_to_consider
+                if self.args.test and len(miners_to_query) > 10:
+                    selected_hotkeys_for_test = list(miners_to_query.keys())[:10]
+                    miners_to_query = {k: miners_to_query[k] for k in selected_hotkeys_for_test}
+                    logger.info(f"Test mode: Selected the first {len(miners_to_query)} miners to query for endpoint: {endpoint} (no specific hotkeys provided).")
+                elif not self.args.test:
+                    logger.info(f"Querying all {len(miners_to_query)} available miners for endpoint: {endpoint} (no specific hotkeys provided).")
+
+            if not miners_to_query:
+                logger.warning(f"No miners to query for endpoint {endpoint} after filtering. Hotkeys: {hotkeys}")
+                return {}
 
             # Create a shared client with optimized connection pooling
             limits = httpx.Limits(max_keepalive_connections=20, max_connections=30, keepalive_expiry=30.0)

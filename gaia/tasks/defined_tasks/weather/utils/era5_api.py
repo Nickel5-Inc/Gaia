@@ -115,18 +115,27 @@ async def fetch_era5_data(
             temp_sl_file = Path(temp_sl_path)
             temp_pl_file = Path(temp_pl_path)
 
-            logger.info(f"Requesting ERA5 single level data...")
+            api_sl_vars = ['2m_temperature', '10m_u_component_of_wind', '10m_v_component_of_wind', 'mean_sea_level_pressure']
+            api_pl_vars = ['temperature', 'u_component_of_wind', 'v_component_of_wind', 'specific_humidity', 'geopotential']
+
+            current_single_level_request = single_level_request.copy()
+            current_single_level_request['variable'] = api_sl_vars
+
+            current_pressure_level_request = pressure_level_request.copy()
+            current_pressure_level_request['variable'] = api_pl_vars
+
+            logger.info(f"Requesting ERA5 single level data with vars: {api_sl_vars}...")
             c.retrieve(
                 'reanalysis-era5-single-levels',
-                single_level_request,
+                current_single_level_request,
                 str(temp_sl_file)
             )
             logger.info(f"Single level data downloaded to {temp_sl_file}")
 
-            logger.info(f"Requesting ERA5 pressure level data...")
+            logger.info(f"Requesting ERA5 pressure level data with vars: {api_pl_vars}...")
             c.retrieve(
                 'reanalysis-era5-pressure-levels',
-                pressure_level_request,
+                current_pressure_level_request,
                 str(temp_pl_file)
             )
             logger.info(f"Pressure level data downloaded to {temp_pl_file}")
@@ -135,13 +144,29 @@ async def fetch_era5_data(
             ds_sl = xr.open_dataset(temp_sl_file)
             ds_pl = xr.open_dataset(temp_pl_file)
 
-            logger.info(f"Original ds_sl variables: {list(ds_sl.variables)}")
-            logger.info(f"Original ds_sl data_vars: {list(ds_sl.data_vars)}")
-            logger.info(f"Original ds_sl coords: {list(ds_sl.coords)}")
+            logger.info(f"Variables in downloaded single-level ERA5: {list(ds_sl.data_vars)}")
+            logger.info(f"Variables in downloaded pressure-level ERA5: {list(ds_pl.data_vars)}")
 
-            ds_sl_renamed = ds_sl.rename({k: v for k, v in ERA5_SINGLE_LEVEL_VARS.items() if k in ds_sl})
-            ds_pl_renamed = ds_pl.rename({k: v for k, v in ERA5_PRESSURE_LEVEL_VARS.items() if k in ds_pl})
+            rename_map_sl = {
+                't2m': '2t',
+                'u10': '10u',
+                'v10': '10v',
+                'msl': 'msl' 
+            }
+            rename_map_pl = {
+                't': 't',
+                'u': 'u',
+                'v': 'v',
+                'q': 'q',
+                'z': 'z'
+            }
+
+            ds_sl_renamed = ds_sl.rename({k: v for k, v in rename_map_sl.items() if k in ds_sl})
+            ds_pl_renamed = ds_pl.rename({k: v for k, v in rename_map_pl.items() if k in ds_pl})
             
+            if '2t' not in ds_sl_renamed.data_vars and ('t2m' in ds_sl.data_vars or '2m_temperature' in ds_sl.data_vars) :
+                logger.warning(f"Variable '2t' not found after renaming. Original SL vars: {list(ds_sl.data_vars)}. Renamed SL vars: {list(ds_sl_renamed.data_vars)}")
+
             logger.info(f"Renamed ds_sl_renamed data_vars: {list(ds_sl_renamed.data_vars)}")
             logger.info(f"Renamed ds_pl_renamed data_vars: {list(ds_pl_renamed.data_vars)}")
             

@@ -526,7 +526,8 @@ class WeatherTask(Task):
                         
                         all_responses = await validator.query_miners(
                             payload=status_payload,
-                            endpoint=endpoint
+                            endpoint=endpoint,
+                            hotkeys=[miner_hk]
                         )
                         
                         status_response = all_responses.get(miner_hk)
@@ -834,7 +835,7 @@ class WeatherTask(Task):
             active_miners_query = "SELECT DISTINCT uid FROM node_table WHERE hotkey IS NOT NULL AND uid >= 0 AND uid < 256"
             result = await session.execute(text(active_miners_query))
             active_miner_uids_records = result.fetchall()
-            active_uids = {rec['uid'] for rec in active_miner_uids_records}
+            active_uids = {rec.uid for rec in active_miner_uids_records}
 
         day1_qc_score_type = "day1_qc_score"
         query_day1_miner_scores = """
@@ -848,10 +849,10 @@ class WeatherTask(Task):
             async with self.db_manager.session(operation_name="fetch_latest_day1_score_for_uid") as session:
                 result = await session.execute(text(query_day1_miner_scores), {"miner_uid": uid, "score_type": day1_qc_score_type})
                 res_day1 = result.fetchone()
-                if res_day1 and res_day1['score'] is not None and np.isfinite(res_day1['score']):
-                    latest_day1_scores_array[uid] = float(res_day1['score'])
-                    if latest_day1_timestamp is None or res_day1['calculation_time'] > latest_day1_timestamp:
-                        latest_day1_timestamp = res_day1['calculation_time']
+                if res_day1 and res_day1.score is not None and np.isfinite(res_day1.score):
+                    latest_day1_scores_array[uid] = float(res_day1.score)
+                    if latest_day1_timestamp is None or res_day1.calculation_time > latest_day1_timestamp:
+                        latest_day1_timestamp = res_day1.calculation_time
         
         if latest_day1_timestamp:
             logger.info(f"[CombinedWeatherScore] Fetched latest Day-1 QC scores for {len(active_uids)} active UIDs, latest timestamp: {latest_day1_timestamp}.")
@@ -868,8 +869,8 @@ class WeatherTask(Task):
             async with self.db_manager.session(operation_name="fetch_latest_era5_composite_score_for_uid") as session:
                 result = await session.execute(text(query_era5_composite), {"miner_uid": uid, "score_type": era5_composite_score_type})
                 res_era5 = result.fetchone()
-                if res_era5 and res_era5['score'] is not None and np.isfinite(res_era5['score']):
-                    latest_era5_composite_scores_array[uid] = float(res_era5['score'])
+                if res_era5 and res_era5.score is not None and np.isfinite(res_era5.score):
+                    latest_era5_composite_scores_array[uid] = float(res_era5.score)
         logger.info(f"[CombinedWeatherScore] Fetched ERA5 composite scores for {len(active_uids)} active UIDs.")
 
         W_day1 = self.config.get('weather_score_day1_weight', 0.2)
@@ -898,8 +899,8 @@ class WeatherTask(Task):
                 ORDER BY calculation_time DESC LIMIT 1
             """
             candidate_scores_for_category = []
-            for uid in active_uids:
-                metric_res = await self.db_manager.fetch_one(query_bonus_metric, {"score_type": metric_to_query, "miner_uid": uid})
+            for uid_val in active_uids:
+                metric_res = await self.db_manager.fetch_one(query_bonus_metric, {"score_type": metric_to_query, "miner_uid": uid_val})
                 if metric_res and metric_res['score'] is not None and np.isfinite(metric_res['score']):
                     score = float(metric_res['score'])
                     eligible = True
@@ -909,7 +910,7 @@ class WeatherTask(Task):
                         elif not higher_is_better and score > min_thresh:
                             eligible = False
                     if eligible:
-                        candidate_scores_for_category.append((score, uid))
+                        candidate_scores_for_category.append((score, uid_val))
             
             if not candidate_scores_for_category:
                 logger.info(f"[CombinedWeatherScore] No eligible miners for bonus: {category['id']}")

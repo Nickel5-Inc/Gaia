@@ -242,7 +242,9 @@ async def _request_fresh_token(task_instance: 'WeatherTask', miner_hotkey: str, 
     endpoint_to_call = "/weather-kerchunk-request"
     try:
         all_responses = await task_instance.validator.query_miners(
-            payload=forecast_request_payload, endpoint=endpoint_to_call
+            payload=forecast_request_payload, 
+            endpoint=endpoint_to_call,
+            hotkeys=[miner_hotkey]
         )
         response_dict = all_responses.get(miner_hotkey)
         if not response_dict: return None
@@ -725,16 +727,20 @@ async def calculate_era5_miner_score(
                     
                     target_grid_for_interp = truth_var_da_std
                     if 'lat' in target_grid_for_interp.dims and len(target_grid_for_interp.lat) > 1 and target_grid_for_interp.lat.values[0] < target_grid_for_interp.lat.values[-1]:
-                        target_grid_for_interp = target_grid_for_interp.isel(lat=slice(None, None, -1))
+                        target_grid_for_interp = await asyncio.to_thread(target_grid_for_interp.isel, lat=slice(None, None, -1))
 
-                    miner_var_da_aligned = miner_var_da_std.interp_like(target_grid_for_interp, method="linear", kwargs={"fill_value": None})
+                    miner_var_da_aligned = await asyncio.to_thread(
+                        miner_var_da_std.interp_like, target_grid_for_interp, method="linear", kwargs={"fill_value": None}
+                    )
                     truth_var_da_final = target_grid_for_interp
                     
                     clim_var_to_interpolate = climatology_var_da_std
                     if var_level and 'pressure_level' in clim_var_to_interpolate.dims and 'pressure_level' not in truth_var_da_final.dims:
-                         clim_var_to_interpolate = clim_var_to_interpolate.sel(pressure_level=var_level, method="nearest").squeeze(drop=True)
+                        clim_var_to_interpolate = clim_var_to_interpolate.sel(pressure_level=var_level, method="nearest").squeeze(drop=True)
                     
-                    climatology_da_aligned = clim_var_to_interpolate.interp_like(truth_var_da_final, method="linear", kwargs={"fill_value": None})
+                    climatology_da_aligned = await asyncio.to_thread(
+                        clim_var_to_interpolate.interp_like, truth_var_da_final, method="linear", kwargs={"fill_value": None}
+                    )
 
                     logger.info(f"[FinalScore info Metric Input] Var: {var_key}, Level: {var_level}")
                     logger.info(f"[FinalScore info Metric Input] truth_var_da_final -> Shape: {truth_var_da_final.shape}, Dims: {truth_var_da_final.dims}, Coords: {list(truth_var_da_final.coords.keys())}")
@@ -743,17 +749,37 @@ async def calculate_era5_miner_score(
 
                     lat_weights = None
                     if 'lat' in truth_var_da_final.dims:
-                        one_d_lat_weights = _calculate_latitude_weights(truth_var_da_final['lat'])
-                        _, lat_weights = xr.broadcast(truth_var_da_final, one_d_lat_weights)
+                        one_d_lat_weights = await asyncio.to_thread(_calculate_latitude_weights, truth_var_da_final['lat'])
+                        _, lat_weights = await asyncio.to_thread(xr.broadcast, truth_var_da_final, one_d_lat_weights)
 
                     current_metrics = {}
                     bias_corrected_forecast_da = await calculate_bias_corrected_forecast(miner_var_da_aligned, truth_var_da_final)
+                    
                     actual_bias_op = (miner_var_da_aligned - truth_var_da_final)
-                    mean_bias_val = float((await asyncio.to_thread(actual_bias_op.mean().compute) if hasattr(actual_bias_op.mean(), 'compute') else actual_bias_op.mean()).item())
+                    
+                    async def calculate_mean_scalar_threaded(op):
+                        computed_mean = op.mean()
+                        if hasattr(computed_mean, 'compute'):
+                            computed_mean = computed_mean.compute()
+                        return float(computed_mean.item())
+                    
+                    mean_bias_val = await asyncio.to_thread(calculate_mean_scalar_threaded, actual_bias_op)
                     current_metrics["bias"] = mean_bias_val
 
-                    raw_mse_op = xs.mse(miner_var_da_aligned, truth_var_da_final, dim=[d for d in truth_var_da_final.dims if d in ('lat', 'lon')], weights=lat_weights, skipna=True)
-                    raw_mse_val = float((await asyncio.to_thread(raw_mse_op.compute) if hasattr(raw_mse_op, 'compute') else raw_mse_op).item())
+                    def calculate_raw_mse_scalar_threaded(*args, **kwargs):
+                        res = xs.mse(*args, **kwargs)
+                        if hasattr(res, 'compute'):
+                            res = res.compute()
+                        return float(res.item())
+
+                    raw_mse_val = await asyncio.to_thread(
+                        calculate_raw_mse_scalar_threaded,
+                        miner_var_da_aligned, 
+                        truth_var_da_final, 
+                        dim=[d for d in truth_var_da_final.dims if d in ('lat', 'lon')], 
+                        weights=lat_weights, 
+                        skipna=True
+                    )
                     current_metrics["mse"] = raw_mse_val
                     current_metrics["rmse"] = np.sqrt(raw_mse_val)
                     
@@ -792,8 +818,14 @@ async def calculate_era5_miner_score(
                                         "score": skill_score_val
                                        }
                     all_metrics_for_db.append(skill_metric_row)
-                    logger.info(f"[FinalScore] Miner {miner_hotkey} V:{var_key} L:{int(lead_hours)}h RMSE:{current_metrics.get('rmse', np.nan):.2f} ACC:{current_metrics.get('acc', np.nan):.3f} SKILL(clim):{skill_score_val:.3f}")
+                    
+                    skill_score_log_str = f"{skill_score_val:.3f}" if skill_score_val is not None else "N/A"
+                    logger.info(f"[FinalScore] Miner {miner_hotkey} V:{var_key} L:{int(lead_hours)}h RMSE:{current_metrics.get('rmse', np.nan):.2f} ACC:{current_metrics.get('acc', np.nan):.3f} SKILL(clim):{skill_score_log_str}")
 
+                except KeyError as ke:
+                    logger.error(f"[FinalScore] Miner {miner_hotkey}: KeyError scoring {var_key} at {valid_time_dt}: {ke}. This often means the variable was not found in one of the datasets (miner, truth, or climatology).", exc_info=True)
+                    error_metric_row = {**db_metric_row_base, "score_type": f"era5_error_{var_key}_{int(lead_hours)}h", "error_message": f"KeyError: {ke}"}
+                    all_metrics_for_db.append(error_metric_row)
                 except Exception as e_var_score:
                     logger.error(f"[FinalScore] Miner {miner_hotkey}: Error scoring {var_key} at {valid_time_dt}: {e_var_score}", exc_info=True)
                     error_metric_row = {**db_metric_row_base, "score_type": f"era5_error_{var_key}_{int(lead_hours)}h", "error_message": str(e_var_score)}

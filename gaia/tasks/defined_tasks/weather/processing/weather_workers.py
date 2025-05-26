@@ -495,6 +495,7 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 run_id = await asyncio.wait_for(task_instance.initial_scoring_queue.get(), timeout=5.0)
                 processed_a_run = True
             except asyncio.TimeoutError:
+                await asyncio.sleep(1)
                 continue 
             
             logger.info(f"[Day1ScoringWorker] Processing Day-1 QC scores for run {run_id}")
@@ -750,22 +751,25 @@ async def finalize_scores_worker(self):
     ERA5_DELAY_DAYS = int(self.config.get('era5_delay_days', 5))
     FORECAST_DURATION_HOURS = int(self.config.get('forecast_duration_hours', 240))
 
+    era5_climatology_ds_for_cycle = await self._get_or_load_era5_climatology()
+    if era5_climatology_ds_for_cycle is None:
+        logger.error("[FinalizeWorker] ERA5 Climatology not available at worker startup. Worker will not be effective. Please check config.")
+
     while self.final_scoring_worker_running:
         run_id = None
         era5_ds = None
         processed_run_ids = set()
-        era5_climatology_ds_for_cycle = None
 
         try:
             logger.info("[FinalizeWorker] Checking for runs ready for final ERA5 scoring...")
 
             if era5_climatology_ds_for_cycle is None:
+                logger.warning("[FinalizeWorker] ERA5 Climatology was not available, attempting to reload it...")
                 era5_climatology_ds_for_cycle = await self._get_or_load_era5_climatology()
-            
-            if era5_climatology_ds_for_cycle is None:
-                logger.error("[FinalizeWorker] ERA5 Climatology not available. Cannot proceed with final scoring cycle. Will retry.")
-                await asyncio.sleep(CHECK_INTERVAL_SECONDS)
-                continue
+                if era5_climatology_ds_for_cycle is None:
+                    logger.error("[FinalizeWorker] ERA5 Climatology still not available after reload attempt. Cannot proceed with this scoring cycle. Will retry.")
+                    await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+                    continue
 
             now_utc = datetime.now(timezone.utc)
             sparse_lead_hours_config = self.config.get('final_scoring_lead_hours', [120, 168]) # Used for cutoff and passed later
