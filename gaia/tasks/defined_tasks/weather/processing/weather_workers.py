@@ -832,6 +832,11 @@ async def finalize_scores_worker(self):
         logger.error("[FinalizeWorker] ERA5 Climatology not available at worker startup. Worker will not be effective. Please check config.")
 
     while self.final_scoring_worker_running:
+        # Check for shutdown signal at the beginning of each loop iteration
+        if self._shutdown_event.is_set():
+            logger.info("[FinalizeWorker] Shutdown event detected, stopping worker.")
+            break
+
         run_id = None
         era5_ds = None
         processed_run_ids = set()
@@ -893,65 +898,11 @@ async def finalize_scores_worker(self):
 
                 logger.info(f"[FinalizeWorker] Processing final scores for run {run_id} (Init: {gfs_init_time}).")
                 
-                # Use SQLAlchemy update statement
-                stmt = (
-                    update(weather_forecast_runs_table)
-                    .where(weather_forecast_runs_table.c.id == run_id)
-                    .values(final_scoring_attempted_time=now_utc)
+                # Ensure this uses raw SQL as db_manager.execute expects a string for query[:30]
+                await self.db_manager.execute(
+                        "UPDATE weather_forecast_runs SET final_scoring_attempted_time = :now WHERE id = :rid",
+                        {"now": now_utc, "rid": run_id}
                 )
-                await self.db_manager.execute(stmt, execute_on_replica=False) # Assuming execute can take the statement directly
-                                                                          # and params are bound if stmt uses bindparam()
-                                                                          # Or if it directly uses values, params dict might not be needed.
-                                                                          # Let's try without the params dict first if values are direct.
-                                                                          # Re-evaluating: The original call had a params dict.
-                                                                          # If db_manager.execute is a simple wrapper that does conn.execute(text(str(stmt)), params),
-                                                                          # then the named parameters in the original string query were key.
-                                                                          # Let's try to match that pattern if direct value binding in SQLAlchemy stmt doesn't work with it.
-                # Corrected approach: if db_manager.execute expects named parameters in the dict,
-                # the SQLAlchemy statement should reflect that, or db_manager should be adapted.
-                # For now, assuming db_manager can handle a statement with direct values like above.
-                # If it still requires a parameter dict for named params, the stmt would be:
-                # stmt = (
-                #     update(weather_forecast_runs_table)
-                #     .where(weather_forecast_runs_table.c.id == ':rid')
-                #     .values(final_scoring_attempted_time=':now')
-                # )
-                # await self.db_manager.execute(stmt, {"now": now_utc, "rid": run_id})
-                # Given the simplicity, the direct value binding is cleaner if supported by execute().
-
-                # Based on the original call structure: execute(str_query, params_dict)
-                # A more robust change that keeps db_manager.execute generic for string queries with dict params
-                # would be for db_manager.execute to also detect if the first arg is an SQLAlchemy statement.
-                # Let's try the version that is most SQLAlchemy-idiomatic first, assuming the execute method
-                # is smart enough or we are willing to adapt it slightly.
-                # If the `execute` method is a simple pass-through that does `connection.execute(text(str(query)), params)`, 
-                # then the above SQLAlchemy object `stmt` might not be directly compatible with the `params` dict in the same way.
-                # However, good `execute` wrappers often handle SQLAlchemy statement objects directly.
-
-                # Final choice for this edit attempt: direct values in statement, no separate params dict. 
-                # If this is not how db_manager.execute works, it will need adjustment or the SQLAlchemy statement
-                # would need to use bindparam() and pass the dict.
-                
-                # Revisiting the original pattern: `execute(query_str, params_dict)`
-                # The most compatible way with the existing `db_manager.execute` signature if it does not 
-                # specifically parse SQLAlchemy objects is to use bindparam with the SQLAlchemy statement, 
-                # and then pass the dictionary.
-
-                # from sqlalchemy import bindparam
-                # stmt = (
-                #     update(weather_forecast_runs_table)
-                #     .where(weather_forecast_runs_table.c.id == bindparam('rid'))
-                #     .values(final_scoring_attempted_time=bindparam('now'))
-                # )
-                # await self.db_manager.execute(stmt, {"now": now_utc, "rid": run_id})
-
-                # The simplest change if db_manager.execute can handle SQLAlchemy objects and does its own compilation:
-                update_stmt = (
-                    update(weather_forecast_runs_table)
-                    .where(weather_forecast_runs_table.c.id == run_id)
-                    .values(final_scoring_attempted_time=now_utc)
-                )
-                await self.db_manager.execute(update_stmt) # Pass the SQLAlchemy object directly
 
                 target_datetimes_for_run = [gfs_init_time + timedelta(hours=h) for h in sparse_lead_hours_config]
 
