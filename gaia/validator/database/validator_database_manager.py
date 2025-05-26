@@ -801,44 +801,22 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 return result
             else:
                 # Create a new session and manage the transaction explicitly
+                # BaseDatabaseManager.session() now ensures a transaction is started on new_session.
                 async with self.session() as new_session:
-                    transaction_started = False
                     try:
-                        await new_session.begin()
-                        transaction_started = True
+                        # No longer need new_session.begin() here.
                         result = await new_session.execute(text(query), params or {})
-                        # If execute was successful, try to commit
-                        await new_session.commit()
-                        logger.debug(f"Transaction committed successfully for session {id(new_session)} after query: {query[:100]}...")
+                        # BaseDatabaseManager.session() will handle the commit on successful exit.
+                        logger.debug(f"Query executed successfully within session {id(new_session)} for query: {query[:100]}...")
                         return result
                     except asyncio.CancelledError:
                         logger.warning(f"Execute operation cancelled for session {id(new_session)} query: {query[:100]}...")
-                        if transaction_started and new_session.is_active: # Only rollback if begin succeeded and session active
-                            logger.warning(f"Attempting rollback for session {id(new_session)} due to cancellation.")
-                            try:
-                                await new_session.rollback()
-                                logger.info(f"Rollback successful for session {id(new_session)} due to cancellation.")
-                            except Exception as e_rollback_cancel:
-                                logger.error(f"Rollback attempt FAILED for session {id(new_session)} after cancellation: {e_rollback_cancel}")
-                        raise # Re-raise CancelledError
+                        # Rollback will be handled by BaseDatabaseManager.session's except block.
+                        raise # Re-raise CancelledError to be caught by BaseDatabaseManager.session
                     except Exception as e_inner:
-                        logger.error(f"Error during query transaction for session {id(new_session)} (query: {query[:100]}...): {e_inner}. Attempting rollback.")
-                        if transaction_started and new_session.is_active: # Only rollback if begin succeeded and session active
-                            logger.warning(f"Attempting rollback for session {id(new_session)} due to error: {e_inner}.")
-                            try:
-                                await new_session.rollback()
-                                logger.info(f"Rollback successful for session {id(new_session)} due to error: {e_inner}")
-                            except Exception as e_rollback_inner:
-                                logger.error(f"Rollback attempt FAILED for session {id(new_session)} after error: {e_rollback_inner}")
-                        raise # Re-raise the original query execution error
-                    finally:
-                        if transaction_started and new_session.is_active and new_session.in_transaction():
-                            logger.error(f"CRITICAL: Session {id(new_session)} exiting 'execute' method still in transaction. This should not happen. Forcing rollback.")
-                            try:
-                                await new_session.rollback()
-                                logger.info(f"Forced rollback in finally block for session {id(new_session)} was successful.")
-                            except Exception as e_final_rollback:
-                                logger.error(f"Forced rollback in finally block for session {id(new_session)} FAILED: {e_final_rollback}")
+                        logger.error(f"Error during query for session {id(new_session)} (query: {query[:100]}...): {e_inner}.")
+                        # Rollback will be handled by BaseDatabaseManager.session's except block.
+                        raise # Re-raise the original query execution error to be caught by BaseDatabaseManager.session
         except Exception as e:
             # Avoid re-logging if already logged by the inner exception block
             if not isinstance(e, DatabaseError): # Assuming DatabaseError is raised by self.session() or explicitly

@@ -261,6 +261,11 @@ class GaiaValidator:
             logger.warning(f"DB_SYNC_INTERVAL_HOURS is {self.db_sync_interval_hours}, defaulting to 1 hour for safety.")
             self.db_sync_interval_hours = 1
 
+        # For database monitor plotting
+        self.db_monitor_history = []
+        self.db_monitor_history_lock = asyncio.Lock()
+        self.DB_MONITOR_HISTORY_MAX_SIZE = 120 # e.g., 2 hours of data if monitor runs every minute
+
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -1193,7 +1198,8 @@ class GaiaValidator:
                 # The MinerScoreSender task will be added conditionally below
                 #lambda: self.check_for_updates(),
                 lambda: self.manage_earthdata_token(),
-                lambda: self.database_monitor()
+                lambda: self.database_monitor(),
+                lambda: self.plot_database_metrics_periodically() # Added plotting task
             ]
 
             # Add DB Sync tasks conditionally
@@ -2076,7 +2082,9 @@ class GaiaValidator:
         while not self._shutdown_event.is_set():
             await asyncio.sleep(60) # Check every 60 seconds
 
-            stats = {
+            current_timestamp_iso = datetime.now(timezone.utc).isoformat()
+            collected_stats = {
+                "timestamp": current_timestamp_iso, # Add timestamp at the start
                 "connection_summary": "[Query Failed or No Data]",
                 "null_state_connection_details": "[Query Failed or No Data for NULL state details]",
                 "idle_in_transaction_details": "[Query Failed or No Data]",
@@ -2089,31 +2097,24 @@ class GaiaValidator:
             try:
                 # Fetch general operation/session stats from DatabaseManager
                 try:
-                    dm_stats = await self.database_manager.get_operation_stats() # This includes session stats now
-                    # For clarity, we can separate them or add them under a specific key if preferred.
-                    # For now, let's assume get_operation_stats() returns everything needed, including session stats.
-                    # If get_session_stats() is separate and preferred:
-                    session_manager_specific_stats = self.database_manager.get_session_stats()
-                    stats["session_manager_stats"] = session_manager_specific_stats
-                    # Optionally, merge other stats from get_operation_stats() if needed
-                    # E.g., stats["db_operation_counts"] = {
-                    #    k: v for k, v in dm_stats.items() 
-                    #    if k not in ['total_sessions_acquired', 'total_session_time_ms', 'max_session_time_ms', 'min_session_time_ms', 'avg_session_time_ms']
-                    # }
+                    # session_manager_specific_stats = self.database_manager.get_session_stats()
+                    # Corrected call for all stats including session stats:
+                    all_db_manager_stats = self.database_manager.get_session_stats() # Renamed for clarity
+                    collected_stats["session_manager_stats"] = all_db_manager_stats
 
                 except Exception as e:
-                    stats["session_manager_stats"] = f"[Error fetching session manager stats: {type(e).__name__}]"
+                    collected_stats["session_manager_stats"] = f"[Error fetching session manager stats: {type(e).__name__}]"
                     logger.warning(f"[DB Monitor] Error fetching session manager stats: {e}")
 
                 # Query overall connection summary
                 conn_summary_query = "SELECT state, count(*) FROM pg_stat_activity GROUP BY state;"
                 try:
-                    stats["connection_summary"] = await self.database_manager.fetch_all(conn_summary_query, timeout=45.0) # Increased timeout
+                    collected_stats["connection_summary"] = await self.database_manager.fetch_all(conn_summary_query, timeout=45.0)
                 except DatabaseTimeout:
-                    stats["connection_summary"] = "[Query Timed Out]"
+                    collected_stats["connection_summary"] = "[Query Timed Out]"
                     logger.warning("[DB Monitor] Timeout fetching connection summary.")
                 except Exception as e:
-                    stats["connection_summary"] = f"[Query Error: {type(e).__name__}]"
+                    collected_stats["connection_summary"] = f"[Query Error: {type(e).__name__}]"
                     logger.warning(f"[DB Monitor] Error fetching connection summary: {e}")
 
                 # Query details for NULL state connections
@@ -2123,12 +2124,12 @@ class GaiaValidator:
                 WHERE state IS NULL;
                 """
                 try:
-                    stats["null_state_connection_details"] = await self.database_manager.fetch_all(null_state_query, timeout=45.0) # Increased timeout
+                    collected_stats["null_state_connection_details"] = await self.database_manager.fetch_all(null_state_query, timeout=45.0)
                 except DatabaseTimeout:
-                    stats["null_state_connection_details"] = "[Query Timed Out for NULL state details]"
+                    collected_stats["null_state_connection_details"] = "[Query Timed Out for NULL state details]"
                     logger.warning("[DB Monitor] Timeout fetching NULL state connection details.")
                 except Exception as e:
-                    stats["null_state_connection_details"] = f"[Query Error for NULL state details: {type(e).__name__}]"
+                    collected_stats["null_state_connection_details"] = f"[Query Error for NULL state details: {type(e).__name__}]"
                     logger.warning(f"[DB Monitor] Error fetching NULL state connection details: {e}")
                 
                 # Query details for 'idle in transaction' connections
@@ -2139,12 +2140,12 @@ class GaiaValidator:
                 ORDER BY state_change ASC;
                 """
                 try:
-                    stats["idle_in_transaction_details"] = await self.database_manager.fetch_all(idle_in_transaction_query, timeout=45.0) # Increased timeout
+                    collected_stats["idle_in_transaction_details"] = await self.database_manager.fetch_all(idle_in_transaction_query, timeout=45.0)
                 except DatabaseTimeout:
-                    stats["idle_in_transaction_details"] = "[Query Timed Out]"
+                    collected_stats["idle_in_transaction_details"] = "[Query Timed Out]"
                     logger.warning("[DB Monitor] Timeout fetching idle in transaction details.")
                 except Exception as e:
-                    stats["idle_in_transaction_details"] = f"[Query Error: {type(e).__name__}]"
+                    collected_stats["idle_in_transaction_details"] = f"[Query Error: {type(e).__name__}]"
                     logger.warning(f"[DB Monitor] Error fetching idle in transaction details: {e}")
 
                 # Query for lock contention
@@ -2165,12 +2166,12 @@ class GaiaValidator:
                 WHERE activity.wait_event_type = 'Lock';
                 """
                 try:
-                    stats["lock_details"] = await self.database_manager.fetch_all(lock_details_query, timeout=45.0) # Increased timeout
+                    collected_stats["lock_details"] = await self.database_manager.fetch_all(lock_details_query, timeout=45.0)
                 except DatabaseTimeout:
-                    stats["lock_details"] = "[Query Timed Out]"
+                    collected_stats["lock_details"] = "[Query Timed Out]"
                     logger.warning("[DB Monitor] Timeout fetching lock details.")
                 except Exception as e:
-                    stats["lock_details"] = f"[Query Error: {type(e).__name__}]"
+                    collected_stats["lock_details"] = f"[Query Error: {type(e).__name__}]"
                     logger.warning(f"[DB Monitor] Error fetching lock details: {e}")
 
                 # Query for top active queries by wait events (excluding background workers and idle)
@@ -2191,23 +2192,29 @@ class GaiaValidator:
                 ORDER BY query_start ASC;
                 """
                 try:
-                    stats["active_query_wait_events"] = await self.database_manager.fetch_all(active_query_wait_events_query, timeout=45.0) # Increased timeout
+                    collected_stats["active_query_wait_events"] = await self.database_manager.fetch_all(active_query_wait_events_query, timeout=45.0)
                 except DatabaseTimeout:
-                    stats["active_query_wait_events"] = "[Query Timed Out]"
+                    collected_stats["active_query_wait_events"] = "[Query Timed Out]"
                     logger.warning("[DB Monitor] Timeout fetching active query wait events.")
                 except Exception as e:
-                    stats["active_query_wait_events"] = f"[Query Error: {type(e).__name__}]"
+                    collected_stats["active_query_wait_events"] = f"[Query Error: {type(e).__name__}]"
                     logger.warning(f"[DB Monitor] Error fetching active query wait events: {e}")
 
             except Exception as e_outer:
-                stats["error"] = f"Outer error in database_monitor: {str(e_outer)}"
+                collected_stats["error"] = f"Outer error in database_monitor: {str(e_outer)}"
                 logger.error(f"[DB Monitor] Outer error: {e_outer}")
                 logger.error(traceback.format_exc())
             
+            # Store collected stats
+            async with self.db_monitor_history_lock:
+                self.db_monitor_history.append(collected_stats)
+                if len(self.db_monitor_history) > self.DB_MONITOR_HISTORY_MAX_SIZE:
+                    self.db_monitor_history.pop(0) # Remove the oldest entry
+
             # Log all collected stats
             log_output = "[DB Monitor] Stats:\n"
-            for key, value in stats.items():
-                if key == "error" and value is None: # Don't print error key if no error
+            for key, value in collected_stats.items():
+                if key == "error" and value is None: 
                     continue
                 try:
                     # Pretty print if it's a list of dicts (likely query results)
@@ -2238,6 +2245,108 @@ class GaiaValidator:
             
             logger.info(log_output)
             gc.collect()
+
+    async def plot_database_metrics_periodically(self):
+        """Periodically generates and saves database metrics plots."""
+        # Ensure matplotlib is imported and backend is set correctly for non-GUI environment
+        try:
+            import matplotlib
+            matplotlib.use('Agg') # Use Agg backend for non-interactive plotting
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            logger.info("Matplotlib initialized successfully for plotting.")
+        except ImportError as e:
+            logger.error(f"Matplotlib import error: {e}. Plotting will be disabled.")
+            return # Exit if matplotlib is not available
+
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(20 * 60) # Plot every 20 minutes
+            logger.info("Generating database performance plots...")
+            try:
+                async with self.db_monitor_history_lock:
+                    if not self.db_monitor_history or len(self.db_monitor_history) < 2:
+                        logger.info("Not enough data in db_monitor_history to generate plots. Skipping.")
+                        continue
+                    # Make a copy for thread-safe iteration if needed, though lock should cover
+                    history_copy = list(self.db_monitor_history) 
+                
+                timestamps = []
+                avg_session_times = []
+                min_session_times = []
+                max_session_times = []
+                total_connections_list = []
+
+                for record in history_copy:
+                    try:
+                        ts = datetime.fromisoformat(record.get("timestamp"))
+                        timestamps.append(ts)
+
+                        session_stats = record.get("session_manager_stats", {})
+                        if isinstance(session_stats, dict):
+                            avg_session_times.append(session_stats.get("avg_session_time_ms", float('nan')))
+                            min_session_times.append(session_stats.get("min_session_time_ms", float('nan')))
+                            max_session_times.append(session_stats.get("max_session_time_ms", float('nan')))
+                        else:
+                            avg_session_times.append(float('nan'))
+                            min_session_times.append(float('nan'))
+                            max_session_times.append(float('nan'))
+
+                        connection_summary = record.get("connection_summary", [])
+                        current_total_connections = 0
+                        if isinstance(connection_summary, list):
+                            for conn_info in connection_summary:
+                                if isinstance(conn_info, dict) and "count" in conn_info and isinstance(conn_info["count"], (int, float)):
+                                    current_total_connections += conn_info["count"]
+                        total_connections_list.append(current_total_connections)
+                    except Exception as e:
+                        logger.warning(f"Skipping record in plot generation due to parsing error: {e} - Record: {record}")
+                        continue # Skip malformed record
+                
+                if not timestamps or len(timestamps) < 2:
+                    logger.info("Not enough valid data points to generate plots after parsing. Skipping.")
+                    continue
+
+                fig, axs = plt.subplots(2, 1, figsize=(15, 12), sharex=True)
+                fig.suptitle('Database Performance Monitor', fontsize=16)
+
+                # Plot 1: Session Times
+                axs[0].plot(timestamps, avg_session_times, label='Avg Session Time (ms)', marker='.', linestyle='-', color='blue')
+                axs[0].plot(timestamps, min_session_times, label='Min Session Time (ms)', marker='.', linestyle=':', color='green')
+                axs[0].plot(timestamps, max_session_times, label='Max Session Time (ms)', marker='.', linestyle=':', color='red')
+                axs[0].set_ylabel('Session Time (ms)')
+                axs[0].set_title('DB Session Durations')
+                axs[0].legend()
+                axs[0].grid(True)
+
+                # Plot 2: Total Connections
+                ax2 = axs[1]
+                ax2.plot(timestamps, total_connections_list, label='Total Connections', marker='.', linestyle='-', color='purple')
+                ax2.set_ylabel('Number of Connections')
+                ax2.set_title('DB Connection Count')
+                ax2.legend()
+                ax2.grid(True)
+
+                # Format X-axis
+                fig.autofmt_xdate() # Auto-rotate date labels
+                xfmt = mdates.DateFormatter('%Y-%m-%d\n%H:%M:%S')
+                for ax_item in axs:
+                    ax_item.xaxis.set_major_formatter(xfmt)
+                
+                plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust layout to make space for suptitle
+                
+                plot_filename = "database_performance_plot.png"
+                plt.savefig(plot_filename)
+                plt.close(fig) # Close the figure to free memory
+                logger.info(f"Database performance plot saved to {plot_filename}")
+
+            except Exception as e:
+                logger.error(f"Error generating database plots: {e}")
+                logger.error(traceback.format_exc())
+            finally:
+                # Explicitly trigger garbage collection after plotting if memory is a concern
+                # However, plt.close(fig) should handle most of it.
+                import gc
+                gc.collect()
 
 
 if __name__ == "__main__":

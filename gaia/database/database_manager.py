@@ -14,6 +14,7 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
 import traceback
+from datetime import datetime, timezone # Added import
 
 logger = get_logger(__name__)
 
@@ -97,23 +98,19 @@ class BaseDatabaseManager(ABC):
             self.node_type = node_type
             self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
             
-            # Connection management
             self._active_sessions = set()
             self._active_operations = 0
             
-            # Pool health monitoring
             self._last_pool_check = 0
             self._pool_health_status = True
             self._pool_recovery_lock = asyncio.Lock()
             
-            # Circuit breaker state
             self._circuit_breaker = {
                 'failures': 0,
                 'last_failure_time': 0,
-                'status': 'closed'  # 'closed', 'open', 'half-open'
+                'status': 'closed'
             }
             
-            # Resource monitoring
             self._resource_stats = {
                 'cpu_percent': 0,
                 'memory_rss': 0,
@@ -122,21 +119,19 @@ class BaseDatabaseManager(ABC):
                 'last_check': 0
             }
             
-            # Operation statistics
             self._operation_stats = {
                 'ddl_operations': 0,
                 'read_operations': 0,
                 'write_operations': 0,
                 'long_running_queries': [],
-                # Session statistics
                 'total_sessions_acquired': 0,
                 'total_session_time_ms': 0.0,
                 'max_session_time_ms': 0.0,
                 'min_session_time_ms': float('inf'),
-                'avg_session_time_ms': 0.0
+                'avg_session_time_ms': 0.0,
+                'top_long_sessions': [] # List of dicts: [{'duration_ms': float, 'operation_name': str, 'acquired_at_iso': str}]
             }
             
-            # Engine will be initialized when first needed
             self._engine = None
             self._engine_initialized = False
             self.initialized = True
@@ -149,7 +144,8 @@ class BaseDatabaseManager(ABC):
             'total_session_time_ms': self._operation_stats.get('total_session_time_ms', 0.0),
             'max_session_time_ms': self._operation_stats.get('max_session_time_ms', 0.0),
             'min_session_time_ms': self._operation_stats.get('min_session_time_ms', float('inf')),
-            'avg_session_time_ms': self._operation_stats.get('avg_session_time_ms', 0.0)
+            'avg_session_time_ms': self._operation_stats.get('avg_session_time_ms', 0.0),
+            'top_long_sessions': self._operation_stats.get('top_long_sessions', [])
         }
 
     async def ensure_engine_initialized(self):
@@ -159,12 +155,6 @@ class BaseDatabaseManager(ABC):
             self._engine_initialized = True
 
     async def _check_circuit_breaker(self) -> bool:
-        """
-        Check if circuit breaker allows operations.
-        
-        Returns:
-            bool: True if circuit breaker is closed, False if open
-        """
         if self._circuit_breaker['status'] == 'open':
             if (time.time() - self._circuit_breaker['last_failure_time'] 
                 > self.CIRCUIT_BREAKER_RECOVERY_TIME):
@@ -176,7 +166,6 @@ class BaseDatabaseManager(ABC):
         return True
 
     async def _update_circuit_breaker(self, success: bool) -> None:
-        """Update circuit breaker state based on operation success."""
         if success:
             if self._circuit_breaker['status'] == 'half-open':
                 self._circuit_breaker['status'] = 'closed'
@@ -192,18 +181,10 @@ class BaseDatabaseManager(ABC):
                 logger.warning("Circuit breaker opened due to repeated failures")
 
     async def _monitor_resources(self) -> Dict[str, Any]:
-        """
-        Monitor and log system resource usage.
-        
-        Returns:
-            Dict[str, Any]: Resource usage statistics
-        """
         if not PSUTIL_AVAILABLE:
             return None
-
         try:
             process = psutil.Process()
-            
             self._resource_stats.update({
                 'cpu_percent': process.cpu_percent(),
                 'memory_rss': process.memory_info().rss,
@@ -211,29 +192,19 @@ class BaseDatabaseManager(ABC):
                 'connections': len(process.connections()),
                 'last_check': time.time()
             })
-
-            # Log warnings for high resource usage
             if self._resource_stats['cpu_percent'] > 80:
                 logger.warning(f"High CPU usage: {self._resource_stats['cpu_percent']}%")
-            
-            if self._resource_stats['memory_rss'] > (1024 * 1024 * 1024):  # 1GB
+            if self._resource_stats['memory_rss'] > (1024 * 1024 * 1024):
                 logger.warning(
                     f"High memory usage: "
                     f"{self._resource_stats['memory_rss'] / (1024*1024):.2f}MB"
                 )
-
             return self._resource_stats
         except Exception as e:
             logger.error(f"Error monitoring resources: {e}")
             return None
 
     async def check_health(self) -> Dict[str, Any]:
-        """
-        Perform comprehensive health check of the database system.
-        
-        Returns:
-            Dict[str, Any]: Health check results
-        """
         health_info = {
             'status': 'healthy',
             'timestamp': time.time(),
@@ -252,86 +223,58 @@ class BaseDatabaseManager(ABC):
             'connection_test': False,
             'errors': []
         }
-
         try:
-            # Test basic connectivity
-            async with self.session() as session:
+            async with self.session(operation_name="check_health_select_1") as session: # Added operation_name
                 await session.execute(text("SELECT 1"))
             health_info['connection_test'] = True
         except Exception as e:
             health_info['status'] = 'unhealthy'
             health_info['errors'].append(str(e))
-
         return health_info
 
     async def _check_pool_health(self) -> bool:
-        """
-        Periodic pool health check with recovery.
-        
-        Returns:
-            bool: True if pool is healthy, False otherwise
-        """
         current_time = time.time()
         if current_time - self._last_pool_check < self.POOL_HEALTH_CHECK_INTERVAL:
             return self._pool_health_status
-
         async with self._pool_recovery_lock:
             try:
-                # First check if engine exists and is initialized
                 if not self._engine or not self._engine_initialized:
                     logger.error("Database engine not initialized")
                     self._pool_health_status = False
                     return False
-
-                # Test basic connectivity
                 healthy = await self._ensure_pool()
-                
                 if not healthy:
                     logger.warning("Pool health check failed - attempting recovery")
                     recovery_successful = False
-                    
                     for attempt in range(self.POOL_RECOVERY_ATTEMPTS):
                         try:
                             logger.info(f"Recovery attempt {attempt + 1}/{self.POOL_RECOVERY_ATTEMPTS}")
-                            
-                            # Close all active sessions first
-                            for session in self._active_sessions.copy():
+                            for session_obj in self._active_sessions.copy(): # Iterate over actual session objects if stored, else ids
                                 try:
-                                    await session.close()
+                                   if hasattr(session_obj, 'close'): await session_obj.close()
                                 except Exception as e:
                                     logger.error(f"Error closing session: {e}")
                             self._active_sessions.clear()
                             self._active_operations = 0
-
-                            # Dispose of the engine
                             if self._engine:
                                 await self._engine.dispose()
-                            
-                            # Reinitialize engine
                             await self._initialize_engine()
-                            
-                            # Verify the new pool
                             if await self._ensure_pool():
                                 logger.info("Pool recovery successful")
                                 recovery_successful = True
                                 break
-                                
                         except Exception as e:
                             logger.error(f"Recovery attempt {attempt + 1} failed: {e}")
-                            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                            await asyncio.sleep(2 ** attempt)
                             continue
-                    
                     if not recovery_successful:
                         logger.error("All recovery attempts failed")
                         self._pool_health_status = False
                         return False
-                    
                     healthy = True
-
                 self._pool_health_status = healthy
                 self._last_pool_check = current_time
                 return healthy
-                
             except Exception as e:
                 logger.error(f"Pool health check failed: {e}")
                 logger.error(f"Stack trace: {traceback.format_exc()}")
@@ -339,17 +282,12 @@ class BaseDatabaseManager(ABC):
                 return False
 
     async def _initialize_engine(self) -> bool:
-        """Initialize the database engine."""
         if not self.db_url:
             raise DatabaseError("Database URL not initialized")
-
         try:
             current_loop = asyncio.get_running_loop()
-            # Log initialization with masked credentials
             masked_url = str(self.db_url).replace(self.db_url.split('@')[0], '***')
             logger.info(f"Initializing database engine with URL: {masked_url} on loop {current_loop}")
-
-            # Configure engine with connection pooling settings
             self._engine = create_async_engine(
                 self.db_url,
                 pool_pre_ping=True,
@@ -367,21 +305,15 @@ class BaseDatabaseManager(ABC):
                     },
                 },
             )
-
-            # Test connection immediately
             async with self._engine.connect() as conn:
                 await asyncio.wait_for(conn.execute(text("SELECT 1")), timeout=self.CONNECTION_TEST_TIMEOUT)
-
-            # Initialize session factory
             self._session_factory = async_sessionmaker(
                 self._engine, class_=AsyncSession, expire_on_commit=False, autobegin=False
             )
-
             self.db_loop = current_loop
             logger.info(f"Database engine initialized successfully on loop {self.db_loop}")
             self._engine_initialized = True
             return True
-
         except Exception as e:
             logger.error(f"Failed to initialize database engine: {e}")
             logger.error(traceback.format_exc())
@@ -391,16 +323,9 @@ class BaseDatabaseManager(ABC):
             return False
 
     async def _ensure_pool(self) -> bool:
-        """
-        Ensure database pool exists and is healthy.
-        
-        Returns:
-            bool: True if pool is healthy, False otherwise
-        """
         if not self._engine:
             logger.error("Cannot ensure pool - engine not initialized")
             return False
-
         conn = None
         try:
             conn = await self._engine.connect()
@@ -419,9 +344,15 @@ class BaseDatabaseManager(ABC):
                 except Exception as e:
                     logger.error(f"Error closing connection in _ensure_pool: {e}")
 
+    def _increment_active_sessions(self) -> int:
+        self._active_operations += 1
+        return self._active_operations
+
+    async def _mark_operation_failed(self):
+        await self._update_circuit_breaker(False)
+
     @asynccontextmanager
     async def get_connection(self):
-        """Get a raw database connection with proper cleanup."""
         conn = None
         try:
             conn = await self._engine.connect()
@@ -434,58 +365,62 @@ class BaseDatabaseManager(ABC):
                     logger.error(f"Error closing connection: {e}")
 
     async def cleanup_stale_connections(self):
-        """Clean up stale connections in the pool."""
         if not self._engine:
             return
-
         try:
             pool = self._engine.pool
             if pool:
-                # Get pool statistics
                 size = pool.size()
                 checkedin = pool.checkedin()
                 overflow = pool.overflow()
-                
-                if overflow > 0 or checkedin > size * 0.8:  # If pool is getting full
+                if overflow > 0 or checkedin > size * 0.8:
                     logger.info(f"Cleaning up connection pool. Size: {size}, "
                               f"Checked-in: {checkedin}, Overflow: {overflow}")
-                    
-                    # Force a few connections to close and be recreated
-                    async with self.get_connection() as conn:
+                    async with self.get_connection() as conn: # This will use a session with op_name
                         await conn.execute(text("SELECT 1"))
-                    
-                    # Let SQLAlchemy know it can dispose of overflow connections
                     await self._engine.dispose()
         except Exception as e:
             logger.error(f"Error cleaning up stale connections: {e}")
-            # Don't raise - this is a background cleanup task
+
+    def _update_top_long_sessions(self, duration_ms: float, name: str, acquired_at_iso_str: str):
+        """Helper to update the list of top longest sessions."""
+        try:
+            # Ensure the list exists in stats
+            if 'top_long_sessions' not in self._operation_stats:
+                self._operation_stats['top_long_sessions'] = []
+            
+            current_top_sessions = self._operation_stats['top_long_sessions']
+            
+            # Add the new session info as a dictionary
+            current_top_sessions.append({
+                'duration_ms': duration_ms, 
+                'operation_name': name, 
+                'acquired_at_iso': acquired_at_iso_str # Use the passed ISO string directly
+            })
+            
+            # Sort by duration_ms in descending order
+            current_top_sessions.sort(key=lambda x: x['duration_ms'], reverse=True)
+            
+            # Keep only the top 3
+            self._operation_stats['top_long_sessions'] = current_top_sessions[:3]
+        except Exception as e:
+            logger.error(f"Error updating top long sessions: {e} - Stats: {self._operation_stats}")
 
     def with_timeout(timeout: float):
-        """
-        Decorator that adds timeout to a database operation.
-        Checks for a 'timeout' kwarg in the wrapped function call to override.
-        
-        Args:
-            timeout (float): Default timeout in seconds
-            
-        Returns:
-            Callable: Decorated function with timeout
-        """
         def decorator(func: Callable[..., T]) -> Callable[..., T]:
             @wraps(func)
             async def wrapper(self, *args, **kwargs) -> T:
-                # Determine the effective timeout
                 call_timeout = kwargs.get('timeout')
                 effective_timeout = call_timeout if call_timeout is not None else timeout
-                
                 try:
                     return await asyncio.wait_for(
                         func(self, *args, **kwargs), 
                         timeout=effective_timeout
                     )
                 except asyncio.TimeoutError:
-                    logger.error(f"Operation {func.__name__} timed out after {effective_timeout}s")
-                    raise DatabaseTimeout(f"Operation {func.__name__} timed out after {effective_timeout}s")
+                    op_name_for_log = getattr(func, '__name__', 'Unnamed_Operation')
+                    logger.error(f"Operation {op_name_for_log} timed out after {effective_timeout}s")
+                    raise DatabaseTimeout(f"Operation {op_name_for_log} timed out after {effective_timeout}s")
             return wrapper
         return decorator
 
@@ -494,19 +429,15 @@ class BaseDatabaseManager(ABC):
         await self.ensure_engine_initialized()
         if not self._engine or not self._session_factory:
             raise DatabaseConnectionError("Engine/Session factory not initialized")
-
         session_instance: Optional[AsyncSession] = None
-        
         try:
             session_instance = self._session_factory()
             yield session_instance
-                
         except Exception as e:
             logger.error(f"Lightweight session error: {str(e)}")
             if isinstance(e, (DatabaseError, SQLAlchemyError)):
                 raise
             raise DatabaseConnectionError(f"Session error: {str(e)}") from e
-        
         finally:
             if session_instance:
                 try:
@@ -515,67 +446,135 @@ class BaseDatabaseManager(ABC):
                     logger.error(f"Error closing lightweight session: {e}")
 
     @asynccontextmanager
-    async def session(self):
-        """
-        Provide a SQLAlchemy AsyncSession from the managed pool.
-        Handles circuit breaker logic and session lifecycle.
-        """
-        await self.ensure_engine_initialized()
+    async def session(self, operation_name: str = "Unnamed Session", operation_type: str = "read", provided_session: Optional[AsyncSession] = None):
+        await self.ensure_engine_initialized() # Ensure engine is ready
 
-        if not await self._check_circuit_breaker():
-            logger.error("Circuit breaker is open. Database operation aborted.")
-            raise CircuitBreakerError("Circuit breaker is open")
-
-        # if not await self._check_pool_health(): # Temporarily disable for focused debugging
-        #     logger.error("Database pool health check failed. Operation aborted.")
-        #     raise DatabaseConnectionError("Database pool is unhealthy")
-
-        # Increment active operations (still useful for monitoring)
-        # Consider if a separate lock for this counter is truly needed if _session_lock is gone.
-        # For now, let's assume _operation_lock handles this if it exists, or it's atomic enough.
-        self._active_operations += 1
+        start_time = time.monotonic()
+        session_id_str = "provided" if provided_session else "new"
         
+        # Attempt to get a more specific operation name if it's a query
+        if operation_name.startswith("fetch_") or operation_name.startswith("execute"):
+            try:
+                # Simplified extraction, assuming format like "fetch_all:SELECT ..." or "execute:UPDATE ..."
+                parts = operation_name.split(":", 1)
+                if len(parts) > 1:
+                    query_preview = parts[1].strip()[:50].replace('\\n', ' ') + "..."
+                    specific_op_name = f"{parts[0]}:{query_preview}"
+                else:
+                    specific_op_name = operation_name
+            except: # Fallback if parsing fails
+                specific_op_name = operation_name
+        else:
+            specific_op_name = operation_name
+
         session_instance: Optional[AsyncSession] = None
-        success = False
-        session_acquire_time = time.perf_counter() # Record session acquisition time
-        session_id_for_log = "N/A"
+        transaction_started_here = False
+        acquired_at_iso_str = datetime.now(timezone.utc).isoformat()
+        e = None # Initialize e to None
 
         try:
-            # Directly use the session factory from SQLAlchemy
-            async with self._session_factory() as session_instance:
-                session_id_for_log = str(id(session_instance))
-                self._active_sessions.add(session_id_for_log)
+            if provided_session:
+                session_instance = provided_session
+                session_id_str = f"provided_{id(session_instance)}"
+                # logger.debug(f"Using provided session {id(session_instance)} for {specific_op_name}")
+                if not session_instance.in_transaction() and not session_instance.is_active: # type: ignore
+                    # This typically means the session was closed or rolled back by an outer manager
+                    # For safety, we might want to begin a new transaction or raise an error
+                    # For now, let's assume if provided, it's managed externally or ready.
+                    # However, if it's not in_transaction AND not active, it's problematic.
+                    # Let's try to begin one if it's not active.
+                    logger.warning(f"Provided session {id(session_instance)} for {specific_op_name} is not in transaction and not active. Attempting to begin.")
+                    try:
+                        logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Attempting to begin new transaction on provided (but inactive) session.")
+                        await session_instance.begin()
+                        transaction_started_here = True
+                        logger.debug(f"Session {id(session_instance)} ({specific_op_name}): New transaction started successfully on provided session.")
+                    except Exception as e_begin_provided:
+                        logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to begin new transaction on provided session: {e_begin_provided}", exc_info=True)
+                        raise # Re-raise if we can't even begin
+            else:
+                if not self._engine or not self._session_factory:
+                    logger.error("Database engine or session factory not initialized before acquiring session.")
+                    raise DatabaseConnectionError("Engine/Session factory not initialized")
+                
+                session_instance = self._session_factory()
+                session_id_str = f"new_{id(session_instance)}"
                 self._operation_stats['total_sessions_acquired'] += 1
-                logger.debug(f"Session {session_id_for_log} acquired. Active sessions: {len(self._active_sessions)}")
-                yield session_instance
-                success = True # Assume success if no exception before this point
+                # logger.debug(f"Acquired new session {id(session_instance)} for {specific_op_name}")
+
+            # Ensure a transaction is started if not already active (and not using a provided session that might manage its own tx)
+            # Or if it IS a provided session, but we detected it was inactive and started one above.
+            if not session_instance.in_transaction(): # type: ignore
+                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Not in transaction. Attempting to begin.")
+                try:
+                    await session_instance.begin() # type: ignore
+                    transaction_started_here = True
+                    logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Transaction started successfully.")
+                except Exception as e_begin:
+                    logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to begin transaction: {e_begin}", exc_info=True)
+                    # If begin fails, we might not want to proceed, or yield a non-transacting session.
+                    # For now, let's re-raise as it's fundamental.
+                    if session_instance and not provided_session: # Only close if newly acquired
+                        await session_instance.close()
+                    raise
+            else:
+                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Already in transaction.")
+
+            self._active_sessions.add(session_id_str) # Add to set before incrementing general counter
+            active_sessions_count = self._increment_active_sessions()
+            logger.debug(f"Session {id(session_instance)} ({specific_op_name}) ready. Active sessions: {active_sessions_count} (Set size: {len(self._active_sessions)})")
+
+            yield session_instance
+
+            # If we started the transaction here, we are responsible for committing it.
+            if transaction_started_here and session_instance and session_instance.in_transaction(): # type: ignore
+                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Attempting to commit transaction.")
+                try:
+                    await session_instance.commit() # type: ignore
+                    logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Transaction committed successfully.")
+                except Exception as e_commit:
+                    logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to commit transaction: {e_commit}", exc_info=True)
+                    # Attempt to rollback if commit failed
+                    try:
+                        logger.warning(f"Session {id(session_instance)} ({specific_op_name}): Commit failed, attempting rollback.")
+                        await session_instance.rollback()
+                        logger.info(f"Session {id(session_instance)} ({specific_op_name}): Rollback successful after failed commit.")
+                    except Exception as e_rollback_after_commit_fail:
+                        logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to rollback after failed commit: {e_rollback_after_commit_fail}", exc_info=True)
+                    raise # Re-raise the original commit error
+            elif transaction_started_here and session_instance and not session_instance.in_transaction(): # type: ignore
+                logger.warning(f"Session {id(session_instance)} ({specific_op_name}): Transaction was started here, but session is no longer in transaction before explicit commit. (Potentially committed or rolled back by yielded code).")
+            elif not transaction_started_here and session_instance and session_instance.in_transaction(): #type: ignore
+                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Transaction was not started here, not attempting commit. (External transaction management).")
+
+
         except asyncio.CancelledError:
-            logger.warning(f"Session usage cancelled for session {session_id_for_log}")
-            success = False # Mark as not successful if cancelled
+            logger.warning(f"Session {id(session_instance)} ({specific_op_name}): Operation cancelled.")
+            if session_instance and session_instance.in_transaction(): # type: ignore
+                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Attempting rollback due to cancellation.")
+                try:
+                    await session_instance.rollback() # type: ignore
+                    logger.info(f"Session {id(session_instance)} ({specific_op_name}): Rollback successful due to cancellation.")
+                except Exception as e_rollback_cancel:
+                    logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to rollback due to cancellation: {e_rollback_cancel}", exc_info=True)
+            self._operation_stats.setdefault('cancelled_operations', 0)
+            self._operation_stats['cancelled_operations'] += 1
+            await self._mark_operation_failed()
             raise
-        except OperationalError as e: # Catch SQLAlchemy operational errors (includes connection issues)
-            logger.error(f"Database operational error during session usage ({session_id_for_log}): {e}")
-            success = False
-            await self._update_circuit_breaker(False)
-            # Attempt to reset pool if it's a connection issue
-            if "connection" in str(e).lower() or "pool" in str(e).lower():
-                logger.warning("Attempting to reset database pool due to operational error.")
-                asyncio.create_task(self.reset_pool()) # Non-blocking reset
-            raise DatabaseConnectionError(f"Database operational error: {e}") from e
-        except SQLAlchemyError as e: # Catch other SQLAlchemy errors
-            logger.error(f"SQLAlchemy error during session usage ({session_id_for_log}): {e}")
-            success = False
-            await self._update_circuit_breaker(False)
-            raise DatabaseError(f"SQLAlchemy error: {e}") from e
         except Exception as e:
-            logger.error(f"Unexpected error during session usage ({session_id_for_log}): {e}")
-            success = False
-            # Do not update circuit breaker for truly unexpected errors here,
-            # let the specific operation's error handling do that if appropriate.
-            raise DatabaseError(f"Unexpected error in session ({session_id_for_log}): {e}") from e
+            logger.error(f"Session {id(session_instance)} ({specific_op_name}): Error during session: {str(e)}", exc_info=True)
+            if session_instance and session_instance.in_transaction(): # type: ignore
+                logger.debug(f"Session {id(session_instance)} ({specific_op_name}): Attempting rollback due to exception: {str(e)}.")
+                try:
+                    await session_instance.rollback() # type: ignore
+                    logger.info(f"Session {id(session_instance)} ({specific_op_name}): Rollback successful due to exception.")
+                except Exception as e_rollback_exception:
+                    logger.error(f"Session {id(session_instance)} ({specific_op_name}): FAILED to rollback due to exception: {e_rollback_exception}", exc_info=True)
+            await self._mark_operation_failed()
+            raise
         finally:
             session_release_time = time.perf_counter()
-            session_duration_ms = (session_release_time - session_acquire_time) * 1000
+            session_duration_ms = (session_release_time - start_time) * 1000
 
             self._operation_stats['total_session_time_ms'] += session_duration_ms
             if self._operation_stats['total_sessions_acquired'] > 0:
@@ -585,32 +584,21 @@ class BaseDatabaseManager(ABC):
             if session_duration_ms < self._operation_stats['min_session_time_ms']:
                 self._operation_stats['min_session_time_ms'] = session_duration_ms
 
-            logger.debug(f"Session {session_id_for_log} held for {session_duration_ms:.2f}ms.")
-
-            if session_instance and session_id_for_log in self._active_sessions: # Check using session_id_for_log
-                if session_instance.is_active and session_instance.in_transaction():
-                    logger.error(f"CRITICAL_BASE_SESSION: Session {session_id_for_log} is being released from BaseDatabaseManager.session() while still in_transaction! Forcing rollback.")
-                    try:
-                        await session_instance.rollback()
-                        logger.info(f"CRITICAL_BASE_SESSION: Forced rollback for session {session_id_for_log} was successful.")
-                    except Exception as e_base_rollback:
-                        logger.error(f"CRITICAL_BASE_SESSION: Forced rollback for session {session_id_for_log} FAILED: {e_base_rollback}")
-                self._active_sessions.remove(session_id_for_log)
-                logger.debug(f"Session {session_id_for_log} released. Active sessions: {len(self._active_sessions)}")
+            logger.debug(f"Session {id(session_instance)} ({specific_op_name}) held for {session_duration_ms:.2f}ms")
+            self._update_top_long_sessions(session_duration_ms, specific_op_name, acquired_at_iso_str)
+            
+            if session_id_str in self._active_sessions: 
+                self._active_sessions.remove(session_id_str)
+                logger.debug(f"Session {session_id_str} released ({specific_op_name}). Active sessions: {len(self._active_sessions)}")
             
             self._active_operations -= 1
-            # No _pool_semaphore to release
-
-            # Update circuit breaker based on whether the session usage block completed without known DB errors
-            # This might need refinement if success=True even when an inner operation failed but didn't bubble up as SQLAlchemyError
-            if success is not None: # Only update if success was determined
-                 await self._update_circuit_breaker(success)
-                 if not success:
-                    logger.warning(f"Operation within session {session_id_for_log} marked as failed for circuit breaker.")
+            if transaction_started_here and session_instance and not session_instance.in_transaction() and not isinstance(e, BaseException):
+                await self._update_circuit_breaker(True)
+            elif not transaction_started_here and not isinstance(e, BaseException):
+                await self._update_circuit_breaker(True)
 
     @with_timeout(CONNECTION_TEST_TIMEOUT)
     async def _test_connection(self, session: AsyncSession) -> bool:
-        """Test database connection"""
         await session.execute(text("SELECT 1"))
         return True
 
@@ -621,55 +609,21 @@ class BaseDatabaseManager(ABC):
         params: Optional[Dict] = None,
         timeout: Optional[float] = None
     ) -> Optional[Dict]:
-        """
-        Fetch a single row from the database.
-        If called within a transaction context, uses the existing transaction.
-        Otherwise, creates a new transaction.
-        
-        Args:
-            query (str): SQL query to execute
-            params (Optional[Dict]): Query parameters
-            timeout (Optional[float]): Operation timeout in seconds
-            
-        Returns:
-            Optional[Dict]: Single row result or None
-        """
         start_time = time.time()
-        
-        # Check if we're already in a transaction
-        if hasattr(self, '_in_transaction') and self._in_transaction:
-            # Get the current session from the active transaction
-            session = next(iter(self._active_sessions))
+        op_name = f"fetch_one:{query[:100]}"
+        async with self.session(operation_name=op_name) as session: # session() ensures a transaction
             try:
+                # No longer need session.begin() here, self.session() handles it.
                 result = await session.execute(text(query), params or {})
                 row = result.first()
-                
-                # Log slow queries
                 duration = time.time() - start_time
-                if duration > self.DEFAULT_QUERY_TIMEOUT / 2:
-                    logger.warning(f"Slow query detected: {duration:.2f}s\nQuery: {query}")
-                
+                if duration > self.DEFAULT_QUERY_TIMEOUT / 2: 
+                    logger.warning(f"Slow query detected ({op_name}): {duration:.2f}s\nQuery: {query}")
                 return dict(row._mapping) if row else None
             except SQLAlchemyError as e:
-                logger.error(f"Database error in fetch_one: {str(e)}\nQuery: {query}")
-                raise DatabaseError(f"Error executing query: {str(e)}")
-        else:
-            # Create new transaction if not in one
-            async with self.session() as session:
-                try:
-                    async with session.begin(): # Ensure transaction is started
-                        result = await session.execute(text(query), params or {})
-                    row = result.first() # result is available after transaction block
-                    
-                    # Log slow queries
-                    duration = time.time() - start_time
-                    if duration > self.DEFAULT_QUERY_TIMEOUT / 2:
-                        logger.warning(f"Slow query detected: {duration:.2f}s\nQuery: {query}")
-                    
-                    return dict(row._mapping) if row else None
-                except SQLAlchemyError as e:
-                    logger.error(f"Database error in fetch_one: {str(e)}\nQuery: {query}")
-                    raise DatabaseError(f"Error executing query: {str(e)}")
+                logger.error(f"Database error in fetch_one ({op_name}): {str(e)}\nQuery: {query}")
+                # The main session context manager will handle rollback.
+                raise DatabaseError(f"Error executing query ({op_name}): {str(e)}")
 
     @with_timeout(DEFAULT_QUERY_TIMEOUT)
     async def fetch_all(
@@ -678,108 +632,54 @@ class BaseDatabaseManager(ABC):
         params: Optional[Dict] = None,
         timeout: Optional[float] = None
     ) -> List[Dict]:
-        """
-        Fetch all rows from the database.
-        If called within a transaction context, uses the existing transaction.
-        Otherwise, creates a new transaction.
-        
-        Args:
-            query (str): SQL query to execute
-            params (Optional[Dict]): Query parameters
-            timeout (Optional[float]): Operation timeout in seconds
-            
-        Returns:
-            List[Dict]: List of result rows
-        """
         start_time = time.time()
-        
-        # Check if we're already in a transaction
-        if hasattr(self, '_in_transaction') and self._in_transaction:
-            # Get the current session from the active transaction
-            session = next(iter(self._active_sessions))
+        op_name = f"fetch_all:{query[:100]}"
+        async with self.session(operation_name=op_name) as session: # session() ensures a transaction
             try:
+                # No longer need session.begin() here, self.session() handles it.
                 result = await session.execute(text(query), params or {})
                 rows = result.all()
-                
-                # Log large result sets
                 if len(rows) > 1000:
                     logger.warning(
-                        f"Large result set: {len(rows)} rows\n"
+                        f"Large result set ({op_name}): {len(rows)} rows\n"
                         f"Query: {query}"
                     )
-                
-                # Log slow queries
                 duration = time.time() - start_time
-                if duration > self.DEFAULT_QUERY_TIMEOUT / 2:
-                    logger.warning(f"Slow query detected: {duration:.2f}s\nQuery: {query}")
-                
+                if duration > self.DEFAULT_QUERY_TIMEOUT / 2: 
+                    logger.warning(f"Slow query detected ({op_name}): {duration:.2f}s\nQuery: {query}")
                 return [dict(row._mapping) for row in rows]
             except SQLAlchemyError as e:
-                logger.error(f"Database error in fetch_all: {str(e)}\nQuery: {query}")
-                raise DatabaseError(f"Error executing query: {str(e)}")
-        else:
-            # Create new transaction if not in one
-            async with self.session() as session:
-                try:
-                    async with session.begin(): # Ensure transaction is started
-                        result = await session.execute(text(query), params or {})
-                    rows = result.all() # result is available after transaction block
-                    
-                    # Log large result sets
-                    if len(rows) > 1000:
-                        logger.warning(
-                            f"Large result set: {len(rows)} rows\n"
-                            f"Query: {query}"
-                        )
-                    
-                    # Log slow queries
-                    duration = time.time() - start_time
-                    if duration > self.DEFAULT_QUERY_TIMEOUT / 2:
-                        logger.warning(f"Slow query detected: {duration:.2f}s\nQuery: {query}")
-                    
-                    return [dict(row._mapping) for row in rows]
-                except SQLAlchemyError as e:
-                    logger.error(f"Database error in fetch_all: {str(e)}\nQuery: {query}")
-                    raise DatabaseError(f"Error executing query: {str(e)}")
+                logger.error(f"Database error in fetch_all ({op_name}): {str(e)}\nQuery: {query}")
+                # The main session context manager will handle rollback.
+                raise DatabaseError(f"Error executing query ({op_name}): {str(e)}")
 
-    @with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
+    @with_timeout(DEFAULT_TRANSACTION_TIMEOUT) # Default timeout for execute
     async def execute(
         self, 
         query: str, 
         params: Optional[Dict] = None,
-        timeout: Optional[float] = None,
-        session: Optional[AsyncSession] = None
+        timeout: Optional[float] = None, # Allows per-call override
+        session: Optional[AsyncSession] = None # Existing session to use
     ) -> Any:
-        """
-        Execute a single database operation.
-        If session is provided, uses it. Otherwise creates a new session and transaction.
-        
-        Args:
-            query (str): SQL query to execute
-            params (Optional[Dict]): Query parameters
-            timeout (Optional[float]): Operation timeout in seconds
-            session (Optional[AsyncSession]): Existing session to use
-            
-        Returns:
-            Any: Query result
-        """
-        if session is not None:
-
+        op_name = f"execute:{query[:100]}"
+        if session is not None: 
             try:
+                # When a session is provided, we assume the caller manages the transaction.
                 result = await session.execute(text(query), params or {})
                 return result
             except SQLAlchemyError as e:
-                logger.error(f"Database error in execute (with existing session): {str(e)}\nQuery: {query}")
-                raise DatabaseError(f"Error executing query (with existing session): {str(e)}")
-        else:
-            async with self.session() as new_session:
+                logger.error(f"Database error in execute (with existing session, op: {op_name}): {str(e)}\nQuery: {query}")
+                raise DatabaseError(f"Error executing query (with existing session, op: {op_name}): {str(e)}")
+        else: 
+            async with self.session(operation_name=op_name) as new_session: # session() ensures a transaction
                 try:
-                    async with new_session.begin():
-                        result = await new_session.execute(text(query), params or {})
-                    return result
+                    # No longer need new_session.begin() here, self.session() handles it.
+                    result = await new_session.execute(text(query), params or {})
+                    return result 
                 except SQLAlchemyError as e:
-                    logger.error(f"Database error in execute (new session): {str(e)}\nQuery: {query}")
-                    raise DatabaseError(f"Error executing query (new session): {str(e)}")
+                    logger.error(f"Database error in execute (new session, op: {op_name}): {str(e)}\nQuery: {query}")
+                    # The main session context manager will handle rollback.
+                    raise DatabaseError(f"Error executing query (new session, op: {op_name}): {str(e)}")
 
     @with_timeout(DEFAULT_TRANSACTION_TIMEOUT)
     async def execute_many(
@@ -789,127 +689,60 @@ class BaseDatabaseManager(ABC):
         timeout: Optional[float] = None,
         batch_size: Optional[int] = None
     ) -> None:
-        """
-        Execute multiple operations in batches.
-        If called within a transaction context, uses the existing transaction.
-        Otherwise, creates a new transaction.
-        
-        Args:
-            query (str): SQL query to execute
-            params_list (List[Dict]): List of parameter dictionaries
-            timeout (Optional[float]): Operation timeout in seconds
-            batch_size (Optional[int]): Size of batches for processing
-        """
         if not params_list:
             return
-
-        # Determine optimal batch size
         batch_size = batch_size or self.DEFAULT_BATCH_SIZE
         total_items = len(params_list)
         
-        # Adaptive batch sizing based on data size
-        avg_param_size = sum(len(str(p)) for p in params_list[:100]) / min(100, total_items)
-        if avg_param_size > 1000:  # Large parameters
+        avg_param_size = sum(len(str(p)) for p in params_list[:100]) / min(100, total_items) if total_items > 0 else 0
+        if avg_param_size > 1000:
             batch_size = min(batch_size, 100)
         
         start_time = time.time()
-        
-        # Check if we're already in a transaction
-        if hasattr(self, '_in_transaction') and self._in_transaction:
-            # Get the current session from the active transaction
-            session = next(iter(self._active_sessions))
+        op_name = f"execute_many:{query[:100]}"
+
+        # execute_many always manages its own transaction here
+        async with self.session(operation_name=op_name) as session: # Pass operation_name
             try:
-                for i in range(0, total_items, batch_size):
-                    batch = params_list[i:i + batch_size]
-                    batch_start = time.time()
-                    
-                    # Execute batch
-                    await session.execute(text(query), batch)
-                    
-                    # Log progress and timing
-                    batch_duration = time.time() - batch_start
-                    if batch_duration > 5:  # Log slow batches
-                        logger.warning(
-                            f"Slow batch detected: {batch_duration:.2f}s "
-                            f"(Items {i}-{i+len(batch)})"
-                        )
-                    
-                    # Log progress periodically
-                    if i > 0 and i % (batch_size * 10) == 0:
-                        progress = (i / total_items) * 100
-                        elapsed = time.time() - start_time
-                        rate = i / elapsed if elapsed > 0 else 0
-                        logger.info(
-                            f"Batch progress: {progress:.1f}% "
-                            f"({i}/{total_items}) "
-                            f"Rate: {rate:.1f} items/s"
-                        )
-                        
-                        # Monitor resources during long operations
-                        await self._monitor_resources()
-                
-                # Log final statistics
-                total_duration = time.time() - start_time
-                logger.info(
-                    f"Batch operation completed: {total_items} items "
-                    f"in {total_duration:.2f}s "
-                    f"({total_items/total_duration:.1f} items/s)"
-                )
-                
-            except SQLAlchemyError as e:
-                logger.error(
-                    f"Batch operation failed at item {i}: {str(e)}\n"
-                    f"Query: {query}"
-                )
-                raise DatabaseError(f"Error executing batch query: {str(e)}")
-        else:
-            # Create new transaction if not in one
-            async with self.transaction() as session:
-                try:
+                # Begin transaction once for all batches
+                async with session.begin():
                     for i in range(0, total_items, batch_size):
                         batch = params_list[i:i + batch_size]
-                        batch_start = time.time()
+                        batch_start_time = time.time()
                         
-                        # Execute batch
                         await session.execute(text(query), batch)
-                        await session.commit()
+                        # Commit is handled by the outer session.begin() context manager
                         
-                        # Log progress and timing
-                        batch_duration = time.time() - batch_start
-                        if batch_duration > 5:  # Log slow batches
+                        batch_duration = time.time() - batch_start_time
+                        if batch_duration > 5:
                             logger.warning(
-                                f"Slow batch detected: {batch_duration:.2f}s "
+                                f"Slow batch detected ({op_name}): {batch_duration:.2f}s "
                                 f"(Items {i}-{i+len(batch)})"
                             )
-                        
-                        # Log progress periodically
                         if i > 0 and i % (batch_size * 10) == 0:
                             progress = (i / total_items) * 100
                             elapsed = time.time() - start_time
                             rate = i / elapsed if elapsed > 0 else 0
                             logger.info(
-                                f"Batch progress: {progress:.1f}% "
+                                f"Batch progress ({op_name}): {progress:.1f}% "
                                 f"({i}/{total_items}) "
                                 f"Rate: {rate:.1f} items/s"
                             )
-                            
-                            # Monitor resources during long operations
                             await self._monitor_resources()
-                    
-                    # Log final statistics
-                    total_duration = time.time() - start_time
-                    logger.info(
-                        f"Batch operation completed: {total_items} items "
-                        f"in {total_duration:.2f}s "
-                        f"({total_items/total_duration:.1f} items/s)"
-                    )
-                    
-                except SQLAlchemyError as e:
-                    logger.error(
-                        f"Batch operation failed at item {i}: {str(e)}\n"
-                        f"Query: {query}"
-                    )
-                    raise DatabaseError(f"Error executing batch query: {str(e)}")
+                
+                total_duration = time.time() - start_time
+                logger.info(
+                    f"Batch operation completed ({op_name}): {total_items} items "
+                    f"in {total_duration:.2f}s "
+                    f"({(total_items/total_duration if total_duration > 0 else 0):.1f} items/s)"
+                )
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Batch operation failed ({op_name}) at item approx {i}: {str(e)}\n" # 'i' might be from previous scope if error in begin()
+                    f"Query: {query}"
+                )
+                # Rollback is handled by session.begin() context manager on error
+                raise DatabaseError(f"Error executing batch query ({op_name}): {str(e)}")
 
     async def execute_with_retry(
         self, 
@@ -918,51 +751,32 @@ class BaseDatabaseManager(ABC):
         max_retries: Optional[int] = None,
         initial_delay: float = 0.1
     ) -> Any:
-        """
-        Execute a query with retry logic for transient failures.
-        
-        Args:
-            query (str): SQL query to execute
-            params (Optional[Dict]): Query parameters
-            max_retries (Optional[int]): Maximum number of retry attempts
-            initial_delay (float): Initial delay between retries (seconds)
-            
-        Returns:
-            Any: Query result
-        """
         max_retries = max_retries or self.MAX_RETRIES
         last_error = None
-        
+        op_name = f"execute_with_retry:{query[:80]}" # Shorter op_name for retry wrapper
+
         for attempt in range(max_retries):
             try:
-                return await self.execute(query, params)
-            except DatabaseError as e:
+                # The execute call will use its own session with a more specific op_name
+                return await self.execute(query, params) 
+            except DatabaseError as e: # Catch DatabaseError, which includes DatabaseTimeout
                 last_error = e
                 if attempt < max_retries - 1:
-                    delay = initial_delay * (2 ** attempt)  # Exponential backoff
+                    delay = initial_delay * (2 ** attempt)
                     logger.warning(
-                        f"Retry attempt {attempt + 1}/{max_retries} "
-                        f"after {delay:.1f}s delay"
+                        f"Retry attempt {attempt + 1}/{max_retries} for {op_name} "
+                        f"after {delay:.1f}s delay. Error: {e}"
                     )
                     await asyncio.sleep(delay)
                     continue
                 logger.error(
-                    f"All retry attempts failed for query: {query}\n"
+                    f"All retry attempts failed for {op_name}: {query}\n"
                     f"Final error: {str(last_error)}"
                 )
-                raise last_error
+                raise last_error # Re-raise the last error after all retries exhausted
 
     @with_timeout(DEFAULT_QUERY_TIMEOUT)
     async def table_exists(self, table_name: str) -> bool:
-        """
-        Check if a table exists in the database.
-        
-        Args:
-            table_name (str): Name of the table to check
-            
-        Returns:
-            bool: True if table exists, False otherwise
-        """
         query = """
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -970,6 +784,7 @@ class BaseDatabaseManager(ABC):
                 AND table_name = :table_name
             )
         """
+        # fetch_one will create its own session with appropriate operation_name
         result = await self.fetch_one(query, {"table_name": table_name})
         return result["exists"] if result else False
 
@@ -979,14 +794,6 @@ class BaseDatabaseManager(ABC):
         status_column: str = 'status',
         timeout_minutes: int = 60
     ) -> None:
-        """
-        Clean up stale operations in a table.
-        
-        Args:
-            table_name (str): Name of the table to clean
-            status_column (str): Name of the status column
-            timeout_minutes (int): Minutes after which to consider an operation stale
-        """
         query = f"""
             UPDATE {table_name}
             SET {status_column} = :error_status
@@ -998,23 +805,19 @@ class BaseDatabaseManager(ABC):
             "processing_status": self.STATUS_PROCESSING,
             "timeout": timeout_minutes
         }
+        # execute will create its own session with appropriate operation_name
         await self.execute(query, params)
 
     async def reset_pool(self) -> None:
-        """Reset the connection pool and recreate engine."""
         try:
             logger.info("Starting database pool reset")
-            
-            # First close all active sessions
-            for session in self._active_sessions.copy():
-                try:
-                    await session.close()
-                except Exception as e:
-                    logger.error(f"Error closing session during pool reset: {e}")
+            active_session_ids_copy = list(self._active_sessions) # Copy IDs
+            for session_id in active_session_ids_copy:
+                # Cannot directly close sessions by ID if not storing actual objects
+                logger.debug(f"Pool reset: Active session ID {session_id} was present.")
             self._active_sessions.clear()
             self._active_operations = 0
 
-            # Dispose of the engine if it exists
             if self._engine:
                 try:
                     logger.info("Disposing of existing engine")
@@ -1022,22 +825,18 @@ class BaseDatabaseManager(ABC):
                 except Exception as e:
                     logger.error(f"Error disposing engine: {e}")
             
-            # Reset state
             self._engine = None
             self._engine_initialized = False
             self._session_factory = None
             
-            # Reinitialize the engine with fresh settings
             logger.info("Reinitializing database engine")
-            await self._initialize_engine()
-            self._engine_initialized = True
+            await self._initialize_engine() # This sets _engine_initialized to True on success
             
-            # Verify the new pool
             logger.info("Verifying new connection pool")
-            if not await self._ensure_pool():
-                raise DatabaseError("Failed to verify new connection pool")
+            if not await self._ensure_pool(): # This also re-sets _engine_initialized if it fails
+                self._engine_initialized = False # Ensure it's false if ensure_pool fails
+                raise DatabaseError("Failed to verify new connection pool after reset")
             
-            # Reset monitoring stats
             self._last_pool_check = time.time()
             self._pool_health_status = True
             self._circuit_breaker['failures'] = 0
@@ -1048,19 +847,19 @@ class BaseDatabaseManager(ABC):
         except Exception as e:
             logger.error(f"Error resetting connection pool: {e}")
             logger.error(f"Stack trace: {traceback.format_exc()}")
-            # Ensure we're in a known bad state
             self._pool_health_status = False
-            self._engine_initialized = False
-            raise DatabaseError(f"Failed to reset connection pool: {str(e)}")
+            self._engine_initialized = False # Ensure this is false on any error during reset
+            # Do not re-raise DatabaseError here if already DatabaseError, to avoid nesting.
+            if not isinstance(e, DatabaseError):
+                 raise DatabaseError(f"Failed to reset connection pool: {str(e)}")
+            else:
+                raise # Re-raise original DatabaseError
 
     async def close(self) -> None:
         """Close all database connections and cleanup resources."""
         try:
-            for session in self._active_sessions.copy():
-                try:
-                    await session.close()
-                except Exception as e:
-                    logger.error(f"Error closing session during cleanup: {e}")
+            # Similar to reset_pool, direct closing of sessions by ID is not feasible
+            # if only IDs are stored. Rely on engine disposal.
             self._active_sessions.clear()
             self._active_operations = 0
 
@@ -1069,36 +868,35 @@ class BaseDatabaseManager(ABC):
                 
         except Exception as e:
             logger.error(f"Error during database cleanup: {e}")
-            raise DatabaseError(f"Failed to cleanup database resources: {str(e)}")
+            # Do not re-raise DatabaseError here if already DatabaseError
+            if not isinstance(e, DatabaseError):
+                raise DatabaseError(f"Failed to cleanup database resources: {str(e)}")
+            else:
+                raise
+
 
     @staticmethod
     def with_transaction():
-        """
-        Decorator that wraps a function in a session with an active transaction.
-        The decorated function must accept a 'session: AsyncSession' parameter as its first argument after 'self'.
-        
-        Returns:
-            Callable: Decorated function with session and transaction handling
-        """
         def decorator(func: Callable[..., T]) -> Callable[..., T]:
             @wraps(func)
             async def wrapper(self: 'BaseDatabaseManager', *args, **kwargs) -> T:
-                # Note: The decorated function 'func' is expected to have 'session' as its first arg after self.
-                # Example: async def some_method(self, session: AsyncSession, other_arg: str)
-                async with self.session() as session: # Get a session from the pool
-                    async with session.begin(): # Start a transaction
-                        # Pass the session with an active transaction to the wrapped function
+                op_name = func.__name__ # Get the name of the decorated function
+                # self.session() handles beginning the transaction internally via _session_factory and autobegin=False
+                # then async with session.begin() is used inside the session block.
+                # The session obtained from self.session() will start a transaction when session.begin() is called.
+                async with self.session(operation_name=op_name) as session: # Pass operation_name
+                    async with session.begin(): # Start the actual transaction
                         return await func(self, session, *args, **kwargs)
             return wrapper
         return decorator
 
     async def initialize_database(self) -> None:
-        """Initialize database tables and add any missing columns."""
         try:
-            # Base initialization code here - no validator specific code
             logger.info("Base database initialization completed")
-            
         except Exception as e:
             logger.error(f"Error initializing database: {str(e)}")
             logger.error(traceback.format_exc())
-            raise DatabaseError(f"Failed to initialize database: {str(e)}")
+            if not isinstance(e, DatabaseError):
+                raise DatabaseError(f"Failed to initialize database: {str(e)}")
+            else:
+                raise
