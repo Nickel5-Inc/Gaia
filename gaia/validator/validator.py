@@ -295,43 +295,79 @@ class GaiaValidator:
             logger.info("Cleanup already completed")
             return
 
+        logger.info("Initiating graceful shutdown sequence...")
+
+        # --- Yappi Profiling Stop and Save - Moved to the beginning ---
         try:
-            logger.info("Initiating graceful shutdown...")
-            
-            # Set shutdown event first to prevent new operations
+            if yappi.is_running():
+                yappi.stop()  # Stop profiling
+                logger.info("YAPPI: Profiling stopped successfully during shutdown.")
+
+                stats = yappi.get_func_stats()
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                profile_output_base = f"yappi_stats_shutdown_{timestamp}"
+
+                stats.sort("totaltime", "desc") 
+                stats.save(f"{profile_output_base}_totaltime.prof", type="pstat")
+                logger.info(f"YAPPI: Stats (sorted by total wall time) saved to {profile_output_base}_totaltime.prof")
+
+                stats.sort("avgtime", "desc") 
+                stats.save(f"{profile_output_base}_avgtime.prof", type="pstat")
+                logger.info(f"YAPPI: Stats (sorted by average wall time) saved to {profile_output_base}_avgtime.prof")
+                
+                # Re-sorting by totaltime for sum_time for clarity as it's wall clock
+                stats.sort("totaltime", "desc") 
+                stats.save(f"{profile_output_base}_sumtime.prof", type="pstat")
+                logger.info(f"YAPPI: Stats (sorted by total wall time, as 'sum_time') saved to {profile_output_base}_sumtime.prof")
+                logger.info("YAPPI: All profiling data saved.")
+            else:
+                logger.info("YAPPI: Profiling was not running at shutdown or already stopped.")
+        except Exception as e_yappi:
+            logger.error(f"YAPPI: Error stopping or saving profiling data during shutdown: {e_yappi}", exc_info=True)
+        # --- End of Yappi Block ---
+
+        try:
+            logger.info("Setting shutdown event (if not already set)...")
             self._shutdown_event.set()
             
-            # Stop the watchdog if running
+            logger.info("Stopping watchdog (if running)...")
             if self.watchdog_running:
                 await self.stop_watchdog()
-                logger.info("Stopped watchdog")
+                logger.info("Watchdog stopped.")
+            else:
+                logger.info("Watchdog was not running.")
             
-            # Stop any running tasks
-            for task_name in ['soil', 'geomagnetic']:
+            logger.info("Updating task statuses to 'stopping'...")
+            for task_name in ['soil', 'geomagnetic', 'weather', 'scoring', 'deregistration', 'status_logger', 'db_sync_backup', 'db_sync_restore', 'miner_score_sender', 'earthdata_token', 'db_monitor', 'plot_db_metrics']:
                 try:
-                    await self.update_task_status(task_name, 'stopping')
-                except Exception as e:
-                    logger.error(f"Error updating {task_name} task status: {e}")
+                    # Check if task exists in health tracking before updating
+                    if task_name in self.task_health or hasattr(self, f"{task_name}_task") or (task_name.startswith("db_sync") and (self.backup_manager or self.restore_manager)):
+                        await self.update_task_status(task_name, 'stopping')
+                    else:
+                        logger.debug(f"Skipping status update for non-existent/inactive task: {task_name}")
+                except Exception as e_status_update:
+                    logger.error(f"Error updating {task_name} task status during shutdown: {e_status_update}")
 
-            # Clean up all resources
+            logger.info("Cleaning up resources (DB connections, HTTP clients, etc.)...")
             await self.cleanup_resources()
+            logger.info("Resource cleanup completed.")
             
-            # Final cleanup steps
+            logger.info("Performing final garbage collection...")
             try:
-                # Force final garbage collection
                 import gc
                 gc.collect()
-                logger.info("Completed final garbage collection")
-            except Exception as e:
-                logger.error(f"Error during final garbage collection: {e}")
+                logger.info("Final garbage collection completed.")
+            except Exception as e_gc:
+                logger.error(f"Error during final garbage collection: {e_gc}")
             
             self._cleanup_done = True
-            logger.info("Graceful shutdown completed")
+            logger.info("Graceful shutdown sequence fully completed.")
             
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
-            logger.error(traceback.format_exc())
-            # Don't raise here - we want to complete as much cleanup as possible
+        except Exception as e_shutdown_main:
+            logger.error(f"Error during main shutdown sequence (after yappi): {e_shutdown_main}", exc_info=True)
+            # Ensure cleanup_done is set even if part of the main shutdown fails, to prevent re-entry
+            self._cleanup_done = True 
+            logger.warning("Graceful shutdown sequence partially completed due to error.")
 
     def setup_neuron(self) -> bool:
         """
@@ -2372,43 +2408,8 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Unhandled exception in main loop: {e}", exc_info=True)
     finally:
-        yappi.stop()  # Stop profiling
-        logger.info("Yappi profiling stopped.")
-
-        # Get function stats
-        stats = yappi.get_func_stats()
-
-        # Define file paths for different sort types
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        profile_output_total_time = f"yappi_stats_total_time_{timestamp}.prof"
-        profile_output_avg_time = f"yappi_stats_avg_time_{timestamp}.prof"
-        profile_output_sum_time = f"yappi_stats_sum_time_{timestamp}.prof" # Corresponds to tsum for wall/cpu
-
-        # Save stats sorted by different criteria
-        stats.sort("totaltime", "desc") # For wall time, 'totaltime' is relevant. For CPU time, 'ttot'
-        stats.save(profile_output_total_time, type="pstat")
-        logger.info(f"Yappi stats (sorted by total wall time) saved to {profile_output_total_time}")
-
-        stats.sort("avgtime", "desc") # 'tavg' for CPU
-        stats.save(profile_output_avg_time, type="pstat")
-        logger.info(f"Yappi stats (sorted by average wall time) saved to {profile_output_avg_time}")
-        
-        # For wall time, 'tsum' is not directly available like CPU's 'tsub' or 'ttot'.
-        # 'totaltime' is the primary metric for wall clock.
-        # If you were using CPU clock, you might sort by 'tsub' (time excluding sub-calls) or 'ttot'.
-        # For Wall time, 'totaltime' often gives the best overview.
-        # We can re-save sorted by 'totaltime' again if needed, or choose another primary sort.
-        # Let's ensure 'tsum' behavior is clear: yappi's 'tsum' is equivalent to 'totaltime' for WALL clock.
-        # For CPU clock, 'ttot' is total time spent in function + children, 'tsub' is time in function only.
-        # We'll sort by 'totaltime' again for "sum_time" to be explicit, as it's wall clock.
-        stats.sort("totaltime", "desc") # Sorting by 'totaltime' as it's wall clock
-        stats.save(profile_output_sum_time, type="pstat")
-        logger.info(f"Yappi stats (sorted by total wall time, as 'sum_time') saved to {profile_output_sum_time}")
-
-        # Optionally, print some stats to console
-        # yappi.get_func_stats().print_all()
-        # yappi.get_thread_stats().print_all()
-
+        # yappi.stop() and save logic moved to _initiate_shutdown
+        logger.info("Main execution finished. Yappi stop/save handled by shutdown sequence.")
 
         if hasattr(validator, '_cleanup_done') and not validator._cleanup_done:
              try:

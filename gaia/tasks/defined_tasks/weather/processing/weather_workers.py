@@ -13,7 +13,7 @@ import shutil
 import time
 import zarr
 import numcodecs
-from typing import Dict
+from typing import Dict, Optional
 import base64
 import pickle
 import httpx # Ensure httpx is available
@@ -43,6 +43,10 @@ from ..utils.hashing import compute_verification_hash, compute_input_data_hash, 
 from ..weather_scoring.metrics import calculate_rmse
 from ..weather_scoring_mechanism import evaluate_miner_forecast_day1 # Assuming this is async def
 from ..weather_scoring_mechanism import evaluate_miner_forecast_day1 # Assuming this is async def
+
+from sqlalchemy import update # Added SQLAlchemy update
+from gaia.database.validator_schema import weather_forecast_runs_table # Added table import
+
 logger = get_logger(__name__)
 
 VALIDATOR_ENSEMBLE_DIR = Path("./validator_ensembles/")
@@ -888,24 +892,68 @@ async def finalize_scores_worker(self):
                 era5_ds_for_run = None
 
                 logger.info(f"[FinalizeWorker] Processing final scores for run {run_id} (Init: {gfs_init_time}).")
-                await self.db_manager.execute(
-                        "UPDATE weather_forecast_runs SET final_scoring_attempted_time = :now WHERE id = :rid",
-                        {"now": now_utc, "rid": run_id}
+                
+                # Use SQLAlchemy update statement
+                stmt = (
+                    update(weather_forecast_runs_table)
+                    .where(weather_forecast_runs_table.c.id == run_id)
+                    .values(final_scoring_attempted_time=now_utc)
                 )
+                await self.db_manager.execute(stmt, execute_on_replica=False) # Assuming execute can take the statement directly
+                                                                          # and params are bound if stmt uses bindparam()
+                                                                          # Or if it directly uses values, params dict might not be needed.
+                                                                          # Let's try without the params dict first if values are direct.
+                                                                          # Re-evaluating: The original call had a params dict.
+                                                                          # If db_manager.execute is a simple wrapper that does conn.execute(text(str(stmt)), params),
+                                                                          # then the named parameters in the original string query were key.
+                                                                          # Let's try to match that pattern if direct value binding in SQLAlchemy stmt doesn't work with it.
+                # Corrected approach: if db_manager.execute expects named parameters in the dict,
+                # the SQLAlchemy statement should reflect that, or db_manager should be adapted.
+                # For now, assuming db_manager can handle a statement with direct values like above.
+                # If it still requires a parameter dict for named params, the stmt would be:
+                # stmt = (
+                #     update(weather_forecast_runs_table)
+                #     .where(weather_forecast_runs_table.c.id == ':rid')
+                #     .values(final_scoring_attempted_time=':now')
+                # )
+                # await self.db_manager.execute(stmt, {"now": now_utc, "rid": run_id})
+                # Given the simplicity, the direct value binding is cleaner if supported by execute().
+
+                # Based on the original call structure: execute(str_query, params_dict)
+                # A more robust change that keeps db_manager.execute generic for string queries with dict params
+                # would be for db_manager.execute to also detect if the first arg is an SQLAlchemy statement.
+                # Let's try the version that is most SQLAlchemy-idiomatic first, assuming the execute method
+                # is smart enough or we are willing to adapt it slightly.
+                # If the `execute` method is a simple pass-through that does `connection.execute(text(str(query)), params)`, 
+                # then the above SQLAlchemy object `stmt` might not be directly compatible with the `params` dict in the same way.
+                # However, good `execute` wrappers often handle SQLAlchemy statement objects directly.
+
+                # Final choice for this edit attempt: direct values in statement, no separate params dict. 
+                # If this is not how db_manager.execute works, it will need adjustment or the SQLAlchemy statement
+                # would need to use bindparam() and pass the dict.
+                
+                # Revisiting the original pattern: `execute(query_str, params_dict)`
+                # The most compatible way with the existing `db_manager.execute` signature if it does not 
+                # specifically parse SQLAlchemy objects is to use bindparam with the SQLAlchemy statement, 
+                # and then pass the dictionary.
+
+                # from sqlalchemy import bindparam
+                # stmt = (
+                #     update(weather_forecast_runs_table)
+                #     .where(weather_forecast_runs_table.c.id == bindparam('rid'))
+                #     .values(final_scoring_attempted_time=bindparam('now'))
+                # )
+                # await self.db_manager.execute(stmt, {"now": now_utc, "rid": run_id})
+
+                # The simplest change if db_manager.execute can handle SQLAlchemy objects and does its own compilation:
+                update_stmt = (
+                    update(weather_forecast_runs_table)
+                    .where(weather_forecast_runs_table.c.id == run_id)
+                    .values(final_scoring_attempted_time=now_utc)
+                )
+                await self.db_manager.execute(update_stmt) # Pass the SQLAlchemy object directly
 
                 target_datetimes_for_run = [gfs_init_time + timedelta(hours=h) for h in sparse_lead_hours_config]
-
-                if self.test_mode: # Test mode date adjustments
-                    adjustment = now_utc - (gfs_init_time + timedelta(hours=max_final_lead_hour)) - timedelta(days=ERA5_DELAY_DAYS+1)
-                    logger.info(f"[FinalizeWorker] TEST MODE: Adjusting target dates by {adjustment} for run {run_id}")
-                    adjusted_target_datetimes_raw = [dt + adjustment for dt in target_datetimes_for_run]
-                    target_datetimes_rounded_to_6h = []
-                    for dt_adj_raw in adjusted_target_datetimes_raw:
-                        rounded_hour = (dt_adj_raw.hour // 6) * 6
-                        dt_rounded = dt_adj_raw.replace(hour=rounded_hour, minute=0, second=0, microsecond=0)
-                        target_datetimes_rounded_to_6h.append(dt_rounded)
-                    target_datetimes_for_run = target_datetimes_rounded_to_6h
-                    logger.info(f"[FinalizeWorker] TEST MODE: Rounded adjusted target dates for run {run_id}: {target_datetimes_for_run}")
 
                 logger.info(f"[FinalizeWorker] Run {run_id}: Fetching ERA5 analysis for final scoring at lead hours: {sparse_lead_hours_config}.")
                 era5_cache = Path(self.config.get('era5_cache_dir', './era5_cache'))

@@ -25,12 +25,9 @@ def upgrade() -> None:
     op.add_column('weather_miner_scores', sa.Column('variable_level', sa.String(length=50), nullable=True))
     op.add_column('weather_miner_scores', sa.Column('valid_time_utc', sa.TIMESTAMP(timezone=True), nullable=True))
 
-    try:
-        op.drop_constraint('uq_weather_miner_scores_response_id_score_type', 'weather_miner_scores', type_='unique')
-        print("Dropped old constraint: uq_weather_miner_scores_response_id_score_type")
-    except Exception as e:
-        print(f"Could not drop constraint uq_weather_miner_scores_response_id_score_type (it might not exist or name is different): {e}")
-
+    # Use op.execute with raw SQL for conditional drop to avoid transaction abortion
+    op.execute("ALTER TABLE weather_miner_scores DROP CONSTRAINT IF EXISTS uq_weather_miner_scores_response_id_score_type")
+    print("Attempted to drop old constraint (IF EXISTS): uq_weather_miner_scores_response_id_score_type")
 
     op.create_unique_constraint(
         'uq_wms_response_scoretype_lead_var_time',
@@ -50,6 +47,11 @@ def downgrade() -> None:
     op.drop_index(op.f('idx_wms_lead_hours'), table_name='weather_miner_scores')
     
     op.drop_constraint('uq_wms_response_scoretype_lead_var_time', 'weather_miner_scores', type_='unique')
+    
+    # For the downgrade, if uq_weather_miner_scores_response_id_score_type might not have been the one active
+    # or if we want to ensure it's safe, we can also use raw SQL with IF NOT EXISTS for creation,
+    # but typically, a direct create_unique_constraint is fine in downgrade if the drop above succeeded.
+    # The try-except here is generally okay for creation if the main concern is it might already exist.
     try:
         op.create_unique_constraint('uq_weather_miner_scores_response_id_score_type', 'weather_miner_scores', ['response_id', 'score_type'])
         print("Recreated old constraint: uq_weather_miner_scores_response_id_score_type")

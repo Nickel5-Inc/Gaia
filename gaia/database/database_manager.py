@@ -162,16 +162,14 @@ class BaseDatabaseManager(ABC):
 
     def get_session_stats(self) -> Dict[str, Any]:
         """Returns a dictionary of current session statistics."""
-        total_acquired = self._operation_stats.get('total_sessions_acquired', 0)
-        total_time_ms = self._operation_stats.get('total_session_time_ms', 0.0)
-        avg_time_ms = total_time_ms / total_acquired if total_acquired > 0 else 0.0
+        
         
         return {
-            'total_sessions_acquired': total_acquired,
-            'total_session_time_ms': total_time_ms,
+            'total_sessions_acquired': self._operation_stats.get('total_sessions_acquired', 0),
+            'total_session_time_ms': self._operation_stats.get('total_session_time_ms', 0.0),
             'max_session_time_ms': self._operation_stats.get('max_session_time_ms', 0.0),
             'min_session_time_ms': self._operation_stats.get('min_session_time_ms', float('inf')),
-            'avg_session_time_ms': avg_time_ms,
+            'avg_session_time_ms': self._operation_stats.get('avg_session_time_ms', 0.0),
             'top_long_sessions': self._operation_stats.get('top_long_sessions', [])
         }
 
@@ -601,9 +599,21 @@ class BaseDatabaseManager(ABC):
 
             self._active_sessions.discard(session_id_str)
             active_sessions_count_after = self._decrement_active_sessions() # This just decrements a counter
-            
+
+
             total_duration_ms = (time.monotonic() - overall_start_time) * 1000
             time_in_yield_ms = (yield_end_time - yield_start_time) * 1000 if yield_start_time > 0 and yield_end_time > 0 else 0.0
+            
+            self._operation_stats['total_sessions_acquired'] += 1
+            self._operation_stats['total_session_time_ms'] += total_duration_ms
+            self._operation_stats['max_session_time_ms'] = max(self._operation_stats['max_session_time_ms'], total_duration_ms)
+            if total_duration_ms < self._operation_stats['min_session_time_ms']:
+                self._operation_stats['min_session_time_ms'] = total_duration_ms if total_duration_ms > 0 else self._operation_stats.get('min_session_time_ms', float('inf'))
+
+            if self._operation_stats['total_sessions_acquired'] > 0:
+                self._operation_stats['avg_session_time_ms'] = self._operation_stats['total_session_time_ms'] / self._operation_stats['total_sessions_acquired']
+            
+
             
             self._update_top_long_sessions(total_duration_ms, specific_op_name, acquired_at_iso_str)
 
