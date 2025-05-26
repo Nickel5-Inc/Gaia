@@ -141,11 +141,23 @@ class BackupManager:
         except Exception as e:
             logger.error(f"Error during Azure backup pruning: {e}", exc_info=True)
     
+    def _os_remove_sync(self, file_path: str):
+        """Synchronous wrapper for os.remove."""
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            return True
+        return False
+
     async def _prune_local_backup(self, local_file_path: str) -> None:
         try:
-            if os.path.exists(local_file_path):
-                os.remove(local_file_path)
+            loop = asyncio.get_event_loop()
+            removed = await loop.run_in_executor(None, self._os_remove_sync, local_file_path)
+            if removed:
                 logger.info(f"Successfully pruned local backup: {local_file_path}")
+            elif os.path.exists(local_file_path): # Check again in case of race or if remove failed silently
+                logger.warning(f"Local backup file still exists after prune attempt: {local_file_path}")
+            else:
+                logger.info(f"Local backup file did not exist or was already pruned: {local_file_path}")
         except Exception as e:
             logger.error(f"Error pruning local backup {local_file_path}: {e}")
 

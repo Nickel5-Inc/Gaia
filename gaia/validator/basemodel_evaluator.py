@@ -55,6 +55,33 @@ class BaseModelEvaluator:
         
         logger.info(f"BaseModelEvaluator initialized. Using device: {self.device}")
     
+    def _geoprep_process_miner_data_sync(self, processed_df):
+        """Synchronous wrapper for geo_preprocessing.process_miner_data."""
+        return self.geo_preprocessing.process_miner_data(processed_df)
+
+    def _geomodel_predict_sync(self, processed_data):
+        """Synchronous wrapper for geo_model.predict."""
+        return self.geo_model.predict(processed_data)
+
+    def _soilmodel_prepare_inputs_sync(self, data_dict):
+        """Synchronous wrapper for preparing soil model inputs (moving to device)."""
+        processed_d = {}
+        for key, value in data_dict.items():
+            if isinstance(value, torch.Tensor):
+                processed_d[key] = value.to(self.device)
+            else:
+                processed_d[key] = value
+        return processed_d
+
+    def _soilmodel_inference_sync(self, sentinel_tensor, era5_tensor, elev_ndvi_tensor):
+        """Synchronous wrapper for soil_model inference."""
+        with torch.no_grad():
+            return self.soil_model(
+                sentinel=sentinel_tensor,
+                era5=era5_tensor,
+                elev_ndvi=elev_ndvi_tensor
+            )
+
     async def initialize_models(self):
         """Initialize both baseline models asynchronously."""
         try:
@@ -166,7 +193,8 @@ class BaseModelEvaluator:
                     
             logger.info(f"GEO BASEMODEL: Prediction timestamp: {prediction_timestamp}")
             
-            processed_data = self.geo_preprocessing.process_miner_data(processed_df)
+            loop = asyncio.get_event_loop() # Get event loop
+            processed_data = await loop.run_in_executor(None, self._geoprep_process_miner_data_sync, processed_df)
             
             logger.info(f"GEO BASEMODEL: Processed data shape: {processed_data.shape}")
             logger.info(f"GEO BASEMODEL: Columns: {list(processed_data.columns)}")
@@ -174,11 +202,11 @@ class BaseModelEvaluator:
             logger.info(f"GEO BASEMODEL: Running model prediction")
             
             if hasattr(self.geo_model, "run_inference"):
-                logger.info("GEO BASEMODEL: Using custom geomagnetic model for inference")
+                logger.info("GEO BASEMODEL: Using custom geomagnetic model for inference (direct call)")
                 predictions = self.geo_model.run_inference(processed_data)
             else:
                 logger.info("GEO BASEMODEL: Using base geomagnetic model")
-                raw_prediction = self.geo_model.predict(processed_data)
+                raw_prediction = await loop.run_in_executor(None, self._geomodel_predict_sync, processed_data)
                 
                 if np.isnan(raw_prediction) or np.isinf(raw_prediction):
                     logger.warning("GEO BASEMODEL: Model returned NaN/Inf, using fallback value")
@@ -257,42 +285,34 @@ class BaseModelEvaluator:
                 
             logger.info(f"SOIL BASEMODEL: Target time: {target_time}")
             
-            for key in ['sentinel_ndvi', 'era5', 'elevation']:
-                if key in data and isinstance(data[key], torch.Tensor):
-                    logger.info(f"SOIL BASEMODEL: {key} tensor shape: {data[key].shape}")
-                    logger.info(f"SOIL BASEMODEL: {key} min: {data[key].min().item():.4f}, max: {data[key].max().item():.4f}")
-            
-            processed_data = {}
             for key, value in data.items():
                 if isinstance(value, torch.Tensor):
-                    processed_data[key] = value.to(self.device)
-                else:
-                    processed_data[key] = value
+                    logger.info(f"SOIL BASEMODEL: {key} tensor shape: {value.shape}")
+                    logger.info(f"SOIL BASEMODEL: {key} min: {value.min().item():.4f}, max: {value.max().item():.4f}")
+            
+            loop = asyncio.get_event_loop() # Get event loop
+            processed_data = await loop.run_in_executor(None, self._soilmodel_prepare_inputs_sync, data)
             
             logger.info("SOIL BASEMODEL: Running model prediction")
             
-            with torch.no_grad():
-                sentinel = processed_data['sentinel_ndvi'][:2].unsqueeze(0).to(self.device)
-                era5 = processed_data['era5'].unsqueeze(0).to(self.device)
-                elevation = processed_data['elevation']
-                ndvi = processed_data['sentinel_ndvi'][2:3]
-                elev_ndvi = torch.cat([elevation, ndvi], dim=0).unsqueeze(0).to(self.device)
-                
-                logger.info(f"SOIL BASEMODEL: Running soil model with inputs:")
-                logger.info(f"SOIL BASEMODEL: - sentinel: {sentinel.shape}")
-                logger.info(f"SOIL BASEMODEL: - era5: {era5.shape}")
-                logger.info(f"SOIL BASEMODEL: - elev_ndvi: {elev_ndvi.shape}")
-                
-                raw_output = self.soil_model(
-                    sentinel=sentinel,
-                    era5=era5,
-                    elev_ndvi=elev_ndvi
-                )
+            # Offload inference to executor
+            sentinel = processed_data['sentinel_ndvi'][:2].unsqueeze(0).to(self.device) # Keep initial tensor ops on main thread if fast
+            era5 = processed_data['era5'].unsqueeze(0).to(self.device)
+            elevation = processed_data['elevation']
+            ndvi = processed_data['sentinel_ndvi'][2:3]
+            elev_ndvi = torch.cat([elevation, ndvi], dim=0).unsqueeze(0).to(self.device)
+            
+            logger.info(f"SOIL BASEMODEL: Running soil model with inputs:")
+            logger.info(f"SOIL BASEMODEL: - sentinel: {sentinel.shape}")
+            logger.info(f"SOIL BASEMODEL: - era5: {era5.shape}")
+            logger.info(f"SOIL BASEMODEL: - elev_ndvi: {elev_ndvi.shape}")
+            
+            raw_output = await loop.run_in_executor(None, self._soilmodel_inference_sync, sentinel, era5, elev_ndvi)
 
-                predictions = {
-                    'surface': raw_output[:, 0].squeeze().cpu().numpy(),
-                    'rootzone': raw_output[:, 1].squeeze().cpu().numpy()
-                }
+            predictions = {
+                'surface': raw_output[:, 0].squeeze().cpu().numpy(),
+                'rootzone': raw_output[:, 1].squeeze().cpu().numpy()
+            }
             
             if not predictions or not isinstance(predictions, dict) or 'surface' not in predictions or 'rootzone' not in predictions:
                 logger.error(f"SOIL BASEMODEL: Invalid prediction output. Keys: {list(predictions.keys()) if predictions else 'None'}")

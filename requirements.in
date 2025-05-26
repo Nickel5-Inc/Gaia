@@ -43,5 +43,6 @@ microsoft-aurora
 pyjwt
 cdsapi
 azure-storage-blob
+pyinstrument
 
 

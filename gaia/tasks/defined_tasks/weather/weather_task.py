@@ -28,6 +28,12 @@ from fiber.encrypted.validator import handshake
 from fiber.encrypted.validator import client as vali_client
 from sqlalchemy import text, bindparam, TEXT
 import httpx
+import gc
+import shutil
+import zarr
+import numcodecs
+from typing import Dict
+import gzip
 
 from .utils.era5_api import fetch_era5_data
 from .utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
@@ -584,7 +590,7 @@ class WeatherTask(Task):
                 miners_to_trigger = []
                 if validator_input_hash:
                     update_tasks = []
-                    for resp_id, status_data in miner_hash_results.items():
+                    for i, (resp_id, status_data) in enumerate(miner_hash_results.items()):
                         miner_status = status_data.get('status')
                         miner_hash = status_data.get('input_data_hash')
                         error_msg = status_data.get('message')
@@ -636,6 +642,10 @@ class WeatherTask(Task):
                                 "now": datetime.now(timezone.utc)
                             }))
                     
+                            # Yield control if processing many results
+                            if len(miner_hash_results) > 20 and i % 20 == 19: # Yield every 20 items after the 20th
+                                await asyncio.sleep(0)
+                    
                     if update_tasks:
                          await asyncio.gather(*update_tasks)
                          logger.info(f"[Run {run_id}] Updated DB for {len(update_tasks)} miner responses after hash check.")
@@ -684,18 +694,16 @@ class WeatherTask(Task):
 
                     final_update_tasks = []
                     triggered_count = 0
-                    for resp_id, success in trigger_results:
+                    for i, (resp_id, success) in enumerate(trigger_results):
                         if success:
                             triggered_count += 1
                             final_update_tasks.append(self.db_manager.execute(
                                 "UPDATE weather_miner_responses SET status = 'inference_triggered' WHERE id = :id",
                                 {"id": resp_id}
                             ))
-                        else:
-                             final_update_tasks.append(self.db_manager.execute(
-                                "UPDATE weather_miner_responses SET status = 'inference_trigger_failed', error_message = COALESCE(error_message || '; ', '') || 'Failed to trigger inference' WHERE id = :id",
-                                {"id": resp_id}
-                            ))
+                        # Yield control if processing many results
+                        if len(trigger_results) > 20 and i % 20 == 19: # Yield every 20 items after the 20th
+                            await asyncio.sleep(0)
                     
                     if final_update_tasks:
                          await asyncio.gather(*final_update_tasks)

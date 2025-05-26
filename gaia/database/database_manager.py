@@ -15,6 +15,7 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 import traceback
 from datetime import datetime, timezone # Added import
+import os # Ensure os is imported
 
 logger = get_logger(__name__)
 
@@ -87,16 +88,38 @@ class BaseDatabaseManager(ABC):
     def __init__(
         self,
         node_type: str,
-        host: str = "localhost",
-        port: int = 5432,
-        database: str = "bittensor",
-        user: str = "postgres",
-        password: str = "postgres",
+        host: str = "localhost", # Default if DB_HOST is not set
+        port: int = 5432,        # Default if DB_PORT is not set
+        database: str = "bittensor",# Default if DB_NAME is not set
+        user: str = "postgres",    # Default if DB_USER is not set
+        password: str = "postgres",# Default if DB_PASSWORD is not set
     ):
         """Initialize database connection parameters and engine."""
         if not hasattr(self, "initialized"):
             self.node_type = node_type
-            self.db_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
+
+            actual_user = os.getenv("DB_USER", user)
+            actual_password = os.getenv("DB_PASSWORD", password)
+            actual_host = os.getenv("DB_HOST", host)
+            actual_port_str = os.getenv("DB_PORT", str(port))
+            actual_database = os.getenv("DB_NAME", database)
+
+            try:
+                actual_port = int(actual_port_str)
+            except ValueError:
+                logger.error(f"Invalid DB_PORT value '{actual_port_str}'. Defaulting to {port}.")
+                actual_port = port
+            
+            # Intelligent URL construction
+            if actual_host and actual_host.startswith("/"):
+                # Assume Unix domain socket if DB_HOST starts with a slash
+                # The host part of the URL is empty, and the socket path is in the 'host' query parameter.
+                self.db_url = f"postgresql+asyncpg://{actual_user}:{actual_password}@/{actual_database}?host={actual_host}"
+                logger.info(f"Configuring database for Unix domain socket connection: {actual_host}")
+            else:
+                # Standard TCP/IP connection
+                self.db_url = f"postgresql+asyncpg://{actual_user}:{actual_password}@{actual_host}:{actual_port}/{actual_database}"
+                logger.info(f"Configuring database for TCP/IP connection: {actual_host}:{actual_port}")
             
             self._active_sessions = set()
             self._active_operations = 0

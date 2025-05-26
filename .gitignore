@@ -53,3 +53,4 @@ pm2_validator.log
 generate_miner_manifest.py
 make_zarr_dir.py
 aurora-0.25-static.pickle
+era5_cache/*

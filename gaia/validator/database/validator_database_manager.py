@@ -345,66 +345,60 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         vtrust: Optional[float] = None,
         protocol: Optional[str] = None,
     ):
-        """Update node information in the node_table for a specific UID."""
-        if not (0 <= index < 256):
-            logger.error(f"Invalid index {index} for update_miner_info. Must be between 0 and 255.")
-            raise ValueError(f"Invalid index {index}. Must be between 0 and 255")
+        """Update miner information in the node_table."""
+        if self._storage_locked:
+            logger.warning("Database storage is locked, update_miner_info operation skipped.")
+            return
 
-        update_values = {
-            "hotkey": hotkey,
-            "coldkey": coldkey,
-            "ip": ip,
-            "ip_type": ip_type,
-            "port": port,
-            "incentive": incentive,
-            "stake": stake,
-            "trust": trust,
-            "vtrust": vtrust,
-            "protocol": protocol,
-            "last_updated": datetime.now(timezone.utc)  # Ensure last_updated is always set
-        }
+        async with self.session(f"update_miner_info_uid_{index}") as s:
+            try:
+                # The session context manager 's' already handles begin/commit/rollback.
+                # No need for an inner 'async with s.begin()'
+                
+                # Check if miner exists
+                existing_miner = await s.execute(
+                    self.node_table.select().where(self.node_table.c.uid == index)
+                )
+                miner_row = existing_miner.fetchone()
 
-        # Filter out None values to avoid overwriting existing data with NULLs if not intended
-        # However, if a field is explicitly passed as None, it WILL be set to NULL.
-        # If a field is not in kwargs (i.e., not passed to the function), it's not included here.
-        # This behavior is slightly different from the old raw query which would set to NULL if param was None.
-        # Consider if this is the desired behavior or if explicit NULLs should be handled differently.
-        
-        # For this refactor, we'll keep the behavior closer to the original:
-        # if a parameter is None, it will be set as None (NULL) in the DB.
-        # The `update_values` dict above already includes all parameters.
+                update_values = {
+                    "hotkey": hotkey,
+                    "coldkey": coldkey,
+                    "ip": ip,
+                    "ip_type": ip_type,
+                    "port": port,
+                    "incentive": float(incentive) if incentive is not None else None,
+                    "stake": float(stake) if stake is not None else None,
+                    "trust": float(trust) if trust is not None else None,
+                    "vtrust": float(vtrust) if vtrust is not None else None,
+                    "protocol": protocol,
+                    "last_updated": datetime.now(timezone.utc)
+                }
+                
+                # Remove None values to avoid overwriting existing data with None
+                update_values = {k: v for k, v in update_values.items() if v is not None}
 
-        stmt = (
-            update(self.node_table)  # Assuming self.node_table is the SQLAlchemy Table object
-            .where(self.node_table.c.uid == index)
-            .values(**update_values)
-        )
 
-        try:
-            # First, check if the row exists. This also helps ensure node_table is initialized.
-            # This check can be debated; for a pure UPDATE it's not strictly necessary if we assume UIDs 0-255 exist.
-            # However, it was in the original code, so keeping it for now.
-            exists_query = text("SELECT 1 FROM node_table WHERE uid = :uid_val")
-            async with self.session(operation_name=f"update_miner_info_uid_{index}") as s:
-                async with s.begin(): # Ensure check and update are atomic
-                    exists_check_stmt = text("SELECT 1 FROM node_table WHERE uid = :uid_val")
-                    exists_result = await s.execute(exists_check_stmt, {"uid_val": index})
-                    if not exists_result.scalar_one_or_none():
-                        logger.error(f"Attempted to update non-existent UID {index} in node_table.")
-                        raise ValueError(f"Cannot update UID {index}: does not exist in node_table.")
+                if miner_row:
+                    # Update existing miner
+                    stmt = (
+                        self.node_table.update()
+                        .where(self.node_table.c.uid == index)
+                        .values(**update_values)
+                    )
+                else:
+                    # Insert new miner
+                    stmt = self.node_table.insert().values(uid=index, **update_values)
+                
+                await s.execute(stmt)
+                # No explicit commit needed here, handled by the session context manager.
 
-                    await s.execute(stmt)
-                    # Commit will happen automatically by the async with s.begin() context manager on successful exit
+                logger.debug(f"Successfully updated/inserted miner info for UID {index} with hotkey {hotkey}")
 
-            logger.debug(f"Successfully updated miner info for UID {index}") # Optional success log
-
-        except ValueError as ve:
-            logger.error(f"ValueError updating miner info for UID {index}: {str(ve)}")
-            raise # Re-raise ValueError to be more specific than generic DatabaseError
-        except Exception as e:
-            logger.error(f"Error updating miner info for UID {index} using SQLAlchemy update: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise DatabaseError(f"Failed to update miner info for UID {index}: {str(e)}") from e
+            except Exception as e:
+                logger.error(f"Error updating miner info for UID {index} using SQLAlchemy update: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise DatabaseError(f"Failed to update miner info for UID {index}: {str(e)}") from e
 
     @track_operation('write')
     async def batch_update_miners(self, miners_data: List[Dict[str, Any]]) -> None:

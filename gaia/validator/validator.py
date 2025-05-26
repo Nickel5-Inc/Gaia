@@ -9,6 +9,7 @@ import concurrent.futures
 import glob
 import signal
 import sys
+import yappi  # Added yappi import
 
 from gaia.database.database_manager import DatabaseTimeout
 try:
@@ -514,20 +515,30 @@ class GaiaValidator:
                             logger.info(f"Initiating handshake with miner {miner_hotkey} at {base_url}")
                             # Perform handshake with timeout
                             handshake_start_time = time.time()
-                            symmetric_key_str, symmetric_key_uuid = await asyncio.wait_for(
-                                handshake.perform_handshake(
-                                    keypair=self.keypair,
-                                    httpx_client=client,
-                                    server_address=base_url,
-                                    miner_hotkey_ss58_address=miner_hotkey,
-                                ),
-                                timeout=30.0
-                            )
+                            symmetric_key_str, symmetric_key_uuid = None, None # Initialize
+                            try:
+                                symmetric_key_str, symmetric_key_uuid = await asyncio.wait_for(
+                                    handshake.perform_handshake(
+                                        keypair=self.keypair,
+                                        httpx_client=client,
+                                        server_address=base_url,
+                                        miner_hotkey_ss58_address=miner_hotkey,
+                                    ),
+                                    timeout=30.0
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning(f"Handshake timed out for miner {miner_hotkey} at {base_url}")
+                                return None
+                            except Exception as hs_err:
+                                logger.error(f"Handshake failed for miner {miner_hotkey} at {base_url}: {type(hs_err).__name__} - {hs_err}")
+                                logger.debug(traceback.format_exc())
+                                return None
+
                             handshake_duration = time.time() - handshake_start_time
                             logger.info(f"Handshake with {miner_hotkey} completed in {handshake_duration:.2f}s")
 
                             if not symmetric_key_str or not symmetric_key_uuid:
-                                logger.warning(f"Failed handshake with miner {miner_hotkey}")
+                                logger.warning(f"Failed handshake with miner {miner_hotkey} (no key/UUID returned)")
                                 return None
 
                             logger.info(f"Handshake successful with miner {miner_hotkey}")
@@ -583,6 +594,7 @@ class GaiaValidator:
                                 if process:
                                     logger.error(f"Memory during request EXCEPTION ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
                                 logger.error(f"Error during make_non_streamed_post for {miner_hotkey}: {type(request_error).__name__} - {request_error}")
+                                logger.debug(f"Request details: URL='{base_url}{endpoint}', Miner Hotkey='{miner_hotkey}'") # Added for context
                                 logger.debug(traceback.format_exc())
                                 return None
                             
@@ -608,7 +620,9 @@ class GaiaValidator:
                         logger.warning(f"Timeout querying miner {miner_hotkey} at {base_url}")
                         return None
                     except Exception as e:
-                        logger.warning(f"Failed request to miner {miner_hotkey} at {base_url}: {str(e)}")
+                        logger.warning(f"Failed request to miner {miner_hotkey} at {base_url}: {type(e).__name__} - {str(e)}")
+                        logger.debug(f"Outer exception context: URL='{base_url}', Miner Hotkey='{miner_hotkey}'") # Added for context
+                        logger.debug(traceback.format_exc())
                         return None
 
                 # Query all miners in parallel with shared client
@@ -636,7 +650,7 @@ class GaiaValidator:
             return {}
 
     async def check_for_updates(self):
-        """Check for and apply updates every 2 minutes."""
+        """Check for and apply updates every 5 minutes."""
         while True:
             try:
                 logger.info("Checking for updates...")
@@ -665,7 +679,7 @@ class GaiaValidator:
                 logger.error(f"Outer error in update checker: {outer_e}")
                 logger.error(traceback.format_exc())
 
-            await asyncio.sleep(120)  # Check every 2 minutes
+            await asyncio.sleep(300)  # Check every 5 minutes
 
     async def update_task_status(self, task_name: str, status: str, operation: Optional[str] = None):
         """Update task status and operation tracking."""
@@ -1509,7 +1523,7 @@ class GaiaValidator:
         while True:
             processed_uids = set() # Keep track of UIDs processed in this cycle
             try:
-                await asyncio.sleep(120) # Run every 2 minutes
+                await asyncio.sleep(600) # Run every 10 minutes
 
                 # Ensure metagraph is up to date
                 if not self.metagraph:
@@ -1719,8 +1733,178 @@ class GaiaValidator:
             except asyncio.CancelledError:
                 logger.info("Miner state synchronization loop cancelled.")
 
+    def _perform_weight_calculations_sync(self, weather_results, geomagnetic_results, soil_results, now, validator_nodes_by_uid_list):
+        """
+        Synchronous helper to perform CPU-bound weight calculations.
+        """
+        logger.info("Synchronous weight calculation: Processing fetched scores...")
+        # Initialize score arrays
+        weather_scores = np.full(256, np.nan)
+        geomagnetic_scores = np.full(256, np.nan)
+        soil_scores = np.full(256, np.nan)
+
+        # Count raw scores per UID
+        weather_counts = [0] * 256
+        geo_counts = [0] * 256
+        soil_counts = [0] * 256
+        
+        if weather_results:
+            for result in weather_results:
+                # Ensure 'score' key exists and is a list of appropriate length
+                scores = result.get('score', [np.nan]*256)
+                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                for uid in range(256):
+                    if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                        weather_counts[uid] += 1
+        
+        if geomagnetic_results:
+            for result in geomagnetic_results:
+                scores = result.get('score', [np.nan]*256)
+                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                for uid in range(256):
+                    if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                        geo_counts[uid] += 1
+
+        if soil_results:
+            for result in soil_results:
+                scores = result.get('score', [np.nan]*256)
+                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                for uid in range(256):
+                    if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                        soil_counts[uid] += 1
+
+        if geomagnetic_results:
+            geo_scores_by_uid = [[] for _ in range(256)]
+            zero_scores_count = 0
+            for result in geomagnetic_results:
+                age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                decay = np.exp(-age_days * np.log(2))
+                scores = result.get('score', [np.nan]*256)
+                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                for uid in range(256):
+                    if isinstance(scores[uid], str) or np.isnan(scores[uid]): scores[uid] = 0.0
+                    geo_scores_by_uid[uid].append((scores[uid], decay))
+                    if scores[uid] == 0.0: zero_scores_count += 1
+            logger.info(f"Loaded {len(geomagnetic_results)} geomagnetic score records with {zero_scores_count} zero scores")
+            zeros_after = 0
+            for uid in range(256):
+                if geo_scores_by_uid[uid]:
+                    s_vals, d_weights = zip(*geo_scores_by_uid[uid])
+                    s_arr, w_arr = np.array(s_vals), np.array(d_weights)
+                    zero_mask, total_count = (s_arr == 0.0), len(s_arr)
+                    if np.all(zero_mask): geomagnetic_scores[uid], zeros_after = 0.0, zeros_after + 1; logger.debug(f"UID {uid}: All {total_count} geo scores zeroed"); continue
+                    masked_s, masked_w = s_arr[~zero_mask], w_arr[~zero_mask]
+                    if np.any(zero_mask): logger.debug(f"UID {uid}: Masked {np.sum(zero_mask)}/{total_count} zero geo scores")
+                    weight_sum = np.sum(masked_w)
+                    if weight_sum > 0: geomagnetic_scores[uid] = np.sum(masked_s * masked_w) / weight_sum; zeros_after += (geomagnetic_scores[uid] == 0.0)
+                    else: geomagnetic_scores[uid], zeros_after = 0.0, zeros_after + 1
+            logger.info(f"Geomagnetic masked array processing: {zeros_after} UIDs have zero final score")
+
+        if weather_results:
+            latest_result = weather_results[0]
+            scores = latest_result.get('score', [np.nan]*256)
+            if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+            score_age_days = (now - latest_result['created_at']).total_seconds() / (24 * 3600)
+            logger.info(f"Using latest weather score from {latest_result['created_at']} ({score_age_days:.1f} days ago)")
+            for uid in range(256):
+                if isinstance(scores[uid], str) or np.isnan(scores[uid]): weather_scores[uid] = 0.0
+                else: weather_scores[uid] = scores[uid]; weather_counts[uid] += (scores[uid] != 0.0)
+            logger.info(f"Weather scores: {sum(1 for s in weather_scores if s == 0.0)} UIDs have zero score")
+
+        if soil_results:
+            soil_scores_by_uid = [[] for _ in range(256)]
+            for result in soil_results:
+                age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                decay = np.exp(-age_days * np.log(2))
+                scores = result.get('score', [np.nan]*256)
+                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                for uid in range(256):
+                    if isinstance(scores[uid], str) or np.isnan(scores[uid]): scores[uid] = 0.0
+                    soil_scores_by_uid[uid].append((scores[uid], decay))
+            zero_soil_scores = sum(s == 0.0 for res in soil_results for s_list in [res.get('score')] if isinstance(s_list, list) for s in s_list if isinstance(s, (int, float)))
+            logger.info(f"Loaded {len(soil_results)} soil records with {zero_soil_scores}/{len(soil_results)*256} zero scores")
+            zeros_after = 0
+            for uid in range(256):
+                if soil_scores_by_uid[uid]:
+                    s_vals, d_weights = zip(*soil_scores_by_uid[uid])
+                    s_arr, w_arr = np.array(s_vals), np.array(d_weights)
+                    zero_mask, total_count = (s_arr == 0.0), len(s_arr)
+                    if np.all(zero_mask): soil_scores[uid], zeros_after = 0.0, zeros_after + 1; logger.debug(f"UID {uid}: All {total_count} soil scores zeroed"); continue
+                    masked_s, masked_w = s_arr[~zero_mask], w_arr[~zero_mask]
+                    if np.any(zero_mask): logger.debug(f"UID {uid}: Masked {np.sum(zero_mask)}/{total_count} zero soil scores")
+                    weight_sum = np.sum(masked_w)
+                    if weight_sum > 0: soil_scores[uid] = np.sum(masked_s * masked_w) / weight_sum; zeros_after += (soil_scores[uid] == 0.0)
+                    else: soil_scores[uid], zeros_after = 0.0, zeros_after + 1
+            logger.info(f"Soil task: {zeros_after} UIDs have zero final score after masked array processing")
+
+        logger.info("Aggregate scores calculated. Proceeding to weight normalization...")
+        def sigmoid(x, k=20, x0=0.93): return 1 / (1 + math.exp(-k * (x - x0)))
+        weights_final = np.zeros(256)
+        for idx in range(256):
+            w_s, g_s, sm_s = weather_scores[idx], geomagnetic_scores[idx], soil_scores[idx]
+            if np.isnan(w_s) or w_s==0: w_s=np.nan
+            if np.isnan(g_s) or g_s==0: g_s=np.nan
+            if np.isnan(sm_s) or sm_s==0: sm_s=np.nan
+            node_obj, hk_chain = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None, "N/A"
+            if node_obj: hk_chain = node_obj.hotkey
+            if np.isnan(w_s) and np.isnan(g_s) and np.isnan(sm_s): weights_final[idx] = 0.0
+            else:
+                wc, gc, sc, total_w_avail = 0.0,0.0,0.0,0.0
+                if not np.isnan(w_s): wc,total_w_avail = 0.70*w_s, total_w_avail+0.70
+                if not np.isnan(g_s): gc,total_w_avail = 0.15*sigmoid(g_s), total_w_avail+0.15
+                if not np.isnan(sm_s): sc,total_w_avail = 0.15*sm_s, total_w_avail+0.15
+                weights_final[idx] = (wc+gc+sc)/total_w_avail if total_w_avail>0 else 0.0
+            logger.info(f"UID {idx} (HK: {hk_chain}): Wea={w_s if not np.isnan(w_s) else '-'} ({weather_counts[idx]} scores), Geo={g_s if not np.isnan(g_s) else '-'} ({geo_counts[idx]} scores), Soil={sm_s if not np.isnan(sm_s) else '-'} ({soil_counts[idx]} scores), AggW={weights_final[idx]:.4f}")
+        logger.info(f"Weights before normalization: Min={np.min(weights_final):.4f}, Max={np.max(weights_final):.4f}, Mean={np.mean(weights_final):.4f}")
+        
+        non_zero_mask = weights_final != 0.0
+        if not np.any(non_zero_mask): logger.warning("No non-zero weights to normalize!"); return None
+        
+        nz_weights = weights_final[non_zero_mask]
+        max_w_val = np.max(nz_weights)
+        if max_w_val == 0: logger.warning("Max weight is 0, cannot normalize."); return None
+        
+        norm_weights = np.copy(weights_final); norm_weights[non_zero_mask] /= max_w_val
+        positives = norm_weights[norm_weights > 0]
+        if not positives.any(): logger.warning("No positive weights after initial normalization!"); return None
+        
+        M = np.percentile(positives, 80); logger.info(f"Using 80th percentile ({M:.8f}) as curve midpoint")
+        b,Q,v,k,a,slope = 70,8,0.3,0.98,0.0,0.01
+        transformed_w = np.zeros_like(weights_final)
+        nz_indices = np.where(weights_final > 0.0)[0]
+        if not nz_indices.any(): logger.warning("No positive weight indices for transformation!"); return None
+
+        for idx in nz_indices:
+            sig_p = a+(k-a)/np.power(1+Q*np.exp(-b*(norm_weights[idx]-M)),1/v)
+            transformed_w[idx] = sig_p + slope*norm_weights[idx]
+        
+        trans_nz = transformed_w[transformed_w > 0]
+        if trans_nz.any(): logger.info(f"Transformed weights: Min={np.min(trans_nz):.4f}, Max={np.max(trans_nz):.4f}, Mean={np.mean(trans_nz):.4f}")
+        else: logger.warning("No positive weights after sigmoid transformation!"); # Continue to rank-based if needed or return None
+
+        if len(trans_nz) > 1 and np.std(trans_nz) < 0.01:
+            logger.warning(f"Transformed weights too uniform (std={np.std(trans_nz):.4f}), switching to rank-based.")
+            sorted_indices = np.argsort(-weights_final); transformed_w = np.zeros_like(weights_final)
+            pos_count = np.sum(weights_final > 0)
+            for i,idx_val in enumerate(sorted_indices[:pos_count]): transformed_w[idx_val] = 1.0/((i+1)**1.2)
+            rank_nz = transformed_w[transformed_w > 0]
+            if rank_nz.any(): logger.info(f"Rank-based: Min={np.min(rank_nz):.4f}, Max={np.max(rank_nz):.4f}, Mean={np.mean(rank_nz):.4f}")
+        
+        final_sum = np.sum(transformed_w); final_weights_list = None
+        if final_sum > 0:
+            transformed_w /= final_sum
+            final_nz_vals = transformed_w[transformed_w > 0]
+            if final_nz_vals.any():
+                logger.info(f"Final Norm Weights: Count={len(final_nz_vals)}, Min={np.min(final_nz_vals):.4f}, Max={np.max(final_nz_vals):.4f}, Std={np.std(final_nz_vals):.4f}")
+                if len(np.unique(final_nz_vals)) < len(final_nz_vals)/2 : logger.warning(f"Low unique weights! {len(np.unique(final_nz_vals))}/{len(final_nz_vals)}")
+                if final_nz_vals.max() > 0.90: logger.warning(f"Max weight {final_nz_vals.max():.4f} is very high!")
+            final_weights_list = transformed_w.tolist()
+            logger.info("Final normalized weights calculated.")
+        else: logger.warning("Sum of weights is zero, cannot normalize! Returning None.")
+        return final_weights_list
+
     async def _calc_task_weights(self):
-        """Calculate weights based on recent task scores."""
+        """Calculate weights based on recent task scores. Async part fetches data."""
         try:
             now = datetime.now(timezone.utc)
             one_day_ago = now - timedelta(days=1)
@@ -1728,376 +1912,63 @@ class GaiaValidator:
             query = """
             SELECT score, created_at 
             FROM score_table 
-            WHERE task_name = :task_name
-            AND created_at >= :start_time
-            ORDER BY created_at DESC
+            WHERE task_name = :task_name AND created_at >= :start_time ORDER BY created_at DESC
             """
             weather_query = """
             SELECT score, created_at 
             FROM score_table 
-            WHERE task_name = :task_name
-            ORDER BY created_at DESC
-            LIMIT 1
+            WHERE task_name = :task_name ORDER BY created_at DESC LIMIT 1
             """
-            weather_results = await self.database_manager.fetch_all(
-                weather_query, {"task_name": "weather"}
-            )
-            logger.info(f"Found {len(weather_results)} weather score row (latest only)")
             
-            # Fetch geomagnetic scores
-            geomagnetic_results = await self.database_manager.fetch_all(
-                query, {"task_name": "geomagnetic", "start_time": one_day_ago}
-            )
-            logger.info(f"Found {len(geomagnetic_results)} geomagnetic score rows")
+            weather_results = await self.database_manager.fetch_all(weather_query, {"task_name": "weather"})
+            logger.info(f"Fetched {len(weather_results)} weather score rows")
+            geomagnetic_results = await self.database_manager.fetch_all(query, {"task_name": "geomagnetic", "start_time": one_day_ago})
+            logger.info(f"Fetched {len(geomagnetic_results)} geomagnetic score rows")
+            soil_results = await self.database_manager.fetch_all(query, {"task_name": "soil_moisture", "start_time": one_day_ago})
+            logger.info(f"Fetched {len(soil_results)} soil moisture score rows")
             
-            # Fetch soil moisture scores
-            soil_results = await self.database_manager.fetch_all(
-                query, {"task_name": "soil_moisture", "start_time": one_day_ago}
-            )
-            logger.info(f"Found {len(soil_results)} soil moisture score rows")
-            
-            # If no scores exist yet, return equal weights for all active nodes
             if not weather_results and not geomagnetic_results and not soil_results:
-                logger.info("No scores found in database - initializing equal weights for active nodes")
+                logger.info("No scores found in DB - initializing equal weights for active nodes")
                 try:
-                    # Get active nodes from metagraph
-                    if not self.metagraph or not self.metagraph.nodes:
-                        logger.warning("No active nodes found in metagraph")
-                        return None
-                        
-                    active_nodes = len(self.metagraph.nodes)
-                    # Create equal weights for active nodes
-                    weights = np.zeros(256)
-                    weight_value = 1.0 / active_nodes
-                    
-                    # Use the index in the nodes dictionary as the UID
-                    for uid, (hotkey, node) in enumerate(self.metagraph.nodes.items()):
-                        weights[uid] = weight_value
-                        logger.debug(f"Set weight {weight_value:.4f} for node {hotkey} at index {uid}")
-                    
-                    logger.info(f"Initialized equal weights ({weight_value:.4f}) for {active_nodes} active nodes")
-                    return weights.tolist()
-                except Exception as e:
-                    logger.error(f"Error initializing equal weights: {e}")
-                    logger.error(traceback.format_exc())
-                    return None
+                    if not self.metagraph or not self.metagraph.nodes: logger.warning("No metagraph/nodes for equal weight init"); return None
+                    active_nodes_count = len(self.metagraph.nodes)
+                    if active_nodes_count == 0: logger.warning("Zero active nodes, cannot init equal weights."); return None
+                    weights_arr = np.zeros(256); weight_val = 1.0 / active_nodes_count
+                    active_uids = [node.node_id for node in self.metagraph.nodes.values() if node.node_id < 256] # Prefer direct node_id
+                    if not hasattr(self.metagraph, 'uids') or self.metagraph.uids is None: # Fallback if direct .uids isn't there/reliable
+                         logger.debug("Metagraph.uids not available, deriving from metagraph.nodes.values()")
+                    elif self.metagraph.uids is not None: # If .uids exists, cross-check or prefer it if more direct
+                         chain_uids = [uid.item() for uid in self.metagraph.uids if uid.item() < 256]
+                         if set(active_uids) != set(chain_uids):
+                              logger.warning(f"Discrepancy in UIDs from metagraph.nodes ({len(active_uids)}) vs metagraph.uids ({len(chain_uids)}). Preferring metagraph.nodes derived UIDs.")
+                    if not active_uids: logger.warning("No active UIDs to assign equal weights."); return None
+                    for uid_val in active_uids: weights_arr[uid_val] = weight_val
+                    logger.info(f"Initialized equal weights ({weight_val:.4f}) for {len(active_uids)} active nodes")
+                    return weights_arr.tolist()
+                except Exception as e: logger.error(f"Error initializing equal weights: {e}", exc_info=True); return None
 
-            # Initialize score arrays
-            weather_scores = np.full(256, np.nan)
-            geomagnetic_scores = np.full(256, np.nan)
-            soil_scores = np.full(256, np.nan)
-
-            # Count raw scores per UID
-            weather_counts = [0] * 256
-            geo_counts = [0] * 256
-            soil_counts = [0] * 256
-            
-            if weather_results:
-                for result in weather_results:
-                    scores = result['score']
-                    for uid in range(256):
-                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
-                            weather_counts[uid] += 1
-            
-            if geomagnetic_results:
-                for result in geomagnetic_results:
-                    scores = result['score']
-                    for uid in range(256):
-                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
-                            geo_counts[uid] += 1
-
-            if soil_results:
-                for result in soil_results:
-                    scores = result['score']
-                    for uid in range(256):
-                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
-                            soil_counts[uid] += 1
-
-            if geomagnetic_results:
-                geo_scores_by_uid = [[] for _ in range(256)]
-                zero_scores_count = 0
-                all_zeros_count = 0
-                
-                for result in geomagnetic_results:
-                    age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                    decay = np.exp(-age_days * np.log(2))  # Decay by half each day
-                    scores = result['score']
-                    for uid in range(256):
-                        # Replace NaN with 0 for API compatibility
-                        if isinstance(scores[uid], str) or np.isnan(scores[uid]):
-                            scores[uid] = 0.0
-                        geo_scores_by_uid[uid].append((scores[uid], decay))
-                        if scores[uid] == 0.0:
-                            zero_scores_count += 1
-                
-                logger.info(f"Loaded {len(geomagnetic_results)} geomagnetic score records with {zero_scores_count} zero scores")
-                
-                zeros_before = 0
-                zeros_after = 0
-                
-                for uid in range(256):
-                    if geo_scores_by_uid[uid]:
-                        scores, decay_weights = zip(*geo_scores_by_uid[uid])
-                        scores_array = np.array(scores)
-                        weights_array = np.array(decay_weights)
-                        
-                        zero_mask = (scores_array == 0.0)
-                        zero_count = np.sum(zero_mask)
-                        total_count = len(scores_array)
-                        
-                        if np.all(zero_mask):
-                            geomagnetic_scores[uid] = 0.0
-                            zeros_after += 1
-                            logger.debug(f"UID {uid}: All {total_count} geo scores were zero - final score zeroed")
-                            continue
-                            
-                        masked_scores = scores_array[~zero_mask]
-                        masked_weights = weights_array[~zero_mask]
-                        
-                        if np.any(zero_mask):
-                            masked_count = np.sum(zero_mask)
-                            total_count = len(zero_mask)
-                            logger.debug(f"UID {uid}: Masked {masked_count}/{total_count} zero geo scores from averaging")
-                        
-                        weight_sum = np.sum(masked_weights)
-                        if weight_sum > 0:
-                            geomagnetic_scores[uid] = np.sum(masked_scores * masked_weights) / weight_sum
-                            if geomagnetic_scores[uid] == 0.0:
-                                zeros_after += 1
-                
-                for uid in range(256):
-                    if not np.isnan(geomagnetic_scores[uid]) and geomagnetic_scores[uid] == 0.0:
-                        zeros_before += 1
-                
-                logger.info(f"Geomagnetic masked array processing: {zeros_after} UIDs have zero final score")
-
-            if weather_results:
-                latest_result = weather_results[0]
-                scores = latest_result['score']
-                score_age_days = (now - latest_result['created_at']).total_seconds() / (24 * 3600)
-                logger.info(f"Using latest weather score from {latest_result['created_at']} ({score_age_days:.1f} days ago)")
-                
-                for uid in range(256):
-                    if isinstance(scores[uid], str) or np.isnan(scores[uid]):
-                        weather_scores[uid] = 0.0
-                    else:
-                        weather_scores[uid] = scores[uid]
-                        if scores[uid] != 0.0:
-                            weather_counts[uid] = 1
-                
-                zero_count = sum(1 for s in weather_scores if s == 0.0)
-                logger.info(f"Weather scores: {zero_count} UIDs have zero score in latest evaluation")
-
-            if soil_results:
-                soil_scores_by_uid = [[] for _ in range(256)]
-                for result in soil_results:
-                    age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                    decay = np.exp(-age_days * np.log(2))
-                    scores = result['score']
-                    for uid in range(256):
-                        if isinstance(scores[uid], str) or np.isnan(scores[uid]):
-                            scores[uid] = 0.0
-                        soil_scores_by_uid[uid].append((scores[uid], decay))
-                
-                total_soil_scores = len(soil_results) * 256
-                zero_soil_scores = sum(scores[uid] == 0.0 for result in soil_results for uid in range(256) 
-                                      if isinstance(scores := result['score'], list) and uid < len(scores))
-                logger.info(f"Loaded {len(soil_results)} soil score records with {zero_soil_scores}/{total_soil_scores} zero scores")
-                
-                zeros_before = sum(1 for uid in range(256) if all(score == 0.0 for score, _ in soil_scores_by_uid[uid]))
-                zeros_after = 0
-                for uid in range(256):
-                    if soil_scores_by_uid[uid]:
-                        scores, decay_weights = zip(*soil_scores_by_uid[uid])
-                        scores_array = np.array(scores)
-                        weights_array = np.array(decay_weights)
-                        zero_mask = (scores_array == 0.0)
-                        
-                        if np.all(zero_mask):
-                            soil_scores[uid] = 0.0
-                            zeros_after += 1
-                            logger.debug(f"UID {uid}: All soil scores were zero, setting final score to zero")
-                            continue
-                            
-                        masked_scores = scores_array[~zero_mask]
-                        masked_weights = weights_array[~zero_mask]
-                        
-                        if np.any(zero_mask):
-                            masked_count = np.sum(zero_mask)
-                            total_count = len(zero_mask)
-                            logger.debug(f"UID {uid}: Masked {masked_count}/{total_count} zero soil scores from averaging")
-                        
-                        weight_sum = np.sum(masked_weights)
-                        if weight_sum > 0:
-                            soil_scores[uid] = np.sum(masked_scores * masked_weights) / weight_sum
-                        else:
-                            soil_scores[uid] = 0.0
-                            zeros_after += 1
-                
-                logger.info(f"Soil task: {zeros_before} UIDs had all zero scores before processing, {zeros_after} UIDs have zero final score after masked array processing")
-
-            logger.info("Recent scores fetched and decay-weighted. Calculating aggregate scores...")
-
-            # Use a sigmoid transformation for geo scores
-            def sigmoid(x, k=20, x0=0.93):
-                return 1 / (1 + math.exp(-k * (x - x0)))
-
-            weights = np.zeros(256)
-            
-            # Fetch active nodes and prepare a UID-indexed list for quick lookup
+            active_nodes_list_sync = []
             try:
-                active_nodes_list = get_nodes_for_netuid(self.substrate, self.metagraph.netuid)
-                if active_nodes_list is None: active_nodes_list = []
-            except Exception as e_fetch_calc_weights:
-                logger.error(f"Failed to fetch nodes in _calc_task_weights: {e_fetch_calc_weights}", exc_info=True)
-                active_nodes_list = []
+                # Ensure this is a synchronous call if get_nodes_for_netuid can be blocking.
+                # For now, assuming it's relatively quick or primarily I/O bound with Substrate.
+                active_nodes_list_from_chain = get_nodes_for_netuid(self.substrate, self.metagraph.netuid)
+                if active_nodes_list_from_chain is None: active_nodes_list_from_chain = []
+                active_nodes_list_sync = active_nodes_list_from_chain # Use this list for the sync method
+            except Exception as e_fetch_nodes:
+                logger.error(f"Failed to fetch nodes for weight calc: {e_fetch_nodes}", exc_info=True)
+                # active_nodes_list_sync remains empty, sync function should handle this
             
-            max_allowed_uid = 256 # Assuming UIDs are 0-255 for a 256-slot subnet
-            validator_nodes_by_uid_list = [None] * max_allowed_uid
-            for node in active_nodes_list:
-                if node.node_id < max_allowed_uid:
-                    validator_nodes_by_uid_list[node.node_id] = node
+            validator_nodes_by_uid_list_sync = [None] * 256
+            for node in active_nodes_list_sync:
+                if node.node_id < 256:
+                    validator_nodes_by_uid_list_sync[node.node_id] = node
             
-            for idx in range(256):
-                weather_score = weather_scores[idx]
-                geomagnetic_score = geomagnetic_scores[idx]
-                soil_score = soil_scores[idx]
-
-                # Treat 0.0 scores the same as NaN
-                if np.isnan(weather_score) or weather_score == 0.0:
-                    weather_score = np.nan
-                if np.isnan(geomagnetic_score) or geomagnetic_score == 0.0:
-                    geomagnetic_score = np.nan
-                if np.isnan(soil_score) or soil_score == 0.0:
-                    soil_score = np.nan
-
-                current_node_obj = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None
-                current_hotkey_on_chain = current_node_obj.hotkey if current_node_obj else "N/A (UID not active)"
-
-                # 70% weather, 15% soil, 15% geo split
-                if np.isnan(weather_score) and np.isnan(geomagnetic_score) and np.isnan(soil_score):
-                    weights[idx] = 0.0
-                else:
-                    weather_component = 0.0
-                    geo_component = 0.0
-                    soil_component = 0.0
-                    
-                    if not np.isnan(weather_score):
-                        weather_component = 0.70 * weather_score
-                    if not np.isnan(geomagnetic_score):
-                        geo_component = 0.15 * sigmoid(geomagnetic_score, k=20, x0=0.93)
-                    if not np.isnan(soil_score):
-                        soil_component = 0.15 * soil_score
-                    
-                    total_weight_available = 0.0
-                    if not np.isnan(weather_score):
-                        total_weight_available += 0.70
-                    if not np.isnan(geomagnetic_score):
-                        total_weight_available += 0.15
-                    if not np.isnan(soil_score):
-                        total_weight_available += 0.15
-                    
-                    if total_weight_available > 0:
-                        scaling_factor = 1.0 / total_weight_available
-                        weights[idx] = (weather_component + geo_component + soil_component) * scaling_factor
-                    else:
-                        weights[idx] = 0.0
-
-                logger.info(f"UID {idx} (CurrentHotKey: {current_hotkey_on_chain}): weather={weather_score} ({weather_counts[idx]} scores), geo={geomagnetic_score} ({geo_counts[idx]} scores), soil={soil_score} ({soil_counts[idx]} scores), weight={weights[idx]:.4f}")
-
-            logger.info(f"Weights before normalization: {weights.tolist()}")
-
-            # generalized logistic curve
-            non_zero_mask = weights != 0.0
-            if np.any(non_zero_mask):
-                non_zero_weights = weights[non_zero_mask]
-                logger.info(f"Found {len(non_zero_weights)} non-zero weights out of 256 miners")
-                logger.info(f"Non-zero weights stats: min={np.min(non_zero_weights):.8f}, max={np.max(non_zero_weights):.8f}, mean={np.mean(non_zero_weights):.8f}")
-                max_weight = np.max(weights[non_zero_mask])
-                normalized_weights = np.copy(weights)  # Start with a copy to preserve zeros
-                normalized_weights[non_zero_mask] = weights[non_zero_mask] / max_weight  # Only normalize non-zeros
-                
-                positives = normalized_weights[normalized_weights > 0]
-                if len(positives) > 0:
-                    M = np.percentile(positives, 80)
-                    logger.info(f"Using 80th percentile of non-zero weights: {M:.8f} as curve midpoint")
-                else:
-                    logger.warning("No positive weights found!")
-                    return None
-                    
-                # Increase steepness and asymmetry for more aggressive differentiation
-                b = 70      # Growth rate (higher = steeper curve) - previously 30
-                Q = 8       # Initial value parameter (higher = sharper transition) - previously 5
-                v = 0.3     # Asymmetry (lower = more asymmetric curve) - previously 0.5
-                k = 0.98    # Upper asymptote (higher max value) - previously 0.95
-                a = 0.0     # Lower asymptote (keep at 0 to preserve zeros)
-                slope = 0.01  # Tilt (small value to emphasize sigmoid shape) - previously 0.02
-
-                new_weights = np.zeros_like(weights)
-                non_zero_indices = np.where(weights > 0.0)[0]
-                
-                if len(non_zero_indices) == 0:
-                    logger.warning("No positive weight indices found!")
-                    return None
-                
-                logger.info(f"Applying curve transformation to {len(non_zero_indices)} positive weights")
-                
-                for idx in non_zero_indices:
-                    normalized_weight = normalized_weights[idx]
-                    sigmoid_part = a + (k - a) / np.power(1 + Q * np.exp(-b * (normalized_weight - M)), 1/v)
-                    linear_part = slope * normalized_weight
-                    new_weights[idx] = sigmoid_part + linear_part
-                
-                transformed_non_zeros = new_weights[new_weights > 0]
-                if len(transformed_non_zeros) > 0:
-                    logger.info(f"Transformed weights stats: min={np.min(transformed_non_zeros):.8f}, max={np.max(transformed_non_zeros):.8f}, mean={np.mean(transformed_non_zeros):.8f}, unique={len(np.unique(transformed_non_zeros))}")
-                
-                if len(transformed_non_zeros) > 1 and np.std(transformed_non_zeros) < 0.01:
-                    logger.warning(f"Transformed weights still too uniform! std={np.std(transformed_non_zeros):.8f}")
-                    
-                    logger.info("Switching to rank-based power law distribution")
-                    sorted_indices = np.argsort(-weights)
-                    new_weights = np.zeros_like(weights)
-                    
-                    positive_count = np.sum(weights > 0)
-                    for i, idx in enumerate(sorted_indices[:positive_count]):
-                        # Power-law formula: score ~ 1/rank^alpha
-                        rank = i + 1
-                        alpha = 1.2
-                        new_weights[idx] = 1.0 / (rank ** alpha)
-                    
-                    rank_based_non_zeros = new_weights[new_weights > 0]
-                    logger.info(f"Rank-based weights: min={np.min(rank_based_non_zeros):.8f}, max={np.max(rank_based_non_zeros):.8f}, mean={np.mean(rank_based_non_zeros):.8f}, std={np.std(rank_based_non_zeros):.8f}")
-
-                non_zero_sum = np.sum(new_weights[new_weights > 0])
-                if non_zero_sum > 0:
-                    new_weights[new_weights > 0] = new_weights[new_weights > 0] / non_zero_sum
-                    
-                    final_non_zeros = new_weights[new_weights > 0]
-                    if len(final_non_zeros) > 0:
-                        logger.info(f"Final normalized weights: count={len(final_non_zeros)}, min={np.min(final_non_zeros):.8f}, max={np.max(final_non_zeros):.8f}, std={np.std(final_non_zeros):.8f}")
-                        
-                        unique_weights = np.unique(final_non_zeros)
-                        logger.info(f"Found {len(unique_weights)} unique non-zero weight values")
-                        
-                        if len(unique_weights) < len(final_non_zeros) / 2:
-                            logger.warning(f"Too few unique weights! {len(unique_weights)} unique values for {len(final_non_zeros)} non-zero miners")
-                        
-                        if np.max(final_non_zeros) > 0.90:
-                            logger.warning(f"Warning: Max weight is very high: {np.max(final_non_zeros):.4f} - might concentrate too much influence")
-                    
-                    logger.info("Final normalized weights calculated")
-                    return new_weights.tolist()
-                else:
-                    logger.warning("No positive weights after transformation!")
-                    return None
-            else:
-                logger.warning("No non-zero weights found to normalize!")
-                return None
-
+            return await asyncio.to_thread(
+                self._perform_weight_calculations_sync,
+                weather_results, geomagnetic_results, soil_results, now, validator_nodes_by_uid_list_sync
+            )
         except Exception as e:
-            logger.error(f"Error calculating weights: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error in _calc_task_weights (async part): {e}", exc_info=True)
             return None
 
     async def update_last_weights_block(self):
@@ -2325,107 +2196,120 @@ class GaiaValidator:
             logger.info(log_output)
             gc.collect()
 
-    async def plot_database_metrics_periodically(self):
-        """Periodically generates and saves database metrics plots."""
-        # Ensure matplotlib is imported and backend is set correctly for non-GUI environment
+    def _generate_and_save_plot_sync(self, history_copy):
+        """Synchronous helper to generate and save database metrics plots."""
         try:
             import matplotlib
             matplotlib.use('Agg') # Use Agg backend for non-interactive plotting
             import matplotlib.pyplot as plt
             import matplotlib.dates as mdates
-            logger.info("Matplotlib initialized successfully for plotting.")
         except ImportError as e:
-            logger.error(f"Matplotlib import error: {e}. Plotting will be disabled.")
-            return # Exit if matplotlib is not available
+            logger.error(f"Matplotlib import error in sync plot generation: {e}. Plotting will be disabled for this cycle.")
+            return
+
+        if not history_copy or len(history_copy) < 2:
+            logger.info("Not enough data in history_copy for sync plot generation. Skipping.")
+            return
+
+        timestamps = []
+        avg_session_times = []
+        min_session_times = []
+        max_session_times = []
+        total_connections_list = []
+
+        for record in history_copy:
+            try:
+                ts = datetime.fromisoformat(record.get("timestamp"))
+                timestamps.append(ts)
+
+                session_stats = record.get("session_manager_stats", {})
+                if isinstance(session_stats, dict):
+                    avg_session_times.append(session_stats.get("avg_session_time_ms", float('nan')))
+                    min_session_times.append(session_stats.get("min_session_time_ms", float('nan')))
+                    max_session_times.append(session_stats.get("max_session_time_ms", float('nan')))
+                else:
+                    avg_session_times.append(float('nan'))
+                    min_session_times.append(float('nan'))
+                    max_session_times.append(float('nan'))
+
+                connection_summary = record.get("connection_summary", [])
+                current_total_connections = 0
+                if isinstance(connection_summary, list):
+                    for conn_info in connection_summary:
+                        if isinstance(conn_info, dict) and "count" in conn_info and isinstance(conn_info["count"], (int, float)):
+                            current_total_connections += conn_info["count"]
+                total_connections_list.append(current_total_connections)
+            except Exception as e:
+                logger.warning(f"Skipping record in sync plot generation due to parsing error: {e} - Record: {record}")
+                continue
+        
+        if not timestamps or len(timestamps) < 2:
+            logger.info("Not enough valid data points for sync plot generation after parsing. Skipping.")
+            return
+
+        fig, axs = plt.subplots(2, 1, figsize=(15, 12), sharex=True)
+        fig.suptitle('Database Performance Monitor', fontsize=16)
+
+        axs[0].plot(timestamps, avg_session_times, label='Avg Session Time (ms)', marker='.', linestyle='-', color='blue')
+        axs[0].plot(timestamps, min_session_times, label='Min Session Time (ms)', marker='.', linestyle=':', color='green')
+        axs[0].plot(timestamps, max_session_times, label='Max Session Time (ms)', marker='.', linestyle=':', color='red')
+        axs[0].set_ylabel('Session Time (ms)')
+        axs[0].set_title('DB Session Durations')
+        axs[0].legend()
+        axs[0].grid(True)
+
+        ax2 = axs[1]
+        ax2.plot(timestamps, total_connections_list, label='Total Connections', marker='.', linestyle='-', color='purple')
+        ax2.set_ylabel('Number of Connections')
+        ax2.set_title('DB Connection Count')
+        ax2.legend()
+        ax2.grid(True)
+
+        fig.autofmt_xdate()
+        xfmt = mdates.DateFormatter('%Y-%m-%d\n%H:%M:%S')
+        for ax_item in axs:
+            ax_item.xaxis.set_major_formatter(xfmt)
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plot_filename = "database_performance_plot.png"
+        try:
+            plt.savefig(plot_filename)
+            logger.info(f"Database performance plot saved to {plot_filename}")
+        except Exception as e_save:
+            logger.error(f"Error saving plot to {plot_filename}: {e_save}")
+        finally:
+            plt.close(fig)
+            # Explicitly trigger garbage collection after plotting if memory is a concern
+            # However, plt.close(fig) should handle most of it.
+            import gc
+            gc.collect()
+
+    async def plot_database_metrics_periodically(self):
+        """Periodically generates and saves database metrics plots."""
+        # Matplotlib imports are now inside _generate_and_save_plot_sync
+        # to ensure they are only imported in the executor thread if needed.
 
         while not self._shutdown_event.is_set():
             await asyncio.sleep(20 * 60) # Plot every 20 minutes
-            logger.info("Generating database performance plots...")
-            try:
-                async with self.db_monitor_history_lock:
-                    if not self.db_monitor_history or len(self.db_monitor_history) < 2:
-                        logger.info("Not enough data in db_monitor_history to generate plots. Skipping.")
-                        continue
-                    # Make a copy for thread-safe iteration if needed, though lock should cover
-                    history_copy = list(self.db_monitor_history) 
-                
-                timestamps = []
-                avg_session_times = []
-                min_session_times = []
-                max_session_times = []
-                total_connections_list = []
-
-                for record in history_copy:
-                    try:
-                        ts = datetime.fromisoformat(record.get("timestamp"))
-                        timestamps.append(ts)
-
-                        session_stats = record.get("session_manager_stats", {})
-                        if isinstance(session_stats, dict):
-                            avg_session_times.append(session_stats.get("avg_session_time_ms", float('nan')))
-                            min_session_times.append(session_stats.get("min_session_time_ms", float('nan')))
-                            max_session_times.append(session_stats.get("max_session_time_ms", float('nan')))
-                        else:
-                            avg_session_times.append(float('nan'))
-                            min_session_times.append(float('nan'))
-                            max_session_times.append(float('nan'))
-
-                        connection_summary = record.get("connection_summary", [])
-                        current_total_connections = 0
-                        if isinstance(connection_summary, list):
-                            for conn_info in connection_summary:
-                                if isinstance(conn_info, dict) and "count" in conn_info and isinstance(conn_info["count"], (int, float)):
-                                    current_total_connections += conn_info["count"]
-                        total_connections_list.append(current_total_connections)
-                    except Exception as e:
-                        logger.warning(f"Skipping record in plot generation due to parsing error: {e} - Record: {record}")
-                        continue # Skip malformed record
-                
-                if not timestamps or len(timestamps) < 2:
-                    logger.info("Not enough valid data points to generate plots after parsing. Skipping.")
+            logger.info("Requesting database performance plot generation...")
+            history_copy_for_plot = []
+            async with self.db_monitor_history_lock:
+                if not self.db_monitor_history or len(self.db_monitor_history) < 2:
+                    logger.info("Not enough data in db_monitor_history to generate plots. Skipping this cycle.")
                     continue
+                history_copy_for_plot = list(self.db_monitor_history) 
+            
+            if not history_copy_for_plot:
+                 logger.info("History copy for plotting is empty, skipping plot generation.") # Should be caught by above check too
+                 continue
 
-                fig, axs = plt.subplots(2, 1, figsize=(15, 12), sharex=True)
-                fig.suptitle('Database Performance Monitor', fontsize=16)
-
-                # Plot 1: Session Times
-                axs[0].plot(timestamps, avg_session_times, label='Avg Session Time (ms)', marker='.', linestyle='-', color='blue')
-                axs[0].plot(timestamps, min_session_times, label='Min Session Time (ms)', marker='.', linestyle=':', color='green')
-                axs[0].plot(timestamps, max_session_times, label='Max Session Time (ms)', marker='.', linestyle=':', color='red')
-                axs[0].set_ylabel('Session Time (ms)')
-                axs[0].set_title('DB Session Durations')
-                axs[0].legend()
-                axs[0].grid(True)
-
-                # Plot 2: Total Connections
-                ax2 = axs[1]
-                ax2.plot(timestamps, total_connections_list, label='Total Connections', marker='.', linestyle='-', color='purple')
-                ax2.set_ylabel('Number of Connections')
-                ax2.set_title('DB Connection Count')
-                ax2.legend()
-                ax2.grid(True)
-
-                # Format X-axis
-                fig.autofmt_xdate() # Auto-rotate date labels
-                xfmt = mdates.DateFormatter('%Y-%m-%d\n%H:%M:%S')
-                for ax_item in axs:
-                    ax_item.xaxis.set_major_formatter(xfmt)
-                
-                plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust layout to make space for suptitle
-                
-                plot_filename = "database_performance_plot.png"
-                plt.savefig(plot_filename)
-                plt.close(fig) # Close the figure to free memory
-                logger.info(f"Database performance plot saved to {plot_filename}")
-
+            try:
+                # Offload the plotting to the synchronous helper method in an executor thread
+                await asyncio.to_thread(self._generate_and_save_plot_sync, history_copy_for_plot)
             except Exception as e:
-                logger.error(f"Error generating database plots: {e}")
+                logger.error(f"Error occurred when calling plot generation in executor: {e}")
                 logger.error(traceback.format_exc())
-            finally:
-                # Explicitly trigger garbage collection after plotting if memory is a concern
-                # However, plt.close(fig) should handle most of it.
-                import gc
-                gc.collect()
+            # No finally gc.collect() here, it's in the sync method
 
 
 if __name__ == "__main__":
@@ -2464,6 +2348,8 @@ if __name__ == "__main__":
         sys.exit("Database schema check failed.")
 
     validator = GaiaValidator(args)
+    yappi.set_clock_type("wall")  # Or "cpu"
+    yappi.start()  # Start profiling
     try:
         asyncio.run(validator.main())
     except KeyboardInterrupt:
@@ -2471,6 +2357,44 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Unhandled exception in main loop: {e}", exc_info=True)
     finally:
+        yappi.stop()  # Stop profiling
+        logger.info("Yappi profiling stopped.")
+
+        # Get function stats
+        stats = yappi.get_func_stats()
+
+        # Define file paths for different sort types
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        profile_output_total_time = f"yappi_stats_total_time_{timestamp}.prof"
+        profile_output_avg_time = f"yappi_stats_avg_time_{timestamp}.prof"
+        profile_output_sum_time = f"yappi_stats_sum_time_{timestamp}.prof" # Corresponds to tsum for wall/cpu
+
+        # Save stats sorted by different criteria
+        stats.sort("totaltime", "desc") # For wall time, 'totaltime' is relevant. For CPU time, 'ttot'
+        stats.save(profile_output_total_time, type="pstat")
+        logger.info(f"Yappi stats (sorted by total wall time) saved to {profile_output_total_time}")
+
+        stats.sort("avgtime", "desc") # 'tavg' for CPU
+        stats.save(profile_output_avg_time, type="pstat")
+        logger.info(f"Yappi stats (sorted by average wall time) saved to {profile_output_avg_time}")
+        
+        # For wall time, 'tsum' is not directly available like CPU's 'tsub' or 'ttot'.
+        # 'totaltime' is the primary metric for wall clock.
+        # If you were using CPU clock, you might sort by 'tsub' (time excluding sub-calls) or 'ttot'.
+        # For Wall time, 'totaltime' often gives the best overview.
+        # We can re-save sorted by 'totaltime' again if needed, or choose another primary sort.
+        # Let's ensure 'tsum' behavior is clear: yappi's 'tsum' is equivalent to 'totaltime' for WALL clock.
+        # For CPU clock, 'ttot' is total time spent in function + children, 'tsub' is time in function only.
+        # We'll sort by 'totaltime' again for "sum_time" to be explicit, as it's wall clock.
+        stats.sort("totaltime", "desc") # Sorting by 'totaltime' as it's wall clock
+        stats.save(profile_output_sum_time, type="pstat")
+        logger.info(f"Yappi stats (sorted by total wall time, as 'sum_time') saved to {profile_output_sum_time}")
+
+        # Optionally, print some stats to console
+        # yappi.get_func_stats().print_all()
+        # yappi.get_thread_stats().print_all()
+
+
         if hasattr(validator, '_cleanup_done') and not validator._cleanup_done:
              try:
                  loop = asyncio.get_event_loop()

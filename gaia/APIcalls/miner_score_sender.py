@@ -7,6 +7,7 @@ import traceback
 import httpx
 from gaia.APIcalls.website_api import GaiaCommunicator
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from typing import Dict, Optional
 
 def prepare_prediction_field(data_list):
     """
@@ -43,6 +44,29 @@ class MinerScoreSender:
         results = await self.db_manager.fetch_all(query)
         return [{"uid": row["uid"], "hotkey": row["hotkey"], "coldkey": row["coldkey"]} for row in results]
 
+    def _process_geomagnetic_row_sync(self, row: Dict) -> Optional[Dict]:
+        """Synchronous helper to process a single geomagnetic history row."""
+        try:
+            # Convert to float and check for NaN/Inf
+            pred_value = float(row["predicted_value"])
+            truth_value = float(row["ground_truth_value"])
+            score_value = float(row["score"])
+
+            if all(not math.isnan(v) and not math.isinf(v) for v in [pred_value, truth_value, score_value]):
+                return {
+                    "predictionId": row["id"],
+                    "predictionDate": row["prediction_datetime"].isoformat(),
+                    "geomagneticPredictionTargetDate": row["prediction_datetime"].isoformat(),
+                    "geomagneticPredictionInputDate": row["prediction_datetime"].isoformat(),
+                    "geomagneticPredictedValue": pred_value,
+                    "geomagneticGroundTruthValue": truth_value,
+                    "geomagneticScore": score_value,
+                    "scoreGenerationDate": row["scored_at"].isoformat()
+                }
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid numeric value in geo row {row.get('id', 'N/A')}, skipping: {e}")
+        return None
+
     async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
         # First clean up NaN values from history
         # cleanup_query = """
@@ -75,28 +99,42 @@ class MinerScoreSender:
         """
         results = await self.db_manager.fetch_all(query, {"miner_hotkey": miner_hotkey})
 
-        valid_predictions = []
-        for row in results:
-            try:
-                # Convert to float and check for NaN/Inf
-                pred_value = float(row["predicted_value"])
-                truth_value = float(row["ground_truth_value"])
-                score_value = float(row["score"])
+        if not results:
+            return []
 
-                if all(not math.isnan(v) and not math.isinf(v) for v in [pred_value, truth_value, score_value]):
-                    valid_predictions.append({
-                        "predictionId": row["id"],
-                        "predictionDate": row["prediction_datetime"].isoformat(),
-                        "geomagneticPredictionTargetDate": row["prediction_datetime"].isoformat(),
-                        "geomagneticPredictionInputDate": row["prediction_datetime"].isoformat(),
-                        "geomagneticPredictedValue": pred_value,
-                        "geomagneticGroundTruthValue": truth_value,
-                        "geomagneticScore": score_value,
-                        "scoreGenerationDate": row["scored_at"].isoformat()
-                    })
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Invalid numeric value in row {row['id']}, skipping: {e}")
+        loop = asyncio.get_event_loop()
+        # Offload row processing
+        processed_rows = await loop.run_in_executor(
+            None, 
+            lambda rows: [self._process_geomagnetic_row_sync(r) for r in rows], 
+            results
+        )
+        
+        # Filter out None results (from rows that failed processing)
+        valid_predictions = [p for p in processed_rows if p is not None]
         return valid_predictions
+
+    def _process_soil_row_sync(self, row: Dict) -> Dict:
+        """Synchronous helper to process a single soil moisture history row."""
+        # Ensure json is imported within the sync function if not globally available in the executor's context
+        # import json # Not strictly needed if json is a built-in and standard library.
+        return {
+            "predictionId": row["id"],
+            "predictionDate": row["target_time"].isoformat(),
+            "soilPredictionRegionId": row["region_id"],
+            "sentinelRegionBounds": json.dumps(row["sentinel_bounds"]) if row["sentinel_bounds"] else "[]",
+            "sentinelRegionCrs": row["sentinel_crs"] if row["sentinel_crs"] else 4326,
+            "soilPredictionTargetDate": row["target_time"].isoformat(),
+            "soilSurfaceRmse": row["surface_rmse"],
+            "soilRootzoneRmse": row["rootzone_rmse"],
+            "soilSurfacePredictedValues": json.dumps(row["surface_sm_pred"]) if row["surface_sm_pred"] else "[]",
+            "soilRootzonePredictedValues": json.dumps(row["rootzone_sm_pred"]) if row["rootzone_sm_pred"] else "[]",
+            "soilSurfaceGroundTruthValues": json.dumps(row["surface_sm_truth"]) if row["surface_sm_truth"] else "[]",
+            "soilRootzoneGroundTruthValues": json.dumps(row["rootzone_sm_truth"]) if row["rootzone_sm_truth"] else "[]",
+            "soilSurfaceStructureScore": row["surface_structure_score"],
+            "soilRootzoneStructureScore": row["rootzone_structure_score"],
+            "scoreGenerationDate": row["scored_at"].isoformat(),
+        }
 
     async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
         query = """
@@ -122,27 +160,19 @@ class MinerScoreSender:
             LIMIT 10
         """
         results = await self.db_manager.fetch_all(query, {"miner_hotkey": miner_hotkey})
-        import json
-        return [
-            {
-                "predictionId": row["id"],
-                "predictionDate": row["target_time"].isoformat(),
-                "soilPredictionRegionId": row["region_id"],
-                "sentinelRegionBounds": json.dumps(row["sentinel_bounds"]) if row["sentinel_bounds"] else "[]",
-                "sentinelRegionCrs": row["sentinel_crs"] if row["sentinel_crs"] else 4326,
-                "soilPredictionTargetDate": row["target_time"].isoformat(),
-                "soilSurfaceRmse": row["surface_rmse"],
-                "soilRootzoneRmse": row["rootzone_rmse"],
-                "soilSurfacePredictedValues": json.dumps(row["surface_sm_pred"]) if row["surface_sm_pred"] else "[]",
-                "soilRootzonePredictedValues": json.dumps(row["rootzone_sm_pred"]) if row["rootzone_sm_pred"] else "[]",
-                "soilSurfaceGroundTruthValues": json.dumps(row["surface_sm_truth"]) if row["surface_sm_truth"] else "[]",
-                "soilRootzoneGroundTruthValues": json.dumps(row["rootzone_sm_truth"]) if row["rootzone_sm_truth"] else "[]",
-                "soilSurfaceStructureScore": row["surface_structure_score"],
-                "soilRootzoneStructureScore": row["rootzone_structure_score"],
-                "scoreGenerationDate": row["scored_at"].isoformat(),
-            }
-            for row in results
-        ]
+        
+        if not results:
+            return []
+            
+        # import json # Moved to _process_soil_row_sync if strictly needed there.
+        loop = asyncio.get_event_loop()
+        # Offload row processing (list comprehension equivalent)
+        processed_rows = await loop.run_in_executor(
+            None,
+            lambda rows: [self._process_soil_row_sync(r) for r in rows],
+            results
+        )
+        return processed_rows # Assuming _process_soil_row_sync never returns None, or they are acceptable
 
     async def send_to_gaia(self):
         try:
