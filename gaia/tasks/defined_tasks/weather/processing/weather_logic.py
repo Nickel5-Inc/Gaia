@@ -20,7 +20,7 @@ from ..utils.remote_access import open_verified_remote_zarr_dataset
 from ..utils.era5_api import fetch_era5_data
 from ..utils.gfs_api import fetch_gfs_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
 from ..utils.variable_maps import AURORA_TO_GFS_VAR_MAP
-from ..utils.hashing import _compute_analysis_profile, ANALYSIS_LOG_DIR
+from ..utils.hashing import compute_verification_hash
 from ..weather_scoring.metrics import calculate_rmse, calculate_mse_skill_score, calculate_acc, calculate_bias_corrected_forecast, _calculate_latitude_weights, perform_sanity_checks
 from fiber.logging_utils import get_logger
 from ..weather_scoring.scoring import VARIABLE_WEIGHTS
@@ -432,38 +432,8 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
             try:
                 logger.info(f"[VerifyLogic, Resp {response_id}] Verified dataset keys: {list(verified_dataset.keys()) if verified_dataset else 'N/A'}")
                 
-                if verified_dataset:
-                    logger.info(f"[VerifyLogic, Resp {response_id}] Running performance profile for verified dataset from miner {miner_hotkey} (Job {job_id}).")
-                    
-                    profile_metadata = {
-                        "time": [run_details.get('gfs_init_time_utc', datetime.now(timezone.utc))], 
-                        "source_model": f"miner_verified_{miner_hotkey[:12]}",
-                        "resolution": verified_dataset.attrs.get("resolution", 0.25) 
-                    }
-                    profile_variables = list(verified_dataset.data_vars.keys()) if verified_dataset.data_vars else []
-
-                    profile_job_id = f"resp_{response_id}_job_{job_id}"
-
-                    try:
-                        loop = asyncio.get_running_loop()
-                        analysis_log_dict = await loop.run_in_executor(
-                            None, 
-                            _compute_analysis_profile,
-                            verified_dataset,
-                            profile_metadata,
-                            profile_variables,
-                            claimed_manifest_content_hash, 
-                            profile_job_id, 
-                            zarr_store_url 
-                        )
-                        if analysis_log_dict:
-                             logger.info(f"[VerifyLogic, Resp {response_id}] Performance profile completed. Log status: {analysis_log_dict.get('status')}, saved to {ANALYSIS_LOG_DIR}")
-                        else:
-                             logger.warning(f"[VerifyLogic, Resp {response_id}] Performance profile call returned None or empty.")
-                    except Exception as e_profile:
-                        logger.error(f"[VerifyLogic, Resp {response_id}] Error during _compute_analysis_profile for {miner_hotkey} (Job {job_id}): {e_profile}", exc_info=True)
             except Exception as e_ds_ops:
-                logger.warning(f"[VerifyLogic, Resp {response_id}] Minor error during initial ops on verified dataset or profiling: {e_ds_ops}")
+                logger.warning(f"[VerifyLogic, Resp {response_id}] Minor error during initial ops on verified dataset: {e_ds_ops}")
                 if error_message_for_db: error_message_for_db += f"; Post-verify op error: {e_ds_ops}"
                 else: error_message_for_db = f"Post-manifest op error: {e_ds_ops}"
         else:
@@ -539,21 +509,32 @@ async def calculate_era5_miner_score(
     all_metrics_for_db = []
 
     try:
+        stored_response_details_query = "SELECT kerchunk_json_url, verification_hash_claimed FROM weather_miner_responses WHERE id = :response_id"
+        stored_response_data = await task_instance.db_manager.fetch_one(stored_response_details_query, {"response_id": response_id})
+
+        if not stored_response_data or not stored_response_data['verification_hash_claimed'] or not stored_response_data['kerchunk_json_url']:
+            logger.error(f"[FinalScore] Miner {miner_hotkey}: Failed to retrieve stored verification_hash_claimed or Zarr URL for response_id {response_id}. Aborting ERA5 scoring.")
+            return False
+        
+        stored_manifest_hash = stored_response_data['verification_hash_claimed']
         token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, job_id)
         if token_data_tuple is None:
-            raise ValueError(f"Failed to get fresh access token/URL/manifest_hash for {miner_hotkey} job {job_id}")
-        access_token, zarr_store_url, claimed_manifest_content_hash = token_data_tuple
+            raise ValueError(f"Failed to get fresh access token for {miner_hotkey} job {job_id}. Cannot ensure Zarr URL is current.")
+        
+        access_token, current_zarr_store_url, _ = token_data_tuple
+        
+        logger.info(f"[FinalScore] Miner {miner_hotkey}: Using stored manifest hash: {stored_manifest_hash[:10]}... and current Zarr URL: {current_zarr_store_url}")
 
         storage_options = {"headers": {"Authorization": f"Bearer {access_token}"}, "ssl": False}
         verification_timeout_seconds = task_instance.config.get('verification_timeout_seconds', 300) / 2
 
         miner_forecast_ds = await asyncio.wait_for(
             open_verified_remote_zarr_dataset(
-                zarr_store_url=zarr_store_url,
-                claimed_manifest_content_hash=claimed_manifest_content_hash,
+                zarr_store_url=current_zarr_store_url,
+                claimed_manifest_content_hash=stored_manifest_hash,
                 miner_hotkey_ss58=miner_hotkey,
                 storage_options=storage_options,
-                job_id=f"{job_id}_final_score"
+                job_id=f"{job_id}_final_score_reverify"
             ),
             timeout=verification_timeout_seconds
         )

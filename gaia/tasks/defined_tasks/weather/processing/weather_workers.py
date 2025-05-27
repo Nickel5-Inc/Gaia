@@ -915,10 +915,18 @@ async def finalize_scores_worker(self):
                     logger.info(f"[FinalizeWorker] Run {run_id}: Found {len(verified_responses_for_run)} verified miner responses.")
                     scoring_execution_tasks = []
                     
+                    async def score_single_miner_with_semaphore(resp_rec):
+                        async with self.era5_scoring_semaphore:
+                            logger.debug(f"[FinalizeWorker] Acquired semaphore for scoring miner {resp_rec.get('miner_hotkey')}, Run {run_id}")
+                            try:
+                                return await calculate_era5_miner_score(
+                                    self, resp_rec, target_datetimes_for_run, era5_ds_for_run, era5_climatology_ds_for_cycle
+                                )
+                            finally:
+                                logger.debug(f"[FinalizeWorker] Released semaphore for scoring miner {resp_rec.get('miner_hotkey')}, Run {run_id}")
+
                     for resp_rec in verified_responses_for_run:
-                         scoring_execution_tasks.append(calculate_era5_miner_score(
-                             self, resp_rec, target_datetimes_for_run, era5_ds_for_run, era5_climatology_ds_for_cycle
-                            ))
+                         scoring_execution_tasks.append(score_single_miner_with_semaphore(resp_rec))
                          if len(verified_responses_for_run) > 5 and len(scoring_execution_tasks) % 5 == 0:
                              await asyncio.sleep(0)
 

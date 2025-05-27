@@ -213,6 +213,10 @@ class WeatherTask(Task):
         
         self.gpu_semaphore = asyncio.Semaphore(self.config.get('max_concurrent_inferences', 1))
         
+        era5_scoring_concurrency = int(os.getenv('WEATHER_VALIDATOR_ERA5_SCORING_CONCURRENCY', '4'))
+        self.era5_scoring_semaphore = asyncio.Semaphore(era5_scoring_concurrency)
+        logger.info(f"ERA5 scoring concurrency for validator set to: {era5_scoring_concurrency}")
+
         self.inference_runner = None 
         if self.node_type == "miner":
             try:
