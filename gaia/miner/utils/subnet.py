@@ -565,55 +565,60 @@ def factory_router(miner_instance) -> APIRouter:
         methods=["POST"],
         response_class=JSONResponse,
     )
-    router.add_api_route(
-        "/forecasts/{file_path:path}",
-        get_forecast_file,
-        tags=["Weather"],
-        methods=["GET", "HEAD"],
-        response_class=Response,
-        response_model=None
-    )
-    # Route for triggering weather forecast run
-    router.add_api_route(
-        "/weather-forecast-request", 
-        weather_forecast_require,
-        tags=["Weather"],
-        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
-        methods=["POST"],
-        response_class=JSONResponse
-    )
-    # Route for validator to request Kerchunk JSON metadata
-    router.add_api_route(
-        "/weather-kerchunk-request", 
-        weather_kerchunk_require,
-        tags=["Weather"],
-        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
-        methods=["POST"],
-        response_class=JSONResponse
-    )
-    router.add_api_route(
-        "/weather-initiate-fetch",
-        weather_initiate_fetch_require,
-        tags=["Weather"],
-        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
-        methods=["POST"],
-        response_class=JSONResponse
-    )
-    router.add_api_route(
-        "/weather-get-input-status",
-        weather_get_input_status_require,
-        tags=["Weather"],
-        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
-        methods=["POST"],
-        response_class=JSONResponse
-    )
-    router.add_api_route(
-        "/weather-start-inference",
-        weather_start_inference_require,
-        tags=["Weather"],
-        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
-        methods=["POST"],
-        response_class=JSONResponse
-    )
+
+    if hasattr(miner_instance, 'weather_task') and miner_instance.weather_task is not None:
+        router.add_api_route(
+            "/forecasts/{file_path:path}",
+            get_forecast_file,
+            tags=["Weather"],
+            methods=["GET", "HEAD"],
+            response_class=Response,
+            response_model=None
+        )
+        # Route for triggering weather forecast run
+        router.add_api_route(
+            "/weather-forecast-request", 
+            weather_forecast_require,
+            tags=["Weather"],
+            dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+            methods=["POST"],
+            response_class=JSONResponse
+        )
+        # Route for validator to request Kerchunk JSON metadata
+        router.add_api_route(
+            "/weather-kerchunk-request", 
+            weather_kerchunk_require,
+            tags=["Weather"],
+            dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+            methods=["POST"],
+            response_class=JSONResponse
+        )
+        router.add_api_route(
+            "/weather-initiate-fetch",
+            weather_initiate_fetch_require,
+            tags=["Weather"],
+            dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+            methods=["POST"],
+            response_class=JSONResponse
+        )
+        router.add_api_route(
+            "/weather-get-input-status",
+            weather_get_input_status_require,
+            tags=["Weather"],
+            dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+            methods=["POST"],
+            response_class=JSONResponse
+        )
+        router.add_api_route(
+            "/weather-start-inference",
+            weather_start_inference_require,
+            tags=["Weather"],
+            dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+            methods=["POST"],
+            response_class=JSONResponse
+        )
+        logger.info("Weather routes registered (weather task is enabled)")
+    else:
+        logger.info("Weather routes NOT registered (weather task is disabled)")
 
     return router

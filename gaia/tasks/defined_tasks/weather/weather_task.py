@@ -1157,14 +1157,11 @@ class WeatherTask(Task):
         """
         Handles the /weather-initiate-fetch request.
         Creates a job record and launches the background task for fetching GFS and hashing.
-        (Called by the API handler in subnet.py)
+        CHECKS FOR EXISTING JOBS to avoid duplicate work.
         """
         if self.node_type != 'miner':
             logger.error("handle_initiate_fetch called on non-miner node.")
             return {"status": "error", "job_id": None, "message": "Invalid node type"}
-
-        job_id = str(uuid.uuid4())
-        logger.info(f"[Miner Job {job_id}] Received initiate_fetch request for T0={request_data.forecast_start_time}")
 
         try:
             t0_run_time = request_data.forecast_start_time
@@ -1172,6 +1169,42 @@ class WeatherTask(Task):
 
             if t0_run_time.tzinfo is None: t0_run_time = t0_run_time.replace(tzinfo=timezone.utc)
             if t_minus_6_run_time.tzinfo is None: t_minus_6_run_time = t_minus_6_run_time.replace(tzinfo=timezone.utc)
+
+            logger.info(f"[Miner] Received initiate_fetch request for T0={t0_run_time}")
+
+            existing_job_query = """
+                SELECT id, status, input_data_hash
+                FROM weather_miner_jobs 
+                WHERE gfs_init_time_utc = :gfs_init
+                AND gfs_t_minus_6_time_utc = :gfs_t_minus_6
+                AND status NOT IN ('error', 'fetch_error')
+                ORDER BY validator_request_time DESC
+                LIMIT 1
+            """
+            
+            existing_job = await self.db_manager.fetch_one(existing_job_query, {
+                "gfs_init": t0_run_time,
+                "gfs_t_minus_6": t_minus_6_run_time
+            })
+
+            if existing_job:
+                job_id = existing_job['id']
+                status = existing_job['status']
+                logger.info(f"[Miner Job {job_id}] Found existing job (status: {status}) for GFS times. Reusing.")
+                
+                response = {
+                    "status": "fetch_accepted", 
+                    "job_id": job_id, 
+                    "message": f"Reusing existing job (status: {status})"
+                }
+                
+                if existing_job.get('input_data_hash'):
+                    response["input_data_hash"] = existing_job['input_data_hash']
+                    
+                return response
+
+            job_id = str(uuid.uuid4())
+            logger.info(f"[Miner Job {job_id}] No existing job found. Creating new job for T0={t0_run_time}.")
 
             insert_query = """
                 INSERT INTO weather_miner_jobs
@@ -1181,11 +1214,11 @@ class WeatherTask(Task):
             await self.db_manager.execute(insert_query, {
                 "id": job_id,
                 "req_time": datetime.now(timezone.utc),
-                "gfs_init": t0_run_time,          # T=0h time
-                "gfs_t_minus_6": t_minus_6_run_time, # T=-6h time
+                "gfs_init": t0_run_time,
+                "gfs_t_minus_6": t_minus_6_run_time,
                 "status": "fetch_queued"
             })
-            logger.info(f"[Miner Job {job_id}] DB record created (status: fetch_queued). Launching background fetch/hash task.")
+            logger.info(f"[Miner Job {job_id}] DB record created. Launching background fetch/hash task.")
 
             asyncio.create_task(fetch_and_hash_gfs_task(
                 task_instance=self,
@@ -1197,11 +1230,8 @@ class WeatherTask(Task):
             return {"status": "fetch_accepted", "job_id": job_id, "message": "Fetch and hash process initiated."}
 
         except Exception as e:
-            logger.error(f"[Miner Job {job_id}] Error during handle_initiate_fetch: {e}", exc_info=True)
-            try:
-                 await update_job_status(self, job_id, "error", f"Initiation failed: {e}")
-            except: pass
-            return {"status": "error", "job_id": job_id, "message": f"Failed to initiate fetch: {e}"}
+            logger.error(f"[Miner] Error during handle_initiate_fetch: {e}", exc_info=True)
+            return {"status": "error", "job_id": None, "message": f"Failed to initiate fetch: {e}"}
 
     async def handle_get_input_status(self, job_id: str) -> Dict[str, Any]:
         """
@@ -1239,6 +1269,7 @@ class WeatherTask(Task):
         """
         Handles the /weather-start-inference request.
         Verifies the job is ready and triggers the main inference background task.
+        CHECKS FOR EXISTING INFERENCE to avoid duplicate work.
         (Called by the API handler in subnet.py)
         """
         if self.node_type != 'miner':
@@ -1254,11 +1285,45 @@ class WeatherTask(Task):
                 logger.warning(f"[Miner Job {job_id}] Start inference requested for non-existent job.")
                 return {"status": "error", "message": "Job ID not found."}
 
-            if job_details['status'] != 'input_hashed_awaiting_validation':
-                logger.warning(f"[Miner Job {job_id}] Start inference requested but job status is '{job_details['status']}' (expected 'input_hashed_awaiting_validation').")
-                return {"status": "error", "message": f"Cannot start inference, job status is {job_details['status']}"}
+            current_status = job_details['status']
+            
+            if current_status in ['inference_queued', 'running_inference', 'completed']:
+                logger.info(f"[Miner Job {job_id}] Inference already in progress or completed (status: {current_status}). Not starting duplicate.")
+                return {
+                    "status": "inference_started", 
+                    "message": f"Inference already {current_status}. Reusing existing job."
+                }
+            
+            if current_status == 'error':
+                logger.warning(f"[Miner Job {job_id}] Cannot start inference on errored job.")
+                return {"status": "error", "message": "Job has errored, cannot start inference"}
 
-            await update_job_status(self, job_id, "inference_queued")
+            if current_status != 'input_hashed_awaiting_validation':
+                logger.warning(f"[Miner Job {job_id}] Start inference requested but job status is '{current_status}' (expected 'input_hashed_awaiting_validation').")
+                return {"status": "error", "message": f"Cannot start inference, job status is {current_status}"}
+
+            update_query = """
+                UPDATE weather_miner_jobs 
+                SET status = 'inference_queued' 
+                WHERE id = :job_id AND status = 'input_hashed_awaiting_validation'
+                RETURNING id
+            """
+            updated = await self.db_manager.fetch_one(update_query, {"job_id": job_id})
+            
+            if not updated:
+                recheck_query = "SELECT status FROM weather_miner_jobs WHERE id = :job_id"
+                recheck_details = await self.db_manager.fetch_one(recheck_query, {"job_id": job_id})
+                new_status = recheck_details['status'] if recheck_details else 'unknown'
+                
+                logger.info(f"[Miner Job {job_id}] Status changed during update attempt. Now: {new_status}. Likely another validator triggered it.")
+                if new_status in ['inference_queued', 'running_inference', 'completed']:
+                    return {
+                        "status": "inference_started", 
+                        "message": f"Inference already triggered by another validator (status: {new_status})"
+                    }
+                else:
+                    return {"status": "error", "message": f"Failed to queue inference, status is now {new_status}"}
+            
             logger.info(f"[Miner Job {job_id}] Status updated to inference_queued. Launching background inference task.")
 
             asyncio.create_task(run_inference_background(

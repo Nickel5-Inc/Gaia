@@ -104,10 +104,17 @@ class Miner:
             db_manager=self.database_manager,
             node_type="miner"
         )
-        self.weather_task = WeatherTask(
-            db_manager=self.database_manager,
-            node_type="miner"
-        )
+        
+        weather_enabled = os.getenv("WEATHER_MINER_ENABLED", "false").lower() in ["true", "1", "yes"]
+        if weather_enabled:
+            logger.info("Weather task ENABLED for this miner (WEATHER_MINER_ENABLED=True)")
+            self.weather_task = WeatherTask(
+                db_manager=self.database_manager,
+                node_type="miner"
+            )
+        else:
+            logger.info("Weather task DISABLED for this miner. Set WEATHER_MINER_ENABLED=True to enable.")
+            self.weather_task = None
     
 
     def setup_neuron(self) -> bool:
@@ -126,18 +133,19 @@ class Miner:
             config.chain_endpoint = self.subtensor_chain_endpoint
             self.config = config
             
-            if hasattr(self.weather_task, 'config') and self.weather_task.config is not None:
-                self.weather_task.config['netuid'] = self.netuid
-                self.weather_task.config['chain_endpoint'] = self.subtensor_chain_endpoint
-                if 'miner_public_base_url' not in self.weather_task.config:
-                     self.weather_task.config['miner_public_base_url'] = None
-            else:
-                self.weather_task.config = {
-                    'netuid': self.netuid,
-                    'chain_endpoint': self.subtensor_chain_endpoint,
-                    'miner_public_base_url': None
-                }
-            self.weather_task.keypair = self.keypair
+            if self.weather_task is not None:
+                if hasattr(self.weather_task, 'config') and self.weather_task.config is not None:
+                    self.weather_task.config['netuid'] = self.netuid
+                    self.weather_task.config['chain_endpoint'] = self.subtensor_chain_endpoint
+                    if 'miner_public_base_url' not in self.weather_task.config:
+                         self.weather_task.config['miner_public_base_url'] = None
+                else:
+                    self.weather_task.config = {
+                        'netuid': self.netuid,
+                        'chain_endpoint': self.subtensor_chain_endpoint,
+                        'miner_public_base_url': None
+                    }
+                self.weather_task.keypair = self.keypair
 
             self.logger.debug(
                 f"""
@@ -192,11 +200,12 @@ class Miner:
                         self.logger.info(f"MINER_SELF_CHECK: Stored Public Protocol: {self.my_public_protocol}")
                         self.logger.info(f"MINER_SELF_CHECK: Stored Public Base URL: {self.my_public_base_url}")
                         
-                        if hasattr(self.weather_task, 'config') and self.weather_task.config is not None:
-                            self.weather_task.config['miner_public_base_url'] = self.my_public_base_url
-                            self.logger.info(f"MINER_SELF_CHECK: Updated WeatherTask config with miner_public_base_url: {self.my_public_base_url}")
-                        else:
-                            self.logger.warning("MINER_SELF_CHECK: WeatherTask.config not found or is None, cannot set miner_public_base_url.")
+                        if self.weather_task is not None:
+                            if hasattr(self.weather_task, 'config') and self.weather_task.config is not None:
+                                self.weather_task.config['miner_public_base_url'] = self.my_public_base_url
+                                self.logger.info(f"MINER_SELF_CHECK: Updated WeatherTask config with miner_public_base_url: {self.my_public_base_url}")
+                            else:
+                                self.logger.warning("MINER_SELF_CHECK: WeatherTask.config not found or is None, cannot set miner_public_base_url.")
 
                     except ValueError as e_ip_conv:
                         self.logger.error(f"MINER_SELF_CHECK: Could not convert/validate IP '{ip_to_convert}' to standard string: {e_ip_conv}. Public URL not set.")
