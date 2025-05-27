@@ -25,6 +25,21 @@ config = context.config
 db_target_env = os.environ.get("DB_TARGET")
 db_connection_type = os.environ.get("DB_CONNECTION_TYPE", "tcp").lower() # Default to tcp
 
+# Determine version locations based on DB_TARGET
+if db_target_env == "miner":
+    version_locations = "alembic_migrations/versions/miner"
+elif db_target_env == "validator":
+    version_locations = "alembic_migrations/versions/validator"
+else:
+    # Default or error if DB_TARGET is not set or invalid
+    # It's important that this matches the behavior for target_metadata
+    logger.warning(
+        f"DB_TARGET environment variable ('{db_target_env}') is not explicitly 'miner' or 'validator' for version_locations. "
+        f"Defaulting version_locations for 'validator'. "
+        "This might lead to unexpected behavior if migrations are not in the 'validator' specific path."
+    )
+    version_locations = "alembic_migrations/versions/validator" # Default to validator specific path
+
 if db_target_env == "miner":
     logger.info("DB_TARGET is 'miner'. Configuring for miner database and schema.")
     db_url_key = "miner_db_socket_url" if db_connection_type == "socket" else "miner_db_url"
@@ -52,6 +67,7 @@ else:
     # raise ValueError("DB_TARGET environment variable must be set to 'miner' or 'validator'")
     db_url_key = "validator_db_socket_url" if db_connection_type == "socket" else "validator_db_url" # Default to validator
     target_metadata = validator_metadata
+    # version_locations is already set above based on db_target_env
 
 # Get the actual URL string from the .ini file based on the determined key
 specific_db_url = config.get_main_option(db_url_key)
@@ -114,6 +130,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         render_as_batch=True,
+        version_locations=version_locations,
     )
 
     with context.begin_transaction():
@@ -125,6 +142,7 @@ def do_run_migrations(connection):
         connection=connection, 
         target_metadata=target_metadata,
         render_as_batch=True, # Added render_as_batch=True for SQLite compatibility if needed, and general good practice
+        version_locations=version_locations,
     )
 
     with context.begin_transaction():
