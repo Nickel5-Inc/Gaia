@@ -89,8 +89,8 @@ def _load_config(self):
     config['initial_scoring_lead_hours'] = parse_int_list('WEATHER_INITIAL_SCORING_LEAD_HOURS', [6, 12]) # Day 0.25, 0.5
     config['final_scoring_lead_hours'] = parse_int_list('WEATHER_FINAL_SCORING_LEAD_HOURS', [78,138, 186]) # Day 5, 7
     config['verification_wait_minutes'] = int(os.getenv('WEATHER_VERIFICATION_WAIT_MINUTES', '60'))
-    config['verification_timeout_seconds'] = int(os.getenv('WEATHER_VERIFICATION_TIMEOUT_SECONDS', '3600')) # Default to 600s (10 minutes)
-    config['final_scoring_check_interval_seconds'] = int(os.getenv('WEATHER_FINAL_SCORING_INTERVAL_S', '3600')) # 1 hour
+    config['verification_timeout_seconds'] = int(os.getenv('WEATHER_VERIFICATION_TIMEOUT_SECONDS', '3600'))
+    config['final_scoring_check_interval_seconds'] = int(os.getenv('WEATHER_FINAL_SCORING_INTERVAL_S', '3600'))
     config['era5_delay_days'] = int(os.getenv('WEATHER_ERA5_DELAY_DAYS', '5'))
     config['cleanup_check_interval_seconds'] = int(os.getenv('WEATHER_CLEANUP_INTERVAL_S', '21600')) # 6 hours
     config['gfs_analysis_cache_dir'] = os.getenv('WEATHER_GFS_CACHE_DIR', './gfs_analysis_cache')
@@ -101,7 +101,7 @@ def _load_config(self):
     config['db_run_retention_days'] = int(os.getenv('WEATHER_DB_RUN_RETENTION_DAYS', '90'))
     config['run_hour_utc'] = int(os.getenv('WEATHER_RUN_HOUR_UTC', '2'))
     config['run_minute_utc'] = int(os.getenv('WEATHER_RUN_MINUTE_UTC', '0'))
-    config['validator_hash_wait_minutes'] = int(os.getenv('WEATHER_VALIDATOR_HASH_WAIT_MINUTES', '5'))
+    config['validator_hash_wait_minutes'] = int(os.getenv('WEATHER_VALIDATOR_HASH_WAIT_MINUTES', '10'))
 
     config['miner_jwt_secret_key'] = os.getenv("MINER_JWT_SECRET_KEY", "insecure_default_key_for_development_only")
     config['jwt_algorithm'] = os.getenv("MINER_JWT_ALGORITHM", "HS256")
@@ -601,9 +601,9 @@ class WeatherTask(Task):
                         new_db_status = None
                         hash_match = None
 
-                        if miner_status == 'input_hashed_awaiting_validation' and miner_hash:
+                        if miner_hash and miner_status in ['input_hashed_awaiting_validation', 'completed']:
                             if miner_hash == validator_input_hash:
-                                logger.info(f"[Run {run_id}] Hash MATCH for response ID {resp_id}!")
+                                logger.info(f"[Run {run_id}] Hash MATCH for response ID {resp_id} (Miner status: {miner_status})!")
                                 new_db_status = 'input_validation_complete'
                                 hash_match = True
                                 orig_rec = next((m for m in miners_to_poll if m['id'] == resp_id), None)
@@ -612,7 +612,7 @@ class WeatherTask(Task):
                                 else:
                                      logger.error(f"[Run {run_id}] Could not find original record for resp_id {resp_id} to trigger inference.")
                             else:
-                                logger.warning(f"[Run {run_id}] Hash MISMATCH for response ID {resp_id}. Miner: {miner_hash[:10]}... Validator: {validator_input_hash[:10]}...")
+                                logger.warning(f"[Run {run_id}] Hash MISMATCH for response ID {resp_id}. Miner: {miner_hash[:10]}... Validator: {validator_input_hash[:10]}... (Miner status: {miner_status})")
                                 new_db_status = 'input_hash_mismatch'
                                 hash_match = False
                         elif miner_status == 'fetch_error':

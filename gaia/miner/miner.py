@@ -6,7 +6,7 @@ import argparse
 from fiber import SubstrateInterface
 import uvicorn
 from fiber.logging_utils import get_logger
-from fiber.encrypted.miner import server
+from fiber.encrypted.miner import server as fiber_server
 from fiber.encrypted.miner.core import configuration
 from fiber.encrypted.miner.middleware import configure_extra_logging_middleware
 from fiber.chain import chain_utils, fetch_nodes
@@ -18,7 +18,7 @@ from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 import ssl
 import logging
 from fiber import logging_utils
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.responses import JSONResponse
 import asyncio
 import ipaddress
@@ -244,33 +244,21 @@ class Miner:
                 self.logger.warning("Miner public base URL could not be determined. Kerchunk JSONs may use relative paths.")
 
             self.logger.info("Starting miner server...")
+            
+            app = fiber_server.factory_app(debug=True)
+            app.body_limit = MAX_REQUEST_SIZE
 
-            # Define the lifespan context manager
-            @asynccontextmanager
-            async def lifespan(app_instance: FastAPI): # Renamed app to app_instance to avoid conflict
-                self.logger.info("Initializing database on application startup...")
+            @app.on_event("startup")
+            async def overridden_startup_event():
+                self.logger.info("Initializing database on application startup (via overridden on_event)...")
                 try:
                     await self.database_manager.ensure_engine_initialized()
                     await self.database_manager.initialize_database()
                     self.logger.info("Database initialization completed successfully")
                 except Exception as e:
                     self.logger.error(f"Failed to initialize database during startup: {e}", exc_info=True)
-                    # import sys
-                    # sys.exit(1) 
-                yield
-                self.logger.info("Application shutting down...")
-            
-            # Create FastAPI app instance directly to use lifespan
-            app = FastAPI(debug=True, lifespan=lifespan)
-            
-            # If server.factory_app did other important setup (e.g., adding specific routers or middleware),
-            # that setup would need to be replicated here.
-            # For example, if it added a default router:
-            # app.include_router(server.some_default_router)
-            # Or if it configured CORS, etc.
 
-            app.body_limit = MAX_REQUEST_SIZE
-
+            
             app.include_router(factory_router(self))
 
             if os.getenv("ENV", "dev").lower() == "dev":
