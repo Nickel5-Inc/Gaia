@@ -41,6 +41,7 @@ from fiber.logging_utils import get_logger
 from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
+from fiber.chain.interface import get_substrate
 from substrateinterface import SubstrateInterface
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
 from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
@@ -424,7 +425,9 @@ class GaiaValidator:
 
             original_blocks_since = w.blocks_since_last_update
             def blocks_since_wrapper(substrate, netuid, node_id):
-                current_block = int(substrate.get_block()["header"]["number"])
+                resp = self.substrate.rpc_request("chain_getHeader", [])  
+                hex_num = resp["result"]["number"]
+                current_block = int(hex_num, 16)
                 last_updated_value = substrate.query(
                     "SubtensorModule",
                     "LastUpdate",
@@ -437,11 +440,10 @@ class GaiaValidator:
             
             w.blocks_since_last_update = blocks_since_wrapper
 
-            # Standard SubstrateInterface Initialization
             try:
-                self.substrate = SubstrateInterface(url=self.subtensor_chain_endpoint)
-                # Basic connection test (optional, can be removed if too verbose or if init itself is trusted)
-                # self.substrate.node_name # Example, or self.substrate.chain
+                self.substrate = get_substrate(
+                    subtensor_network=self.subtensor_network,
+                    subtensor_address=self.subtensor_chain_endpoint)
             except Exception as e_sub_init:
                 logger.error(f"CRITICAL: Failed to initialize SubstrateInterface with endpoint {self.subtensor_chain_endpoint}: {e_sub_init}", exc_info=True)
                 return False
@@ -461,7 +463,9 @@ class GaiaValidator:
                 logger.error(f"CRITICAL: Metagraph sync_nodes() FAILED: {e_meta_sync}", exc_info=True)
                 return False # Sync failure is critical for neuron operation
 
-            self.current_block = int(self.substrate.get_block()["header"]["number"])
+            resp = self.substrate.rpc_request("chain_getHeader", [])  
+            hex_num = resp["result"]["number"]
+            self.current_block = int(hex_num, 16)
             logger.info(f"Initial block number type: {type(self.current_block)}, value: {self.current_block}")
             self.last_set_weights_block = self.current_block - 300
 
@@ -1439,7 +1443,9 @@ class GaiaValidator:
                         ).value
                         if last_updated_value is not None and validator_uid < len(last_updated_value):
                             last_updated = int(last_updated_value[validator_uid])
-                            current_block = int(self.substrate.get_block()["header"]["number"])
+                            resp = self.substrate.rpc_request("chain_getHeader", [])  
+                            hex_num = resp["result"]["number"]
+                            current_block = int(hex_num, 16)
                             blocks_since_update = current_block - last_updated
                             logger.info(f"Calculated blocks since update: {blocks_since_update} (current: {current_block}, last: {last_updated})")
                         else:
@@ -1452,7 +1458,9 @@ class GaiaValidator:
                         )
                         if min_interval is not None:
                             min_interval = int(min_interval)
-                        current_block = int(self.substrate.get_block()["header"]["number"])                        
+                        resp = self.substrate.rpc_request("chain_getHeader", [])  
+                        hex_num = resp["result"]["number"]
+                        current_block = int(hex_num, 16)                     
                         if current_block - self.last_set_weights_block < min_interval:
                             logger.info(f"Recently set weights {current_block - self.last_set_weights_block} blocks ago")
                             await self.update_task_status('scoring', 'idle', 'waiting')
@@ -1537,16 +1545,18 @@ class GaiaValidator:
                 formatted_time = current_time_utc.strftime("%Y-%m-%d %H:%M:%S")
 
                 try:
-                    block = self.substrate.get_block()
-                    self.current_block = block["header"]["number"]
+                    resp = self.substrate.rpc_request("chain_getHeader", [])  
+                    hex_num = resp["result"]["number"]
+                    self.current_block = int(hex_num, 16)
                     blocks_since_weights = (
                             self.current_block - self.last_set_weights_block
                     )
                 except Exception as block_error:
 
                     try:
-                        self.substrate = SubstrateInterface(
-                            url=self.subtensor_chain_endpoint
+                        self.substrate = get_substrate(
+                            subtensor_network=self.subtensor_network,
+                            subtensor_address=self.subtensor_chain_endpoint
                         )
                     except Exception as e:
                         logger.error(f"Failed to reconnect to substrate: {e}")
@@ -2024,8 +2034,9 @@ class GaiaValidator:
 
     async def update_last_weights_block(self):
         try:
-            block = self.substrate.get_block()
-            block_number = int(block["header"]["number"])
+            resp = self.substrate.rpc_request("chain_getHeader", [])  
+            hex_num = resp["result"]["number"]
+            block_number = int(hex_num, 16)
             self.last_set_weights_block = block_number
         except Exception as e:
             logger.error(f"Error updating last weights block: {e}")
