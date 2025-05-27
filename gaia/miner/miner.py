@@ -24,6 +24,7 @@ import asyncio
 import ipaddress
 from typing import Optional
 import warnings
+from contextlib import asynccontextmanager # Add this import
 
 # Imports for Alembic check
 from alembic.config import Config # Add Alembic import
@@ -64,9 +65,11 @@ class Miner:
             args.netuid if args.netuid is not None else int(os.getenv("NETUID", 237))
         )
         self.port = (
-            args.port if args.port is not None else int(os.getenv("PORT", 8091))
+            args.port if args.port is not None else int(os.getenv("PORT", 33334))
         )
-        
+        self.public_port = (
+            args.public_port if args.public_port is not None else int(os.getenv("PUBLIC_PORT", 33333))
+        )
         # Load chain endpoint from args or env (CLI > ENV > Default)
         # Check if args.subtensor and args.subtensor.chain_endpoint exist and were provided via CLI
         cli_chain_endpoint = None
@@ -91,9 +94,9 @@ class Miner:
         logger.info(f"Subtensor network: {self.subtensor_network}")
         logger.info(f"Subtensor chain endpoint: {self.subtensor_chain_endpoint}")
         logger.info(f"Subtensor netuid: {self.netuid}")
-        logger.info(f"Subtensor port: {self.port}")
-        logger.info(f" Wallet Name: {self.wallet}")
-        logger.info(f" Hotkey Name: {self.hotkey}")
+        logger.info(f"Public port: {self.public_port}")
+        logger.info(f"Wallet Name: {self.wallet}")
+        logger.info(f"Hotkey Name: {self.hotkey}")
 
         self.database_manager = MinerDatabaseManager()
         self.geomagnetic_task = GeomagneticTask(
@@ -157,7 +160,8 @@ class Miner:
     Keypair Public Key: {self.keypair.public_key}
     Subtensor Chain Endpoint: {self.subtensor_chain_endpoint}
     Network: {self.subtensor_network}
-    FastAPI Port (serving on): {self.port}
+    Public Port (posted to chain): {self.public_port}
+    Internal Port (for FastAPI): {self.port}
     Target Netuid: {self.netuid}
             """
             )
@@ -240,24 +244,32 @@ class Miner:
                 self.logger.warning("Miner public base URL could not be determined. Kerchunk JSONs may use relative paths.")
 
             self.logger.info("Starting miner server...")
-            
-            app = server.factory_app(debug=True)
-            app.body_limit = MAX_REQUEST_SIZE
 
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*on_event is deprecated.*")
-                
-                @app.on_event("startup")
-                async def startup_event():
-                    self.logger.info("Initializing database on FastAPI startup...")
-                    try:
-                        await self.database_manager.ensure_engine_initialized()
-                        await self.database_manager.initialize_database()
-                        self.logger.info("Database initialization completed successfully")
-                    except Exception as e:
-                        self.logger.error(f"Failed to initialize database during startup: {e}", exc_info=True)
-                        import sys
-                        sys.exit(1)
+            # Define the lifespan context manager
+            @asynccontextmanager
+            async def lifespan(app_instance: FastAPI): # Renamed app to app_instance to avoid conflict
+                self.logger.info("Initializing database on application startup...")
+                try:
+                    await self.database_manager.ensure_engine_initialized()
+                    await self.database_manager.initialize_database()
+                    self.logger.info("Database initialization completed successfully")
+                except Exception as e:
+                    self.logger.error(f"Failed to initialize database during startup: {e}", exc_info=True)
+                    # import sys
+                    # sys.exit(1) 
+                yield
+                self.logger.info("Application shutting down...")
+            
+            # Create FastAPI app instance directly to use lifespan
+            app = FastAPI(debug=True, lifespan=lifespan)
+            
+            # If server.factory_app did other important setup (e.g., adding specific routers or middleware),
+            # that setup would need to be replicated here.
+            # For example, if it added a default router:
+            # app.include_router(server.some_default_router)
+            # Or if it configured CORS, etc.
+
+            app.body_limit = MAX_REQUEST_SIZE
 
             app.include_router(factory_router(self))
 
@@ -311,6 +323,7 @@ class Miner:
             )
             fh.setFormatter(formatter)
             fiber_logger.addHandler(fh)
+            logger.info(f"port for fastapi: {self.port}")
 
             uvicorn.run(
                 app,
@@ -327,9 +340,13 @@ class Miner:
 
 if __name__ == "__main__":
     # Load environment variables *before* anything else (like Alembic check)
-    load_dotenv(".env")
+    load_dotenv(".env", override=True)
 
     # --- Alembic check code ---
+    # Set DB_TARGET for miner-specific migrations
+    os.environ['DB_TARGET'] = 'miner'
+    logger.info(f"[Startup] DB_TARGET set to: {os.environ.get('DB_TARGET')}") # Log the DB_TARGET
+
     # Copied from validator.py
     try:
         # Use print here as logger might not be fully setup yet
@@ -344,20 +361,21 @@ if __name__ == "__main__":
             sys.exit("Alembic configuration not found.")
 
         alembic_cfg = Config(alembic_ini_path)
-        # Ensure alembic.ini is accessible from the miner's execution context
-        # If miner runs from a different directory, adjust the path to alembic.ini
-        command.upgrade(alembic_cfg, "head")
-        print("[Startup] Database schema is up-to-date.")
+        
+        # Conditionally run alembic upgrade based on environment variable
+        alembic_auto_upgrade = os.getenv("ALEMBIC_AUTO_UPGRADE", "True").lower() in ["true", "1", "yes"]
+        if alembic_auto_upgrade:
+            print("[Startup] ALEMBIC_AUTO_UPGRADE is True. Attempting to upgrade database schema to head...")
+            command.upgrade(alembic_cfg, "head")
+            print("[Startup] Database schema is up-to-date (or upgrade attempted).")
+        else:
+            print("[Startup] ALEMBIC_AUTO_UPGRADE is False. Skipping automatic schema upgrade. Current schema version will be checked by the application later if necessary.")
+            # Optionally, you might want to run command.current(alembic_cfg) to just log the current version without upgrading.
+            # For now, just skipping as per common practice when auto-upgrade is off.
+
     except CommandError as e:
          # Use print here as well
          print(f"[Startup] ERROR: Alembic command failed during startup check: {e}")
-         print("[Startup] ERROR: Please ensure the database is accessible and migrations are correct.")
-         sys.exit("Database migration/check failed.") # Exit directly
-    except Exception as e:
-        print(f"[Startup] ERROR: Failed to check/upgrade database schema during startup: {e}")
-        traceback.print_exc() # Print full traceback for unexpected errors
-        sys.exit("Database schema check failed.")
-    # --- End Alembic check ---
 
     logger.info("Miner Alembic check complete. Starting main miner application...") # Keep this log message after the check
     
@@ -371,6 +389,7 @@ if __name__ == "__main__":
 
     # Optional arguments
     parser.add_argument("--port", type=int, default=None, help="Port to run the miner on (overrides PORT env var)")
+    parser.add_argument("--public-port", type=int, default=None, help="Public port to announce to the chain (overrides PUBLIC_PORT env var)")
     parser.add_argument("--use_base_model", action="store_true", help="Enable base model usage")
 
     # Create a subtensor group

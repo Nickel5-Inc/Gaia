@@ -88,38 +88,50 @@ class BaseDatabaseManager(ABC):
     def __init__(
         self,
         node_type: str,
-        host: str = "localhost", # Default if DB_HOST is not set
-        port: int = 5432,        # Default if DB_PORT is not set
-        database: str = "bittensor",# Default if DB_NAME is not set
-        user: str = "postgres",    # Default if DB_USER is not set
-        password: str = "postgres",# Default if DB_PASSWORD is not set
+        host: Optional[str] = "localhost", # Can be hostname or socket path
+        port: Optional[int] = 5432,        # Port for TCP, None for socket
+        database: str = "bittensor",
+        user: str = "postgres",
+        password: str = "postgres",
+        connection_type: Optional[str] = None, # Explicitly passed connection type
+        enable_monitoring: bool = True # New flag for enabling/disabling monitoring
     ):
         """Initialize database connection parameters and engine."""
         if not hasattr(self, "initialized"):
             self.node_type = node_type
+            self.monitoring_enabled = enable_monitoring # Store the flag
 
-            actual_user = os.getenv("DB_USER", user)
-            actual_password = os.getenv("DB_PASSWORD", password)
-            actual_host = os.getenv("DB_HOST", host)
-            actual_port_str = os.getenv("DB_PORT", str(port))
-            actual_database = os.getenv("DB_NAME", database)
-
-            try:
-                actual_port = int(actual_port_str)
-            except ValueError:
-                logger.error(f"Invalid DB_PORT value '{actual_port_str}'. Defaulting to {port}.")
-                actual_port = port
+            # Prioritize parameters passed from subclass (MinerDatabaseManager)
+            # These have already considered their specific environment variables.
+            actual_user = user
+            actual_password = password
+            actual_database = database
+            actual_host = host # This is the resolved host or socket path from MinerDBManager
+            actual_port = port # This is the resolved port (or None for socket) from MinerDBManager
             
-            # Intelligent URL construction
-            if actual_host and actual_host.startswith("/"):
-                # Assume Unix domain socket if DB_HOST starts with a slash
-                # The host part of the URL is empty, and the socket path is in the 'host' query parameter.
+            # Use connection_type passed from subclass, or default to "tcp"
+            # Subclasses should resolve DB_CONNECTION_TYPE or their specific env var.
+            resolved_connection_type = connection_type if connection_type else os.getenv("DB_CONNECTION_TYPE", "tcp").lower()
+
+            logger.info(f"BaseDatabaseManager init for node_type '{node_type}' with connection_type: '{resolved_connection_type}', monitoring: {self.monitoring_enabled}")
+
+            if resolved_connection_type == "socket":
+                if not actual_host or not actual_host.startswith("/"): 
+                    logger.error(f"Socket connection type specified, but host ('{actual_host}') is not a valid socket path. Attempting to use default /var/run/postgresql.")
+                    actual_host = "/var/run/postgresql" # Fallback, consider making this configurable or erroring out
+                
                 self.db_url = f"postgresql+asyncpg://{actual_user}:{actual_password}@/{actual_database}?host={actual_host}"
-                logger.info(f"Configuring database for Unix domain socket connection: {actual_host}")
-            else:
-                # Standard TCP/IP connection
+                logger.info(f"BaseDatabaseManager: Configuring database for Unix domain socket connection. Socket path: '{actual_host}', DB: '{actual_database}', User: '{actual_user}'")
+            else: # Default to TCP/IP
+                if actual_port is None: # Should not happen if TCP is chosen and port was default
+                    logger.warning(f"TCP connection type specified, but port is None. Defaulting to 5432.")
+                    actual_port = 5432
+                if not actual_host or actual_host.startswith("/"): # Host looks like a path, but TCP is selected
+                    logger.warning(f"TCP connection type specified, but host ('{actual_host}') looks like a path. Defaulting to 'localhost'.")
+                    actual_host = "localhost"
+
                 self.db_url = f"postgresql+asyncpg://{actual_user}:{actual_password}@{actual_host}:{actual_port}/{actual_database}"
-                logger.info(f"Configuring database for TCP/IP connection: {actual_host}:{actual_port}")
+                logger.info(f"BaseDatabaseManager: Configuring database for TCP/IP connection. Host: '{actual_host}', Port: {actual_port}, DB: '{actual_database}', User: '{actual_user}'")
             
             self._active_sessions = set()
             self._active_operations = 0
@@ -191,6 +203,7 @@ class BaseDatabaseManager(ABC):
         return True
 
     async def _update_circuit_breaker(self, success: bool) -> None:
+        if not self.monitoring_enabled: return # Skip if monitoring is disabled
         if success:
             if self._circuit_breaker['status'] == 'half-open':
                 self._circuit_breaker['status'] = 'closed'
@@ -206,7 +219,7 @@ class BaseDatabaseManager(ABC):
                 logger.warning("Circuit breaker opened due to repeated failures")
 
     async def _monitor_resources(self) -> Dict[str, Any]:
-        if not PSUTIL_AVAILABLE:
+        if not PSUTIL_AVAILABLE or not self.monitoring_enabled: # Also check monitoring_enabled
             return None
         try:
             process = psutil.Process()
@@ -413,6 +426,7 @@ class BaseDatabaseManager(ABC):
 
     def _update_top_long_sessions(self, duration_ms: float, name: str, acquired_at_iso_str: str):
         """Helper to update the list of top longest sessions."""
+        if not self.monitoring_enabled: return # Skip if monitoring is disabled
         try:
             # Ensure the list exists in stats
             if 'top_long_sessions' not in self._operation_stats:
@@ -480,7 +494,7 @@ class BaseDatabaseManager(ABC):
 
         overall_start_time = time.monotonic()
         session_id_str = "provided" if provided_session else "new"
-        specific_op_name = operation_name # Keep original operation_name for top_long_sessions
+        specific_op_name = operation_name
 
         actual_session_instance: Optional[AsyncSession] = None
         session_acquired_time = 0.0
@@ -488,24 +502,15 @@ class BaseDatabaseManager(ABC):
         yield_end_time = 0.0
         session_init_duration = 0.0
         
-        # Attempt to get a more specific operation name if it's a query
-        if ":" not in specific_op_name and (specific_op_name.startswith("fetch_") or specific_op_name.startswith("execute")):
-            try:
-                # Simplified extraction, assuming format like "fetch_all:SELECT ..." or "execute:UPDATE ..."
-                # This part is usually handled by the calling methods like fetch_one, execute
-                pass # No change here, specific_op_name is already good for top_long_sessions
-            except Exception as e_op_name:
-                logger.warning(f"Session (raw_op:{operation_name}): Error trying to refine op_name: {e_op_name}")
-
         transaction_started_here = False
         acquired_at_iso_str = datetime.now(timezone.utc).isoformat()
-        e_outer = None # Initialize e_outer to None
+        e_outer = None
 
         try:
             if provided_session:
                 actual_session_instance = provided_session
                 session_id_for_log = f"provided_{id(actual_session_instance)}"
-                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Using provided session.")
+                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Using provided session.")
             else:
                 acquire_start_time = time.monotonic()
                 if not self._session_factory:
@@ -514,28 +519,25 @@ class BaseDatabaseManager(ABC):
                 actual_session_instance = self._session_factory()
                 session_init_duration = (time.monotonic() - acquire_start_time) * 1000
                 session_id_for_log = f"new_{id(actual_session_instance)}"
-                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): New session acquired from factory in {session_init_duration:.2f}ms.")
+                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): New session acquired from factory in {session_init_duration:.2f}ms.")
 
             session_acquired_time = time.monotonic()
-            session_id_str = session_id_for_log # For active session tracking
+            session_id_str = session_id_for_log
 
-            if not actual_session_instance: # Should not happen if factory worked or session provided
+            if not actual_session_instance:
                  logger.error(f"Session ({specific_op_name}): Failed to obtain a session instance.")
                  raise DatabaseConnectionError("Failed to obtain session instance.")
 
-            # Transaction management
-            if not actual_session_instance.in_transaction(): # type: ignore
-                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Beginning new transaction.")
-                # The `begin()` call itself returns a new AsyncTransaction object if not nested.
-                # We don't typically need to assign this to a variable unless managing nested transactions manually.
-                await actual_session_instance.begin() # type: ignore
+            if not actual_session_instance.in_transaction():
+                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Beginning new transaction.")
+                await actual_session_instance.begin()
                 transaction_started_here = True
             else:
-                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Already in transaction.")
+                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Already in transaction.")
 
-            self._active_sessions.add(session_id_str) 
-            active_sessions_count = self._increment_active_sessions() # This just increments a counter, doesn't use session_id_str
-            logger.debug(f"Session {session_id_for_log} ({specific_op_name}) ready. Active sessions: {active_sessions_count} (Set size: {len(self._active_sessions)})")
+            if self.monitoring_enabled: self._active_sessions.add(session_id_str)
+            active_sessions_count = self._increment_active_sessions()
+            if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}) ready. Active sessions: {active_sessions_count} (Set size: {len(self._active_sessions) if self.monitoring_enabled else 'N/A'})")
 
             yield_start_time = time.monotonic()
             yield actual_session_instance
@@ -543,102 +545,96 @@ class BaseDatabaseManager(ABC):
 
             if transaction_started_here:
                 commit_start_time = time.monotonic()
-                await actual_session_instance.commit() # type: ignore
+                await actual_session_instance.commit()
                 commit_duration = (time.monotonic() - commit_start_time) * 1000
-                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Transaction committed in {commit_duration:.2f}ms (normal exit).")
+                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Transaction committed in {commit_duration:.2f}ms (normal exit).")
             
         except asyncio.CancelledError:
             e_outer = asyncio.CancelledError("Session cancelled")
             logger.warning(f"Session {session_id_for_log} ({specific_op_name}): Operation cancelled.")
-            if transaction_started_here and actual_session_instance and actual_session_instance.in_transaction(): # type: ignore
-                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Attempting rollback due to cancellation.")
+            if transaction_started_here and actual_session_instance and actual_session_instance.in_transaction():
+                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Attempting rollback due to cancellation.")
                 try:
                     rollback_start_time = time.monotonic()
-                    await actual_session_instance.rollback() # type: ignore
+                    await actual_session_instance.rollback()
                     rollback_duration = (time.monotonic() - rollback_start_time) * 1000
-                    logger.info(f"Session {session_id_for_log} ({specific_op_name}): Transaction rolled back in {rollback_duration:.2f}ms due to cancellation.")
+                    if self.monitoring_enabled: logger.info(f"Session {session_id_for_log} ({specific_op_name}): Transaction rolled back in {rollback_duration:.2f}ms due to cancellation.")
                 except Exception as r_err:
                     logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error during rollback after cancellation: {r_err}", exc_info=True)
-            self._operation_stats.setdefault('cancelled_operations', 0)
-            self._operation_stats['cancelled_operations'] += 1
+            if self.monitoring_enabled: 
+                self._operation_stats.setdefault('cancelled_operations', 0)
+                self._operation_stats['cancelled_operations'] += 1
             await self._mark_operation_failed() 
             raise
         except Exception as e:
             e_outer = e
             logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error during session: {str(e_outer)}", exc_info=True)
-            if transaction_started_here and actual_session_instance and actual_session_instance.in_transaction(): # type: ignore
-                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Attempting rollback due to exception: {str(e_outer)}.")
+            if transaction_started_here and actual_session_instance and actual_session_instance.in_transaction():
+                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Attempting rollback due to exception: {str(e_outer)}.")
                 try:
                     rollback_start_time = time.monotonic()
-                    await actual_session_instance.rollback() # type: ignore
+                    await actual_session_instance.rollback()
                     rollback_duration = (time.monotonic() - rollback_start_time) * 1000
-                    logger.info(f"Session {session_id_for_log} ({specific_op_name}): Transaction rolled back in {rollback_duration:.2f}ms due to exception.")
+                    if self.monitoring_enabled: logger.info(f"Session {session_id_for_log} ({specific_op_name}): Transaction rolled back in {rollback_duration:.2f}ms due to exception.")
                 except Exception as r_err:
                     logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error during rollback after exception: {r_err}", exc_info=True)
             
-            await self._mark_operation_failed() # Mark failure for circuit breaker
+            await self._mark_operation_failed()
             raise
         finally:
             session_release_start_time = time.monotonic()
             if actual_session_instance and not provided_session:
                 try:
-                    # Check if session is still active and in a transaction due to an unhandled scenario
-                    # This is a safeguard; ideally, commit/rollback should have happened.
-                    if actual_session_instance.is_active and actual_session_instance.in_transaction() and transaction_started_here: # type: ignore
+                    if actual_session_instance.is_active and actual_session_instance.in_transaction() and transaction_started_here:
                         logger.error(f"Session {session_id_for_log} ({specific_op_name}): Session being closed but still in transaction started here! Forcing rollback. Exception was: {e_outer}")
                         try:
-                            await actual_session_instance.rollback() # type: ignore
-                            logger.info(f"Session {session_id_for_log} ({specific_op_name}): Defensive rollback executed in finally.")
+                            await actual_session_instance.rollback()
+                            if self.monitoring_enabled: logger.info(f"Session {session_id_for_log} ({specific_op_name}): Defensive rollback executed in finally.")
                         except Exception as rb_finally_err:
                             logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error during defensive rollback in finally: {rb_finally_err}")
                     
-                    await actual_session_instance.close() # type: ignore
-                    logger.debug(f"Session {session_id_for_log} ({specific_op_name}): New session closed.")
+                    await actual_session_instance.close()
+                    if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): New session closed.")
                 except Exception as close_err:
                     logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error closing new session: {close_err}", exc_info=True)
 
-            self._active_sessions.discard(session_id_str)
-            active_sessions_count_after = self._decrement_active_sessions() # This just decrements a counter
+            if self.monitoring_enabled: self._active_sessions.discard(session_id_str)
+            active_sessions_count_after = self._decrement_active_sessions()
 
+            if self.monitoring_enabled:
+                total_duration_ms = (time.monotonic() - overall_start_time) * 1000
+                time_in_yield_ms = (yield_end_time - yield_start_time) * 1000 if yield_start_time > 0 and yield_end_time > 0 else 0.0
+                
+                self._operation_stats['total_sessions_acquired'] += 1
+                self._operation_stats['total_session_time_ms'] += total_duration_ms
+                self._operation_stats['max_session_time_ms'] = max(self._operation_stats['max_session_time_ms'], total_duration_ms)
+                if total_duration_ms < self._operation_stats['min_session_time_ms']:
+                    self._operation_stats['min_session_time_ms'] = total_duration_ms if total_duration_ms > 0 else self._operation_stats.get('min_session_time_ms', float('inf'))
 
-            total_duration_ms = (time.monotonic() - overall_start_time) * 1000
-            time_in_yield_ms = (yield_end_time - yield_start_time) * 1000 if yield_start_time > 0 and yield_end_time > 0 else 0.0
-            
-            self._operation_stats['total_sessions_acquired'] += 1
-            self._operation_stats['total_session_time_ms'] += total_duration_ms
-            self._operation_stats['max_session_time_ms'] = max(self._operation_stats['max_session_time_ms'], total_duration_ms)
-            if total_duration_ms < self._operation_stats['min_session_time_ms']:
-                self._operation_stats['min_session_time_ms'] = total_duration_ms if total_duration_ms > 0 else self._operation_stats.get('min_session_time_ms', float('inf'))
+                if self._operation_stats['total_sessions_acquired'] > 0:
+                    self._operation_stats['avg_session_time_ms'] = self._operation_stats['total_session_time_ms'] / self._operation_stats['total_sessions_acquired']
+                
+                self._update_top_long_sessions(total_duration_ms, specific_op_name, acquired_at_iso_str)
 
-            if self._operation_stats['total_sessions_acquired'] > 0:
-                self._operation_stats['avg_session_time_ms'] = self._operation_stats['total_session_time_ms'] / self._operation_stats['total_sessions_acquired']
-            
+                current_time = time.monotonic()
+                if e_outer and not isinstance(e_outer, asyncio.CancelledError):
+                    if self._circuit_breaker['status'] == 'half-open':
+                        logger.info(f"Circuit breaker: Successful operation in half-open state. Closing breaker. ({specific_op_name})")
+                        self._circuit_breaker['status'] = 'closed'
+                        self._circuit_breaker['failures'] = 0
+                elif not e_outer and self._circuit_breaker['status'] == 'half-open':
+                     logger.info(f"Circuit breaker: Successful operation in half-open state. Closing breaker. ({specific_op_name})")
+                     self._circuit_breaker['status'] = 'closed'
+                     self._circuit_breaker['failures'] = 0
 
-            
-            self._update_top_long_sessions(total_duration_ms, specific_op_name, acquired_at_iso_str)
-
-            # Circuit breaker update logic
-            current_time = time.monotonic()
-            if e_outer and not isinstance(e_outer, asyncio.CancelledError): # Success, or handled error
-                # If an error occurred and was handled (e.g. rolled back), still counts as a "use" for half-open
-                if self._circuit_breaker['status'] == 'half-open':
-                    logger.info(f"Circuit breaker: Successful operation in half-open state. Closing breaker. ({specific_op_name})")
-                    self._circuit_breaker['status'] = 'closed'
-                    self._circuit_breaker['failures'] = 0
-            # If e_outer is None (no exception), it's a success, which also resets/confirms 'closed' or 'half-open' success
-            elif not e_outer and self._circuit_breaker['status'] == 'half-open':
-                 logger.info(f"Circuit breaker: Successful operation in half-open state. Closing breaker. ({specific_op_name})")
-                 self._circuit_breaker['status'] = 'closed'
-                 self._circuit_breaker['failures'] = 0
-
-
-            session_release_duration_ms = (time.monotonic() - session_release_start_time) * 1000
-            logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Released. Total time: {total_duration_ms:.2f}ms, Factory init: {session_init_duration:.2f}ms, In yield: {time_in_yield_ms:.2f}ms, Release code: {session_release_duration_ms:.2f}ms. Active now: {active_sessions_count_after} (Set size: {len(self._active_sessions)})")
-            
-            # This is a bit verbose, but can be useful for diagnosing where time is spent outside `yield`
-            overhead_ms = total_duration_ms - time_in_yield_ms
-            if overhead_ms > 50 and total_duration_ms > 100: # Log if overhead is significant
-                logger.info(f"Session {session_id_for_log} ({specific_op_name}): Significant overhead detected. Total: {total_duration_ms:.2f}ms, Yield: {time_in_yield_ms:.2f}ms, Overhead: {overhead_ms:.2f}ms")
+                session_release_duration_ms = (time.monotonic() - session_release_start_time) * 1000
+                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Released. Total time: {total_duration_ms:.2f}ms, Factory init: {session_init_duration:.2f}ms, In yield: {time_in_yield_ms:.2f}ms, Release code: {session_release_duration_ms:.2f}ms. Active now: {active_sessions_count_after} (Set size: {len(self._active_sessions) if self.monitoring_enabled else 'N/A'})")
+                
+                overhead_ms = total_duration_ms - time_in_yield_ms
+                if overhead_ms > 50 and total_duration_ms > 100:
+                    logger.info(f"Session {session_id_for_log} ({specific_op_name}): Significant overhead detected. Total: {total_duration_ms:.2f}ms, Yield: {time_in_yield_ms:.2f}ms, Overhead: {overhead_ms:.2f}ms")
+            else: # Monitoring disabled
+                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Released. Monitoring disabled. Active now: {active_sessions_count_after}")
 
     @with_timeout(CONNECTION_TEST_TIMEOUT)
     async def _test_connection(self, session: AsyncSession) -> bool:

@@ -2395,19 +2395,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-
-        print("[Startup] Checking database schema version using Alembic...") # Use print as logger might not be fully setup
+        # Use print as logger might not be fully setup
+        print("[Startup] Checking database schema version using Alembic...") 
         alembic_cfg = Config("alembic.ini") 
-        command.upgrade(alembic_cfg, "head")
-        print("[Startup] Database schema is up-to-date.")
+
+        # Conditionally run alembic upgrade based on environment variable
+        alembic_auto_upgrade = os.getenv("ALEMBIC_AUTO_UPGRADE", "True").lower() in ["true", "1", "yes"]
+        if alembic_auto_upgrade:
+            print("[Startup] ALEMBIC_AUTO_UPGRADE is True. Attempting to upgrade database schema to head...")
+            command.upgrade(alembic_cfg, "head")
+            print("[Startup] Database schema is up-to-date (or upgrade attempted).")
+        else:
+            print("[Startup] ALEMBIC_AUTO_UPGRADE is False. Skipping automatic schema upgrade. Current schema version will be checked by the application later if necessary.")
+
     except CommandError as e:
          print(f"[Startup] ERROR: Alembic command failed during startup check: {e}")
-         print("[Startup] ERROR: Please ensure the database is accessible and migrations are correct.")
-         sys.exit("Database migration/check failed.")
-    except Exception as e:
-        print(f"[Startup] ERROR: Failed to check/upgrade database schema during startup: {e}")
-        traceback.print_exc()
-        sys.exit("Database schema check failed.")
 
     validator = GaiaValidator(args)
     yappi.set_clock_type("wall")  # Or "cpu"
