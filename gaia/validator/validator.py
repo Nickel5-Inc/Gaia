@@ -9,7 +9,6 @@ import concurrent.futures
 import glob
 import signal
 import sys
-import yappi  # Added yappi import
 
 from gaia.database.database_manager import DatabaseTimeout
 try:
@@ -317,35 +316,6 @@ class GaiaValidator:
 
         logger.info("Initiating graceful shutdown sequence...")
 
-        # --- Yappi Profiling Stop and Save - Moved to the beginning ---
-        try:
-            if yappi.is_running():
-                yappi.stop()  # Stop profiling
-                logger.info("YAPPI: Profiling stopped successfully during shutdown.")
-
-                stats = yappi.get_func_stats()
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                profile_output_base = f"yappi_stats_shutdown_{timestamp}"
-
-                stats.sort("totaltime", "desc") 
-                stats.save(f"{profile_output_base}_totaltime.prof", type="pstat")
-                logger.info(f"YAPPI: Stats (sorted by total wall time) saved to {profile_output_base}_totaltime.prof")
-
-                stats.sort("avgtime", "desc") 
-                stats.save(f"{profile_output_base}_avgtime.prof", type="pstat")
-                logger.info(f"YAPPI: Stats (sorted by average wall time) saved to {profile_output_base}_avgtime.prof")
-                
-                # Re-sorting by totaltime for sum_time for clarity as it's wall clock
-                stats.sort("totaltime", "desc") 
-                stats.save(f"{profile_output_base}_sumtime.prof", type="pstat")
-                logger.info(f"YAPPI: Stats (sorted by total wall time, as 'sum_time') saved to {profile_output_base}_sumtime.prof")
-                logger.info("YAPPI: All profiling data saved.")
-            else:
-                logger.info("YAPPI: Profiling was not running at shutdown or already stopped.")
-        except Exception as e_yappi:
-            logger.error(f"YAPPI: Error stopping or saving profiling data during shutdown: {e_yappi}", exc_info=True)
-        # --- End of Yappi Block ---
-
         try:
             logger.info("Setting shutdown event (if not already set)...")
             self._shutdown_event.set()
@@ -384,7 +354,7 @@ class GaiaValidator:
             logger.info("Graceful shutdown sequence fully completed.")
             
         except Exception as e_shutdown_main:
-            logger.error(f"Error during main shutdown sequence (after yappi): {e_shutdown_main}", exc_info=True)
+            logger.error(f"Error during main shutdown sequence: {e_shutdown_main}", exc_info=True)
             # Ensure cleanup_done is set even if part of the main shutdown fails, to prevent re-entry
             self._cleanup_done = True 
             logger.warning("Graceful shutdown sequence partially completed due to error.")
@@ -2495,8 +2465,6 @@ if __name__ == "__main__":
     # --- End Alembic check code for Validator ---
 
     validator = GaiaValidator(args)
-    yappi.set_clock_type("wall")  # Or "cpu"
-    yappi.start()  # Start profiling
     try:
         asyncio.run(validator.main())
     except KeyboardInterrupt:
@@ -2504,8 +2472,6 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Unhandled exception in main loop: {e}", exc_info=True)
     finally:
-        # yappi.stop() and save logic moved to _initiate_shutdown
-        logger.info("Main execution finished. Yappi stop/save handled by shutdown sequence.")
 
         if hasattr(validator, '_cleanup_done') and not validator._cleanup_done:
              try:
