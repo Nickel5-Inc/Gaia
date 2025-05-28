@@ -45,4 +45,5 @@ cdsapi
 azure-storage-blob
 pyinstrument
 kerchunk
+alembic
 
