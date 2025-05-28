@@ -46,4 +46,4 @@ azure-storage-blob
 pyinstrument
 kerchunk
 alembic
-
+gcsfs
