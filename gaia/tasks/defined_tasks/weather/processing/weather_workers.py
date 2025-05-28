@@ -201,7 +201,7 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                         logger.error(f"[InferenceTask Job {job_id}] HTTP inference service call failed (returned None). Job will be marked as error.")
                     elif not selected_predictions_cpu:
                         logger.info(f"[InferenceTask Job {job_id}] HTTP inference service call completed but returned an empty list of predictions. This may be normal (e.g. no data produced by model).")
-                 elif inference_type == "local":
+                 elif inference_type == "local_model":
                      logger.info(f"[InferenceTask Job {job_id}] Using local runner for inference (type: {inference_type})...")
                      if task_instance.inference_runner.model is None:
                          logger.error(f"[InferenceTask Job {job_id}] Local model not loaded. Aborting.")
