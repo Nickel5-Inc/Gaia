@@ -676,6 +676,11 @@ class WeatherTask(Task):
                 logger.info(f"Initiating weather forecast run triggered around {now_utc}...")
                 await validator.update_task_status('weather', 'processing', 'initializing_run')
 
+                if self.test_mode:
+                    logger.info(f"Test mode enabled. Adjusting GFS init time by -1 day from {now_utc.strftime('%Y-%m-%d %H:%M')} UTC.")
+                    now_utc -= timedelta(days=1)
+                    logger.info(f"Adjusted GFS init time for test mode: {now_utc.strftime('%Y-%m-%d %H:%M')} UTC.")
+                    
                 gfs_t0_run_time = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
                 gfs_t_minus_6_run_time = gfs_t0_run_time - timedelta(hours=6) # This will be 18Z from the previous day
 
