@@ -31,8 +31,7 @@ async def fetch_data(url=None, max_retries=3):
 
     for attempt in range(max_retries):
         try:
-            # Force HTTP/1.1 (kept from previous successful diagnostic step)
-            async with httpx.AsyncClient(timeout=60.0, http1=True, http2=False, verify=False) as client:
+            async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.get(url)
                 response.raise_for_status()
                 return response.text
@@ -40,10 +39,9 @@ async def fetch_data(url=None, max_retries=3):
         except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
             if attempt == max_retries - 1:  # Last attempt
                 logger.error(f"Failed to fetch data after {max_retries} attempts: {e}")
-                # Preserve original error message structure for consistency if other parts of app expect it
                 raise RuntimeError(
                     f"Error fetching data after {max_retries} retries: {e}"
-                ) from e
+                )
             else:
                 wait_time = (attempt + 1) * 5  # Exponential backoff
                 logger.warning(
@@ -52,7 +50,6 @@ async def fetch_data(url=None, max_retries=3):
                 await asyncio.sleep(wait_time)
 
         except Exception as e:
-            logger.error(f"An unexpected error occurred while fetching data: {e}")
+            logger.error(f"Error fetching data: {e}")
             logger.error(f"{traceback.format_exc()}")
-            # Propagate with a more generic error or the original one
-            raise RuntimeError(f"Unexpected error fetching data: {e}") from e
+            raise e

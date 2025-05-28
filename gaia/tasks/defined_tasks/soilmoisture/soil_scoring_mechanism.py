@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import tempfile
 from gaia.tasks.base.components.scoring_mechanism import ScoringMechanism
 from gaia.tasks.base.decorators import task_timer
@@ -27,6 +27,8 @@ import psutil
 import gc
 import logging
 import json
+import concurrent.futures
+from pathlib import Path
 
 logger = get_logger(__name__)
 
@@ -47,11 +49,12 @@ if not metrics_logger.handlers:
 class SoilScoringMechanism(ScoringMechanism):
     """Scoring mechanism for soil moisture predictions."""
 
-    alpha: float = Field(default=10, description="Sigmoid steepness parameter")
-    beta: float = Field(default=0.1, description="Sigmoid midpoint parameter")
+    alpha: float = Field(default=3, description="Sigmoid steepness parameter")
+    beta: float = Field(default=0.15, description="Sigmoid midpoint parameter")
     baseline_rmse: float = Field(default=50, description="Baseline RMSE value")
     db_manager: Any = Field(default=None)
     task: Any = Field(default=None, description="Reference to the parent task")
+    executor: concurrent.futures.ThreadPoolExecutor = Field(default_factory=concurrent.futures.ThreadPoolExecutor, exclude=True)
 
     def __init__(self, baseline_rmse: float = 50, alpha: float = 10, beta: float = 0.1, db_manager=None, task=None):
         super().__init__(
@@ -65,10 +68,17 @@ class SoilScoringMechanism(ScoringMechanism):
         self.baseline_rmse = baseline_rmse
         self.db_manager = db_manager
         self.task = task
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
 
     def sigmoid_rmse(self, rmse: float) -> float:
         """Convert RMSE to score using sigmoid function. (higher is better)"""
         return 1 / (1 + torch.exp(self.alpha * (rmse - self.beta)))
+
+    def _create_prediction_tensor_sync(self, pred_data_dict):
+        """Synchronous helper to create prediction tensor."""
+        surface_sm = torch.tensor(pred_data_dict["surface_sm"])
+        rootzone_sm = torch.tensor(pred_data_dict["rootzone_sm"])
+        return torch.stack([surface_sm, rootzone_sm], dim=0).unsqueeze(0)
 
     def compute_final_score(self, metrics: Dict) -> float:
         """Compute final score combining RMSE and SSIM metrics."""
@@ -97,11 +107,12 @@ class SoilScoringMechanism(ScoringMechanism):
                 return False
 
             if isinstance(pred_data, dict):
-                surface_sm = torch.tensor(pred_data["surface_sm"])
-                rootzone_sm = torch.tensor(pred_data["rootzone_sm"])
-                model_predictions = torch.stack(
-                    [surface_sm, rootzone_sm], dim=0
-                ).unsqueeze(0)
+                loop = asyncio.get_event_loop()
+                model_predictions = await loop.run_in_executor(
+                    self.executor, 
+                    self._create_prediction_tensor_sync, 
+                    pred_data
+                )
             else:
                 model_predictions = pred_data
 
@@ -248,220 +259,159 @@ class SoilScoringMechanism(ScoringMechanism):
             bounds: The bounding box of the area
             crs: The coordinate reference system
             model_predictions: The model predictions as a tensor
-            target_date: The target date for the prediction
-            miner_id: The miner ID
-            smap_file_path: Optional path to an already downloaded SMAP file
-            test_mode: Override the test_mode setting (defaults to task.test_mode if None)
+            target_date: The target date for comparison
+            miner_id: ID of the miner
+            smap_file_path: Optional path to an already downloaded SMAP data file (for baseline scoring)
+            test_mode: Optional flag for test mode behavior
+            
+        Returns:
+            dict: Dictionary containing metrics like RMSE and SSIM, or None if error
         """
-        device = model_predictions.device
-        loop = asyncio.get_event_loop()
+        process = psutil.Process() if psutil else None
+        mem_before = process.memory_info().rss / (1024 * 1024) if process else 0
+        loop = asyncio.get_event_loop() # Get event loop early
 
-        left, bottom, right, top = bounds
-        sentinel_bounds = BoundingBox(left=left, bottom=bottom, right=right, top=top)
-        sentinel_crs = CRS.from_epsg(int(crs))
-
-        if test_mode is None:
-            test_mode = getattr(self.task, 'test_mode', False)
-        
-        temp_file = None
-        temp_path = None
-        should_download = True
-        
-        if smap_file_path and os.path.exists(smap_file_path):
-            temp_path = smap_file_path
-            should_download = False
-            logger.info(f"Using provided SMAP file: {smap_file_path}")
-        
         try:
-            if should_download:
-                smap_url = construct_smap_url(target_date, test_mode=test_mode)
-                temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
-                temp_path = temp_file.name
-                temp_file.close()
+            if self.task and self.task.test_mode:
+                target_date = target_date - timedelta(days=7)
+                logger.info(f"TEST MODE: Scoring with SMAP data from 7 days prior: {target_date}")
 
-                if not download_smap_data(smap_url, temp_file.name):
-                    return None
+            logger.info(f"Computing SMAP score metrics for miner {miner_id}, target_date {target_date}")
             
-            self._last_baseline_metrics = None
+            smap_url = construct_smap_url(target_date)
+            temp_smap_filename = None # Ensure it's defined for finally block
 
-            smap_data = get_smap_data_for_sentinel_bounds(
-                temp_path,
-                (
-                    sentinel_bounds.left,
-                    sentinel_bounds.bottom,
-                    sentinel_bounds.right,
-                    sentinel_bounds.top,
-                ),
-                sentinel_crs.to_string(),
+            if smap_file_path and os.path.exists(smap_file_path):
+                logger.info(f"Using provided SMAP file: {smap_file_path}")
+                temp_smap_filename = smap_file_path
+            else:
+                # Use a unique temporary file for download
+                cache_dir = Path("smap_cache")
+                cache_dir.mkdir(exist_ok=True)
+                
+                # Check if the file already exists in cache based on URL
+                cached_file_name = Path(smap_url).name
+                potential_cache_path = cache_dir / cached_file_name
+
+                if await loop.run_in_executor(self.executor, potential_cache_path.exists):
+                    logger.info(f"Found SMAP data in cache: {potential_cache_path}")
+                    temp_smap_filename = str(potential_cache_path)
+                else:
+                    # If not in cache, download it
+                    unique_suffix = f"_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}_{os.getpid()}"
+                    temp_h5_file = tempfile.NamedTemporaryFile(
+                        suffix=f"{unique_suffix}.h5", 
+                        dir=cache_dir, # download directly to cache dir with .part or unique name
+                        delete=False 
+                    )
+                    temp_smap_filename = temp_h5_file.name
+                    temp_h5_file.close() # Close it so download_smap_data can open it
+
+                    logger.info(f"Downloading SMAP data from {smap_url} to {temp_smap_filename}")
+                    download_success = await download_smap_data(smap_url, temp_smap_filename)
+
+                    if not download_success:
+                        logger.error(f"Failed to download SMAP data from {smap_url}")
+                        # Schedule retry for the miner
+                        await self.schedule_retry_for_miner(miner_id, target_date, "SMAP download failed")
+                        return {"status": "retry_scheduled", "message": "SMAP download failed"}
+
+            if not temp_smap_filename or not os.path.exists(temp_smap_filename):
+                 logger.error(f"SMAP data file {temp_smap_filename} not found or not accessible after download/cache check.")
+                 await self.schedule_retry_for_miner(miner_id, target_date, "SMAP file not found post-download")
+                 return {"status": "retry_scheduled", "message": "SMAP file not found post-download"}
+
+            logger.info(f"Using SMAP file: {temp_smap_filename} for bounds: {bounds}, CRS: {crs}")
+            smap_data = await get_smap_data_for_sentinel_bounds(
+                temp_smap_filename, bounds, str(crs)
             )
+
             if not smap_data:
-                return None
-
-            if model_predictions.size(2) == 0 or model_predictions.size(3) == 0:
-                logger.error(f"Empty model predictions detected with shape: {model_predictions.shape}")
-                # WRITE operation - use session for deleting invalid prediction
-                query = """
-                    DELETE FROM soil_moisture_predictions 
-                    WHERE miner_uid = :miner_id 
-                    AND target_time = :target_time
-                """
-                await self.db_manager.execute(
-                    query,
-                    {
-                        "miner_id": miner_id,
-                        "target_time": target_date
-                    }
-                )
-                logger.info(f"Deleted invalid prediction for miner {miner_id} at {target_date}")
-                return None
-
-            if model_predictions.shape[-2:] != (11, 11):
-                logger.error(f"Invalid model prediction shape: {model_predictions.shape}, expected last dimensions to be (11, 11)")
-                return None
-
-            surface_sm = torch.from_numpy(smap_data["surface_sm"]).float()
-            rootzone_sm = torch.from_numpy(smap_data["rootzone_sm"]).float()
-
-            if surface_sm.dim() == 2:
-                surface_sm = surface_sm.unsqueeze(0).unsqueeze(0)
-            if rootzone_sm.dim() == 2:
-                rootzone_sm = rootzone_sm.unsqueeze(0).unsqueeze(0)
-
-            surface_sm = surface_sm.to(device)
-            rootzone_sm = rootzone_sm.to(device)
-
-            logger.info(f"Model predictions shape: {model_predictions.shape}")
-            logger.info(f"SMAP data shapes - surface: {smap_data['surface_sm'].shape}, rootzone: {smap_data['rootzone_sm'].shape}")
-            logger.info(f"Processed shapes - surface: {surface_sm.shape}, rootzone: {rootzone_sm.shape}, model: {model_predictions.shape}")
-
-            if model_predictions.shape[1] != 2:
-                logger.error(f"Model predictions should have 2 channels, got shape: {model_predictions.shape}")
-                return None
-
-            # Run interpolation in thread pool
-            surface_sm_11x11 = await loop.run_in_executor(None, 
-                lambda: F.interpolate(surface_sm, size=(11, 11), mode="bilinear", align_corners=False))
-            rootzone_sm_11x11 = await loop.run_in_executor(None,
-                lambda: F.interpolate(rootzone_sm, size=(11, 11), mode="bilinear", align_corners=False))
-
-            surface_mask_11x11 = ~torch.isnan(surface_sm_11x11[0, 0])
-            rootzone_mask_11x11 = ~torch.isnan(rootzone_sm_11x11[0, 0])
-
-            if not (surface_mask_11x11.any() or rootzone_mask_11x11.any()):
-                logger.warning(f"No valid SMAP data found for bounds {bounds}")
-                cleanup_success = await self.cleanup_invalid_prediction(bounds, target_date, miner_id)
-                if not cleanup_success:
-                    logger.error(f"Failed to cleanup invalid prediction for bounds {bounds}")
-                return None
-
-            results = {"validation_metrics": {}}
-            if surface_mask_11x11.any():
-                valid_surface_pred = model_predictions[0, 0][surface_mask_11x11]
-                valid_surface_truth = surface_sm_11x11[0, 0][surface_mask_11x11]
-                
-                # Run RMSE calculation in thread pool
-                surface_rmse = await loop.run_in_executor(None, 
-                    lambda: torch.sqrt(F.mse_loss(valid_surface_pred, valid_surface_truth)))
-                results["validation_metrics"]["surface_rmse"] = surface_rmse.item()
-
-                surface_pred_masked = torch.zeros_like(model_predictions[0:1, 0:1])
-                surface_truth_masked = torch.zeros_like(surface_sm_11x11)
-                surface_pred_masked[0, 0][surface_mask_11x11] = model_predictions[0, 0][surface_mask_11x11]
-                surface_truth_masked[0, 0][surface_mask_11x11] = surface_sm_11x11[0, 0][surface_mask_11x11]
-
-                valid_min = torch.min(valid_surface_pred.min(), valid_surface_truth.min())
-                valid_max = torch.max(valid_surface_pred.max(), valid_surface_truth.max())
-                data_range = valid_max - valid_min
-
-                if data_range > 0:
-                    # Run SSIM calculation in thread pool
-                    surface_ssim = await loop.run_in_executor(None, lambda: ssim(
-                        surface_pred_masked,
-                        surface_truth_masked,
-                        data_range=data_range,
-                        kernel_size=9,
-                    ))
-                    results["validation_metrics"]["surface_ssim"] = surface_ssim.item()
-
-            if rootzone_mask_11x11.any():
-                valid_rootzone_pred = model_predictions[0, 1][rootzone_mask_11x11]
-                valid_rootzone_truth = rootzone_sm_11x11[0, 0][rootzone_mask_11x11]
-                
-                # Run RMSE calculation in thread pool
-                rootzone_rmse = await loop.run_in_executor(None,
-                    lambda: torch.sqrt(F.mse_loss(valid_rootzone_pred, valid_rootzone_truth)))
-                results["validation_metrics"]["rootzone_rmse"] = rootzone_rmse.item()
-
-                rootzone_pred_masked = torch.zeros_like(model_predictions[0:1, 1:2])
-                rootzone_truth_masked = torch.zeros_like(rootzone_sm_11x11)
-                rootzone_pred_masked[0, 0][rootzone_mask_11x11] = model_predictions[0, 1][rootzone_mask_11x11]
-                rootzone_truth_masked[0, 0][rootzone_mask_11x11] = rootzone_sm_11x11[0, 0][rootzone_mask_11x11]
-
-                valid_min = torch.min(valid_rootzone_pred.min(), valid_rootzone_truth.min())
-                valid_max = torch.max(valid_rootzone_pred.max(), valid_rootzone_truth.max())
-                data_range = valid_max - valid_min
-
-                if data_range > 0:
-                    # Run SSIM calculation in thread pool
-                    rootzone_ssim = await loop.run_in_executor(None, lambda: ssim(
-                        rootzone_pred_masked,
-                        rootzone_truth_masked,
-                        data_range=data_range,
-                        kernel_size=9,
-                    ))
-                    results["validation_metrics"]["rootzone_ssim"] = rootzone_ssim.item()
-
-            try:
-                pred_surface_np = model_predictions[0, 0].cpu().numpy()
-                pred_rootzone_np = model_predictions[0, 1].cpu().numpy() 
-                truth_surface_np = surface_sm_11x11[0, 0].cpu().numpy()
-                truth_rootzone_np = rootzone_sm_11x11[0, 0].cpu().numpy()
-
-                if surface_mask_11x11.any():
-                    surface_metrics = calculate_all_metrics(pred_surface_np, truth_surface_np)
-                    metrics_logger.info(f"METRICS|{miner_id}|{target_date}|surface|{json.dumps(surface_metrics)}")
-
-                if rootzone_mask_11x11.any():
-                    rootzone_metrics = calculate_all_metrics(pred_rootzone_np, truth_rootzone_np)
-                    metrics_logger.info(f"METRICS|{miner_id}|{target_date}|rootzone|{json.dumps(rootzone_metrics)}")
-            except Exception as e:
-                logger.error(f"Error calculating extended metrics: {str(e)}")
-                logger.debug(traceback.format_exc())
-
-            if miner_id == "baseline":
-                self._last_baseline_metrics = results
-
-            return results
-
-        except Exception as e:
-            logger.error(f"Error processing SMAP data: {str(e)}")
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            return None
-        finally:
-            # Clean up temp file
-            if temp_file:
-                try:
-                    temp_file.close()
-                except:
-                    pass
+                logger.error(f"Failed to process SMAP data for bounds {bounds}, CRS {crs}")
+                await self.schedule_retry_for_miner(miner_id, target_date, "SMAP processing failed")
+                return {"status": "retry_scheduled", "message": "SMAP processing failed"}
             
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                    logger.debug(f"Removed temporary file: {temp_path}")
-                except Exception as e:
-                    logger.error(f"Failed to remove temporary file {temp_path}: {e}")
+            # Move model_predictions to CPU before metric calculation if it's on GPU
+            original_model_predictions_device = model_predictions.device
+            model_predictions = model_predictions.cpu()
+
+            # Ensure smap_data is processed correctly
+            if not isinstance(smap_data, dict) or not all(k in smap_data for k in ['surface_sm', 'rootzone_sm']):
+                logger.error(f"SMAP data is not in the expected dictionary format or missing keys. Got: {type(smap_data)}")
+                return None
+
+            # Convert SMAP data to tensors
+            smap_surface = torch.from_numpy(smap_data["surface_sm"]).float()
+            smap_rootzone = torch.from_numpy(smap_data["rootzone_sm"]).float()
+            smap_tensor = torch.stack([smap_surface, smap_rootzone], dim=0).unsqueeze(0)
+
+            # --- Offload metric calculation ---
+            def _calculate_all_metrics_sync(preds, truth):
+                return calculate_all_metrics(preds, truth)
             
-            # Clean up any other .h5 files in /tmp
-            try:
-                for f in glob.glob("/tmp/*.h5"):
+            all_metrics = await loop.run_in_executor(
+                self.executor,
+                _calculate_all_metrics_sync,
+                model_predictions, # CPU tensor
+                smap_tensor        # CPU tensor
+            )
+            # --- End offload --
+
+            if not all_metrics:
+                logger.error(f"Failed to compute metrics for miner {miner_id} at {target_date}")
+                return None
+                
+            # Move model_predictions back to original device if needed (e.g. if other parts of class expect it there)
+            # model_predictions = model_predictions.to(original_model_predictions_device) # Not strictly necessary if only used here
+
+            # Check if data needs to be cleared from cache (only if it was a temporary download, not a direct cache hit)
+            # And if it's not the same as a smap_file_path provided externally
+            if (smap_file_path is None or temp_smap_filename != smap_file_path) and Path(temp_smap_filename).name.startswith("tmp"):
+                # This indicates it was a file created by NamedTemporaryFile and downloaded specifically for this run
+                # and not a persistent cache hit or an external file.
+                if os.path.exists(temp_smap_filename):
                     try:
-                        os.unlink(f)
-                        logger.debug(f"Cleaned up additional temp file: {f}")
-                    except Exception as e:
-                        logger.error(f"Failed to remove temp file {f}: {e}")
-            except Exception as e:
-                logger.error(f"Error during temp file cleanup: {e}")
+                        await loop.run_in_executor(self.executor, os.unlink, temp_smap_filename)
+                        logger.info(f"Successfully deleted temporary SMAP file: {temp_smap_filename}")
+                    except Exception as e_unlink:
+                        logger.error(f"Error deleting temporary SMAP file {temp_smap_filename}: {e_unlink}")
+            elif temp_smap_filename and Path(temp_smap_filename).name.startswith("SMAP_L4_SM_gph_"):
+                 logger.debug(f"Keeping cached SMAP file: {temp_smap_filename}")
+
+
+            extended_log_message = {
+                "miner_id": miner_id,
+                "target_date": target_date.isoformat(),
+                "bounds": bounds,
+                "crs": str(crs),
+                "smap_file_used": temp_smap_filename,
+                "metrics_computed": all_metrics
+            }
+            metrics_logger.info(json.dumps(extended_log_message))
+
+
+            return {
+                "validation_metrics": all_metrics, 
+                "ground_truth": smap_data
+            }
+
+        except FileNotFoundError as e_fnf:
+            logger.error(f"SMAP file not found during metric computation for miner {miner_id}, date {target_date}: {e_fnf}")
+            await self.schedule_retry_for_miner(miner_id, target_date, f"SMAP file not found: {e_fnf.filename}")
+            return {"status": "retry_scheduled", "message": f"SMAP file not found: {e_fnf.filename}"}
+        except Exception as e:
+            logger.error(f"Error computing SMAP score metrics for miner {miner_id}, date {target_date}: {str(e)}")
+            logger.error(traceback.format_exc())
+            # If a generic error occurs, also schedule a retry
+            await self.schedule_retry_for_miner(miner_id, target_date, "General error during SMAP metrics")
+            return {"status": "retry_scheduled", "message": "General error during SMAP metrics"}
+
+        finally:
+            if process:
+                mem_after = process.memory_info().rss / (1024 * 1024)
+                logger.info(f"Memory usage for compute_smap_score_metrics: {(mem_after - mem_before):.2f} MB (Start: {mem_before:.2f}, End: {mem_after:.2f})")
+            
+            gc.collect() # Explicit garbage collection
 
     async def cleanup_invalid_prediction(self, bounds, target_time: datetime, miner_id: str):
         try:

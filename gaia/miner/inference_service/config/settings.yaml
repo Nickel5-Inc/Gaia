@@ -1,0 +1,42 @@
+model:
+  # path_to_model_weights: "/app/models/your_model.pt" # Legacy or for non-Aurora custom models. For Aurora, prefer model_repo and checkpoint.
+
+  # --- Aurora Model Configuration --- 
+  # For Hugging Face Hub model:
+  model_repo: "microsoft/aurora"
+  checkpoint: "aurora-0.25-pretrained.ckpt"
+  
+  # OR For a local model (ensure files are copied into the Docker image, e.g., to /app/local_models/my_aurora_model):
+  # model_repo: "/app/local_models/my_aurora_model" # Path to the directory containing the checkpoint and other model files
+  # checkpoint: "my_custom_weights.ckpt" # Name of the checkpoint file in the model_repo directory
+
+  device: "auto" # "cuda", "cpu", or "auto" to pick best available
+  inference_steps: 40
+  forecast_step_hours: 6
+  resolution: "0.25" # Example, relevant if your model or batch creation needs it.
+
+api:
+  port: 8000
+  host: "0.0.0.0"
+  # INFERENCE_SERVICE_API_KEY: "your_secure_api_key_here" # Set via ENV for production or uncomment for local dev only
+  # Example: INFERENCE_SERVICE_API_KEY: fOcuWmBM8UuhMWllLxrkD+C78zBpjZlbSlElv+98C3A=
+
+logging:
+  level: "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  log_to_file: false
+  log_file_path: "inference_service.log" # Used if log_to_file is true
+
+data:
+  static_download_dir: "/app/static_data" # Path inside the container for static data if aurora needs it 
+
+security:
+  api_key: fOcuWmBM8UuhMWllLxrkD+C78zBpjZlbSlElv+98C3A=
+
+# env: # You can remove this 'env' section if it only contained the API key, or keep it for other env-like configs.
+  # INFERENCE_SERVICE_API_KEY: fOcuWmBM8UuhMWllLxrkD+C78zBpjZlbSlElv+98C3A= # <-- Remove or comment out
+
+# --- Add this section ---
+storage:
+  network_volume_base_path: "/mnt/runpod_volume/forecast_outputs" # Example mount path for outputs
+  # Ensure this '/mnt/runpod_volume' part matches how you configure the mount in RunPod

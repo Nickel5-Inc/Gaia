@@ -7,6 +7,7 @@ import subprocess # For pg_restore, psql
 from fiber.logging_utils import get_logger
 from gaia.validator.sync.azure_blob_utils import AzureBlobManager # Direct import
 import random
+from typing import Optional
 
 logger = get_logger(__name__)
 
@@ -37,6 +38,16 @@ class RestoreManager:
         self._is_restoring_lock = asyncio.Lock() # Prevent concurrent restore attempts
         self._stop_event = asyncio.Event() # For graceful shutdown
 
+    def _read_marker_file_sync(self, file_path: str) -> Optional[str]:
+        """Synchronous helper to read marker file content."""
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, 'r') as f:
+                    return f.read().strip()
+        except Exception as e:
+            logger.error(f"Sync Error reading marker file {file_path}: {e}")
+        return None
+
     async def _get_latest_backup_blob_name_from_manifest(self) -> str | None:
         logger.info(f"Fetching latest backup name from Azure manifest: {self.manifest_filename}")
         blob_name = await self.azure_manager.read_blob_content(self.manifest_filename)
@@ -49,24 +60,37 @@ class RestoreManager:
 
     async def _get_last_restored_backup_name(self) -> str | None:
         try:
-            if os.path.exists(self.last_restored_marker_path):
-                with open(self.last_restored_marker_path, 'r') as f:
-                    last_restored = f.read().strip()
-                    logger.info(f"Last locally restored backup marker: {last_restored}")
-                    return last_restored
-            logger.info("No last restored backup marker file found.")
+            loop = asyncio.get_event_loop()
+            last_restored = await loop.run_in_executor(None, self._read_marker_file_sync, self.last_restored_marker_path)
+            if last_restored:
+                logger.info(f"Last locally restored backup marker: {last_restored}")
+                return last_restored
+            logger.info("No last restored backup marker file found or error reading it.")
             return None
         except Exception as e:
-            logger.error(f"Error reading last restored backup marker: {e}")
+            logger.error(f"Async Error reading last restored backup marker: {e}") # Should be caught by sync helper ideally
             return None
+
+    def _write_marker_file_sync(self, file_path: str, content: str) -> bool:
+        """Synchronous helper to write content to a marker file."""
+        try:
+            with open(file_path, 'w') as f:
+                f.write(content)
+            return True
+        except Exception as e:
+            logger.error(f"Sync Error writing marker file {file_path}: {e}")
+        return False
 
     async def _set_last_restored_backup_name(self, blob_name: str) -> None:
         try:
-            with open(self.last_restored_marker_path, 'w') as f:
-                f.write(blob_name)
-            logger.info(f"Successfully updated last restored backup marker to: {blob_name}")
+            loop = asyncio.get_event_loop()
+            success = await loop.run_in_executor(None, self._write_marker_file_sync, self.last_restored_marker_path, blob_name)
+            if success:
+                logger.info(f"Successfully updated last restored backup marker to: {blob_name}")
+            else:
+                logger.error(f"Failed to write last restored backup marker for: {blob_name}")
         except Exception as e:
-            logger.error(f"Error writing last restored backup marker: {e}")
+            logger.error(f"Async Error writing last restored backup marker for {blob_name}: {e}")
 
     async def _run_psql_command(self, command: str, dbname: str = None) -> bool:
         psql_cmd = ["psql", 
@@ -167,11 +191,23 @@ class RestoreManager:
             logger.error(f"pg_restore stderr: {stderr.decode().strip()}")
             return False
         
+    def _os_remove_sync(self, file_path: str):
+        """Synchronous wrapper for os.remove."""
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            return True
+        return False
+
     async def _prune_local_download(self, local_file_path: str) -> None:
         try:
-            if os.path.exists(local_file_path):
-                os.remove(local_file_path)
+            loop = asyncio.get_event_loop()
+            removed = await loop.run_in_executor(None, self._os_remove_sync, local_file_path)
+            if removed:
                 logger.info(f"Successfully pruned local downloaded backup: {local_file_path}")
+            elif os.path.exists(local_file_path):
+                logger.warning(f"Local downloaded backup file still exists after prune attempt: {local_file_path}")
+            else:
+                logger.info(f"Local downloaded backup file did not exist or was already pruned: {local_file_path}")
         except Exception as e:
             logger.error(f"Error pruning local downloaded backup {local_file_path}: {e}")
 

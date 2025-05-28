@@ -1,0 +1,228 @@
+{
+    "weather_forecast_runs": {
+        "table_name": "weather_forecast_runs",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "run_initiation_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "target_forecast_time_utc": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "gfs_init_time_utc": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "gfs_input_metadata": "JSONB",
+            "status": "VARCHAR(50) NOT NULL DEFAULT 'pending'",
+            "completion_time": "TIMESTAMP WITH TIME ZONE",
+            "final_scoring_attempted_time": "TIMESTAMP WITH TIME ZONE NULL",
+            "error_message": "TEXT"
+        },
+        "indexes": [
+            {"column": "run_initiation_time", "unique": false},
+            {"column": "target_forecast_time_utc", "unique": false},
+            {"column": "gfs_init_time_utc", "unique": false},
+            {"column": "status", "unique": false}
+        ],
+        "foreign_keys": [],
+        "comment": "Tracks each weather forecast run initiated by the validator."
+    },
+    "weather_miner_responses": {
+        "table_name": "weather_miner_responses",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "run_id": "INTEGER NOT NULL",
+            "miner_uid": "INTEGER NOT NULL",
+            "miner_hotkey": "VARCHAR(255) NOT NULL",
+            "response_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "job_id": "VARCHAR(100) NULL",
+            "kerchunk_json_url": "TEXT",
+            "target_netcdf_url_template": "TEXT",
+            "kerchunk_json_retrieved": "JSONB",
+            "verification_hash_computed": "VARCHAR(64)",
+            "verification_hash_claimed": "VARCHAR(64)",
+            "verification_passed": "BOOLEAN",
+            "status": "VARCHAR(50) NOT NULL DEFAULT 'received'",
+            "error_message": "TEXT",
+            "input_hash_miner": "VARCHAR(64)",
+            "input_hash_validator": "VARCHAR(64)",
+            "input_hash_match": "BOOLEAN",
+            "last_polled_time": "TIMESTAMP WITH TIME ZONE"
+        },
+        "indexes": [
+            {"column": "run_id", "unique": false},
+            {"column": "miner_uid", "unique": false},
+            {"column": "miner_hotkey", "unique": false},
+            {"column": "verification_passed", "unique": false},
+            {"column": "status", "unique": false},
+            {"column": "job_id", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "run_id",
+                "references": "weather_forecast_runs(id)",
+                "on_delete": "CASCADE"
+            }
+        ],
+        "unique_constraints": [
+            {
+                "name": "uq_weather_miner_responses_run_miner",
+                "columns": ["run_id", "miner_uid"]
+            }
+        ],
+        "comment": "Records miner responses for a specific forecast run. Tracks status through fetch, hash verification, and inference."
+    },
+    "weather_miner_scores": {
+        "table_name": "weather_miner_scores",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "response_id": "INTEGER NOT NULL",
+            "run_id": "INTEGER NOT NULL",
+            "miner_uid": "INTEGER NOT NULL",
+            "miner_hotkey": "VARCHAR(255) NOT NULL",
+            "score_type": "VARCHAR(50) NOT NULL",
+            "calculation_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "metrics": "JSONB",
+            "score": "FLOAT",
+            "error_message": "TEXT",
+            "lead_hours": "INTEGER",
+            "variable_level": "VARCHAR(50)",
+            "valid_time_utc": "TIMESTAMP WITH TIME ZONE"
+        },
+        "indexes": [
+            {"column": "run_id", "unique": false},
+            {"column": "miner_uid", "unique": false},
+            {"column": "miner_hotkey", "unique": false},
+            {"column": "calculation_time", "unique": false},
+            {"column": "score_type", "unique": false},
+            {"column": "lead_hours", "unique": false},
+            {"column": "variable_level", "unique": false},
+            {"column": "valid_time_utc", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "response_id",
+                "references": "weather_miner_responses(id)",
+                "on_delete": "CASCADE"
+            },
+            {
+                "column": "run_id",
+                "references": "weather_forecast_runs(id)",
+                "on_delete": "CASCADE"
+            }
+        ],
+        "unique_constraints": [
+            {
+                "name": "uq_wms_response_scoretype_lead_var_time",
+                "columns": ["response_id", "score_type", "lead_hours", "variable_level", "valid_time_utc"]
+            }
+        ],
+        "comment": "Stores calculated scores (e.g., gfs_rmse, era5_rmse) for each miner response, detailed by lead time and variable."
+    },
+    "weather_ensemble_forecasts": {
+        "table_name": "weather_ensemble_forecasts",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "forecast_run_id": "INTEGER NOT NULL",
+            "creation_time": "TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            "processing_end_time": "TIMESTAMP WITH TIME ZONE NULL",
+            "ensemble_path": "TEXT",
+            "ensemble_kerchunk_path": "TEXT",
+            "ensemble_verification_hash": "VARCHAR(64)",
+            "status": "VARCHAR(50) NOT NULL DEFAULT 'pending'",
+            "error_message": "TEXT"
+        },
+        "indexes": [
+            {"column": "forecast_run_id"}
+        ],
+        "foreign_keys": [
+            {
+                "column": "forecast_run_id",
+                "references": "weather_forecast_runs(id)",
+                "on_delete": "CASCADE"
+            }
+        ],
+        "comment": "Stores ensemble forecast information created by combining multiple miner forecasts."
+    },
+    "weather_ensemble_components": {
+        "table_name": "weather_ensemble_components",
+        "database_type": "validator",
+        "columns": {
+            "id": "SERIAL PRIMARY KEY",
+            "ensemble_id": "INTEGER NOT NULL",
+            "response_id": "INTEGER NOT NULL",
+            "weight": "FLOAT NOT NULL",
+            "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+        },
+        "indexes": [
+            {"column": "ensemble_id", "unique": false},
+            {"column": "response_id", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "ensemble_id",
+                "references": "weather_ensemble_forecasts(id)",
+                "on_delete": "CASCADE"
+            },
+            {
+                "column": "response_id",
+                "references": "weather_miner_responses(id)",
+                "on_delete": "CASCADE"
+            }
+        ],
+        "comment": "Tracks which miner forecasts are included in an ensemble and their weights."
+    },
+    "weather_historical_weights": {
+        "table_name": "weather_historical_weights",
+        "database_type": "validator",
+        "columns": {
+            "miner_hotkey": "VARCHAR(255) NOT NULL",
+            "run_id": "INTEGER NOT NULL",
+            "score_type": "VARCHAR(50) NOT NULL",
+            "score": "FLOAT",
+            "weight": "FLOAT",
+            "last_updated": "TIMESTAMP WITH TIME ZONE NOT NULL"
+        },
+        "indexes": [
+            {"column": "miner_hotkey", "unique": false},
+            {"column": "run_id", "unique": false},
+            {"column": "score_type", "unique": false}
+        ],
+        "foreign_keys": [
+            {
+                "column": "run_id",
+                "references": "weather_forecast_runs(id)",
+                "on_delete": "CASCADE"
+            }
+        ],
+        "comment": "Stores calculated scores and weights for miners on a per-run basis (e.g., initial GFS score)."
+    },
+    "weather_miner_jobs": {
+        "table_name": "weather_miner_jobs",
+        "database_type": "miner",
+        "columns": {
+            "id": "VARCHAR(100) PRIMARY KEY",
+            "validator_request_time": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "validator_hotkey": "VARCHAR(255)",
+            "miner_hotkey": "VARCHAR(255)",
+            "gfs_init_time_utc": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "gfs_input_metadata": "JSONB",
+            "processing_start_time": "TIMESTAMP WITH TIME ZONE",
+            "processing_end_time": "TIMESTAMP WITH TIME ZONE",
+            "target_netcdf_path": "TEXT",
+            "kerchunk_json_path": "TEXT",
+            "verification_hash": "VARCHAR(64)",
+            "ipfs_cid": "VARCHAR(255)",
+            "status": "VARCHAR(50) NOT NULL DEFAULT 'received'",
+            "error_message": "TEXT",
+            "updated_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
+            "gfs_t_minus_6_time_utc": "TIMESTAMP WITH TIME ZONE NOT NULL",
+            "input_data_hash": "TEXT NULL"
+        },
+        "indexes": [
+            {"column": "validator_request_time", "unique": false},
+            {"column": "gfs_init_time_utc", "unique": false},
+            {"column": "status", "unique": false}
+        ],
+        "foreign_keys": [],
+        "comment": "Tracks weather forecast jobs processed by the miner. Includes status for fetch/hash step."
+    }
+}

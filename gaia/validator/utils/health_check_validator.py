@@ -1,6 +1,6 @@
 import os
 import sys
-import logging
+from fiber.logging_utils import get_logger
 from unittest.mock import patch
 
 #####Temp Health Check to run on local
@@ -22,12 +22,7 @@ with patch.dict(
     )
     import requests
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # Mock Subtensor and Blockchain Interactions

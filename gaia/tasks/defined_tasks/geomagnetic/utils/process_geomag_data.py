@@ -2,6 +2,7 @@ import traceback
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from gaia.tasks.defined_tasks.geomagnetic.utils.pull_geomag_data import fetch_data
+import asyncio
 
 
 # Constants
@@ -54,6 +55,10 @@ def parse_data(data):
     return pd.DataFrame({"timestamp": dates, "Dst": hourly_values})
 
 
+def _parse_data_sync(data):
+    return parse_data(data)
+
+
 def clean_data(df):
     now = datetime.now(timezone.utc)
 
@@ -72,6 +77,11 @@ def clean_data(df):
     # Reset index
     return df.reset_index(drop=True)
 
+
+def _clean_data_sync(df):
+    return clean_data(df)
+
+
 async def get_latest_geomag_data(include_historical=False):
     """
     Fetch, parse, clean, and return the latest valid geomagnetic data point.
@@ -86,10 +96,11 @@ async def get_latest_geomag_data(include_historical=False):
     try:
         # Fetch raw data
         raw_data = await fetch_data()
+        loop = asyncio.get_event_loop()
 
         # Parse and clean raw data into DataFrame
-        parsed_df = parse_data(raw_data)
-        cleaned_df = clean_data(parsed_df)
+        parsed_df = await loop.run_in_executor(None, _parse_data_sync, raw_data)
+        cleaned_df = await loop.run_in_executor(None, _clean_data_sync, parsed_df)
 
         # Extract the latest data point
         if not cleaned_df.empty:
@@ -112,4 +123,4 @@ async def get_latest_geomag_data(include_historical=False):
     except Exception as e:
         logger.error(f"Error fetching geomagnetic data: {e}")
         logger.error(f"{traceback.format_exc()}")
-        return "N/A", "N/A"
+        return "N/A", "N/A", None

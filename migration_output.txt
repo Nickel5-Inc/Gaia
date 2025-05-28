@@ -1,0 +1,14 @@
+[34m[1m2025-05-27 22:03:18.326[0m | [37m[1m[36m[1mDEBUG[0m[0m | [34m[1menv_py[0m:[34m[1mget_logger[0m:[34m[1m56[0m - [37m[1mLogging mode is DEBUG[0m
+[34m[1m2025-05-27 22:03:18.374[0m | [37m[1m[32m[1mINFO[0m[0m | [34m[1menv_py[0m:[34m[1m<module>[0m:[34m[1m29[0m - [37m[1mDB_TARGET is 'miner'. Configuring for miner database and schema.[0m
+[34m[1m2025-05-27 22:03:18.374[0m | [37m[1m[32m[1mINFO[0m[0m | [34m[1menv_py[0m:[34m[1m<module>[0m:[34m[1m63[0m - [37m[1mAlembic will use database URL: postgresql+psycopg2://postgres:postgres@/miner_db?host=/var/run/postgresql (from key: miner_db_socket_url)[0m
+Found tables in public schema: ['alembic_version', 'miner_state', 'miner_task_assignments', 'task_queue']
+Attempting to drop tables...
+  Skipping Alembic version table: public.alembic_version
+  Attempting to drop table: public.miner_state...
+    Successfully dropped table: public.miner_state
+  Attempting to drop table: public.miner_task_assignments...
+    Successfully dropped table: public.miner_task_assignments
+  Attempting to drop table: public.task_queue...
+    Successfully dropped table: public.task_queue
+Creating tables based on current MinerBase.metadata: ['weather_miner_jobs']
+Successfully created tables from MinerBase.metadata.

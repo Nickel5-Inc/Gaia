@@ -14,7 +14,6 @@ import shutil
 from sqlalchemy import text
 from fiber.logging_utils import get_logger
 import random
-import traceback
 
 logger = get_logger(__name__)
 
@@ -103,13 +102,6 @@ class SoilValidatorPreprocessing(Preprocessing):
         try:
             logger.info(f"Storing region with bbox: {region['bbox']}")
 
-            if region.get("combined_data") is None:
-                logger.error(f"Combined data (TIFF path) is None for region {region.get('bbox')}, cannot store region.")
-                # Option 1: Raise an error to stop the current region processing
-                raise ValueError(f"Invalid TIFF path: None for region {region.get('bbox')}")
-                # Option 2: Return an indicator of failure (e.g., None or -1 for region_id)
-                # return -1 
-
             # Read and validate the tiff file
             with open(region["combined_data"], "rb") as f:
                 combined_data_bytes = f.read()
@@ -182,7 +174,6 @@ class SoilValidatorPreprocessing(Preprocessing):
         self, target_time: datetime, ifs_forecast_time: datetime
     ) -> List[Dict]:
         """Get regions for today, selecting new ones if needed."""
-        processed_regions = [] # Renamed from regions to avoid conflict with module name
         try:
             has_existing_regions = await self._check_existing_regions(target_time)
             if has_existing_regions:
@@ -205,86 +196,67 @@ class SoilValidatorPreprocessing(Preprocessing):
             consecutive_500_errors = 0
             MAX_500_ERRORS = 3
             
-            while len(processed_regions) < self.regions_per_timestep:
-                bbox = None # Initialize bbox to None
+            while len(regions) < self.regions_per_timestep:
                 try:
                     bbox = select_random_region(
                         base_cells=self._base_cells,
                         urban_cells_set=self._urban_cells,
-                        lakes_cells_set=self._lakes_cells, # Corrected typo: _lakes_cells_set
+                        lakes_cells_set=self._lakes_cells,
                         timestamp=target_time,
                         used_bounds=used_bounds
                     )
                     if bbox:
-                        # get_soil_data now returns a tuple: (tiff_path, sentinel_bounds, sentinel_crs)
-                        # or (None, None, None) on failure.
-                        tiff_path, sentinel_bounds_val, sentinel_crs_val = await self.get_soil_data(bbox, ifs_forecast_time)
+                        soil_data = await self.get_soil_data(bbox, ifs_forecast_time)
 
-                        if tiff_path is not None and sentinel_bounds_val is not None and sentinel_crs_val is not None:
+                        if soil_data is not None:
+                            tiff_path, bounds, crs = soil_data
                             region_data = {
                                 "datetime": target_time,
                                 "bbox": bbox,
-                                "combined_data": tiff_path, # This is the path string
-                                "sentinel_bounds": sentinel_bounds_val,
-                                "sentinel_crs": sentinel_crs_val,
-                                "array_shape": (222, 222), # Assuming this is fixed or derived elsewhere if not
+                                "combined_data": tiff_path,
+                                "sentinel_bounds": bounds,
+                                "sentinel_crs": crs,
+                                "array_shape": (222, 222),
                             }
-                            try:
-                                region_id = await self.store_region(region_data, target_time)
-                                if region_id != -1 and region_id is not None: # Check if store_region was successful
-                                    region_data["id"] = region_id
-                                    processed_regions.append(region_data)
-                                    used_bounds.add(bbox) # Corrected: bbox is already a tuple
-                                    self._update_daily_count(target_time)
-                                else:
-                                    logger.warning(f"Failed to store region for bbox {bbox}, store_region returned {region_id}.")
-                            except ValueError as ve_store: # Catch specific error from store_region if tiff_path was None
-                                logger.error(f"Error storing region for bbox {bbox}: {ve_store}")
-                                # Decide if to continue or break, for now, continue to try other regions
-                                continue 
+                            region_id = await self.store_region(region_data, target_time)
+                            region_data["id"] = region_id
+                            regions.append(region_data)
+                            self._update_daily_count(target_time)
 
-                            # Clean up downloaded files immediately after successful processing of one region
-                            data_dir = get_data_dir() # Make sure get_data_dir() is accessible or defined
+                            data_dir = get_data_dir()
                             for filename in os.listdir(data_dir):
                                 filepath = os.path.join(data_dir, filename)
                                 if os.path.isdir(filepath) and filename.startswith('tmp'):
                                     try:
                                         shutil.rmtree(filepath)
                                         logger.info(f"Removed temp directory: {filepath}")
-                                    except Exception as e_rm_dir:
-                                        logger.error(f"Failed to remove temp directory {filepath}: {e_rm_dir}")
-                                elif filename.endswith('.tif') or filename.endswith('.grib2') or filename.endswith('.nc') or filename.endswith('.h5'):
+                                    except Exception as e:
+                                        logger.error(f"Failed to remove temp directory {filepath}: {e}")
+                                elif filename.endswith('.tif'):
                                     try:
                                         os.remove(filepath)
-                                        logger.info(f"Removed data file: {filepath}")
-                                    except Exception as e_rm_file:
-                                        logger.error(f"Failed to remove data file {filepath}: {e_rm_file}")
-                        else:
-                            logger.warning(f"Failed to get complete soil data (tiff_path, bounds, or crs is None) for bbox {bbox}. Skipping this region.")
+                                        logger.info(f"Removed tif file: {filepath}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to remove tif file {filepath}: {e}")
 
                 except SentinelServerError:
                     consecutive_500_errors += 1
-                    logger.warning(f"Sentinel server error ({consecutive_500_errors}/{MAX_500_ERRORS}) for bbox {bbox}. Retrying with new region if possible.")
                     if consecutive_500_errors >= MAX_500_ERRORS:
-                        logger.error(f"Hit {MAX_500_ERRORS} consecutive Sentinel 500 errors, stopping region collection for this cycle.")
-                        break # Stop trying to collect regions for this cycle
-                    # Continue to the next attempt to select a region
-                except Exception as e_region_loop:
-                    logger.error(f"Unexpected error processing region for bbox {bbox}: {e_region_loop}")
-                    logger.error(traceback.format_exc())
-                    # Potentially add a counter for general errors too if needed
-                    # Continue to try and get more regions unless a critical number of general errors occur
+                        logger.warning(f"Hit {MAX_500_ERRORS} consecutive 500 errors, stopping region collection")
+                        raise 
+                    continue
 
-            random.seed() # Reset random seed
-            return processed_regions
+            random.seed()
+            return regions
+
+        except SentinelServerError:
+            raise
         except Exception as e:
             logger.error(f"Error in get_daily_regions: {str(e)}")
-            logger.error(traceback.format_exc())
-            random.seed() # Ensure random seed is reset in case of outer exception
-            return [] # Return empty list on failure
+            return []
 
     def _update_daily_count(self, target_time: datetime) -> None:
-        """Update the count of regions selected for this hour."""
+        """Update region count for specific timestep."""
         today = target_time.date()
         hour = target_time.hour
 

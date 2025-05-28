@@ -41,6 +41,7 @@ import glob
 from collections import defaultdict
 import torch
 from gaia.tasks.defined_tasks.soilmoisture.utils.inference_class import SoilMoistureInferencePreprocessor
+from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import get_smap_data
 
 logger = get_logger(__name__)
 
@@ -217,12 +218,15 @@ class SoilMoistureTask(Task):
                                 logger.info(f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB")
                                 logger.info(f"Region {region['id']} TIFF header: {combined_data[:4]}")
                                 logger.info(f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}")
-                                encoded_data = base64.b64encode(combined_data)
-                                logger.info(f"Base64 first 16 chars: {encoded_data[:16]}")
+                                
+                                loop = asyncio.get_event_loop()
+                                encoded_data_bytes = await loop.run_in_executor(None, base64.b64encode, combined_data)
+                                encoded_data_ascii = encoded_data_bytes.decode("ascii")
+                                logger.info(f"Base64 first 16 chars: {encoded_data_ascii[:16]}")
 
                                 task_data = {
                                     "region_id": region["id"],
-                                    "combined_data": encoded_data.decode("ascii"),
+                                    "combined_data": encoded_data_ascii,
                                     "sentinel_bounds": region["sentinel_bounds"],
                                     "sentinel_crs": region["sentinel_crs"],
                                     "target_time": target_smap_time.isoformat(),
@@ -232,13 +236,29 @@ class SoilMoistureTask(Task):
                                     try:
                                         logger.info(f"Running soil moisture baseline model for region {region['id']}")
                                         model_inputs = None
+                                        temp_file_path = None # Initialize temp_file_path
                                         try:
-                                            with tempfile.NamedTemporaryFile(suffix='.tiff', delete=False) as temp_file:
-                                                temp_file.write(combined_data)
-                                                temp_file_path = temp_file.name
-                                            
-                                            preprocessor = SoilMoistureInferencePreprocessor()
-                                            model_inputs = preprocessor.preprocess(temp_file_path)
+                                            # Offload file writing and preprocessing to an executor
+                                            def _write_and_preprocess_sync(data_bytes):
+                                                t_file_path = None
+                                                try:
+                                                    with tempfile.NamedTemporaryFile(suffix='.tiff', delete=False) as temp_f:
+                                                        temp_f.write(data_bytes)
+                                                        t_file_path = temp_f.name
+                                                    
+                                                    s_preprocessor = SoilMoistureInferencePreprocessor()
+                                                    m_inputs = s_preprocessor.preprocess(t_file_path)
+                                                    return m_inputs, t_file_path
+                                                finally:
+                                                    # Ensure temp file is cleaned up if preprocess fails before returning path
+                                                    if t_file_path and (not 'm_inputs' in locals() or m_inputs is None) and os.path.exists(t_file_path):
+                                                        try:
+                                                            os.unlink(t_file_path)
+                                                        except Exception as e_unlink_inner:
+                                                            logger.error(f"Error cleaning temp file in sync helper: {e_unlink_inner}")
+
+                                            loop = asyncio.get_event_loop()
+                                            model_inputs, temp_file_path = await loop.run_in_executor(None, _write_and_preprocess_sync, combined_data)
                                             
                                             if model_inputs:
                                                 for key, value in model_inputs.items():
@@ -394,12 +414,15 @@ class SoilMoistureTask(Task):
                             logger.info(f"Region {region['id']} TIFF size: {len(combined_data) / (1024 * 1024):.2f} MB")
                             logger.info(f"Region {region['id']} TIFF header: {combined_data[:4]}")
                             logger.info(f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}")
-                            encoded_data = base64.b64encode(combined_data)
-                            logger.info(f"Base64 first 16 chars: {encoded_data[:16]}")
+                                
+                            loop = asyncio.get_event_loop()
+                            encoded_data_bytes = await loop.run_in_executor(None, base64.b64encode, combined_data)
+                            encoded_data_ascii = encoded_data_bytes.decode("ascii")
+                            logger.info(f"Base64 first 16 chars: {encoded_data_ascii[:16]}")
 
                             task_data = {
                                 "region_id": region["id"],
-                                "combined_data": encoded_data.decode("ascii"),
+                                "combined_data": encoded_data_ascii,
                                 "sentinel_bounds": region["sentinel_bounds"],
                                 "sentinel_crs": region["sentinel_crs"],
                                 "target_time": target_smap_time.isoformat(),
@@ -833,21 +856,16 @@ class SoilMoistureTask(Task):
                     tasks_by_time[target_time] = []
                 tasks_by_time[target_time].append(task)
 
-            for target_time, tasks in tasks_by_time.items():
-                logger.info(f"Processing {len(tasks)} predictions for timestamp {target_time}")
-                
-                smap_url = construct_smap_url(target_time, test_mode=self.test_mode)
-                temp_file = None
+            for target_time, tasks_in_time_window in tasks_by_time.items():
                 temp_path = None
                 try:
-                    temp_file = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
-                    temp_path = temp_file.name
-                    temp_file.close()
-
-                    if not download_smap_data(smap_url, temp_file.name):
-                        logger.error(f"Failed to download SMAP data for {target_time}")
+                    logger.info(f"Processing tasks for target_time: {target_time}")
+                    smap_data_result = await get_smap_data(target_time, tasks_in_time_window)
+                    
+                    if smap_data_result is None or not isinstance(smap_data_result, dict):
+                        logger.error(f"Failed to download or process SMAP data for {target_time}")
                         # Update retry information for failed tasks
-                        for task in tasks:
+                        for task in tasks_in_time_window:
                             for prediction in task["predictions"]:
                                 update_query = """
                                     UPDATE soil_moisture_predictions
@@ -866,7 +884,7 @@ class SoilMoistureTask(Task):
                                 await self.db_manager.execute(update_query, params)
                         continue
 
-                    for task in tasks:
+                    for task in tasks_in_time_window:
                         try:
                             scores = {}
                             for prediction in task["predictions"]:
@@ -1011,7 +1029,7 @@ class SoilMoistureTask(Task):
                             logger.error(f"Error scoring task {task['id']}: {str(e)}")
                             continue
 
-                    score_rows = await self.build_score_row(target_time, tasks)
+                    score_rows = await self.build_score_row(target_time, tasks_in_time_window)
                     if score_rows:
                         # Insert scores
                         insert_query = """

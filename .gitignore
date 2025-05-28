@@ -21,20 +21,40 @@ data/
 
 gaia.egg-info/*
 
+gaia.egg-info/*
+
 
 # Cache directories
 **/smap_cache/
 smap_cache/
 
+# Specific analysis cache
+gfs_analysis_cache/
+
 db_wipe_trigger
 db_wipe_trigger.executed.*
+gaia/models/checkpoints/*
+
+miner_forecasts_background/*
+ecosystem.config.js
+fiber_debug.log
+
+gaia/models/geomagnetic_model.pkl
 
 metric_plots/*
 logs/*
-gaia.egg-info/*
+gaia.egg-info/* 
 gaia/models/checkpoints/*
 analysis.py 
 miner.log
 parse_soil_metrics.py
 extended_metrics.log
 pm2_validator.log
+generate_miner_manifest.py
+make_zarr_dir.py
+aurora-0.25-static.pickle
+era5_cache/*
+analysis_logs/*
+verification_logs/*
+era5_cache/*
+database_performance_plot.png

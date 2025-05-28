@@ -36,5 +36,14 @@ uvicorn
 xarray
 netcdf4
 h5netcdf
+yarl
+xskillscore
+metpy
+microsoft-aurora
+pyjwt
+cdsapi
 azure-storage-blob
-cfgrib
+pyinstrument
+kerchunk
+alembic
+gcsfs

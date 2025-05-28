@@ -4,16 +4,10 @@ import logging
 from unittest.mock import patch
 from gaia.miner.miner import Miner
 import requests
-
+from fiber.logging_utils import get_logger
 ######Temp Health Check to run on local
 
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+logger = getLogger(__name__)
 
 
 def check_environment_variables(required_vars):

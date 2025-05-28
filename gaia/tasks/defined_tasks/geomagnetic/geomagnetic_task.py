@@ -295,13 +295,22 @@ class GeomagneticTask(Task):
         # Construct Payload for Miners
         nonce = str(uuid4())
 
+        def _prepare_historical_records_sync(hist_data):
+            """Synchronous helper to prepare historical records from DataFrame."""
+            records = []
+            if hist_data is not None:
+                for _, rec_row in hist_data.iterrows(): # Changed variable name to avoid conflict
+                    records.append(
+                        {"timestamp": rec_row["timestamp"].isoformat(), "Dst": rec_row["Dst"]}
+                    )
+            return records
+
         # Convert historical data to serializable format
-        historical_records = []
         if historical_data is not None:
-            for _, row in historical_data.iterrows():
-                historical_records.append(
-                    {"timestamp": row["timestamp"].isoformat(), "Dst": row["Dst"]}
-                )
+            loop = asyncio.get_event_loop()
+            historical_records = await loop.run_in_executor(None, _prepare_historical_records_sync, historical_data)
+        else:
+            historical_records = []
 
         payload_template = {
             "nonce": nonce,
@@ -843,6 +852,10 @@ class GeomagneticTask(Task):
                     return None
         return None
 
+    def _extract_prediction_sync(self, response): # Synchronous wrapper
+        """Synchronous version of extract_prediction for executor."""
+        return self.extract_prediction(response)
+
     async def process_miner_responses(
         self,
         responses: Dict[str, Any],
@@ -859,7 +872,9 @@ class GeomagneticTask(Task):
                 try:
                     logger.info(f"Raw response from miner {hotkey}: {response}")
                     
-                    predicted_value = self.extract_prediction(response)
+                    loop = asyncio.get_event_loop() # Get event loop
+                    predicted_value = await loop.run_in_executor(None, self._extract_prediction_sync, response)
+
                     if predicted_value is None:
                         logger.error(f"No valid prediction found in response from {hotkey}")
                         continue

@@ -1,0 +1,29 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+PyYAML
+httpx
+
+# Core Weather/ML Dependencies
+xarray
+pandas
+numpy
+torch
+# torchvision # Uncomment if your model uses it
+# torchaudio # Uncomment if your model uses it
+numcodecs
+zarr
+netcdf4
+h5netcdf
+
+# Aurora Weather SDK (confirm package name if different)
+microsoft_aurora
+
+# Other utilities (if needed, scikit-learn is an example)
+# scikit-learn
+
+# Add your project-specific dependencies here, for example:
+
+
+# Potentially aurora-weather (or the correct package name for the Aurora SDK)
+# If Aurora requires specific system libraries, they need to be in the Dockerfile 
