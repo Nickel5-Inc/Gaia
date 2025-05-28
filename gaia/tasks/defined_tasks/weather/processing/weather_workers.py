@@ -190,80 +190,22 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                      selected_predictions_cpu = predictions_list 
                  elif inference_type == "http_service":
                     logger.info(f"[InferenceTask Job {job_id}] Using HTTP inference service (type: {inference_type})...")
-                    service_url = os.getenv("WEATHER_INFERENCE_SERVICE_URL")
-                    api_key = os.getenv("MINER_API_KEY_FOR_INFRA_SERVICE")
-
-                    if not service_url:
-                        logger.error(f"[InferenceTask Job {job_id}] WEATHER_INFERENCE_SERVICE_URL not set. Aborting HTTP inference.")
-                        await update_job_status(task_instance, job_id, "error", "HTTP service URL not configured")
+                    if not task_instance.inference_service_url:
+                        logger.error(f"[InferenceTask Job {job_id}] WEATHER_INFERENCE_SERVICE_URL (via task_instance.inference_service_url) not set. Aborting HTTP inference.")
+                        await update_job_status(task_instance, job_id, "error", "HTTP service URL not configured in WeatherTask")
                         return
 
-                    try:
-                        gzipped_payload = await asyncio.to_thread(_prepare_http_payload_sync, prepared_batch)
-                        
-                        gzipped_payload = await asyncio.to_thread(_prepare_http_payload_sync, prepared_batch)
-                        
-                        headers = {
-                            "Content-Type": "application/json",
-                            "Content-Encoding": "gzip",
-                            "Accept": "application/x-ndjson" 
-                        }
-                        if api_key:
-                            headers["X-API-Key"] = api_key
-                        else:
-                            logger.warning(f"[{job_id}] MINER_API_KEY_FOR_INFRA_SERVICE not set. Sending request without API key.")
+                    logger.info(f"[InferenceTask Job {job_id}] Calling task_instance._run_inference_via_http_service...")
+                    selected_predictions_cpu = await task_instance._run_inference_via_http_service(
+                        job_id=job_id,
+                        initial_batch=prepared_batch
+                    )
 
-                        
-                        async with httpx.AsyncClient(timeout=None) as client: 
-                            logger.info(f"[{job_id}] Sending request to HTTP inference service: {service_url}")
-                            response_steps_data = []
-                            async with client.stream("POST", service_url, content=gzipped_payload, headers=headers) as response:
-                                if response.status_code == 200:
-                                    logger.info(f"[{job_id}] Successfully connected to service. Streaming responses...")
-                                    async for line in response.aiter_lines():
-                                        if line.strip():
-                                            try:
-                                                # Deserialization can still be a bit heavy if chunks are large
-                                                # but breaking it down further is very complex with aiter_lines.
-                                                # Focus on server sending reasonably sized chunks.
-                                                step_data = json.loads(line) 
-                                                # Deserialization can still be a bit heavy if chunks are large
-                                                # but breaking it down further is very complex with aiter_lines.
-                                                # Focus on server sending reasonably sized chunks.
-                                                step_data = json.loads(line) 
-                                                if step_data.get("error"):
-                                                    logger.error(f"[{job_id}] Error from service for step {step_data.get('step_index', 'unknown')}: {step_data.get('detail', step_data['error'])}")
-                                                    continue 
-                                                    continue 
-                                                
-                                                serialized_prediction = step_data.get("serialized_prediction")
-                                                if serialized_prediction:
-                                                    decoded_prediction = base64.b64decode(serialized_prediction)
-                                                    unpickled_batch_step = pickle.loads(decoded_prediction)
-                                                    response_steps_data.append(unpickled_batch_step)
-                                                    logger.debug(f"[{job_id}] Deserialized prediction step {step_data.get('step_index')}")
-                                                else:
-                                                    logger.warning(f"[{job_id}] Received step data without 'serialized_prediction' for step {step_data.get('step_index')}")
-                                            except json.JSONDecodeError as e_json:
-                                                logger.error(f"[{job_id}] Failed to decode JSON line from stream: '{line}'. Error: {e_json}")
-                                            except (pickle.UnpicklingError, base64.binascii.Error, TypeError) as e_deserialize:
-                                                logger.error(f"[{job_id}] Failed to deserialize prediction step from stream: {e_deserialize}")
-                                    logger.info(f"[{job_id}] Finished streaming. Received {len(response_steps_data)} steps from service.")
-                                    selected_predictions_cpu = response_steps_data
-                                else:
-                                    error_content = await response.aread()
-                                    logger.error(f"[{job_id}] HTTP inference service request failed with status {response.status_code}: {error_content.decode()}")
-                                    await update_job_status(task_instance, job_id, "error", f"HTTP service error {response.status_code}: {error_content.decode()[:200]}")
-                                    return
-                    except ImportError:
-                        logger.error(f"[InferenceTask Job {job_id}] httpx or gzip library not found. Please install it. Aborting HTTP inference.")
-                        await update_job_status(task_instance, job_id, "error", "Missing httpx/gzip for HTTP service")
+                    if selected_predictions_cpu is not None:
+                        logger.info(f"[InferenceTask Job {job_id}] HTTP inference completed successfully. Forecast data received.")
+                    else:
+                        logger.error(f"[InferenceTask Job {job_id}] HTTP inference failed. selected_predictions_cpu is None.")
                         return
-                    except Exception as http_err:
-                        logger.error(f"[InferenceTask Job {job_id}] Error during HTTP service inference: {http_err}", exc_info=True)
-                        await update_job_status(task_instance, job_id, "error", f"HTTP service communication error: {http_err}")
-                        return
-                 
                  elif inference_type == "local":
                      logger.info(f"[InferenceTask Job {job_id}] Using local runner for inference (type: {inference_type})...")
                      if task_instance.inference_runner.model is None:
@@ -341,60 +283,91 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
             MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
 
             def _blocking_save_and_process():
-                if not selected_predictions_cpu:
-                    raise ValueError("Inference returned no prediction steps.")
+                if not selected_predictions_cpu: # This applies whether it's a list or a direct dataset
+                    raise ValueError("Inference returned no prediction data (selected_predictions_cpu is None or empty).")
 
-                forecast_datasets = []
-                lead_times_hours = []
-                base_time = pd.to_datetime(gfs_init_time_utc)
+                combined_forecast_ds = None
+                base_time = pd.to_datetime(gfs_init_time_utc) # Needed in both branches
 
-                for i, batch_step in enumerate(selected_predictions_cpu):
-                    forecast_step_h = task_instance.config.get('forecast_step_hours', 6)
-                    lead_time_hours = (i + 1) * forecast_step_h 
-                    forecast_time = base_time + timedelta(hours=lead_time_hours)
+                if isinstance(selected_predictions_cpu, xr.Dataset):
+                    logger.info(f"[InferenceTask Job {job_id}] Processing pre-combined forecast (xr.Dataset) from HTTP service.")
+                    combined_forecast_ds = selected_predictions_cpu
 
-                    if not isinstance(batch_step, Batch):
-                         logger.warning(f"[InferenceTask Job {job_id}] Step {i} prediction is not an aurora.Batch, skipping.")
-                         continue
+                    if 'time' not in combined_forecast_ds.coords or not pd.api.types.is_datetime64_any_dtype(combined_forecast_ds['time'].dtype):
+                        logger.error(f"[InferenceTask Job {job_id}] Dataset from HTTP service is missing a valid 'time' coordinate. Cannot proceed with saving.")
+                        raise ValueError("Dataset from HTTP service is missing a valid 'time' coordinate.")
 
-                    logger.debug(f"Converting prediction Batch step {i+1} (T+{lead_time_hours}h) to xarray Dataset...")
-                    data_vars = {}
-                    for var_name, tensor_data in batch_step.surf_vars.items():
+                    # Ensure 'lead_time' coordinate exists, try to derive if missing
+                    if 'lead_time' not in combined_forecast_ds.coords:
+                        logger.warning(f"[InferenceTask Job {job_id}] 'lead_time' coordinate not found in dataset from HTTP service. Attempting to derive.")
                         try:
-                            np_data = tensor_data.squeeze().cpu().numpy()
-                            data_vars[var_name] = xr.DataArray(np_data, dims=["lat", "lon"], name=var_name)
-                        except Exception as e_surf:
-                             logger.error(f"Error processing surface var {var_name} for step {i+1}: {e_surf}")
-                    
-                    for var_name, tensor_data in batch_step.atmos_vars.items():
-                         try:
-                             np_data = tensor_data.squeeze().cpu().numpy()
-                             data_vars[var_name] = xr.DataArray(np_data, dims=["pressure_level", "lat", "lon"], name=var_name)
-                         except Exception as e_atmos:
-                              logger.error(f"Error processing atmos var {var_name} for step {i+1}: {e_atmos}")
+                            # Calculate lead hours from the time coordinate relative to gfs_init_time_utc
+                            derived_lead_times_hours = ((pd.to_datetime(combined_forecast_ds['time'].values) - base_time) / pd.Timedelta(hours=1)).astype(int)
+                            combined_forecast_ds = combined_forecast_ds.assign_coords(lead_time=('time', derived_lead_times_hours))
+                            logger.info(f"[InferenceTask Job {job_id}] Derived and assigned 'lead_time' coordinate based on 'time' and gfs_init_time_utc.")
+                        except Exception as e_derive_lead:
+                            logger.error(f"[InferenceTask Job {job_id}] Failed to derive 'lead_time' coordinate: {e_derive_lead}. Hashing might be affected if it relies on 'lead_time'.")
+                            # Depending on strictness, could raise error here. For now, log and continue.
+                else: # Assume it's a list of Batch objects (local/Azure inference)
+                    logger.info(f"[InferenceTask Job {job_id}] Processing list of Batch objects from local/Azure inference.")
+                    if not isinstance(selected_predictions_cpu, list) or not selected_predictions_cpu:
+                         raise ValueError("Inference returned no prediction steps or unexpected format for batch list.")
 
-                    lat_coords = batch_step.metadata.lat.cpu().numpy()
-                    lon_coords = batch_step.metadata.lon.cpu().numpy()
-                    level_coords = np.array(batch_step.metadata.atmos_levels) 
-                    
-                    ds_step = xr.Dataset(
-                        data_vars,
-                        coords={
-                            "time": ([forecast_time]),
-                            "pressure_level": (("pressure_level"), level_coords),
-                            "lat": (("lat"), lat_coords),
-                            "lon": (("lon"), lon_coords),
-                        }
-                    )
+                    forecast_datasets = []
+                    lead_times_hours_list = [] # Renamed to avoid conflict if used outside this block
 
-                    forecast_datasets.append(ds_step)
-                    lead_times_hours.append(lead_time_hours)
+                    for i, batch_step in enumerate(selected_predictions_cpu):
+                        forecast_step_h = task_instance.config.get('forecast_step_hours', 6)
+                        current_lead_time_hours = (i + 1) * forecast_step_h
+                        forecast_time = base_time + timedelta(hours=current_lead_time_hours)
 
-                if not forecast_datasets:
-                    raise ValueError("No forecast datasets created after processing prediction steps.")
+                        if not isinstance(batch_step, Batch):
+                            logger.warning(f"[InferenceTask Job {job_id}] Step {i} prediction is not an aurora.Batch (type: {type(batch_step)}), skipping.")
+                            continue
 
-                combined_forecast_ds = xr.concat(forecast_datasets, dim='time')
-                combined_forecast_ds = combined_forecast_ds.assign_coords(lead_time=('time', lead_times_hours))
+                        logger.debug(f"Converting prediction Batch step {i+1} (T+{current_lead_time_hours}h) to xarray Dataset...")
+                        data_vars = {}
+                        for var_name, tensor_data in batch_step.surf_vars.items():
+                            try:
+                                np_data = tensor_data.squeeze().cpu().numpy()
+                                data_vars[var_name] = xr.DataArray(np_data, dims=["lat", "lon"], name=var_name)
+                            except Exception as e_surf:
+                                logger.error(f"Error processing surface var {var_name} for step {i+1}: {e_surf}")
+                        
+                        for var_name, tensor_data in batch_step.atmos_vars.items():
+                            try:
+                                np_data = tensor_data.squeeze().cpu().numpy()
+                                data_vars[var_name] = xr.DataArray(np_data, dims=["pressure_level", "lat", "lon"], name=var_name)
+                            except Exception as e_atmos:
+                                logger.error(f"Error processing atmos var {var_name} for step {i+1}: {e_atmos}")
+
+                        lat_coords = batch_step.metadata.lat.cpu().numpy()
+                        lon_coords = batch_step.metadata.lon.cpu().numpy()
+                        level_coords = np.array(batch_step.metadata.atmos_levels)
+                        
+                        ds_step = xr.Dataset(
+                            data_vars,
+                            coords={
+                                "time": ([forecast_time]), # Ensure this is a list/array for concat
+                                "pressure_level": (("pressure_level"), level_coords),
+                                "lat": (("lat"), lat_coords),
+                                "lon": (("lon"), lon_coords),
+                            }
+                        )
+                        forecast_datasets.append(ds_step)
+                        lead_times_hours_list.append(current_lead_time_hours)
+
+                    if not forecast_datasets:
+                        raise ValueError("No forecast datasets created after processing batch prediction steps.")
+
+                    combined_forecast_ds = xr.concat(forecast_datasets, dim='time')
+                    # Assign the lead_time coordinate using the populated list
+                    combined_forecast_ds = combined_forecast_ds.assign_coords(lead_time=('time', lead_times_hours_list))
+
+                # Ensure combined_forecast_ds is not None before proceeding
+                if combined_forecast_ds is None:
+                    raise ValueError("combined_forecast_ds was not properly assigned.")
+
                 logger.info(f"[InferenceTask Job {job_id}] Combined forecast dimensions: {combined_forecast_ds.dims}")
 
                 gfs_time_str = gfs_init_time_utc.strftime('%Y%m%d%H')

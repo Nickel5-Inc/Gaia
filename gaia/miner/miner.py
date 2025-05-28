@@ -1,6 +1,11 @@
 import os
 import sys  # Add sys import
 import traceback # Add traceback import
+import subprocess # For managing inference server subprocess
+import atexit # To ensure inference server is stopped
+import time # For health check delays
+import httpx # For health checking inference server
+from urllib.parse import urlparse # To parse service URL
 from dotenv import load_dotenv
 import argparse
 from fiber import SubstrateInterface
@@ -37,6 +42,42 @@ logger = get_logger(__name__)
 
 os.environ["NODE_TYPE"] = "miner"
 
+# --- Globals for Inference Service Management ---
+inference_server_process: Optional[subprocess.Popen] = None
+INFERENCE_SERVICE_READY_TIMEOUT = 60  # seconds to wait for inference service
+INFERENCE_SERVICE_HEALTH_CHECK_INTERVAL = 3  # seconds between health checks
+
+# --- Helper Functions for Inference Service Management ---
+def _is_local_url(service_url: str) -> bool:
+    if not service_url:
+        return False
+    try:
+        parsed_url = urlparse(service_url)
+        hostname = parsed_url.hostname
+        return hostname in ["localhost", "127.0.0.1"]
+    except Exception as e:
+        logger.error(f"Error parsing WEATHER_INFERENCE_SERVICE_URL '{service_url}': {e}")
+        return False
+
+def _get_port_from_url(service_url: str, default_port: int = 8000) -> int:
+    try:
+        parsed_url = urlparse(service_url)
+        port = parsed_url.port
+        if port:
+            return port
+        # If URL is like http://localhost/run_inference (no port), use default for local
+        if parsed_url.hostname in ["localhost", "127.0.0.1"] and not port:
+            logger.warning(f"No port in local URL '{service_url}', defaulting to {default_port}.")
+            return default_port
+        elif not port: # Remote URL with no port, this is unusual for http
+            logger.error(f"No port found in remote URL '{service_url}' and no default specified for remote. Returning default {default_port} but this may be incorrect.")
+            return default_port # Or raise error
+        return default_port # Should be caught by if port: above
+
+    except Exception as e:
+        logger.error(f"Error extracting port from URL '{service_url}': {e}. Defaulting to {default_port}.")
+        return default_port
+
 
 class Miner:
     """
@@ -50,6 +91,8 @@ class Miner:
         self.my_public_port: Optional[int] = None
         self.my_public_protocol: Optional[str] = None
         self.my_public_base_url: Optional[str] = None
+        self.weather_inference_service_url: Optional[str] = None # Added for inference service URL
+        self.weather_task = None # Will be initialized in lifespan
 
         # Load environment variables
         load_dotenv(".env")
@@ -111,13 +154,13 @@ class Miner:
         weather_enabled = os.getenv("WEATHER_MINER_ENABLED", "false").lower() in ["true", "1", "yes"]
         if weather_enabled:
             logger.info("Weather task ENABLED for this miner (WEATHER_MINER_ENABLED=True)")
-            self.weather_task = WeatherTask(
-                db_manager=self.database_manager,
-                node_type="miner"
-            )
+            # self.weather_task = WeatherTask(
+            #     db_manager=self.database_manager,
+            #     node_type="miner"
+            # )
         else:
             logger.info("Weather task DISABLED for this miner. Set WEATHER_MINER_ENABLED=True to enable.")
-            self.weather_task = None
+            # self.weather_task = None
     
 
     def setup_neuron(self) -> bool:
@@ -245,20 +288,128 @@ class Miner:
 
             self.logger.info("Starting miner server...")
             
+            # --- Inference Service Management Functions (modified for Docker context) ---
+            async def check_local_inference_service_readiness(service_url: str) -> bool:
+                health_url = service_url.replace("/run_inference", "/health") # Construct health URL
+                logger.info(f"Checking readiness of local inference service at {health_url}...")
+                start_time = time.monotonic()
+                while time.monotonic() - start_time < INFERENCE_SERVICE_READY_TIMEOUT:
+                    try:
+                        # Synchronous HTTP GET for simplicity in this startup phase
+                        response = httpx.get(health_url, timeout=5) 
+                        if response.status_code == 200:
+                            health_data = response.json()
+                            model_status = health_data.get("model_status", "unknown")
+                            logger.info(f"Local inference service is healthy. Status: {response.status_code}, Model Status: {model_status}")
+                            if "ready" in model_status or "loaded" in model_status: # Check for positive model status
+                                return True
+                            else:
+                                logger.warning(f"Inference service at {health_url} is up, but model status is '{model_status}'. Retrying...")
+                        else:
+                            logger.warning(f"Local inference service at {health_url} not ready (Status: {response.status_code}). Retrying...")
+                    except httpx.RequestError as e:
+                        logger.warning(f"Error connecting to local inference service at {health_url}: {e}. Retrying...")
+                    
+                    await asyncio.sleep(INFERENCE_SERVICE_HEALTH_CHECK_INTERVAL) # Use asyncio.sleep in async context
+                
+                logger.error(f"Local inference service at {health_url} did not become ready within {INFERENCE_SERVICE_READY_TIMEOUT} seconds.")
+                return False
+
             app = fiber_server.factory_app(debug=True)
             app.body_limit = MAX_REQUEST_SIZE
 
             @app.on_event("startup")
             async def overridden_startup_event():
+                nonlocal self # Ensure self is captured if methods like self.database_manager are used
                 self.logger.info("Initializing database on application startup (via overridden on_event)...")
                 try:
                     await self.database_manager.ensure_engine_initialized()
                     await self.database_manager.initialize_database()
                     self.logger.info("Database initialization completed successfully")
-                except Exception as e:
-                    self.logger.error(f"Failed to initialize database during startup: {e}", exc_info=True)
+                except Exception as e_db:
+                    self.logger.error(f"Failed to initialize database during startup: {e_db}", exc_info=True)
+                    # Depending on severity, you might want to sys.exit(1) here
+                
+                # Weather Inference Service Setup
+                weather_inference_type = os.getenv("WEATHER_INFERENCE_TYPE", "local_model").lower()
+                service_url_env = os.getenv("WEATHER_INFERENCE_SERVICE_URL")
+                weather_enabled_env = os.getenv("WEATHER_MINER_ENABLED", "false").lower() in ["true", "1", "yes"]
+                self.weather_runpod_api_key = None # Initialize
 
+                if weather_enabled_env:
+                    if weather_inference_type == "http_service":
+                        if not service_url_env:
+                            self.logger.error("WEATHER_INFERENCE_TYPE is 'http_service' but WEATHER_INFERENCE_SERVICE_URL is not set. Weather task cannot use inference service.")
+                        else:
+                            self.weather_inference_service_url = service_url_env
+                            self.logger.info(f"HTTP inference service configured. URL: {self.weather_inference_service_url}")
+
+                            # Check for RunPod API Key specifically if using http_service
+                            runpod_api_key_from_env = os.getenv("CREDENTIAL")
+                            if runpod_api_key_from_env:
+                                self.weather_runpod_api_key = runpod_api_key_from_env
+                                self.logger.info(f"RunPod API Key loaded from CREDENTIAL env var. Will be used for Authorization header.")
+                            else:
+                                self.logger.info("CREDENTIAL env var not found. If this HTTP service is non-RunPod, it might use MINER_API_KEY_FOR_INFRA_SERVICE (checked in WeatherTask).")
+
+                            # If it's a local URL, perform readiness check (won't apply to RunPod usually)
+                            if _is_local_url(service_url_env):
+                                self.logger.info(f"Local inference service URL configured: {service_url_env}. Checking readiness...")
+                                service_ready = await check_local_inference_service_readiness(service_url_env)
+                                if service_ready:
+                                    self.logger.info(f"Local inference service is ready.")
+                                else:
+                                    self.logger.error(f"Local inference service at {service_url_env} failed to become ready. Weather task may not function correctly if this URL was intended for local service.")
+                            else:
+                                self.logger.info(f"Remote HTTP inference service URL: {self.weather_inference_service_url}. No local readiness check performed.")
+
+                    elif weather_inference_type == "local_model": # Keep other types as they were
+                        self.logger.info(f"Weather inference type is '{weather_inference_type}'. WeatherTask will use its internal model logic.")
+                    # Add other existing inference types here if any (e.g., azure_foundry)
+                    else: 
+                        self.logger.warning(f"Unhandled WEATHER_INFERENCE_TYPE: '{weather_inference_type}'. Defaulting to local model behavior if applicable, or no remote service.")
+
+                # Initialize WeatherTask if enabled, after inference URL is determined
+                if weather_enabled_env:
+                    self.logger.info("Initializing WeatherTask...")
+                    weather_task_args = {
+                        "db_manager": self.database_manager,
+                        "node_type": "miner",
+                        "inference_service_url": self.weather_inference_service_url 
+                        # No need to pass weather_inference_type to WeatherTask if it simplifies
+                    }
+                    if self.weather_runpod_api_key: # Only pass if found
+                        weather_task_args["runpod_api_key"] = self.weather_runpod_api_key
+
+                    self.weather_task = WeatherTask(**weather_task_args)
+                    
+                    # Update weather_task.config with relevant chain/neuron info if it was initialized
+                    if self.weather_task and self.config: # self.config is from setup_neuron
+                        if hasattr(self.weather_task, 'config') and self.weather_task.config is not None:
+                            self.weather_task.config['netuid'] = self.config.netuid
+                            self.weather_task.config['chain_endpoint'] = self.config.chain_endpoint
+                            # miner_public_base_url is set during MINER_SELF_CHECK in setup_neuron if weather_task exists
+                            # If it was None then, it might be updated here, or re-ensure it gets there.
+                            if 'miner_public_base_url' not in self.weather_task.config:
+                                self.weather_task.config['miner_public_base_url'] = self.my_public_base_url # from setup_neuron
+                        else:
+                            self.weather_task.config = {
+                                'netuid': self.config.netuid,
+                                'chain_endpoint': self.config.chain_endpoint,
+                                'miner_public_base_url': self.my_public_base_url # from setup_neuron
+                            }
+                        self.weather_task.keypair = self.keypair # from setup_neuron
+                        self.logger.info("WeatherTask initialized and configured with neuron details.")
+                else:
+                    self.logger.info("Weather task is disabled. WEATHER_MINER_ENABLED is not true.")
+
+                yield
+                self.logger.info("Application shutting down...")
             
+            
+
+            app.body_limit = MAX_REQUEST_SIZE
+
             app.include_router(factory_router(self))
 
             if os.getenv("ENV", "dev").lower() == "dev":

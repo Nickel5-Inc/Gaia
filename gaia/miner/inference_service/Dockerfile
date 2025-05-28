@@ -3,12 +3,13 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # Install system dependencies that might be needed by some Python packages
-# For example, if xarray or its dependencies need them. Adjust as necessary.
-# RUN apt-get update && apt-get install -y --no-install-recommends \
-#     gcc \
-#     g++ \
-#     make \
-#     && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    make \
+    libnetcdf-dev \
+    libhdf5-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt requirements.txt
@@ -26,8 +27,12 @@ COPY ./config /app/config
 #    and `checkpoint` to your checkpoint file name.
 # COPY ./local_models/my_aurora_model /app/local_models/my_aurora_model
 
+ENV HF_HOME=/root/.cache/huggingface
+# Ensure the directory exists and is writable (though as root, it likely will be)
+RUN mkdir -p /root/.cache/huggingface && chmod 777 /root/.cache/huggingface
+
 # Expose the port the app runs on
 EXPOSE 8000
 
 # Command to run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"] 
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000","--root-path","/run"] 

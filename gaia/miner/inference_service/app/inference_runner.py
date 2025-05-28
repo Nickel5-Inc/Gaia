@@ -37,6 +37,9 @@ class InferenceModel:
         self.model_config = config.get('model', {}) # Get the 'model' sub-config
         self.model: Optional[AuroraModelType] = None
         self.device: Optional[torch.device] = None
+        _model_repo = self.model_config.get('model_repo', "microsoft/aurora")
+        _checkpoint = self.model_config.get('checkpoint', "aurora-0.25-pretrained.ckpt")
+        self.model_name: str = f"{_model_repo}/{_checkpoint}"
         self._load_model_and_device()
 
     def _load_model_and_device(self):
@@ -160,16 +163,52 @@ async def initialize_inference_runner(app_config: Dict[str, Any]):
     Initializes the global INFERENCE_RUNNER instance.
     This should be called during application startup (e.g., FastAPI lifespan event).
     """
-    global INFERENCE_RUNNER
+    global INFERENCE_RUNNER # MOVED TO THE TOP
+
+    # ---- Print module and global ID from inference_runner.py's perspective ----
+    import sys
+    current_module = sys.modules[__name__]
+    print(f"[IR_PY_DEBUG_ID] id(current_module i.e. app.inference_runner): {id(current_module)}", flush=True)
+    print(f"[IR_PY_DEBUG_ID] id(INFERENCE_RUNNER global var in ir_module before assignment): {id(INFERENCE_RUNNER)}", flush=True)
+    print(f"[IR_PY_DEBUG_ID] Value of INFERENCE_RUNNER in ir_module before assignment: {INFERENCE_RUNNER}", flush=True)
+
+    print("[INFERENCE_RUNNER_PY_DEBUG] initialize_inference_runner function CALLED.", flush=True)
     if INFERENCE_RUNNER is None:
-        logger.info("Initializing global inference runner...")
-        INFERENCE_RUNNER = InferenceModel(config=app_config)
-        if INFERENCE_RUNNER.model is None:
-            logger.error("Inference runner initialized, but model FAILED to load. Inference will not be available.")
-        else:
-            logger.info("Global inference runner initialized and model loaded successfully.")
+        logger.info("[INIT_RUNNER_DEBUG] Current INFERENCE_RUNNER is None. Attempting to create InferenceModel...")
+        print("[INIT_RUNNER_DEBUG_PRINT] Current INFERENCE_RUNNER is None. Attempting to create InferenceModel...", flush=True)
+        try:
+            # Temporary variable for clarity during debugging
+            temp_runner_instance = InferenceModel(config=app_config)
+            logger.info(f"[INIT_RUNNER_DEBUG] InferenceModel() call completed. Instance: {temp_runner_instance}")
+            print(f"[INIT_RUNNER_DEBUG_PRINT] InferenceModel() call completed. Instance: {temp_runner_instance}", flush=True)
+            
+            INFERENCE_RUNNER = temp_runner_instance # Assign to global in this module
+            logger.info(f"[INIT_RUNNER_DEBUG] Global INFERENCE_RUNNER assigned. Checking model state...")
+            print(f"[INIT_RUNNER_DEBUG_PRINT] Global INFERENCE_RUNNER assigned. Checking model state...", flush=True)
+            # ---- Print ID of INFERENCE_RUNNER global from ir_module AFTER assignment ----
+            print(f"[IR_PY_DEBUG_ID] id(INFERENCE_RUNNER global var in ir_module AFTER assignment): {id(INFERENCE_RUNNER)}", flush=True)
+            print(f"[IR_PY_DEBUG_ID] Value of INFERENCE_RUNNER in ir_module AFTER assignment: {INFERENCE_RUNNER}", flush=True)
+
+            if INFERENCE_RUNNER.model is None:
+                logger.error("[INIT_RUNNER_DEBUG] Inference runner initialized (global var is set), but INFERENCE_RUNNER.model FAILED to load. Inference will not be available.")
+                print("[INIT_RUNNER_DEBUG_PRINT] Inference runner initialized (global var is set), but INFERENCE_RUNNER.model FAILED to load. Inference will not be available.", flush=True)
+            else:
+                logger.info("[INIT_RUNNER_DEBUG] Global inference runner initialized successfully and model is loaded.")
+                print("[INIT_RUNNER_DEBUG_PRINT] Global inference runner initialized successfully and model is loaded.", flush=True)
+                logger.info(f"[INIT_RUNNER_DEBUG] Model: {INFERENCE_RUNNER.model_name}, Device: {INFERENCE_RUNNER.device}")
+                print(f"[INIT_RUNNER_DEBUG_PRINT] Model: {INFERENCE_RUNNER.model_name}, Device: {INFERENCE_RUNNER.device}", flush=True)
+        
+        except ImportError as e_import:
+            logger.error(f"[INIT_RUNNER_DEBUG] ImportError during InferenceModel instantiation or its setup: {e_import}", exc_info=True)
+            print(f"[INIT_RUNNER_DEBUG_PRINT] ImportError during InferenceModel instantiation or its setup: {e_import}", flush=True)
+            INFERENCE_RUNNER = None # Ensure it's None if init fails
+        except Exception as e:
+            logger.error(f"[INIT_RUNNER_DEBUG] Exception during InferenceModel instantiation: {e}", exc_info=True)
+            print(f"[INIT_RUNNER_DEBUG_PRINT] Exception during InferenceModel instantiation: {e}", flush=True)
+            INFERENCE_RUNNER = None # Ensure it's None if init fails
     else:
-        logger.info("Global inference runner already initialized.")
+        logger.info(f"[INIT_RUNNER_DEBUG] Inference runner already initialized. Model: {INFERENCE_RUNNER.model_name}, Device: {INFERENCE_RUNNER.device}")
+        print(f"[INIT_RUNNER_DEBUG_PRINT] Inference runner already initialized. Model: {INFERENCE_RUNNER.model_name}, Device: {INFERENCE_RUNNER.device}", flush=True)
 
 async def get_inference_runner() -> Optional[InferenceModel]:
     """
