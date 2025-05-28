@@ -270,6 +270,25 @@ class GaiaValidator:
 
         self.validator_uid = None
 
+        # --- Stepped Task Weight ---
+        self.task_weight_schedule = [
+            (datetime(2025, 5, 28, 0, 0, 0, tzinfo=timezone.utc), 
+             {"weather": 0.50, "geomagnetic": 0.25, "soil": 0.25}),
+            
+            # Transition Point 1: June 1st, 2025, 00:00:00 UTC
+            (datetime(2025, 6, 1, 0, 0, 0, tzinfo=timezone.utc), 
+             {"weather": 0.65, "geomagnetic": 0.175, "soil": 0.175}), 
+            
+            # Target Weights: June 5th, 2025, 00:00:00 UTC
+            (datetime(2025, 6, 5, 0, 0, 0, tzinfo=timezone.utc), 
+             {"weather": 0.80, "geomagnetic": 0.10, "soil": 0.10})
+        ]
+
+        for dt_thresh, weights_dict in self.task_weight_schedule:
+            if not math.isclose(sum(weights_dict.values()), 1.0):
+                logger.error(f"Task weights for threshold {dt_thresh.isoformat()} do not sum to 1.0! Sum: {sum(weights_dict.values())}. Fix configuration.")
+
+
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
         signame = signal.Signals(signum).name
@@ -2372,6 +2391,26 @@ class GaiaValidator:
                 logger.error(f"Error occurred when calling plot generation in executor: {e}")
                 logger.error(traceback.format_exc())
             # No finally gc.collect() here, it's in the sync method
+
+    def get_current_task_weights(self) -> Dict[str, float]:
+        now_utc = datetime.now(timezone.utc)
+        
+        # Default to the first set of weights in the schedule if current time is before any scheduled change
+        # or if the schedule is somehow empty (though it's hardcoded not to be).
+        active_weights = self.task_weight_schedule[0][1] 
+        
+        # Iterate through the schedule to find the latest applicable weights
+        # The schedule is assumed to be sorted by datetime.
+        for dt_threshold, weights_at_threshold in self.task_weight_schedule:
+            if now_utc >= dt_threshold:
+                active_weights = weights_at_threshold
+            else:
+                # Since the list is sorted, once we pass a threshold that's in the future,
+                # the previously set active_weights are correct for the current time.
+                break 
+                
+        # logger.debug(f"Using task weights for current time {now_utc.isoformat()}: {active_weights}")
+        return active_weights.copy() # Return a copy to prevent modification of the schedule
 
 
 if __name__ == "__main__":

@@ -37,9 +37,7 @@ import gzip
 import tarfile
 import io
 import tempfile
-
-# Import the new utils
-from . import weather_http_utils # Corrected import path
+from . import weather_http_utils
 
 from .utils.era5_api import fetch_era5_data
 from .utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
@@ -185,7 +183,7 @@ class WeatherTask(Task):
     db_manager: Union[ValidatorDatabaseManager, MinerDatabaseManager]
     node_type: str = Field(default="validator")
     test_mode: bool = Field(default=False)
-    era5_climatology_ds: Optional[xr.Dataset] = Field(default=None, exclude=True) # Exclude from Pydantic model
+    era5_climatology_ds: Optional[xr.Dataset] = Field(default=None, exclude=True)
  
     model_config = ConfigDict(
         extra = 'allow',
@@ -648,7 +646,7 @@ class WeatherTask(Task):
             await self.start_background_workers(num_initial_scoring_workers=1, num_final_scoring_workers=1, num_cleanup_workers=1)
             logger.info("Started background workers for scoring and cleanup.")
 
-        run_hour_utc = self.config.get('run_hour_utc', 12) # Default to 12 if not in config for some reason
+        run_hour_utc = self.config.get('run_hour_utc', 18)
         run_minute_utc = self.config.get('run_minute_utc', 0)
         logger.info(f"Validator execute loop configured to run around {run_hour_utc:02d}:{run_minute_utc:02d} UTC.")
 

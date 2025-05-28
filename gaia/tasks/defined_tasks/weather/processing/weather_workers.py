@@ -16,10 +16,10 @@ import numcodecs
 from typing import Dict, Optional
 import base64
 import pickle
-import httpx # Ensure httpx is available
-import gzip # Ensure gzip is available
-import httpx # Ensure httpx is available
-import gzip # Ensure gzip is available
+import httpx
+import gzip
+import httpx
+import gzip
 
 from fiber.logging_utils import get_logger
 from aurora import Batch
@@ -41,11 +41,11 @@ from ..utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data, GFS_SURFACE
 from ..utils.era5_api import fetch_era5_data
 from ..utils.hashing import compute_verification_hash, compute_input_data_hash, CANONICAL_VARS_FOR_HASHING
 from ..weather_scoring.metrics import calculate_rmse
-from ..weather_scoring_mechanism import evaluate_miner_forecast_day1 # Assuming this is async def
-from ..weather_scoring_mechanism import evaluate_miner_forecast_day1 # Assuming this is async def
+from ..weather_scoring_mechanism import evaluate_miner_forecast_day1
+from ..weather_scoring_mechanism import evaluate_miner_forecast_day1
 
-from sqlalchemy import update # Added SQLAlchemy update
-from gaia.database.validator_schema import weather_forecast_runs_table # Added table import
+from sqlalchemy import update
+from gaia.database.validator_schema import weather_forecast_runs_table
 
 logger = get_logger(__name__)
 
@@ -53,7 +53,6 @@ VALIDATOR_ENSEMBLE_DIR = Path("./validator_ensembles/")
 MINER_FORECAST_DIR_BG = Path("./miner_forecasts_background/")
 
 
-# Helper for HTTP inference serialization
 def _prepare_http_payload_sync(prepared_batch_for_http: Batch) -> bytes:
     logger.debug(f"SYNC: Serializing Aurora Batch for HTTP service...")
     pickled_batch = pickle.dumps(prepared_batch_for_http)
@@ -63,7 +62,6 @@ def _prepare_http_payload_sync(prepared_batch_for_http: Batch) -> bytes:
     return gzipped_payload
 
 
-# Helper for HTTP inference serialization
 def _prepare_http_payload_sync(prepared_batch_for_http: Batch) -> bytes:
     logger.debug(f"SYNC: Serializing Aurora Batch for HTTP service...")
     pickled_batch = pickle.dumps(prepared_batch_for_http)
@@ -133,7 +131,6 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                 await update_job_status(task_instance, job_id, "error", "Failed to load GFS data for inference")
                 return
             
-            # This part (concat, sortby) can be CPU intensive if datasets are large
             def _prepare_gfs_concat_sync(ds_t0_sync, ds_t_minus_6_sync):
                 return xr.concat([ds_t_minus_6_sync, ds_t0_sync], dim='time').sortby('time')
 
@@ -141,7 +138,6 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
 
             logger.info(f"[InferenceTask Job {job_id}] Preparing Aurora Batch from fetched datasets...")
             
-            # This part (concat, sortby) can be CPU intensive if datasets are large
             def _prepare_gfs_concat_sync(ds_t0_sync, ds_t_minus_6_sync):
                 return xr.concat([ds_t_minus_6_sync, ds_t0_sync], dim='time').sortby('time')
 
@@ -150,7 +146,7 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
             logger.info(f"[InferenceTask Job {job_id}] Preparing Aurora Batch from fetched datasets...")
             prepared_batch = await asyncio.to_thread(
                 create_aurora_batch_from_gfs, 
-                gfs_data=gfs_concat_data_for_batch_prep # Use the threaded result
+                gfs_data=gfs_concat_data_for_batch_prep
             )
 
             if prepared_batch is None:
@@ -296,11 +292,11 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
             MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
 
             def _blocking_save_and_process():
-                if not selected_predictions_cpu: # This applies whether it's a list or a direct dataset
+                if not selected_predictions_cpu:
                     raise ValueError("Inference returned no prediction data (selected_predictions_cpu is None or empty).")
 
                 combined_forecast_ds = None
-                base_time = pd.to_datetime(gfs_init_time_utc) # Needed in both branches
+                base_time = pd.to_datetime(gfs_init_time_utc)
 
                 if isinstance(selected_predictions_cpu, xr.Dataset):
                     logger.info(f"[InferenceTask Job {job_id}] Processing pre-combined forecast (xr.Dataset) from HTTP service.")
@@ -310,24 +306,21 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                         logger.error(f"[InferenceTask Job {job_id}] Dataset from HTTP service is missing a valid 'time' coordinate. Cannot proceed with saving.")
                         raise ValueError("Dataset from HTTP service is missing a valid 'time' coordinate.")
 
-                    # Ensure 'lead_time' coordinate exists, try to derive if missing
                     if 'lead_time' not in combined_forecast_ds.coords:
                         logger.warning(f"[InferenceTask Job {job_id}] 'lead_time' coordinate not found in dataset from HTTP service. Attempting to derive.")
                         try:
-                            # Calculate lead hours from the time coordinate relative to gfs_init_time_utc
                             derived_lead_times_hours = ((pd.to_datetime(combined_forecast_ds['time'].values) - base_time) / pd.Timedelta(hours=1)).astype(int)
                             combined_forecast_ds = combined_forecast_ds.assign_coords(lead_time=('time', derived_lead_times_hours))
                             logger.info(f"[InferenceTask Job {job_id}] Derived and assigned 'lead_time' coordinate based on 'time' and gfs_init_time_utc.")
                         except Exception as e_derive_lead:
                             logger.error(f"[InferenceTask Job {job_id}] Failed to derive 'lead_time' coordinate: {e_derive_lead}. Hashing might be affected if it relies on 'lead_time'.")
-                            # Depending on strictness, could raise error here. For now, log and continue.
-                else: # Assume it's a list of Batch objects (local/Azure inference)
+                else:
                     logger.info(f"[InferenceTask Job {job_id}] Processing list of Batch objects from local/Azure inference.")
                     if not isinstance(selected_predictions_cpu, list) or not selected_predictions_cpu:
                          raise ValueError("Inference returned no prediction steps or unexpected format for batch list.")
 
                     forecast_datasets = []
-                    lead_times_hours_list = [] # Renamed to avoid conflict if used outside this block
+                    lead_times_hours_list = []
 
                     for i, batch_step in enumerate(selected_predictions_cpu):
                         forecast_step_h = task_instance.config.get('forecast_step_hours', 6)
@@ -374,10 +367,8 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                         raise ValueError("No forecast datasets created after processing batch prediction steps.")
 
                     combined_forecast_ds = xr.concat(forecast_datasets, dim='time')
-                    # Assign the lead_time coordinate using the populated list
                     combined_forecast_ds = combined_forecast_ds.assign_coords(lead_time=('time', lead_times_hours_list))
 
-                # Ensure combined_forecast_ds is not None before proceeding
                 if combined_forecast_ds is None:
                     raise ValueError("combined_forecast_ds was not properly assigned.")
 
@@ -425,11 +416,11 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                     output_zarr_path,
                     encoding=encoding,
                     consolidated=True,
-                    compute=True # Ensure compute is True for actual saving
+                    compute=True
                 )
                 
                 try:
-                    zarr.consolidate_metadata(str(output_zarr_path)) # Explicit consolidation
+                    zarr.consolidate_metadata(str(output_zarr_path))
                     logger.info(f"[InferenceTask Job {job_id}] Explicitly consolidated Zarr metadata")
                 except Exception as e_consolidate:
                     logger.warning(f"[InferenceTask Job {job_id}] Failed to explicitly consolidate Zarr metadata: {e_consolidate}")
@@ -461,7 +452,7 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                         metadata=output_metadata,
                         variables=variables_to_hash,
                         timesteps=timesteps_to_hash
-                    ) # This is CPU bound!
+                    )
                     if verification_hash:
                          logger.info(f"[InferenceTask Job {job_id}] Computed output verification hash: {verification_hash[:10]}...")
                     else:
@@ -475,7 +466,7 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                 task_instance=task_instance,
                 job_id=job_id,
                 netcdf_path=zarr_path,
-                kerchunk_path=zarr_path, # Assuming kerchunk is same as zarr path for now
+                kerchunk_path=zarr_path,
                 verification_hash=v_hash
             )
             await update_job_status(task_instance, job_id, "completed")
@@ -515,7 +506,7 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
     logger.info(f"[InitialScoringWorker-{worker_id}] Starting up at {datetime.now(timezone.utc).isoformat()}")
     if task_instance.db_manager is None:
         logger.error(f"[InitialScoringWorker-{worker_id}] DB manager not available. Aborting.")
-        task_instance.initial_scoring_worker_running = False # Ensure flag is reset
+        task_instance.initial_scoring_worker_running = False
         return
 
     try:
@@ -795,7 +786,7 @@ async def finalize_scores_worker(self):
     CHECK_INTERVAL_SECONDS = 30 if self.test_mode else int(self.config.get('final_scoring_check_interval_seconds', 3600))
     ERA5_DELAY_DAYS = int(self.config.get('era5_delay_days', 5))
     FORECAST_DURATION_HOURS = int(self.config.get('forecast_duration_hours', 240))
-    ERA5_BUFFER_HOURS = int(self.config.get('era5_buffer_hours', 6)) # New config, defaults to 6 hours
+    ERA5_BUFFER_HOURS = int(self.config.get('era5_buffer_hours', 6))
 
     era5_climatology_ds_for_cycle = await self._get_or_load_era5_climatology()
     if era5_climatology_ds_for_cycle is None:
@@ -959,7 +950,6 @@ async def finalize_scores_worker(self):
                         try: era5_ds_for_run.close()
                         except Exception: pass
 
-                # Only collect garbage after processing work
                 if work_done:
                     gc.collect()
 
