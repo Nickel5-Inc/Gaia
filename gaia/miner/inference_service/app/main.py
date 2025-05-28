@@ -5,7 +5,7 @@ import logging
 import os
 import pickle
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, Optional, List
+from typing import Any, AsyncGenerator, Dict, Optional, List, Tuple
 
 import uvicorn
 import yaml
@@ -16,10 +16,42 @@ from pydantic import BaseModel
 import pandas as pd
 from pathlib import Path
 import uuid
+import tarfile
+import runpod
+import subprocess
+import shutil
+import tempfile
+import gzip
+import io
+import time
+from datetime import timezone, timedelta
+import sys # Ensure sys is imported if you use it for stdout/stderr explicitly later
+
+# --- Logging Configuration ---
+# Default to INFO, allow override via LOG_LEVEL environment variable (e.g., DEBUG, WARNING, ERROR)
+_log_level_str = os.getenv("LOG_LEVEL", "DEBUG").upper()
+_log_level = getattr(logging, _log_level_str, logging.DEBUG) # Also ensure default for getattr is DEBUG
+
+# Configure root logger
+# This basicConfig call should be one of the first things in your script.
+# It ensures that all log messages of the configured level and above
+# are directed to standard output (or standard error, depending on the level)
+# which Docker will then pick up.
+logging.basicConfig(
+    level=_log_level,
+    format="%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
+    stream=sys.stdout  # Explicitly set stream to stdout
+)
+
+# Example: If the runpod library itself has a logger and you want to control its verbosity
+# logging.getLogger("runpod").setLevel(_log_level) # Or a different level like logging.WARNING
+
+_logger = logging.getLogger(__name__) # Logger for this specific module
+_logger.info(f"Logging configured with level: {_log_level_str}")
+# --- End Logging Configuration ---
 
 # --- Actual imports from local modules ---
-from .data_preprocessor import prepare_input_batch_from_payload, serialize_prediction_step
-from .data_preprocessor import serialize_batch_step_to_base64_gzipped_netcdf, save_dataset_step_to_gzipped_netcdf
+from .data_preprocessor import prepare_input_batch_from_payload
 from . import inference_runner as ir_module # Import the module itself
 from .inference_runner import (
     initialize_inference_runner,
@@ -28,6 +60,9 @@ from .inference_runner import (
     _AURORA_AVAILABLE # Import the module-level variable
 )
 # Note: If Aurora SDK is unavailable, BatchType will be 'Any' as defined in inference_runner.py
+
+import xarray as xr # Add import for xarray
+import numpy as np # Add import for numpy
 
 # --- Configuration Loading ---
 CONFIG_PATH = os.getenv("INFERENCE_CONFIG_PATH", "config/settings.yaml")
@@ -138,6 +173,84 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Weather Inference Service", lifespan=lifespan)
 
+# --- Helper function for subprocess ---
+async def _run_subprocess_command(command_args: List[str], timeout_seconds: int = 300) -> Tuple[bool, str, str]:
+    """
+    Runs a subprocess command, captures its output, and handles timeouts.
+
+    Args:
+        command_args: A list of strings representing the command and its arguments.
+        timeout_seconds: How long to wait for the command to complete.
+
+    Returns:
+        A tuple: (success: bool, stdout: str, stderr: str)
+    """
+    try:
+        logging.debug(f"Running subprocess command: {' '.join(command_args)}")
+        process = await asyncio.to_thread(
+            subprocess.run,
+            command_args,
+            capture_output=True,
+            text=True,
+            check=False, # Don't raise exception on non-zero exit; we'll check returncode
+            timeout=timeout_seconds
+        )
+        if process.returncode == 0:
+            logging.debug(f"Subprocess command successful. STDOUT: {process.stdout[:200]}...") # Log snippet
+            return True, process.stdout.strip(), process.stderr.strip()
+        else:
+            logging.error(f"Subprocess command failed with return code {process.returncode}. COMMAND: {' '.join(command_args)}")
+            logging.error(f"STDERR: {process.stderr}")
+            logging.error(f"STDOUT: {process.stdout}")
+            return False, process.stdout.strip(), process.stderr.strip()
+    except subprocess.TimeoutExpired:
+        logging.error(f"Subprocess command timed out after {timeout_seconds} seconds. COMMAND: {' '.join(command_args)}")
+        return False, "", "TimeoutExpired"
+    except Exception as e:
+        logging.error(f"Exception during subprocess command {' '.join(command_args)}: {e}", exc_info=True)
+        return False, "", str(e)
+
+# --- RunPodctl Helper Functions ---
+async def _execute_runpodctl_receive(code: str, output_path: Path, timeout_seconds: int = 600) -> bool:
+    """Receives a file using runpodctl."""
+    # Ensure parent directory for output_path exists
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = ["runpodctl", "receive", code, "-o", str(output_path)]
+    logging.info(f"Attempting to receive file with runpodctl, code: {code}, output: {output_path}")
+    success, stdout, stderr = await _run_subprocess_command(command, timeout_seconds=timeout_seconds)
+    if success:
+        logging.info(f"runpodctl receive successful for code {code} to {output_path}. Stdout: {stdout}")
+        return True
+    else:
+        logging.error(f"runpodctl receive failed for code {code}. Stdout: {stdout}, Stderr: {stderr}")
+        return False
+
+async def _execute_runpodctl_send(file_path: Path, timeout_seconds: int = 600) -> Optional[str]:
+    """Sends a file using runpodctl and returns the one-time code."""
+    if not file_path.is_file():
+        logging.error(f"[RunpodctlSend] File not found for sending: {file_path}")
+        return None
+    command = ["runpodctl", "send", str(file_path)]
+    logging.info(f"Attempting to send file with runpodctl: {file_path}")
+    success, stdout, stderr = await _run_subprocess_command(command, timeout_seconds=timeout_seconds)
+    if success:
+        # Expected output: 
+        # Sending 'your_file.tar.gz' (1.2 MiB)
+        # Code is: 1234-some-random-words
+        # On the other computer run
+        # runpodctl receive 1234-some-random-words
+        lines = stdout.splitlines()
+        for line in lines:
+            if "Code is:" in line:
+                code = line.split("Code is:", 1)[1].strip()
+                logging.info(f"runpodctl send successful for {file_path}. Code: {code}. Full stdout: {stdout}")
+                return code
+        logging.error(f"runpodctl send for {file_path} appeared successful but code line not found in stdout: {stdout}")
+        return None
+    else:
+        logging.error(f"runpodctl send failed for {file_path}. Stdout: {stdout}, Stderr: {stderr}")
+        return None
+
 # --- Pydantic Models for API ---
 class InferencePayload(BaseModel):
     # serialized_aurora_batch: str = Field(..., description="Base64 encoded pickled aurora.Batch object.")
@@ -207,237 +320,324 @@ async def stream_gzipped_netcdf_steps(
             })
             yield error_payload + "\n"
 
-@app.post("/run_inference")
-async def handle_run_inference(
-    request: Request,
-    auth_result: bool = Security(verify_api_key)
-):
-    if not auth_result:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication failed")
+async def _perform_inference_and_process_with_runpodctl(
+    local_input_file_path: Path, 
+    job_run_uuid: str, # For logging and structuring output paths
+    app_config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Performs inference using the input file, streams serialized+gzipped forecast steps 
+    directly into a single .tar.gz archive on a network volume, sends the archive via runpodctl,
+    and returns a manifest with the runpodctl code and base_time.
+    """
+    logging.info(f"[{job_run_uuid}] Starting inference and archiving process with input: {local_input_file_path}")
 
-    logging.info("Received /run_inference request for saving to Network Volume.")
-    
-    network_volume_base_path_str = APP_CONFIG.get('storage', {}).get('network_volume_base_path')
-    if not network_volume_base_path_str:
-        logging.error("Network volume base path not configured in settings.yaml (storage.network_volume_base_path)")
-        raise HTTPException(status_code=500, detail="Server configuration error: Network volume path missing.")
-    
-    network_volume_base_path = Path(network_volume_base_path_str)
-    job_run_uuid = str(uuid.uuid4())
-    job_output_dir_on_volume = network_volume_base_path / job_run_uuid
-
+    # --- 1. Deserialize Input Batch ---
+    initial_batch: Optional[Batch] = None
+    base_time_dt_for_coords: Optional[pd.Timestamp] = None # For forecast time calculation
     try:
-        job_output_dir_on_volume.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created output directory for job {job_run_uuid} at {job_output_dir_on_volume}")
-    except OSError as e_mkdir:
-        logging.error(f"Failed to create job output directory {job_output_dir_on_volume}: {e_mkdir}")
-        raise HTTPException(status_code=500, detail=f"Server error: Could not create output directory: {e_mkdir}")
+        with open(local_input_file_path, "rb") as f:
+            initial_batch = pickle.load(f)
+        if not initial_batch:
+            raise ValueError("Deserialized initial_batch is None.")
+        if not (_AURORA_AVAILABLE and isinstance(initial_batch, Batch)) and not (not _AURORA_AVAILABLE and initial_batch is not None) : # type: ignore
+             raise ValueError(f"Deserialized object is not an Aurora Batch or placeholder. Type: {type(initial_batch)}")
 
-    try:
-        raw_body = await request.body()
-        if not raw_body:
-            logging.error("Request body is empty.")
-            raise HTTPException(status_code=400, detail="Request body is empty.")
-        payload_str = raw_body.decode('utf-8')
-    except Exception as e:
-        logging.error(f"Error reading or decoding request body: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
-
-    prepared_batch = await prepare_input_batch_from_payload(payload_str, APP_CONFIG)
-    if prepared_batch is None:
-        logging.error("Failed to prepare input batch from payload.")
-        raise HTTPException(status_code=400, detail="Failed to process input batch.")
-
-    input_base_time = None
-    if hasattr(prepared_batch, 'metadata') and \
-       hasattr(prepared_batch.metadata, 'time') and \
-       prepared_batch.metadata.time is not None and \
-       len(prepared_batch.metadata.time) > 0:
-        try:
-            input_base_time = pd.to_datetime(prepared_batch.metadata.time[-1])
-            logging.info(f"Determined input_base_time from batch metadata: {input_base_time}")
-        except Exception as e_time_parse:
-            logging.error(f"Could not parse time from prepared_batch.metadata.time[-1]. Error: {e_time_parse}")
-    
-    if input_base_time is None:
-        logging.error("Could not determine a valid base_time from input_batch.metadata.time.")
-        # For critical failure, you might raise HTTPException here. Or proceed and try to serialize steps without it if possible.
-        # However, `serialize_batch_step_to_base64_gzipped_netcdf` and thus the conversion logic needs base_time.
-        raise HTTPException(status_code=500, detail="Failed to determine base time from input for forecast step processing.")
-
-    predictions = await run_model_inference(prepared_batch, APP_CONFIG)
-    if not predictions:
-        logging.warning("Model inference returned no predictions.")
-        # Return a manifest indicating no files if that's acceptable, or an error
-        return JSONResponse(
-            status_code=200, # Or 500 if no predictions is an error
-            content={
-                "status": "completed_no_predictions",
-                "runpod_job_id_internal": job_run_uuid,
-                "output_path_on_volume": job_run_uuid,
-                "files": [],
-                "total_steps": 0,
-                "base_time": str(input_base_time)
-            }
-        )
-
-    saved_files = []
-    forecast_step_h = APP_CONFIG.get('model', {}).get('forecast_step_hours', 6)
-
-    for i, prediction_step_batch_obj in enumerate(predictions):
-        # Convert Batch object to xr.Dataset - adapting logic from serialize_batch_step_to_base64_gzipped_netcdf
-        # This part needs careful adaptation. `serialize_batch_step_to_base64_gzipped_netcdf` does this conversion internally.
-        # Let's assume we need to replicate that conversion here if `prediction_step_batch_obj` is an aurora.Batch.
+        if not (hasattr(initial_batch, 'metadata') and initial_batch.metadata and 
+                hasattr(initial_batch.metadata, 'time') and len(initial_batch.metadata.time) > 0):
+            raise ValueError("Initial batch missing essential metadata.time for base_time determination.")
         
-        dataset_for_step: Optional[xr.Dataset] = None
-        if _AURORA_AVAILABLE and isinstance(prediction_step_batch_obj, Batch): # type: ignore
-            # Temporary conversion logic (simplified from serialize_batch_step_to_base64_gzipped_netcdf)
-            # This needs to match how an xr.Dataset is formed for one step for your model.
-            # You might need a dedicated function: convert_aurora_batch_step_to_dataset(batch_step, base_time, step_index, config)
-            try:
-                current_lead_time = pd.Timedelta(hours=(i + 1) * forecast_step_h)
-                forecast_time_for_step = input_base_time + current_lead_time
-                # This assumes prediction_step_batch_obj.data is already an xr.Dataset or similar
-                # If it's raw tensors, more complex conversion is needed based on variable names, levels, etc.
-                if hasattr(prediction_step_batch_obj, 'data') and isinstance(prediction_step_batch_obj.data, xr.Dataset):
-                    dataset_for_step = prediction_step_batch_obj.data.assign_coords(
-                        time=([forecast_time_for_step]),
-                        lead_time=([current_lead_time])
-                    ).expand_dims('time')
-                    # Ensure lat/lon are correctly set if not already
-                    if 'latitude' not in dataset_for_step.coords and 'lat' in dataset_for_step.dims:
-                        dataset_for_step = dataset_for_step.rename({'lat': 'latitude'})
-                    if 'longitude' not in dataset_for_step.coords and 'lon' in dataset_for_step.dims:
-                        dataset_for_step = dataset_for_step.rename({'lon': 'longitude'})
-                else:
-                     logging.error(f"Prediction step {i} data is not an xr.Dataset or not structured as expected.")
-                     # Handle error - skip step or fail job?
-                     continue # Skip this step for now
-
-            except Exception as e_conv:
-                logging.error(f"Error converting prediction step {i} (aurora.Batch) to xr.Dataset: {e_conv}", exc_info=True)
-                continue # Skip this step
-        elif isinstance(prediction_step_batch_obj, xr.Dataset):
-            # If run_model_inference already returns xr.Dataset steps, use them directly
-            # Ensure they have the correct time/lead_time coordinates for consistency
-            dataset_for_step = prediction_step_batch_obj
-            # Add time/lead_time if missing (this is a basic assumption, adjust if needed)
-            if 'time' not in dataset_for_step.coords:
-                current_lead_time = pd.Timedelta(hours=(i + 1) * forecast_step_h)
-                forecast_time_for_step = input_base_time + current_lead_time
-                dataset_for_step = dataset_for_step.assign_coords(time=([forecast_time_for_step])).expand_dims('time')
-            if 'lead_time' not in dataset_for_step.coords and 'time' in dataset_for_step.coords:
-                 dataset_for_step = dataset_for_step.assign_coords(lead_time=('time', [dataset_for_step.time.data[0] - input_base_time]))
+        # Store the base time (first timestamp) from the input batch metadata for coordinate calculation
+        base_time_dt_for_coords = pd.to_datetime(initial_batch.metadata.time[0])
+        if base_time_dt_for_coords.tzinfo is None:
+            base_time_dt_for_coords = base_time_dt_for_coords.tz_localize('UTC')
         else:
-            logging.error(f"Prediction step {i} is neither aurora.Batch nor xr.Dataset. Type: {type(prediction_step_batch_obj)}. Cannot process.")
-            continue # Skip this step
+            base_time_dt_for_coords = base_time_dt_for_coords.tz_convert('UTC')
 
-        if dataset_for_step is None:
-            logging.warning(f"Dataset for step {i} could not be prepared. Skipping save.")
-            continue
+        logging.info(f"[{job_run_uuid}] Successfully deserialized initial_batch from {local_input_file_path}. Base time for coords: {base_time_dt_for_coords.isoformat()}")
+    except Exception as e_pkl:
+        logging.error(f"[{job_run_uuid}] Failed to deserialize initial_batch from {local_input_file_path}: {e_pkl}", exc_info=True)
+        return {"error": f"Failed to load input batch: {e_pkl}"}
+
+    # --- 2. Run Model Inference ---
+    # This now returns a List[BatchType] or None
+    prediction_steps_batch_list: Optional[List[Batch]] = None
+    try:
+        logging.info(f"[{job_run_uuid}] Calling run_model_inference...")
+        # Pass initial_batch (which is BatchType) and app_config
+        prediction_steps_batch_list = await run_model_inference(initial_batch, app_config) 
+        if prediction_steps_batch_list is None:
+            logging.error(f"[{job_run_uuid}] run_model_inference returned None. Inference failed or produced no output.")
+            return {"error": "Inference process failed or produced no output."}
+        if not prediction_steps_batch_list: # Empty list
+            logging.warning(f"[{job_run_uuid}] run_model_inference returned an empty list of predictions.")
+            # This might be acceptable depending on the model/input, but for now, we treat it as needing an empty archive.
+    except Exception as e_run_model:
+        logging.error(f"[{job_run_uuid}] Exception during run_model_inference: {e_run_model}", exc_info=True)
+        return {"error": f"Exception during model inference execution: {e_run_model}"}
+
+    logging.info(f"[{job_run_uuid}] run_model_inference completed. Received {len(prediction_steps_batch_list)} prediction steps (BatchType).")
+
+    # --- 3. Prepare for Output Archiving ---
+    network_volume_base_path_str = app_config.get('storage', {}).get('network_volume_base_path')
+    if not network_volume_base_path_str:
+        logging.error(f"[{job_run_uuid}] Network volume base path not configured in app_config.")
+        return {"error": "Server configuration error: Network volume path missing."}
+
+    job_output_dir_on_volume = Path(network_volume_base_path_str) / "job_outputs" / job_run_uuid
+    job_output_dir_on_volume.mkdir(parents=True, exist_ok=True)
+    archive_filename = "forecast_archive.tar.gz"
+    archive_file_on_volume = job_output_dir_on_volume / archive_filename
+    
+    logging.info(f"[{job_run_uuid}] Output archive will be saved to: {archive_file_on_volume}")
+
+    # --- 3. Iterative Inference and Streaming to Archive ---
+    forecast_steps_count = 0
+    try:
+        with tarfile.open(archive_file_on_volume, "w:gz") as tar:
+            logging.info(f"[{job_run_uuid}] Opened tar archive {archive_file_on_volume} for writing.")
             
-        filename = f"step_{i}.nc.gz"
-        saved_path = save_dataset_step_to_gzipped_netcdf(
-            dataset_step=dataset_for_step,
-            output_dir=job_output_dir_on_volume,
-            filename=filename,
-            step_index=i
-        )
-        if saved_path:
-            saved_files.append(filename) # Store just the filename for the manifest
-        else:
-            # Handle error: failed to save a step. Could abort or just log and exclude from manifest.
-            logging.error(f"Failed to save step {i} to network volume. Job: {job_run_uuid}")
-            # For now, we'll continue and it won't be in the manifest
+            # The run_model_inference function is expected to be an async generator yielding xr.Dataset steps
+            async for step_index, prediction_step_xr in run_model_inference(initial_batch, app_config):
+                if prediction_step_xr is None:
+                    logging.warning(f"[{job_run_uuid}] run_model_inference yielded None for step {step_index}. Skipping.")
+                    continue
+
+                logging.info(f"[{job_run_uuid}] Processing forecast step {step_index}...")
+                
+                # Serialize xr.Dataset to in-memory gzipped NetCDF bytes
+                step_filename = f"forecast_step_{step_index:02d}.nc.gz"
+                gzipped_netcdf_bytes: Optional[bytes] = None
+                try:
+                    with io.BytesIO() as nc_buffer:
+                        prediction_step_xr.to_netcdf(nc_buffer, engine="h5netcdf") # or netcdf4
+                        nc_bytes = nc_buffer.getvalue()
+                    
+                    with io.BytesIO() as gz_buffer:
+                        with gzip.GzipFile(fileobj=gz_buffer, mode='wb') as gz_file:
+                            gz_file.write(nc_bytes)
+                        gzipped_netcdf_bytes = gz_buffer.getvalue()
+                    
+                    if not gzipped_netcdf_bytes:
+                         raise ValueError("Gzipped NetCDF bytes are empty.")
+                         
+                    logging.debug(f"[{job_run_uuid}] Serialized and gzipped step {step_index} to {len(gzipped_netcdf_bytes)} bytes.")
+                except Exception as e_ser_gz:
+                    logging.error(f"[{job_run_uuid}] Failed to serialize/gzip step {step_index}: {e_ser_gz}", exc_info=True)
+                    # Decide: skip this step or abort? For now, skip.
+                    continue 
+                
+                # Add to Tar Archive
+                tarinfo = tarfile.TarInfo(name=step_filename)
+                tarinfo.size = len(gzipped_netcdf_bytes)
+                tarinfo.mtime = int(time.time()) # Set modification time
+                
+                with io.BytesIO(gzipped_netcdf_bytes) as step_fileobj:
+                    tar.addfile(tarinfo, step_fileobj)
+                
+                logging.info(f"[{job_run_uuid}] Added {step_filename} (size: {tarinfo.size}) to archive.")
+                forecast_steps_count += 1
+                
+                # Clean up explicit references to potentially large objects
+                del prediction_step_xr, gzipped_netcdf_bytes, nc_bytes
+                # Consider gc.collect() if memory becomes an issue after many steps, but usually not needed.
+
+        logging.info(f"[{job_run_uuid}] Finished processing all forecast steps. Added {forecast_steps_count} steps to archive {archive_file_on_volume}.")
+
+    except Exception as e_inf_arc:
+        logging.error(f"[{job_run_uuid}] Error during inference or tarball creation: {e_inf_arc}", exc_info=True)
+        # Cleanup potentially incomplete archive
+        if archive_file_on_volume.exists():
+            try: archive_file_on_volume.unlink()
+            except OSError: pass
+        return {"error": f"Error during inference/archiving: {e_inf_arc}"}
+
+    if forecast_steps_count == 0:
+        logging.warning(f"[{job_run_uuid}] No forecast steps were added to the archive. Archive might be empty or not created.")
+        # Depending on requirements, this might be an error or an expected outcome (e.g., no prediction for this input)
+        # For now, let's assume it's an error if the archive is expected.
+        return {"error": "No forecast steps generated or saved to archive."}
+
+    # --- 4. Send Archive via runpodctl ---
+    logging.info(f"[{job_run_uuid}] Attempting to send archive {archive_file_on_volume} via runpodctl.")
+    output_archive_code = await _execute_runpodctl_send(archive_file_on_volume)
+
+    if not output_archive_code:
+        logging.error(f"[{job_run_uuid}] Failed to send archive {archive_file_on_volume} via runpodctl.")
+        return {"error": "Failed to send output archive using runpodctl."}
     
-    if not saved_files:
-        logging.error(f"No forecast steps were successfully saved to network volume for job {job_run_uuid}.")
-        # This could be an error state for the job
-        raise HTTPException(status_code=500, detail="Failed to save any forecast steps to output volume.")
+    logging.info(f"[{job_run_uuid}] Successfully sent archive. Runpodctl code: {output_archive_code}")
 
-    manifest_content = {
-        "status": "completed_written_to_volume",
-        "runpod_job_id_internal": job_run_uuid,
-        "output_path_on_volume": job_run_uuid, # Relative path for client to use
-        "files": saved_files,
-        "total_steps_generated": len(predictions),
-        "total_steps_saved": len(saved_files),
-        "base_time": str(input_base_time)
-    }
-    logging.info(f"Inference completed for job {job_run_uuid}. Manifest: {manifest_content}")
-    return JSONResponse(content=manifest_content)
-
-# --- New Endpoint for Downloading Files from Network Volume ---
-@app.get("/download_step")
-async def download_step(
-    job_path_on_volume: str, # This will be the job_run_uuid
-    filename: str,
-    auth_result: bool = Security(verify_api_key)
-):
-    if not auth_result:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication failed")
-
-    network_volume_base_path_str = APP_CONFIG.get('storage', {}).get('network_volume_base_path')
-    if not network_volume_base_path_str:
-        logging.error("Network volume base path not configured for download.")
-        raise HTTPException(status_code=500, detail="Server configuration error: Network volume path missing.")
-
+    # --- 5. Return Manifest ---
+    base_time_str = None
     try:
-        # Sanitize inputs to prevent path traversal
-        # Ensure job_path_on_volume and filename are simple names, not full paths with '..' etc.
-        if ".." in job_path_on_volume or "/" in job_path_on_volume or "\\" in job_path_on_volume:
-            raise HTTPException(status_code=400, detail="Invalid job path component.")
-        if ".." in filename or "/" in filename or "\\" in filename:
-            raise HTTPException(status_code=400, detail="Invalid filename component.")
+        # initial_batch.metadata.time is typically a numpy array of datetime64
+        # We need to convert it to a Python datetime, then to ISO string
+        pd_timestamp = pd.to_datetime(initial_batch.metadata.time[0])
+        py_datetime = pd_timestamp.to_pydatetime(warn=False) # warn=False if already Python datetime
+        if py_datetime.tzinfo is None: # Ensure timezone awareness (UTC)
+            py_datetime = py_datetime.replace(tzinfo=timezone.utc)
+        base_time_str = py_datetime.isoformat()
+    except Exception as e_time:
+        logging.error(f"[{job_run_uuid}] Could not extract or format base_time from initial_batch: {e_time}", exc_info=True)
+        # Fallback or error, for now, return error as base_time is crucial for WeatherTask
+        return {"error": "Failed to determine base_time for the forecast."}
 
-        file_to_serve = Path(network_volume_base_path_str) / job_path_on_volume / filename
-        
-        if not file_to_serve.is_file():
-            logging.warning(f"Requested file not found or is not a file: {file_to_serve}")
-            raise HTTPException(status_code=404, detail=f"File not found: {filename} for job {job_path_on_volume}")
+    output_manifest = {
+        "output_archive_code": output_archive_code,
+        "base_time": base_time_str, # ISO format string
+        "job_run_uuid": job_run_uuid, # For WeatherTask to cross-reference
+        "archive_filename": archive_filename, # Inform WeatherTask of the filename
+        "num_steps_archived": forecast_steps_count
+    }
+    
+    logging.info(f"[{job_run_uuid}] Successfully processed and sent archive. Manifest: {output_manifest}")
+    return output_manifest
 
-        logging.info(f"Serving file: {file_to_serve}")
-        # Return StreamingResponse to send the file
-        # The file is already gzipped NetCDF.
-        return StreamingResponse(open(file_to_serve, "rb"), media_type="application/octet-stream", headers={
-            "Content-Disposition": f"attachment; filename=\"{filename}\""
-        })
+# --- FastAPI Network Volume Endpoints (TO BE REMOVED/REPLACED) ---
+# The following endpoints /run_inference, /upload_input, /download_step 
+# will be removed or heavily modified as their logic is moving into the combined_runpod_handler
+# and _perform_inference_and_process_with_runpodctl.
+# For now, we will comment them out. Consider removing them entirely later.
 
-    except HTTPException: # Re-raise known HTTP exceptions
-        raise
-    except Exception as e:
-        logging.error(f"Error serving file {job_path_on_volume}/{filename}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error serving file.")
+# @app.post("/run_inference")
+# async def handle_run_inference(
+#     request: Request, 
+#     auth_result: bool = Security(verify_api_key)
+# ):
+#     # ... (previous implementation) ...
+#     pass
+
+# @app.post("/upload_input")
+# async def handle_upload_input(
+#     request: Request, # We'll read raw body
+#     auth_result: bool = Security(verify_api_key)
+# ):
+#     # ... (previous implementation) ...
+#     pass
+
+# @app.get("/download_step")
+# async def download_step(
+#     job_path_on_volume: str, # This will be the job_run_uuid
+#     filename: str,
+#     auth_result: bool = Security(verify_api_key)
+# ):
+#     # ... (previous implementation) ...
+#     pass 
 
 async def main_init():
-    await initialize_inference_runner(APP_CONFIG)
+    # This function seems to be a remnant and not used. 
+    # Lifespan handles initialization.
+    # If it has a specific purpose, it should be clarified or integrated.
+    logging.info("main_init called - check if this is still needed.")
+    pass
+
+async def combined_runpod_handler(job: Dict[str, Any]):
+    """
+    Main handler for RunPod serverless invocations.
+    Dispatches actions based on job_input.
+    """
+    job_id = job.get("id", "unknown_job_id")
+    job_input = job.get("input", {})
+    
+    if not job_input or not isinstance(job_input, dict):
+        logging.error(f"Job {job_id}: Invalid or missing 'input' in job payload: {job_input}")
+        return {"error": "Invalid job input: 'input' field is missing or not a dictionary."}
+
+    action = job_input.get("action")
+    logging.info(f"Job {job_id}: Action requested: {action}")
+
+    # Ensure APP_CONFIG is loaded (it should be by lifespan, but good check)
+    if not APP_CONFIG:
+        logging.error(f"Job {job_id}: APP_CONFIG not loaded. Lifespan issue?")
+        return {"error": "Server configuration error: APP_CONFIG not loaded."}
+
+    # Create a unique ID for this specific execution run if not provided
+    # This will be used for naming temporary directories.
+    # WeatherTask should ideally provide this so it can correlate logs and outputs.
+    job_run_uuid = job_input.get("job_run_uuid", str(uuid.uuid4()))
+    logging.info(f"Job {job_id}: Effective job_run_uuid for this execution: {job_run_uuid}")
+
+    # Define base temporary directory for this specific job run
+    # This helps in organizing and cleaning up files.
+    job_temp_base_dir = Path(tempfile.gettempdir()) / "runpod_jobs" / job_run_uuid
+    try:
+        job_temp_base_dir.mkdir(parents=True, exist_ok=True)
+        logging.info(f"Job {job_id}: Created base temporary directory: {job_temp_base_dir}")
+
+        if action == "run_inference_with_runpodctl":
+            logging.info(f"Job {job_id}: Executing 'run_inference_with_runpodctl' action.")
+            input_file_code = job_input.get("input_file_code")
+            
+            if not input_file_code:
+                logging.error(f"Job {job_id}: 'input_file_code' is missing for action 'run_inference_with_runpodctl'.")
+                return {"error": "Missing 'input_file_code' for inference action."}
+
+            local_input_dir = job_temp_base_dir / "input"
+            local_input_dir.mkdir(parents=True, exist_ok=True)
+            # Define a fixed name for the received input file for simplicity
+            local_input_file_path = local_input_dir / "input_batch.pkl"
+
+            logging.info(f"Job {job_id}: Attempting to receive input file with code {input_file_code} to {local_input_file_path}")
+            receive_success = await _execute_runpodctl_receive(input_file_code, local_input_file_path)
+            
+            if not receive_success:
+                logging.error(f"Job {job_id}: Failed to receive input file using runpodctl code {input_file_code}.")
+                return {"error": f"Failed to receive input file via runpodctl with code: {input_file_code}"}
+            
+            logging.info(f"Job {job_id}: Successfully received input file to {local_input_file_path}")
+
+            try:
+                # The _perform_inference_and_process_with_runpodctl function handles its own temp output dirs based on job_run_uuid
+                # and returns the manifest with codes for archives.
+                inference_result_manifest = await _perform_inference_and_process_with_runpodctl(
+                    local_input_file_path=local_input_file_path,
+                    job_run_uuid=job_run_uuid, # Pass the consistent UUID
+                    app_config=APP_CONFIG
+                )
+                logging.info(f"Job {job_id}: Inference processing completed. Result manifest: {inference_result_manifest}")
+                return inference_result_manifest # This is the success output for the RunPod job
+            except RuntimeError as e_rt:
+                logging.error(f"Job {job_id}: Runtime error during inference processing: {e_rt}", exc_info=True)
+                return {"error": f"Runtime error during inference: {str(e_rt)}"}
+            except ValueError as e_val:
+                logging.error(f"Job {job_id}: Value error during inference processing: {e_val}", exc_info=True)
+                return {"error": f"Value error during inference: {str(e_val)}"}
+            except FileNotFoundError as e_fnf:
+                logging.error(f"Job {job_id}: File not found error during inference processing: {e_fnf}", exc_info=True)
+                return {"error": f"File not found error during inference: {str(e_fnf)}"}
+            except Exception as e_inf:
+                logging.error(f"Job {job_id}: Unexpected error during inference processing: {e_inf}", exc_info=True)
+                return {"error": f"An unexpected error occurred during inference: {str(e_inf)}"}
+
+        # elif action == "upload_input": # REMOVED
+        #     logging.info("DEPRECATED ACTION: 'upload_input' called, no longer supported.")
+        #     return {"error": "Action 'upload_input' is deprecated and no longer supported."}
+
+        # elif action == "download_archive": # REMOVED
+        #     logging.info("DEPRECATED ACTION: 'download_archive' called, no longer supported.")
+        #     return {"error": "Action 'download_archive' is deprecated and no longer supported."}
+
+        else:
+            logging.warning(f"Job {job_id}: Unknown or unsupported action: {action}")
+            return {"error": f"Unknown action: {action}"}
+
+    except Exception as e_handler_main:
+        logging.error(f"Job {job_id}: Critical error in combined_runpod_handler for action '{action}': {e_handler_main}", exc_info=True)
+        return {"error": f"A critical server error occurred: {str(e_handler_main)}"}
+    finally:
+        # Cleanup: Remove the job-specific base temporary directory and all its contents
+        if job_temp_base_dir.exists():
+            try:
+                shutil.rmtree(job_temp_base_dir)
+                logging.info(f"Job {job_id}: Successfully cleaned up temporary directory: {job_temp_base_dir}")
+            except Exception as e_clean:
+                logging.error(f"Job {job_id}: Error during cleanup of temporary directory {job_temp_base_dir}: {e_clean}", exc_info=True)
+        else:
+            logging.info(f"Job {job_id}: Temporary directory {job_temp_base_dir} not found for cleanup (may have failed before creation or cleaned by sub-function).")
 
 if __name__ == "__main__":
-    if not APP_CONFIG:
-        APP_CONFIG = load_config(CONFIG_PATH)
-        setup_logging(APP_CONFIG)
-        
-        current_expected_key = os.getenv("INFERENCE_SERVICE_API_KEY")
-        if not current_expected_key:
-            current_expected_key = APP_CONFIG.get('security', {}).get('api_key')
-        EXPECTED_API_KEY = current_expected_key
 
-        if not EXPECTED_API_KEY:
-            logging.warning(
-            "Running directly: INFERENCE_SERVICE_API_KEY is not set. Endpoint /run_inference is UNPROTECTED."
-        )
-        else:
-            logging.info("Running directly: API key protection is CONFIGURED for /run_inference.")
-
-        asyncio.run(main_init())
-
-    api_config = APP_CONFIG.get('api', {})
-    host = api_config.get('host', '0.0.0.0')
-    port = api_config.get('port', 8000)
-    uvicorn_kwargs = api_config.get('uvicorn_kwargs', {})
-
-    logging.info(f"Starting Uvicorn server on {host}:{port}")
-    uvicorn.run("main:app", host=host, port=port, reload=False, **uvicorn_kwargs)
-
-# Ensure __init__.py exists in the app folder if it doesn't, for Python to treat it as a package.
-# For example, create an empty inference_service/app/__init__.py 
+    # Correct entry point for RunPod Serverless GPU/CPU Docker image:
+    logging.info("Starting RunPod serverless handler...")
+    runpod.serverless.start({'handler': combined_runpod_handler}) 

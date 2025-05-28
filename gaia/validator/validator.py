@@ -2394,22 +2394,66 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # --- Alembic check code for Validator ---
+    # Set DB_TARGET for validator-specific migrations
+    os.environ['DB_TARGET'] = 'validator' # Ensure this is set for validator
+    logger.info(f"[Startup] DB_TARGET set to: {os.environ.get('DB_TARGET')}")
+
     try:
-        # Use print as logger might not be fully setup
-        print("[Startup] Checking database schema version using Alembic...") 
-        alembic_cfg = Config("alembic.ini") 
+        print("[Startup] Checking database schema version using Alembic...")
+        # Construct path relative to this script file to find alembic.ini at project root
+        # Assumes validator.py is in project_root/gaia/validator/validator.py
+        current_script_dir_val = os.path.dirname(os.path.abspath(__file__))
+        project_root_val = os.path.abspath(os.path.join(current_script_dir_val, "..", ".."))
+        alembic_ini_path_val = os.path.join(project_root_val, "alembic.ini")
 
-        # Conditionally run alembic upgrade based on environment variable
-        alembic_auto_upgrade = os.getenv("ALEMBIC_AUTO_UPGRADE", "True").lower() in ["true", "1", "yes"]
-        if alembic_auto_upgrade:
-            print("[Startup] ALEMBIC_AUTO_UPGRADE is True. Attempting to upgrade database schema to head...")
-            command.upgrade(alembic_cfg, "head")
-            print("[Startup] Database schema is up-to-date (or upgrade attempted).")
+        if not os.path.exists(alembic_ini_path_val):
+            print(f"[Startup] ERROR: alembic.ini not found at expected path: {alembic_ini_path_val}")
+            sys.exit("Alembic configuration not found for validator.")
+
+        alembic_cfg_val = Config(alembic_ini_path_val)
+
+        db_target_for_val_config = os.environ.get('DB_TARGET')
+        if db_target_for_val_config:
+            absolute_version_path_val = os.path.join(project_root_val, "alembic_migrations", "versions", db_target_for_val_config)
+            alembic_cfg_val.set_main_option("version_locations", absolute_version_path_val)
+            print(f"[Startup] Validator: Attempting to set main option 'version_locations' to: {absolute_version_path_val}")
+            if not os.path.isdir(absolute_version_path_val):
+                print(f"[Startup] Validator: CRITICAL ERROR: Calculated absolute version path does not exist: {absolute_version_path_val}")
         else:
-            print("[Startup] ALEMBIC_AUTO_UPGRADE is False. Skipping automatic schema upgrade. Current schema version will be checked by the application later if necessary.")
+            print("[Startup] Validator: ERROR: DB_TARGET not set. Cannot dynamically set Alembic version_locations.")
 
-    except CommandError as e:
-         print(f"[Startup] ERROR: Alembic command failed during startup check: {e}")
+        # Diagnostic block for validator (optional, but good for consistency)
+        print(f"[Startup] Validator DIAGNOSTIC: Value from get_main_option('version_locations'): {alembic_cfg_val.get_main_option('version_locations')}")
+        try:
+            from alembic.script import ScriptDirectory
+            script_dir_instance_val = ScriptDirectory.from_config(alembic_cfg_val)
+            print(f"[Startup] Validator DIAGNOSTIC: ScriptDirectory main path: {script_dir_instance_val.dir}")
+            print(f"[Startup] Validator DIAGNOSTIC: ScriptDirectory effective version_locations: {script_dir_instance_val.version_locations}")
+            # You might want to find a specific validator revision if known, e.g., validator_db_head_id = "1d8c0e7972ea"
+            # test_rev_obj = script_dir_instance_val.get_revision(validator_db_head_id) 
+            # print(f"[Startup] Validator DIAGNOSTIC: Found validator test revision: {bool(test_rev_obj)}")
+        except Exception as e_diag_val:
+            print(f"[Startup] Validator DIAGNOSTIC: Error: {e_diag_val}")
+
+        alembic_auto_upgrade_val = os.getenv("ALEMBIC_AUTO_UPGRADE", "True").lower() in ["true", "1", "yes"]
+        if alembic_auto_upgrade_val:
+            if not db_target_for_val_config:
+                print("[Startup] Validator: ERROR: Cannot run Alembic upgrade, DB_TARGET not set.")
+            else:
+                print(f"[Startup] Validator: ALEMBIC_AUTO_UPGRADE is True. Attempting to upgrade to head for {db_target_for_val_config}...")
+                command.upgrade(alembic_cfg_val, "head")
+                print("[Startup] Validator: Database schema is up-to-date (or upgrade attempted).")
+        else:
+            print("[Startup] Validator: ALEMBIC_AUTO_UPGRADE is False. Skipping auto schema upgrade.")
+
+    except CommandError as e_val:
+         print(f"[Startup] Validator: ERROR: Alembic command failed: {e_val}")
+    except Exception as e_val_outer: # Catch other potential errors like path issues
+        print(f"[Startup] Validator: ERROR during Alembic setup: {e_val_outer}", exc_info=True)
+
+    logger.info("Validator Alembic check complete. Starting main validator application...")
+    # --- End Alembic check code for Validator ---
 
     validator = GaiaValidator(args)
     yappi.set_clock_type("wall")  # Or "cpu"

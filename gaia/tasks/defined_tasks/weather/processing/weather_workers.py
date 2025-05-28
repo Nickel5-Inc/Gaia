@@ -201,11 +201,10 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                         initial_batch=prepared_batch
                     )
 
-                    if selected_predictions_cpu is not None:
-                        logger.info(f"[InferenceTask Job {job_id}] HTTP inference completed successfully. Forecast data received.")
-                    else:
-                        logger.error(f"[InferenceTask Job {job_id}] HTTP inference failed. selected_predictions_cpu is None.")
-                        return
+                    if selected_predictions_cpu is None:
+                        logger.error(f"[InferenceTask Job {job_id}] HTTP inference service call failed (returned None). Job will be marked as error.")
+                    elif not selected_predictions_cpu:
+                        logger.info(f"[InferenceTask Job {job_id}] HTTP inference service call completed but returned an empty list of predictions. This may be normal (e.g. no data produced by model).")
                  elif inference_type == "local":
                      logger.info(f"[InferenceTask Job {job_id}] Using local runner for inference (type: {inference_type})...")
                      if task_instance.inference_runner.model is None:
@@ -226,57 +225,71 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
             except Exception as infer_err:
                 original_inference_error_for_dev_skip = str(infer_err)
                 logger.error(f"[InferenceTask Job {job_id}] Inference failed: {infer_err}", exc_info=True)
+                selected_predictions_cpu = None
 
-            if selected_predictions_cpu is None or not selected_predictions_cpu:
-                dev_error_message = original_inference_error_for_dev_skip or "Inference returned no predictions or None."
-                logger.warning(f"[InferenceTask Job {job_id}] DEV_OVERRIDE: Inference appears to have failed or yielded no data ('{dev_error_message}'). Attempting to use existing DB outputs.")
-                try:
-                    hardcoded_job_id_for_dev_override = '702c840c-2176-4c4c-ac5c-573515016fc9' 
-                    logger.warning(f"[InferenceTask Job {job_id}] DEV_OVERRIDE: Forcing use of data associated with hardcoded job ID: {hardcoded_job_id_for_dev_override}")
-                    
-                    fallback_job_query = "SELECT target_netcdf_path, verification_hash FROM weather_miner_jobs WHERE id = :id"
-                    fallback_job_details = await task_instance.db_manager.fetch_one(fallback_job_query, {"id": hardcoded_job_id_for_dev_override})
+            if selected_predictions_cpu is None:
+                dev_error_message = original_inference_error_for_dev_skip or "Inference returned None or failed."
+                logger.error(f"[InferenceTask Job {job_id}] Inference process resulted in None. Error: '{dev_error_message}'")
+                
+                enable_dev_override = os.getenv("DEV_SKIP_INFERENCE_USE_FALLBACK_DATA", "false").lower() == "true"
+                if enable_dev_override:
+                    logger.warning(f"[InferenceTask Job {job_id}] DEV_OVERRIDE active: Attempting to use existing DB outputs due to inference failure: {dev_error_message}.")
+                    try:
+                        hardcoded_job_id_for_dev_override = '702c840c-2176-4c4c-ac5c-573515016fc9'
+                        fallback_job_query = "SELECT target_netcdf_path, verification_hash FROM weather_miner_jobs WHERE id = :id"
+                        fallback_job_details = await task_instance.db_manager.fetch_one(fallback_job_query, {"id": hardcoded_job_id_for_dev_override})
 
-                    if fallback_job_details and fallback_job_details['target_netcdf_path'] and fallback_job_details['verification_hash']:
-                        zarr_path_override = fallback_job_details['target_netcdf_path']
-                        hash_override = fallback_job_details['verification_hash']
-                        
-                        if not zarr_path_override.endswith('.zarr'):
-                            logger.error(f"[InferenceTask Job {job_id}] DEV_OVERRIDE ERROR: The target_netcdf_path for the hardcoded job '{hardcoded_job_id_for_dev_override}' is '{zarr_path_override}', which does not have a .zarr extension. Please ensure the fallback job has been processed with the latest Zarr conversion scripts.")
-                            await update_job_status(task_instance, job_id, "error", "DEV_OVERRIDE failed: Fallback job data not in Zarr format.")
+                        if fallback_job_details and fallback_job_details['target_netcdf_path'] and fallback_job_details['verification_hash']:
+                            zarr_path_override = fallback_job_details['target_netcdf_path']
+                            hash_override = fallback_job_details['verification_hash']
+                            
+                            if not zarr_path_override.endswith('.zarr'):
+                                logger.error(f"[InferenceTask Job {job_id}] DEV_OVERRIDE ERROR: The target_netcdf_path for the hardcoded job '{hardcoded_job_id_for_dev_override}' is '{zarr_path_override}', which does not have a .zarr extension. Please ensure the fallback job has been processed with the latest Zarr conversion scripts.")
+                                await update_job_status(task_instance, job_id, "error", "DEV_OVERRIDE failed: Fallback job data not in Zarr format.")
+                                return
+
+                            logger.info(f"[InferenceTask Job {job_id}] DEV_OVERRIDE_SUCCESS: Using data from hardcoded job '{hardcoded_job_id_for_dev_override}'. Zarr_Path: '{zarr_path_override}', HASH: '{hash_override[:10]}...'.")
+                            
+                            await update_job_paths(
+                                task_instance=task_instance,
+                                job_id=job_id,
+                                netcdf_path=zarr_path_override,
+                                kerchunk_path=zarr_path_override,
+                                verification_hash=hash_override
+                            )
+                            await update_job_status(task_instance, job_id, "completed")
+                            logger.info(f"[InferenceTask Job {job_id}] DEV_OVERRIDE: Marked current job '{job_id}' as completed using data from '{hardcoded_job_id_for_dev_override}'.")
                             return
-
-                        logger.info(f"[InferenceTask Job {job_id}] DEV_OVERRIDE_SUCCESS: Using data from hardcoded job '{hardcoded_job_id_for_dev_override}'. Zarr_Path: '{zarr_path_override}', HASH: '{hash_override[:10]}...'.")
-                        
-                        await update_job_paths(
-                            task_instance=task_instance,
-                            job_id=job_id,
-                            netcdf_path=zarr_path_override,
-                            kerchunk_path=zarr_path_override, # Assuming kerchunk path is same as zarr path for this override
-                            verification_hash=hash_override
-                        )
-                        await update_job_status(task_instance, job_id, "completed")
-                        logger.info(f"[InferenceTask Job {job_id}] DEV_OVERRIDE: Marked current job '{job_id}' as completed using data from '{hardcoded_job_id_for_dev_override}'.")
-                        return
-                    else:
-                        missing_prereqs_dev = []
-                        if not fallback_job_details:
-                            missing_prereqs_dev.append(f"DB record for job {hardcoded_job_id_for_dev_override}")
                         else:
-                            if not fallback_job_details.get('target_netcdf_path'): 
-                                missing_prereqs_dev.append(f"DB target_netcdf_path (for job {hardcoded_job_id_for_dev_override})")
-                            if not fallback_job_details.get('verification_hash'): 
-                                missing_prereqs_dev.append(f"DB verification_hash (for job {hardcoded_job_id_for_dev_override})")
-                        
-                        final_dev_error_msg = f"DevOverride: Prerequisites missing/invalid for hardcoded job '{hardcoded_job_id_for_dev_override}' - {', '.join(list(set(missing_prereqs_dev)))}. Original error for job '{job_id}': {dev_error_message}"
-                        logger.error(f"[InferenceTask Job {job_id}] DEV_OVERRIDE_FAILED: {final_dev_error_msg}")
-                        await update_job_status(task_instance, job_id, "error", final_dev_error_msg)
-                        return 
-                except Exception as e_dev_override:
-                    final_dev_error_msg_outer = f"DevOverride: Unexpected error using hardcoded job '{hardcoded_job_id_for_dev_override}' - {str(e_dev_override)}. Original error for job '{job_id}': {dev_error_message}"
-                    logger.error(f"[InferenceTask Job {job_id}] DEV_OVERRIDE_FAILED: {final_dev_error_msg_outer}", exc_info=True)
-                    await update_job_status(task_instance, job_id, "error", final_dev_error_msg_outer)
-                    return
+                            missing_prereqs_dev = []
+                            if not fallback_job_details:
+                                missing_prereqs_dev.append(f"DB record for job {hardcoded_job_id_for_dev_override}")
+                            else:
+                                if not fallback_job_details.get('target_netcdf_path'): 
+                                    missing_prereqs_dev.append(f"DB target_netcdf_path (for job {hardcoded_job_id_for_dev_override})")
+                                if not fallback_job_details.get('verification_hash'): 
+                                    missing_prereqs_dev.append(f"DB verification_hash (for job {hardcoded_job_id_for_dev_override})")
+                            
+                            final_dev_error_msg = f"DevOverride: Prerequisites missing/invalid for hardcoded job '{hardcoded_job_id_for_dev_override}' - {', '.join(list(set(missing_prereqs_dev)))}. Original error for job '{job_id}': {dev_error_message}"
+                            logger.error(f"[InferenceTask Job {job_id}] DEV_OVERRIDE_FAILED: {final_dev_error_msg}")
+                            await update_job_status(task_instance, job_id, "error", final_dev_error_msg)
+                            return 
+                    except Exception as e_dev_override:
+                        final_dev_error_msg_outer = f"DevOverride: Unexpected error using hardcoded job '{hardcoded_job_id_for_dev_override}' - {str(e_dev_override)}. Original error for job '{job_id}': {dev_error_message}"
+                        logger.error(f"[InferenceTask Job {job_id}] DEV_OVERRIDE_FAILED: {final_dev_error_msg_outer}", exc_info=True)
+                        await update_job_status(task_instance, job_id, "error", final_dev_error_msg_outer)
+                        return
+
+                await update_job_status(task_instance, job_id, "error", f"Inference failed: {dev_error_message}")
+                return
+
+            if not selected_predictions_cpu:
+                logger.info(f"[InferenceTask Job {job_id}] Inference resulted in an empty list of predictions. This may be an expected outcome (e.g., model generated no steps for this input).")
+                await update_job_status(task_instance, job_id, "completed_no_data", "Inference produced no forecast steps to save.")
+                logger.info(f"[InferenceTask Job {job_id}] No forecast data to save. Background task for this job ends here.")
+                return
+
+            logger.info(f"[InferenceTask Job {job_id}] Inference successful. Processing {len(selected_predictions_cpu)} steps for saving...")
 
         await update_job_status(task_instance, job_id, "processing_output")
         try:

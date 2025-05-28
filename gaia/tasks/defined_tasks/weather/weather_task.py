@@ -34,6 +34,12 @@ import zarr
 import numcodecs
 from typing import Dict
 import gzip
+import tarfile
+import io
+import tempfile
+
+# Import the new utils
+from . import weather_http_utils # Corrected import path
 
 from .utils.era5_api import fetch_era5_data
 from .utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
@@ -168,6 +174,7 @@ def _load_config(self):
     config['runpod_poll_interval_seconds'] = int(os.getenv('RUNPOD_POLL_INTERVAL_SECONDS', '10'))
     config['runpod_max_poll_attempts'] = int(os.getenv('RUNPOD_MAX_POLL_ATTEMPTS', '90')) # 90 * 10s = 15 minutes
     config['runpod_download_endpoint_suffix'] = os.getenv('RUNPOD_DOWNLOAD_ENDPOINT_SUFFIX', 'run/download_step') # e.g., "run/download_step"
+    config['runpod_upload_input_suffix'] = os.getenv('RUNPOD_UPLOAD_INPUT_SUFFIX', 'run/upload_input') # e.g., "run/upload_input"
 
      # Default to 6 hours
 
@@ -286,315 +293,254 @@ class WeatherTask(Task):
     # HTTP Inference Service Helpers (Miner)
     ############################################################
 
-    def _serialize_aurora_batch_for_service(self, batch: Batch) -> bytes:
-        """Serializes an aurora.Batch object for sending to the inference service."""
-        try:
-            pickled_batch = pickle.dumps(batch)
-            return base64.b64encode(pickled_batch)
-        except Exception as e:
-            logger.error(f"Error serializing aurora.Batch: {e}", exc_info=True)
-            raise
+    # _serialize_aurora_batch_for_service is now in weather_http_utils.py
+    # _deserialize_prediction_from_service is now in weather_http_utils.py
 
-    def _deserialize_prediction_from_service(self, response_data: bytes) -> Optional[xr.Dataset]:
+    async def _run_inference_via_http_service(self, job_id: str, initial_batch: Batch) -> Optional[List[xr.Dataset]]:
         """
-        Deserializes gzipped netCDF data from the inference service response into an xr.Dataset.
-        """
-        try:
-            uncompressed_data = gzip.decompress(response_data)
-            # Load dataset from bytes in memory
-            with fsspec.open(f"memory://{uuid.uuid4()}.nc", "wb") as memfile:
-                memfile.write(uncompressed_data)
-            with fsspec.open(f"memory://{uuid.uuid4()}.nc", "rb") as memfile_read:
-                 # Need to ensure the in-memory file is seekable for xarray
-                 # A simple way is to read into a BytesIO buffer
-                 import io
-                 buffer = io.BytesIO(memfile_read.read())
-                 buffer.seek(0)
-                 ds = xr.open_dataset(buffer, engine="h5netcdf") # or engine="netcdf4" if appropriate
-            return ds
-        except gzip.BadGzipFile:
-            logger.error("Failed to decompress: Bad Gzip File. Response data might not be gzipped.", exc_info=True)
-            # Attempt to load directly if not gzipped (or if error in gzip assumption)
-            try:
-                import io
-                buffer = io.BytesIO(response_data)
-                buffer.seek(0)
-                ds = xr.open_dataset(buffer, engine="h5netcdf")
-                logger.info("Successfully deserialized non-gzipped data after gzip error.")
-                return ds
-            except Exception as e_direct:
-                logger.error(f"Failed to deserialize directly after gzip error: {e_direct}", exc_info=True)
-                return None
-        except Exception as e:
-            logger.error(f"Error deserializing prediction from service: {e}", exc_info=True)
-            return None
-
-    async def _run_inference_via_http_service(self, job_id: str, initial_batch: Batch) -> Optional[xr.Dataset]:
-        """
-        Runs inference by making a request to the configured HTTP inference service.
+        Runs inference by making requests to an external HTTP/RunPod service using runpodctl for data transfer.
+        Handles input serialization and send, job submission, status polling,
+        archive download, and deserialization using utility functions.
+        Returns a list of xr.Dataset objects (forecast steps) or None on failure.
         """
         if not self.inference_service_url:
-            logger.error(f"[Job {job_id}] Inference service URL not configured. Cannot run inference via HTTP.")
-            await update_job_status(self, job_id, "error", "Inference service URL not configured")
+            logger.error(f"Job {job_id}: Inference service URL not configured. Cannot run inference.")
             return None
 
-        logger.info(f"[Job {job_id}] Preparing to run inference via HTTP service: {self.inference_service_url}")
+        # Create a unique ID for this specific WeatherTask job execution to correlate with miner logs
+        # This job_run_uuid will be passed to the inference service.
+        weather_task_job_run_uuid = str(uuid.uuid4())
+        logger.info(f"Job {job_id}: Starting HTTP inference. Effective weather_task_job_run_uuid: {weather_task_job_run_uuid}")
+
+        tmp_dir_for_runpodctl: Optional[Path] = None # For managing temp files for runpodctl
 
         try:
-            serialized_batch_bytes = self._serialize_aurora_batch_for_service(initial_batch)
-            if not serialized_batch_bytes:
-                logger.error(f"[Job {job_id}] Failed to serialize batch for HTTP service. Cannot proceed.")
-                await update_job_status(self, job_id, "error_serializing_batch")
+            # --- Step 1: Serialize initial_batch and save to a temporary file ---
+            logger.info(f"Job {job_id}: Serializing initial_batch for runpodctl transfer...")
+            serialized_batch_bytes = pickle.dumps(initial_batch)
+            
+            # Create a temporary directory for this job's runpodctl operations
+            # This ensures that concurrent calls to this method don't interfere with each other's temp files.
+            base_temp_dir = Path(tempfile.gettempdir()) / "weather_task_runpodctl"
+            tmp_dir_for_runpodctl = base_temp_dir / weather_task_job_run_uuid
+            tmp_dir_for_runpodctl.mkdir(parents=True, exist_ok=True)
+            
+            temp_input_file = tmp_dir_for_runpodctl / "input_batch.pkl"
+            with open(temp_input_file, "wb") as f:
+                f.write(serialized_batch_bytes)
+            logger.info(f"Job {job_id}: Initial batch serialized and saved to temp file: {temp_input_file}")
+
+            # --- Step 2: Send the temporary file using runpodctl send ---
+            input_file_code = self._execute_runpodctl_send_from_weather_task(temp_input_file)
+            if not input_file_code:
+                logger.error(f"Job {job_id}: Failed to send input batch via runpodctl. Temp file: {temp_input_file}")
                 return None
+            logger.info(f"Job {job_id}: Successfully sent input batch. Runpodctl code: {input_file_code}")
 
-            # Prepare the actual content to be sent
-            request_content: bytes
-
-            if self.runpod_api_key: # Assuming RunPod if key is present
-                # RunPod typically expects an "input" field in the JSON payload
-                payload_dict = {
-                    "input": {
-                        "batch_data": serialized_batch_bytes.decode('utf-8') # Decode bytes to string for JSON
-                        # Add any other parameters your RunPod endpoint's input schema expects here
-                    }
+            # --- Step 3: Submit job to RunPod /run endpoint ---
+            # The payload for the RunPod /run endpoint (which goes to combined_runpod_handler)
+            run_payload = {
+                "input": {
+                    "action": "run_inference_with_runpodctl",
+                    "input_file_code": input_file_code,
+                    "job_run_uuid": weather_task_job_run_uuid # Pass our unique ID
                 }
-                request_content = json.dumps(payload_dict).encode('utf-8')
-                logger.debug(f"[Job {job_id}] Serialized payload for RunPod: {payload_dict}")
-            else:
-                # For other generic HTTP services, send the raw serialized batch bytes
-                # (as it was before, assuming the service expects the direct b64 string as top-level) 
-                # The previous code sent this as content=serialized_batch_bytes, which is correct for raw bytes.
-                # If generic services also expect JSON, this branch needs adjustment.
-                # For now, keep consistent with previous direct sending of bytes if not RunPod.
-                request_content = serialized_batch_bytes 
+            }
+            logger.info(f"Job {job_id}: Submitting job to RunPod service: {self.inference_service_url} with payload containing action and input_file_code.")
+            
+            headers = {}
+            if self.runpod_api_key: # If CREDENTIAL was set for miner, WeatherTask gets it
+                headers["Authorization"] = f"Bearer {self.runpod_api_key}"
+            elif self.config.get('miner_api_key_for_infra_service'): # Fallback to general API key if RunPod specific one isn't there
+                 headers["X-API-Key"] = self.config['miner_api_key_for_infra_service']
 
-            all_predictions_ds: Optional[xr.Dataset] = None
-            current_lines = []
-            processed_lines_count = 0
-
+            run_response_json = None
             try:
-                async with httpx.AsyncClient(timeout=None) as client: # Single client context
-                    auth_method_log = "using RunPod Authorization header" if self.runpod_api_key else "using X-API-Key (if MINER_API_KEY_FOR_INFRA_SERVICE is set)"
-                    logger.info(f"[Job {job_id}] Preparing for HTTP inference service. URL: {self.inference_service_url}. Auth: {auth_method_log}. Payload size: {len(request_content)} bytes.")
-                
-                    headers = {
-                        "Accept": "application/json" # Expecting JSON for initial RunPod /run and /status
-                    }
-                    if self.runpod_api_key:
-                        headers["Authorization"] = f"Bearer {self.runpod_api_key}"
-                        headers["Content-Type"] = "application/json" # RunPod /run expects JSON
-                    else: 
-                        headers["Content-Type"] = "application/json" # Assuming generic also expects JSON
-                        api_key_infra = os.getenv("MINER_API_KEY_FOR_INFRA_SERVICE")
-                        if api_key_infra:
-                            headers["X-API-Key"] = api_key_infra
-                        else:
-                            logger.warning(f"[Job {job_id}] Neither RunPod API key nor MINER_API_KEY_FOR_INFRA_SERVICE is set for generic HTTP. Sending without specific API key header.")
+                async with httpx.AsyncClient(timeout=self.config.get('runpod_submit_timeout_seconds', 60)) as client:
+                    # The main URL for RunPod serverless is the one we use for /run
+                    # It should be the base URL of the serverless endpoint.
+                    submit_url = self.inference_service_url # This should be the .../run URL path
+                    if not submit_url.endswith('/run'):
+                        submit_url = submit_url.rstrip('/') + '/run'
 
-                    if self.runpod_api_key: # RunPod Asynchronous Workflow
-                        logger.info(f"[Job {job_id}] Submitting job to RunPod endpoint: {self.inference_service_url}")
-                        # Initial POST to /run
-                        run_response = await client.post(self.inference_service_url, content=request_content, headers=headers)
-                        run_response.raise_for_status()
-                        run_data = run_response.json()
-                        runpod_job_id = run_data.get("id")
-
-                        if not runpod_job_id:
-                            logger.error(f"[Job {job_id}] Failed to get job ID from RunPod /run response. Data: {run_data}")
-                            await update_job_status(self, job_id, "error", "RunPod submission failed: no job ID")
-                            return None
-                        
-                        logger.info(f"[Job {job_id}] RunPod job submitted. RunPod Job ID: {runpod_job_id}, Initial Status: {run_data.get('status', 'N/A')}")
-                        await update_job_status(self, job_id, "processing_inference_runpod_submitted", f"RunPod Job ID: {runpod_job_id}")
-
-                        # Determine status URL - assumes /status is relative to the /run part of the URL
-                        # e.g. if self.inference_service_url = ".../endpoint_id/run", then status_url_base = ".../endpoint_id"
-                        status_url_base = self.inference_service_url.rsplit('/', 1)[0]
-                        status_url = f"{status_url_base}/status/{runpod_job_id}"
-                        logger.info(f"[Job {job_id}] Polling RunPod status URL: {status_url}")
-
-                        POLL_INTERVAL_SECONDS = self.config.get('runpod_poll_interval_seconds', 10)
-                        MAX_POLL_ATTEMPTS = self.config.get('runpod_max_poll_attempts', 90) # 90 * 10s = 15 minutes
-                        attempts = 0
-                        final_data_lines = []
-
-                        while attempts < MAX_POLL_ATTEMPTS:
-                            attempts += 1
-                            logger.debug(f"[Job {job_id}] Polling RunPod (Attempt {attempts}/{MAX_POLL_ATTEMPTS})...")
-                            # For /status, only Authorization header is typically needed for GET
-                            status_headers = {"Authorization": f"Bearer {self.runpod_api_key}", "Accept": "application/json"}
-                            try:
-                                status_response = await client.get(status_url, headers=status_headers, timeout=30.0) # Add timeout to GET
-                                status_response.raise_for_status()
-                                status_data = status_response.json()
-                            except httpx.HTTPStatusError as e_stat_http:
-                                logger.error(f"[Job {job_id}] HTTP error polling RunPod status for {runpod_job_id}: {e_stat_http}. Response: {e_stat_http.response.text}")
-                                # Decide if this is a retryable error or fatal for polling
-                                if attempts >= MAX_POLL_ATTEMPTS or not (500 <= e_stat_http.response.status_code < 600):
-                                    await update_job_status(self, job_id, "error", f"RunPod status poll failed: HTTP {e_stat_http.response.status_code}")
-                                    return None 
-                                await asyncio.sleep(POLL_INTERVAL_SECONDS) # Wait before retrying poll
-                                continue # Retry polling
-                            except httpx.RequestError as e_stat_req:
-                                logger.error(f"[Job {job_id}] Request error polling RunPod status for {runpod_job_id}: {e_stat_req}")
-                                if attempts >= MAX_POLL_ATTEMPTS:
-                                    await update_job_status(self, job_id, "error", "RunPod status poll failed: Request error")
-                                    return None
-                                await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                                continue # Retry polling
-                                
-                            current_runpod_status = status_data.get("status")
-                            logger.info(f"[Job {job_id}] RunPod Job {runpod_job_id} Status: {current_runpod_status}")
-
-                            if current_runpod_status == "COMPLETED":
-                                manifest_data = status_data.get("output")
-                                if not isinstance(manifest_data, dict):
-                                    logger.error(f"[Job {job_id}] RunPod job COMPLETED but output is not a JSON manifest. Output: {manifest_data}")
-                                    await update_job_status(self, job_id, "error", "RunPod job COMPLETED but output format invalid")
-                                    return None
-
-                                output_path_on_volume = manifest_data.get("output_path_on_volume")
-                                files_to_download = manifest_data.get("files")
-                                internal_runpod_job_id = manifest_data.get("runpod_job_id_internal") # Match key from service
-
-                                if not output_path_on_volume or not isinstance(files_to_download, list) or not internal_runpod_job_id:
-                                    logger.error(f"[Job {job_id}] Invalid manifest received from RunPod. Path: {output_path_on_volume}, Files: {files_to_download}, Internal ID: {internal_runpod_job_id}")
-                                    await update_job_status(self, job_id, "error", "RunPod manifest structure invalid")
-                                    return None
-                                
-                                logger.info(f"[Job {job_id}] RunPod job COMPLETED. Manifest received for {internal_runpod_job_id} with {len(files_to_download)} files. Path on volume: {output_path_on_volume}.")
-                                
-                                # Clear current_lines to be repopulated by downloads
-                                current_lines = [] 
-                                
-                                # Construct base URL for downloads
-                                # self.inference_service_url is like https://api.runpod.ai/v2/YOUR_ENDPOINT_ID/run
-                                # We need https://api.runpod.ai/v2/YOUR_ENDPOINT_ID/
-                                runpod_endpoint_base_url = self.inference_service_url.rsplit('/', 1)[0]
-                                download_suffix = self.config.get('runpod_download_endpoint_suffix', 'run/download_step')
-
-                                for filename_to_download in files_to_download:
-                                    download_url = f"{runpod_endpoint_base_url}/{download_suffix}?job_path_on_volume={output_path_on_volume}&filename={filename_to_download}"
-                                    logger.info(f"[Job {job_id}] Downloading step: {filename_to_download} from {download_url}")
-                                    
-                                    download_headers = {
-                                        "Authorization": f"Bearer {self.runpod_api_key}",
-                                        "Accept": "application/octet-stream" # We expect raw bytes for the file
-                                    }
-                                    try:
-                                        file_response = await client.get(download_url, headers=download_headers, timeout=300.0) # 5 min timeout per file
-                                        file_response.raise_for_status()
-                                        gzipped_nc_bytes = file_response.content # Read the bytes
-                                        
-                                        ds_step = self._deserialize_prediction_from_service(gzipped_nc_bytes)
-                                        if ds_step is not None:
-                                            current_lines.append(ds_step)
-                                            logger.debug(f"[Job {job_id}] Successfully downloaded and deserialized {filename_to_download}")
-                                        else:
-                                            logger.warning(f"[Job {job_id}] Failed to deserialize downloaded step {filename_to_download} from RunPod.")
-                                            # Optionally, decide if one failed download should fail the whole job
-                                    except httpx.HTTPStatusError as e_file_http:
-                                        logger.error(f"[Job {job_id}] HTTP error downloading {filename_to_download}: {e_file_http}. Response: {e_file_http.response.text}")
-                                        # Decide if one failed download should fail the whole job
-                                        # For now, log and continue; job will fail later if current_lines is empty.
-                                    except httpx.RequestError as e_file_req:
-                                        logger.error(f"[Job {job_id}] Request error downloading {filename_to_download}: {e_file_req}")
-                                    except Exception as e_file_proc:
-                                        logger.error(f"[Job {job_id}] Error processing downloaded file {filename_to_download}: {e_file_proc}")
-                                
-                                if len(current_lines) != len(files_to_download):
-                                    logger.warning(f"[Job {job_id}] Expected {len(files_to_download)} files from manifest, but only successfully processed {len(current_lines)}.")
-                                    # Decide if this discrepancy is an error
-                                
-                                break # Exit polling loop, as job is COMPLETED and files processed (or attempted)
-                            elif current_runpod_status in ["FAILED", "CANCELLED"]:
-                                error_detail = status_data.get("error", status_data.get("errorMessage", "Unknown error"))
-                                logger.error(f"[Job {job_id}] RunPod job {runpod_job_id} FAILED/CANCELLED. Detail: {error_detail}. Full Data: {status_data}")
-                                await update_job_status(self, job_id, "error", f"RunPod job failed: {error_detail}")
-                                return None
-                            elif current_runpod_status in ["IN_QUEUE", "IN_PROGRESS", "PAUSED"]:
-                                await update_job_status(self, job_id, f"processing_inference_runpod_{current_runpod_status.lower().replace('_', '')}")
-                            else:
-                                logger.warning(f"[Job {job_id}] Unexpected RunPod status: {current_runpod_status}. Full Data: {status_data}. Continuing to poll.")
-                            
-                            await asyncio.sleep(POLL_INTERVAL_SECONDS) # Wait before next poll, regardless of status if not terminal
-
-                        else: # Loop finished due to MAX_POLL_ATTEMPTS
-                            logger.error(f"[Job {job_id}] RunPod job {runpod_job_id} timed out after {attempts} attempts ({attempts * POLL_INTERVAL_SECONDS} seconds).")
-                            await update_job_status(self, job_id, "error", "RunPod job polling timed out")
-                            return None
-                        
-                        for line in final_data_lines:
-                            if not str(line).strip(): continue
-                            try:
-                                base64_gzipped_nc_step_str = str(line)
-                                gzipped_nc_bytes = base64.b64decode(base64_gzipped_nc_step_str)
-                                ds_step = self._deserialize_prediction_from_service(gzipped_nc_bytes)
-                                if ds_step is not None:
-                                    current_lines.append(ds_step)
-                                else:
-                                    logger.warning(f"[Job {job_id}] Failed to deserialize a prediction step from RunPod output line.")
-                            except Exception as e_line_proc:
-                                logger.error(f"[Job {job_id}] Error processing line from RunPod output: '{str(line)[:100]}...', Error: {e_line_proc}")
-
-                    else: # Original synchronous streaming logic for non-RunPod http_service
-                        headers["Accept"] = "application/x-ndjson" # Original accept for streaming data
-                        logger.info(f"[Job {job_id}] Using synchronous streaming for generic HTTP service.")
-                        async with client.stream("POST", self.inference_service_url, content=request_content, headers=headers) as response:
-                            logger.info(f"[Job {job_id}] HTTP Response Status: {response.status_code}")
-                            response.raise_for_status() 
-                            logger.info(f"[Job {job_id}] Connected to inference service. Streaming responses...")
-                            async for line in response.aiter_lines():
-                                if not line.strip(): continue
-                                try:
-                                    try:
-                                        error_payload = json.loads(line)
-                                        if isinstance(error_payload, dict) and 'error' in error_payload:
-                                            logger.error(f"[Job {job_id}] Error message from service line: {error_payload.get('detail', error_payload['error'])}")
-                                            continue
-                                    except json.JSONDecodeError: pass
-                                    base64_gzipped_nc_step_str = line
-                                    gzipped_nc_bytes = base64.b64decode(base64_gzipped_nc_step_str)
-                                    ds_step = self._deserialize_prediction_from_service(gzipped_nc_bytes)
-                                    if ds_step is not None:
-                                        current_lines.append(ds_step)
-                                    else:
-                                        logger.warning(f"[Job {job_id}] Failed to deserialize a prediction step from generic service line.")
-                                except Exception as e_line_proc:
-                                    logger.error(f"[Job {job_id}] Error processing line from generic service: {e_line_proc}")
-
-                    # Common processing for results (either from RunPod or generic stream)
-                    if not current_lines:
-                        logger.error(f"[Job {job_id}] No prediction steps were successfully deserialized.")
-                        await update_job_status(self, job_id, "error", "No valid steps received from remote inference")
-                        return None
-
-                    logger.info(f"[Job {job_id}] Received and deserialized {len(current_lines)} steps. Concatenating...")
-                    all_predictions_ds = xr.concat(current_lines, dim="time")
-                    all_predictions_ds = all_predictions_ds.sortby('time')
-                    logger.info(f"[Job {job_id}] Successfully concatenated steps into final forecast dataset.")
-                    return all_predictions_ds
-
+                    response = await client.post(submit_url, json=run_payload, headers=headers)
+                    response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+                    run_response_json = response.json()
             except httpx.HTTPStatusError as e_http:
-                error_message = f"HTTP error {e_http.response.status_code} from inference service: {e_http.response.text}"
-                logger.error(f"[Job {job_id}] {error_message}", exc_info=True)
-                await update_job_status(self, job_id, "error", error_message)
+                logger.error(f"Job {job_id}: HTTP error submitting job to RunPod {submit_url}: {e_http.response.status_code} - {e_http.response.text}", exc_info=True)
                 return None
             except httpx.RequestError as e_req:
-                error_message = f"Request error connecting to inference service: {e_req}"
-                logger.error(f"[Job {job_id}] {error_message}", exc_info=True)
-                await update_job_status(self, job_id, "error", error_message)
+                logger.error(f"Job {job_id}: Request error submitting job to RunPod {submit_url}: {e_req}", exc_info=True)
                 return None
-            except Exception as e:
-                error_message = f"Generic error during HTTP inference: {e}"
-                logger.error(f"[Job {job_id}] {error_message}", exc_info=True)
-                await update_job_status(self, job_id, "error", error_message)
+            except json.JSONDecodeError as e_json:
+                logger.error(f"Job {job_id}: Failed to decode JSON response from RunPod job submission at {submit_url}. Response: {response.text if 'response' in locals() else 'N/A'}", exc_info=True)
                 return None
 
-        except Exception as e:
-            logger.error(f"Error during _run_inference_via_http_service: {e}", exc_info=True)
-            await update_job_status(self, job_id, "error", f"Inference error: {e}")
+            if not run_response_json or "id" not in run_response_json:
+                logger.error(f"Job {job_id}: Failed to get a valid job ID from RunPod submission. Response: {run_response_json}")
+                return None
+
+            runpod_job_id = run_response_json["id"]
+            logger.info(f"Job {job_id}: Successfully submitted job to RunPod. RunPod Job ID: {runpod_job_id}")
+
+            # --- Step 4: Poll RunPod /status endpoint ---
+            status_url = f"{self.inference_service_url.replace('/run', '/status')}/{runpod_job_id}"
+            logger.info(f"Job {job_id}: Polling RunPod status URL: {status_url}")
+            
+            status_data = None
+            for attempt in range(self.config.get('runpod_max_poll_attempts', 90)):
+                await asyncio.sleep(self.config.get('runpod_poll_interval_seconds', 10))
+                try:
+                    async with httpx.AsyncClient(timeout=self.config.get('runpod_poll_timeout_seconds', 30)) as client:
+                        response = await client.get(status_url, headers=headers)
+                        response.raise_for_status()
+                        status_data = response.json()
+                        job_status = status_data.get("status")
+                        logger.info(f"Job {job_id}: Poll attempt {attempt + 1}. RunPod Job {runpod_job_id} status: {job_status}")
+
+                        if job_status == "COMPLETED":
+                            logger.info(f"Job {job_id}: RunPod job {runpod_job_id} completed.")
+                            break
+                        elif job_status in ["FAILED", "CANCELLED"]:
+                            error_detail = status_data.get("error", "No error details provided by RunPod.")
+                            if isinstance(status_data.get("output"), dict):
+                                error_detail_from_output = status_data.get("output", {}).get("error", error_detail)
+                                error_detail = f"{error_detail} Output Error: {error_detail_from_output}"
+                            logger.error(f"Job {job_id}: RunPod job {runpod_job_id} {job_status}. Error: {error_detail}")
+                            return None
+                        # IN_PROGRESS, IN_QUEUE, RETRYING - continue polling
+                        
+                except httpx.HTTPStatusError as e_http_poll:
+                    logger.warning(f"Job {job_id}: HTTP error polling RunPod status for job {runpod_job_id} (attempt {attempt + 1}): {e_http_poll.response.status_code} - {e_http_poll.response.text}. Retrying...")
+                except httpx.RequestError as e_req_poll:
+                    logger.warning(f"Job {job_id}: Request error polling RunPod status for job {runpod_job_id} (attempt {attempt + 1}): {e_req_poll}. Retrying...")
+                except json.JSONDecodeError as e_json_poll:
+                    logger.warning(f"Job {job_id}: Failed to decode JSON from RunPod status for job {runpod_job_id} (attempt {attempt + 1}). Response: {response.text if 'response' in locals() else 'N/A'}. Retrying...")
+            else: # Loop finished without break (max attempts reached)
+                logger.error(f"Job {job_id}: RunPod job {runpod_job_id} did not complete within the max polling attempts.")
+                return None
+
+            if not status_data or status_data.get("status") != "COMPLETED":
+                logger.error(f"Job {job_id}: RunPod job {runpod_job_id} did not complete successfully or status_data is invalid. Final status: {status_data.get('status') if status_data else 'N/A'}")
+                return None
+
+            output_manifest = status_data.get("output", {})
+            if not isinstance(output_manifest, dict) or not output_manifest:
+                logger.error(f"Job {job_id}: RunPod job {runpod_job_id} completed but 'output' (manifest) is missing, empty, or not a dict. Output: {output_manifest}")
+                return None
+            
+            logger.info(f"Job {job_id}: Received manifest from RunPod job {runpod_job_id}: {output_manifest}")
+
+            # --- Process Manifest --- 
+            output_archive_code = output_manifest.get("output_archive_code")
+            base_time_str = output_manifest.get("base_time")
+            # job_run_uuid_from_miner = output_manifest.get("job_run_uuid") # For cross-referencing if needed
+            archive_filename_on_miner = output_manifest.get("archive_filename_on_miner") # Actual filename used by miner
+            num_steps_archived = output_manifest.get("num_steps_archived") # Should be an int
+
+            # Handle special archive codes first
+            if output_archive_code == "NO_ARCHIVE_EMPTY_PREDICTIONS":
+                logger.info(f"Job {job_id}: Manifest indicates no predictions were generated by the model (code: {output_archive_code}). Returning empty list of datasets.")
+                return [] # Return empty list, signifying successful run but no data
+            
+            if output_archive_code in ["ARCHIVE_CREATION_FAILED_NO_SEND", "RUNPODCTL_SEND_FAILED"] or not output_archive_code:
+                error_detail = output_manifest.get("error_details", f"Manifest indicates failure. Code: {output_archive_code}")
+                logger.error(f"Job {job_id}: {error_detail}. Manifest: {output_manifest}")
+                return None # Indicates a hard failure in the remote process
+
+            if not base_time_str:
+                logger.error(f"Job {job_id}: Manifest from RunPod job {runpod_job_id} is valid but 'base_time' is missing. Cannot process. Manifest: {output_manifest}")
+                return None
+            
+            if archive_filename_on_miner is None: # Could be empty string from miner if not set
+                logger.warning(f"Job {job_id}: Manifest 'archive_filename_on_miner' is missing. Using default 'forecast_archive.tar.gz' for runpodctl receive.")
+                archive_filename_on_miner = "forecast_archive.tar.gz" # Default if not provided
+
+            if not isinstance(num_steps_archived, int):
+                logger.warning(f"Job {job_id}: 'num_steps_archived' in manifest is missing or not an integer (value: {num_steps_archived}). Cannot reliably verify downloaded content against expected steps, but will proceed with extraction.")
+                # We can still proceed, but with less certainty about the content initially.
+
+            # --- Step 5: Download Archive using runpodctl receive ---
+            logger.info(f"Job {job_id}: Attempting to download archive with runpodctl code: {output_archive_code}")
+            # We will save the received archive to our job-specific temporary directory
+            downloaded_archive_path = tmp_dir_for_runpodctl / archive_filename_on_miner 
+            
+            receive_success = self._execute_runpodctl_receive_in_weather_task(
+                code=output_archive_code,
+                output_path=downloaded_archive_path
+            )
+
+            if not receive_success or not downloaded_archive_path.is_file() or downloaded_archive_path.stat().st_size == 0:
+                logger.error(f"Job {job_id}: Failed to download archive with code {output_archive_code}, or downloaded file is empty/missing. Path: {downloaded_archive_path}")
+                return None
+            
+            logger.info(f"Job {job_id}: Successfully downloaded archive to {downloaded_archive_path} (size: {downloaded_archive_path.stat().st_size} bytes).")
+
+            # --- Step 6: Extract Archives and Deserialize Steps ---
+            base_time_dt: Optional[datetime] = None
+            try:
+                base_time_dt = pd.to_datetime(base_time_str).to_pydatetime(warn=False)
+                if base_time_dt.tzinfo is None:
+                    base_time_dt = base_time_dt.replace(tzinfo=timezone.utc)
+            except Exception as e_time_parse: 
+                logger.error(f"Job {job_id}: Could not parse 'base_time' string '{base_time_str}' from manifest: {e_time_parse}", exc_info=True)
+                return None
+            
+            downloaded_archive_bytes: bytes
+            with open(downloaded_archive_path, "rb") as f_archive:
+                downloaded_archive_bytes = f_archive.read()
+
+            if not downloaded_archive_bytes:
+                logger.error(f"Job {job_id}: Read 0 bytes from downloaded archive file {downloaded_archive_path}. Cannot extract.")
+                return None
+
+            # Pass the logger instance to the utility function
+            # The utility function now takes a list containing single archive bytes
+            forecast_datasets: List[xr.Dataset] = self.weather_http_utils.extract_and_deserialize_tar_archives(
+                archive_bytes_list=[downloaded_archive_bytes],
+                deserialize_func=lambda data, logger_inst: self.weather_http_utils.deserialize_prediction_from_service(data, logger_inst),
+                logger_instance=logger
+            )
+
+            if not forecast_datasets:
+                logger.warning(f"Job {job_id}: No datasets were extracted/deserialized from the downloaded archive {downloaded_archive_path}. This could be due to an empty archive (despite download) or deserialization errors for all steps.")
+                # If num_steps_archived was > 0, this is an issue.
+                if isinstance(num_steps_archived, int) and num_steps_archived > 0:
+                    logger.error(f"Job {job_id}: Manifest reported {num_steps_archived} steps, but none were extracted. This indicates a problem with the archive content or deserialization.")
+                    return None # Treat as failure if steps were expected but not received properly
+                else: # num_steps_archived was 0 or not an int, or forecast_datasets is empty matching this
+                    logger.info(f"Job {job_id}: No datasets extracted, consistent with manifest num_steps_archived ({num_steps_archived}). Returning empty list.")
+                    return [] # Successful run, but no data resulted
+
+            logger.info(f"Job {job_id}: Successfully extracted {len(forecast_datasets)} forecast steps from archive.")
+            if isinstance(num_steps_archived, int) and len(forecast_datasets) != num_steps_archived:
+                 logger.warning(f"Job {job_id}: Number of extracted datasets ({len(forecast_datasets)}) does not match 'num_steps_archived' from manifest ({num_steps_archived}).")
+
+            # TODO: Further validation of the datasets based on base_time and forecast_step_hours might be needed here.
+            # For now, we assume the deserialized datasets are correct if extraction succeeded.
+            return forecast_datasets
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Job {job_id}: HTTPStatusError during inference service communication: {e.response.status_code} - {e.response.text}. URL: {e.request.url}", exc_info=True)
             return None
+        except httpx.RequestError as e:
+            logger.error(f"Job {job_id}: RequestError during inference service communication: {e.request.url} - {e}", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"Job {job_id}: An unexpected error occurred in _run_inference_via_http_service: {e}", exc_info=True)
+            return None
+        finally:
+            # Cleanup temporary directory used for this job's runpodctl operations
+            if tmp_dir_for_runpodctl and tmp_dir_for_runpodctl.exists():
+                try:
+                    shutil.rmtree(tmp_dir_for_runpodctl)
+                    logger.info(f"Job {job_id}: Successfully cleaned up temporary runpodctl directory: {tmp_dir_for_runpodctl}")
+                except Exception as e_clean:
+                    logger.error(f"Job {job_id}: Failed to cleanup temporary runpodctl directory {tmp_dir_for_runpodctl}: {e_clean}")
+            elif tmp_dir_for_runpodctl: # Path was set but dir doesn't exist (e.g. failed before creation)
+                logger.debug(f"Job {job_id}: Temporary runpodctl directory {tmp_dir_for_runpodctl} not found for cleanup (may have failed before creation).")
+
+    # _extract_and_deserialize_archives is now in weather_http_utils.py
 
     ############################################################
     # Validator methods

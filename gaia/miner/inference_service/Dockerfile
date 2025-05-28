@@ -35,4 +35,4 @@ RUN mkdir -p /root/.cache/huggingface && chmod 777 /root/.cache/huggingface
 EXPOSE 8000
 
 # Command to run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000","--root-path","/run"] 
+CMD ["python", "-u", "app/main.py"] 
