@@ -99,7 +99,7 @@ def _load_config(self):
     config['era5_cache_retention_days'] = int(os.getenv('WEATHER_ERA5_CACHE_RETENTION_DAYS', '30'))
     config['ensemble_retention_days'] = int(os.getenv('WEATHER_ENSEMBLE_RETENTION_DAYS', '14'))
     config['db_run_retention_days'] = int(os.getenv('WEATHER_DB_RUN_RETENTION_DAYS', '90'))
-    config['run_hour_utc'] = int(os.getenv('WEATHER_RUN_HOUR_UTC', '2'))
+    config['run_hour_utc'] = int(os.getenv('WEATHER_RUN_HOUR_UTC', '18'))
     config['run_minute_utc'] = int(os.getenv('WEATHER_RUN_MINUTE_UTC', '0'))
     config['validator_hash_wait_minutes'] = int(os.getenv('WEATHER_VALIDATOR_HASH_WAIT_MINUTES', '10'))
 

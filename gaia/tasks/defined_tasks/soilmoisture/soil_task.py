@@ -41,6 +41,7 @@ import glob
 from collections import defaultdict
 import torch
 from gaia.tasks.defined_tasks.soilmoisture.utils.inference_class import SoilMoistureInferencePreprocessor
+from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import get_smap_data
 
 logger = get_logger(__name__)
 

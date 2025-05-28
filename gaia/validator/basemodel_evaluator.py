@@ -374,16 +374,22 @@ class BaseModelEvaluator:
                 return None
                 
             logger.info(f"Retrieving geomagnetic baseline prediction for task_id: {task_id}")
-            result = await self.db_manager.get_baseline_prediction(
-                task_name="geomagnetic",
-                task_id=task_id
-            )
-            
-            if result and 'prediction' in result and 'value' in result['prediction']:
-                return float(result['prediction']['value'])
-            
-            logger.warning(f"No geomagnetic baseline prediction found for task_id {task_id}")
-            return None
+            result = await self.db_manager.get_baseline_prediction(task_name="geomagnetic", task_id=task_id)
+
+            if result and 'prediction' in result:
+                prediction_value = result['prediction']
+                if isinstance(prediction_value, (float, int)):
+                    logger.info(f"Retrieved geomagnetic baseline prediction for task_id {task_id}: {float(prediction_value)}")
+                    return float(prediction_value)
+                elif isinstance(prediction_value, dict) and 'value' in prediction_value and isinstance(prediction_value['value'], (float, int)):
+                    logger.warning(f"Retrieved geomagnetic baseline prediction for task_id {task_id} in dict format: {prediction_value['value']}. Consider re-saving in simpler format.")
+                    return float(prediction_value['value'])
+                else:
+                    logger.warning(f"Geomagnetic baseline prediction for task_id {task_id} has unexpected payload type or structure: {type(prediction_value)}, value: {prediction_value}")
+                    return None
+            else:
+                logger.warning(f"No geomagnetic baseline prediction found or 'prediction' field missing for task_id {task_id}")
+                return None
         except Exception as e:
             logger.error(f"Error retrieving geomagnetic baseline prediction: {e}")
             logger.error(traceback.format_exc())

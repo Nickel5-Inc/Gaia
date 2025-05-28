@@ -723,10 +723,22 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 logger.warning(f"No baseline prediction found for {task_name}, task_id: {task_id}, region: {region_id}")
                 return None
                 
-            if isinstance(result['prediction'], dict):
-                prediction_data = result['prediction']
+            raw_prediction_from_db = result['prediction']
+            prediction_data: Any
+
+            if isinstance(raw_prediction_from_db, (dict, list)):
+                prediction_data = raw_prediction_from_db
+            elif isinstance(raw_prediction_from_db, str):
+                try:
+                    prediction_data = json.loads(raw_prediction_from_db)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON string from DB for baseline prediction '{task_name}' task_id '{task_id}': {raw_prediction_from_db}. Error: {e}")
+                    return None 
+            elif isinstance(raw_prediction_from_db, (int, float, bool)) or raw_prediction_from_db is None:
+                prediction_data = raw_prediction_from_db
             else:
-                prediction_data = json.loads(result['prediction'])
+                logger.error(f"Unexpected type for baseline prediction from DB for '{task_name}' task_id '{task_id}': {type(raw_prediction_from_db)}. Value: {raw_prediction_from_db}")
+                return None 
                 
             return {
                 "task_name": result['task_name'],
