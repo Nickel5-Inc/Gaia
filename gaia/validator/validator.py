@@ -527,7 +527,7 @@ class GaiaValidator:
             else:
                 miners_to_query = nodes_to_consider
                 if self.args.test and len(miners_to_query) > 10:
-                    selected_hotkeys_for_test = list(miners_to_query.keys())[-10:]
+                    selected_hotkeys_for_test = list(miners_to_query.keys())[:10]
                     miners_to_query = {k: miners_to_query[k] for k in selected_hotkeys_for_test}
                     logger.info(f"Test mode: Selected the first {len(miners_to_query)} miners to query for endpoint: {endpoint} (no specific hotkeys provided).")
                 elif not self.args.test:
@@ -567,7 +567,7 @@ class GaiaValidator:
                                 logger.warning(f"Handshake timed out for miner {miner_hotkey} at {base_url}")
                                 return None
                             except Exception as hs_err:
-                                logger.error(f"Handshake failed for miner {miner_hotkey} at {base_url}: {type(hs_err).__name__} - {hs_err}")
+                                logger.warning(f"Handshake failed for miner {miner_hotkey} at {base_url}: {type(hs_err).__name__} - {hs_err}")
                                 logger.debug(traceback.format_exc())
                                 return None
 
