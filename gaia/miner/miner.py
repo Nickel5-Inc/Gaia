@@ -487,96 +487,48 @@ if __name__ == "__main__":
     load_dotenv(".env", override=True)
 
     # --- Alembic check code ---
-    # Set DB_TARGET for miner-specific migrations
-    os.environ['DB_TARGET'] = 'miner'
-    logger.info(f"[Startup] DB_TARGET set to: {os.environ.get('DB_TARGET')}") # Log the DB_TARGET
+    # No need to set DB_TARGET since we have separate configurations now
+    logger.info(f"[Startup] Using miner-specific Alembic configuration")
 
-    # Copied from validator.py
     try:
         # Use print here as logger might not be fully setup yet
         print("[Startup] Checking database schema version using Alembic...")
-        # Construct path relative to this script file to find alembic.ini at project root
+        # Construct path relative to this script file to find alembic_miner.ini at project root
         script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.abspath(os.path.join(script_dir, "..", "..")) # Assumes script is in gaia/miner/
-        alembic_ini_path = os.path.join(project_root, "alembic.ini")
+        alembic_ini_path = os.path.join(project_root, "alembic_miner.ini")
 
         if not os.path.exists(alembic_ini_path):
-            print(f"[Startup] ERROR: alembic.ini not found at expected path: {alembic_ini_path}")
-            sys.exit("Alembic configuration not found.")
+            print(f"[Startup] ERROR: alembic_miner.ini not found at expected path: {alembic_ini_path}")
+            sys.exit("Alembic miner configuration not found.")
 
         alembic_cfg = Config(alembic_ini_path)
+        print(f"[Startup] Miner: Using Alembic configuration from: {alembic_ini_path}")
         
-        # Dynamically set version_locations on the Config object based on DB_TARGET
-        db_target_for_config = os.environ.get('DB_TARGET')
-        if db_target_for_config:
-            # Construct an absolute path to the specific versions directory
-            # Assumes this script (miner.py) is in a subdirectory of project_root (e.g., project_root/gaia/miner/miner.py)
-            # and alembic_migrations is at project_root/alembic_migrations
-            current_script_dir = os.path.dirname(os.path.abspath(__file__))
-            # project_root for alembic_migrations should be two levels up from gaia/miner/ script_dir
-            project_root_for_alembic = os.path.abspath(os.path.join(current_script_dir, "..", "..")) 
-            
-            absolute_version_path = os.path.join(project_root_for_alembic, "alembic_migrations", "versions", db_target_for_config)
-            # alembic_cfg.version_locations = [absolute_version_path] # Previous attempt
-            # Instead, use set_main_option to make it act like it was read from ini
-            alembic_cfg.set_main_option("version_locations", absolute_version_path)
-            print(f"[Startup] Attempting to set main option 'version_locations' to: {absolute_version_path}")
-            
-            if not os.path.isdir(absolute_version_path):
-                print(f"[Startup] CRITICAL ERROR: Calculated absolute version path does not exist or is not a directory: {absolute_version_path}")
-                # Consider sys.exit() here if this path is critical and missing
-        else:
-            print("[Startup] ERROR: DB_TARGET not set. Cannot dynamically set Alembic version_locations.")
-            # Consider exiting or raising an error if DB_TARGET is essential
-            # For now, let it proceed and likely fail at command.upgrade if path isn't set
-
-        # --- Start Diagnostic Block ---
-        print(f"[Startup] DIAGNOSTIC: alembic_cfg.version_locations attribute (programmatic): {getattr(alembic_cfg, 'version_locations', 'Not Set on object - this is not used by ScriptDirectory.from_config')}")
-        print(f"[Startup] DIAGNOSTIC: Value from get_main_option('version_locations'): {alembic_cfg.get_main_option('version_locations')}")
-        
+        # --- Diagnostic Block ---
         try:
             from alembic.script import ScriptDirectory
             script_dir_instance = ScriptDirectory.from_config(alembic_cfg)
             
-            print(f"[Startup] DIAGNOSTIC: ScriptDirectory main path (from script_location in ini): {script_dir_instance.dir}")
-            print(f"[Startup] DIAGNOSTIC: ScriptDirectory effective version_locations: {script_dir_instance.version_locations}")
-            
-            target_rev_to_find = "79b314575524"
-            revision_obj = None # Initialize
-            try:
-                revision_obj = script_dir_instance.get_revision(target_rev_to_find)
-            except Exception as e_get_rev:
-                print(f"[Startup] DIAGNOSTIC: Error calling script_dir_instance.get_revision('{target_rev_to_find}'): {e_get_rev}")
-
-            if revision_obj:
-                print(f"[Startup] DIAGNOSTIC: Successfully found revision '{target_rev_to_find}' via ScriptDirectory. Path: {revision_obj.path}")
-            else:
-                print(f"[Startup] DIAGNOSTIC: FAILED to find revision '{target_rev_to_find}' via ScriptDirectory.")
-                # List all revisions this ScriptDirectory instance *can* find
-                all_found_revs = [rev.revision for rev in script_dir_instance.walk_revisions()]
-                print(f"[Startup] DIAGNOSTIC: Revisions found by this ScriptDirectory instance: {all_found_revs}")
+            print(f"[Startup] DIAGNOSTIC: ScriptDirectory main path: {script_dir_instance.dir}")
+            print(f"[Startup] DIAGNOSTIC: ScriptDirectory version_locations: {script_dir_instance.version_locations}")
         except Exception as e_diag:
-            print(f"[Startup] DIAGNOSTIC: Error during manual ScriptDirectory check: {e_diag}", exc_info=True)
+            print(f"[Startup] DIAGNOSTIC: Error during ScriptDirectory check: {e_diag}")
         # --- End Diagnostic Block ---
 
         alembic_auto_upgrade = os.getenv("ALEMBIC_AUTO_UPGRADE", "True").lower() in ["true", "1", "yes"]
         if alembic_auto_upgrade:
-            if not db_target_for_config: # Guard against running upgrade without target path
-                print("[Startup] ERROR: Cannot run Alembic upgrade because DB_TARGET was not set, so version_locations could not be determined.")
-            else:
-                print(f"[Startup] ALEMBIC_AUTO_UPGRADE is True. Attempting to upgrade database schema to head for {db_target_for_config}...")
-                command.upgrade(alembic_cfg, "head")
-                print("[Startup] Database schema is up-to-date (or upgrade attempted).")
+            print(f"[Startup] ALEMBIC_AUTO_UPGRADE is True. Attempting to upgrade database schema to head...")
+            command.upgrade(alembic_cfg, "head")
+            print("[Startup] Database schema is up-to-date (or upgrade attempted).")
         else:
-            print("[Startup] ALEMBIC_AUTO_UPGRADE is False. Skipping automatic schema upgrade. Current schema version will be checked by the application later if necessary.")
-            # Optionally, you might want to run command.current(alembic_cfg) to just log the current version without upgrading.
-            # For now, just skipping as per common practice when auto-upgrade is off.
+            print("[Startup] ALEMBIC_AUTO_UPGRADE is False. Skipping automatic schema upgrade.")
 
     except CommandError as e:
          # Use print here as well
          print(f"[Startup] ERROR: Alembic command failed during startup check: {e}")
 
-    logger.info("Miner Alembic check complete. Starting main miner application...") # Keep this log message after the check
+    logger.info("Miner Alembic check complete. Starting main miner application...")
     
     # --- Argument Parsing ---
     parser = argparse.ArgumentParser(description="Start the miner with optional flags.")

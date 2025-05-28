@@ -1283,20 +1283,20 @@ class GaiaValidator:
                 # The MinerScoreSender task will be added conditionally below
                 #lambda: self.check_for_updates(),
                 lambda: self.manage_earthdata_token(),
-                lambda: self.database_monitor(),
-                lambda: self.plot_database_metrics_periodically() # Added plotting task
+                #lambda: self.database_monitor(),
+                #lambda: self.plot_database_metrics_periodically() # Added plotting task
             ]
 
             # Add DB Sync tasks conditionally
-            if self.is_source_validator_for_db_sync and self.backup_manager:
-                logger.info(f"Adding DB Sync Backup task (interval: {self.db_sync_interval_hours}h).")
-                # Using insert to make it one of the earlier tasks, but order might not be critical.
-                tasks.insert(0, lambda: self.backup_manager.start_periodic_backups(self.db_sync_interval_hours))
-            elif not self.is_source_validator_for_db_sync and self.restore_manager:
-                logger.info(f"Adding DB Sync Restore task (interval: {self.db_sync_interval_hours}h).")
-                tasks.insert(0, lambda: self.restore_manager.start_periodic_restores(self.db_sync_interval_hours))
-            else:
-                logger.info("DB Sync is not active for this node (either source or replica manager failed to init, not configured, or Azure manager failed).")
+            # if self.is_source_validator_for_db_sync and self.backup_manager:
+            #     logger.info(f"Adding DB Sync Backup task (interval: {self.db_sync_interval_hours}h).")
+            #     # Using insert to make it one of the earlier tasks, but order might not be critical.
+            #     tasks.insert(0, lambda: self.backup_manager.start_periodic_backups(self.db_sync_interval_hours))
+            # elif not self.is_source_validator_for_db_sync and self.restore_manager:
+            #     logger.info(f"Adding DB Sync Restore task (interval: {self.db_sync_interval_hours}h).")
+            #     tasks.insert(0, lambda: self.restore_manager.start_periodic_restores(self.db_sync_interval_hours))
+            # else:
+            #     logger.info("DB Sync is not active for this node (either source or replica manager failed to init, not configured, or Azure manager failed).")
 
             
             # Conditionally add miner_score_sender task
@@ -1459,7 +1459,7 @@ class GaiaValidator:
                         # Only enter weight_setting state when actually setting weights
                         if (min_interval is None or 
                             (blocks_since_update is not None and blocks_since_update >= min_interval)):
-                            
+                            logger.info(f"Setting weights: {blocks_since_update}/{min_interval} blocks")
                             can_set = w.can_set_weights(
                                 self.substrate, 
                                 self.netuid, 
@@ -1506,7 +1506,7 @@ class GaiaValidator:
                         logger.error(traceback.format_exc())
                         return False
                     finally:
-                        await asyncio.sleep(12)
+                        await asyncio.sleep(60)
 
                 # Run scoring cycle with overall timeout
                 await asyncio.wait_for(scoring_cycle(), timeout=900)
@@ -2404,55 +2404,38 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # --- Alembic check code for Validator ---
-    # Set DB_TARGET for validator-specific migrations
-    os.environ['DB_TARGET'] = 'validator' # Ensure this is set for validator
-    logger.info(f"[Startup] DB_TARGET set to: {os.environ.get('DB_TARGET')}")
+    # No need to set DB_TARGET since we have separate configurations now
+    logger.info(f"[Startup] Using validator-specific Alembic configuration")
 
     try:
         print("[Startup] Checking database schema version using Alembic...")
-        # Construct path relative to this script file to find alembic.ini at project root
+        # Construct path relative to this script file to find alembic_validator.ini at project root
         # Assumes validator.py is in project_root/gaia/validator/validator.py
         current_script_dir_val = os.path.dirname(os.path.abspath(__file__))
         project_root_val = os.path.abspath(os.path.join(current_script_dir_val, "..", ".."))
-        alembic_ini_path_val = os.path.join(project_root_val, "alembic.ini")
+        alembic_ini_path_val = os.path.join(project_root_val, "alembic_validator.ini")
 
         if not os.path.exists(alembic_ini_path_val):
-            print(f"[Startup] ERROR: alembic.ini not found at expected path: {alembic_ini_path_val}")
-            sys.exit("Alembic configuration not found for validator.")
+            print(f"[Startup] ERROR: alembic_validator.ini not found at expected path: {alembic_ini_path_val}")
+            sys.exit("Alembic validator configuration not found.")
 
         alembic_cfg_val = Config(alembic_ini_path_val)
+        print(f"[Startup] Validator: Using Alembic configuration from: {alembic_ini_path_val}")
 
-        db_target_for_val_config = os.environ.get('DB_TARGET')
-        if db_target_for_val_config:
-            absolute_version_path_val = os.path.join(project_root_val, "alembic_migrations", "versions", db_target_for_val_config)
-            alembic_cfg_val.set_main_option("version_locations", absolute_version_path_val)
-            print(f"[Startup] Validator: Attempting to set main option 'version_locations' to: {absolute_version_path_val}")
-            if not os.path.isdir(absolute_version_path_val):
-                print(f"[Startup] Validator: CRITICAL ERROR: Calculated absolute version path does not exist: {absolute_version_path_val}")
-        else:
-            print("[Startup] Validator: ERROR: DB_TARGET not set. Cannot dynamically set Alembic version_locations.")
-
-        # Diagnostic block for validator (optional, but good for consistency)
-        print(f"[Startup] Validator DIAGNOSTIC: Value from get_main_option('version_locations'): {alembic_cfg_val.get_main_option('version_locations')}")
+        # Diagnostic block for validator
         try:
             from alembic.script import ScriptDirectory
             script_dir_instance_val = ScriptDirectory.from_config(alembic_cfg_val)
             print(f"[Startup] Validator DIAGNOSTIC: ScriptDirectory main path: {script_dir_instance_val.dir}")
-            print(f"[Startup] Validator DIAGNOSTIC: ScriptDirectory effective version_locations: {script_dir_instance_val.version_locations}")
-            # You might want to find a specific validator revision if known, e.g., validator_db_head_id = "1d8c0e7972ea"
-            # test_rev_obj = script_dir_instance_val.get_revision(validator_db_head_id) 
-            # print(f"[Startup] Validator DIAGNOSTIC: Found validator test revision: {bool(test_rev_obj)}")
+            print(f"[Startup] Validator DIAGNOSTIC: ScriptDirectory version_locations: {script_dir_instance_val.version_locations}")
         except Exception as e_diag_val:
             print(f"[Startup] Validator DIAGNOSTIC: Error: {e_diag_val}")
 
         alembic_auto_upgrade_val = os.getenv("ALEMBIC_AUTO_UPGRADE", "True").lower() in ["true", "1", "yes"]
         if alembic_auto_upgrade_val:
-            if not db_target_for_val_config:
-                print("[Startup] Validator: ERROR: Cannot run Alembic upgrade, DB_TARGET not set.")
-            else:
-                print(f"[Startup] Validator: ALEMBIC_AUTO_UPGRADE is True. Attempting to upgrade to head for {db_target_for_val_config}...")
-                command.upgrade(alembic_cfg_val, "head")
-                print("[Startup] Validator: Database schema is up-to-date (or upgrade attempted).")
+            print(f"[Startup] Validator: ALEMBIC_AUTO_UPGRADE is True. Attempting to upgrade to head...")
+            command.upgrade(alembic_cfg_val, "head")
+            print("[Startup] Validator: Database schema is up-to-date (or upgrade attempted).")
         else:
             print("[Startup] Validator: ALEMBIC_AUTO_UPGRADE is False. Skipping auto schema upgrade.")
 

@@ -710,8 +710,12 @@ class WeatherTask(Task):
 
                 except Exception as db_err:
                      logger.error(f"Failed to create forecast run record in DB: {db_err}", exc_info=True)
-                     await asyncio.sleep(60)
-                     continue 
+                     if self.test_mode:
+                         logger.warning("TEST MODE: DB error during run_id creation. Exiting validator_execute loop.")
+                         break 
+                     else:
+                         await asyncio.sleep(60)
+                         continue 
 
                 await validator.update_task_status('weather', 'processing', 'sending_fetch_requests')
                 await _update_run_status(self, run_id, "sending_fetch_requests")
@@ -1036,9 +1040,9 @@ class WeatherTask(Task):
                       try: await _update_run_status(self, run_id, "error", error_message=f"Unhandled loop error: {loop_err}")
                       except: pass
                  
-                 # In test mode, log the error but continue to try the full pipeline
                  if self.test_mode:
-                     logger.info("TEST MODE: Encountered an error but continuing to try and complete the full pipeline.")
+                     logger.info("TEST MODE: Encountered an error. Exiting validator_execute loop.")
+                     break 
                  
                  await asyncio.sleep(600) # Sleep only if not in test mode
 
