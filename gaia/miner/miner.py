@@ -93,6 +93,7 @@ class Miner:
         self.my_public_base_url: Optional[str] = None
         self.weather_inference_service_url: Optional[str] = None # Added for inference service URL
         self.weather_task = None # Will be initialized in lifespan
+        self.weather_runpod_api_key = None
 
         # Load environment variables
         load_dotenv(".env")
@@ -151,16 +152,30 @@ class Miner:
             node_type="miner"
         )
         
-        weather_enabled = os.getenv("WEATHER_MINER_ENABLED", "false").lower() in ["true", "1", "yes"]
+        weather_enabled_env_val = os.getenv("WEATHER_MINER_ENABLED", "false")
+        weather_enabled = weather_enabled_env_val.lower() in ["true", "1", "yes"]
+        
+        self.weather_inference_service_url = os.getenv("WEATHER_INFERENCE_SERVICE_URL")
+        runpod_api_key_from_env = os.getenv("CREDENTIAL")
+        if runpod_api_key_from_env:
+            self.weather_runpod_api_key = runpod_api_key_from_env
+            logger.info(f"RunPod API Key loaded from CREDENTIAL env var in __init__.")
+
         if weather_enabled:
-            logger.info("Weather task ENABLED for this miner (WEATHER_MINER_ENABLED=True)")
-            # self.weather_task = WeatherTask(
-            #     db_manager=self.database_manager,
-            #     node_type="miner"
-            # )
+            logger.info("Weather task ENABLED by WEATHER_MINER_ENABLED. Initializing in __init__.")
+            weather_task_args = {
+                "db_manager": self.database_manager,
+                "node_type": "miner",
+                "inference_service_url": self.weather_inference_service_url
+            }
+            if self.weather_runpod_api_key:
+                weather_task_args["runpod_api_key"] = self.weather_runpod_api_key
+            
+            self.weather_task = WeatherTask(**weather_task_args)
+            logger.info("WeatherTask basic initialization completed in __init__.")
         else:
-            logger.info("Weather task DISABLED for this miner. Set WEATHER_MINER_ENABLED=True to enable.")
-            # self.weather_task = None
+            logger.info("Weather task DISABLED by WEATHER_MINER_ENABLED. self.weather_task remains None.")
+            self.weather_task = None
     
 
     def setup_neuron(self) -> bool:
@@ -331,82 +346,67 @@ class Miner:
                     # Depending on severity, you might want to sys.exit(1) here
                 
                 # Weather Inference Service Setup
-                weather_inference_type = os.getenv("WEATHER_INFERENCE_TYPE", "local_model").lower()
-                service_url_env = os.getenv("WEATHER_INFERENCE_SERVICE_URL")
-                
-                # Corrected and robust way to get and log the environment variable
                 weather_enabled_env_val = os.getenv("WEATHER_MINER_ENABLED", "false") 
                 self.logger.info(f"DEBUG_WEATHER_ENABLED: Value of WEATHER_MINER_ENABLED from os.getenv: '{weather_enabled_env_val}'")
                 weather_enabled_env = weather_enabled_env_val.lower() in ["true", "1", "yes"]
                 
-                self.weather_runpod_api_key = None # Initialize
 
                 if weather_enabled_env:
-                    if weather_inference_type == "http_service":
-                        if not service_url_env:
-                            self.logger.error("WEATHER_INFERENCE_TYPE is 'http_service' but WEATHER_INFERENCE_SERVICE_URL is not set. Weather task cannot use inference service.")
-                        else:
-                            self.weather_inference_service_url = service_url_env
-                            self.logger.info(f"HTTP inference service configured. URL: {self.weather_inference_service_url}")
+                    if self.weather_task is None:
+                        self.logger.warning("WeatherTask was None at startup despite WEATHER_MINER_ENABLED being true. Re-initializing. This might indicate an issue if __init__ didn't set it.")
+                        weather_task_args = {
+                            "db_manager": self.database_manager,
+                            "node_type": "miner",
+                            "inference_service_url": self.weather_inference_service_url
+                        }
+                        if self.weather_runpod_api_key:
+                            weather_task_args["runpod_api_key"] = self.weather_runpod_api_key
+                        self.weather_task = WeatherTask(**weather_task_args)
 
-                            # Check for RunPod API Key specifically if using http_service
-                            runpod_api_key_from_env = os.getenv("CREDENTIAL")
-                            if runpod_api_key_from_env:
-                                self.weather_runpod_api_key = runpod_api_key_from_env
-                                self.logger.info(f"RunPod API Key loaded from CREDENTIAL env var. Will be used for Authorization header.")
+                    if self.weather_task:
+                        weather_inference_type = os.getenv("WEATHER_INFERENCE_TYPE", "local_model").lower()
+                        service_url_env = self.weather_inference_service_url
+
+                        if weather_inference_type == "http_service":
+                            if not service_url_env:
+                                self.logger.error("WEATHER_INFERENCE_TYPE is 'http_service' but WEATHER_INFERENCE_SERVICE_URL is not set. Weather task cannot use inference service.")
                             else:
-                                self.logger.info("CREDENTIAL env var not found. If this HTTP service is non-RunPod, it might use MINER_API_KEY_FOR_INFRA_SERVICE (checked in WeatherTask).")
+                                self.logger.info(f"HTTP inference service configured. URL: {self.weather_inference_service_url}")
 
-                            # If it's a local URL, perform readiness check (won't apply to RunPod usually)
-                            if _is_local_url(service_url_env):
-                                self.logger.info(f"Local inference service URL configured: {service_url_env}. Checking readiness...")
-                                service_ready = await check_local_inference_service_readiness(service_url_env)
-                                if service_ready:
-                                    self.logger.info(f"Local inference service is ready.")
+                                if _is_local_url(service_url_env):
+                                    self.logger.info(f"Local inference service URL configured: {service_url_env}. Checking readiness...")
+                                    service_ready = await check_local_inference_service_readiness(service_url_env)
+                                    if service_ready:
+                                        self.logger.info(f"Local inference service is ready.")
+                                    else:
+                                        self.logger.error(f"Local inference service at {service_url_env} failed to become ready. Weather task may not function correctly.")
                                 else:
-                                    self.logger.error(f"Local inference service at {service_url_env} failed to become ready. Weather task may not function correctly if this URL was intended for local service.")
+                                    self.logger.info(f"Remote HTTP inference service URL: {self.weather_inference_service_url}. No local readiness check performed.")
+                        elif weather_inference_type == "local_model":
+                            self.logger.info(f"Weather inference type is '{weather_inference_type}'. WeatherTask will use its internal model logic.")
+                        else: 
+                            self.logger.warning(f"Unhandled WEATHER_INFERENCE_TYPE: '{weather_inference_type}'. Defaulting to local model behavior if applicable, or no remote service.")
+
+                        if self.config:
+                            if hasattr(self.weather_task, 'config') and self.weather_task.config is not None:
+                                self.weather_task.config['netuid'] = self.config.netuid
+                                self.weather_task.config['chain_endpoint'] = self.config.chain_endpoint
+                                if 'miner_public_base_url' not in self.weather_task.config:
+                                    self.weather_task.config['miner_public_base_url'] = self.my_public_base_url
                             else:
-                                self.logger.info(f"Remote HTTP inference service URL: {self.weather_inference_service_url}. No local readiness check performed.")
-
-                    elif weather_inference_type == "local_model": # Keep other types as they were
-                        self.logger.info(f"Weather inference type is '{weather_inference_type}'. WeatherTask will use its internal model logic.")
-                    # Add other existing inference types here if any (e.g., azure_foundry)
-                    else: 
-                        self.logger.warning(f"Unhandled WEATHER_INFERENCE_TYPE: '{weather_inference_type}'. Defaulting to local model behavior if applicable, or no remote service.")
-
-                # Initialize WeatherTask if enabled, after inference URL is determined
-                if weather_enabled_env:
-                    self.logger.info("Initializing WeatherTask...")
-                    weather_task_args = {
-                        "db_manager": self.database_manager,
-                        "node_type": "miner",
-                        "inference_service_url": self.weather_inference_service_url 
-                        # No need to pass weather_inference_type to WeatherTask if it simplifies
-                    }
-                    if self.weather_runpod_api_key: # Only pass if found
-                        weather_task_args["runpod_api_key"] = self.weather_runpod_api_key
-
-                    self.weather_task = WeatherTask(**weather_task_args)
-                    
-                    # Update weather_task.config with relevant chain/neuron info if it was initialized
-                    if self.weather_task and self.config: # self.config is from setup_neuron
-                        if hasattr(self.weather_task, 'config') and self.weather_task.config is not None:
-                            self.weather_task.config['netuid'] = self.config.netuid
-                            self.weather_task.config['chain_endpoint'] = self.config.chain_endpoint
-                            # miner_public_base_url is set during MINER_SELF_CHECK in setup_neuron if weather_task exists
-                            # If it was None then, it might be updated here, or re-ensure it gets there.
-                            if 'miner_public_base_url' not in self.weather_task.config:
-                                self.weather_task.config['miner_public_base_url'] = self.my_public_base_url # from setup_neuron
+                                self.weather_task.config = {
+                                    'netuid': self.config.netuid,
+                                    'chain_endpoint': self.config.chain_endpoint,
+                                    'miner_public_base_url': self.my_public_base_url
+                                }
+                            self.weather_task.keypair = self.keypair
+                            self.logger.info("WeatherTask re-configured with neuron details during startup.")
                         else:
-                            self.weather_task.config = {
-                                'netuid': self.config.netuid,
-                                'chain_endpoint': self.config.chain_endpoint,
-                                'miner_public_base_url': self.my_public_base_url # from setup_neuron
-                            }
-                        self.weather_task.keypair = self.keypair # from setup_neuron
-                        self.logger.info("WeatherTask initialized and configured with neuron details.")
+                            self.logger.warning("Miner self.config not found during startup, WeatherTask config might be incomplete.")
+                    else:
+                        self.logger.error("WeatherTask is still None during startup even though weather_enabled_env is true. This is unexpected.")
                 else:
-                    self.logger.info("Weather task is disabled. DEBUG_WEATHER_ENABLED reported: WEATHER_MINER_ENABLED is not true, or was evaluated as such.")
+                    self.logger.info("Weather task is disabled (checked in startup event). self.weather_task should be None.")
 
                 yield
                 self.logger.info("Application shutting down...")
