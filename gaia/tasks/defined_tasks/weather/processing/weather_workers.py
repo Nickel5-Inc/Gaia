@@ -782,6 +782,7 @@ async def finalize_scores_worker(self):
     CHECK_INTERVAL_SECONDS = 30 if self.test_mode else int(self.config.get('final_scoring_check_interval_seconds', 3600))
     ERA5_DELAY_DAYS = int(self.config.get('era5_delay_days', 5))
     FORECAST_DURATION_HOURS = int(self.config.get('forecast_duration_hours', 240))
+    ERA5_BUFFER_HOURS = int(self.config.get('era5_buffer_hours', 6)) # New config, defaults to 6 hours
 
     era5_climatology_ds_for_cycle = await self._get_or_load_era5_climatology()
     if era5_climatology_ds_for_cycle is None:
@@ -821,8 +822,8 @@ async def finalize_scores_worker(self):
                     """
                     ready_runs = await self.db_manager.fetch_all(runs_to_score_query, {})
                 else:
-                    init_time_cutoff = now_utc - timedelta(days=ERA5_DELAY_DAYS) - timedelta(hours=max_final_lead_hour)
-                    retry_cutoff_time = now_utc - timedelta(hours=6) # For retrying failed attempts
+                    init_time_cutoff = now_utc - timedelta(days=ERA5_DELAY_DAYS) - timedelta(hours=max_final_lead_hour) - timedelta(hours=ERA5_BUFFER_HOURS)
+                    retry_cutoff_time = now_utc - timedelta(hours=6)
                     runs_to_score_query = """
                     SELECT id, gfs_init_time_utc
                     FROM weather_forecast_runs
