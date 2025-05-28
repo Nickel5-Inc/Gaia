@@ -5,6 +5,7 @@ import pprint
 import math
 import traceback
 import httpx
+import json
 from gaia.APIcalls.website_api import GaiaCommunicator
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from typing import Dict, Optional
