@@ -1231,7 +1231,7 @@ class GaiaValidator:
             logger.info("Database tables initialized.")
             
             # Initialize DB Sync Components - AFTER DB init
-            await self._initialize_db_sync_components()
+            # await self._initialize_db_sync_components()
 
             #logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
             await handle_db_wipe(self.database_manager)
