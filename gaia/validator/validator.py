@@ -339,8 +339,14 @@ class GaiaValidator:
                     logger.error(f"Error updating {task_name} task status during shutdown: {e_status_update}")
 
             logger.info("Cleaning up resources (DB connections, HTTP clients, etc.)...")
-            await self.cleanup_resources()
-            logger.info("Resource cleanup completed.")
+            try:
+                # Add timeout for cleanup to prevent hanging
+                await asyncio.wait_for(self.cleanup_resources(), timeout=30)
+                logger.info("Resource cleanup completed.")
+            except asyncio.TimeoutError:
+                logger.warning("Resource cleanup timed out after 30 seconds, proceeding with shutdown")
+            except Exception as e_cleanup:
+                logger.error(f"Error during resource cleanup: {e_cleanup}")
             
             logger.info("Performing final garbage collection...")
             try:
@@ -350,10 +356,9 @@ class GaiaValidator:
             except Exception as e_gc:
                 logger.error(f"Error during final garbage collection: {e_gc}")
             
-            self._cleanup_done = True
-            logger.info("Graceful shutdown sequence fully completed.")
-            
-            # Create cleanup completion file for auto updater
+            # Create cleanup completion file BEFORE setting _cleanup_done
+            # This ensures auto updater gets the signal even if some processes are slow
+            logger.info("Creating cleanup completion file for auto updater...")
             try:
                 cleanup_file = "/tmp/validator_cleanup_done"
                 with open(cleanup_file, "w") as f:
@@ -361,6 +366,9 @@ class GaiaValidator:
                 logger.info(f"Created cleanup completion file: {cleanup_file}")
             except Exception as e_cleanup_file:
                 logger.error(f"Failed to create cleanup completion file: {e_cleanup_file}")
+            
+            self._cleanup_done = True
+            logger.info("Graceful shutdown sequence fully completed.")
             
         except Exception as e_shutdown_main:
             logger.error(f"Error during main shutdown sequence: {e_shutdown_main}", exc_info=True)

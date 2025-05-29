@@ -1649,6 +1649,18 @@ class WeatherTask(Task):
         in case of errors or shutdowns.
         """
         logger.info("Cleaning up weather task resources...")
+        
+        # Stop all background workers
+        logger.info("Stopping all background workers...")
+        await self.stop_background_workers()
+        
+        # Clean up any other resources
+        try:
+            if hasattr(self, 'era5_climatology_ds') and self.era5_climatology_ds is not None:
+                self.era5_climatology_ds.close()
+                logger.info("Closed ERA5 climatology dataset")
+        except Exception as e:
+            logger.warning(f"Error closing ERA5 climatology dataset: {e}")
 
         logger.info("Weather task cleanup completed")
        
