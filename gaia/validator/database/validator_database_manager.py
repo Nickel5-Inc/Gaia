@@ -127,14 +127,6 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 'last_check': 0
             }
             
-            # Operation statistics
-            cls._instance._operation_stats = {
-                'ddl_operations': 0,
-                'read_operations': 0,
-                'write_operations': 0,
-                'long_running_queries': []
-            }
-            
             # Initialize engine placeholders
             cls._instance._engine = None
             cls._instance._session_factory = None
