@@ -327,6 +327,17 @@ class GaiaValidator:
             else:
                 logger.info("Watchdog was not running.")
             
+            # Create cleanup completion file early for auto updater
+            # PM2 will handle any remaining background processes
+            logger.info("Creating cleanup completion file for auto updater...")
+            try:
+                cleanup_file = "/tmp/validator_cleanup_done"
+                with open(cleanup_file, "w") as f:
+                    f.write(f"Cleanup initiated at {time.time()}\n")
+                logger.info(f"Created cleanup completion file: {cleanup_file}")
+            except Exception as e_cleanup_file:
+                logger.error(f"Failed to create cleanup completion file: {e_cleanup_file}")
+            
             logger.info("Updating task statuses to 'stopping'...")
             for task_name in ['soil', 'geomagnetic', 'weather', 'scoring', 'deregistration', 'status_logger', 'db_sync_backup', 'db_sync_restore', 'miner_score_sender', 'earthdata_token', 'db_monitor', 'plot_db_metrics']:
                 try:
@@ -339,8 +350,14 @@ class GaiaValidator:
                     logger.error(f"Error updating {task_name} task status during shutdown: {e_status_update}")
 
             logger.info("Cleaning up resources (DB connections, HTTP clients, etc.)...")
-            await self.cleanup_resources()
-            logger.info("Resource cleanup completed.")
+            try:
+                # Add timeout for cleanup to prevent hanging
+                await asyncio.wait_for(self.cleanup_resources(), timeout=30)
+                logger.info("Resource cleanup completed.")
+            except asyncio.TimeoutError:
+                logger.warning("Resource cleanup timed out after 30 seconds, proceeding with shutdown")
+            except Exception as e_cleanup:
+                logger.error(f"Error during resource cleanup: {e_cleanup}")
             
             logger.info("Performing final garbage collection...")
             try:
@@ -358,6 +375,15 @@ class GaiaValidator:
             # Ensure cleanup_done is set even if part of the main shutdown fails, to prevent re-entry
             self._cleanup_done = True 
             logger.warning("Graceful shutdown sequence partially completed due to error.")
+            
+            # Still try to create cleanup completion file even if shutdown had errors
+            try:
+                cleanup_file = "/tmp/validator_cleanup_done"
+                with open(cleanup_file, "w") as f:
+                    f.write(f"Cleanup completed with errors at {time.time()}\n")
+                logger.info(f"Created cleanup completion file (with errors): {cleanup_file}")
+            except Exception as e_cleanup_file:
+                logger.error(f"Failed to create cleanup completion file after error: {e_cleanup_file}")
 
     def setup_neuron(self) -> bool:
         """
@@ -695,7 +721,7 @@ class GaiaValidator:
                 try:
                     update_successful = await asyncio.wait_for(
                         perform_update(self),
-                        timeout=60  # 60 second timeout
+                        timeout=180  # 3 minute timeout to allow for cleanup and restart
                     )
 
                     if update_successful:
@@ -704,7 +730,7 @@ class GaiaValidator:
                         logger.debug("No updates available or update failed")
 
                 except asyncio.TimeoutError:
-                    logger.warning("Update check timed out after 30 seconds")
+                    logger.warning("Update check timed out after 3 minutes")
                 except Exception as e:
                     if "500" in str(e):
                         logger.warning(f"GitHub temporarily unavailable (500 error): {e}")
@@ -1231,7 +1257,7 @@ class GaiaValidator:
             logger.info("Database tables initialized.")
             
             # Initialize DB Sync Components - AFTER DB init
-            await self._initialize_db_sync_components()
+            # await self._initialize_db_sync_components()
 
             #logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
             await handle_db_wipe(self.database_manager)
@@ -1273,6 +1299,11 @@ class GaiaValidator:
             await self.basemodel_evaluator.initialize_models()
             logger.info("Baseline models initialization complete")
             
+            # Start auto-updater as independent task (not in main loop to avoid self-cancellation)
+            logger.info("Starting independent auto-updater task...")
+            auto_updater_task = asyncio.create_task(self.check_for_updates())
+            logger.info("Auto-updater task started independently")
+            
             tasks = [
                 lambda: self.geomagnetic_task.validator_execute(self),
                 lambda: self.soil_task.validator_execute(self),
@@ -1281,7 +1312,6 @@ class GaiaValidator:
                 lambda: self.main_scoring(),
                 lambda: self.handle_miner_deregistration_loop(),
                 # The MinerScoreSender task will be added conditionally below
-                lambda: self.check_for_updates(),
                 lambda: self.manage_earthdata_token(),
                 #lambda: self.database_monitor(),
                 #lambda: self.plot_database_metrics_periodically() # Added plotting task

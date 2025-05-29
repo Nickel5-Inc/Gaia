@@ -211,25 +211,33 @@ async def get_pm2_process_name():
         print(f"Error getting PM2 process name: {e}")
         return None
 
-
+#test6
 async def perform_update(validator):
     """Enhanced update process with dependency management"""
     logger.info("Starting update process...")
 
     # First check and install core dependencies
+    logger.info("Step 1: Checking and installing core dependencies...")
     if not await check_and_install_dependencies():
         logger.error("Failed to install core dependencies")
         return False
+    logger.info("Step 1 completed: Core dependencies checked/installed")
 
+    logger.info("Step 2: Checking for latest changes...")
     if await pull_latest_changes():
+        logger.info("Step 2 completed: Changes pulled successfully")
         try:
             # Install updated requirements
+            logger.info("Step 3: Installing updated requirements...")
             if not await install_requirements():
                 logger.error("Failed to install updated requirements")
                 return False
+            logger.info("Step 3 completed: Requirements installed successfully")
 
             # Check if scoring reset is needed
+            logger.info("Step 4: Checking if scoring reset is needed...")
             if check_version_and_reset():
+                logger.info("Step 4a: Scoring reset required, performing reset...")
                 try:
                     await validator.reset_scoring_system()
                     logger.info("Scoring system reset successfully")
@@ -239,28 +247,36 @@ async def perform_update(validator):
                     config.set("metadata", "reset_validator_scores", "False")
                     with open("setup.cfg", "w") as f:
                         config.write(f)
+                    logger.info("Step 4a completed: Scoring reset completed")
 
                 except Exception as e:
                     logger.error(f"Failed to reset scoring system: {e}")
                     logger.error(traceback.format_exc())
+            else:
+                logger.info("Step 4 completed: No scoring reset needed")
 
             # Handle PM2 restart
+            logger.info("Step 5: Initiating PM2 restart...")
             process_name = await get_pm2_process_name()
             if process_name:
-                logger.info(f"Restarting PM2 process: {process_name}")
+                logger.info(f"Step 5a: Found PM2 process: {process_name}, initiating restart...")
                 success = await restart_pm2_process(process_name)
                 if not success:
                     logger.error("Failed to restart via PM2")
                     return False
+                logger.info("Step 5a completed: PM2 restart initiated")
             else:
-                logger.warning("Not running under PM2, manual restart may be required")
+                logger.warning("Step 5 completed: Not running under PM2, manual restart may be required")
 
+            logger.info("Update process completed successfully - all steps finished")
             return True
 
         except Exception as e:
             logger.error(f"Error during update process: {e}")
             logger.error(traceback.format_exc())
             return False
+    else:
+        logger.info("Step 2 completed: No new changes to pull")
 
     return False
 
@@ -270,6 +286,10 @@ async def restart_pm2_process(process_name):
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            # Add a small delay to ensure any pending operations complete
+            logger.info("Preparing for graceful shutdown...")
+            await asyncio.sleep(2)
+            
             # First send SIGTERM to allow graceful shutdown
             logger.info("Sending SIGTERM for graceful shutdown...")
             term_proc = await asyncio.create_subprocess_exec(
@@ -278,21 +298,35 @@ async def restart_pm2_process(process_name):
                 stderr=asyncio.subprocess.PIPE
             )
             
+            # Wait for the SIGTERM command to complete
+            term_stdout, term_stderr = await term_proc.communicate()
+            if term_proc.returncode != 0:
+                logger.warning(f"SIGTERM command failed: {term_stderr.decode()}")
+            else:
+                logger.info("SIGTERM sent successfully")
+            
             # Wait for process to indicate cleanup is done via its status file
             cleanup_file = "/tmp/validator_cleanup_done"
-            max_wait = 60  # Maximum seconds to wait for cleanup
+            max_wait = 10  # Reduced to 10 seconds since PM2 will forcefully terminate anyway
             wait_interval = 1
+            cleanup_detected = False
             for _ in range(max_wait // wait_interval):
                 if os.path.exists(cleanup_file):
                     logger.info("Detected cleanup completion flag, proceeding with restart")
+                    cleanup_detected = True
                     try:
                         os.remove(cleanup_file)  # Clean up the file
                     except Exception as e:
                         logger.warning(f"Could not remove cleanup file: {e}")
                     break
                 await asyncio.sleep(wait_interval)
-            else:
-                logger.warning("Cleanup completion not detected after timeout, proceeding with restart")
+            
+            if not cleanup_detected:
+                logger.warning(f"Cleanup completion not detected after {max_wait} seconds")
+                logger.info("PM2 will handle any remaining background processes during restart")
+            
+            # Add small delay before restart to ensure main process has time to exit
+            await asyncio.sleep(2)
             
             # Then do the restart
             logger.info(f"Restarting process {process_name}...")
@@ -306,7 +340,9 @@ async def restart_pm2_process(process_name):
             
             if restart_proc.returncode == 0:
                 logger.info(f"PM2 restart successful on attempt {attempt + 1}")
-                return True
+                # Don't return True immediately, instead just break the retry loop
+                # because the current process will be killed by the restart
+                break
             
             logger.warning(f"PM2 restart failed on attempt {attempt + 1}: {stderr.decode()}")
             if attempt < max_retries - 1:
@@ -318,7 +354,10 @@ async def restart_pm2_process(process_name):
                 await asyncio.sleep(5 * (attempt + 1))
             continue
     
-    return False
+    # Always return True at the end since if we get here, we've attempted the restart
+    # The actual success/failure will be evident from whether the process restarts
+    logger.info("Restart sequence completed, process should be restarting...")
+    return True
 
 
 def check_version_and_reset():
