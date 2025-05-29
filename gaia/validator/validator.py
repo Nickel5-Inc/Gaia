@@ -327,6 +327,17 @@ class GaiaValidator:
             else:
                 logger.info("Watchdog was not running.")
             
+            # Create cleanup completion file early for auto updater
+            # PM2 will handle any remaining background processes
+            logger.info("Creating cleanup completion file for auto updater...")
+            try:
+                cleanup_file = "/tmp/validator_cleanup_done"
+                with open(cleanup_file, "w") as f:
+                    f.write(f"Cleanup initiated at {time.time()}\n")
+                logger.info(f"Created cleanup completion file: {cleanup_file}")
+            except Exception as e_cleanup_file:
+                logger.error(f"Failed to create cleanup completion file: {e_cleanup_file}")
+            
             logger.info("Updating task statuses to 'stopping'...")
             for task_name in ['soil', 'geomagnetic', 'weather', 'scoring', 'deregistration', 'status_logger', 'db_sync_backup', 'db_sync_restore', 'miner_score_sender', 'earthdata_token', 'db_monitor', 'plot_db_metrics']:
                 try:
@@ -355,17 +366,6 @@ class GaiaValidator:
                 logger.info("Final garbage collection completed.")
             except Exception as e_gc:
                 logger.error(f"Error during final garbage collection: {e_gc}")
-            
-            # Create cleanup completion file BEFORE setting _cleanup_done
-            # This ensures auto updater gets the signal even if some processes are slow
-            logger.info("Creating cleanup completion file for auto updater...")
-            try:
-                cleanup_file = "/tmp/validator_cleanup_done"
-                with open(cleanup_file, "w") as f:
-                    f.write(f"Cleanup completed at {time.time()}\n")
-                logger.info(f"Created cleanup completion file: {cleanup_file}")
-            except Exception as e_cleanup_file:
-                logger.error(f"Failed to create cleanup completion file: {e_cleanup_file}")
             
             self._cleanup_done = True
             logger.info("Graceful shutdown sequence fully completed.")
@@ -1299,6 +1299,11 @@ class GaiaValidator:
             await self.basemodel_evaluator.initialize_models()
             logger.info("Baseline models initialization complete")
             
+            # Start auto-updater as independent task (not in main loop to avoid self-cancellation)
+            logger.info("Starting independent auto-updater task...")
+            auto_updater_task = asyncio.create_task(self.check_for_updates())
+            logger.info("Auto-updater task started independently")
+            
             tasks = [
                 lambda: self.geomagnetic_task.validator_execute(self),
                 lambda: self.soil_task.validator_execute(self),
@@ -1307,7 +1312,6 @@ class GaiaValidator:
                 lambda: self.main_scoring(),
                 lambda: self.handle_miner_deregistration_loop(),
                 # The MinerScoreSender task will be added conditionally below
-                lambda: self.check_for_updates(),
                 lambda: self.manage_earthdata_token(),
                 #lambda: self.database_monitor(),
                 #lambda: self.plot_database_metrics_periodically() # Added plotting task

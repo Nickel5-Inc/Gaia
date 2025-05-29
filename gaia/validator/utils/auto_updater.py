@@ -307,7 +307,7 @@ async def restart_pm2_process(process_name):
             
             # Wait for process to indicate cleanup is done via its status file
             cleanup_file = "/tmp/validator_cleanup_done"
-            max_wait = 30  # Reduced from 60 to 30 seconds - background workers may take longer
+            max_wait = 10  # Reduced to 10 seconds since PM2 will forcefully terminate anyway
             wait_interval = 1
             cleanup_detected = False
             for _ in range(max_wait // wait_interval):
@@ -323,11 +323,10 @@ async def restart_pm2_process(process_name):
             
             if not cleanup_detected:
                 logger.warning(f"Cleanup completion not detected after {max_wait} seconds")
-                logger.info("Some background workers may still be running, but proceeding with restart")
-                logger.info("PM2 will handle any remaining processes during restart")
+                logger.info("PM2 will handle any remaining background processes during restart")
             
-            # Add delay before restart to ensure main process has time to exit
-            await asyncio.sleep(5)
+            # Add small delay before restart to ensure main process has time to exit
+            await asyncio.sleep(2)
             
             # Then do the restart
             logger.info(f"Restarting process {process_name}...")
