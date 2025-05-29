@@ -353,11 +353,29 @@ class GaiaValidator:
             self._cleanup_done = True
             logger.info("Graceful shutdown sequence fully completed.")
             
+            # Create cleanup completion file for auto updater
+            try:
+                cleanup_file = "/tmp/validator_cleanup_done"
+                with open(cleanup_file, "w") as f:
+                    f.write(f"Cleanup completed at {time.time()}\n")
+                logger.info(f"Created cleanup completion file: {cleanup_file}")
+            except Exception as e_cleanup_file:
+                logger.error(f"Failed to create cleanup completion file: {e_cleanup_file}")
+            
         except Exception as e_shutdown_main:
             logger.error(f"Error during main shutdown sequence: {e_shutdown_main}", exc_info=True)
             # Ensure cleanup_done is set even if part of the main shutdown fails, to prevent re-entry
             self._cleanup_done = True 
             logger.warning("Graceful shutdown sequence partially completed due to error.")
+            
+            # Still try to create cleanup completion file even if shutdown had errors
+            try:
+                cleanup_file = "/tmp/validator_cleanup_done"
+                with open(cleanup_file, "w") as f:
+                    f.write(f"Cleanup completed with errors at {time.time()}\n")
+                logger.info(f"Created cleanup completion file (with errors): {cleanup_file}")
+            except Exception as e_cleanup_file:
+                logger.error(f"Failed to create cleanup completion file after error: {e_cleanup_file}")
 
     def setup_neuron(self) -> bool:
         """
@@ -695,7 +713,7 @@ class GaiaValidator:
                 try:
                     update_successful = await asyncio.wait_for(
                         perform_update(self),
-                        timeout=60  # 60 second timeout
+                        timeout=180  # 3 minute timeout to allow for cleanup and restart
                     )
 
                     if update_successful:
@@ -704,7 +722,7 @@ class GaiaValidator:
                         logger.debug("No updates available or update failed")
 
                 except asyncio.TimeoutError:
-                    logger.warning("Update check timed out after 30 seconds")
+                    logger.warning("Update check timed out after 3 minutes")
                 except Exception as e:
                     if "500" in str(e):
                         logger.warning(f"GitHub temporarily unavailable (500 error): {e}")
