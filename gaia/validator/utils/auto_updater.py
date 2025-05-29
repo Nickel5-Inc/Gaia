@@ -211,7 +211,7 @@ async def get_pm2_process_name():
         print(f"Error getting PM2 process name: {e}")
         return None
 
-
+#test
 async def perform_update(validator):
     """Enhanced update process with dependency management"""
     logger.info("Starting update process...")
