@@ -2014,24 +2014,11 @@ class GaiaValidator:
             logger.info(f"Fetched {len(soil_results)} soil moisture score rows")
             
             if not weather_results and not geomagnetic_results and not soil_results:
-                logger.info("No scores found in DB - initializing equal weights for active nodes")
-                try:
-                    if not self.metagraph or not self.metagraph.nodes: logger.warning("No metagraph/nodes for equal weight init"); return None
-                    active_nodes_count = len(self.metagraph.nodes)
-                    if active_nodes_count == 0: logger.warning("Zero active nodes, cannot init equal weights."); return None
-                    weights_arr = np.zeros(256); weight_val = 1.0 / active_nodes_count
-                    active_uids = [node.node_id for node in self.metagraph.nodes.values() if node.node_id < 256] # Prefer direct node_id
-                    if not hasattr(self.metagraph, 'uids') or self.metagraph.uids is None: # Fallback if direct .uids isn't there/reliable
-                         logger.debug("Metagraph.uids not available, deriving from metagraph.nodes.values()")
-                    elif self.metagraph.uids is not None: # If .uids exists, cross-check or prefer it if more direct
-                         chain_uids = [uid.item() for uid in self.metagraph.uids if uid.item() < 256]
-                         if set(active_uids) != set(chain_uids):
-                              logger.warning(f"Discrepancy in UIDs from metagraph.nodes ({len(active_uids)}) vs metagraph.uids ({len(chain_uids)}). Preferring metagraph.nodes derived UIDs.")
-                    if not active_uids: logger.warning("No active UIDs to assign equal weights."); return None
-                    for uid_val in active_uids: weights_arr[uid_val] = weight_val
-                    logger.info(f"Initialized equal weights ({weight_val:.4f}) for {len(active_uids)} active nodes")
-                    return weights_arr.tolist()
-                except Exception as e: logger.error(f"Error initializing equal weights: {e}", exc_info=True); return None
+                logger.info("No scores found in DB - returning zero weights (no scores to base weights on)")
+                # Return zero weights array instead of equal weights
+                weights_arr = np.zeros(256)
+                logger.info("Initialized zero weights for all nodes (no scoring data available)")
+                return weights_arr.tolist()
 
             active_nodes_list_sync = []
             try:
