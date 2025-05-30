@@ -607,7 +607,7 @@ class GaiaValidator:
         raise TypeError(f"Type {type(obj)} not serializable")
 
     async def query_miners(self, payload: Dict, endpoint: str, hotkeys: Optional[List[str]] = None) -> Dict:
-        """Query miners with the given payload in parallel."""
+        """Query miners with the given payload in parallel with batch retry logic."""
         try:
             logger.info(f"Querying miners for endpoint {endpoint} with payload size: {len(str(payload))} bytes. Specified hotkeys: {hotkeys if hotkeys else 'All/Default'}")
             if "data" in payload and "combined_data" in payload["data"]:
@@ -649,9 +649,9 @@ class GaiaValidator:
             else:
                 miners_to_query = nodes_to_consider
                 if self.args.test and len(miners_to_query) > 10:
-                    selected_hotkeys_for_test = list(miners_to_query.keys())[:10]
+                    selected_hotkeys_for_test = list(miners_to_query.keys())[-10:]
                     miners_to_query = {k: miners_to_query[k] for k in selected_hotkeys_for_test}
-                    logger.info(f"Test mode: Selected the first {len(miners_to_query)} miners to query for endpoint: {endpoint} (no specific hotkeys provided).")
+                    logger.info(f"Test mode: Selected the last {len(miners_to_query)} miners to query for endpoint: {endpoint} (no specific hotkeys provided).")
                 elif not self.args.test:
                     logger.info(f"Querying all {len(miners_to_query)} available miners for endpoint: {endpoint} (no specific hotkeys provided).")
 
@@ -688,142 +688,193 @@ class GaiaValidator:
             semaphore = asyncio.Semaphore(max_concurrent)
             logger.info(f"Using concurrency limit of {max_concurrent} for {len(miners_to_query)} miners")
 
-            async def query_single_miner(miner_hotkey: str, node: Any) -> Optional[Dict]:
-                """Query a single miner with proper handshake and error handling."""
-                base_url = f"https://{node.ip}:{node.port}"
-                process = psutil.Process() if PSUTIL_AVAILABLE else None
-                try:
-                    async with semaphore:  # Control concurrency
-                        logger.info(f"Initiating handshake with miner {miner_hotkey} at {base_url}")
-                        # Perform handshake with increased timeout
-                        handshake_start_time = time.time()
-                        symmetric_key_str, symmetric_key_uuid = None, None
-                        try:
-                            # Use our custom handshake function with retry logic
-                            symmetric_key_str, symmetric_key_uuid = await perform_handshake_with_retry(
-                                httpx_client=self.miner_client,
-                                server_address=base_url,
-                                keypair=self.keypair,
-                                miner_hotkey_ss58_address=miner_hotkey,
-                                max_retries=2,
-                                base_timeout=10.0  # Start with 10s, will increase with retries
-                            )
-                        except asyncio.TimeoutError:
-                            logger.warning(f"Handshake timed out for miner {miner_hotkey} at {base_url}")
-                            return None
-                        except Exception as hs_err:
-                            logger.warning(f"Handshake failed for miner {miner_hotkey} at {base_url}: {type(hs_err).__name__} - {hs_err}")
-                            logger.debug(traceback.format_exc())
-                            return None
+            # Batch retry configuration
+            max_retry_rounds = 2  # Total of 3 attempts (1 initial + 2 retries)
+            retry_delay = 2.0  # Delay between retry rounds
+            
+            # Track miners for retry
+            miners_remaining = dict(miners_to_query)  # Copy for first attempt
+            
+            for retry_round in range(max_retry_rounds + 1):  # 0 = initial attempt, 1+ = retry rounds
+                if not miners_remaining:
+                    break
+                    
+                round_type = "Initial attempt" if retry_round == 0 else f"Retry round {retry_round}"
+                logger.info(f"{round_type}: Querying {len(miners_remaining)} miners")
+                
+                async def query_single_miner_no_retry(miner_hotkey: str, node: Any, attempt_num: int) -> Optional[Dict]:
+                    """Query a single miner without internal retries (batch retry handled at higher level)."""
+                    base_url = f"https://{node.ip}:{node.port}"
+                    process = psutil.Process() if PSUTIL_AVAILABLE else None
+                    try:
+                        async with semaphore:  # Control concurrency
+                            logger.debug(f"[{round_type}] Initiating handshake with miner {miner_hotkey} at {base_url}")
+                            
+                            # Perform handshake with a single attempt (no retry at this level)
+                            handshake_start_time = time.time()
+                            symmetric_key_str, symmetric_key_uuid = None, None
+                            try:
+                                # Use a single attempt with longer timeout for retries
+                                current_timeout = 15.0 + (attempt_num * 5.0)  # Increase timeout with retry attempts
+                                
+                                # Get public key
+                                public_key_encryption_key = await asyncio.wait_for(
+                                    handshake.get_public_encryption_key(
+                                        self.miner_client, 
+                                        base_url, 
+                                        timeout=int(current_timeout)
+                                    ),
+                                    timeout=current_timeout
+                                )
+                                
+                                # Generate symmetric key
+                                symmetric_key: bytes = os.urandom(32)
+                                symmetric_key_uuid: str = os.urandom(32).hex()
+                                
+                                # Send symmetric key
+                                success = await asyncio.wait_for(
+                                    handshake.send_symmetric_key_to_server(
+                                        self.miner_client,
+                                        base_url,
+                                        self.keypair,
+                                        public_key_encryption_key,
+                                        symmetric_key,
+                                        symmetric_key_uuid,
+                                        miner_hotkey,
+                                        timeout=int(current_timeout),
+                                    ),
+                                    timeout=current_timeout
+                                )
+                                
+                                if success:
+                                    symmetric_key_str = base64.b64encode(symmetric_key).decode()
+                                else:
+                                    raise Exception("Handshake failed: server returned unsuccessful status")
+                                    
+                            except Exception as hs_err:
+                                logger.debug(f"[{round_type}] Handshake failed for miner {miner_hotkey} at {base_url}: {type(hs_err).__name__} - {hs_err}")
+                                return None
 
-                        handshake_duration = time.time() - handshake_start_time
-                        logger.info(f"Handshake with {miner_hotkey} completed in {handshake_duration:.2f}s")
+                            handshake_duration = time.time() - handshake_start_time
+                            logger.debug(f"[{round_type}] Handshake with {miner_hotkey} completed in {handshake_duration:.2f}s")
 
-                        if not symmetric_key_str or not symmetric_key_uuid:
-                            logger.warning(f"Failed handshake with miner {miner_hotkey} (no key/UUID returned)")
-                            return None
+                            if not symmetric_key_str or not symmetric_key_uuid:
+                                logger.debug(f"[{round_type}] Failed handshake with miner {miner_hotkey} (no key/UUID returned)")
+                                return None
 
-                        logger.info(f"Handshake successful with miner {miner_hotkey}")
-                        if process:
-                            logger.info(f"Memory after handshake ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
-                        
-                        fernet = Fernet(symmetric_key_str)
-                        
-                        try:
-                            import pickle
-                            payload_bytes = pickle.dumps(payload)
-                            payload_size_bytes = len(payload_bytes)
-                            logger.info(f"Preparing to send request to miner {miner_hotkey} at {base_url}{endpoint}. Raw payload size: {payload_size_bytes / (1024*1024):.2f} MB")
-                            del payload_bytes
-                            import gc
-                            gc.collect()
-                        except Exception as size_err:
-                            logger.warning(f"Could not accurately determine payload size for {miner_hotkey}: {size_err}")
-                            payload_size_bytes = -1
-                                                        
-                        resp = None
-                        try:
-                            logger.info(f"Calling vali_client.make_non_streamed_post for {miner_hotkey} (timeout: 180s)...")
-                            logger.debug(f"Calling vali_client.make_non_streamed_post for {miner_hotkey}...")
+                            logger.debug(f"[{round_type}] Handshake successful with miner {miner_hotkey}")
                             if process:
-                                mem_before = process.memory_info().rss / (1024*1024)
-                                logger.info(f"Memory BEFORE request call ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
-                            request_start_time = time.time()
-                            resp = await asyncio.wait_for(
-                                vali_client.make_non_streamed_post(
-                                    httpx_client=self.miner_client,  # Use existing client
-                                    server_address=base_url,
-                                    fernet=fernet,
-                                    keypair=self.keypair,
-                                    symmetric_key_uuid=symmetric_key_uuid,
-                                    validator_ss58_address=self.keypair.ss58_address,
-                                    miner_ss58_address=miner_hotkey,
-                                    payload=payload,
-                                    endpoint=endpoint,
-                                ),
-                                timeout=240.0  # Increased from 180s for large payloads
-                            )
-                            request_duration = time.time() - request_start_time
-                            if process:
-                                mem_after = process.memory_info().rss / (1024*1024)
-                                logger.info(f"Memory AFTER successful request call ({miner_hotkey}): {mem_after:.2f} MB (Delta: {mem_after - mem_before:.2f} MB)")
-                            if resp:
-                                logger.info(f"Successfully called make_non_streamed_post for {miner_hotkey}. Response status: {resp.status_code}. Duration: {request_duration:.2f}s. Response content length: {len(resp.content) if resp.content else 0} bytes.")
-                            else:
-                                logger.warning(f"Call to make_non_streamed_post for {miner_hotkey} completed without error but response object is None. Duration: {request_duration:.2f}s")
+                                logger.debug(f"Memory after handshake ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
+                            
+                            fernet = Fernet(symmetric_key_str)
+                            
+                            try:
+                                import pickle
+                                payload_bytes = pickle.dumps(payload)
+                                payload_size_bytes = len(payload_bytes)
+                                logger.debug(f"Preparing to send request to miner {miner_hotkey} at {base_url}{endpoint}. Raw payload size: {payload_size_bytes / (1024*1024):.2f} MB")
+                                del payload_bytes
+                                import gc
+                                gc.collect()
+                            except Exception as size_err:
+                                logger.warning(f"Could not accurately determine payload size for {miner_hotkey}: {size_err}")
+                                payload_size_bytes = -1
+                                                            
+                            resp = None
+                            try:
+                                logger.debug(f"[{round_type}] Calling vali_client.make_non_streamed_post for {miner_hotkey}...")
+                                if process:
+                                    mem_before = process.memory_info().rss / (1024*1024)
+                                    logger.debug(f"Memory BEFORE request call ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
+                                request_start_time = time.time()
+                                resp = await asyncio.wait_for(
+                                    vali_client.make_non_streamed_post(
+                                        httpx_client=self.miner_client,  # Use existing client
+                                        server_address=base_url,
+                                        fernet=fernet,
+                                        keypair=self.keypair,
+                                        symmetric_key_uuid=symmetric_key_uuid,
+                                        validator_ss58_address=self.keypair.ss58_address,
+                                        miner_ss58_address=miner_hotkey,
+                                        payload=payload,
+                                        endpoint=endpoint,
+                                    ),
+                                    timeout=240.0  # Increased from 180s for large payloads
+                                )
+                                request_duration = time.time() - request_start_time
+                                if process:
+                                    mem_after = process.memory_info().rss / (1024*1024)
+                                    logger.debug(f"Memory AFTER successful request call ({miner_hotkey}): {mem_after:.2f} MB (Delta: {mem_after - mem_before:.2f} MB)")
+                                if resp:
+                                    logger.info(f"[{round_type}] Successfully called make_non_streamed_post for {miner_hotkey}. Response status: {resp.status_code}. Duration: {request_duration:.2f}s. Response content length: {len(resp.content) if resp.content else 0} bytes.")
+                                else:
+                                    logger.warning(f"[{round_type}] Call to make_non_streamed_post for {miner_hotkey} completed without error but response object is None. Duration: {request_duration:.2f}s")
 
-                        except Exception as request_error:
-                            if process:
-                                logger.error(f"Memory during request EXCEPTION ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
-                            logger.error(f"Error during make_non_streamed_post for {miner_hotkey}: {type(request_error).__name__} - {request_error}")
-                            logger.debug(f"Request details: URL='{base_url}{endpoint}', Miner Hotkey='{miner_hotkey}'")
-                            logger.debug(traceback.format_exc())
-                            return None
-                        
-                        if resp is None:
-                             logger.warning(f"No response object received from {miner_hotkey} despite no exception, likely due to prior error.")
-                             return None
-                        elif resp.status_code >= 400:
-                            logger.warning(f"Miner {miner_hotkey} returned error status {resp.status_code}. Response text: {resp.text[:500]}...")
-                            return None
+                            except Exception as request_error:
+                                if process:
+                                    logger.error(f"Memory during request EXCEPTION ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
+                                logger.debug(f"[{round_type}] Error during make_non_streamed_post for {miner_hotkey}: {type(request_error).__name__} - {request_error}")
+                                return None
+                            
+                            if resp is None:
+                                 logger.debug(f"[{round_type}] No response object received from {miner_hotkey} despite no exception, likely due to prior error.")
+                                 return None
+                            elif resp.status_code >= 400:
+                                logger.debug(f"[{round_type}] Miner {miner_hotkey} returned error status {resp.status_code}. Response text: {resp.text[:500]}...")
+                                return None
 
-                        response_data = {
-                            "text": resp.text,
-                            "status_code": resp.status_code,
-                            "hotkey": miner_hotkey,
-                            "port": node.port,
-                            "ip": node.ip,
-                            "content_length": len(resp.content) if resp.content else 0
-                        }
-                        logger.info(f"Successfully received response from miner {miner_hotkey}")
-                        return response_data
+                            response_data = {
+                                "text": resp.text,
+                                "status_code": resp.status_code,
+                                "hotkey": miner_hotkey,
+                                "port": node.port,
+                                "ip": node.ip,
+                                "content_length": len(resp.content) if resp.content else 0
+                            }
+                            logger.info(f"[{round_type}] Successfully received response from miner {miner_hotkey}")
+                            return response_data
 
-                except asyncio.TimeoutError:
-                    logger.warning(f"Timeout querying miner {miner_hotkey} at {base_url}")
-                    return None
-                except Exception as e:
-                    logger.warning(f"Failed request to miner {miner_hotkey} at {base_url}: {type(e).__name__} - {str(e)}")
-                    logger.debug(f"Outer exception context: URL='{base_url}', Miner Hotkey='{miner_hotkey}'")
-                    logger.debug(traceback.format_exc())
-                    return None
+                    except asyncio.TimeoutError:
+                        logger.debug(f"[{round_type}] Timeout querying miner {miner_hotkey} at {base_url}")
+                        return None
+                    except Exception as e:
+                        logger.debug(f"[{round_type}] Failed request to miner {miner_hotkey} at {base_url}: {type(e).__name__} - {str(e)}")
+                        return None
 
-            # Query all miners in parallel
-            tasks = []
-            for hotkey, node in miners_to_query.items():
-                if node.ip and node.port:  # Only query miners with valid IP/port
-                    tasks.append(query_single_miner(hotkey, node))
-                else:
-                    logger.warning(f"Skipping miner {hotkey} - missing IP or port")
+                # Query all remaining miners in parallel for this round
+                tasks = []
+                for hotkey, node in miners_remaining.items():
+                    if node.ip and node.port:  # Only query miners with valid IP/port
+                        tasks.append(query_single_miner_no_retry(hotkey, node, retry_round))
+                    else:
+                        logger.warning(f"Skipping miner {hotkey} - missing IP or port")
 
-            # Gather responses with timeout
-            miner_responses = await asyncio.gather(*tasks, return_exceptions=True)
+                # Gather responses with timeout
+                miner_responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Process responses
-            for hotkey, response in zip(miners_to_query.keys(), miner_responses):
-                if response is not None and not isinstance(response, Exception):
-                    responses[response['hotkey']] = response
+                # Process responses and track failures for next round
+                miners_for_next_round = {}
+                successful_this_round = 0
+                
+                for (hotkey, node), response in zip(miners_remaining.items(), miner_responses):
+                    if response is not None and not isinstance(response, Exception):
+                        responses[response['hotkey']] = response
+                        successful_this_round += 1
+                    else:
+                        # Add to retry list for next round
+                        miners_for_next_round[hotkey] = node
 
-            logger.info(f"Received {len(responses)} valid responses from miners")
+                logger.info(f"{round_type} completed: {successful_this_round} successful, {len(miners_for_next_round)} failed")
+                
+                # Update miners_remaining for next round
+                miners_remaining = miners_for_next_round
+                
+                # If we have more rounds and miners to retry, wait before next round
+                if miners_remaining and retry_round < max_retry_rounds:
+                    logger.info(f"Waiting {retry_delay}s before retry round {retry_round + 1} with {len(miners_remaining)} miners")
+                    await asyncio.sleep(retry_delay)
+
+            logger.info(f"Batch query completed: Received {len(responses)} total valid responses from miners")
             return responses
 
         except Exception as e:
@@ -1424,8 +1475,8 @@ class GaiaValidator:
             logger.info("Auto-updater task started independently")
             
             tasks = [
-                lambda: self.geomagnetic_task.validator_execute(self),
-                lambda: self.soil_task.validator_execute(self),
+                #lambda: self.geomagnetic_task.validator_execute(self),
+                #lambda: self.soil_task.validator_execute(self),
                 lambda: self.weather_task.validator_execute(self),
                 lambda: self.status_logger(),
                 lambda: self.main_scoring(),
@@ -1729,17 +1780,17 @@ class GaiaValidator:
         while True:
             processed_uids = set() # Keep track of UIDs processed in this cycle
             try:
-                await asyncio.sleep(600) # Run every 10 minutes
-
                 # Ensure metagraph is up to date
                 if not self.metagraph:
                     logger.warning("Metagraph object not initialized, cannot sync miner state.")
+                    await asyncio.sleep(600)  # Sleep before retrying
                     continue # Wait for metagraph to be initialized
                 
                 logger.info("Syncing metagraph for miner state update...")
                 self.metagraph.sync_nodes()
                 if not self.metagraph.nodes:
                     logger.warning("Metagraph empty after sync, skipping miner state update.")
+                    await asyncio.sleep(600)  # Sleep before retrying
                     continue
 
                 async with self.miner_table_lock:
@@ -1938,6 +1989,12 @@ class GaiaValidator:
 
             except asyncio.CancelledError:
                 logger.info("Miner state synchronization loop cancelled.")
+                break
+            except Exception as e:
+                logger.error(f"Error in miner state synchronization loop: {e}", exc_info=True)
+            
+            # Sleep at the end of the loop - runs immediately on first iteration, then every 10 minutes
+            await asyncio.sleep(600)  # Run every 10 minutes
 
     def _perform_weight_calculations_sync(self, weather_results, geomagnetic_results, soil_results, now, validator_nodes_by_uid_list):
         """
