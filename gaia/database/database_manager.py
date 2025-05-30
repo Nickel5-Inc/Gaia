@@ -79,6 +79,9 @@ class BaseDatabaseManager(ABC):
     STATUS_ERROR = 'error'
     STATUS_TIMEOUT = 'timeout'
 
+    # Note: Log level 5 is used for TRACE-level session debugging (more verbose than DEBUG level 10)
+    # This reduces console noise while still allowing detailed session tracking when needed
+
     def __new__(cls, node_type: str, *args, **kwargs):
         """Ensure singleton instance per node type"""
         if node_type not in cls._instances:
@@ -519,7 +522,7 @@ class BaseDatabaseManager(ABC):
                 actual_session_instance = self._session_factory()
                 session_init_duration = (time.monotonic() - acquire_start_time) * 1000
                 session_id_for_log = f"new_{id(actual_session_instance)}"
-                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): New session acquired from factory in {session_init_duration:.2f}ms.")
+                if self.monitoring_enabled: logger.log(5, f"Session {session_id_for_log} ({specific_op_name}): New session acquired from factory in {session_init_duration:.2f}ms.")
 
             session_acquired_time = time.monotonic()
             session_id_str = session_id_for_log
@@ -529,15 +532,15 @@ class BaseDatabaseManager(ABC):
                  raise DatabaseConnectionError("Failed to obtain session instance.")
 
             if not actual_session_instance.in_transaction():
-                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Beginning new transaction.")
+                if self.monitoring_enabled: logger.log(5, f"Session {session_id_for_log} ({specific_op_name}): Beginning new transaction.")
                 await actual_session_instance.begin()
                 transaction_started_here = True
             else:
-                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Already in transaction.")
+                if self.monitoring_enabled: logger.log(5, f"Session {session_id_for_log} ({specific_op_name}): Already in transaction.")
 
             if self.monitoring_enabled: self._active_sessions.add(session_id_str)
             active_sessions_count = self._increment_active_sessions()
-            if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}) ready. Active sessions: {active_sessions_count} (Set size: {len(self._active_sessions) if self.monitoring_enabled else 'N/A'})")
+            if self.monitoring_enabled: logger.log(5, f"Session {session_id_for_log} ({specific_op_name}) ready. Active sessions: {active_sessions_count} (Set size: {len(self._active_sessions) if self.monitoring_enabled else 'N/A'})")
 
             yield_start_time = time.monotonic()
             yield actual_session_instance
@@ -547,13 +550,13 @@ class BaseDatabaseManager(ABC):
                 commit_start_time = time.monotonic()
                 await actual_session_instance.commit()
                 commit_duration = (time.monotonic() - commit_start_time) * 1000
-                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Transaction committed in {commit_duration:.2f}ms (normal exit).")
+                if self.monitoring_enabled: logger.log(5, f"Session {session_id_for_log} ({specific_op_name}): Transaction committed in {commit_duration:.2f}ms (normal exit).")
             
         except asyncio.CancelledError:
             e_outer = asyncio.CancelledError("Session cancelled")
             logger.warning(f"Session {session_id_for_log} ({specific_op_name}): Operation cancelled.")
             if transaction_started_here and actual_session_instance and actual_session_instance.in_transaction():
-                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Attempting rollback due to cancellation.")
+                if self.monitoring_enabled: logger.log(5, f"Session {session_id_for_log} ({specific_op_name}): Attempting rollback due to cancellation.")
                 try:
                     rollback_start_time = time.monotonic()
                     await actual_session_instance.rollback()
@@ -570,7 +573,7 @@ class BaseDatabaseManager(ABC):
             e_outer = e
             logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error during session: {str(e_outer)}", exc_info=True)
             if transaction_started_here and actual_session_instance and actual_session_instance.in_transaction():
-                if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Attempting rollback due to exception: {str(e_outer)}.")
+                if self.monitoring_enabled: logger.log(5, f"Session {session_id_for_log} ({specific_op_name}): Attempting rollback due to exception: {str(e_outer)}.")
                 try:
                     rollback_start_time = time.monotonic()
                     await actual_session_instance.rollback()
@@ -594,7 +597,7 @@ class BaseDatabaseManager(ABC):
                             logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error during defensive rollback in finally: {rb_finally_err}")
                     
                     await actual_session_instance.close()
-                    if self.monitoring_enabled: logger.debug(f"Session {session_id_for_log} ({specific_op_name}): New session closed.")
+                    if self.monitoring_enabled: logger.log(5, f"Session {session_id_for_log} ({specific_op_name}): New session closed.")
                 except Exception as close_err:
                     logger.error(f"Session {session_id_for_log} ({specific_op_name}): Error closing new session: {close_err}", exc_info=True)
 
@@ -628,13 +631,13 @@ class BaseDatabaseManager(ABC):
                      self._circuit_breaker['failures'] = 0
 
                 session_release_duration_ms = (time.monotonic() - session_release_start_time) * 1000
-                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Released. Total time: {total_duration_ms:.2f}ms, Factory init: {session_init_duration:.2f}ms, In yield: {time_in_yield_ms:.2f}ms, Release code: {session_release_duration_ms:.2f}ms. Active now: {active_sessions_count_after} (Set size: {len(self._active_sessions) if self.monitoring_enabled else 'N/A'})")
+                logger.log(5, f"Session {session_id_for_log} ({specific_op_name}): Released. Total time: {total_duration_ms:.2f}ms, Factory init: {session_init_duration:.2f}ms, In yield: {time_in_yield_ms:.2f}ms, Release code: {session_release_duration_ms:.2f}ms. Active now: {active_sessions_count_after} (Set size: {len(self._active_sessions) if self.monitoring_enabled else 'N/A'})")
                 
                 overhead_ms = total_duration_ms - time_in_yield_ms
                 if overhead_ms > 50 and total_duration_ms > 100:
                     logger.info(f"Session {session_id_for_log} ({specific_op_name}): Significant overhead detected. Total: {total_duration_ms:.2f}ms, Yield: {time_in_yield_ms:.2f}ms, Overhead: {overhead_ms:.2f}ms")
             else: # Monitoring disabled
-                logger.debug(f"Session {session_id_for_log} ({specific_op_name}): Released. Monitoring disabled. Active now: {active_sessions_count_after}")
+                logger.log(5, f"Session {session_id_for_log} ({specific_op_name}): Released. Monitoring disabled. Active now: {active_sessions_count_after}")
 
     @with_timeout(CONNECTION_TEST_TIMEOUT)
     async def _test_connection(self, session: AsyncSession) -> bool:
