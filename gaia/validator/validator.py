@@ -1473,7 +1473,7 @@ class GaiaValidator:
             logger.info("Starting independent auto-updater task...")
             auto_updater_task = asyncio.create_task(self.check_for_updates())
             logger.info("Auto-updater task started independently")
-            
+            #test
             tasks = [
                 #lambda: self.geomagnetic_task.validator_execute(self),
                 #lambda: self.soil_task.validator_execute(self),
