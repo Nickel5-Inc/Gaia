@@ -1148,32 +1148,69 @@ class GaiaValidator:
                     await self.miner_score_sender.cleanup()
                 logger.info("Cleaned up miner score sender resources")
 
-            # Clean up fsspec/gcsfs caches and sessions
+            # Clean up WeatherTask resources that might be using gcsfs
             try:
-                logger.info("Clearing fsspec filesystem cache...")
-                # Suppress fsspec warnings during shutdown
-                import logging
-                logging.getLogger('fsspec').setLevel(logging.ERROR)
-                logging.getLogger('gcsfs').setLevel(logging.ERROR)
-                logging.getLogger('aiohttp').setLevel(logging.ERROR)
+                if hasattr(self, 'weather_task'):
+                    await self.weather_task.cleanup_resources()
+                    logger.info("Cleaned up WeatherTask resources")
+            except Exception as e:
+                logger.debug(f"Error cleaning up WeatherTask: {e}")
+
+            # Aggressive fsspec/gcsfs cleanup to prevent session errors blocking PM2 restart
+            try:
+                logger.info("Performing aggressive fsspec/gcsfs cleanup...")
                 
-                # Clear fsspec registry and cache to prevent session cleanup issues
+                # Suppress all related warnings and errors that could block PM2 restart
+                import logging
+                import warnings
+                logging.getLogger('fsspec').setLevel(logging.CRITICAL)
+                logging.getLogger('gcsfs').setLevel(logging.CRITICAL)
+                logging.getLogger('aiohttp').setLevel(logging.CRITICAL)
+                logging.getLogger('asyncio').setLevel(logging.CRITICAL)
+                warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*coroutine.*never awaited.*')
+                warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*Non-thread-safe operation.*')
+                
+                # Force clear fsspec caches and registries
                 import fsspec
                 fsspec.config.conf.clear()
                 if hasattr(fsspec.filesystem, '_cache'):
                     fsspec.filesystem._cache.clear()
-                logger.info("Cleared fsspec caches")
+                
+                # Try to close any active gcsfs sessions more aggressively
+                try:
+                    import gcsfs
+                    # Clear any cached filesystems
+                    if hasattr(gcsfs, '_fs_cache'):
+                        gcsfs._fs_cache.clear()
+                    if hasattr(gcsfs.core, '_fs_cache'):
+                        gcsfs.core._fs_cache.clear()
+                except ImportError:
+                    pass
+                except Exception:
+                    pass  # Ignore any errors during aggressive cleanup
+                
+                # Force garbage collection to help clean up lingering references
+                import gc
+                gc.collect()
+                
+                # Set environment variable to suppress aiohttp warnings
+                import os
+                os.environ['PYTHONWARNINGS'] = 'ignore::RuntimeWarning'
+                
+                logger.info("Aggressive fsspec/gcsfs cleanup completed")
+                
             except ImportError:
                 logger.debug("fsspec not available for cleanup")
             except Exception as e:
-                logger.warning(f"Error clearing fsspec caches: {e}")
+                # Don't let cleanup errors block shutdown
+                logger.debug(f"Non-critical error during aggressive cleanup: {e}")
             
             logger.info("Completed resource cleanup")
             
         except Exception as e:
             logger.error(f"Error during resource cleanup: {e}")
-            logger.error(traceback.format_exc())
-            raise
+            # Don't raise the exception - let shutdown continue for PM2 restart
+            logger.info("Continuing shutdown despite cleanup errors to allow PM2 restart")
 
     async def recover_task(self, task_name: str):
         """Enhanced task recovery with specific handling for each task type."""
@@ -1425,7 +1462,19 @@ class GaiaValidator:
     async def main(self):
         """Main execution loop for the validator."""
 
-        # --- Alembic check removed from here --- 
+        # Suppress gcsfs/aiohttp cleanup warnings that can block PM2 restart
+        def custom_excepthook(exc_type, exc_value, exc_traceback):
+            # Suppress specific gcsfs/aiohttp cleanup errors
+            if (exc_type == RuntimeWarning and 
+                ('coroutine' in str(exc_value) and 'never awaited' in str(exc_value)) or
+                ('Non-thread-safe operation' in str(exc_value))):
+                return  # Silently ignore these warnings
+            # Call the default handler for other exceptions
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        
+        sys.excepthook = custom_excepthook
+
+        # --- Alembic check removed from here ---
 
         try:
             logger.info("Setting up neuron...")
