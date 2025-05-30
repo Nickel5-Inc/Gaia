@@ -36,7 +36,7 @@ from alembic.config import Config # Add Alembic import
 from alembic import command # Add Alembic import
 from alembic.util import CommandError # Add Alembic import
 
-MAX_REQUEST_SIZE = 800 * 1024 * 1024  # 800MB
+MAX_REQUEST_SIZE = 100 * 1024 * 1024  # Reduced from 800MB to 100MB
 
 logger = get_logger(__name__)
 
@@ -475,6 +475,12 @@ class Miner:
                 port=self.port,
                 log_config=log_config,
                 log_level="debug",
+                access_log=True,
+                workers=1,  # Keep single worker for simplicity but explicitly set
+                limit_concurrency=50,  # Limit concurrent connections
+                limit_max_requests=1000,  # Restart worker after N requests to prevent memory leaks
+                timeout_keep_alive=30,  # Keep alive timeout
+                timeout_graceful_shutdown=30,  # Graceful shutdown timeout
             )
         except Exception as e:
             self.logger.error(f"Error starting miner: {e}")
