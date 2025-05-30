@@ -19,28 +19,34 @@ logger = logging.getLogger(__name__)
 class PgBackRestIntegration:
     """Handles pgBackRest integration for database synchronization"""
     
-    def __init__(self, config_path: str = "/etc/gaia/pgbackrest.env"):
-        self.config_path = config_path
+    def __init__(self):
         self.config = {}
         self.is_available = False
         self.stanza_name = "gaia"
         self._load_config()
     
     def _load_config(self) -> None:
-        """Load pgBackRest configuration from environment file"""
+        """Load pgBackRest configuration from environment variables"""
         try:
-            if not os.path.exists(self.config_path):
-                logger.debug(f"pgBackRest config not found at {self.config_path}")
-                return
+            # Load configuration from environment variables with PGBACKREST_ prefix
+            env_mapping = {
+                'AZURE_STORAGE_ACCOUNT': 'PGBACKREST_AZURE_STORAGE_ACCOUNT',
+                'AZURE_STORAGE_KEY': 'PGBACKREST_AZURE_STORAGE_KEY', 
+                'AZURE_CONTAINER': 'PGBACKREST_AZURE_CONTAINER',
+                'STANZA_NAME': 'PGBACKREST_STANZA_NAME',
+                'PGDATA': 'PGBACKREST_PGDATA',
+                'PGPORT': 'PGBACKREST_PGPORT',
+                'PGUSER': 'PGBACKREST_PGUSER',
+                'PRIMARY_HOST': 'PGBACKREST_PRIMARY_HOST',
+                'REPLICA_HOSTS': 'PGBACKREST_REPLICA_HOSTS'
+            }
             
-            # Parse environment file
-            with open(self.config_path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, value = line.split('=', 1)
-                        self.config[key.strip()] = value.strip()
+            for internal_key, env_var in env_mapping.items():
+                value = os.getenv(env_var)
+                if value:
+                    self.config[internal_key] = value
             
+            # Set stanza name from config or default
             self.stanza_name = self.config.get('STANZA_NAME', 'gaia')
             
             # Check if pgBackRest is properly configured
@@ -60,15 +66,18 @@ class PgBackRestIntegration:
             result = subprocess.run(['which', 'pgbackrest'], 
                                   capture_output=True, text=True)
             if result.returncode != 0:
+                logger.debug("pgBackRest command not found")
                 return False
             
-            # Check if configuration file exists
-            if not os.path.exists('/etc/pgbackrest/pgbackrest.conf'):
-                return False
+            # Check if configuration file exists OR we have environment variables
+            config_file_exists = os.path.exists('/etc/pgbackrest/pgbackrest.conf')
             
-            # Check if we have required Azure configuration
+            # Check if we have required Azure configuration in environment
             required_keys = ['AZURE_STORAGE_ACCOUNT', 'AZURE_STORAGE_KEY', 'AZURE_CONTAINER']
-            if not all(key in self.config for key in required_keys):
+            env_config_complete = all(key in self.config for key in required_keys)
+            
+            if not config_file_exists and not env_config_complete:
+                logger.debug("pgBackRest config file and environment variables both incomplete")
                 return False
             
             return True

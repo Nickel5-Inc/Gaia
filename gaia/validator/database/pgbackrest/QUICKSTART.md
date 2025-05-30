@@ -7,39 +7,45 @@ This guide will get you up and running with pgBackRest database synchronization 
 - Ubuntu 20.04+ with PostgreSQL installed
 - Azure Storage Account credentials
 - Root/sudo access
+- Existing Gaia validator with configured .env file
 
 ## Step 1: Configure Environment (5 minutes)
 
-1. **Copy the environment template:**
+1. **Add pgBackRest configuration to your existing .env file:**
+   
+   Edit your main validator `.env` file and add the pgBackRest configuration section:
+   
+   **REQUIRED**: Update these values in your `.env` file:
    ```bash
-   sudo mkdir -p /etc/gaia
-   sudo cp pgbackrest/pgbackrest.env.template /etc/gaia/pgbackrest.env
+   # pgBackRest Configuration
+   PGBACKREST_AZURE_STORAGE_ACCOUNT=your_actual_storage_account
+   PGBACKREST_AZURE_STORAGE_KEY=your_actual_storage_key
+   PGBACKREST_AZURE_CONTAINER=gaia-db-backups
+   PGBACKREST_PRIMARY_HOST=1.2.3.4  # IP of your primary validator
+   
+   # Optional pgBackRest settings (defaults shown)
+   PGBACKREST_STANZA_NAME=gaia
+   PGBACKREST_PGDATA=/var/lib/postgresql/data
+   PGBACKREST_PGPORT=5432
+   PGBACKREST_PGUSER=postgres
    ```
 
-2. **Edit the environment file:**
+2. **Restart your validator to load the new configuration:**
    ```bash
-   sudo nano /etc/gaia/pgbackrest.env
-   ```
-   
-   **REQUIRED**: Update these values:
-   ```bash
-   AZURE_STORAGE_ACCOUNT=your_actual_storage_account
-   AZURE_STORAGE_KEY=your_actual_storage_key
-   AZURE_CONTAINER=gaia-db-backups
-   PRIMARY_HOST=1.2.3.4  # IP of your primary validator
+   pm2 restart validator
    ```
 
 ## Step 2: Setup Node Type (3 minutes)
 
 ### For PRIMARY node (source validator):
 ```bash
-cd pgbackrest
+cd gaia/validator/database/pgbackrest
 sudo ./setup-primary.sh
 ```
 
 ### For REPLICA nodes (other validators):
 ```bash
-cd pgbackrest
+cd gaia/validator/database/pgbackrest
 sudo ./setup-replica.sh <PRIMARY_NODE_IP>
 ```
 
@@ -61,13 +67,15 @@ If you see any issues:
 - **Replicas**: Automatically sync by downloading and replaying WAL logs
 - **Backups**: Full backup weekly, differential daily (automated)
 - **Monitoring**: Status checked every 15 minutes
+- **Integration**: Validator automatically detects pgBackRest and disables built-in DB sync
 
 ## Common Issues & Quick Fixes
 
 ### "Azure connectivity failed"
 ```bash
-# Check your Azure credentials
-sudo nano /etc/gaia/pgbackrest.env
+# Check your Azure credentials in .env file
+nano .env
+# Look for PGBACKREST_AZURE_* variables
 # Test connectivity
 sudo -u postgres pgbackrest --stanza=gaia check
 ```
@@ -101,12 +109,26 @@ sudo chown -R postgres:postgres /var/log/pgbackrest /var/lib/pgbackrest
 | `sudo -u postgres pgbackrest --stanza=gaia info` | Backup information |
 | `sudo -u postgres psql -c "SELECT pg_is_in_recovery();"` | Check if replica |
 
-## Files Created
+## Environment Variables Reference
 
-- `/etc/gaia/pgbackrest.env` - Configuration
-- `/etc/pgbackrest/pgbackrest.conf` - pgBackRest config
-- `/var/log/gaia-pgbackrest/` - Setup logs
-- `/var/log/pgbackrest/` - pgBackRest logs
+Add these to your main validator `.env` file:
+
+```bash
+# Required
+PGBACKREST_AZURE_STORAGE_ACCOUNT=your_storage_account
+PGBACKREST_AZURE_STORAGE_KEY=your_storage_key
+PGBACKREST_AZURE_CONTAINER=gaia-db-backups
+PGBACKREST_PRIMARY_HOST=primary.validator.ip
+
+# Optional (with defaults)
+PGBACKREST_STANZA_NAME=gaia
+PGBACKREST_PGDATA=/var/lib/postgresql/data
+PGBACKREST_PGPORT=5432
+PGBACKREST_PGUSER=postgres
+PGBACKREST_RETENTION_FULL=7
+PGBACKREST_RETENTION_DIFF=2
+PGBACKREST_PROCESS_MAX=4
+```
 
 ## Security Notes
 
@@ -130,5 +152,6 @@ If you encounter issues:
 2. Review logs in `/var/log/gaia-pgbackrest/`
 3. Check Azure Storage connectivity
 4. Verify network connectivity between nodes
+5. Ensure your `.env` file has all required PGBACKREST_ variables
 
 For detailed configuration options, see the full [README.md](README.md). 

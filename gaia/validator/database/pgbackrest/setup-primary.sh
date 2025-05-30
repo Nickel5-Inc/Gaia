@@ -1,4 +1,3 @@
-
 # Gaia Validator pgBackRest Primary Node Setup Script
 set -euo pipefail
 
@@ -27,14 +26,46 @@ fi
 
 info "Starting Gaia Validator pgBackRest Primary Node Setup"
 
-# Load environment
-ENV_FILE="/etc/gaia/pgbackrest.env"
+# Load environment from main validator .env file
+ENV_FILE=".env"
 if [[ ! -f "$ENV_FILE" ]]; then
-    error "Environment file not found: $ENV_FILE"
+    # Try alternative paths
+    if [[ -f "/root/Gaia/.env" ]]; then
+        ENV_FILE="/root/Gaia/.env"
+    elif [[ -f "../../.env" ]]; then
+        ENV_FILE="../../.env"
+    else
+        error "Environment file not found. Please ensure .env file exists with PGBACKREST_ variables configured"
+        exit 1
+    fi
+fi
+
+info "Loading environment from: $ENV_FILE"
+set -a; source "$ENV_FILE"; set +a
+
+# Map PGBACKREST_ prefixed variables to the expected names
+AZURE_STORAGE_ACCOUNT="${PGBACKREST_AZURE_STORAGE_ACCOUNT}"
+AZURE_STORAGE_KEY="${PGBACKREST_AZURE_STORAGE_KEY}"
+AZURE_CONTAINER="${PGBACKREST_AZURE_CONTAINER}"
+STANZA_NAME="${PGBACKREST_STANZA_NAME:-gaia}"
+PGDATA="${PGBACKREST_PGDATA:-/var/lib/postgresql/data}"
+PGPORT="${PGBACKREST_PGPORT:-5432}"
+PGUSER="${PGBACKREST_PGUSER:-postgres}"
+
+# Validate required variables
+if [[ -z "$AZURE_STORAGE_ACCOUNT" ]] || [[ -z "$AZURE_STORAGE_KEY" ]] || [[ -z "$AZURE_CONTAINER" ]]; then
+    error "Missing required pgBackRest environment variables. Please configure:"
+    error "- PGBACKREST_AZURE_STORAGE_ACCOUNT"
+    error "- PGBACKREST_AZURE_STORAGE_KEY"
+    error "- PGBACKREST_AZURE_CONTAINER"
     exit 1
 fi
 
-set -a; source "$ENV_FILE"; set +a
+info "Configuration loaded:"
+info "- Azure Storage Account: $AZURE_STORAGE_ACCOUNT"
+info "- Azure Container: $AZURE_CONTAINER"
+info "- Stanza Name: $STANZA_NAME"
+info "- PostgreSQL Data Dir: $PGDATA"
 
 # Install dependencies
 info "Installing pgBackRest..."

@@ -11,12 +11,16 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # Load environment if available
-ENV_FILE="/etc/gaia/pgbackrest.env"
+ENV_FILE=".env"
 if [[ -f "$ENV_FILE" ]]; then
     set -a; source "$ENV_FILE"; set +a
+elif [[ -f "/root/Gaia/.env" ]]; then
+    set -a; source "/root/Gaia/.env"; set +a
+elif [[ -f "../../.env" ]]; then
+    set -a; source "../../.env"; set +a
 fi
 
-STANZA_NAME="${STANZA_NAME:-gaia}"
+STANZA_NAME="${PGBACKREST_STANZA_NAME:-gaia}"
 
 echo "=============================================================================="
 echo "                    Gaia Validator Database Sync Monitor"

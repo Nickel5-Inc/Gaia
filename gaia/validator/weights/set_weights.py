@@ -212,11 +212,10 @@ class FiberWeightSetter:
             if calculated_weights is None:
                 logger.warning("No weights calculated - skipping weight setting")
                 return False
-            
-            # Check if all weights are zero
+
+            # Log if all weights are zero but still proceed to set them
             if torch.is_tensor(calculated_weights) and calculated_weights.sum().item() == 0:
-                logger.warning("All calculated weights are zero - skipping weight setting")
-                return False
+                logger.info("All calculated weights are zero - proceeding to set zero weights on-chain")
 
             try:
                 logger.info(f"Setting weights for {len(self.nodes)} nodes")
