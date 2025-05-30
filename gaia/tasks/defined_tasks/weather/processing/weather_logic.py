@@ -247,10 +247,14 @@ async def _request_fresh_token(task_instance: 'WeatherTask', miner_hotkey: str, 
             hotkeys=[miner_hotkey]
         )
         response_dict = all_responses.get(miner_hotkey)
-        if not response_dict: return None
+        if not response_dict: 
+            logger.warning(f"[VerifyLogic] No response received from miner {miner_hotkey[:12]} for job {job_id}")
+            return None
         if response_dict.get("status_code") == 200:
             miner_response_data = json.loads(response_dict['text'])
-            if miner_response_data.get("status") == "completed":
+            miner_status = miner_response_data.get("status")
+            
+            if miner_status == "completed":
                 token = miner_response_data.get("access_token")
                 zarr_store_relative_url = miner_response_data.get("zarr_store_url") 
                 manifest_content_hash = miner_response_data.get("verification_hash") 
@@ -264,7 +268,23 @@ async def _request_fresh_token(task_instance: 'WeatherTask', miner_hotkey: str, 
                     full_zarr_url = miner_base_url.rstrip('/') + "/" + zarr_store_relative_url.lstrip('/')
                     logger.info(f"[VerifyLogic] Success: Token, URL: {full_zarr_url}, ManifestHash: {manifest_content_hash[:10]}...")
                     return token, full_zarr_url, manifest_content_hash
-    except Exception as e: logger.error(f"Unhandled exception in _request_fresh_token: {e!r}", exc_info=True)
+                else:
+                    logger.warning(f"[VerifyLogic] Miner {miner_hotkey[:12]} responded 'completed' for job {job_id} but missing token/URL/hash")
+            elif miner_status == "processing":
+                logger.info(f"[VerifyLogic] Miner {miner_hotkey[:12]} job {job_id} still processing: {miner_response_data.get('message', 'No message')}")
+                return None  # This is expected, validator should retry later
+            elif miner_status == "error":
+                logger.warning(f"[VerifyLogic] Miner {miner_hotkey[:12]} job {job_id} failed: {miner_response_data.get('message', 'No error message')}")
+                return None
+            elif miner_status == "not_found":
+                logger.warning(f"[VerifyLogic] Miner {miner_hotkey[:12]} reports job {job_id} not found")
+                return None
+            else:
+                logger.warning(f"[VerifyLogic] Miner {miner_hotkey[:12]} returned unknown status '{miner_status}' for job {job_id}")
+        else:
+            logger.warning(f"[VerifyLogic] Miner {miner_hotkey[:12]} returned HTTP {response_dict.get('status_code')} for job {job_id}")
+    except Exception as e: 
+        logger.error(f"Unhandled exception in _request_fresh_token for job {job_id}: {e!r}", exc_info=True)
     return None
 
 async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_utc: datetime) -> Optional[Dict[str, Any]]:
@@ -391,7 +411,15 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
     try:
         token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, job_id)
         if token_data_tuple is None: 
-            raise ValueError(f"Failed to get access token/manifest details for {miner_hotkey} job {job_id}")
+            # Miner job is still processing or failed - log warning and skip
+            logger.warning(f"[VerifyLogic, Resp {response_id}] Miner {miner_hotkey} job {job_id} not ready for verification (still processing or failed). Skipping.")
+            await task_instance.db_manager.execute("""
+                UPDATE weather_miner_responses 
+                SET status = 'awaiting_miner_completion', 
+                    error_message = 'Miner job still processing or not available for verification'
+                WHERE id = :id
+            """, {"id": response_id})
+            return  # Exit gracefully, this miner won't be scored for this run
 
         access_token, zarr_store_url, claimed_manifest_content_hash = token_data_tuple
         logger.info(f"[VerifyLogic, Resp {response_id}] Unpacked token data. URL: {zarr_store_url}, Manifest Hash: {claimed_manifest_content_hash[:10] if claimed_manifest_content_hash else 'N/A'}...")
