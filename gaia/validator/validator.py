@@ -1147,6 +1147,26 @@ class GaiaValidator:
                 if hasattr(self.miner_score_sender, 'cleanup'):
                     await self.miner_score_sender.cleanup()
                 logger.info("Cleaned up miner score sender resources")
+
+            # Clean up fsspec/gcsfs caches and sessions
+            try:
+                logger.info("Clearing fsspec filesystem cache...")
+                # Suppress fsspec warnings during shutdown
+                import logging
+                logging.getLogger('fsspec').setLevel(logging.ERROR)
+                logging.getLogger('gcsfs').setLevel(logging.ERROR)
+                logging.getLogger('aiohttp').setLevel(logging.ERROR)
+                
+                # Clear fsspec registry and cache to prevent session cleanup issues
+                import fsspec
+                fsspec.config.conf.clear()
+                if hasattr(fsspec.filesystem, '_cache'):
+                    fsspec.filesystem._cache.clear()
+                logger.info("Cleared fsspec caches")
+            except ImportError:
+                logger.debug("fsspec not available for cleanup")
+            except Exception as e:
+                logger.warning(f"Error clearing fsspec caches: {e}")
             
             logger.info("Completed resource cleanup")
             
