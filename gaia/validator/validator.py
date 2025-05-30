@@ -2526,9 +2526,18 @@ class GaiaValidator:
                                 keepalive_connections = sum(1 for conn in connections 
                                                           if hasattr(conn, '_keepalive_expiry') and conn._keepalive_expiry)
                             
+                            # Get pool limit - check multiple possible locations
+                            pool_limit = "unknown"
+                            if hasattr(self.miner_client, '_limits') and hasattr(self.miner_client._limits, 'max_connections'):
+                                pool_limit = self.miner_client._limits.max_connections
+                            elif hasattr(pool, '_max_connections'):
+                                pool_limit = pool._max_connections
+                            elif hasattr(pool, 'max_connections'):
+                                pool_limit = pool.max_connections
+                            
                             logger.debug(f"HTTP Client Pool Health - Total: {total_connections}, "
                                        f"Keepalive: {keepalive_connections}, "
-                                       f"Pool limit: {self.miner_client._limits.max_connections}")
+                                       f"Pool limit: {pool_limit}")
                 await asyncio.sleep(300)  # Check every 5 minutes
             except Exception as e:
                 logger.debug(f"Error monitoring client health: {e}")
