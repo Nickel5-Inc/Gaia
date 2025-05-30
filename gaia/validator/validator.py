@@ -1536,7 +1536,8 @@ class GaiaValidator:
                         logger.error(traceback.format_exc())
                         return False
                     finally:
-                        await asyncio.sleep(60)
+                        # Sleep removed - now handled in main loop for consistent timing
+                        pass
 
                 # Run scoring cycle with overall timeout
                 await asyncio.wait_for(scoring_cycle(), timeout=900)
@@ -1555,6 +1556,11 @@ class GaiaValidator:
                 logger.error(traceback.format_exc())
                 await self.update_task_status('scoring', 'error')
                 await asyncio.sleep(12)
+                continue
+            
+            # Add sleep to prevent rapid cycling when scoring completes quickly
+            # This ensures consistent timing regardless of scoring outcome
+            await asyncio.sleep(60)
 
     async def status_logger(self):
         """Log the status of the validator periodically."""
