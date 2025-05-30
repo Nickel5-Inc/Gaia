@@ -963,7 +963,8 @@ class WeatherTask(Task):
                             
                             all_responses = await validator.query_miners(
                                 payload=trigger_payload,
-                                endpoint=endpoint
+                                endpoint=endpoint,
+                                hotkeys=[miner_hk]
                             )
                             
                             trigger_response = all_responses.get(miner_hk)
