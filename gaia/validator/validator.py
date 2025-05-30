@@ -201,6 +201,13 @@ class GaiaValidator:
 
         # Initialize HTTP clients first
         # Client for miner communication with SSL verification disabled
+        import ssl
+        
+        # Create SSL context that doesn't verify certificates
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
         self.miner_client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0),
             follow_redirects=True,
@@ -210,7 +217,10 @@ class GaiaValidator:
                 max_keepalive_connections=15,  # Reduced from 20
                 keepalive_expiry=60,  # Increased from 30
             ),
-            transport=httpx.AsyncHTTPTransport(retries=2),  # Reduced from 3
+            transport=httpx.AsyncHTTPTransport(
+                retries=2,  # Reduced from 3
+                verify=False,  # Explicitly set verify=False on transport
+            ),
         )
         # Client for API communication with SSL verification enabled
         self.api_client = httpx.AsyncClient(
@@ -652,6 +662,12 @@ class GaiaValidator:
             # Use the existing miner_client instead of creating a new one
             if not hasattr(self, 'miner_client') or self.miner_client.is_closed:
                 logger.warning("Miner client not available or closed, creating new one")
+                # Create SSL context that doesn't verify certificates
+                import ssl
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
                 self.miner_client = httpx.AsyncClient(
                     timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0),
                     follow_redirects=True,
@@ -661,7 +677,10 @@ class GaiaValidator:
                         max_keepalive_connections=15,  # Reduced from 20 
                         keepalive_expiry=60,  # Increased from 30
                     ),
-                    transport=httpx.AsyncHTTPTransport(retries=2),  # Reduced from 3
+                    transport=httpx.AsyncHTTPTransport(
+                        retries=2,  # Reduced from 3
+                        verify=False,  # Explicitly set verify=False on transport
+                    ),
                 )
 
             # Reduce concurrency based on number of miners to avoid overwhelming the system
