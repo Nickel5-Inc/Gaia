@@ -1,0 +1,118 @@
+# PostgreSQL Client Authentication Configuration File
+# =============================================================================
+# This file controls: which hosts are allowed to connect, how clients
+# are authenticated, which PostgreSQL user names they can use, which
+# databases they can access.
+#
+# Copy this template and customize the IP addresses for your validator network
+# =============================================================================
+
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# =============================================================================
+# Local connections
+# =============================================================================
+local   all             postgres                                peer
+local   all             all                                     peer
+
+# =============================================================================
+# IPv4 local connections
+# =============================================================================
+host    all             postgres        127.0.0.1/32            md5
+host    all             all             127.0.0.1/32            md5
+
+# =============================================================================
+# IPv6 local connections
+# =============================================================================
+host    all             postgres        ::1/128                 md5
+host    all             all             ::1/128                 md5
+
+# =============================================================================
+# Replication connections for pgBackRest
+# =============================================================================
+local   replication     postgres                                peer
+host    replication     postgres        127.0.0.1/32            trust
+host    replication     postgres        ::1/128                 trust
+
+# =============================================================================
+# Validator Network Connections
+# =============================================================================
+
+# Private network ranges (adjust based on your cloud provider)
+# AWS VPC default ranges
+host    all             postgres        10.0.0.0/8              md5
+host    all             gaia_user       10.0.0.0/8              md5
+host    replication     postgres        10.0.0.0/8              md5
+
+# Azure Virtual Network default ranges
+host    all             postgres        172.16.0.0/12           md5
+host    all             gaia_user       172.16.0.0/12           md5
+host    replication     postgres        172.16.0.0/12           md5
+
+# Google Cloud VPC default ranges
+host    all             postgres        192.168.0.0/16          md5
+host    all             gaia_user       192.168.0.0/16          md5
+host    replication     postgres        192.168.0.0/16          md5
+
+# =============================================================================
+# Specific Validator Nodes (CUSTOMIZE THESE)
+# =============================================================================
+# Primary validator node
+# host    all             postgres        PRIMARY_VALIDATOR_IP/32    md5
+# host    replication     postgres        PRIMARY_VALIDATOR_IP/32    md5
+
+# Replica validator nodes (add one line for each validator)
+# host    all             postgres        VALIDATOR_IP_1/32          md5
+# host    replication     postgres        VALIDATOR_IP_1/32          md5
+# host    all             postgres        VALIDATOR_IP_2/32          md5
+# host    replication     postgres        VALIDATOR_IP_2/32          md5
+# host    all             postgres        VALIDATOR_IP_3/32          md5
+# host    replication     postgres        VALIDATOR_IP_3/32          md5
+
+# =============================================================================
+# Example specific IP configurations (UNCOMMENT AND CUSTOMIZE)
+# =============================================================================
+# Example: Primary validator at 1.2.3.4
+# host    all             postgres        1.2.3.4/32              md5
+# host    all             gaia_user       1.2.3.4/32              md5
+# host    replication     postgres        1.2.3.4/32              md5
+
+# Example: Replica validators
+# host    all             postgres        5.6.7.8/32              md5
+# host    all             gaia_user       5.6.7.8/32              md5
+# host    replication     postgres        5.6.7.8/32              md5
+
+# host    all             postgres        9.10.11.12/32           md5
+# host    all             gaia_user       9.10.11.12/32           md5
+# host    replication     postgres        9.10.11.12/32           md5
+
+# =============================================================================
+# Security Notes:
+# =============================================================================
+# 1. Replace the broad network ranges above with specific IP addresses
+#    for production environments
+# 2. Consider using 'scram-sha-256' instead of 'md5' for better security
+# 3. Enable SSL/TLS connections by adding 'hostssl' entries
+# 4. Remove or comment out any unused connection types
+# 5. Always place more specific rules before general ones
+# 6. Test connections after making changes: sudo systemctl reload postgresql
+# =============================================================================
+
+# =============================================================================
+# SSL/TLS Connections (OPTIONAL - for enhanced security)
+# =============================================================================
+# hostssl all             postgres        10.0.0.0/8              md5
+# hostssl all             gaia_user       10.0.0.0/8              md5
+# hostssl replication     postgres        10.0.0.0/8              md5
+
+# =============================================================================
+# Monitoring and Administrative Access
+# =============================================================================
+# Allow monitoring tools (adjust IP ranges as needed)
+# host    all             postgres        MONITORING_SERVER_IP/32  md5
+
+# =============================================================================
+# DENY ALL OTHER CONNECTIONS (Security hardening)
+# =============================================================================
+# Uncomment this line to explicitly deny all other connections
+# host    all             all             0.0.0.0/0               reject 
