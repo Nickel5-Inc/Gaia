@@ -1475,7 +1475,7 @@ class GaiaValidator:
         sys.excepthook = custom_excepthook
 
         # --- Alembic check removed from here ---
-
+        #test
         try:
             logger.info("Setting up neuron...")
             if not self.setup_neuron():
