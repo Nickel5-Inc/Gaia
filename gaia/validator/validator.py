@@ -2515,9 +2515,17 @@ class GaiaValidator:
                     if hasattr(transport, '_pool'):
                         pool = transport._pool
                         if hasattr(pool, '_connections'):
-                            total_connections = len(pool._connections)
-                            keepalive_connections = sum(1 for conn in pool._connections.values() 
-                                                      if hasattr(conn, '_keepalive_expiry') and conn._keepalive_expiry)
+                            connections = pool._connections
+                            total_connections = len(connections)
+                            
+                            # Handle both list and dict cases for _connections
+                            if hasattr(connections, 'values'):  # It's a dict-like object
+                                keepalive_connections = sum(1 for conn in connections.values() 
+                                                          if hasattr(conn, '_keepalive_expiry') and conn._keepalive_expiry)
+                            else:  # It's a list-like object
+                                keepalive_connections = sum(1 for conn in connections 
+                                                          if hasattr(conn, '_keepalive_expiry') and conn._keepalive_expiry)
+                            
                             logger.debug(f"HTTP Client Pool Health - Total: {total_connections}, "
                                        f"Keepalive: {keepalive_connections}, "
                                        f"Pool limit: {self.miner_client._limits.max_connections}")
