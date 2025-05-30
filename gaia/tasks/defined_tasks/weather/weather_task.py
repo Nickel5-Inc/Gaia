@@ -963,7 +963,8 @@ class WeatherTask(Task):
                             
                             all_responses = await validator.query_miners(
                                 payload=trigger_payload,
-                                endpoint=endpoint
+                                endpoint=endpoint,
+                                hotkeys=[miner_hk]
                             )
                             
                             trigger_response = all_responses.get(miner_hk)
@@ -1444,8 +1445,10 @@ class WeatherTask(Task):
                 }
                 
             elif job["status"] == "error":
+                logger.warning(f"[Job {job_id}] Forecast data requested but job failed. Error: {job['error_message'] or 'Unknown error'}")
                 return {"status": "error", "message": f"Job failed: {job['error_message'] or 'Unknown error'}"}
             else:
+                logger.info(f"[Job {job_id}] Forecast data requested but job still processing (status: {job['status']}). Validator will need to retry later.")
                 return {"status": "processing", "message": f"Job is currently in status: {job['status']}"}
                 
         except Exception as e:
@@ -1650,20 +1653,60 @@ class WeatherTask(Task):
         """
         logger.info("Cleaning up weather task resources...")
         
-        # Stop all background workers
+        # Stop all background workers with proper awaiting
         logger.info("Stopping all background workers...")
-        await self.stop_background_workers()
+        try:
+            await self.stop_background_workers()
+        except Exception as e:
+            logger.error(f"Error during background worker cleanup: {e}")
         
-        # Clean up any other resources
+        # Clean up ERA5 climatology dataset
         try:
             if hasattr(self, 'era5_climatology_ds') and self.era5_climatology_ds is not None:
+                logger.info("Closing ERA5 climatology dataset...")
                 self.era5_climatology_ds.close()
+                self.era5_climatology_ds = None
                 logger.info("Closed ERA5 climatology dataset")
         except Exception as e:
             logger.warning(f"Error closing ERA5 climatology dataset: {e}")
 
+        # Clean up any HTTP clients
+        try:
+            if hasattr(self, 'validator') and self.validator and hasattr(self.validator, 'miner_client'):
+                logger.info("Closing validator HTTP clients...")
+                if not self.validator.miner_client.is_closed:
+                    await self.validator.miner_client.aclose()
+                logger.info("Closed validator HTTP clients")
+        except Exception as e:
+            logger.warning(f"Error closing HTTP clients: {e}")
+
+        # Clean up fsspec/gcsfs caches and sessions
+        try:
+            logger.info("Clearing fsspec filesystem cache...")
+            # Suppress fsspec warnings during shutdown
+            import logging
+            logging.getLogger('fsspec').setLevel(logging.ERROR)
+            logging.getLogger('gcsfs').setLevel(logging.ERROR)
+            logging.getLogger('aiohttp').setLevel(logging.ERROR)
+            
+            # Clear fsspec registry and cache to prevent session cleanup issues
+            fsspec.config.conf.clear()
+            if hasattr(fsspec.filesystem, '_cache'):
+                fsspec.filesystem._cache.clear()
+            logger.info("Cleared fsspec caches")
+        except Exception as e:
+            logger.warning(f"Error clearing fsspec caches: {e}")
+
+        # Force garbage collection to help with cleanup
+        try:
+            import gc
+            collected = gc.collect()
+            logger.info(f"Garbage collection freed {collected} objects")
+        except Exception as e:
+            logger.warning(f"Error during garbage collection: {e}")
+
         logger.info("Weather task cleanup completed")
-       
+
     async def start_initial_scoring_workers(self, num_workers=1):
         if self.node_type != "validator":
             return
@@ -1747,15 +1790,58 @@ class WeatherTask(Task):
          await self.start_cleanup_workers(num_cleanup_workers)
          
     async def stop_background_workers(self):
-        """Stops all background worker types."""
+        """Stops all background worker types with proper task cleanup."""
+        logger.info("Stopping all background workers...")
 
-        try: await self.stop_initial_scoring_workers()
-        except Exception as e: logger.error(f"Error stopping initial scoring workers: {e}")
-        try: await self.stop_final_scoring_workers()
-        except Exception as e: logger.error(f"Error stopping final scoring workers: {e}")
-        try: await self.stop_cleanup_workers()
-        except Exception as e: logger.error(f"Error stopping cleanup workers: {e}")
+        async def _stop_worker_list(worker_list, worker_name):
+            """Helper to properly stop a list of worker tasks."""
+            if not worker_list:
+                return
             
+            logger.info(f"Stopping {len(worker_list)} {worker_name} worker(s)...")
+            
+            # Cancel all tasks
+            for worker in worker_list:
+                if not worker.done():
+                    worker.cancel()
+            
+            # Wait for cancellation to complete with timeout
+            if worker_list:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*worker_list, return_exceptions=True),
+                        timeout=5.0
+                    )
+                    logger.info(f"Successfully stopped {worker_name} workers")
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout stopping {worker_name} workers, forcing cleanup")
+                except Exception as e:
+                    logger.warning(f"Error stopping {worker_name} workers: {e}")
+
+        # Stop each worker type
+        try: 
+            await _stop_worker_list(self.initial_scoring_workers, "initial_scoring")
+            self.initial_scoring_workers = []
+            self.initial_scoring_worker_running = False
+        except Exception as e: 
+            logger.error(f"Error stopping initial scoring workers: {e}")
+            
+        try: 
+            await _stop_worker_list(self.final_scoring_workers, "final_scoring")
+            self.final_scoring_workers = []
+            self.final_scoring_worker_running = False
+        except Exception as e: 
+            logger.error(f"Error stopping final scoring workers: {e}")
+            
+        try: 
+            await _stop_worker_list(self.cleanup_workers, "cleanup")
+            self.cleanup_workers = []
+            self.cleanup_worker_running = False
+        except Exception as e: 
+            logger.error(f"Error stopping cleanup workers: {e}")
+
+        logger.info("All background workers stopped")
+        
     async def miner_fetch_hash_worker(self):
         """Worker that periodically checks for jobs awaiting input hash verification."""
         CHECK_INTERVAL_SECONDS = 10 if self.test_mode else 60

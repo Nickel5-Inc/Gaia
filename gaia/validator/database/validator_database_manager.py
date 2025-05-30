@@ -395,7 +395,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
     @track_operation('write')
     async def batch_update_miners(self, miners_data: List[Dict[str, Any]]) -> None:
         """
-        Update multiple miners.
+        Update multiple miners using upsert (INSERT ... ON CONFLICT DO UPDATE).
         Args:
             miners_data: List of dictionaries containing miner update data.
                         Each dict should have 'index' and other miner fields.
@@ -416,42 +416,65 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             return
 
         updated_count = 0
+        inserted_count = 0
         try:
-            async with self.lightweight_session() as session: # Assuming lightweight_session provides an AsyncSession
-                async with session.begin(): # Manage transaction for the whole batch
+            async with self.lightweight_session() as session:
+                async with session.begin():
                     for miner_data in valid_miners_to_update:
                         index_val = miner_data['index']
                         
-                        values_to_set = {}
-                        if 'hotkey' in miner_data: values_to_set['hotkey'] = miner_data['hotkey']
-                        if 'coldkey' in miner_data: values_to_set['coldkey'] = miner_data['coldkey']
-                        if 'ip' in miner_data: values_to_set['ip'] = miner_data['ip']
-                        if 'ip_type' in miner_data: values_to_set['ip_type'] = miner_data['ip_type']
-                        if 'port' in miner_data: values_to_set['port'] = miner_data['port']
-                        if 'incentive' in miner_data: values_to_set['incentive'] = miner_data['incentive']
-                        if 'stake' in miner_data: values_to_set['stake'] = miner_data['stake']
-                        if 'trust' in miner_data: values_to_set['trust'] = miner_data['trust']
-                        if 'vtrust' in miner_data: values_to_set['vtrust'] = miner_data['vtrust']
-                        if 'protocol' in miner_data: values_to_set['protocol'] = miner_data['protocol']
+                        # Prepare values for upsert
+                        insert_values = {
+                            'uid': index_val,
+                            'last_updated': datetime.now(timezone.utc)
+                        }
+                        update_values = {
+                            'last_updated': datetime.now(timezone.utc)
+                        }
                         
-                        # Always update last_updated
-                        values_to_set['last_updated'] = datetime.now(timezone.utc)
+                        # Add fields that are present in miner_data
+                        for field in ['hotkey', 'coldkey', 'ip', 'ip_type', 'port', 'incentive', 'stake', 'trust', 'vtrust', 'protocol']:
+                            if field in miner_data:
+                                insert_values[field] = miner_data[field]
+                                update_values[field] = miner_data[field]
 
-                        if not values_to_set: # Should not happen if last_updated is always set
+                        if not update_values:
                             logger.warning(f"No values to update for miner index {index_val}. Skipping.")
                             continue
 
-                        stmt = (
-                            update(self.node_table)
-                            .where(self.node_table.c.uid == index_val)
-                            .values(**values_to_set)
-                        )
+                        # Use PostgreSQL's ON CONFLICT DO UPDATE for proper upsert
+                        upsert_query = """
+                        INSERT INTO node_table (uid, hotkey, coldkey, ip, ip_type, port, incentive, stake, trust, vtrust, protocol, last_updated)
+                        VALUES (:uid, :hotkey, :coldkey, :ip, :ip_type, :port, :incentive, :stake, :trust, :vtrust, :protocol, :last_updated)
+                        ON CONFLICT (uid) DO UPDATE SET
+                            hotkey = EXCLUDED.hotkey,
+                            coldkey = EXCLUDED.coldkey,
+                            ip = EXCLUDED.ip,
+                            ip_type = EXCLUDED.ip_type,
+                            port = EXCLUDED.port,
+                            incentive = EXCLUDED.incentive,
+                            stake = EXCLUDED.stake,
+                            trust = EXCLUDED.trust,
+                            vtrust = EXCLUDED.vtrust,
+                            protocol = EXCLUDED.protocol,
+                            last_updated = EXCLUDED.last_updated
+                        """
                         
-                        result = await session.execute(stmt)
-                        if result.rowcount is not None and result.rowcount > 0:
-                            updated_count += result.rowcount
+                        result = await session.execute(text(upsert_query), insert_values)
+                        
+                        # Check if this was an insert or update by checking if the row existed before
+                        check_query = "SELECT 1 FROM node_table WHERE uid = :uid AND last_updated = :last_updated"
+                        exists_result = await session.execute(text(check_query), {
+                            'uid': index_val, 
+                            'last_updated': insert_values['last_updated']
+                        })
+                        
+                        if exists_result.fetchone():
+                            # We can't easily distinguish insert vs update with ON CONFLICT, 
+                            # so we'll assume success and count all operations
+                            updated_count += 1
                             
-            logger.info(f"Successfully batch updated {updated_count} miners (executed {len(valid_miners_to_update)} individual SQLAlchemy updates in one transaction).")
+            logger.info(f"Successfully batch processed {updated_count} miners (upserts executed in one transaction).")
                         
         except Exception as e:
             logger.error(f"Error in batch_update_miners: {str(e)}")

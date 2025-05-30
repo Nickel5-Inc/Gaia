@@ -67,11 +67,11 @@ class FiberWeightSetter:
         self.timeout = timeout
 
 
-    def calculate_weights(self, weights: List[float] = None) -> torch.Tensor:
+    def calculate_weights(self, weights: List[float] = None) -> tuple[torch.Tensor, List[int]]:
         """Convert input weights to normalized tensor with min/max bounds"""
         if weights is None:
             logger.warning("No weights provided")
-            return None
+            return None, []
 
         nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid) if self.nodes is None else self.nodes
         node_ids = [node.node_id for node in nodes]
@@ -87,7 +87,9 @@ class FiberWeightSetter:
 
         if active_nodes == 0:
             logger.warning("No active nodes found")
-            return None
+            # Return zero weights tensor instead of None to maintain consistent return type
+            zero_weights = torch.zeros(len(node_ids), dtype=torch.float32)
+            return zero_weights, node_ids
 
         logger.info(f"Raw computed weights before normalization: {weights}")
 
@@ -208,7 +210,12 @@ class FiberWeightSetter:
 
             calculated_weights, node_ids = self.calculate_weights(weights_copy)
             if calculated_weights is None:
+                logger.warning("No weights calculated - skipping weight setting")
                 return False
+
+            # Log if all weights are zero but still proceed to set them
+            if torch.is_tensor(calculated_weights) and calculated_weights.sum().item() == 0:
+                logger.info("All calculated weights are zero - proceeding to set zero weights on-chain")
 
             try:
                 logger.info(f"Setting weights for {len(self.nodes)} nodes")
