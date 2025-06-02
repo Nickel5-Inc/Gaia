@@ -2469,7 +2469,7 @@ class GaiaValidator:
 
             # Query node table for validator nodes with chunking to manage memory
             validator_nodes_query = """
-            SELECT uid, hotkey, ip, port, incentive, emission, dividends 
+            SELECT uid, hotkey, ip, port, incentive 
             FROM node_table 
             WHERE uid IS NOT NULL 
             ORDER BY uid
