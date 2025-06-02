@@ -2380,7 +2380,7 @@ class GaiaValidator:
             if np.isnan(g_s) or g_s==0: g_s=np.nan
             if np.isnan(sm_s) or sm_s==0: sm_s=np.nan
             node_obj, hk_chain = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None, "N/A"
-            if node_obj: hk_chain = node_obj.hotkey
+            if node_obj: hk_chain = node_obj.get('hotkey', 'N/A')
             if np.isnan(w_s) and np.isnan(g_s) and np.isnan(sm_s): weights_final[idx] = 0.0
             else:
                 wc, gc, sc, total_w_avail = 0.0,0.0,0.0,0.0
@@ -2511,7 +2511,11 @@ class GaiaValidator:
                 logger.info(f"Fetched scores: Weather={len(weather_results)}, Geo={len(geomagnetic_results)}, Soil={len(soil_results)}")
                 
                 # Convert to list for the sync calculation
-                validator_nodes_by_uid_list = list(validator_nodes_list)
+                validator_nodes_by_uid_list = [None] * 256
+                for node_dict in validator_nodes_list:
+                    uid = node_dict.get('uid')
+                    if uid is not None and 0 <= uid < 256:
+                        validator_nodes_by_uid_list[uid] = node_dict
 
                 # Perform CPU-bound weight calculation in thread pool to avoid blocking
                 loop = asyncio.get_event_loop()
