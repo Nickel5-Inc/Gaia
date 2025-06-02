@@ -1544,8 +1544,8 @@ class GaiaValidator:
             logger.info("Auto-updater task started independently")
             
             tasks = [
-                #lambda: self.geomagnetic_task.validator_execute(self),
-                #lambda: self.soil_task.validator_execute(self),
+                lambda: self.geomagnetic_task.validator_execute(self),
+                lambda: self.soil_task.validator_execute(self),
                 lambda: self.weather_task.validator_execute(self),
                 lambda: self.status_logger(),
                 lambda: self.main_scoring(),
