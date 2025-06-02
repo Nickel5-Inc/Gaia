@@ -691,12 +691,13 @@ class GaiaValidator:
                     ),
                 )
 
-            # Use HTTP client connection limits as natural throttling - remove semaphore bottleneck
-            # max_connections=100 will naturally limit concurrency
-            logger.info(f"Starting high-concurrency queries for {len(miners_to_query)} miners (no artificial semaphore limit)")
+            # Reintroduce Semaphore for concurrency control
+            concurrency_limit = 30  # Limit to 30 concurrent miner queries
+            semaphore = asyncio.Semaphore(concurrency_limit)
+            logger.info(f"Starting queries for {len(miners_to_query)} miners with concurrency limit: {concurrency_limit}")
 
             # Configuration for immediate retries
-            max_retries_per_miner = 2  # Total attempts per miner
+            max_retries_per_miner = 3  # Increased from 2 to 3
             base_timeout = 15.0
             
             # Track miners and their attempt counts
@@ -708,171 +709,173 @@ class GaiaValidator:
                 base_url = f"https://{node.ip}:{node.port}"
                 process = psutil.Process() if PSUTIL_AVAILABLE else None
                 
-                for attempt in range(max_retries_per_miner):
-                    miner_info["attempts"] = attempt + 1
-                    attempt_timeout = base_timeout + (attempt * 5.0)  # Progressive timeout
-                    
-                    try:
-                        logger.debug(f"Miner {miner_hotkey} attempt {attempt + 1}/{max_retries_per_miner}")
+                async with semaphore: # Acquire semaphore before starting attempts for a miner
+                    for attempt in range(max_retries_per_miner):
+                        miner_info["attempts"] = attempt + 1
+                        attempt_timeout = base_timeout + (attempt * 5.0)  # Progressive timeout
                         
-                        # Perform handshake
-                        handshake_start_time = time.time()
                         try:
-                            # Get public key
-                            public_key_encryption_key = await asyncio.wait_for(
-                                handshake.get_public_encryption_key(
-                                    self.miner_client, 
-                                    base_url, 
-                                    timeout=int(attempt_timeout)
-                                ),
-                                timeout=attempt_timeout
-                            )
+                            logger.debug(f"Miner {miner_hotkey} attempt {attempt + 1}/{max_retries_per_miner}")
                             
-                            # Generate symmetric key
-                            symmetric_key: bytes = os.urandom(32)
-                            symmetric_key_uuid: str = os.urandom(32).hex()
-                            
-                            # Send symmetric key
-                            success = await asyncio.wait_for(
-                                handshake.send_symmetric_key_to_server(
-                                    self.miner_client,
-                                    base_url,
-                                    self.keypair,
-                                    public_key_encryption_key,
-                                    symmetric_key,
-                                    symmetric_key_uuid,
-                                    miner_hotkey,
-                                    timeout=int(attempt_timeout),
-                                ),
-                                timeout=attempt_timeout
-                            )
-                            
-                            if not success:
-                                raise Exception("Handshake failed: server returned unsuccessful status")
-                                
-                            symmetric_key_str = base64.b64encode(symmetric_key).decode()
-                                
-                        except Exception as hs_err:
-                            logger.debug(f"Handshake failed for miner {miner_hotkey} attempt {attempt + 1}: {type(hs_err).__name__}")
-                            if attempt < max_retries_per_miner - 1:
-                                await asyncio.sleep(0.5 * (attempt + 1))  # Brief delay before retry
-                                continue
-                            return None
-
-                        handshake_duration = time.time() - handshake_start_time
-                        logger.debug(f"Handshake with {miner_hotkey} completed in {handshake_duration:.2f}s (attempt {attempt + 1})")
-
-                        if process:
-                            logger.debug(f"Memory after handshake ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
-                        
-                        fernet = Fernet(symmetric_key_str)
-                        
-                        # Make the actual request
-                        try:
-                            logger.debug(f"Making request to {miner_hotkey} (attempt {attempt + 1})")
-                            request_start_time = time.time()
-                            
-                            # Log payload size for memory tracking
+                            # Perform handshake
+                            handshake_start_time = time.time()
                             try:
-                                payload_size_mb = len(str(payload).encode('utf-8')) / (1024 * 1024)
-                                if payload_size_mb > 50:  # Log large payloads
-                                    logger.info(f"Large payload warning: {miner_hotkey} payload size: {payload_size_mb:.1f}MB")
-                            except Exception:
-                                pass
-                            
-                            resp = await asyncio.wait_for(
-                                vali_client.make_non_streamed_post(
-                                    httpx_client=self.miner_client,
-                                    server_address=base_url,
-                                    fernet=fernet,
-                                    keypair=self.keypair,
-                                    symmetric_key_uuid=symmetric_key_uuid,
-                                    validator_ss58_address=self.keypair.ss58_address,
-                                    miner_ss58_address=miner_hotkey,
-                                    payload=payload,
-                                    endpoint=endpoint,
-                                ),
-                                timeout=240.0  # Keep longer timeout for actual request
-                            )
-                            request_duration = time.time() - request_start_time
-                            
-                            # Immediate cleanup of cryptographic objects and large variables
-                            try:
-                                # Clear Fernet cipher and symmetric key data
-                                if hasattr(fernet, '__dict__'):
-                                    fernet.__dict__.clear()
-                                del fernet
+                                # Get public key
+                                public_key_encryption_key = await asyncio.wait_for(
+                                    handshake.get_public_encryption_key(
+                                        self.miner_client, 
+                                        base_url, 
+                                        timeout=int(attempt_timeout)
+                                    ),
+                                    timeout=attempt_timeout
+                                )
                                 
-                                # Clear symmetric key variables
-                                symmetric_key = None
-                                del symmetric_key_str
-                                del symmetric_key_uuid
+                                # Generate symmetric key
+                                symmetric_key: bytes = os.urandom(32)
+                                symmetric_key_uuid: str = os.urandom(32).hex()
                                 
-                                # Clear request response data if it's large
-                                if resp and hasattr(resp, 'content') and len(resp.content) > 1024*1024:  # > 1MB
-                                    logger.debug(f"Clearing large response content for {miner_hotkey}: {len(resp.content)} bytes")
+                                # Send symmetric key
+                                success = await asyncio.wait_for(
+                                    handshake.send_symmetric_key_to_server(
+                                        self.miner_client,
+                                        base_url,
+                                        self.keypair,
+                                        public_key_encryption_key,
+                                        symmetric_key,
+                                        symmetric_key_uuid,
+                                        miner_hotkey,
+                                        timeout=int(attempt_timeout),
+                                    ),
+                                    timeout=attempt_timeout
+                                )
+                                
+                                if not success:
+                                    raise Exception("Handshake failed: server returned unsuccessful status")
                                     
-                            except Exception as cleanup_err:
-                                logger.debug(f"Non-critical cleanup error for {miner_hotkey}: {cleanup_err}")
-                            
-                            if process:
-                                mem_after = process.memory_info().rss / (1024*1024)
-                                logger.debug(f"Memory after request ({miner_hotkey}): {mem_after:.2f} MB")
-                            
-                            if resp and resp.status_code < 400:
-                                response_data = {
-                                    "text": resp.text,
-                                    "status_code": resp.status_code,
-                                    "hotkey": miner_hotkey,
-                                    "port": node.port,
-                                    "ip": node.ip,
-                                    "content_length": len(resp.content) if resp.content else 0,
-                                    "attempts_used": attempt + 1
-                                }
-                                logger.info(f"SUCCESS: {miner_hotkey} responded in {request_duration:.2f}s (attempt {attempt + 1})")
-                                return response_data
-                            else:
-                                logger.debug(f"Bad response from {miner_hotkey} attempt {attempt + 1}: status {resp.status_code if resp else 'None'}")
+                                symmetric_key_str = base64.b64encode(symmetric_key).decode()
+                                    
+                            except Exception as hs_err:
+                                logger.debug(f"Handshake failed for miner {miner_hotkey} attempt {attempt + 1}: {type(hs_err).__name__}")
                                 if attempt < max_retries_per_miner - 1:
-                                    await asyncio.sleep(0.5 * (attempt + 1))
+                                    await asyncio.sleep(0.5 * (attempt + 1))  # Brief delay before retry
                                     continue
                                 return None
 
-                        except Exception as request_error:
-                            # Enhanced cleanup on error
+                            handshake_duration = time.time() - handshake_start_time
+                            logger.debug(f"Handshake with {miner_hotkey} completed in {handshake_duration:.2f}s (attempt {attempt + 1})")
+
+                            if process:
+                                logger.debug(f"Memory after handshake ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
+                            
+                            fernet = Fernet(symmetric_key_str)
+                            
+                            # Make the actual request
                             try:
-                                if 'fernet' in locals() and fernet:
+                                logger.debug(f"Making request to {miner_hotkey} (attempt {attempt + 1})")
+                                request_start_time = time.time()
+                                
+                                # Log payload size for memory tracking
+                                try:
+                                    payload_size_mb = len(str(payload).encode('utf-8')) / (1024 * 1024)
+                                    if payload_size_mb > 50:  # Log large payloads
+                                        logger.info(f"Large payload warning: {miner_hotkey} payload size: {payload_size_mb:.1f}MB")
+                                except Exception:
+                                    pass
+                                
+                                resp = await asyncio.wait_for(
+                                    vali_client.make_non_streamed_post(
+                                        httpx_client=self.miner_client,
+                                        server_address=base_url,
+                                        fernet=fernet,
+                                        keypair=self.keypair,
+                                        symmetric_key_uuid=symmetric_key_uuid,
+                                        validator_ss58_address=self.keypair.ss58_address,
+                                        miner_ss58_address=miner_hotkey,
+                                        payload=payload,
+                                        endpoint=endpoint,
+                                    ),
+                                    timeout=240.0  # Keep longer timeout for actual request
+                                )
+                                request_duration = time.time() - request_start_time
+                                
+                                # Immediate cleanup of cryptographic objects and large variables
+                                try:
+                                    # Clear Fernet cipher and symmetric key data
                                     if hasattr(fernet, '__dict__'):
                                         fernet.__dict__.clear()
                                     del fernet
-                                if 'symmetric_key_str' in locals():
-                                    del symmetric_key_str
-                                if 'symmetric_key_uuid' in locals():
-                                    del symmetric_key_uuid
-                                if 'symmetric_key' in locals():
+                                    
+                                    # Clear symmetric key variables
                                     symmetric_key = None
-                            except Exception:
-                                pass
+                                    del symmetric_key_str
+                                    del symmetric_key_uuid
+                                    
+                                    # Clear request response data if it's large
+                                    if resp and hasattr(resp, 'content') and len(resp.content) > 1024*1024:  # > 1MB
+                                        logger.debug(f"Clearing large response content for {miner_hotkey}: {len(resp.content)} bytes")
+                                        
+                                except Exception as cleanup_err:
+                                    logger.debug(f"Non-critical cleanup error for {miner_hotkey}: {cleanup_err}")
                                 
-                            logger.debug(f"Request error for {miner_hotkey} attempt {attempt + 1}: {type(request_error).__name__}")
+                                if process:
+                                    mem_after = process.memory_info().rss / (1024*1024)
+                                    logger.debug(f"Memory after request ({miner_hotkey}): {mem_after:.2f} MB")
+                                
+                                if resp and resp.status_code < 400:
+                                    response_data = {
+                                        "text": resp.text,
+                                        "status_code": resp.status_code,
+                                        "hotkey": miner_hotkey,
+                                        "port": node.port,
+                                        "ip": node.ip,
+                                        "content_length": len(resp.content) if resp.content else 0,
+                                        "attempts_used": attempt + 1
+                                    }
+                                    logger.info(f"SUCCESS: {miner_hotkey} responded in {request_duration:.2f}s (attempt {attempt + 1})")
+                                    return response_data # Success, return immediately
+                                else:
+                                    logger.debug(f"Bad response from {miner_hotkey} attempt {attempt + 1}: status {resp.status_code if resp else 'None'}")
+                                    if attempt < max_retries_per_miner - 1:
+                                        await asyncio.sleep(0.5 * (attempt + 1))
+                                        continue # Go to next attempt for this miner
+                                    return None # Max retries reached for this miner
+
+                            except Exception as request_error:
+                                # Enhanced cleanup on error
+                                try:
+                                    if 'fernet' in locals() and fernet:
+                                        if hasattr(fernet, '__dict__'):
+                                            fernet.__dict__.clear()
+                                        del fernet
+                                    if 'symmetric_key_str' in locals():
+                                        del symmetric_key_str
+                                    if 'symmetric_key_uuid' in locals():
+                                        del symmetric_key_uuid
+                                    if 'symmetric_key' in locals():
+                                        symmetric_key = None
+                                except Exception:
+                                    pass
+                                    
+                                logger.debug(f"Request error for {miner_hotkey} attempt {attempt + 1}: {type(request_error).__name__}")
+                                if attempt < max_retries_per_miner - 1:
+                                    await asyncio.sleep(0.5 * (attempt + 1))
+                                    continue # Go to next attempt for this miner
+                                return None # Max retries reached for this miner
+                                
+                        except Exception as outer_error: # Catch errors within the attempt loop but outside handshake/request
+                            logger.debug(f"Outer error for {miner_hotkey} attempt {attempt + 1}: {type(outer_error).__name__} - {outer_error}")
                             if attempt < max_retries_per_miner - 1:
                                 await asyncio.sleep(0.5 * (attempt + 1))
-                                continue
-                            return None
-                            
-                    except Exception as outer_error:
-                        logger.debug(f"Outer error for {miner_hotkey} attempt {attempt + 1}: {type(outer_error).__name__}")
-                        if attempt < max_retries_per_miner - 1:
-                            await asyncio.sleep(0.5 * (attempt + 1))
-                            continue
-                        return None
-                
-                # All attempts failed
-                logger.debug(f"All {max_retries_per_miner} attempts failed for {miner_hotkey}")
-                return None
+                                continue # Go to next attempt for this miner
+                            return None # Max retries reached for this miner
+                    
+                    # If loop finishes, all attempts for this miner failed (should be caught by returns above but as a fallback)
+                    logger.debug(f"All {max_retries_per_miner} attempts failed for {miner_hotkey} (fallback).")
+                    return None
+                # Semaphore is automatically released when async with block exits
 
-            # Launch all queries immediately with maximum concurrency
-            logger.info(f"Launching {len(miners_to_attempt)} concurrent miner queries...")
+            # Launch all queries immediately - semaphore in query_single_miner_with_retries will handle concurrency
+            logger.info(f"Launching {len(miners_to_attempt)} miner query tasks (concurrency managed by semaphore)...")
             start_time = time.time()
             
             # Log memory before launching queries
