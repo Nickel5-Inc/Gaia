@@ -3060,13 +3060,14 @@ if __name__ == "__main__":
         if alembic_auto_upgrade_val:
             print(f"[Startup] Validator: ALEMBIC_AUTO_UPGRADE is True. Attempting to upgrade to head...")
             
-            # Construct database URL for Alembic check
+            # Construct database URL for Alembic check - use psycopg2 for synchronous operations
             db_host = os.getenv("DB_HOST", "localhost")
             db_port = os.getenv("DB_PORT", "5432")
             db_name = os.getenv("DB_NAME", "validator_db")
             db_user = os.getenv("DB_USER", "postgres")
             db_password = os.getenv("DB_PASSWORD", "postgres")
-            db_url = f"postgresql+asyncpg://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+            # Use psycopg2 for synchronous Alembic operations instead of asyncpg
+            db_url = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
             
             # Safety check: Verify no data-destructive migrations are pending
             try:
@@ -3075,7 +3076,7 @@ if __name__ == "__main__":
                 
                 script_dir = ScriptDirectory.from_config(alembic_cfg_val)
                 
-                # Check current revision
+                # Check current revision using synchronous engine
                 with create_engine(db_url, poolclass=pool.NullPool).connect() as conn:
                     context = MigrationContext.configure(conn)
                     current_rev = context.get_current_revision()
@@ -3108,6 +3109,52 @@ if __name__ == "__main__":
 
     logger.info("Validator Alembic check complete. Starting main validator application...")
     # --- End Alembic check code for Validator ---
+
+    # --- Ensure requirements are up to date on every restart ---
+    try:
+        import subprocess
+        import sys
+        
+        logger.info("Ensuring Python requirements are up to date...")
+        print("[Startup] Installing/updating requirements from requirements.txt...")
+        
+        # Construct path to requirements.txt relative to this script
+        current_script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(current_script_dir, "..", ".."))
+        requirements_path = os.path.join(project_root, "requirements.txt")
+        
+        if not os.path.exists(requirements_path):
+            logger.warning(f"requirements.txt not found at {requirements_path}, skipping pip install")
+            print(f"[Startup] Warning: requirements.txt not found at {requirements_path}")
+        else:
+            # Run pip install with timeout to prevent hanging
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", requirements_path],
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 minute timeout
+                cwd=project_root
+            )
+            
+            if result.returncode == 0:
+                logger.info("Successfully updated Python requirements")
+                print("[Startup] Python requirements updated successfully")
+                if result.stdout:
+                    logger.debug(f"Pip install output: {result.stdout}")
+            else:
+                logger.warning(f"Pip install returned non-zero exit code {result.returncode}")
+                print(f"[Startup] Warning: pip install failed with exit code {result.returncode}")
+                if result.stderr:
+                    logger.warning(f"Pip install stderr: {result.stderr}")
+                    print(f"[Startup] Pip error output: {result.stderr}")
+                    
+    except subprocess.TimeoutExpired:
+        logger.warning("Pip install timed out after 5 minutes, continuing with startup")
+        print("[Startup] Warning: pip install timed out, continuing with startup")
+    except Exception as e:
+        logger.warning(f"Error during pip install: {e}, continuing with startup")
+        print(f"[Startup] Warning: Error during pip install: {e}")
+    # --- End requirements update ---
 
     validator = GaiaValidator(args)
     try:
