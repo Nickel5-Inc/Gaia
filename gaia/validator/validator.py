@@ -71,7 +71,7 @@ from alembic.util import CommandError # Import CommandError
 from sqlalchemy import create_engine, pool
 
 # New imports for DB Sync
-from gaia.validator.sync.azure_blob_utils import get_azure_blob_manager_for_db_sync, AzureBlobManager
+from gaia.validator.sync.storage_utils import get_storage_manager_for_db_sync, StorageManager
 from gaia.validator.sync.backup_manager import get_backup_manager, BackupManager
 from gaia.validator.sync.restore_manager import get_restore_manager, RestoreManager
 import random # for staggering db sync tasks
@@ -348,7 +348,7 @@ class GaiaValidator:
         logger.info("BaseModelEvaluator initialized")
         
         # DB Sync components
-        self.azure_blob_manager_for_sync: AzureBlobManager | None = None
+        self.storage_manager_for_sync: StorageManager | None = None
         self.backup_manager: BackupManager | None = None
         self.restore_manager: RestoreManager | None = None
         
@@ -2595,24 +2595,24 @@ class GaiaValidator:
         db_sync_enabled_str = os.getenv("DB_SYNC_ENABLED", "True") # Default to True if not set
         if db_sync_enabled_str.lower() != "true":
             logger.info("DB_SYNC_ENABLED is not 'true'. Database synchronization feature will be disabled.")
-            self.azure_blob_manager_for_sync = None
+            self.storage_manager_for_sync = None
             self.backup_manager = None
             self.restore_manager = None
             return
 
-        self.azure_blob_manager_for_sync = await get_azure_blob_manager_for_db_sync()
-        if not self.azure_blob_manager_for_sync:
-            logger.error("Failed to initialize AzureBlobManager for DB Sync. DB Sync will be disabled.")
+        self.storage_manager_for_sync = await get_storage_manager_for_db_sync()
+        if not self.storage_manager_for_sync:
+            logger.error("Failed to initialize StorageManager for DB Sync. DB Sync will be disabled.")
             return
 
         if self.is_source_validator_for_db_sync:
             logger.info("This node is configured as the SOURCE for DB Sync.")
-            self.backup_manager = await get_backup_manager(self.azure_blob_manager_for_sync)
+            self.backup_manager = await get_backup_manager(self.storage_manager_for_sync)
             if not self.backup_manager:
                 logger.error("Failed to initialize BackupManager. DB Sync (source) will be disabled.")
         else:
             logger.info("This node is configured as a REPLICA for DB Sync.")
-            self.restore_manager = await get_restore_manager(self.azure_blob_manager_for_sync)
+            self.restore_manager = await get_restore_manager(self.storage_manager_for_sync)
             if not self.restore_manager:
                 logger.error("Failed to initialize RestoreManager. DB Sync (replica) will be disabled.")
         logger.info("DB Sync components initialization attempt finished.")

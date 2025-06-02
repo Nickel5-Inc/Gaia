@@ -6,7 +6,7 @@ import random
 import time
 import subprocess # For running pg_dump
 from fiber.logging_utils import get_logger
-from gaia.validator.sync.azure_blob_utils import AzureBlobManager # Direct import
+from gaia.validator.sync.storage_utils import StorageManager, get_storage_manager_for_db_sync, get_storage_backend_name
 # Assuming ValidatorDatabaseManager might be needed for DB config, though pg_dump uses env vars or pgpass
 # from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager 
 
@@ -21,16 +21,17 @@ DB_PORT_DEFAULT = "5432"
 BACKUP_DIR_DEFAULT = "/tmp/db_backups_gaia" # Local temporary storage for dumps
 BACKUP_PREFIX_DEFAULT = "validator_db_backup_"
 MANIFEST_FILENAME_DEFAULT = "latest_backup_manifest.txt"
-MAX_AZURE_BACKUPS_DEFAULT = 5 # Keep last 5 backups
+MAX_BACKUPS_DEFAULT = 5 # Keep last 5 backups
 PG_DUMP_TIMEOUT_SECONDS = 1800 # Timeout for pg_dump command (30 minutes)
 TARGET_BACKUP_MINUTE = 30 # Target minute of the hour to start backups (e.g., HH:30)
 
 class BackupManager:
-    def __init__(self, azure_manager: AzureBlobManager, 
+    def __init__(self, storage_manager: StorageManager, 
                  db_name: str, db_user: str, db_host: str, db_port: str, db_password: str | None,
                  local_backup_dir: str, backup_prefix: str, 
-                 manifest_filename: str, max_azure_backups: int):
-        self.azure_manager = azure_manager
+                 manifest_filename: str, max_backups: int):
+        self.storage_manager = storage_manager
+        self.storage_backend_name = get_storage_backend_name(storage_manager)
         self.db_name = db_name
         self.db_user = db_user
         self.db_host = db_host
@@ -39,8 +40,10 @@ class BackupManager:
         self.local_backup_dir = local_backup_dir
         self.backup_prefix = backup_prefix
         self.manifest_filename = manifest_filename
-        self.max_azure_backups = max_azure_backups
+        self.max_backups = max_backups
         os.makedirs(self.local_backup_dir, exist_ok=True)
+        
+        logger.info(f"BackupManager initialized with {self.storage_backend_name} storage backend")
 
     async def _run_pg_dump(self, backup_file_path: str) -> bool:
         cmd = [
@@ -106,13 +109,13 @@ class BackupManager:
 
     async def _update_latest_backup_manifest(self, latest_dump_blob_name: str) -> bool:
         logger.info(f"Updating manifest file '{self.manifest_filename}' with new backup: {latest_dump_blob_name}")
-        return await self.azure_manager.upload_blob_content(latest_dump_blob_name, self.manifest_filename)
+        return await self.storage_manager.upload_blob_content(latest_dump_blob_name, self.manifest_filename)
 
-    async def _prune_old_backups_azure(self) -> None:
-        logger.info("Pruning old backups from Azure Blob Storage...")
+    async def _prune_old_backups(self) -> None:
+        logger.info(f"Pruning old backups from {self.storage_backend_name} storage...")
         try:
             # Assuming dumps are stored with a prefix or in a specific virtual folder for listing
-            blob_list = await self.azure_manager.list_blobs(prefix=f"dumps/{self.backup_prefix}")
+            blob_list = await self.storage_manager.list_blobs(prefix=f"dumps/{self.backup_prefix}")
             
             # Filter and sort backups by timestamp in filename (descending, newest first)
             # Example filename: dumps/validator_db_backup_20230101_120000.dump
@@ -130,16 +133,16 @@ class BackupManager:
             
             backups.sort(key=lambda item: item[0], reverse=True) # Sort by datetime object, newest first
             
-            if len(backups) > self.max_azure_backups:
-                backups_to_delete = backups[self.max_azure_backups:]
-                logger.info(f"Found {len(backups_to_delete)} old backups to delete from Azure.")
+            if len(backups) > self.max_backups:
+                backups_to_delete = backups[self.max_backups:]
+                logger.info(f"Found {len(backups_to_delete)} old backups to delete from {self.storage_backend_name}.")
                 for _, blob_name_to_delete in backups_to_delete:
-                    logger.info(f"Deleting old Azure backup: {blob_name_to_delete}")
-                    await self.azure_manager.delete_blob(blob_name_to_delete)
+                    logger.info(f"Deleting old {self.storage_backend_name} backup: {blob_name_to_delete}")
+                    await self.storage_manager.delete_blob(blob_name_to_delete)
             else:
-                logger.info("No old Azure backups to prune based on current count and max limit.")
+                logger.info(f"No old {self.storage_backend_name} backups to prune based on current count and max limit.")
         except Exception as e:
-            logger.error(f"Error during Azure backup pruning: {e}", exc_info=True)
+            logger.error(f"Error during {self.storage_backend_name} backup pruning: {e}", exc_info=True)
     
     def _os_remove_sync(self, file_path: str):
         """Synchronous wrapper for os.remove."""
@@ -165,9 +168,9 @@ class BackupManager:
         timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
         local_dump_filename = f"{self.backup_prefix}{timestamp_str}.dump"
         local_dump_full_path = os.path.join(self.local_backup_dir, local_dump_filename)
-        azure_blob_name = f"dumps/{local_dump_filename}" # Store in a 'dumps' folder in Azure
+        storage_blob_name = f"dumps/{local_dump_filename}" # Store in a 'dumps' folder in storage
 
-        logger.info(f"Starting database backup cycle. Target: {local_dump_full_path}, Azure Blob: {azure_blob_name}")
+        logger.info(f"Starting database backup cycle. Target: {local_dump_full_path}, {self.storage_backend_name} Blob: {storage_blob_name}")
 
         # 1. Run pg_dump
         logger.info("Step 1: Running pg_dump...")
@@ -177,33 +180,33 @@ class BackupManager:
             return False
         logger.info("Step 1: pg_dump successful.")
 
-        # 2. Upload to Azure
-        logger.info(f"Step 2: Uploading '{local_dump_full_path}' to Azure as '{azure_blob_name}'...")
-        if not await self.azure_manager.upload_blob(local_dump_full_path, azure_blob_name):
-            logger.error("Azure upload failed. Aborting backup cycle.")
+        # 2. Upload to storage
+        logger.info(f"Step 2: Uploading '{local_dump_full_path}' to {self.storage_backend_name} as '{storage_blob_name}'...")
+        if not await self.storage_manager.upload_blob(local_dump_full_path, storage_blob_name):
+            logger.error(f"{self.storage_backend_name} upload failed. Aborting backup cycle.")
             await self._prune_local_backup(local_dump_full_path) # Clean up local dump if upload fails
             return False
-        logger.info("Step 2: Azure upload successful.")
+        logger.info(f"Step 2: {self.storage_backend_name} upload successful.")
 
         # 3. Update manifest
         logger.info("Step 3: Updating latest backup manifest...")
-        if not await self._update_latest_backup_manifest(azure_blob_name):
+        if not await self._update_latest_backup_manifest(storage_blob_name):
             logger.warning("Failed to update latest backup manifest. Continuing, but replicas might not find this backup immediately.")
             # Not returning False here as the backup itself is successful and uploaded.
         else:
             logger.info("Step 3: Manifest update successful.")
 
-        # 4. Prune old Azure backups
-        logger.info("Step 4: Pruning old Azure backups...")
-        await self._prune_old_backups_azure()
-        logger.info("Step 4: Azure pruning finished.")
+        # 4. Prune old backups
+        logger.info(f"Step 4: Pruning old {self.storage_backend_name} backups...")
+        await self._prune_old_backups()
+        logger.info(f"Step 4: {self.storage_backend_name} pruning finished.")
 
         # 5. Prune local dump file
         logger.info(f"Step 5: Pruning local dump file '{local_dump_full_path}'...")
         await self._prune_local_backup(local_dump_full_path)
         logger.info("Step 5: Local pruning finished.")
         
-        logger.info(f"Database backup cycle completed successfully for {azure_blob_name}.")
+        logger.info(f"Database backup cycle completed successfully for {storage_blob_name}.")
         return True
 
     async def start_periodic_backups(self, interval_hours: int):
@@ -283,12 +286,12 @@ class BackupManager:
                 logger.error(f"Critical error during periodic backup cycle: {e}", exc_info=True)
 
     async def close(self):
-        # The azure_manager is passed in, so its lifecycle is managed externally (e.g., by GaiaValidator)
-        logger.info("BackupManager closed. (Azure client lifecycle managed externally)")
+        # The storage_manager is passed in, so its lifecycle is managed externally (e.g., by GaiaValidator)
+        logger.info("BackupManager closed. (Storage client lifecycle managed externally)")
 
-async def get_backup_manager(azure_manager: AzureBlobManager) -> BackupManager | None:
-    if not azure_manager:
-        logger.error("AzureBlobManager instance is required to create BackupManager.")
+async def get_backup_manager(storage_manager: StorageManager) -> BackupManager | None:
+    if not storage_manager:
+        logger.error("StorageManager instance is required to create BackupManager.")
         return None
 
     db_name = os.getenv("DB_NAME", DB_NAME_DEFAULT) # Using DB_NAME from env
@@ -300,10 +303,10 @@ async def get_backup_manager(azure_manager: AzureBlobManager) -> BackupManager |
     local_backup_dir = os.getenv("DB_SYNC_BACKUP_DIR", BACKUP_DIR_DEFAULT)
     backup_prefix = os.getenv("DB_SYNC_BACKUP_PREFIX", BACKUP_PREFIX_DEFAULT)
     manifest_filename = os.getenv("DB_SYNC_MANIFEST_FILENAME", MANIFEST_FILENAME_DEFAULT)
-    max_azure_backups = int(os.getenv("DB_SYNC_MAX_AZURE_BACKUPS", MAX_AZURE_BACKUPS_DEFAULT))
+    max_backups = int(os.getenv("DB_SYNC_MAX_BACKUPS", MAX_BACKUPS_DEFAULT))
 
     return BackupManager(
-        azure_manager=azure_manager,
+        storage_manager=storage_manager,
         db_name=db_name,
         db_user=db_user,
         db_host=db_host,
@@ -312,32 +315,49 @@ async def get_backup_manager(azure_manager: AzureBlobManager) -> BackupManager |
         local_backup_dir=local_backup_dir,
         backup_prefix=backup_prefix,
         manifest_filename=manifest_filename,
-        max_azure_backups=max_azure_backups
+        max_backups=max_backups
     )
 
 
 # Example Usage (for testing)
 async def _example_main_backup():
-    from gaia.validator.sync.azure_blob_utils import get_azure_blob_manager_for_db_sync # Relative import for example
+    from gaia.validator.sync.storage_utils import get_storage_manager_for_db_sync # Relative import for example
     logger.info("Testing BackupManager...")
     
-    # Ensure AZURE_STORAGE_CONNECTION_STRING is set for AzureBlobManager
-    if not os.getenv("AZURE_STORAGE_CONNECTION_STRING"):
-        logger.error("Please set AZURE_STORAGE_CONNECTION_STRING environment variable to test BackupManager.")
+    # Check for storage configuration - supports both Azure and R2
+    azure_configured = bool(os.getenv("AZURE_STORAGE_CONNECTION_STRING") or 
+                           (os.getenv("AZURE_STORAGE_ACCOUNT_URL") and os.getenv("AZURE_STORAGE_SAS_TOKEN")))
+    r2_configured = bool(os.getenv("R2_ENDPOINT_URL") and 
+                        os.getenv("R2_ACCESS_KEY_ID") and 
+                        os.getenv("R2_SECRET_ACCESS_KEY"))
+    
+    if not azure_configured and not r2_configured:
+        logger.error("""
+        No storage backend configured. Please set one of:
+        
+        For Azure:
+        - AZURE_STORAGE_CONNECTION_STRING, or
+        - AZURE_STORAGE_ACCOUNT_URL + AZURE_STORAGE_SAS_TOKEN
+        
+        For R2:
+        - R2_ENDPOINT_URL + R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY
+        
+        You can also set STORAGE_BACKEND=azure|r2|auto to specify preference.
+        """)
         return
 
     # It's also assumed that PostgreSQL is running and accessible for pg_dump
     # and that pg_dump is in the system PATH. Adjust DB_USER and DB_NAME if needed via env vars.
 
-    azure_manager_instance = await get_azure_blob_manager_for_db_sync()
-    if not azure_manager_instance:
-        logger.error("Failed to initialize AzureBlobManager for BackupManager test.")
+    storage_manager_instance = await get_storage_manager_for_db_sync()
+    if not storage_manager_instance:
+        logger.error("Failed to initialize StorageManager for BackupManager test.")
         return
 
-    backup_manager_instance = await get_backup_manager(azure_manager_instance)
+    backup_manager_instance = await get_backup_manager(storage_manager_instance)
     if not backup_manager_instance:
         logger.error("Failed to initialize BackupManager.")
-        await azure_manager_instance.close()
+        await storage_manager_instance.close()
         return
     
     try:
@@ -351,7 +371,7 @@ async def _example_main_backup():
         logger.error(f"Error during BackupManager test: {e}", exc_info=True)
     finally:
         await backup_manager_instance.close()
-        await azure_manager_instance.close()
+        await storage_manager_instance.close()
 
 if __name__ == "__main__":
     # To run: python -m gaia.validator.sync.backup_manager

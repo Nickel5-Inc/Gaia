@@ -5,7 +5,7 @@ import datetime
 import time
 import subprocess # For pg_restore, psql
 from fiber.logging_utils import get_logger
-from gaia.validator.sync.azure_blob_utils import AzureBlobManager # Direct import
+from gaia.validator.sync.storage_utils import StorageManager, get_storage_manager_for_db_sync, get_storage_backend_name
 import random
 from typing import Optional
 
@@ -22,10 +22,11 @@ MANIFEST_FILENAME_DEFAULT = "latest_backup_manifest.txt" # Should match BackupMa
 LAST_RESTORED_MARKER_FILE_DEFAULT = ".last_restored_backup_marker"
 
 class RestoreManager:
-    def __init__(self, azure_manager: AzureBlobManager, 
+    def __init__(self, storage_manager: StorageManager, 
                  db_name: str, db_user: str, db_host: str, db_port: str, db_password: str | None,
                  local_restore_dir: str, manifest_filename: str):
-        self.azure_manager = azure_manager
+        self.storage_manager = storage_manager
+        self.storage_backend_name = get_storage_backend_name(storage_manager)
         self.db_name = db_name
         self.db_user = db_user
         self.db_host = db_host
@@ -37,6 +38,8 @@ class RestoreManager:
         os.makedirs(self.local_restore_dir, exist_ok=True)
         self._is_restoring_lock = asyncio.Lock() # Prevent concurrent restore attempts
         self._stop_event = asyncio.Event() # For graceful shutdown
+        
+        logger.info(f"RestoreManager initialized with {self.storage_backend_name} storage backend")
 
     def _read_marker_file_sync(self, file_path: str) -> Optional[str]:
         """Synchronous helper to read marker file content."""
@@ -49,8 +52,8 @@ class RestoreManager:
         return None
 
     async def _get_latest_backup_blob_name_from_manifest(self) -> str | None:
-        logger.info(f"Fetching latest backup name from Azure manifest: {self.manifest_filename}")
-        blob_name = await self.azure_manager.read_blob_content(self.manifest_filename)
+        logger.info(f"Fetching latest backup name from {self.storage_backend_name} manifest: {self.manifest_filename}")
+        blob_name = await self.storage_manager.read_blob_content(self.manifest_filename)
         if blob_name:
             logger.info(f"Latest backup blob name from manifest: {blob_name}")
             return blob_name
@@ -218,26 +221,26 @@ class RestoreManager:
         
         async with self._is_restoring_lock:
             logger.info("Starting database restore check cycle...")
-            latest_azure_backup_blob = await self._get_latest_backup_blob_name_from_manifest()
-            if not latest_azure_backup_blob:
-                logger.info("No new backup found in Azure manifest. Restore cycle ending.")
+            latest_backup_blob = await self._get_latest_backup_blob_name_from_manifest()
+            if not latest_backup_blob:
+                logger.info(f"No new backup found in {self.storage_backend_name} manifest. Restore cycle ending.")
                 return False
 
             last_locally_restored = await self._get_last_restored_backup_name()
 
-            if latest_azure_backup_blob == last_locally_restored:
-                logger.info(f"Database is already up-to-date with the latest backup: {latest_azure_backup_blob}. Restore cycle ending.")
+            if latest_backup_blob == last_locally_restored:
+                logger.info(f"Database is already up-to-date with the latest backup: {latest_backup_blob}. Restore cycle ending.")
                 return False
 
-            logger.info(f"New backup found: {latest_azure_backup_blob}. Current local: {last_locally_restored or 'None'}. Proceeding with restore.")
+            logger.info(f"New backup found: {latest_backup_blob}. Current local: {last_locally_restored or 'None'}. Proceeding with restore.")
             
-            local_download_filename = latest_azure_backup_blob.split('/')[-1]
+            local_download_filename = latest_backup_blob.split('/')[-1]
             local_download_full_path = os.path.join(self.local_restore_dir, local_download_filename)
 
             # Download new backup
-            logger.info(f"Downloading '{latest_azure_backup_blob}' to '{local_download_full_path}'...")
-            if not await self.azure_manager.download_blob(latest_azure_backup_blob, local_download_full_path):
-                logger.error("Failed to download new backup. Aborting restore.")
+            logger.info(f"Downloading '{latest_backup_blob}' from {self.storage_backend_name} to '{local_download_full_path}'...")
+            if not await self.storage_manager.download_blob(latest_backup_blob, local_download_full_path):
+                logger.error(f"Failed to download new backup from {self.storage_backend_name}. Aborting restore.")
                 await self._prune_local_download(local_download_full_path)
                 return True # Attempted restore
 
@@ -249,10 +252,10 @@ class RestoreManager:
             await self._prune_local_download(local_download_full_path)
 
             if restore_successful:
-                logger.info(f"Database restore successful from {latest_azure_backup_blob}.")
-                await self._set_last_restored_backup_name(latest_azure_backup_blob)
+                logger.info(f"Database restore successful from {latest_backup_blob}.")
+                await self._set_last_restored_backup_name(latest_backup_blob)
             else:
-                logger.error(f"Database restore FAILED from {latest_azure_backup_blob}.")
+                logger.error(f"Database restore FAILED from {latest_backup_blob}.")
             
             logger.info("Restore cycle finished.")
             return True # Attempted restore
@@ -298,11 +301,11 @@ class RestoreManager:
             logger.warning("Timeout waiting for restore lock to release during close. Potential unterminated restore.")
         except Exception as e:
             logger.error(f"Error managing restore lock during close: {e}")
-        logger.info("RestoreManager closed. (Azure client lifecycle managed externally)")
+        logger.info(f"RestoreManager closed. ({self.storage_backend_name} client lifecycle managed externally)")
 
-async def get_restore_manager(azure_manager: AzureBlobManager) -> RestoreManager | None:
-    if not azure_manager:
-        logger.error("AzureBlobManager instance is required to create RestoreManager.")
+async def get_restore_manager(storage_manager: StorageManager) -> RestoreManager | None:
+    if not storage_manager:
+        logger.error("StorageManager instance is required to create RestoreManager.")
         return None
 
     db_name = os.getenv("DB_NAME", DB_NAME_DEFAULT)
@@ -315,7 +318,7 @@ async def get_restore_manager(azure_manager: AzureBlobManager) -> RestoreManager
     manifest_filename = os.getenv("DB_SYNC_MANIFEST_FILENAME", MANIFEST_FILENAME_DEFAULT)
 
     return RestoreManager(
-        azure_manager=azure_manager,
+        storage_manager=storage_manager,
         db_name=db_name,
         db_user=db_user,
         db_host=db_host,
@@ -327,30 +330,48 @@ async def get_restore_manager(azure_manager: AzureBlobManager) -> RestoreManager
 
 # Example Usage (for testing)
 async def _example_main_restore():
-    from gaia.validator.sync.azure_blob_utils import get_azure_blob_manager_for_db_sync
+    from gaia.validator.sync.storage_utils import get_storage_manager_for_db_sync
     logger.info("Testing RestoreManager...")
 
-    if not os.getenv("AZURE_STORAGE_CONNECTION_STRING"):
-        logger.error("Please set AZURE_STORAGE_CONNECTION_STRING environment variable to test RestoreManager.")
+    # Check for storage configuration - supports both Azure and R2
+    azure_configured = bool(os.getenv("AZURE_STORAGE_CONNECTION_STRING") or 
+                           (os.getenv("AZURE_STORAGE_ACCOUNT_URL") and os.getenv("AZURE_STORAGE_SAS_TOKEN")))
+    r2_configured = bool(os.getenv("R2_ENDPOINT_URL") and 
+                        os.getenv("R2_ACCESS_KEY_ID") and 
+                        os.getenv("R2_SECRET_ACCESS_KEY"))
+    
+    if not azure_configured and not r2_configured:
+        logger.error("""
+        No storage backend configured. Please set one of:
+        
+        For Azure:
+        - AZURE_STORAGE_CONNECTION_STRING, or
+        - AZURE_STORAGE_ACCOUNT_URL + AZURE_STORAGE_SAS_TOKEN
+        
+        For R2:
+        - R2_ENDPOINT_URL + R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY
+        
+        You can also set STORAGE_BACKEND=azure|r2|auto to specify preference.
+        """)
         return
 
     # Assumes a backup has been created by BackupManager and manifest exists.
     # Assumes PostgreSQL is running and accessible for psql/pg_restore.
 
-    azure_manager_instance = await get_azure_blob_manager_for_db_sync()
-    if not azure_manager_instance:
-        logger.error("Failed to initialize AzureBlobManager for RestoreManager test.")
+    storage_manager_instance = await get_storage_manager_for_db_sync()
+    if not storage_manager_instance:
+        logger.error("Failed to initialize StorageManager for RestoreManager test.")
         return
 
-    restore_manager_instance = await get_restore_manager(azure_manager_instance)
+    restore_manager_instance = await get_restore_manager(storage_manager_instance)
     if not restore_manager_instance:
         logger.error("Failed to initialize RestoreManager.")
-        await azure_manager_instance.close()
+        await storage_manager_instance.close()
         return
 
     try:
         logger.info("Performing a single restore cycle for testing...")
-        # To test this, ensure a backup is in Azure and manifest is updated (e.g., run backup_manager example first)
+        # To test this, ensure a backup is in storage and manifest is updated (e.g., run backup_manager example first)
         # For a real test, you might want to manually place a .last_restored_backup_marker with an older backup name.
         # e.g., with open(os.path.join(RESTORE_DIR_DEFAULT, LAST_RESTORED_MARKER_FILE_DEFAULT), 'w') as f: 
         #    f.write("dumps/validator_db_backup_YYYYMMDD_HHMMSS_old.dump") 
@@ -365,7 +386,7 @@ async def _example_main_restore():
         logger.error(f"Error during RestoreManager test: {e}", exc_info=True)
     finally:
         await restore_manager_instance.close()
-        await azure_manager_instance.close()
+        await storage_manager_instance.close()
 
 if __name__ == "__main__":
     # To run: python -m gaia.validator.sync.restore_manager

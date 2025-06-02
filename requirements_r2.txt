@@ -1,0 +1,13 @@
+# R2 Storage Dependencies for Gaia Validator
+# High-performance AWS SDK for S3-compatible storage
+
+# Core boto3 dependencies for R2 (S3-compatible) storage
+boto3>=1.34.0
+botocore>=1.34.0
+
+# Async boto3 for high-performance async operations
+aioboto3>=12.0.0
+
+# Additional performance and utility dependencies
+aiofiles>=23.0.0  # For efficient async file operations
+urllib3>=1.26.0   # HTTP client used by boto3 

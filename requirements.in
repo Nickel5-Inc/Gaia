@@ -47,3 +47,4 @@ pyinstrument
 kerchunk
 alembic
 gcsfs
+aioboto3
