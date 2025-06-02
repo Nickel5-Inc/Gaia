@@ -1158,6 +1158,7 @@ class GeomagneticTask(Task):
                 AND query_time <= :current_time
                 AND miner_uid = ANY(:uids)
                 ORDER BY query_time ASC
+                LIMIT 10000
                 """,
                 {
                     "history_window": history_window,
@@ -1170,6 +1171,10 @@ class GeomagneticTask(Task):
                 logger.warning(f"No historical data found for UIDs {uids} in window {history_window} to {current_time}")
                 return
 
+            # Log if we fetched a large dataset
+            if len(history_results) > 1000:
+                logger.warning(f"Large geomagnetic history dataset: {len(history_results)} records for UIDs {uids}")
+
             # Get current miner mappings
             miner_mappings = await self.db_manager.fetch_all(
                 """
@@ -1180,15 +1185,43 @@ class GeomagneticTask(Task):
             )
             hotkey_to_uid: Dict[str, int] = {row["hotkey"]: row["uid"] for row in miner_mappings}
 
-            # Group records by hour
+            # Group records by hour with memory-efficient processing
             hourly_records: Dict[datetime.datetime, List[Dict[str, Any]]] = {}
-            for record in history_results:
-                hour_key = record["query_time"].replace(
-                    minute=0, second=0, microsecond=0
-                )
-                if hour_key not in hourly_records:
-                    hourly_records[hour_key] = []
-                hourly_records[hour_key].append(record)
+            processed_count = 0
+            
+            try:
+                for record in history_results:
+                    hour_key = record["query_time"].replace(
+                        minute=0, second=0, microsecond=0
+                    )
+                    if hour_key not in hourly_records:
+                        hourly_records[hour_key] = []
+                    hourly_records[hour_key].append(record)
+                    processed_count += 1
+                    
+                    # Yield control periodically for large datasets
+                    if processed_count % 1000 == 0:
+                        await asyncio.sleep(0)
+
+                # Clear the large results list to free memory
+                del history_results
+                del miner_mappings
+                
+                # Force garbage collection for large datasets
+                if processed_count > 1000:
+                    import gc
+                    collected = gc.collect()
+                    logger.info(f"Geomagnetic history processing: GC collected {collected} objects after processing {processed_count} records")
+
+            except Exception as processing_error:
+                logger.error(f"Error processing historical records: {processing_error}")
+                # Clean up on error
+                try:
+                    del history_results
+                    del miner_mappings
+                except:
+                    pass
+                raise
 
             # Process each hour
             for hour, records in hourly_records.items():

@@ -681,15 +681,32 @@ class BaseDatabaseManager(ABC):
                 # No longer need session.begin() here, self.session() handles it.
                 result = await session.execute(text(query), params or {})
                 rows = result.all()
+                
+                # Enhanced handling and cleanup for large result sets
                 if len(rows) > 1000:
                     logger.warning(
                         f"Large result set ({op_name}): {len(rows)} rows\n"
-                        f"Query: {query}"
+                        f"Query: {query[:200]}..."
                     )
+                    
+                    # Force garbage collection for very large result sets
+                    if len(rows) > 5000:
+                        import gc
+                        collected = gc.collect()
+                        logger.warning(f"Very large result set detected ({len(rows)} rows), forced GC collected {collected} objects")
+                
+                # Convert to dict format
+                converted_rows = [dict(row._mapping) for row in rows]
+                
+                # Clear SQLAlchemy result objects to free memory immediately
+                del rows
+                del result
+                
                 duration = time.time() - start_time
                 if duration > self.DEFAULT_QUERY_TIMEOUT / 2: 
                     logger.warning(f"Slow query detected ({op_name}): {duration:.2f}s\nQuery: {query}")
-                return [dict(row._mapping) for row in rows]
+                    
+                return converted_rows
             except SQLAlchemyError as e:
                 logger.error(f"Database error in fetch_all ({op_name}): {str(e)}\nQuery: {query}")
                 # The main session context manager will handle rollback.

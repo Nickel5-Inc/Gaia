@@ -55,11 +55,53 @@ MINER_FORECAST_DIR_BG = Path("./miner_forecasts_background/")
 
 def _prepare_http_payload_sync(prepared_batch_for_http: Batch) -> bytes:
     logger.debug(f"SYNC: Serializing Aurora Batch for HTTP service...")
-    pickled_batch = pickle.dumps(prepared_batch_for_http)
-    base64_encoded_batch = base64.b64encode(pickled_batch).decode('utf-8')
-    payload_json_str = json.dumps({"serialized_aurora_batch": base64_encoded_batch})
-    gzipped_payload = gzip.compress(payload_json_str.encode('utf-8'))
-    return gzipped_payload
+    
+    # Track memory usage for large batch processing
+    pickled_batch = None
+    base64_encoded_batch = None
+    payload_json_str = None
+    
+    try:
+        pickled_batch = pickle.dumps(prepared_batch_for_http)
+        pickled_size_mb = len(pickled_batch) / (1024 * 1024)
+        if pickled_size_mb > 50:
+            logger.warning(f"Large Aurora batch pickle: {pickled_size_mb:.1f}MB")
+        
+        base64_encoded_batch = base64.b64encode(pickled_batch).decode('utf-8')
+        
+        # Clean up pickled data immediately
+        del pickled_batch
+        pickled_batch = None
+        
+        payload_json_str = json.dumps({"serialized_aurora_batch": base64_encoded_batch})
+        
+        # Clean up base64 data immediately
+        del base64_encoded_batch
+        base64_encoded_batch = None
+        
+        gzipped_payload = gzip.compress(payload_json_str.encode('utf-8'))
+        
+        # Clean up JSON string immediately
+        del payload_json_str
+        payload_json_str = None
+        
+        # Force garbage collection for large data
+        if pickled_size_mb > 50:
+            collected = gc.collect()
+            logger.info(f"GC collected {collected} objects after large batch serialization ({pickled_size_mb:.1f}MB)")
+        
+        return gzipped_payload
+        
+    except Exception as e:
+        # Clean up on error
+        if pickled_batch:
+            del pickled_batch
+        if base64_encoded_batch:
+            del base64_encoded_batch
+        if payload_json_str:
+            del payload_json_str
+        logger.error(f"Error in _prepare_http_payload_sync: {e}")
+        raise
 
 
 def _prepare_http_payload_sync(prepared_batch_for_http: Batch) -> bytes:
@@ -157,12 +199,43 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
             await update_job_status(task_instance, job_id, "error", f"Batch preparation failed: {batch_prep_err}")
             return
         finally:
-            if local_ds_t0 and hasattr(local_ds_t0, 'close'): local_ds_t0.close()
-            if local_ds_t_minus_6 and hasattr(local_ds_t_minus_6, 'close'): local_ds_t_minus_6.close()
-            if gfs_concat_data_for_batch_prep and hasattr(gfs_concat_data_for_batch_prep, 'close'): gfs_concat_data_for_batch_prep.close()
-
-            if gfs_concat_data_for_batch_prep and hasattr(gfs_concat_data_for_batch_prep, 'close'): gfs_concat_data_for_batch_prep.close()
-
+            # Comprehensive cleanup of large GFS datasets and prepared batch
+            cleanup_tasks = [
+                ("local_ds_t0", local_ds_t0),
+                ("local_ds_t_minus_6", local_ds_t_minus_6), 
+                ("gfs_concat_data_for_batch_prep", gfs_concat_data_for_batch_prep)
+            ]
+            
+            for name, obj in cleanup_tasks:
+                if obj and hasattr(obj, 'close'):
+                    try:
+                        obj.close()
+                        logger.debug(f"[InferenceTask Job {job_id}] Closed {name}")
+                    except Exception as e:
+                        logger.warning(f"[InferenceTask Job {job_id}] Error closing {name}: {e}")
+            
+            # Clean up prepared batch if it was created
+            if 'prepared_batch' in locals() and prepared_batch:
+                try:
+                    # Clear batch references to free memory
+                    if hasattr(prepared_batch, 'surf_vars'):
+                        prepared_batch.surf_vars.clear()
+                    if hasattr(prepared_batch, 'atmos_vars'):
+                        prepared_batch.atmos_vars.clear()
+                    if hasattr(prepared_batch, 'static_vars'):
+                        prepared_batch.static_vars.clear()
+                    del prepared_batch
+                    logger.debug(f"[InferenceTask Job {job_id}] Cleaned up prepared_batch")
+                except Exception as e:
+                    logger.warning(f"[InferenceTask Job {job_id}] Error cleaning prepared_batch: {e}")
+            
+            # Force garbage collection for large data cleanup
+            try:
+                collected = gc.collect()
+                if collected > 50:  # Log if significant cleanup occurred
+                    logger.info(f"[InferenceTask Job {job_id}] Memory cleanup: GC collected {collected} objects")
+            except Exception:
+                pass
 
         await update_job_status(task_instance, job_id, "running_inference")
         logger.info(f"[InferenceTask Job {job_id}] Waiting for GPU semaphore...")

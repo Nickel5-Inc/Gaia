@@ -213,9 +213,9 @@ class GaiaValidator:
             follow_redirects=True,
             verify=False,
             limits=httpx.Limits(
-                max_connections=50,  # Reduced from 100
-                max_keepalive_connections=15,  # Reduced from 20
-                keepalive_expiry=60,  # Increased from 30
+                max_connections=100,  # Restore higher limit for 200+ miners
+                max_keepalive_connections=50,  # Allow more keepalive for efficiency
+                keepalive_expiry=300,  # 5 minutes - good balance for regular queries
             ),
             transport=httpx.AsyncHTTPTransport(
                 retries=2,  # Reduced from 3
@@ -659,9 +659,17 @@ class GaiaValidator:
                 logger.warning(f"No miners to query for endpoint {endpoint} after filtering. Hotkeys: {hotkeys}")
                 return {}
 
-            # Use the existing miner_client instead of creating a new one
+            # Ensure miner client is available
             if not hasattr(self, 'miner_client') or self.miner_client.is_closed:
                 logger.warning("Miner client not available or closed, creating new one")
+                # Properly close old client if it exists
+                if hasattr(self, 'miner_client') and not self.miner_client.is_closed:
+                    try:
+                        await self.miner_client.aclose()
+                        logger.debug("Closed old miner client before creating new one")
+                    except Exception as e:
+                        logger.debug(f"Error closing old miner client: {e}")
+                
                 # Create SSL context that doesn't verify certificates
                 import ssl
                 ssl_context = ssl.create_default_context()
@@ -673,9 +681,9 @@ class GaiaValidator:
                     follow_redirects=True,
                     verify=False,
                     limits=httpx.Limits(
-                        max_connections=50,  # Reduced from 100
-                        max_keepalive_connections=15,  # Reduced from 20 
-                        keepalive_expiry=60,  # Increased from 30
+                        max_connections=100,  # Restore higher limit for 200+ miners
+                        max_keepalive_connections=50,  # Allow more keepalive for efficiency
+                        keepalive_expiry=300,  # 5 minutes - good balance for regular queries
                     ),
                     transport=httpx.AsyncHTTPTransport(
                         retries=2,  # Reduced from 3
@@ -683,204 +691,392 @@ class GaiaValidator:
                     ),
                 )
 
-            # Reduce concurrency based on number of miners to avoid overwhelming the system
-            max_concurrent = min(5, len(miners_to_query))  # Much more conservative
-            semaphore = asyncio.Semaphore(max_concurrent)
-            logger.info(f"Using concurrency limit of {max_concurrent} for {len(miners_to_query)} miners")
+            # Use HTTP client connection limits as natural throttling - remove semaphore bottleneck
+            # max_connections=100 will naturally limit concurrency
+            logger.info(f"Starting high-concurrency queries for {len(miners_to_query)} miners (no artificial semaphore limit)")
 
-            # Batch retry configuration
-            max_retry_rounds = 2  # Total of 3 attempts (1 initial + 2 retries)
-            retry_delay = 2.0  # Delay between retry rounds
+            # Configuration for immediate retries
+            max_retries_per_miner = 2  # Total attempts per miner
+            base_timeout = 15.0
             
-            # Track miners for retry
-            miners_remaining = dict(miners_to_query)  # Copy for first attempt
+            # Track miners and their attempt counts
+            miners_to_attempt = {hotkey: {"node": node, "attempts": 0} for hotkey, node in miners_to_query.items()}
             
-            for retry_round in range(max_retry_rounds + 1):  # 0 = initial attempt, 1+ = retry rounds
-                if not miners_remaining:
-                    break
+            async def query_single_miner_with_retries(miner_hotkey: str, miner_info: dict) -> Optional[Dict]:
+                """Query a single miner with immediate retries on failure."""
+                node = miner_info["node"]
+                base_url = f"https://{node.ip}:{node.port}"
+                process = psutil.Process() if PSUTIL_AVAILABLE else None
+                
+                for attempt in range(max_retries_per_miner):
+                    miner_info["attempts"] = attempt + 1
+                    attempt_timeout = base_timeout + (attempt * 5.0)  # Progressive timeout
                     
-                round_type = "Initial attempt" if retry_round == 0 else f"Retry round {retry_round}"
-                logger.info(f"{round_type}: Querying {len(miners_remaining)} miners")
-                
-                async def query_single_miner_no_retry(miner_hotkey: str, node: Any, attempt_num: int) -> Optional[Dict]:
-                    """Query a single miner without internal retries (batch retry handled at higher level)."""
-                    base_url = f"https://{node.ip}:{node.port}"
-                    process = psutil.Process() if PSUTIL_AVAILABLE else None
                     try:
-                        async with semaphore:  # Control concurrency
-                            logger.debug(f"[{round_type}] Initiating handshake with miner {miner_hotkey} at {base_url}")
+                        logger.debug(f"Miner {miner_hotkey} attempt {attempt + 1}/{max_retries_per_miner}")
+                        
+                        # Perform handshake
+                        handshake_start_time = time.time()
+                        try:
+                            # Get public key
+                            public_key_encryption_key = await asyncio.wait_for(
+                                handshake.get_public_encryption_key(
+                                    self.miner_client, 
+                                    base_url, 
+                                    timeout=int(attempt_timeout)
+                                ),
+                                timeout=attempt_timeout
+                            )
                             
-                            # Perform handshake with a single attempt (no retry at this level)
-                            handshake_start_time = time.time()
-                            symmetric_key_str, symmetric_key_uuid = None, None
+                            # Generate symmetric key
+                            symmetric_key: bytes = os.urandom(32)
+                            symmetric_key_uuid: str = os.urandom(32).hex()
+                            
+                            # Send symmetric key
+                            success = await asyncio.wait_for(
+                                handshake.send_symmetric_key_to_server(
+                                    self.miner_client,
+                                    base_url,
+                                    self.keypair,
+                                    public_key_encryption_key,
+                                    symmetric_key,
+                                    symmetric_key_uuid,
+                                    miner_hotkey,
+                                    timeout=int(attempt_timeout),
+                                ),
+                                timeout=attempt_timeout
+                            )
+                            
+                            if not success:
+                                raise Exception("Handshake failed: server returned unsuccessful status")
+                                
+                            symmetric_key_str = base64.b64encode(symmetric_key).decode()
+                                
+                        except Exception as hs_err:
+                            logger.debug(f"Handshake failed for miner {miner_hotkey} attempt {attempt + 1}: {type(hs_err).__name__}")
+                            if attempt < max_retries_per_miner - 1:
+                                await asyncio.sleep(0.5 * (attempt + 1))  # Brief delay before retry
+                                continue
+                            return None
+
+                        handshake_duration = time.time() - handshake_start_time
+                        logger.debug(f"Handshake with {miner_hotkey} completed in {handshake_duration:.2f}s (attempt {attempt + 1})")
+
+                        if process:
+                            logger.debug(f"Memory after handshake ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
+                        
+                        fernet = Fernet(symmetric_key_str)
+                        
+                        # Make the actual request
+                        try:
+                            logger.debug(f"Making request to {miner_hotkey} (attempt {attempt + 1})")
+                            request_start_time = time.time()
+                            
+                            # Log payload size for memory tracking
                             try:
-                                # Use a single attempt with longer timeout for retries
-                                current_timeout = 15.0 + (attempt_num * 5.0)  # Increase timeout with retry attempts
+                                payload_size_mb = len(str(payload).encode('utf-8')) / (1024 * 1024)
+                                if payload_size_mb > 50:  # Log large payloads
+                                    logger.info(f"Large payload warning: {miner_hotkey} payload size: {payload_size_mb:.1f}MB")
+                            except Exception:
+                                pass
+                            
+                            resp = await asyncio.wait_for(
+                                vali_client.make_non_streamed_post(
+                                    httpx_client=self.miner_client,
+                                    server_address=base_url,
+                                    fernet=fernet,
+                                    keypair=self.keypair,
+                                    symmetric_key_uuid=symmetric_key_uuid,
+                                    validator_ss58_address=self.keypair.ss58_address,
+                                    miner_ss58_address=miner_hotkey,
+                                    payload=payload,
+                                    endpoint=endpoint,
+                                ),
+                                timeout=240.0  # Keep longer timeout for actual request
+                            )
+                            request_duration = time.time() - request_start_time
+                            
+                            # Immediate cleanup of cryptographic objects and large variables
+                            try:
+                                # Clear Fernet cipher and symmetric key data
+                                if hasattr(fernet, '__dict__'):
+                                    fernet.__dict__.clear()
+                                del fernet
                                 
-                                # Get public key
-                                public_key_encryption_key = await asyncio.wait_for(
-                                    handshake.get_public_encryption_key(
-                                        self.miner_client, 
-                                        base_url, 
-                                        timeout=int(current_timeout)
-                                    ),
-                                    timeout=current_timeout
-                                )
+                                # Clear symmetric key variables
+                                symmetric_key = None
+                                del symmetric_key_str
+                                del symmetric_key_uuid
                                 
-                                # Generate symmetric key
-                                symmetric_key: bytes = os.urandom(32)
-                                symmetric_key_uuid: str = os.urandom(32).hex()
-                                
-                                # Send symmetric key
-                                success = await asyncio.wait_for(
-                                    handshake.send_symmetric_key_to_server(
-                                        self.miner_client,
-                                        base_url,
-                                        self.keypair,
-                                        public_key_encryption_key,
-                                        symmetric_key,
-                                        symmetric_key_uuid,
-                                        miner_hotkey,
-                                        timeout=int(current_timeout),
-                                    ),
-                                    timeout=current_timeout
-                                )
-                                
-                                if success:
-                                    symmetric_key_str = base64.b64encode(symmetric_key).decode()
-                                else:
-                                    raise Exception("Handshake failed: server returned unsuccessful status")
+                                # Clear request response data if it's large
+                                if resp and hasattr(resp, 'content') and len(resp.content) > 1024*1024:  # > 1MB
+                                    logger.debug(f"Clearing large response content for {miner_hotkey}: {len(resp.content)} bytes")
                                     
-                            except Exception as hs_err:
-                                logger.debug(f"[{round_type}] Handshake failed for miner {miner_hotkey} at {base_url}: {type(hs_err).__name__} - {hs_err}")
-                                return None
-
-                            handshake_duration = time.time() - handshake_start_time
-                            logger.debug(f"[{round_type}] Handshake with {miner_hotkey} completed in {handshake_duration:.2f}s")
-
-                            if not symmetric_key_str or not symmetric_key_uuid:
-                                logger.debug(f"[{round_type}] Failed handshake with miner {miner_hotkey} (no key/UUID returned)")
-                                return None
-
-                            logger.debug(f"[{round_type}] Handshake successful with miner {miner_hotkey}")
+                            except Exception as cleanup_err:
+                                logger.debug(f"Non-critical cleanup error for {miner_hotkey}: {cleanup_err}")
+                            
                             if process:
-                                logger.debug(f"Memory after handshake ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
+                                mem_after = process.memory_info().rss / (1024*1024)
+                                logger.debug(f"Memory after request ({miner_hotkey}): {mem_after:.2f} MB")
                             
-                            fernet = Fernet(symmetric_key_str)
-                            
-                            try:
-                                import pickle
-                                payload_bytes = pickle.dumps(payload)
-                                payload_size_bytes = len(payload_bytes)
-                                logger.debug(f"Preparing to send request to miner {miner_hotkey} at {base_url}{endpoint}. Raw payload size: {payload_size_bytes / (1024*1024):.2f} MB")
-                                del payload_bytes
-                                import gc
-                                gc.collect()
-                            except Exception as size_err:
-                                logger.warning(f"Could not accurately determine payload size for {miner_hotkey}: {size_err}")
-                                payload_size_bytes = -1
-                                                            
-                            resp = None
-                            try:
-                                logger.debug(f"[{round_type}] Calling vali_client.make_non_streamed_post for {miner_hotkey}...")
-                                if process:
-                                    mem_before = process.memory_info().rss / (1024*1024)
-                                    logger.debug(f"Memory BEFORE request call ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
-                                request_start_time = time.time()
-                                resp = await asyncio.wait_for(
-                                    vali_client.make_non_streamed_post(
-                                        httpx_client=self.miner_client,  # Use existing client
-                                        server_address=base_url,
-                                        fernet=fernet,
-                                        keypair=self.keypair,
-                                        symmetric_key_uuid=symmetric_key_uuid,
-                                        validator_ss58_address=self.keypair.ss58_address,
-                                        miner_ss58_address=miner_hotkey,
-                                        payload=payload,
-                                        endpoint=endpoint,
-                                    ),
-                                    timeout=240.0  # Increased from 180s for large payloads
-                                )
-                                request_duration = time.time() - request_start_time
-                                if process:
-                                    mem_after = process.memory_info().rss / (1024*1024)
-                                    logger.debug(f"Memory AFTER successful request call ({miner_hotkey}): {mem_after:.2f} MB (Delta: {mem_after - mem_before:.2f} MB)")
-                                if resp:
-                                    logger.info(f"[{round_type}] Successfully called make_non_streamed_post for {miner_hotkey}. Response status: {resp.status_code}. Duration: {request_duration:.2f}s. Response content length: {len(resp.content) if resp.content else 0} bytes.")
-                                else:
-                                    logger.warning(f"[{round_type}] Call to make_non_streamed_post for {miner_hotkey} completed without error but response object is None. Duration: {request_duration:.2f}s")
-
-                            except Exception as request_error:
-                                if process:
-                                    logger.error(f"Memory during request EXCEPTION ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
-                                logger.debug(f"[{round_type}] Error during make_non_streamed_post for {miner_hotkey}: {type(request_error).__name__} - {request_error}")
-                                return None
-                            
-                            if resp is None:
-                                 logger.debug(f"[{round_type}] No response object received from {miner_hotkey} despite no exception, likely due to prior error.")
-                                 return None
-                            elif resp.status_code >= 400:
-                                logger.debug(f"[{round_type}] Miner {miner_hotkey} returned error status {resp.status_code}. Response text: {resp.text[:500]}...")
+                            if resp and resp.status_code < 400:
+                                response_data = {
+                                    "text": resp.text,
+                                    "status_code": resp.status_code,
+                                    "hotkey": miner_hotkey,
+                                    "port": node.port,
+                                    "ip": node.ip,
+                                    "content_length": len(resp.content) if resp.content else 0,
+                                    "attempts_used": attempt + 1
+                                }
+                                logger.info(f"SUCCESS: {miner_hotkey} responded in {request_duration:.2f}s (attempt {attempt + 1})")
+                                return response_data
+                            else:
+                                logger.debug(f"Bad response from {miner_hotkey} attempt {attempt + 1}: status {resp.status_code if resp else 'None'}")
+                                if attempt < max_retries_per_miner - 1:
+                                    await asyncio.sleep(0.5 * (attempt + 1))
+                                    continue
                                 return None
 
-                            response_data = {
-                                "text": resp.text,
-                                "status_code": resp.status_code,
-                                "hotkey": miner_hotkey,
-                                "port": node.port,
-                                "ip": node.ip,
-                                "content_length": len(resp.content) if resp.content else 0
-                            }
-                            logger.info(f"[{round_type}] Successfully received response from miner {miner_hotkey}")
-                            return response_data
-
-                    except asyncio.TimeoutError:
-                        logger.debug(f"[{round_type}] Timeout querying miner {miner_hotkey} at {base_url}")
+                        except Exception as request_error:
+                            # Enhanced cleanup on error
+                            try:
+                                if 'fernet' in locals() and fernet:
+                                    if hasattr(fernet, '__dict__'):
+                                        fernet.__dict__.clear()
+                                    del fernet
+                                if 'symmetric_key_str' in locals():
+                                    del symmetric_key_str
+                                if 'symmetric_key_uuid' in locals():
+                                    del symmetric_key_uuid
+                                if 'symmetric_key' in locals():
+                                    symmetric_key = None
+                            except Exception:
+                                pass
+                                
+                            logger.debug(f"Request error for {miner_hotkey} attempt {attempt + 1}: {type(request_error).__name__}")
+                            if attempt < max_retries_per_miner - 1:
+                                await asyncio.sleep(0.5 * (attempt + 1))
+                                continue
+                            return None
+                            
+                    except Exception as outer_error:
+                        logger.debug(f"Outer error for {miner_hotkey} attempt {attempt + 1}: {type(outer_error).__name__}")
+                        if attempt < max_retries_per_miner - 1:
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                            continue
                         return None
-                    except Exception as e:
-                        logger.debug(f"[{round_type}] Failed request to miner {miner_hotkey} at {base_url}: {type(e).__name__} - {str(e)}")
-                        return None
+                
+                # All attempts failed
+                logger.debug(f"All {max_retries_per_miner} attempts failed for {miner_hotkey}")
+                return None
 
-                # Query all remaining miners in parallel for this round
-                tasks = []
-                for hotkey, node in miners_remaining.items():
-                    if node.ip and node.port:  # Only query miners with valid IP/port
-                        tasks.append(query_single_miner_no_retry(hotkey, node, retry_round))
+            # Launch all queries immediately with maximum concurrency
+            logger.info(f"Launching {len(miners_to_attempt)} concurrent miner queries...")
+            start_time = time.time()
+            
+            # Log memory before launching queries
+            self._log_memory_usage("query_miners_start")
+            
+            # Log total payload memory footprint
+            try:
+                import sys
+                total_payload_size = sys.getsizeof(payload) / (1024 * 1024)
+                estimated_total_memory = total_payload_size * len(miners_to_attempt)
+                if estimated_total_memory > 500:  # Warn if > 500MB total
+                    logger.warning(f"Large memory usage expected: {len(miners_to_attempt)} miners × {total_payload_size:.1f}MB = {estimated_total_memory:.1f}MB total")
+            except Exception:
+                pass
+            
+            # Create all tasks immediately - let HTTP client connection limits provide natural throttling
+            tasks = []
+            for hotkey, miner_info in miners_to_attempt.items():
+                if miner_info["node"].ip and miner_info["node"].port:
+                    task = asyncio.create_task(
+                        query_single_miner_with_retries(hotkey, miner_info),
+                        name=f"query_{hotkey[:8]}"
+                    )
+                    tasks.append((hotkey, task))
+                else:
+                    logger.warning(f"Skipping miner {hotkey} - missing IP or port")
+
+            # Process responses as they complete using asyncio.as_completed for maximum speed
+            responses = {}
+            completed_count = 0
+            failed_count = 0
+            
+            logger.info(f"Processing {len(tasks)} responses as they arrive...")
+            
+            # Create a mapping to track which task belongs to which hotkey
+            task_to_hotkey = {task: hotkey for hotkey, task in tasks}
+            just_tasks = [task for _, task in tasks]
+            
+            for completed_task in asyncio.as_completed(just_tasks):
+                completed_count += 1
+                try:
+                    # Get the hotkey for this completed task
+                    task_hotkey = task_to_hotkey.get(completed_task, "unknown")
+                    
+                    result = await completed_task
+                    if result:
+                        responses[result['hotkey']] = result
+                        logger.debug(f"Response {completed_count}/{len(tasks)}: SUCCESS from {task_hotkey}")
                     else:
-                        logger.warning(f"Skipping miner {hotkey} - missing IP or port")
+                        failed_count += 1
+                        logger.debug(f"Response {completed_count}/{len(tasks)}: FAILED from {task_hotkey}")
+                        
+                    # Log progress every 10 completions
+                    if completed_count % 10 == 0:
+                        elapsed = time.time() - start_time
+                        rate = completed_count / elapsed if elapsed > 0 else 0
+                        logger.info(f"Progress: {completed_count}/{len(tasks)} completed, "
+                                  f"{len(responses)} successful, {failed_count} failed, "
+                                  f"Rate: {rate:.1f}/sec, Elapsed: {elapsed:.1f}s")
+                        
+                except Exception as e:
+                    failed_count += 1
+                    logger.debug(f"Exception processing response {completed_count}: {e}")
 
-                # Gather responses with timeout
-                miner_responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # Process responses and track failures for next round
-                miners_for_next_round = {}
-                successful_this_round = 0
+            total_time = time.time() - start_time
+            success_rate = len(responses) / len(tasks) * 100 if tasks else 0
+            avg_rate = len(tasks) / total_time if total_time > 0 else 0
+            
+            logger.info(f"High-concurrency query completed: {len(responses)}/{len(tasks)} successful "
+                       f"({success_rate:.1f}%) in {total_time:.2f}s, avg rate: {avg_rate:.1f}/sec")
+            
+            # Aggressive memory cleanup after large payload processing
+            try:
+                # Clear all task references
+                for hotkey, task in tasks:
+                    if not task.done():
+                        task.cancel()
+                del tasks
+                del task_to_hotkey
+                del just_tasks
+                del miners_to_attempt
                 
-                for (hotkey, node), response in zip(miners_remaining.items(), miner_responses):
-                    if response is not None and not isinstance(response, Exception):
-                        responses[response['hotkey']] = response
-                        successful_this_round += 1
-                    else:
-                        # Add to retry list for next round
-                        miners_for_next_round[hotkey] = node
-
-                logger.info(f"{round_type} completed: {successful_this_round} successful, {len(miners_for_next_round)} failed")
+                # Clear payload reference - critical for large payloads
+                if 'payload' in locals():
+                    payload_size_mb = 0
+                    try:
+                        payload_size_mb = len(str(payload).encode('utf-8')) / (1024 * 1024)
+                    except:
+                        pass
+                    del payload
+                    if payload_size_mb > 50:
+                        logger.info(f"Cleared large payload from memory ({payload_size_mb:.1f}MB)")
                 
-                # Update miners_remaining for next round
-                miners_remaining = miners_for_next_round
+                # Force garbage collection for large memory cleanup
+                import gc
+                collected = gc.collect()
+                if collected > 100:  # Log significant cleanup
+                    logger.info(f"Garbage collected {collected} objects after miner queries")
                 
-                # If we have more rounds and miners to retry, wait before next round
-                if miners_remaining and retry_round < max_retry_rounds:
-                    logger.info(f"Waiting {retry_delay}s before retry round {retry_round + 1} with {len(miners_remaining)} miners")
-                    await asyncio.sleep(retry_delay)
-
-            logger.info(f"Batch query completed: Received {len(responses)} total valid responses from miners")
+                # Log memory after cleanup if psutil available
+                if PSUTIL_AVAILABLE:
+                    try:
+                        process = psutil.Process()
+                        mem_after_cleanup = process.memory_info().rss / (1024*1024)
+                        logger.debug(f"Memory after query cleanup: {mem_after_cleanup:.2f}MB")
+                    except:
+                        pass
+                        
+            except Exception as cleanup_error:
+                logger.warning(f"Error during post-query memory cleanup: {cleanup_error}")
+            
+            # Log memory after cleanup to verify effectiveness
+            self._log_memory_usage("query_miners_end")
+            
+            # Clean up connections after query batch completes
+            await self._cleanup_idle_connections()
+            
             return responses
 
         except Exception as e:
             logger.error(f"Error querying miners: {e}")
             logger.error(traceback.format_exc())
             return {}
+
+    async def _cleanup_idle_connections(self):
+        """Clean up idle connections in the HTTP client pool, but only stale ones."""
+        try:
+            if hasattr(self, 'miner_client') and not self.miner_client.is_closed:
+                # Force close idle connections by accessing the transport pool
+                if hasattr(self.miner_client, '_transport') and hasattr(self.miner_client._transport, '_pool'):
+                    pool = self.miner_client._transport._pool
+                    if hasattr(pool, '_connections'):
+                        connections = pool._connections
+                        closed_count = 0
+                        
+                        # Handle both dict and list cases
+                        if hasattr(connections, 'items'):  # Dict-like
+                            connection_items = list(connections.items())
+                            for key, conn in connection_items:
+                                # Only close connections that have been idle for a while
+                                # This preserves recent connections for potential reuse
+                                if (hasattr(conn, 'is_idle') and conn.is_idle() and 
+                                    hasattr(conn, '_idle_time') and 
+                                    getattr(conn, '_idle_time', 0) > 60):  # 60 seconds idle
+                                    try:
+                                        await conn.aclose()
+                                        del connections[key]
+                                        closed_count += 1
+                                        logger.debug(f"Closed stale idle connection to {key}")
+                                    except Exception as e:
+                                        logger.debug(f"Error closing idle connection: {e}")
+                        else:  # List-like
+                            for conn in list(connections):
+                                if (hasattr(conn, 'is_idle') and conn.is_idle() and 
+                                    hasattr(conn, '_idle_time') and 
+                                    getattr(conn, '_idle_time', 0) > 60):  # 60 seconds idle
+                                    try:
+                                        await conn.aclose()
+                                        connections.remove(conn)
+                                        closed_count += 1
+                                        logger.debug(f"Closed stale idle connection")
+                                    except Exception as e:
+                                        logger.debug(f"Error closing idle connection: {e}")
+                    
+                        if closed_count > 0:
+                            logger.info(f"Cleaned up {closed_count} stale idle connections")
+                        else:
+                            logger.debug("No stale connections found to clean up")
+                        
+        except Exception as e:
+            logger.debug(f"Error during connection cleanup: {e}")
+
+    def _log_memory_usage(self, context: str, threshold_mb: float = 100.0):
+        """Log current memory usage if above threshold or if significant change detected."""
+        try:
+            if not PSUTIL_AVAILABLE:
+                return
+                
+            process = psutil.Process()
+            current_memory_mb = process.memory_info().rss / (1024 * 1024)
+            
+            # Check if we have a previous measurement for this context
+            if not hasattr(self, '_memory_baselines'):
+                self._memory_baselines = {}
+            
+            previous_memory = self._memory_baselines.get(context)
+            self._memory_baselines[context] = current_memory_mb
+            
+            # Log if above threshold or significant change
+            should_log = current_memory_mb > threshold_mb
+            
+            if previous_memory:
+                memory_change = current_memory_mb - previous_memory
+                if abs(memory_change) > 50:  # 50MB change threshold
+                    should_log = True
+                    change_str = f"(+{memory_change:.1f}MB)" if memory_change > 0 else f"({memory_change:.1f}MB)"
+                    logger.info(f"Memory usage [{context}]: {current_memory_mb:.1f}MB {change_str}")
+                elif should_log:
+                    logger.debug(f"Memory usage [{context}]: {current_memory_mb:.1f}MB")
+            elif should_log:
+                logger.info(f"Memory usage [{context}]: {current_memory_mb:.1f}MB (baseline)")
+                
+        except Exception as e:
+            logger.debug(f"Error logging memory usage for {context}: {e}")
 
     async def check_for_updates(self):
         """Check for and apply updates every 5 minutes."""
@@ -1135,6 +1331,12 @@ class GaiaValidator:
 
             # Clean up HTTP clients
             if hasattr(self, 'miner_client') and self.miner_client and not self.miner_client.is_closed:
+                # Clean up connections before closing client
+                try:
+                    await self._cleanup_idle_connections()
+                except Exception as e:
+                    logger.debug(f"Error cleaning up connections before client close: {e}")
+                
                 await self.miner_client.aclose()
                 logger.info("Closed miner HTTP client")
             
@@ -2238,6 +2440,9 @@ class GaiaValidator:
     async def _calc_task_weights(self):
         """Calculate weights based on recent task scores. Async part fetches data."""
         try:
+            # Log memory before large database operations
+            self._log_memory_usage("calc_weights_start")
+            
             now = datetime.now(timezone.utc)
             one_day_ago = now - timedelta(days=1)
             
@@ -2249,45 +2454,107 @@ class GaiaValidator:
             weather_query = """
             SELECT score, created_at 
             FROM score_table 
-            WHERE task_name = :task_name ORDER BY created_at DESC LIMIT 1
+            WHERE task_name = 'weather' AND created_at >= :start_time ORDER BY created_at DESC LIMIT 50
             """
-            
-            weather_results = await self.database_manager.fetch_all(weather_query, {"task_name": "weather"})
-            logger.info(f"Fetched {len(weather_results)} weather score rows")
-            geomagnetic_results = await self.database_manager.fetch_all(query, {"task_name": "geomagnetic", "start_time": one_day_ago})
-            logger.info(f"Fetched {len(geomagnetic_results)} geomagnetic score rows")
-            soil_results = await self.database_manager.fetch_all(query, {"task_name": "soil_moisture", "start_time": one_day_ago})
-            logger.info(f"Fetched {len(soil_results)} soil moisture score rows")
-            
-            if not weather_results and not geomagnetic_results and not soil_results:
-                logger.info("No scores found in DB - returning zero weights (no scores to base weights on)")
-                # Return zero weights array instead of equal weights
-                weights_arr = np.zeros(256)
-                logger.info("Initialized zero weights for all nodes (no scoring data available)")
-                return weights_arr.tolist()
+            geomagnetic_query = """
+            SELECT score, created_at 
+            FROM score_table 
+            WHERE task_name = 'geomagnetic' AND created_at >= :start_time ORDER BY created_at DESC LIMIT 50
+            """
+            soil_query = """
+            SELECT score, created_at 
+            FROM score_table 
+            WHERE task_name LIKE 'soil_moisture_region_%' AND created_at >= :start_time ORDER BY created_at DESC LIMIT 200
+            """
 
-            active_nodes_list_sync = []
+            # Query node table for validator nodes with chunking to manage memory
+            validator_nodes_query = """
+            SELECT uid, hotkey, ip, port, incentive, emission, dividends 
+            FROM node_table 
+            WHERE uid IS NOT NULL 
+            ORDER BY uid
+            """
+
+            params = {"start_time": one_day_ago}
+            
+            # Fetch all data concurrently but with limits to prevent memory overload
             try:
-                # Ensure this is a synchronous call if get_nodes_for_netuid can be blocking.
-                # For now, assuming it's relatively quick or primarily I/O bound with Substrate.
-                active_nodes_list_from_chain = get_nodes_for_netuid(self.substrate, self.metagraph.netuid)
-                if active_nodes_list_from_chain is None: active_nodes_list_from_chain = []
-                active_nodes_list_sync = active_nodes_list_from_chain # Use this list for the sync method
-            except Exception as e_fetch_nodes:
-                logger.error(f"Failed to fetch nodes for weight calc: {e_fetch_nodes}", exc_info=True)
-                # active_nodes_list_sync remains empty, sync function should handle this
-            
-            validator_nodes_by_uid_list_sync = [None] * 256
-            for node in active_nodes_list_sync:
-                if node.node_id < 256:
-                    validator_nodes_by_uid_list_sync[node.node_id] = node
-            
-            return await asyncio.to_thread(
-                self._perform_weight_calculations_sync,
-                weather_results, geomagnetic_results, soil_results, now, validator_nodes_by_uid_list_sync
-            )
+                weather_results, geomagnetic_results, soil_results, validator_nodes_list = await asyncio.gather(
+                    self.database_manager.fetch_all(weather_query, params),
+                    self.database_manager.fetch_all(geomagnetic_query, params),
+                    self.database_manager.fetch_all(soil_query, params),
+                    self.database_manager.fetch_all(validator_nodes_query),
+                    return_exceptions=True
+                )
+                
+                # Check for exceptions in results
+                for i, result in enumerate([weather_results, geomagnetic_results, soil_results, validator_nodes_list]):
+                    if isinstance(result, Exception):
+                        task_names = ['weather', 'geomagnetic', 'soil', 'validator_nodes']
+                        logger.error(f"Error fetching {task_names[i]} data: {result}")
+                        return None
+                
+                # Log memory after database queries
+                self._log_memory_usage("calc_weights_after_db_queries")
+
+                # Defensive fallbacks for failed queries
+                if not weather_results:
+                    weather_results = []
+                if not geomagnetic_results:
+                    geomagnetic_results = []
+                if not soil_results:
+                    soil_results = []
+                if not validator_nodes_list:
+                    logger.error("Failed to fetch validator nodes - cannot calculate weights")
+                    return None
+
+                logger.info(f"Fetched scores: Weather={len(weather_results)}, Geo={len(geomagnetic_results)}, Soil={len(soil_results)}")
+                
+                # Convert to list for the sync calculation
+                validator_nodes_by_uid_list = list(validator_nodes_list)
+
+                # Perform CPU-bound weight calculation in thread pool to avoid blocking
+                loop = asyncio.get_event_loop()
+                final_weights_list = await loop.run_in_executor(
+                    None,
+                    self._perform_weight_calculations_sync,
+                    weather_results,
+                    geomagnetic_results,
+                    soil_results,
+                    now,
+                    validator_nodes_by_uid_list
+                )
+
+                # Aggressive memory cleanup after weight calculation
+                try:
+                    # Clear all large data structures
+                    del weather_results
+                    del geomagnetic_results
+                    del soil_results
+                    del validator_nodes_list
+                    del validator_nodes_by_uid_list
+                    
+                    # Force garbage collection after processing large datasets
+                    import gc
+                    collected = gc.collect()
+                    if collected > 50:
+                        logger.info(f"Weight calculation cleanup: GC collected {collected} objects")
+                        
+                    # Log memory after cleanup
+                    self._log_memory_usage("calc_weights_after_cleanup")
+                    
+                except Exception as cleanup_err:
+                    logger.warning(f"Error during weight calculation cleanup: {cleanup_err}")
+
+                return final_weights_list
+
+            except Exception as query_error:
+                logger.error(f"Error during database queries for weight calculation: {query_error}")
+                return None
+
         except Exception as e:
-            logger.error(f"Error in _calc_task_weights (async part): {e}", exc_info=True)
+            logger.error(f"Error calculating task weights: {e}")
+            logger.error(traceback.format_exc())
             return None
 
     async def update_last_weights_block(self):
@@ -2663,26 +2930,74 @@ class GaiaValidator:
                             connections = pool._connections
                             total_connections = len(connections)
                             
+                            # Count different connection states
+                            keepalive_connections = 0
+                            idle_connections = 0
+                            active_connections = 0
+                            unique_hosts = set()
+                            
                             # Handle both list and dict cases for _connections
                             if hasattr(connections, 'values'):  # It's a dict-like object
-                                keepalive_connections = sum(1 for conn in connections.values() 
-                                                          if hasattr(conn, '_keepalive_expiry') and conn._keepalive_expiry)
+                                connection_items = connections.values()
                             else:  # It's a list-like object
-                                keepalive_connections = sum(1 for conn in connections 
-                                                          if hasattr(conn, '_keepalive_expiry') and conn._keepalive_expiry)
+                                connection_items = connections
+                            
+                            for conn in connection_items:
+                                # Count keepalive connections
+                                if hasattr(conn, '_keepalive_expiry') and conn._keepalive_expiry:
+                                    keepalive_connections += 1
+                                
+                                # Count idle connections
+                                if hasattr(conn, 'is_idle') and callable(conn.is_idle):
+                                    try:
+                                        if conn.is_idle():
+                                            idle_connections += 1
+                                        else:
+                                            active_connections += 1
+                                    except Exception:
+                                        pass
+                                
+                                # Track unique hosts
+                                if hasattr(conn, '_origin') and conn._origin:
+                                    unique_hosts.add(str(conn._origin))
+                                elif hasattr(conn, '_socket') and hasattr(conn._socket, 'getpeername'):
+                                    try:
+                                        peer = conn._socket.getpeername()
+                                        unique_hosts.add(f"{peer[0]}:{peer[1]}")
+                                    except Exception:
+                                        pass
                             
                             # Get pool limit - check multiple possible locations
                             pool_limit = "unknown"
-                            if hasattr(self.miner_client, '_limits') and hasattr(self.miner_client._limits, 'max_connections'):
-                                pool_limit = self.miner_client._limits.max_connections
-                            elif hasattr(pool, '_max_connections'):
-                                pool_limit = pool._max_connections
-                            elif hasattr(pool, 'max_connections'):
-                                pool_limit = pool.max_connections
+                            keepalive_limit = "unknown"
+                            if hasattr(self.miner_client, '_limits'):
+                                if hasattr(self.miner_client._limits, 'max_connections'):
+                                    pool_limit = self.miner_client._limits.max_connections
+                                if hasattr(self.miner_client._limits, 'max_keepalive_connections'):
+                                    keepalive_limit = self.miner_client._limits.max_keepalive_connections
                             
-                            logger.debug(f"HTTP Client Pool Health - Total: {total_connections}, "
-                                       f"Keepalive: {keepalive_connections}, "
-                                       f"Pool limit: {pool_limit}")
+                            # Log detailed information - use INFO level when high connection counts detected
+                            log_level = logger.info if total_connections > 75 else logger.debug
+                            log_level(f"HTTP Client Pool Health - "
+                                    f"Total: {total_connections}/{pool_limit}, "
+                                    f"Keepalive: {keepalive_connections}/{keepalive_limit}, "
+                                    f"Idle: {idle_connections}, Active: {active_connections}, "
+                                    f"Unique hosts: {len(unique_hosts)}")
+                            
+                            # If we have excessive connections, log the unique hosts
+                            if total_connections > 80 and unique_hosts:
+                                logger.info(f"Connection pool has {total_connections} connections to {len(unique_hosts)} unique hosts")
+                                if len(unique_hosts) <= 15:  # Only log if manageable number
+                                    logger.debug(f"Connected hosts: {list(unique_hosts)[:15]}")
+                            
+                            # Only trigger cleanup if we have excessive idle connections (not just any idle)
+                            if idle_connections > 30:
+                                logger.info(f"High idle connection count ({idle_connections}), triggering cleanup")
+                                try:
+                                    await self._cleanup_idle_connections()
+                                except Exception as e:
+                                    logger.warning(f"Error during automatic connection cleanup: {e}")
+                            
                 await asyncio.sleep(300)  # Check every 5 minutes
             except Exception as e:
                 logger.debug(f"Error monitoring client health: {e}")
