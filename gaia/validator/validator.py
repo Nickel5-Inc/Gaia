@@ -9,6 +9,7 @@ import concurrent.futures
 import glob
 import signal
 import sys
+import tracemalloc # Added import
 
 from gaia.database.database_manager import DatabaseTimeout
 try:
@@ -386,6 +387,8 @@ class GaiaValidator:
             (datetime(2025, 6, 5, 0, 0, 0, tzinfo=timezone.utc), 
              {"weather": 0.80, "geomagnetic": 0.10, "soil": 0.10})
         ]
+
+        self.tracemalloc_snapshot1: Optional[tracemalloc.Snapshot] = None # Initialize for the snapshot taker task
 
         for dt_thresh, weights_dict in self.task_weight_schedule:
             if not math.isclose(sum(weights_dict.values()), 1.0):
@@ -1746,6 +1749,9 @@ class GaiaValidator:
             logger.info("Starting watchdog...")
             await self.start_watchdog()
             logger.info("Watchdog started.")
+
+            logger.info("Starting tracemalloc for memory analysis...")
+            tracemalloc.start(25) # Start tracemalloc, 25 frames for traceback
             
             logger.info("Initializing baseline models...")
             await self.basemodel_evaluator.initialize_models()
@@ -1757,8 +1763,8 @@ class GaiaValidator:
             logger.info("Auto-updater task started independently")
             
             tasks = [
-                lambda: self.geomagnetic_task.validator_execute(self),
-                lambda: self.soil_task.validator_execute(self),
+                #lambda: self.geomagnetic_task.validator_execute(self),
+                #lambda: self.soil_task.validator_execute(self),
                 lambda: self.weather_task.validator_execute(self),
                 lambda: self.status_logger(),
                 lambda: self.main_scoring(),
@@ -1766,6 +1772,7 @@ class GaiaValidator:
                 # The MinerScoreSender task will be added conditionally below
                 lambda: self.manage_earthdata_token(),
                 lambda: self.monitor_client_health(),  # Added HTTP client monitoring
+                lambda: self.memory_snapshot_taker(), # Added memory snapshot task
                 #lambda: self.database_monitor(),
                 #lambda: self.plot_database_metrics_periodically() # Added plotting task
             ]
@@ -3023,6 +3030,51 @@ class GaiaValidator:
             except Exception as e:
                 logger.debug(f"Error monitoring client health: {e}")
                 await asyncio.sleep(300)
+
+    async def memory_snapshot_taker(self):
+        """Periodically takes memory snapshots and logs differences."""
+        logger.info("Starting memory snapshot taker task...")
+        
+        snapshot_interval_seconds = 300 # 5 minutes
+        logger.info(f"Memory snapshots will be taken every {snapshot_interval_seconds} seconds.")
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(snapshot_interval_seconds)
+                if self._shutdown_event.is_set():
+                    break
+
+                logger.info("--- Taking Tracemalloc Snapshot ---")
+                current_snapshot = tracemalloc.take_snapshot()
+                
+                logger.info("Top 10 current memory allocations (by line number):")
+                for stat in current_snapshot.statistics('lineno')[:10]:
+                    logger.info(f"  {stat}")
+                    # Uncomment for full traceback of top allocations if needed
+                    # logger.info(f"    Traceback for allocation at {stat.traceback[0]}:")
+                    # for line in stat.traceback.format():
+                    #    logger.info(f"      {line}")
+
+                if self.tracemalloc_snapshot1:
+                    logger.info("Comparing to previous snapshot...")
+                    top_stats = current_snapshot.compare_to(self.tracemalloc_snapshot1, 'lineno')
+                    logger.info("Top 10 memory differences since last snapshot:")
+                    for stat in top_stats[:10]:
+                        logger.info(f"  {stat}")
+                        # Uncomment for full traceback of significant differences
+                        # logger.info(f"    Traceback for diff at {stat.traceback[0]}:")
+                        # for line in stat.traceback.format():
+                        #    logger.info(f"      {line}")
+                
+                self.tracemalloc_snapshot1 = current_snapshot
+                logger.info("--- Tracemalloc Snapshot Processed ---")
+
+            except asyncio.CancelledError:
+                logger.info("Memory snapshot taker task cancelled.")
+                break
+            except Exception as e:
+                logger.error(f"Error in memory_snapshot_taker: {e}", exc_info=True)
+                await asyncio.sleep(60) # Wait a bit before retrying if an error occurs
 
 
 if __name__ == "__main__":
