@@ -11,11 +11,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libhdf5-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Set PYTHONPATH to include the root directory where your 'app' package structure begins
+# Since your code is copied to /app/app, and you want to import 'app.main',
+# /app needs to be in PYTHONPATH so it finds the outer 'app' directory as a potential namespace for packages.
+ENV PYTHONPATH="/app:${PYTHONPATH}"
+
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
+# Your main application package 'app' (containing main.py, inference_runner.py, etc.)
+# will be located at /app/app within the container.
 COPY ./app /app/app
 COPY ./config /app/config
 
@@ -28,11 +35,13 @@ COPY ./config /app/config
 # COPY ./local_models/my_aurora_model /app/local_models/my_aurora_model
 
 ENV HF_HOME=/root/.cache/huggingface
-# Ensure the directory exists and is writable (though as root, it likely will be)
+# Ensure the directory exists and is writable
 RUN mkdir -p /root/.cache/huggingface && chmod 777 /root/.cache/huggingface
 
-# Expose the port the app runs on
+# Expose the port the app runs on (RunPod typically uses 8000 or injects its own)
 EXPOSE 8000
 
-# Command to run the application
-CMD ["python", "-u", "app/main.py"] 
+# Command to run the application as a module
+# Python will look for a package named 'app' (which is /app/app)
+# and then run 'main.py' within that package.
+CMD ["python", "-u", "-m", "app.main"] 

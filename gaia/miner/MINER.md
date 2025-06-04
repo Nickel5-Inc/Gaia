@@ -46,8 +46,8 @@ Validators preprocess the DST data to ensure consistency and provide it to Miner
 
 The miner must return the following to the Validator for evaluation:
 
-- **Predicted DST Value**: The miner’s predicted DST index for the next hour.
-- **Timestamp (UTC)**: The UTC timestamp of the last observation used in the prediction, ensuring it’s standardized.
+- **Predicted DST Value**: The miner's predicted DST index for the next hour.
+- **Timestamp (UTC)**: The UTC timestamp of the last observation used in the prediction, ensuring it's standardized.
 
 ---
 
@@ -227,6 +227,41 @@ PASSWORD=""         # Password for basic auth or platform-specific auth
 # and these shared credentials and database name.
 
 ```
+
+## Remote Inference Service for Computationally Intensive Tasks (e.g., Weather Task)
+
+Some tasks, like the Weather Task, require significant computational resources for model inference and are often run on dedicated remote services (e.g., RunPod serverless workers).
+
+**Miner Configuration for Remote Inference:**
+
+Miners running these tasks will typically need to:
+1.  **Deploy or Utilize a Provided Inference Service:** This service handles the actual model execution.
+    *   For detailed instructions on setting up, configuring (including R2 environment variables for data transfer), and deploying the reference Weather Inference Service, see: [`gaia/miner/inference_service/README.md`](./inference_service/README.md).
+
+2.  **Configure their Local Miner Environment:** The local miner application (the one running `miner.py`) needs to know how to communicate with this remote inference service. This includes:
+    *   **Inference Service URL:** The endpoint of your deployed inference service.
+    *   **API Keys:** If the inference service is protected by an API key.
+    *   **R2 Credentials (for the Miner):** The local miner also needs its own R2 credentials if it's directly pre-uploading any data or post-downloading results, separate from the R2 credentials used *by the inference service itself*.
+
+**Environment Variables for the Miner Process (`miner.py`):**
+
+While the inference service has its own set of environment variables (detailed in its README), your main miner process (`miner.py`) will also need certain environment variables to interact with it and the broader system. These are typically set in your primary `.env` file for the miner (similar to the `dev.env` example above).
+
+*   `WEATHER_INFERENCE_TYPE`: Set to `http_service` to use a remote inference endpoint for the WeatherTask.
+*   `WEATHER_INFERENCE_SERVICE_URL`: The URL of your deployed Weather Inference Service.
+    *   Example: `WEATHER_INFERENCE_SERVICE_URL=https://your-runpod-endpoint.runpod.net`
+*   `WEATHER_RUNPOD_API_KEY`: (If applicable) An API key specifically for authenticating the miner's requests *to* the RunPod service endpoint if it's protected directly by RunPod's API gateway or a similar mechanism. This might be different from an API key used *within* the inference service for `runpodctl`.
+
+*   **R2 Credentials for the Miner Application (if directly interacting with R2):**
+    *   `R2_BUCKET`: The R2 bucket name the miner uses for its operations.
+    *   `R2_ENDPOINT_URL`: The R2 endpoint URL for the miner.
+    *   `R2_ACCESS_KEY`: R2 Access Key ID for the miner.
+    *   `R2_SECRET_ACCESS_KEY`: R2 Secret Access Key for the miner.
+
+**Validator-Provided Configurations:**
+
+In some setups, particularly managed environments, the validator or network operators might provide templates or pre-configured settings for the inference service environment. Refer to documentation provided by your network operators or the `validator_template.env` for insights into how these might be structured. The variables like `MINER_INF_SVC_R2_BUCKET_NAME` in `validator_template.env` are placeholders for such scenarios.
+
 
 #### Run the miner
 ```bash

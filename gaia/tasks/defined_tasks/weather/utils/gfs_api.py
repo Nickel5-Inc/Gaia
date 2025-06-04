@@ -396,9 +396,22 @@ async def fetch_gfs_analysis_data(
                         logger.error(f"Could not get URL for GFS cycle {target_time}. Skipping.")
                         continue
                         
-                    logger.info(f"Opening GFS cycle {target_time} from {base_url} for analysis (T+0h)...")
-                    full_ds = xr.open_dataset(base_url, decode_times=True, chunks={})
+                    logger.info(f"Opening GFS cycle {target_time_dt_utc.strftime('%Y-%m-%d %H:%M:%S')} from {base_url} for analysis (T+0h)...")
+                    full_ds = xr.open_dataset(base_url, decode_times=False, chunks={})
+                    logger.info(f"Successfully opened GFS dataset with decode_times=False. Raw time variable attributes: {full_ds.time.attrs}")
+                    logger.info(f"Raw time variable sample values: {full_ds.time.values[:5] if len(full_ds.time.values) > 5 else full_ds.time.values}")
+                    
+                    # Attempt to decode time manually to see if we can handle it with cftime directly
+                    try:
+                        time_decoded = xr.coding.times.decode_cf_datetime(full_ds.time, units=full_ds.time.attrs.get('units'), calendar=full_ds.time.attrs.get('calendar', 'standard'), use_cftime=True)
+                        logger.info(f"Manually decoded time with cftime (sample): {time_decoded.values[:5] if len(time_decoded.values) > 5 else time_decoded.values}")
+                        full_ds['time'] = time_decoded # Replace the time coordinate
+                    except Exception as e_manual_decode:
+                        logger.error(f"Failed to manually decode time with cftime: {e_manual_decode}", exc_info=True)
+                        logger.warning("Proceeding with undecoded time coordinate. Downstream processing might fail or use incorrect times.")
 
+                    # Select the single time point (T+0h)
+                    # Need to select based on the raw numerical time values if decode_times=False was used and manual decode failed
                     analysis_select_time_np = np.datetime64(target_time.replace(tzinfo=None))
 
                     analysis_slice = full_ds.sel(time=analysis_select_time_np, method='nearest')

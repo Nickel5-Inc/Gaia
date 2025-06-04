@@ -13,7 +13,7 @@ import shutil
 import time
 import zarr
 import numcodecs
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import base64
 import pickle
 import httpx
@@ -51,6 +51,8 @@ logger = get_logger(__name__)
 
 VALIDATOR_ENSEMBLE_DIR = Path("./validator_ensembles/")
 MINER_FORECAST_DIR_BG = Path("./miner_forecasts_background/")
+MINER_INPUT_BATCHES_DIR = Path("./miner_input_batches/")
+MINER_INPUT_BATCHES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _prepare_http_payload_sync(prepared_batch_for_http: Batch) -> bytes:
@@ -112,25 +114,22 @@ def _prepare_http_payload_sync(prepared_batch_for_http: Batch) -> bytes:
     gzipped_payload = gzip.compress(payload_json_str.encode('utf-8'))
     return gzipped_payload
 
-async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
+async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
     """
-    Runs the weather forecast inference as a background task.
-    Fetches data based on job_id (expects cache hit from fetch_and_hash task)
-    and prepares the batch before running the model.
+    Background task to run the inference process for a given job_id.
+    Uses a semaphore to limit concurrent GPU-intensive operations.
+    Handles both local model inference and HTTP service-based inference.
     """
-    logger.info(f"[InferenceTask Job {job_id}] Starting background inference task...")
-    if task_instance.db_manager is None:
-         logger.error(f"[InferenceTask Job {job_id}] DB manager not available. Aborting.")
-         return
-    if task_instance.inference_runner is None:
-        logger.error(f"[InferenceTask Job {job_id}] Inference runner not available. Aborting.")
-        await update_job_status(task_instance, job_id, "error", "Inference runner missing")
-        return
+    logger.info(f"[InferenceTask Job {job_id}] Background inference task initiated.")
 
-    prepared_batch = None
-    ds_t0 = None # Should be local_ds_t0 from context
-    ds_t_minus_6 = None # Should be local_ds_t_minus_6 from context
+    # Initialize variables at the top of the function scope
+    prepared_batch: Optional[Batch] = None
+    output_steps_datasets: Optional[List[xr.Dataset]] = None # To store the final list of xr.Dataset predictions
+    ds_t0: Optional[xr.Dataset] = None
+    ds_t_minus_6: Optional[xr.Dataset] = None
+    gfs_concat_data_for_batch_prep: Optional[xr.Dataset] = None
     
+    local_gfs_cache_dir = Path(task_instance.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
     miner_hotkey_for_filename = "unknown_miner_hk"
     if task_instance.keypair and task_instance.keypair.ss58_address:
         miner_hotkey_for_filename = task_instance.keypair.ss58_address
@@ -138,194 +137,173 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
         logger.warning(f"[InferenceTask Job {job_id}] Miner keypair not available for filename generation.")
 
     try:
+        await update_job_status(task_instance, job_id, "processing_input")
         logger.info(f"[InferenceTask Job {job_id}] Fetching job details from DB...")
-        query = "SELECT status, gfs_init_time_utc, gfs_t_minus_6_time_utc, validator_hotkey FROM weather_miner_jobs WHERE id = :job_id"
-        job_details = await task_instance.db_manager.fetch_one(query, {"job_id": job_id})
-
-        if not job_details:
+        job_db_details = await task_instance.db_manager.fetch_one(
+            "SELECT gfs_init_time_utc, gfs_t_minus_6_time_utc FROM weather_miner_jobs WHERE id = :job_id",
+            {"job_id": job_id}
+        )
+        if not job_db_details:
             logger.error(f"[InferenceTask Job {job_id}] Job details not found in DB. Aborting.")
+            await update_job_status(task_instance, job_id, "error", "Job details not found")
             return
+        gfs_init_time_utc = job_db_details['gfs_init_time_utc']
+        gfs_t_minus_6_time_utc = job_db_details['gfs_t_minus_6_time_utc']
 
-        current_status = job_details['status']
-        if current_status != 'inference_queued':
-             logger.warning(f"[InferenceTask Job {job_id}] Expected status 'inference_queued' but found '{current_status}'. Proceeding cautiously...")
-        
-        gfs_init_time_utc = job_details['gfs_init_time_utc']
-        gfs_t_minus_6_time_utc = job_details['gfs_t_minus_6_time_utc']
-        
-        if not gfs_init_time_utc or not gfs_t_minus_6_time_utc:
-            logger.error(f"[InferenceTask Job {job_id}] Missing GFS timestamps in DB record. Aborting.")
-            await update_job_status(task_instance, job_id, "error", "Missing GFS timestamps for inference")
-            return
-        
-        await update_job_status(task_instance, job_id, "loading_input")
-        logger.info(f"[InferenceTask Job {job_id}] Fetching GFS data (expecting cache hit) for T0={gfs_init_time_utc}, T-6={gfs_t_minus_6_time_utc}")
-        gfs_cache_dir = Path(task_instance.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'))
-        
-        local_ds_t0, local_ds_t_minus_6 = None, None 
-        gfs_concat_data_for_batch_prep = None
-        try:
-            local_ds_t0 = await fetch_gfs_analysis_data([gfs_init_time_utc], cache_dir=gfs_cache_dir)
-            local_ds_t_minus_6 = await fetch_gfs_analysis_data([gfs_t_minus_6_time_utc], cache_dir=gfs_cache_dir)
+        current_inference_type = task_instance.config.get("weather_inference_type", "local_model").lower()
+        logger.info(f"[InferenceTask Job {job_id}] Current inference type for pre-semaphore prep: {current_inference_type}")
 
-            if local_ds_t0 is None or local_ds_t_minus_6 is None:
-                logger.error(f"[InferenceTask Job {job_id}] Failed to fetch/load GFS data from cache. Aborting.")
-                await update_job_status(task_instance, job_id, "error", "Failed to load GFS data for inference")
+        if current_inference_type == "http_service":
+            http_service_url_available = task_instance.inference_service_url is not None and task_instance.inference_service_url.strip() != ""
+            if not http_service_url_available:
+                err_msg = "HTTP service URL not configured in WeatherTask for http_service type."
+                logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
+                await update_job_status(task_instance, job_id, "error", err_msg)
+                return
+
+            logger.info(f"[InferenceTask Job {job_id}] Fetching initial batch path for HTTP service from 'input_batch_pickle_path'.")
+            job_details_for_http = await task_instance.db_manager.fetch_one(
+                "SELECT input_batch_pickle_path FROM weather_miner_jobs WHERE id = :job_id",
+                {"job_id": job_id}
+            )
+            if not job_details_for_http or not job_details_for_http['input_batch_pickle_path']:
+                err_msg = f"Cannot find input_batch_pickle_path for job {job_id} for HTTP inference."
+                logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
+                await update_job_status(task_instance, job_id, "error", err_msg)
                 return
             
-            def _prepare_gfs_concat_sync(ds_t0_sync, ds_t_minus_6_sync):
-                return xr.concat([ds_t_minus_6_sync, ds_t0_sync], dim='time').sortby('time')
-
-            gfs_concat_data_for_batch_prep = await asyncio.to_thread(_prepare_gfs_concat_sync, local_ds_t0, local_ds_t_minus_6)
-
-            logger.info(f"[InferenceTask Job {job_id}] Preparing Aurora Batch from fetched datasets...")
+            input_batch_file_path = Path(job_details_for_http['input_batch_pickle_path'])
+            if not await asyncio.to_thread(input_batch_file_path.exists):
+                err_msg = f"Input batch pickle file {input_batch_file_path} not found for HTTP inference."
+                logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
+                await update_job_status(task_instance, job_id, "error", err_msg)
+                return
             
-            def _prepare_gfs_concat_sync(ds_t0_sync, ds_t_minus_6_sync):
-                return xr.concat([ds_t_minus_6_sync, ds_t0_sync], dim='time').sortby('time')
+            try:
+                logger.info(f"[InferenceTask Job {job_id}] Loading initial batch from {input_batch_file_path} for HTTP service.")
+                def _load_pickle_sync(path):
+                    with open(path, "rb") as f: return pickle.load(f)
+                prepared_batch = await asyncio.to_thread(_load_pickle_sync, input_batch_file_path) # Assign to prepared_batch
+                if not prepared_batch: raise ValueError("Loaded pickled batch is None.")
+                logger.info(f"[InferenceTask Job {job_id}] Successfully loaded pickled batch for HTTP. Type: {type(prepared_batch)}")
+            except Exception as e_load_batch:
+                err_msg = f"Failed to load pickled batch from {input_batch_file_path}: {e_load_batch}"
+                logger.error(f"[InferenceTask Job {job_id}] {err_msg}", exc_info=True)
+                await update_job_status(task_instance, job_id, "error", err_msg)
+                return
 
-            gfs_concat_data_for_batch_prep = await asyncio.to_thread(_prepare_gfs_concat_sync, local_ds_t0, local_ds_t_minus_6)
+        elif current_inference_type == "local_model":
+            if task_instance.inference_runner is None or not hasattr(task_instance.inference_runner, 'run_multistep_inference'):
+                err_msg = "Local inference runner or model not ready for local_model type."
+                logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
+                await update_job_status(task_instance, job_id, "error", err_msg)
+                return
 
-            logger.info(f"[InferenceTask Job {job_id}] Preparing Aurora Batch from fetched datasets...")
-            prepared_batch = await asyncio.to_thread(
+            logger.info(f"[InferenceTask Job {job_id}] Fetching GFS data for local model (T0={gfs_init_time_utc}, T-6={gfs_t_minus_6_time_utc})...")
+            ds_t0 = await fetch_gfs_analysis_data([gfs_init_time_utc], cache_dir=local_gfs_cache_dir)
+            ds_t_minus_6 = await fetch_gfs_analysis_data([gfs_t_minus_6_time_utc], cache_dir=local_gfs_cache_dir)
+            if ds_t0 is None or ds_t_minus_6 is None:
+                err_msg = "Failed to fetch/load GFS data from cache for local_model."
+                logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
+                await update_job_status(task_instance, job_id, "error", err_msg)
+                return
+            
+            logger.info(f"[InferenceTask Job {job_id}] Preparing Aurora batch from GFS data for local model...")
+            gfs_concat_data_for_batch_prep = xr.concat([ds_t0, ds_t_minus_6], dim='time').sortby('time')
+            prepared_batch = await asyncio.to_thread( # Assign to prepared_batch
                 create_aurora_batch_from_gfs, 
                 gfs_data=gfs_concat_data_for_batch_prep
             )
-
             if prepared_batch is None:
-                raise ValueError("Batch preparation function returned None")
-            logger.info(f"[InferenceTask Job {job_id}] Aurora Batch prepared successfully.")
-        except Exception as batch_prep_err:
-            logger.error(f"[InferenceTask Job {job_id}] Failed to prepare Aurora Batch: {batch_prep_err}", exc_info=True)
-            await update_job_status(task_instance, job_id, "error", f"Batch preparation failed: {batch_prep_err}")
+                err_msg = "Failed to create Aurora batch for local model from GFS data."
+                logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
+                await update_job_status(task_instance, job_id, "error", err_msg)
+                return
+            logger.info(f"[InferenceTask Job {job_id}] Aurora batch prepared for local model. Type: {type(prepared_batch)}")
+        
+        else:
+            err_msg = f"Unknown current_inference_type: '{current_inference_type}'. Aborting."
+            logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
+            await update_job_status(task_instance, job_id, "error", err_msg)
             return
-        finally:
-            # Comprehensive cleanup of large GFS datasets and prepared batch
-            cleanup_tasks = [
-                ("local_ds_t0", local_ds_t0),
-                ("local_ds_t_minus_6", local_ds_t_minus_6), 
-                ("gfs_concat_data_for_batch_prep", gfs_concat_data_for_batch_prep)
-            ]
-            
-            for name, obj in cleanup_tasks:
-                if obj and hasattr(obj, 'close'):
-                    try:
-                        obj.close()
-                        logger.debug(f"[InferenceTask Job {job_id}] Closed {name}")
-                    except Exception as e:
-                        logger.warning(f"[InferenceTask Job {job_id}] Error closing {name}: {e}")
-            
-            # Clean up prepared batch if it was created
-            if 'prepared_batch' in locals() and prepared_batch:
-                try:
-                    # Clear batch references to free memory
-                    if hasattr(prepared_batch, 'surf_vars'):
-                        prepared_batch.surf_vars.clear()
-                    if hasattr(prepared_batch, 'atmos_vars'):
-                        prepared_batch.atmos_vars.clear()
-                    if hasattr(prepared_batch, 'static_vars'):
-                        prepared_batch.static_vars.clear()
-                    del prepared_batch
-                    logger.debug(f"[InferenceTask Job {job_id}] Cleaned up prepared_batch")
-                except Exception as e:
-                    logger.warning(f"[InferenceTask Job {job_id}] Error cleaning prepared_batch: {e}")
-            
-            # Force garbage collection for large data cleanup
-            try:
-                collected = gc.collect()
-                if collected > 50:  # Log if significant cleanup occurred
-                    logger.info(f"[InferenceTask Job {job_id}] Memory cleanup: GC collected {collected} objects")
-            except Exception:
-                pass
+
+        # Critical check: prepared_batch must be valid to proceed to semaphore
+        if prepared_batch is None:
+            err_msg = "CRITICAL: `prepared_batch` is None before entering GPU semaphore. This indicates a flaw in pre-semaphore preparation logic."
+            logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
+            await update_job_status(task_instance, job_id, "error", err_msg)
+            # Ensure GFS datasets are closed if they were loaded for local model path that failed before semaphore
+            if ds_t0: ds_t0.close()
+            if ds_t_minus_6: ds_t_minus_6.close()
+            if gfs_concat_data_for_batch_prep: gfs_concat_data_for_batch_prep.close()
+            gc.collect()
+            return
 
         await update_job_status(task_instance, job_id, "running_inference")
         logger.info(f"[InferenceTask Job {job_id}] Waiting for GPU semaphore...")
-        selected_predictions_cpu = None
+        
         async with task_instance.gpu_semaphore:
-            logger.info(f"[InferenceTask Job {job_id}] Acquired GPU semaphore, running inference...")
-            original_inference_error_for_dev_skip = None 
-            original_inference_error_for_dev_skip = None 
-            try:
-                 inference_type = task_instance.config.get("weather_inference_type", "local").lower() 
-                 if task_instance.inference_runner is None: 
-                     raise RuntimeError("Inference runner is None before attempting inference call.")
+            logger.info(f"[InferenceTask Job {job_id}] Acquired GPU semaphore. Running inference...")
+            inference_type_for_call = task_instance.config.get("weather_inference_type", "local_model").lower()
+            logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) Effective inference type for call: {inference_type_for_call}")
 
-                 if inference_type == "azure_foundry":
-                     logger.info(f"[InferenceTask Job {job_id}] Using Azure AI Foundry for inference (type: {inference_type})...")
-                     predictions_list = await task_instance.inference_runner.run_foundry_inference(
-                         initial_batch=prepared_batch, 
-                         steps=task_instance.config.get('inference_steps', 40)
-                     )
-                     logger.info(f"[InferenceTask Job {job_id}] Foundry inference completed. Received {len(predictions_list if predictions_list else [])} steps.")
-                     selected_predictions_cpu = predictions_list 
-                 elif inference_type == "http_service":
-                    logger.info(f"[InferenceTask Job {job_id}] Using HTTP inference service (type: {inference_type})...")
-                    if not task_instance.inference_service_url:
-                        logger.error(f"[InferenceTask Job {job_id}] WEATHER_INFERENCE_SERVICE_URL (via task_instance.inference_service_url) not set. Aborting HTTP inference.")
-                        await update_job_status(task_instance, job_id, "error", "HTTP service URL not configured in WeatherTask")
-                        return
-
-                    logger.info(f"[InferenceTask Job {job_id}] Calling task_instance._run_inference_via_http_service...")
-                    selected_predictions_cpu = await task_instance._run_inference_via_http_service(
-                        job_id=job_id,
-                        initial_batch=prepared_batch
+            if inference_type_for_call == "local_model":
+                if task_instance.inference_runner and task_instance.inference_runner.model:
+                    logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) Running local inference using prepared_batch (type: {type(prepared_batch)})...")
+                    output_steps_datasets = await asyncio.to_thread( # Assign to output_steps_datasets
+                        task_instance.inference_runner.run_multistep_inference,
+                        prepared_batch,
+                        steps=task_instance.config.get('inference_steps', 40)
                     )
+                    logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) Local inference completed. Received {len(output_steps_datasets if output_steps_datasets else [])} steps.")
+                else:
+                    logger.error(f"[InferenceTask Job {job_id}] (Inside Semaphore) Local model runner/model not available. Cannot run local inference.")
+                    output_steps_datasets = None
+            
+            elif inference_type_for_call == "http_service":
+                logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) HTTP inference will use prepared_batch (type: {type(prepared_batch)}). Calling _run_inference_via_http_service...")
+                output_steps_datasets = await task_instance._run_inference_via_http_service( # Assign to output_steps_datasets
+                    job_id=job_id,
+                    initial_batch=prepared_batch 
+                )
+                logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) HTTP inference call completed. Result steps: {len(output_steps_datasets if output_steps_datasets else [])}.")
+            
+            else:
+                logger.error(f"[InferenceTask Job {job_id}] (Inside Semaphore) Unknown inference type for call: '{inference_type_for_call}'. Skipping inference.")
+                output_steps_datasets = None
+        
+        logger.info(f"[InferenceTask Job {job_id}] Released GPU semaphore.")
 
-                    if selected_predictions_cpu is None:
-                        logger.error(f"[InferenceTask Job {job_id}] HTTP inference service call failed (returned None). Job will be marked as error.")
-                    elif not selected_predictions_cpu:
-                        logger.info(f"[InferenceTask Job {job_id}] HTTP inference service call completed but returned an empty list of predictions. This may be normal (e.g. no data produced by model).")
-                 elif inference_type == "local_model":
-                     logger.info(f"[InferenceTask Job {job_id}] Using local runner for inference (type: {inference_type})...")
-                     if task_instance.inference_runner.model is None:
-                         logger.error(f"[InferenceTask Job {job_id}] Local model not loaded. Aborting.")
-                         await update_job_status(task_instance, job_id, "error", "Local model not loaded")
-                         return
-                     selected_predictions_cpu = await asyncio.to_thread(
-                         task_instance.inference_runner.run_multistep_inference,
-                         prepared_batch,
-                         steps=task_instance.config.get('inference_steps', 40)
-                     )
-                     logger.info(f"[InferenceTask Job {job_id}] Local inference completed. Received {len(selected_predictions_cpu if selected_predictions_cpu else [])} steps.")
-                 else:
-                     logger.error(f"[InferenceTask Job {job_id}] Unknown inference type configured: '{inference_type}'. Aborting.")
-                     await update_job_status(task_instance, job_id, "error", f"Unknown inference type: {inference_type}")
-                     return
-                     
-            except Exception as infer_err:
-                original_inference_error_for_dev_skip = str(infer_err)
-                logger.error(f"[InferenceTask Job {job_id}] Inference failed: {infer_err}", exc_info=True)
-                selected_predictions_cpu = None
+        # selected_predictions_cpu is now output_steps_datasets
+        if output_steps_datasets is None:
+            error_msg_inference = "Inference process failed or returned None."
+            logger.error(f"[InferenceTask Job {job_id}] {error_msg_inference}")
+            await update_job_status(task_instance, job_id, "error", error_msg_inference)
+            # GFS data cleanup happens in finally block
+            return
+        
+        if not output_steps_datasets: # Empty list
+            logger.info(f"[InferenceTask Job {job_id}] Inference resulted in an empty list of predictions (0 steps). This may be an expected outcome.")
+            await update_job_status(task_instance, job_id, "completed_no_data", "Inference produced no forecast steps.")
+            # GFS data cleanup happens in finally block
+            return
 
-            if selected_predictions_cpu is None:
-                dev_error_message = original_inference_error_for_dev_skip or "Inference returned None or failed."
-                logger.error(f"[InferenceTask Job {job_id}] Inference process resulted in None. Error: '{dev_error_message}'")
-                
-                # Directly mark the job as error without checking for dev override
-                await update_job_status(task_instance, job_id, "error", f"Inference failed: {dev_error_message}")
-                return
-
-            if not selected_predictions_cpu:
-                logger.info(f"[InferenceTask Job {job_id}] Inference resulted in an empty list of predictions. This may be an expected outcome (e.g., model generated no steps for this input).")
-                await update_job_status(task_instance, job_id, "completed_no_data", "Inference produced no forecast steps to save.")
-                logger.info(f"[InferenceTask Job {job_id}] No forecast data to save. Background task for this job ends here.")
-                return
-
-            logger.info(f"[InferenceTask Job {job_id}] Inference successful. Processing {len(selected_predictions_cpu)} steps for saving...")
-
+        logger.info(f"[InferenceTask Job {job_id}] Inference successful. Processing {len(output_steps_datasets)} steps for saving...")
         await update_job_status(task_instance, job_id, "processing_output")
+
         try:
             MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
 
             def _blocking_save_and_process():
-                if not selected_predictions_cpu:
-                    raise ValueError("Inference returned no prediction data (selected_predictions_cpu is None or empty).")
+                if not output_steps_datasets:
+                    raise ValueError("Inference returned no prediction data (output_steps_datasets is None or empty).")
 
                 combined_forecast_ds = None
                 base_time = pd.to_datetime(gfs_init_time_utc)
 
-                if isinstance(selected_predictions_cpu, xr.Dataset):
+                if isinstance(output_steps_datasets, xr.Dataset):
                     logger.info(f"[InferenceTask Job {job_id}] Processing pre-combined forecast (xr.Dataset) from HTTP service.")
-                    combined_forecast_ds = selected_predictions_cpu
+                    combined_forecast_ds = output_steps_datasets
 
                     if 'time' not in combined_forecast_ds.coords or not pd.api.types.is_datetime64_any_dtype(combined_forecast_ds['time'].dtype):
                         logger.error(f"[InferenceTask Job {job_id}] Dataset from HTTP service is missing a valid 'time' coordinate. Cannot proceed with saving.")
@@ -341,13 +319,13 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                             logger.error(f"[InferenceTask Job {job_id}] Failed to derive 'lead_time' coordinate: {e_derive_lead}. Hashing might be affected if it relies on 'lead_time'.")
                 else:
                     logger.info(f"[InferenceTask Job {job_id}] Processing list of Batch objects from local/Azure inference.")
-                    if not isinstance(selected_predictions_cpu, list) or not selected_predictions_cpu:
+                    if not isinstance(output_steps_datasets, list) or not output_steps_datasets:
                          raise ValueError("Inference returned no prediction steps or unexpected format for batch list.")
 
                     forecast_datasets = []
                     lead_times_hours_list = []
 
-                    for i, batch_step in enumerate(selected_predictions_cpu):
+                    for i, batch_step in enumerate(output_steps_datasets):
                         forecast_step_h = task_instance.config.get('forecast_step_hours', 6)
                         current_lead_time_hours = (i + 1) * forecast_step_h
                         forecast_time = base_time + timedelta(hours=current_lead_time_hours)
@@ -544,19 +522,33 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
         except Exception as final_db_err:
              logger.error(f"[InferenceTask Job {job_id}] Failed to update job status to error after task failure: {final_db_err}")
     finally:
-        if ds_t0 is not None and hasattr(ds_t0, 'close'):
-            try: ds_t0.close() 
-            except Exception: pass
-        if ds_t_minus_6 is not None and hasattr(ds_t_minus_6, 'close'):
-            try: ds_t_minus_6.close()
-            except Exception: pass
-        if 'gfs_concat_data_for_batch_prep' in locals() and gfs_concat_data_for_batch_prep is not None and hasattr(gfs_concat_data_for_batch_prep, 'close'):
-            try: gfs_concat_data_for_batch_prep.close()
-            except Exception: pass
+        # Comprehensive cleanup of large GFS datasets and other objects
+        logger.debug(f"[InferenceTask Job {job_id}] Entering finally block for cleanup.")
+        if ds_t0 and hasattr(ds_t0, 'close'): 
+            try: ds_t0.close(); logger.debug(f"[InferenceTask Job {job_id}] Closed ds_t0.")
+            except Exception as e_close: logger.warning(f"[InferenceTask Job {job_id}] Error closing ds_t0: {e_close}")
+        if ds_t_minus_6 and hasattr(ds_t_minus_6, 'close'):
+            try: ds_t_minus_6.close(); logger.debug(f"[InferenceTask Job {job_id}] Closed ds_t_minus_6.")
+            except Exception as e_close: logger.warning(f"[InferenceTask Job {job_id}] Error closing ds_t_minus_6: {e_close}")
+        if gfs_concat_data_for_batch_prep and hasattr(gfs_concat_data_for_batch_prep, 'close'):
+            try: gfs_concat_data_for_batch_prep.close(); logger.debug(f"[InferenceTask Job {job_id}] Closed gfs_concat_data_for_batch_prep.")
+            except Exception as e_close: logger.warning(f"[InferenceTask Job {job_id}] Error closing gfs_concat_data_for_batch_prep: {e_close}")
+        
+        # prepared_batch is not an xarray dataset usually, so no close(), just delete reference
+        if 'prepared_batch' in locals() and prepared_batch:
+            del prepared_batch
+            logger.debug(f"[InferenceTask Job {job_id}] Cleared reference to prepared_batch.")
+        
+        if 'output_steps_datasets' in locals() and output_steps_datasets: # list of datasets
+            for i, ds_step in enumerate(output_steps_datasets):
+                if ds_step and hasattr(ds_step, 'close'):
+                    try: ds_step.close(); logger.debug(f"[InferenceTask Job {job_id}] Closed output_steps_datasets step {i}.")
+                    except Exception as e_close: logger.warning(f"[InferenceTask Job {job_id}] Error closing output_steps_datasets step {i}: {e_close}")
+            del output_steps_datasets
+            logger.debug(f"[InferenceTask Job {job_id}] Cleared reference to output_steps_datasets.")
 
-        if 'gfs_concat_data_for_batch_prep' in locals() and gfs_concat_data_for_batch_prep is not None and hasattr(gfs_concat_data_for_batch_prep, 'close'):
-            try: gfs_concat_data_for_batch_prep.close()
-            except Exception: pass
+        gc.collect() # Force garbage collection
+        logger.info(f"[InferenceTask Job {job_id}] Background inference task finally block completed.")
 
 
 async def initial_scoring_worker(task_instance: 'WeatherTask'):
@@ -1151,9 +1143,11 @@ async def fetch_and_hash_gfs_task(
 ):
     """
     Background task for miners: Fetches GFS analysis data for T=0h and T=-6h,
-    computes the canonical input hash, and updates the job record in the database.
+    prepares the initial Aurora Batch, saves it, computes the canonical input hash,
+    and updates the job record in the database with the path and hash.
     """
-    logger.info(f"[FetchHashTask Job {job_id}] Starting GFS fetch and input hash computation for T0={t0_run_time}, T-6={t_minus_6_run_time}")
+    logger.info(f"[FetchHashTask Job {job_id}] Starting GFS fetch, batch prep, and input hash computation for T0={t0_run_time}, T-6={t_minus_6_run_time}")
+    input_batch_pickle_file_path_str = None # Initialize here for broader scope
 
     try:
         await update_job_status(task_instance, job_id, "fetching_gfs")
@@ -1162,36 +1156,109 @@ async def fetch_and_hash_gfs_task(
         gfs_cache_dir = Path(cache_dir_str)
         gfs_cache_dir.mkdir(parents=True, exist_ok=True)
 
+        # --- Fetch GFS Data ---
+        logger.info(f"[FetchHashTask Job {job_id}] Fetching GFS T0 data ({t0_run_time})...")
+        ds_t0 = await fetch_gfs_analysis_data([t0_run_time], cache_dir=gfs_cache_dir)
+        logger.info(f"[FetchHashTask Job {job_id}] Fetching GFS T-6 data ({t_minus_6_run_time})...")
+        ds_t_minus_6 = await fetch_gfs_analysis_data([t_minus_6_run_time], cache_dir=gfs_cache_dir)
+
+        if ds_t0 is None or ds_t_minus_6 is None:
+            logger.error(f"[FetchHashTask Job {job_id}] Failed to fetch GFS data (T0 or T-6 is None).")
+            await update_job_status(task_instance, job_id, "fetch_error", "Failed to fetch GFS data for batch preparation.")
+            return
+
+        # --- Prepare Aurora Batch ---
+        logger.info(f"[FetchHashTask Job {job_id}] Preparing Aurora Batch from GFS data...")
+        gfs_concat_data_for_batch_prep = await asyncio.to_thread(
+            lambda d0, d_minus_6: xr.concat([d_minus_6, d0], dim='time').sortby('time'),
+            ds_t0,
+            ds_t_minus_6
+        )
+        initial_batch = await asyncio.to_thread(
+            create_aurora_batch_from_gfs,
+            gfs_data=gfs_concat_data_for_batch_prep
+        )
+        if initial_batch is None:
+            logger.error(f"[FetchHashTask Job {job_id}] Failed to create Aurora Batch (create_aurora_batch_from_gfs returned None).")
+            await update_job_status(task_instance, job_id, "error", "Failed to prepare initial Aurora batch.")
+            return
+        logger.info(f"[FetchHashTask Job {job_id}] Aurora Batch prepared successfully.")
+
+        # --- Save Pickled Aurora Batch ---
+        MINER_INPUT_BATCHES_DIR.mkdir(parents=True, exist_ok=True) # Ensure dir exists
+        input_batch_pickle_filename = f"input_batch_{job_id}.pkl"
+        input_batch_pickle_file_path = MINER_INPUT_BATCHES_DIR / input_batch_pickle_filename
+        input_batch_pickle_file_path_str = str(input_batch_pickle_file_path.resolve())
+
+        logger.info(f"[FetchHashTask Job {job_id}] Saving pickled Aurora Batch to {input_batch_pickle_file_path_str}...")
+        def _save_pickle_sync(batch, path):
+            with open(path, "wb") as f:
+                pickle.dump(batch, f)
+        await asyncio.to_thread(_save_pickle_sync, initial_batch, input_batch_pickle_file_path_str)
+        logger.info(f"[FetchHashTask Job {job_id}] Successfully saved pickled Aurora Batch.")
+        
+        # --- Compute Input Hash (using the original datasets, not the batch object) ---
         logger.info(f"[FetchHashTask Job {job_id}] Calling compute_input_data_hash...")
         computed_hash = await compute_input_data_hash(
             t0_run_time=t0_run_time,
             t_minus_6_run_time=t_minus_6_run_time,
-            cache_dir=gfs_cache_dir
+            cache_dir=gfs_cache_dir,
+            ds_t0_override=ds_t0, # Pass fetched datasets to avoid re-fetch/re-load
+            ds_t_minus_6_override=ds_t_minus_6
         )
 
         if computed_hash:
             logger.info(f"[FetchHashTask Job {job_id}] Successfully computed input hash: {computed_hash[:10]}... Updating DB.")
             update_query = """
                 UPDATE weather_miner_jobs
-                SET input_data_hash = :hash, status = :status, updated_at = :now
+                SET input_data_hash = :hash,
+                    input_batch_pickle_path = :pickle_path,
+                    status = :status,
+                    updated_at = :now
                 WHERE id = :job_id
             """
             await task_instance.db_manager.execute(update_query, {
                 "job_id": job_id,
                 "hash": computed_hash,
+                "pickle_path": input_batch_pickle_file_path_str, # Store the path
                 "status": "input_hashed_awaiting_validation",
                 "now": datetime.now(timezone.utc)
             })
-            logger.info(f"[FetchHashTask Job {job_id}] Status updated to input_hashed_awaiting_validation.")
+            logger.info(f"[FetchHashTask Job {job_id}] Status updated to input_hashed_awaiting_validation with hash and batch path.")
         else:
             logger.error(f"[FetchHashTask Job {job_id}] compute_input_data_hash failed (returned None). Updating status to fetch_error.")
-            await update_job_status(task_instance, job_id, "fetch_error", "Failed to fetch GFS data or compute input hash.")
+            await update_job_status(task_instance, job_id, "fetch_error", "Failed to compute input hash.")
 
     except Exception as e:
         logger.error(f"[FetchHashTask Job {job_id}] Unexpected error: {e}", exc_info=True)
+        error_message = f"Unexpected error during fetch/hash: {e}"
+        # Attempt to clean up partial pickle file if it exists and an error occurred
+        if input_batch_pickle_file_path_str:
+            try:
+                partial_pickle_path = Path(input_batch_pickle_file_path_str)
+                if partial_pickle_path.exists():
+                    partial_pickle_path.unlink()
+                    logger.info(f"[FetchHashTask Job {job_id}] Cleaned up partial pickle file: {input_batch_pickle_file_path_str}")
+            except Exception as cleanup_err:
+                logger.warning(f"[FetchHashTask Job {job_id}] Error cleaning up partial pickle file {input_batch_pickle_file_path_str}: {cleanup_err}")
+        
         try:
-            await update_job_status(task_instance, job_id, "error", f"Unexpected error during fetch/hash: {e}")
+            await update_job_status(task_instance, job_id, "error", error_message)
         except Exception as db_err:
             logger.error(f"[FetchHashTask Job {job_id}] Failed to update status to error after exception: {db_err}")
+    finally:
+        # Close datasets if they were opened
+        if 'ds_t0' in locals() and ds_t0 and hasattr(ds_t0, 'close'):
+            try: ds_t0.close()
+            except Exception: pass
+        if 'ds_t_minus_6' in locals() and ds_t_minus_6 and hasattr(ds_t_minus_6, 'close'):
+            try: ds_t_minus_6.close()
+            except Exception: pass
+        if 'gfs_concat_data_for_batch_prep' in locals() and gfs_concat_data_for_batch_prep is not None and hasattr(gfs_concat_data_for_batch_prep, 'close'):
+            try: gfs_concat_data_for_batch_prep.close()
+            except Exception: pass
+        del initial_batch # Explicitly delete to free memory sooner
+        gc.collect()
+
 
     logger.info(f"[FetchHashTask Job {job_id}] Task finished.")

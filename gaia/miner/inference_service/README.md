@@ -153,6 +153,66 @@ It's designed to be packaged as a Docker container and run in a serverless-style
     ```
     The service will run on `http://localhost:8000` by default (or as configured).
 
+## Environment Configuration for Serverless/RunPod Deployment
+
+When deploying the inference service in a serverless environment like RunPod, or any environment where configuration is primarily managed via environment variables, the following settings are crucial. These complement or override settings in `config/settings.yaml`.
+
+**Core Settings:**
+
+*   **`INFERENCE_CONFIG_PATH`**:
+    *   **Description**: Path to the `settings.yaml` configuration file *inside the container*.
+    *   **Default**: `config/settings.yaml`
+    *   **Usage**: If your configuration file is located elsewhere, set this variable.
+
+*   **`LOG_LEVEL`**:
+    *   **Description**: Sets the logging verbosity.
+    *   **Default**: `DEBUG` (if not set, or if set in `settings.yaml` under `logging.level`)
+    *   **Values**: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`.
+    *   **Usage**: `LOG_LEVEL=INFO`
+
+*   **`INFERENCE_SERVICE_API_KEY`**:
+    *   **Description**: The API key required to communicate with `runpodctl` for file transfers (if using the legacy `runpodctl send/receive` mechanism). It's also used to secure the API endpoints if they were exposed directly.
+    *   **Default**: None. If not set, `runpodctl` operations requiring an API key might fail.
+    *   **Usage**: Set this to the API key you've configured for your RunPod instance or want to use for securing the service.
+
+**R2 (Cloudflare R2 Storage) Configuration:**
+
+The service interacts with R2 for downloading input files and uploading output files when using the `run_inference_from_r2` action. The specific environment variable *names* that the application will look for are defined in your `config/settings.yaml` under the `r2` section. The application then reads the *values* from the environment variables specified by those names.
+
+**Example `config/settings.yaml` snippet for R2:**
+```yaml
+# In your config/settings.yaml
+r2:
+  bucket_env_var: "WORKER_R2_BUCKET_NAME"                 # Name of the ENV VAR holding the R2 bucket name
+  endpoint_url_env_var: "WORKER_R2_ENDPOINT_URL"         # Name of the ENV VAR holding the R2 endpoint URL
+  access_key_id_env_var: "WORKER_R2_ACCESS_KEY_ID"       # Name of the ENV VAR holding the R2 Access Key ID
+  secret_access_key_env_var: "WORKER_R2_SECRET_ACCESS_KEY" # Name of the ENV VAR holding the R2 Secret Access Key
+```
+
+**Corresponding Environment Variables to Set:**
+
+Based on the example `settings.yaml` above, you would then need to set the following environment variables in your deployment environment (e.g., RunPod template environment variables):
+
+*   **`WORKER_R2_BUCKET_NAME`**:
+    *   **Description**: The actual name of your R2 bucket.
+    *   **Example**: `my-weather-inference-bucket`
+
+*   **`WORKER_R2_ENDPOINT_URL`**:
+    *   **Description**: The R2 S3 API endpoint URL for your account.
+    *   **Example**: `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` (replace `<ACCOUNT_ID>` with your Cloudflare account ID)
+
+*   **`WORKER_R2_ACCESS_KEY_ID`**:
+    *   **Description**: Your R2 Access Key ID.
+    *   **Example**: `your_r2_access_key_id`
+
+*   **`WORKER_R2_SECRET_ACCESS_KEY`**:
+    *   **Description**: Your R2 Secret Access Key.
+    *   **Example**: `your_r2_secret_access_key`
+
+**Important Notes on R2 Configuration:**
+*   Ensure the R2 credentials have the necessary permissions (Read for input objects, Write for output objects) on the specified bucket.
+*   The names of the environment variables (`WORKER_R2_BUCKET_NAME`, etc.) are defined by you in `settings.yaml`. The examples above are illustrative.
+
 ## Important Notes for Implementation:
 
 *   **`create_aurora_batch_from_gfs` (Miner Side):** The logic for creating the initial Aurora Batch (from GFS data or other sources) is now expected to reside on the client-side (e.g., the miner application). The miner should prepare the `Batch` object, pickle it, base64 encode it, and then send it in the `serialized_aurora_batch` field of the `/run_inference` request.

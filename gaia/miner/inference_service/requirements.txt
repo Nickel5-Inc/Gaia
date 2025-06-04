@@ -16,6 +16,9 @@ zarr
 netcdf4
 h5netcdf
 
+# RunPod SDK
+runpod
+
 # Aurora Weather SDK (confirm package name if different)
 microsoft_aurora
 
@@ -27,3 +30,5 @@ microsoft_aurora
 
 # Potentially aurora-weather (or the correct package name for the Aurora SDK)
 # If Aurora requires specific system libraries, they need to be in the Dockerfile 
+
+boto3 

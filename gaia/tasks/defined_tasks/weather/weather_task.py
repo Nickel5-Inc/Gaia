@@ -37,6 +37,10 @@ import gzip
 import tarfile
 import io
 import tempfile
+import subprocess
+
+import boto3 # For R2
+from botocore.exceptions import ClientError as BotoClientError # For R2 error handling, aliased to avoid conflict if other ClientError exists
 from . import weather_http_utils
 
 from .utils.era5_api import fetch_era5_data
@@ -170,7 +174,7 @@ def _load_config(self):
 
     # --- RunPod Specific Config ---
     config['runpod_poll_interval_seconds'] = int(os.getenv('RUNPOD_POLL_INTERVAL_SECONDS', '10'))
-    config['runpod_max_poll_attempts'] = int(os.getenv('RUNPOD_MAX_POLL_ATTEMPTS', '90')) # 90 * 10s = 15 minutes
+    config['runpod_max_poll_attempts'] = int(os.getenv('RUNPOD_MAX_POLL_ATTEMPTS', '900')) # 900 attempts * 10s/attempt = 9000s = 150 minutes = 2.5 hours
     config['runpod_download_endpoint_suffix'] = os.getenv('RUNPOD_DOWNLOAD_ENDPOINT_SUFFIX', 'run/download_step') # e.g., "run/download_step"
     config['runpod_upload_input_suffix'] = os.getenv('RUNPOD_UPLOAD_INPUT_SUFFIX', 'run/upload_input') # e.g., "run/upload_input"
 
@@ -217,6 +221,7 @@ class WeatherTask(Task):
         self.era5_climatology_ds = None
         self.inference_service_url = inference_service_url # Store the URL
         self.runpod_api_key = runpod_api_key # Store RunPod API key (will be None if not provided)
+        logger.info(f"WeatherTask initialized. RunPod API Key is {'SET' if self.runpod_api_key else 'NOT SET'}. First 5 chars: {self.runpod_api_key[:5] if self.runpod_api_key else 'N/A'}")
 
         self.initial_scoring_queue = asyncio.Queue()
         self.initial_scoring_worker_running = False
@@ -243,16 +248,16 @@ class WeatherTask(Task):
                 load_local_model_flag = True
 
                 if self.config['weather_inference_type'] == "http_service":
-                    logger.info(f"Configured to use HTTP Inference Service. URL: {self.inference_service_url}")
+                    logger.info(f"WeatherTask.__init__: Configured to use HTTP Inference Service. Provided URL: '{self.inference_service_url}'") # Log the provided URL
                     if not self.inference_service_url:
-                        logger.error("HTTP Inference Service selected, but no URL provided. Cannot use HTTP inference.")
+                        logger.error("WeatherTask.__init__: HTTP Inference Service selected, but no valid URL provided to WeatherTask constructor. Cannot use HTTP inference.")
                         # Fallback or error needed? For now, it will try to load local if URL is missing.
                         # To prevent local model loading if HTTP was intended but URL is missing:
-                        load_local_model_flag = False 
-                        # Or, explicitly set type to local_model if URL is bad for http_service
-                        # self.config['weather_inference_type'] = "local_model"
-                        # logger.warning("Falling back to local_model due to missing HTTP service URL.")
+                        load_local_model_flag = True # Fallback to trying local model if URL is bad.
+                        self.config['weather_inference_type'] = "local_model" # Explicitly set to local_model
+                        logger.warning("WeatherTask.__init__: Falling back to 'local_model' due to missing/invalid HTTP service URL.")
                     else:
+                        logger.info("WeatherTask.__init__: HTTP Inference Service URL is present. Will proceed with HTTP client logic. Local model will NOT be loaded.")
                         load_local_model_flag = False # Don't load local model if using HTTP service
 
                 elif self.config['weather_inference_type'] == "azure_foundry":
@@ -288,257 +293,401 @@ class WeatherTask(Task):
     _load_config = _load_config
 
     ############################################################
-    # HTTP Inference Service Helpers (Miner)
+    # RunPodCTL Helpers (Synchronous, for WeatherTask execution path)
     ############################################################
+    def _run_weather_task_subprocess_command(
+        self, 
+        command_parts: List[str], 
+        timeout_seconds: int = 300,
+        extract_code_and_terminate: bool = False,
+        extract_code_prefix: str = "Code is: "
+    ) -> Tuple[bool, str, str]:
+        """
+        Runs a subprocess command.
+        If extract_code_and_terminate is True, it reads stdout line by line for a specific prefix,
+        extracts the value, terminates the process, and returns the code.
+        Otherwise, it waits for the command to complete or timeout using communicate().
+        Returns a tuple: (success_boolean, stdout_str, stderr_str).
+        """
+        try:
+            full_command = ' '.join(command_parts)
+            logger.info(f"Executing command: {full_command} with timeout {timeout_seconds}s. Extract and terminate: {extract_code_and_terminate}")
+            
+            current_env = os.environ.copy()
+            logger.debug(f"Subprocess PATH: {current_env.get('PATH', 'N/A')}")
 
-    # _serialize_aurora_batch_for_service is now in weather_http_utils.py
-    # _deserialize_prediction_from_service is now in weather_http_utils.py
+            process = subprocess.Popen(
+                command_parts, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                text=True, 
+                bufsize=1, 
+                universal_newlines=True,
+                env=current_env
+            )
+            
+            if extract_code_and_terminate:
+                stdout_lines = []
+                stderr_lines = [] 
+                extracted_code = ""
+                code_found = False
+                
+                start_time = time.time()
+                while time.time() - start_time < timeout_seconds:
+                    if process.poll() is not None:
+                        logger.warning(f"Process '{full_command}' terminated prematurely with code {process.returncode} while waiting for code line.")
+                        break
+                    
+                    if process.stdout:
+                        line = process.stdout.readline()
+                        if line:
+                            stdout_lines.append(line)
+                            # MODIFIED CONDITION: If the stripped line from stdout is non-empty, consider it the code.
+                            line_stripped = line.strip()
+                            if line_stripped: 
+                                extracted_code = line_stripped
+                                code_found = True
+                                logger.info(f"Extracted code from stdout: '{extracted_code}' (from raw line: '{line.strip()}')")
+                                break 
+                        else: 
+                            logger.debug(f"End of stdout stream reached for '{full_command}' before code found or timeout.")
+                            break 
+                    time.sleep(0.01)
+
+                if code_found:
+                    logger.info(f"Code '{extracted_code}' extracted. Terminating process '{full_command}'.")
+                    process.terminate()
+                    try:
+                        remaining_stdout, final_stderr = process.communicate(timeout=5) 
+                        if remaining_stdout:
+                            stdout_lines.append(remaining_stdout)
+                        if final_stderr:
+                            stderr_lines.append(final_stderr)
+                    except subprocess.TimeoutExpired:
+                        logger.warning(f"Timeout waiting for process '{full_command}' to terminate/communicate after code extraction.")
+                        process.kill()
+                        try:
+                            remaining_stdout_kill, final_stderr_kill = process.communicate()
+                            if remaining_stdout_kill:
+                                stdout_lines.append(remaining_stdout_kill)
+                            if final_stderr_kill:
+                                stderr_lines.append(final_stderr_kill)
+                        except Exception as e_kill_comm:
+                            logger.warning(f"Exception during final communicate after kill for '{full_command}': {e_kill_comm}")
+                    except Exception as e_comm:
+                        logger.warning(f"Exception during final communicate for '{full_command}' after code extraction: {e_comm}")
+                    
+                    full_stdout_str = "".join(stdout_lines).strip()
+                    full_stderr_str = "".join(stderr_lines).strip()
+                    logger.debug(f"Command '{full_command}' (extract mode) successful. Code: {extracted_code}. Full Stdout (first 500 chars): {full_stdout_str[:500]}. Full Stderr (first 500 chars): {full_stderr_str[:500]}.")
+                    # Verify if "Code is: <extracted_code>" is in stderr for confirmation
+                    # This uses the extract_code_prefix passed to the function.
+                    if f"{extract_code_prefix}{extracted_code}" in full_stderr_str:
+                        logger.info(f"Confirmation: Extracted code '{extracted_code}' found in stderr output with prefix '{extract_code_prefix}'.")
+                    else:
+                        logger.warning(f"Verification: Extracted code '{extracted_code}' from stdout NOT found in stderr output (stderr: '{full_stderr_str[:200]}...') with prefix '{extract_code_prefix}'. This might be okay if stdout is the sole reliable source for the code itself.")
+                    
+                    full_stdout_log = "".join(stdout_lines).strip()
+                    return True, extracted_code, full_stderr_str 
+                else: 
+                    if process.poll() is None:
+                        process.kill()
+                    try:
+                        remaining_stdout, remaining_stderr = process.communicate(timeout=5) 
+                        if remaining_stdout:
+                            stdout_lines.append(remaining_stdout)
+                        if remaining_stderr:
+                            stderr_lines.append(remaining_stderr)
+                    except Exception: 
+                        pass 
+                    
+                    full_stdout_str = "".join(stdout_lines).strip()
+                    full_stderr_str = "".join(stderr_lines).strip()
+                    logger.error(f"Command '{full_command}' (extract mode) failed: Code '{extract_code_prefix}...' not found or timeout. Full Stdout (first 500 chars): {full_stdout_str[:500]}. Full Stderr (first 500 chars): {full_stderr_str[:500]}.")
+                    return False, full_stdout_str, f"Code not found or timeout. Partial stderr: {full_stderr_str}"
+
+            else: # Original behavior: wait for process to complete
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    process.kill() 
+                    stdout_on_timeout, stderr_on_timeout = process.communicate() 
+                    logger.error(f"Command '{full_command}' timed out after {timeout_seconds} seconds.")
+                    s_out = stdout_on_timeout.strip() if stdout_on_timeout else ""
+                    s_err = stderr_on_timeout.strip() if stderr_on_timeout else ""
+                    logger.debug(f"Stdout on timeout (first 500 chars): {s_out[:500]}")
+                    logger.debug(f"Stderr on timeout (first 500 chars): {s_err[:500]}")
+                    return False, s_out, f"Command timed out. Partial stderr: {s_err}"
+
+                max_log_len = 1000 
+                stripped_stdout = stdout.strip() if stdout else ""
+                stripped_stderr = stderr.strip() if stderr else ""
+
+                logger.debug(f"Command '{full_command}' completed. Return code: {process.returncode}")
+                logger.debug(f"Stdout (len: {len(stripped_stdout)}): {stripped_stdout[:max_log_len]}{'...' if len(stripped_stdout) > max_log_len else ''}")
+                logger.debug(f"Stderr (len: {len(stripped_stderr)}): {stripped_stderr[:max_log_len]}{'...' if len(stripped_stderr) > max_log_len else ''}")
+
+                if process.returncode == 0:
+                    logger.info(f"Command '{full_command}' successful.")
+                    return True, stripped_stdout, stripped_stderr
+                else:
+                    logger.error(f"Command '{full_command}' failed with return code {process.returncode}.")
+                    return False, stripped_stdout, stripped_stderr
+                
+        except FileNotFoundError:
+            logger.error(f"Command not found: {command_parts[0]}. Ensure it is installed and in PATH.")
+            return False, "", f"Command not found: {command_parts[0]}"
+        except Exception as e:
+            # Corrected f-string for the exception logging
+            logger.error(f"An error occurred while running command '{' '.join(command_parts)}': {e}", exc_info=True)
+            return False, "", str(e)
+
+    async def _get_r2_s3_client(self) -> Optional[boto3.client]:
+        """Initializes and returns an S3 client configured for R2."""
+        # This could be a helper method or part of a class initialization if used more broadly.
+        # For now, let's keep it simple and initialize when first needed by _run_inference_via_http_service.
+        # It can be enhanced to cache the client if called multiple times.
+
+        r2_bucket = os.getenv("R2_BUCKET")
+        r2_endpoint_url = os.getenv("R2_ENDPOINT_URL")
+        r2_access_key_id = os.getenv("R2_ACCESS_KEY")
+        r2_secret_access_key = os.getenv("R2_SECRET_ACCESS_KEY")
+
+        if not all([r2_bucket, r2_endpoint_url, r2_access_key_id, r2_secret_access_key]):
+            logger.error("One or more R2 environment variables (R2_BUCKET, R2_ENDPOINT_URL, R2_ACCESS_KEY, R2_SECRET_ACCESS_KEY) are not set. Cannot initialize R2 client.")
+            return None
+        
+        try:
+            s3_client = boto3.client(
+                's3',
+                endpoint_url=r2_endpoint_url,
+                aws_access_key_id=r2_access_key_id,
+                aws_secret_access_key=r2_secret_access_key,
+                config=boto3.session.Config(signature_version='s3v4'),
+                region_name='auto' 
+            )
+            logger.info(f"S3 client for R2 initialized. Endpoint: {r2_endpoint_url}, Bucket: {r2_bucket}")
+            return s3_client
+        except Exception as e:
+            logger.error(f"Failed to initialize S3 client for R2: {e}", exc_info=True)
+            return None
 
     async def _run_inference_via_http_service(self, job_id: str, initial_batch: Batch) -> Optional[List[xr.Dataset]]:
-        """
-        Runs inference by making requests to an external HTTP/RunPod service using runpodctl for data transfer.
-        Handles input serialization and send, job submission, status polling,
-        archive download, and deserialization using utility functions.
-        Returns a list of xr.Dataset objects (forecast steps) or None on failure.
-        """
         if not self.inference_service_url:
-            logger.error(f"Job {job_id}: Inference service URL not configured. Cannot run inference.")
+            logger.error("HTTP Inference service URL is not configured for WeatherTask.")
             return None
 
-        # Create a unique ID for this specific WeatherTask job execution to correlate with miner logs
-        # This job_run_uuid will be passed to the inference service.
-        weather_task_job_run_uuid = str(uuid.uuid4())
-        logger.info(f"Job {job_id}: Starting HTTP inference. Effective weather_task_job_run_uuid: {weather_task_job_run_uuid}")
+        s3_client = await self._get_r2_s3_client()
+        if not s3_client:
+            logger.error("Failed to get R2 S3 client, cannot proceed with inference via HTTP service using R2.")
+            return None
+        
+        r2_bucket_name = os.getenv("R2_BUCKET") # Already checked in _get_r2_s3_client, but good to have here.
 
-        tmp_dir_for_runpodctl: Optional[Path] = None # For managing temp files for runpodctl
+
+        run_uuid = str(uuid.uuid4()) # Unique ID for this specific runpod job and R2 objects
+        logger.info(f"[WeatherTask Run: {run_uuid}] Starting inference via HTTP service for job_id: {job_id}.")
+
+        # --- R2 Input Upload ---
+        temp_input_file_path: Optional[Path] = None
+        input_r2_object_key: Optional[str] = None
 
         try:
-            # --- Step 1: Serialize initial_batch and save to a temporary file ---
-            logger.info(f"Job {job_id}: Serializing initial_batch for runpodctl transfer...")
-            serialized_batch_bytes = pickle.dumps(initial_batch)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl", prefix=f"wt_input_{run_uuid}_") as tmpfile:
+                pickle.dump(initial_batch, tmpfile)
+                temp_input_file_path = Path(tmpfile.name)
             
-            # Create a temporary directory for this job's runpodctl operations
-            # This ensures that concurrent calls to this method don't interfere with each other's temp files.
-            base_temp_dir = Path(tempfile.gettempdir()) / "weather_task_runpodctl"
-            tmp_dir_for_runpodctl = base_temp_dir / weather_task_job_run_uuid
-            tmp_dir_for_runpodctl.mkdir(parents=True, exist_ok=True)
+            input_r2_object_key = f"inputs/{run_uuid}/initial_batch_data.pkl"
+            logger.info(f"[WeatherTask Run: {run_uuid}] Uploading serialized input batch {temp_input_file_path} to R2: s3://{r2_bucket_name}/{input_r2_object_key}")
             
-            temp_input_file = tmp_dir_for_runpodctl / "input_batch.pkl"
-            with open(temp_input_file, "wb") as f:
-                f.write(serialized_batch_bytes)
-            logger.info(f"Job {job_id}: Initial batch serialized and saved to temp file: {temp_input_file}")
-
-            # --- Step 2: Send the temporary file using runpodctl send ---
-            input_file_code = self._execute_runpodctl_send_from_weather_task(temp_input_file)
-            if not input_file_code:
-                logger.error(f"Job {job_id}: Failed to send input batch via runpodctl. Temp file: {temp_input_file}")
-                return None
-            logger.info(f"Job {job_id}: Successfully sent input batch. Runpodctl code: {input_file_code}")
-
-            # --- Step 3: Submit job to RunPod /run endpoint ---
-            # The payload for the RunPod /run endpoint (which goes to combined_runpod_handler)
-            run_payload = {
-                "input": {
-                    "action": "run_inference_with_runpodctl",
-                    "input_file_code": input_file_code,
-                    "job_run_uuid": weather_task_job_run_uuid # Pass our unique ID
-                }
-            }
-            logger.info(f"Job {job_id}: Submitting job to RunPod service: {self.inference_service_url} with payload containing action and input_file_code.")
-            
-            headers = {}
-            if self.runpod_api_key: # If CREDENTIAL was set for miner, WeatherTask gets it
-                headers["Authorization"] = f"Bearer {self.runpod_api_key}"
-            elif self.config.get('miner_api_key_for_infra_service'): # Fallback to general API key if RunPod specific one isn't there
-                 headers["X-API-Key"] = self.config['miner_api_key_for_infra_service']
-
-            run_response_json = None
-            try:
-                async with httpx.AsyncClient(timeout=self.config.get('runpod_submit_timeout_seconds', 60)) as client:
-                    # The main URL for RunPod serverless is the one we use for /run
-                    # It should be the base URL of the serverless endpoint.
-                    submit_url = self.inference_service_url # This should be the .../run URL path
-                    if not submit_url.endswith('/run'):
-                        submit_url = submit_url.rstrip('/') + '/run'
-
-                    response = await client.post(submit_url, json=run_payload, headers=headers)
-                    response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-                    run_response_json = response.json()
-            except httpx.HTTPStatusError as e_http:
-                logger.error(f"Job {job_id}: HTTP error submitting job to RunPod {submit_url}: {e_http.response.status_code} - {e_http.response.text}", exc_info=True)
-                return None
-            except httpx.RequestError as e_req:
-                logger.error(f"Job {job_id}: Request error submitting job to RunPod {submit_url}: {e_req}", exc_info=True)
-                return None
-            except json.JSONDecodeError as e_json:
-                logger.error(f"Job {job_id}: Failed to decode JSON response from RunPod job submission at {submit_url}. Response: {response.text if 'response' in locals() else 'N/A'}", exc_info=True)
-                return None
-
-            if not run_response_json or "id" not in run_response_json:
-                logger.error(f"Job {job_id}: Failed to get a valid job ID from RunPod submission. Response: {run_response_json}")
-                return None
-
-            runpod_job_id = run_response_json["id"]
-            logger.info(f"Job {job_id}: Successfully submitted job to RunPod. RunPod Job ID: {runpod_job_id}")
-
-            # --- Step 4: Poll RunPod /status endpoint ---
-            status_url = f"{self.inference_service_url.replace('/run', '/status')}/{runpod_job_id}"
-            logger.info(f"Job {job_id}: Polling RunPod status URL: {status_url}")
-            
-            status_data = None
-            for attempt in range(self.config.get('runpod_max_poll_attempts', 90)):
-                await asyncio.sleep(self.config.get('runpod_poll_interval_seconds', 10))
-                try:
-                    async with httpx.AsyncClient(timeout=self.config.get('runpod_poll_timeout_seconds', 30)) as client:
-                        response = await client.get(status_url, headers=headers)
-                        response.raise_for_status()
-                        status_data = response.json()
-                        job_status = status_data.get("status")
-                        logger.info(f"Job {job_id}: Poll attempt {attempt + 1}. RunPod Job {runpod_job_id} status: {job_status}")
-
-                        if job_status == "COMPLETED":
-                            logger.info(f"Job {job_id}: RunPod job {runpod_job_id} completed.")
-                            break
-                        elif job_status in ["FAILED", "CANCELLED"]:
-                            error_detail = status_data.get("error", "No error details provided by RunPod.")
-                            if isinstance(status_data.get("output"), dict):
-                                error_detail_from_output = status_data.get("output", {}).get("error", error_detail)
-                                error_detail = f"{error_detail} Output Error: {error_detail_from_output}"
-                            logger.error(f"Job {job_id}: RunPod job {runpod_job_id} {job_status}. Error: {error_detail}")
-                            return None
-                        # IN_PROGRESS, IN_QUEUE, RETRYING - continue polling
-                        
-                except httpx.HTTPStatusError as e_http_poll:
-                    logger.warning(f"Job {job_id}: HTTP error polling RunPod status for job {runpod_job_id} (attempt {attempt + 1}): {e_http_poll.response.status_code} - {e_http_poll.response.text}. Retrying...")
-                except httpx.RequestError as e_req_poll:
-                    logger.warning(f"Job {job_id}: Request error polling RunPod status for job {runpod_job_id} (attempt {attempt + 1}): {e_req_poll}. Retrying...")
-                except json.JSONDecodeError as e_json_poll:
-                    logger.warning(f"Job {job_id}: Failed to decode JSON from RunPod status for job {runpod_job_id} (attempt {attempt + 1}). Response: {response.text if 'response' in locals() else 'N/A'}. Retrying...")
-            else: # Loop finished without break (max attempts reached)
-                logger.error(f"Job {job_id}: RunPod job {runpod_job_id} did not complete within the max polling attempts.")
-                return None
-
-            if not status_data or status_data.get("status") != "COMPLETED":
-                logger.error(f"Job {job_id}: RunPod job {runpod_job_id} did not complete successfully or status_data is invalid. Final status: {status_data.get('status') if status_data else 'N/A'}")
-                return None
-
-            output_manifest = status_data.get("output", {})
-            if not isinstance(output_manifest, dict) or not output_manifest:
-                logger.error(f"Job {job_id}: RunPod job {runpod_job_id} completed but 'output' (manifest) is missing, empty, or not a dict. Output: {output_manifest}")
-                return None
-            
-            logger.info(f"Job {job_id}: Received manifest from RunPod job {runpod_job_id}: {output_manifest}")
-
-            # --- Process Manifest --- 
-            output_archive_code = output_manifest.get("output_archive_code")
-            base_time_str = output_manifest.get("base_time")
-            # job_run_uuid_from_miner = output_manifest.get("job_run_uuid") # For cross-referencing if needed
-            archive_filename_on_miner = output_manifest.get("archive_filename_on_miner") # Actual filename used by miner
-            num_steps_archived = output_manifest.get("num_steps_archived") # Should be an int
-
-            # Handle special archive codes first
-            if output_archive_code == "NO_ARCHIVE_EMPTY_PREDICTIONS":
-                logger.info(f"Job {job_id}: Manifest indicates no predictions were generated by the model (code: {output_archive_code}). Returning empty list of datasets.")
-                return [] # Return empty list, signifying successful run but no data
-            
-            if output_archive_code in ["ARCHIVE_CREATION_FAILED_NO_SEND", "RUNPODCTL_SEND_FAILED"] or not output_archive_code:
-                error_detail = output_manifest.get("error_details", f"Manifest indicates failure. Code: {output_archive_code}")
-                logger.error(f"Job {job_id}: {error_detail}. Manifest: {output_manifest}")
-                return None # Indicates a hard failure in the remote process
-
-            if not base_time_str:
-                logger.error(f"Job {job_id}: Manifest from RunPod job {runpod_job_id} is valid but 'base_time' is missing. Cannot process. Manifest: {output_manifest}")
-                return None
-            
-            if archive_filename_on_miner is None: # Could be empty string from miner if not set
-                logger.warning(f"Job {job_id}: Manifest 'archive_filename_on_miner' is missing. Using default 'forecast_archive.tar.gz' for runpodctl receive.")
-                archive_filename_on_miner = "forecast_archive.tar.gz" # Default if not provided
-
-            if not isinstance(num_steps_archived, int):
-                logger.warning(f"Job {job_id}: 'num_steps_archived' in manifest is missing or not an integer (value: {num_steps_archived}). Cannot reliably verify downloaded content against expected steps, but will proceed with extraction.")
-                # We can still proceed, but with less certainty about the content initially.
-
-            # --- Step 5: Download Archive using runpodctl receive ---
-            logger.info(f"Job {job_id}: Attempting to download archive with runpodctl code: {output_archive_code}")
-            # We will save the received archive to our job-specific temporary directory
-            downloaded_archive_path = tmp_dir_for_runpodctl / archive_filename_on_miner 
-            
-            receive_success = self._execute_runpodctl_receive_in_weather_task(
-                code=output_archive_code,
-                output_path=downloaded_archive_path
+            await asyncio.to_thread(
+                s3_client.upload_file,
+                str(temp_input_file_path),
+                r2_bucket_name,
+                input_r2_object_key
             )
+            logger.info(f"[WeatherTask Run: {run_uuid}] Successfully uploaded input to R2.")
 
-            if not receive_success or not downloaded_archive_path.is_file() or downloaded_archive_path.stat().st_size == 0:
-                logger.error(f"Job {job_id}: Failed to download archive with code {output_archive_code}, or downloaded file is empty/missing. Path: {downloaded_archive_path}")
-                return None
-            
-            logger.info(f"Job {job_id}: Successfully downloaded archive to {downloaded_archive_path} (size: {downloaded_archive_path.stat().st_size} bytes).")
-
-            # --- Step 6: Extract Archives and Deserialize Steps ---
-            base_time_dt: Optional[datetime] = None
-            try:
-                base_time_dt = pd.to_datetime(base_time_str).to_pydatetime(warn=False)
-                if base_time_dt.tzinfo is None:
-                    base_time_dt = base_time_dt.replace(tzinfo=timezone.utc)
-            except Exception as e_time_parse: 
-                logger.error(f"Job {job_id}: Could not parse 'base_time' string '{base_time_str}' from manifest: {e_time_parse}", exc_info=True)
-                return None
-            
-            downloaded_archive_bytes: bytes
-            with open(downloaded_archive_path, "rb") as f_archive:
-                downloaded_archive_bytes = f_archive.read()
-
-            if not downloaded_archive_bytes:
-                logger.error(f"Job {job_id}: Read 0 bytes from downloaded archive file {downloaded_archive_path}. Cannot extract.")
-                return None
-
-            # Pass the logger instance to the utility function
-            # The utility function now takes a list containing single archive bytes
-            forecast_datasets: List[xr.Dataset] = self.weather_http_utils.extract_and_deserialize_tar_archives(
-                archive_bytes_list=[downloaded_archive_bytes],
-                deserialize_func=lambda data, logger_inst: self.weather_http_utils.deserialize_prediction_from_service(data, logger_inst),
-                logger_instance=logger
-            )
-
-            if not forecast_datasets:
-                logger.warning(f"Job {job_id}: No datasets were extracted/deserialized from the downloaded archive {downloaded_archive_path}. This could be due to an empty archive (despite download) or deserialization errors for all steps.")
-                # If num_steps_archived was > 0, this is an issue.
-                if isinstance(num_steps_archived, int) and num_steps_archived > 0:
-                    logger.error(f"Job {job_id}: Manifest reported {num_steps_archived} steps, but none were extracted. This indicates a problem with the archive content or deserialization.")
-                    return None # Treat as failure if steps were expected but not received properly
-                else: # num_steps_archived was 0 or not an int, or forecast_datasets is empty matching this
-                    logger.info(f"Job {job_id}: No datasets extracted, consistent with manifest num_steps_archived ({num_steps_archived}). Returning empty list.")
-                    return [] # Successful run, but no data resulted
-
-            logger.info(f"Job {job_id}: Successfully extracted {len(forecast_datasets)} forecast steps from archive.")
-            if isinstance(num_steps_archived, int) and len(forecast_datasets) != num_steps_archived:
-                 logger.warning(f"Job {job_id}: Number of extracted datasets ({len(forecast_datasets)}) does not match 'num_steps_archived' from manifest ({num_steps_archived}).")
-
-            # TODO: Further validation of the datasets based on base_time and forecast_step_hours might be needed here.
-            # For now, we assume the deserialized datasets are correct if extraction succeeded.
-            return forecast_datasets
-
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Job {job_id}: HTTPStatusError during inference service communication: {e.response.status_code} - {e.response.text}. URL: {e.request.url}", exc_info=True)
+        except BotoClientError as e_boto_up:
+            logger.error(f"[WeatherTask Run: {run_uuid}] R2 ClientError during input upload: {e_boto_up.response.get('Error', {}).get('Message', str(e_boto_up))}", exc_info=True)
+            if temp_input_file_path and temp_input_file_path.exists(): temp_input_file_path.unlink(missing_ok=True)
             return None
-        except httpx.RequestError as e:
-            logger.error(f"Job {job_id}: RequestError during inference service communication: {e.request.url} - {e}", exc_info=True)
-            return None
-        except Exception as e:
-            logger.error(f"Job {job_id}: An unexpected error occurred in _run_inference_via_http_service: {e}", exc_info=True)
+        except Exception as e_upload:
+            logger.error(f"[WeatherTask Run: {run_uuid}] Failed to serialize or upload initial batch to R2: {e_upload}", exc_info=True)
+            if temp_input_file_path and temp_input_file_path.exists(): temp_input_file_path.unlink(missing_ok=True)
             return None
         finally:
-            # Cleanup temporary directory used for this job's runpodctl operations
-            if tmp_dir_for_runpodctl and tmp_dir_for_runpodctl.exists():
-                try:
-                    shutil.rmtree(tmp_dir_for_runpodctl)
-                    logger.info(f"Job {job_id}: Successfully cleaned up temporary runpodctl directory: {tmp_dir_for_runpodctl}")
-                except Exception as e_clean:
-                    logger.error(f"Job {job_id}: Failed to cleanup temporary runpodctl directory {tmp_dir_for_runpodctl}: {e_clean}")
-            elif tmp_dir_for_runpodctl: # Path was set but dir doesn't exist (e.g. failed before creation)
-                logger.debug(f"Job {job_id}: Temporary runpodctl directory {tmp_dir_for_runpodctl} not found for cleanup (may have failed before creation).")
+            if temp_input_file_path and temp_input_file_path.exists(): # Ensure cleanup if upload failed mid-way
+                temp_input_file_path.unlink(missing_ok=True)
+        
+        if not input_r2_object_key: # Should not happen if upload was successful, but as a safeguard
+             logger.error(f"[WeatherTask Run: {run_uuid}] input_r2_object_key was not set after upload attempt. Aborting.")
+             return None
 
-    # _extract_and_deserialize_archives is now in weather_http_utils.py
+
+        # Prepare payload for RunPod job submission
+        payload = {
+            "input": {
+                "action": "run_inference_from_r2", # New action for R2 based workflow
+                "input_r2_object_key": input_r2_object_key,
+                "job_run_uuid": run_uuid # Pass the unique ID for correlation and R2 paths
+            }
+        }
+        logger.debug(f"[WeatherTask Run: {run_uuid}] Submitting job to RunPod. Payload: {payload}")
+
+        # --- RunPod Job Submission and Polling ---
+        runpod_job_id: Optional[str] = None
+        try:
+            async with httpx.AsyncClient(timeout=self.config.get('runpod_http_timeout', 60)) as client: # Added timeout
+                # The specific endpoint path might be just the base URL + /run for serverless handlers
+                # or could be different if a custom API gateway is in front.
+                # Assuming self.inference_service_url is the base URL for the serverless worker.
+                base_url = self.inference_service_url.rstrip('/')
+                if base_url.endswith('/run'): # Check if it already ends with /run
+                    target_url = base_url
+                else:
+                    target_url = f"{base_url}/run"
+                
+                headers = {}
+                if self.runpod_api_key: # This is for RunPod's own API auth if directly hitting RunPod endpoints
+                    headers["Authorization"] = f"Bearer {self.runpod_api_key}"
+                # If the inference service itself has an API key (X-API-Key), it should be added here too.
+                # For now, assuming runpod_api_key is for RunPod platform calls.
+
+                logger.info(f"[WeatherTask Run: {run_uuid}] Posting job to {target_url}")
+                response = await client.post(target_url, json=payload, headers=headers)
+                response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+                
+                response_data = response.json()
+                logger.debug(f"[WeatherTask Run: {run_uuid}] RunPod job submission response: {response_data}")
+                runpod_job_id = response_data.get("id")
+                if not runpod_job_id:
+                    logger.error(f"[WeatherTask Run: {run_uuid}] Failed to get job ID from RunPod submission response: {response_data}")
+                    return None
+                logger.info(f"[WeatherTask Run: {run_uuid}] RunPod job submitted. RunPod Job ID: {runpod_job_id}")
+
+                # Polling logic
+                base_status_url = self.inference_service_url.rstrip('/')
+                if base_status_url.endswith('/run'): # if original URL was .../run, replace /run with /status
+                    base_status_url = base_status_url[:-len('/run')].rstrip('/')
+                
+                # Ensure /status is not duplicated if base_status_url already contains it (less likely but good check)
+                if base_status_url.endswith('/status'):
+                     poll_url = f"{base_status_url}/{runpod_job_id}"
+                else:
+                     poll_url = f"{base_status_url.rstrip('/')}/status/{runpod_job_id}"
+
+                poll_interval = self.config.get('runpod_poll_interval_seconds', 10)
+                max_attempts = self.config.get('runpod_max_poll_attempts', 900)
+                
+                for attempt in range(max_attempts):
+                    await asyncio.sleep(poll_interval)
+                    logger.info(f"[WeatherTask Run: {run_uuid}] Polling RunPod job {runpod_job_id}, attempt {attempt + 1}/{max_attempts}. URL: {poll_url}")
+                    status_response = await client.get(poll_url, headers=headers) # Use same headers for status
+                    status_response.raise_for_status()
+                    status_data = status_response.json()
+                    logger.debug(f"[WeatherTask Run: {run_uuid}] Poll status response: {status_data}")
+
+                    job_status = status_data.get("status")
+                    if job_status == "COMPLETED":
+                        logger.info(f"[WeatherTask Run: {run_uuid}] RunPod job {runpod_job_id} completed.")
+                        # Output is expected directly in status_data['output'] for COMPLETED jobs
+                        job_output = status_data.get("output")
+                        if not job_output:
+                            logger.error(f"[WeatherTask Run: {run_uuid}] RunPod job {runpod_job_id} COMPLETED but no output found in response.")
+                            return None
+                        
+                        # --- R2 Output Download and Processing ---
+                        output_r2_bucket = job_output.get("output_r2_bucket_name")
+                        output_r2_object_key_from_manifest = job_output.get("output_r2_object_key")
+
+                        if not output_r2_bucket or not output_r2_object_key_from_manifest:
+                            logger.error(f"[WeatherTask Run: {run_uuid}] Job output manifest missing R2 bucket/key. Output: {job_output}")
+                            if job_output.get("error"): logger.error(f"[WeatherTask Run: {run_uuid}] Server-side error: {job_output['error']}")
+                            return None
+
+                        temp_output_archive_path: Optional[Path] = None
+                        try:
+                            # Create a temporary file to download the R2 archive
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz", prefix=f"wt_output_archive_{run_uuid}_") as tmp_archive_file:
+                                temp_output_archive_path = Path(tmp_archive_file.name)
+                            
+                            logger.info(f"[WeatherTask Run: {run_uuid}] Downloading output archive from R2: s3://{output_r2_bucket}/{output_r2_object_key_from_manifest} to {temp_output_archive_path}")
+                            await asyncio.to_thread(
+                                s3_client.download_file,
+                                output_r2_bucket,
+                                output_r2_object_key_from_manifest,
+                                str(temp_output_archive_path)
+                            )
+                            logger.info(f"[WeatherTask Run: {run_uuid}] Successfully downloaded output archive from R2.")
+
+                            # Use existing deserialization logic from weather_http_utils
+                            base_time_str = job_output.get("base_time") # Ensure this is passed in the manifest
+                            if not base_time_str:
+                                logger.error(f"[WeatherTask Run: {run_uuid}] 'base_time' missing from successful job output manifest: {job_output}")
+                                return None
+                            
+                            # Convert base_time_str (ISO format string) to pd.Timestamp
+                            # Assuming it's UTC. If not, timezone handling might be needed.
+                            base_time_for_coords = pd.Timestamp(base_time_str, tz='UTC')
+
+
+                            deserialized_steps = weather_http_utils.deserialize_gzipped_netcdf_archive(
+                                archive_path=temp_output_archive_path,
+                                base_time_for_coords=base_time_for_coords, # Pass the parsed base_time
+                                config=self.config # Pass relevant parts of self.config if needed by deserializer
+                            )
+                            if deserialized_steps:
+                                logger.info(f"[WeatherTask Run: {run_uuid}] Successfully deserialized {len(deserialized_steps)} steps from downloaded archive.")
+                                return deserialized_steps
+                            else:
+                                logger.error(f"[WeatherTask Run: {run_uuid}] Failed to deserialize steps from downloaded R2 archive {temp_output_archive_path}.")
+                                return None
+                        except BotoClientError as e_boto_down:
+                            logger.error(f"[WeatherTask Run: {run_uuid}] R2 ClientError during output download: {e_boto_down.response.get('Error', {}).get('Message', str(e_boto_down))}", exc_info=True)
+                            return None
+                        except pd.errors.ParserError as e_time_parse:
+                            logger.error(f"[WeatherTask Run: {run_uuid}] Failed to parse 'base_time' string '{base_time_str}' from manifest: {e_time_parse}", exc_info=True)
+                            return None
+                        except Exception as e_output_proc:
+                            logger.error(f"[WeatherTask Run: {run_uuid}] Error processing downloaded R2 output: {e_output_proc}", exc_info=True)
+                            return None
+                        finally:
+                            if temp_output_archive_path and temp_output_archive_path.exists():
+                                temp_output_archive_path.unlink(missing_ok=True)
+                                logger.debug(f"[WeatherTask Run: {run_uuid}] Cleaned up temporary output archive: {temp_output_archive_path}")
+
+                    elif job_status in ["IN_PROGRESS", "IN_QUEUE"]:
+                        logger.info(f"[WeatherTask Run: {run_uuid}] RunPod job {runpod_job_id} status: {job_status}. Continuing to poll.")
+                    else: # FAILED, TIMED_OUT, or other unknown status
+                        logger.error(f"[WeatherTask Run: {run_uuid}] RunPod job {runpod_job_id} failed or unexpected status: {job_status}. Response: {status_data}")
+                        job_output = status_data.get("output", {})
+                        if job_output and job_output.get("error"): # Check for error message from worker
+                            logger.error(f"[WeatherTask Run: {run_uuid}] Server-side error from RunPod worker: {job_output['error']}")
+                        return None # Job failed
+
+                logger.warning(f"[WeatherTask Run: {run_uuid}] RunPod job {runpod_job_id} polling timed out after {max_attempts} attempts.")
+                return None
+
+        except httpx.HTTPStatusError as e_http:
+            logger.error(f"[WeatherTask Run: {run_uuid}] HTTP error during RunPod operation: {e_http.response.status_code} - {e_http.response.text}", exc_info=True)
+            return None
+        except httpx.RequestError as e_req:
+            logger.error(f"[WeatherTask Run: {run_uuid}] Request error during RunPod operation: {e_req}", exc_info=True)
+            return None
+        except json.JSONDecodeError as e_json:
+            logger.error(f"[WeatherTask Run: {run_uuid}] Failed to decode JSON response from RunPod: {e_json}", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"[WeatherTask Run: {run_uuid}] An unexpected error occurred in _run_inference_via_http_service: {e}", exc_info=True)
+            return None
+        finally:
+            # Any final cleanup specific to this function if needed, beyond temp files handled above
+            logger.info(f"[WeatherTask Run: {run_uuid}] Finished _run_inference_via_http_service for job_id: {job_id}.")
+            # Ensure temp_input_file_path is cleaned up if it wasn't in its own try/finally
+            if 'temp_input_file_path' in locals() and temp_input_file_path and temp_input_file_path.exists():
+                temp_input_file_path.unlink(missing_ok=True)
+                logger.debug(f"[WeatherTask Run: {run_uuid}] Final cleanup of temp input file: {temp_input_file_path}")
 
     ############################################################
     # Validator methods

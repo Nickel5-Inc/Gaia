@@ -152,8 +152,18 @@ class Miner:
             node_type="miner"
         )
         
+        # --- Initialize WeatherTask in __init__ ---
+        self.weather_inference_service_url = None # Will be determined here
+        self.weather_runpod_api_key = None      # Will be determined here
+        self.weather_task = None                # Initialize to None
+
         weather_enabled_env_val = os.getenv("WEATHER_MINER_ENABLED", "false")
         weather_enabled = weather_enabled_env_val.lower() in ["true", "1", "yes"]
+        
+        # Corrected logging for WEATHER_MINER_ENABLED
+        weather_enabled_env_val_for_log = os.getenv("WEATHER_MINER_ENABLED")
+        logger.info(f"DEBUG_WEATHER_ENABLED in __init__: Value from os.getenv: '{weather_enabled_env_val_for_log}', Evaluated to: {weather_enabled}")
+
         
         self.weather_inference_service_url = os.getenv("WEATHER_INFERENCE_SERVICE_URL")
         runpod_api_key_from_env = os.getenv("CREDENTIAL")
@@ -162,7 +172,32 @@ class Miner:
             logger.info(f"RunPod API Key loaded from CREDENTIAL env var in __init__.")
 
         if weather_enabled:
-            logger.info("Weather task ENABLED by WEATHER_MINER_ENABLED. Initializing in __init__.")
+            logger.info("Weather task IS ENABLED based on WEATHER_MINER_ENABLED in __init__.")
+            
+            weather_inference_type = os.getenv("WEATHER_INFERENCE_TYPE", "local_model").lower()
+            service_url_env = os.getenv("WEATHER_INFERENCE_SERVICE_URL")
+
+            if weather_inference_type == "http_service":
+                if not service_url_env:
+                    logger.error("WEATHER_INFERENCE_TYPE is 'http_service' but WEATHER_INFERENCE_SERVICE_URL is not set. Weather task cannot use inference service.")
+                    # self.weather_task remains None
+                else:
+                    self.weather_inference_service_url = service_url_env
+                    logger.info(f"HTTP inference service configured in __init__. URL: {self.weather_inference_service_url}")
+                    
+                    runpod_api_key_from_env = os.getenv("WEATHER_RUNPOD_API_KEY")
+                    if runpod_api_key_from_env:
+                        self.weather_runpod_api_key = runpod_api_key_from_env
+                        logger.info("RunPod API Key loaded from WEATHER_RUNPOD_API_KEY env var in __init__.")
+                    else:
+                        logger.info("WEATHER_RUNPOD_API_KEY env var not found in __init__.")
+            
+            elif weather_inference_type == "local_model":
+                logger.info(f"Weather inference type is '{weather_inference_type}' in __init__. WeatherTask will use internal model logic.")
+            else:
+                logger.warning(f"Unhandled WEATHER_INFERENCE_TYPE: '{weather_inference_type}' in __init__.")
+
+            # Now, instantiate WeatherTask if it's still considered viable
             weather_task_args = {
                 "db_manager": self.database_manager,
                 "node_type": "miner",
@@ -171,11 +206,16 @@ class Miner:
             if self.weather_runpod_api_key:
                 weather_task_args["runpod_api_key"] = self.weather_runpod_api_key
             
-            self.weather_task = WeatherTask(**weather_task_args)
-            logger.info("WeatherTask basic initialization completed in __init__.")
+            try:
+                self.weather_task = WeatherTask(**weather_task_args)
+                logger.info("WeatherTask INSTANTIATED in Miner.__init__.")
+            except Exception as e_wt_init:
+                logger.error(f"Failed to instantiate WeatherTask in Miner.__init__: {e_wt_init}", exc_info=True)
+                self.weather_task = None # Ensure it's None on failure
         else:
-            logger.info("Weather task DISABLED by WEATHER_MINER_ENABLED. self.weather_task remains None.")
-            self.weather_task = None
+            logger.info("Weather task IS DISABLED based on WEATHER_MINER_ENABLED in __init__. self.weather_task is None.")
+            self.weather_task = None # Explicitly None
+        # --- End WeatherTask Initialization in __init__ ---
     
 
     def setup_neuron(self) -> bool:
@@ -194,19 +234,22 @@ class Miner:
             config.chain_endpoint = self.subtensor_chain_endpoint
             self.config = config
             
-            if self.weather_task is not None:
+            if self.weather_task is not None: # Check if weather_task was initialized
                 if hasattr(self.weather_task, 'config') and self.weather_task.config is not None:
                     self.weather_task.config['netuid'] = self.netuid
                     self.weather_task.config['chain_endpoint'] = self.subtensor_chain_endpoint
                     if 'miner_public_base_url' not in self.weather_task.config:
-                         self.weather_task.config['miner_public_base_url'] = None
+                         self.weather_task.config['miner_public_base_url'] = None # Will be set by self-check if possible
+                    self.weather_task.keypair = self.keypair
+                    logger.info("Miner.setup_neuron: Applied neuron config to existing WeatherTask.")
                 else:
                     self.weather_task.config = {
                         'netuid': self.netuid,
                         'chain_endpoint': self.subtensor_chain_endpoint,
-                        'miner_public_base_url': None
+                        'miner_public_base_url': None # Will be set by self-check if possible
                     }
-                self.weather_task.keypair = self.keypair
+                    self.weather_task.keypair = self.keypair
+                    logger.info("Miner.setup_neuron: WeatherTask is None, skipping neuron config for it.")
 
             self.logger.debug(
                 f"""
@@ -267,7 +310,7 @@ class Miner:
                                 self.weather_task.config['miner_public_base_url'] = self.my_public_base_url
                                 self.logger.info(f"MINER_SELF_CHECK: Updated WeatherTask config with miner_public_base_url: {self.my_public_base_url}")
                             else:
-                                self.logger.warning("MINER_SELF_CHECK: WeatherTask.config not found or is None, cannot set miner_public_base_url.")
+                                self.logger.info("MINER_SELF_CHECK: WeatherTask is None or WeatherTask.config is None, cannot set miner_public_base_url for it.") # Modified log
 
                     except ValueError as e_ip_conv:
                         self.logger.error(f"MINER_SELF_CHECK: Could not convert/validate IP '{ip_to_convert}' to standard string: {e_ip_conv}. Public URL not set.")
