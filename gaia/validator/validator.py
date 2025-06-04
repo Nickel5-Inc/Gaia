@@ -10,6 +10,7 @@ import glob
 import signal
 import sys
 import tracemalloc # Added import
+import memray # Added for programmatic memray tracking
 
 from gaia.database.database_manager import DatabaseTimeout
 try:
@@ -199,6 +200,7 @@ class GaiaValidator:
         self.last_set_weights_block = 0
         self.current_block = 0
         self.nodes = {}
+        self.memray_tracker: Optional[memray.Tracker] = None # For programmatic memray
 
         # Initialize HTTP clients first
         # Client for miner communication with SSL verification disabled
@@ -1678,209 +1680,240 @@ class GaiaValidator:
     async def main(self):
         """Main execution loop for the validator."""
 
-        # Suppress gcsfs/aiohttp cleanup warnings that can block PM2 restart
-        def custom_excepthook(exc_type, exc_value, exc_traceback):
-            # Suppress specific gcsfs/aiohttp cleanup errors
-            if (exc_type == RuntimeWarning and 
-                ('coroutine' in str(exc_value) and 'never awaited' in str(exc_value)) or
-                ('Non-thread-safe operation' in str(exc_value))):
-                return  # Silently ignore these warnings
-            # Call the default handler for other exceptions
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        
-        sys.excepthook = custom_excepthook
+        memray_active = False
+        memray_output_file_path = "validator_memray_output.bin" 
 
-        # --- Alembic check removed from here ---
-        #test
-        try:
-            logger.info("Setting up neuron...")
-            if not self.setup_neuron():
-                logger.error("Failed to setup neuron, exiting...")
-                return
-
-            logger.info("Neuron setup complete.")
-
-            logger.info("Checking metagraph initialization...")
-            if self.metagraph is None:
-                logger.error("Metagraph not initialized, exiting...")
-                return
-
-            logger.info("Metagraph initialized.")
-
-            logger.info("Initializing database connection...") 
-            await self.database_manager.initialize_database()
-            logger.info("Database tables initialized.")
-            
-            # Initialize DB Sync Components - AFTER DB init
-            await self._initialize_db_sync_components()
-
-            #logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
-            await handle_db_wipe(self.database_manager)
-            
-            # Perform startup history cleanup AFTER db init and wipe check
-            await self.cleanup_stale_history_on_startup()
-
-            # Lock storage to prevent any writes
-            self.database_manager._storage_locked = False
-            if self.database_manager._storage_locked:
-                logger.warning("Database storage is locked - no data will be stored until manually unlocked")
-
-            logger.info("Checking HTTP clients...")
-            # Only create clients if they don't exist or are closed
-            if not hasattr(self, 'miner_client') or self.miner_client.is_closed:
-                self.miner_client = httpx.AsyncClient(
-                    timeout=30.0, follow_redirects=True, verify=False
-                )
-                logger.info("Created new miner client")
-            if not hasattr(self, 'api_client') or self.api_client.is_closed:
-                self.api_client = httpx.AsyncClient(
-                    timeout=30.0,
-                    follow_redirects=True,
-                    limits=httpx.Limits(
-                        max_connections=100,
-                        max_keepalive_connections=20,
-                        keepalive_expiry=30,
-                    ),
-                    transport=httpx.AsyncHTTPTransport(retries=3),
-                )
-                logger.info("Created new API client")
-            logger.info("HTTP clients ready.")
-
-            logger.info("Starting watchdog...")
-            await self.start_watchdog()
-            logger.info("Watchdog started.")
-
-            logger.info("Starting tracemalloc for memory analysis...")
-            tracemalloc.start(25) # Start tracemalloc, 25 frames for traceback
-            
-            logger.info("Initializing baseline models...")
-            await self.basemodel_evaluator.initialize_models()
-            logger.info("Baseline models initialization complete")
-            
-            # Start auto-updater as independent task (not in main loop to avoid self-cancellation)
-            logger.info("Starting independent auto-updater task...")
-            auto_updater_task = asyncio.create_task(self.check_for_updates())
-            logger.info("Auto-updater task started independently")
-            
-            tasks = [
-                #lambda: self.geomagnetic_task.validator_execute(self),
-                #lambda: self.soil_task.validator_execute(self),
-                lambda: self.weather_task.validator_execute(self),
-                lambda: self.status_logger(),
-                lambda: self.main_scoring(),
-                lambda: self.handle_miner_deregistration_loop(),
-                # The MinerScoreSender task will be added conditionally below
-                lambda: self.manage_earthdata_token(),
-                lambda: self.monitor_client_health(),  # Added HTTP client monitoring
-                lambda: self.memory_snapshot_taker(), # Added memory snapshot task
-                #lambda: self.database_monitor(),
-                #lambda: self.plot_database_metrics_periodically() # Added plotting task
-            ]
-
-            # Add DB Sync tasks conditionally
-            if self.is_source_validator_for_db_sync and self.backup_manager:
-                logger.info(f"Adding DB Sync Backup task (interval: {self.db_sync_interval_hours}h).")
-                # Using insert to make it one of the earlier tasks, but order might not be critical.
-                tasks.insert(0, lambda: self.backup_manager.start_periodic_backups(self.db_sync_interval_hours))
-            elif not self.is_source_validator_for_db_sync and self.restore_manager:
-                logger.info(f"Adding DB Sync Restore task (interval: {self.db_sync_interval_hours}h).")
-                tasks.insert(0, lambda: self.restore_manager.start_periodic_restores(self.db_sync_interval_hours))
-            else:
-                logger.info("DB Sync is not active for this node (either source or replica manager failed to init, not configured, or Azure manager failed).")
-
-            
-            # Conditionally add miner_score_sender task
-            score_sender_on_str = os.getenv("SCORE_SENDER_ON", "False")
-            if score_sender_on_str.lower() == "true":
-                logger.info("SCORE_SENDER_ON is True, enabling MinerScoreSender task.")
-                tasks.insert(5, lambda: self.miner_score_sender.run_async())
-
-            active_service_tasks = []  # Define here for access in except CancelledError
-            shutdown_waiter = None # Define here for access in except CancelledError
+        if os.getenv("ENABLE_MEMRAY_TRACKING", "false").lower() == "true":
             try:
-                logger.info(f"Creating {len(tasks)} main service tasks...")
-                active_service_tasks = [asyncio.create_task(t()) for t in tasks]
-                logger.info(f"All {len(active_service_tasks)} main service tasks created.")
+                # memray is already imported at the top
+                logger.info(f"Programmatic Memray tracking enabled. Output will be saved to: {memray_output_file_path}")
+                self.memray_tracker = memray.Tracker(
+                    destination=memray.FileDestination(path=memray_output_file_path, overwrite=True),
+                    native_traces=True 
+                )
+                memray_active = True
+            except ImportError: # Should not happen if import is at top, but good for safety
+                logger.warning("Memray library seemed to be missing despite top-level import. Programmatic Memray tracking is disabled.")
+            except Exception as e:
+                logger.error(f"Failed to initialize Memray tracker: {e}")
+                self.memray_tracker = None # Ensure it's None if init fails
+        
+        async def run_validator_logic():
+            # Suppress gcsfs/aiohttp cleanup warnings that can block PM2 restart
+            def custom_excepthook(exc_type, exc_value, exc_traceback):
+                # Suppress specific gcsfs/aiohttp cleanup errors
+                if (exc_type == RuntimeWarning and 
+                    ('coroutine' in str(exc_value) and 'never awaited' in str(exc_value)) or
+                    ('Non-thread-safe operation' in str(exc_value))):
+                    return  # Silently ignore these warnings
+                # Call the default handler for other exceptions
+                sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            
+            sys.excepthook = custom_excepthook
 
-                shutdown_waiter = asyncio.create_task(self._shutdown_event.wait())
+            # --- Alembic check removed from here ---
+            #test
+            try:
+                logger.info("Setting up neuron...")
+                if not self.setup_neuron():
+                    logger.error("Failed to setup neuron, exiting...")
+                    return
+
+                logger.info("Neuron setup complete.")
+
+                logger.info("Checking metagraph initialization...")
+                if self.metagraph is None:
+                    logger.error("Metagraph not initialized, exiting...")
+                    return
+
+                logger.info("Metagraph initialized.")
+
+                logger.info("Initializing database connection...") 
+                await self.database_manager.initialize_database()
+                logger.info("Database tables initialized.")
                 
-                # Tasks to monitor are all service tasks plus the shutdown_waiter
-                all_tasks_being_monitored = active_service_tasks + [shutdown_waiter]
+                # Initialize DB Sync Components - AFTER DB init
+                await self._initialize_db_sync_components()
 
-                while not self._shutdown_event.is_set():
-                    # Filter out already completed tasks from the list we pass to asyncio.wait
-                    current_wait_list = [t for t in all_tasks_being_monitored if not t.done()]
-                    
-                    if not current_wait_list: 
-                        # This means all tasks (services + shutdown_waiter) are done.
-                        logger.info("All monitored tasks have completed.")
-                        if not self._shutdown_event.is_set():
-                             logger.warning("All tasks completed but shutdown event was not explicitly set. Setting it now to ensure proper cleanup.")
-                             self._shutdown_event.set() # Ensure shutdown is triggered
-                        break # Exit the while loop
+                #logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
+                await handle_db_wipe(self.database_manager)
+                
+                # Perform startup history cleanup AFTER db init and wipe check
+                await self.cleanup_stale_history_on_startup()
 
-                    done, pending = await asyncio.wait(
-                        current_wait_list,
-                        return_when=asyncio.FIRST_COMPLETED
+                # Lock storage to prevent any writes
+                self.database_manager._storage_locked = False
+                if self.database_manager._storage_locked:
+                    logger.warning("Database storage is locked - no data will be stored until manually unlocked")
+
+                logger.info("Checking HTTP clients...")
+                # Only create clients if they don't exist or are closed
+                if not hasattr(self, 'miner_client') or self.miner_client.is_closed:
+                    self.miner_client = httpx.AsyncClient(
+                        timeout=30.0, follow_redirects=True, verify=False
                     )
+                    logger.info("Created new miner client")
+                if not hasattr(self, 'api_client') or self.api_client.is_closed:
+                    self.api_client = httpx.AsyncClient(
+                        timeout=30.0,
+                        follow_redirects=True,
+                        limits=httpx.Limits(
+                            max_connections=100,
+                            max_keepalive_connections=20,
+                            keepalive_expiry=30,
+                        ),
+                        transport=httpx.AsyncHTTPTransport(retries=3),
+                    )
+                    logger.info("Created new API client")
+                logger.info("HTTP clients ready.")
+
+                logger.info("Starting watchdog...")
+                await self.start_watchdog()
+                logger.info("Watchdog started.")
+
+                if not memray_active: # Start tracemalloc only if memray is not active
+                    logger.info("Starting tracemalloc for memory analysis...")
+                    tracemalloc.start(25) # Start tracemalloc, 25 frames for traceback
+                
+                logger.info("Initializing baseline models...")
+                await self.basemodel_evaluator.initialize_models()
+                logger.info("Baseline models initialization complete")
+                
+                # Start auto-updater as independent task (not in main loop to avoid self-cancellation)
+                logger.info("Starting independent auto-updater task...")
+                auto_updater_task = asyncio.create_task(self.check_for_updates())
+                logger.info("Auto-updater task started independently")
+                
+                tasks_lambdas = [ # Renamed to avoid conflict if tasks variable is used elsewhere
+                    #lambda: self.geomagnetic_task.validator_execute(self),
+                    #lambda: self.soil_task.validator_execute(self),
+                    lambda: self.weather_task.validator_execute(self),
+                    lambda: self.status_logger(),
+                    lambda: self.main_scoring(),
+                    lambda: self.handle_miner_deregistration_loop(),
+                    # The MinerScoreSender task will be added conditionally below
+                    lambda: self.manage_earthdata_token(),
+                    lambda: self.monitor_client_health(),  # Added HTTP client monitoring
+                    #lambda: self.database_monitor(),
+                    #lambda: self.plot_database_metrics_periodically() # Added plotting task
+                ]
+                if not memray_active: # Add tracemalloc snapshot taker only if memray is not active
+                    tasks_lambdas.append(lambda: self.memory_snapshot_taker())
+
+
+                # Add DB Sync tasks conditionally
+                if self.is_source_validator_for_db_sync and self.backup_manager:
+                    logger.info(f"Adding DB Sync Backup task (interval: {self.db_sync_interval_hours}h).")
+                    # Using insert to make it one of the earlier tasks, but order might not be critical.
+                    tasks_lambdas.insert(0, lambda: self.backup_manager.start_periodic_backups(self.db_sync_interval_hours))
+                elif not self.is_source_validator_for_db_sync and self.restore_manager:
+                    logger.info(f"Adding DB Sync Restore task (interval: {self.db_sync_interval_hours}h).")
+                    tasks_lambdas.insert(0, lambda: self.restore_manager.start_periodic_restores(self.db_sync_interval_hours))
+                else:
+                    logger.info("DB Sync is not active for this node (either source or replica manager failed to init, not configured, or Azure manager failed).")
+
+                
+                # Conditionally add miner_score_sender task
+                score_sender_on_str = os.getenv("SCORE_SENDER_ON", "False")
+                if score_sender_on_str.lower() == "true":
+                    logger.info("SCORE_SENDER_ON is True, enabling MinerScoreSender task.")
+                    tasks_lambdas.insert(5, lambda: self.miner_score_sender.run_async())
+
+                active_service_tasks = []  # Define here for access in except CancelledError
+                shutdown_waiter = None # Define here for access in except CancelledError
+                try:
+                    logger.info(f"Creating {len(tasks_lambdas)} main service tasks...")
+                    active_service_tasks = [asyncio.create_task(t()) for t in tasks_lambdas]
+                    logger.info(f"All {len(active_service_tasks)} main service tasks created.")
+
+                    shutdown_waiter = asyncio.create_task(self._shutdown_event.wait())
                     
-                    # If shutdown_event is set (e.g. by signal handler) or shutdown_waiter completed, break the loop.
-                    if self._shutdown_event.is_set() or shutdown_waiter.done():
-                        logger.info("Shutdown signaled or shutdown_waiter completed. Breaking main monitoring loop.")
-                        break 
+                    # Tasks to monitor are all service tasks plus the shutdown_waiter
+                    all_tasks_being_monitored = active_service_tasks + [shutdown_waiter]
 
-                    # If we are here, one of the active_service_tasks completed. Log it.
-                    for task in done:
-                        if task in active_service_tasks: # Check if it's one of our main service tasks
-                            try:
-                                result = task.result() # Access result to raise exception if task failed
-                                logger.warning(f"Main service task {task.get_name()} completed unexpectedly with result: {result}. It will not be automatically restarted by this loop.")
-                            except asyncio.CancelledError:
-                                logger.info(f"Main service task {task.get_name()} was cancelled.")
-                            except Exception as e:
-                                logger.error(f"Main service task {task.get_name()} failed with exception: {e}", exc_info=True)
-                
-                # --- After the while loop (either by break or _shutdown_event being set before loop start) ---
-                logger.info("Main monitoring loop finished. Initiating cancellation of any remaining active tasks for shutdown.")
-                
-                # Cancel all original service tasks if not already done
-                for task_to_cancel in active_service_tasks:
-                    if not task_to_cancel.done():
-                        logger.info(f"Cancelling service task: {task_to_cancel.get_name()}")
-                        task_to_cancel.cancel()
-                
-                # Cancel shutdown_waiter if not done
-                # (e.g., if loop broke because all service tasks finished before shutdown_event was set)
-                if shutdown_waiter and not shutdown_waiter.done():
-                    logger.info("Cancelling shutdown_waiter task.")
-                    shutdown_waiter.cancel()
-                
-                # Await all of them to ensure they are properly cleaned up
-                await asyncio.gather(*(active_service_tasks + ([shutdown_waiter] if shutdown_waiter else [])), return_exceptions=True)
-                logger.info("All main service tasks and the shutdown waiter have been processed (awaited/cancelled).")
-                
-            except asyncio.CancelledError:
-                logger.info("Main task execution block was cancelled. Ensuring child tasks are also cancelled.")
-                # This block handles if validator.main() itself is cancelled from outside.
-                tasks_to_ensure_cancelled = []
-                if 'active_service_tasks' in locals(): # Check if list was initialized
-                    tasks_to_ensure_cancelled.extend(active_service_tasks)
-                if 'shutdown_waiter' in locals() and shutdown_waiter: # Check if waiter was initialized
-                    tasks_to_ensure_cancelled.append(shutdown_waiter)
-                
-                for task_to_cancel in tasks_to_ensure_cancelled:
-                    if task_to_cancel and not task_to_cancel.done():
-                        logger.info(f"Cancelling task due to main cancellation: {task_to_cancel.get_name()}")
-                        task_to_cancel.cancel()
-                await asyncio.gather(*tasks_to_ensure_cancelled, return_exceptions=True)
-                logger.info("Child tasks cancellation process completed due to main cancellation.")
+                    while not self._shutdown_event.is_set():
+                        # Filter out already completed tasks from the list we pass to asyncio.wait
+                        current_wait_list = [t for t in all_tasks_being_monitored if not t.done()]
+                        
+                        if not current_wait_list: 
+                            # This means all tasks (services + shutdown_waiter) are done.
+                            logger.info("All monitored tasks have completed.")
+                            if not self._shutdown_event.is_set():
+                                 logger.warning("All tasks completed but shutdown event was not explicitly set. Setting it now to ensure proper cleanup.")
+                                 self._shutdown_event.set() # Ensure shutdown is triggered
+                            break # Exit the while loop
 
-        except Exception as e:
-            logger.error(f"Error in main: {e}")
-            logger.error(traceback.format_exc())
-        finally:
-            if not self._cleanup_done:
-                await self._initiate_shutdown()
+                        done, pending = await asyncio.wait(
+                            current_wait_list,
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+                        
+                        # If shutdown_event is set (e.g. by signal handler) or shutdown_waiter completed, break the loop.
+                        if self._shutdown_event.is_set() or shutdown_waiter.done():
+                            logger.info("Shutdown signaled or shutdown_waiter completed. Breaking main monitoring loop.")
+                            break 
+
+                        # If we are here, one of the active_service_tasks completed. Log it.
+                        for task in done:
+                            if task in active_service_tasks: # Check if it's one of our main service tasks
+                                try:
+                                    result = task.result() # Access result to raise exception if task failed
+                                    logger.warning(f"Main service task {task.get_name()} completed unexpectedly with result: {result}. It will not be automatically restarted by this loop.")
+                                except asyncio.CancelledError:
+                                    logger.info(f"Main service task {task.get_name()} was cancelled.")
+                                except Exception as e:
+                                    logger.error(f"Main service task {task.get_name()} failed with exception: {e}", exc_info=True)
+                    
+                    # --- After the while loop (either by break or _shutdown_event being set before loop start) ---
+                    logger.info("Main monitoring loop finished. Initiating cancellation of any remaining active tasks for shutdown.")
+                    
+                    # Cancel all original service tasks if not already done
+                    for task_to_cancel in active_service_tasks:
+                        if not task_to_cancel.done():
+                            logger.info(f"Cancelling service task: {task_to_cancel.get_name()}")
+                            task_to_cancel.cancel()
+                    
+                    # Cancel shutdown_waiter if not done
+                    # (e.g., if loop broke because all service tasks finished before shutdown_event was set)
+                    if shutdown_waiter and not shutdown_waiter.done():
+                        logger.info("Cancelling shutdown_waiter task.")
+                        shutdown_waiter.cancel()
+                    
+                    # Await all of them to ensure they are properly cleaned up
+                    await asyncio.gather(*(active_service_tasks + ([shutdown_waiter] if shutdown_waiter else [])), return_exceptions=True)
+                    logger.info("All main service tasks and the shutdown waiter have been processed (awaited/cancelled).")
+                    
+                except asyncio.CancelledError:
+                    logger.info("Main task execution block was cancelled. Ensuring child tasks are also cancelled.")
+                    # This block handles if validator.main() itself is cancelled from outside.
+                    tasks_to_ensure_cancelled = []
+                    if 'active_service_tasks' in locals(): # Check if list was initialized
+                        tasks_to_ensure_cancelled.extend(active_service_tasks)
+                    if 'shutdown_waiter' in locals() and shutdown_waiter: # Check if waiter was initialized
+                        tasks_to_ensure_cancelled.append(shutdown_waiter)
+                    
+                    for task_to_cancel in tasks_to_ensure_cancelled:
+                        if task_to_cancel and not task_to_cancel.done():
+                            logger.info(f"Cancelling task due to main cancellation: {task_to_cancel.get_name()}")
+                            task_to_cancel.cancel()
+                    await asyncio.gather(*tasks_to_ensure_cancelled, return_exceptions=True)
+                    logger.info("Child tasks cancellation process completed due to main cancellation.")
+
+            except Exception as e:
+                logger.error(f"Error in main: {e}")
+                logger.error(traceback.format_exc())
+            finally:
+                if not self._cleanup_done:
+                    await self._initiate_shutdown()
+
+        if memray_active and self.memray_tracker:
+            with self.memray_tracker: # This starts the tracking
+                logger.info("Memray tracker is active and wrapping validator logic.")
+                await run_validator_logic()
+            logger.info(f"Memray tracking finished. Output file '{memray_output_file_path}' should be written.")
+        else:
+            logger.info("Memray tracking is not active. Running validator logic directly.")
+            await run_validator_logic()
 
     async def main_scoring(self):
         """Run scoring every subnet tempo blocks."""
