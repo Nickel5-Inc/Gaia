@@ -278,6 +278,16 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                         forecast_step_h = task_instance.config.get('forecast_step_hours', 6)
                         current_lead_time_hours = (i + 1) * forecast_step_h
                         forecast_time = base_time + timedelta(hours=current_lead_time_hours)
+                        
+                        # Convert timezone-aware datetime to timezone-naive to avoid zarr serialization issues
+                        if hasattr(forecast_time, 'tz_localize'):
+                            # If pandas timestamp
+                            forecast_time_naive = forecast_time.tz_localize(None)
+                        elif hasattr(forecast_time, 'replace'):
+                            # If python datetime
+                            forecast_time_naive = forecast_time.replace(tzinfo=None)
+                        else:
+                            forecast_time_naive = forecast_time
 
                         if not isinstance(batch_step, Batch):
                             logger.warning(f"[InferenceTask Job {job_id}] Step {i} prediction is not an aurora.Batch (type: {type(batch_step)}), skipping.")
@@ -306,7 +316,7 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                         ds_step = xr.Dataset(
                             data_vars,
                             coords={
-                                "time": ([forecast_time]), # Ensure this is a list/array for concat
+                                "time": ([forecast_time_naive]), # Use timezone-naive datetime
                                 "pressure_level": (("pressure_level"), level_coords),
                                 "lat": (("lat"), lat_coords),
                                 "lon": (("lon"), lon_coords),
@@ -346,13 +356,13 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                     if level_dim_in_var:
                         chunks_for_var[level_dim_in_var] = 1 
                     if lat_dim_in_var:
-                        chunks_for_var[lat_dim_in_var] = combined_forecast_ds.dims[lat_dim_in_var]
+                        chunks_for_var[lat_dim_in_var] = combined_forecast_ds.sizes[lat_dim_in_var]
                     if lon_dim_in_var:
-                        chunks_for_var[lon_dim_in_var] = combined_forecast_ds.dims[lon_dim_in_var]
+                        chunks_for_var[lon_dim_in_var] = combined_forecast_ds.sizes[lon_dim_in_var]
                     
                     ordered_chunks_list = []
                     for dim_name_in_da in da.dims:
-                        ordered_chunks_list.append(chunks_for_var.get(dim_name_in_da, combined_forecast_ds.dims[dim_name_in_da]))
+                        ordered_chunks_list.append(chunks_for_var.get(dim_name_in_da, combined_forecast_ds.sizes[dim_name_in_da]))
                     
                     encoding[var_name] = {
                         'chunks': tuple(ordered_chunks_list),
@@ -383,32 +393,36 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                     "source_model": "aurora",
                     "resolution": 0.25
                 }
-                data_for_hash = {"surf_vars": {}, "atmos_vars": {}}
-                for var_name_hash in combined_forecast_ds.data_vars:
-                     if var_name_hash in CANONICAL_VARS_FOR_HASHING:
-                          da_for_hash = combined_forecast_ds[var_name_hash]
-                          if len(da_for_hash.dims) == 3: 
-                               data_for_hash["surf_vars"][var_name_hash] = da_for_hash.values[np.newaxis, ...]
-                          elif len(da_for_hash.dims) == 4: 
-                               data_for_hash["atmos_vars"][var_name_hash] = da_for_hash.values[np.newaxis, ...]
-
-                variables_to_hash = list(data_for_hash["surf_vars"].keys()) + list(data_for_hash["atmos_vars"].keys())
-                timesteps_to_hash = list(range(len(combined_forecast_ds.time)))
                 
+                # Generate manifest and signature for the zarr store
                 verification_hash = None
-                if not variables_to_hash:
-                    logger.warning(f"[InferenceTask Job {job_id}] No variables found/categorized for output hashing!")
-                else:
-                    verification_hash = compute_verification_hash(
-                        data=data_for_hash,
-                        metadata=output_metadata,
-                        variables=variables_to_hash,
-                        timesteps=timesteps_to_hash
-                    )
-                    if verification_hash:
-                         logger.info(f"[InferenceTask Job {job_id}] Computed output verification hash: {verification_hash[:10]}...")
+                try:
+                    from ..utils.hashing import generate_manifest_and_signature
+                    
+                    # Get miner keypair for signing
+                    miner_keypair = task_instance.keypair if task_instance.keypair else None
+                    
+                    if miner_keypair:
+                        logger.info(f"[InferenceTask Job {job_id}] Generating manifest and signature for Zarr store...")
+                        manifest_result = generate_manifest_and_signature(
+                            zarr_store_path=Path(output_zarr_path),
+                            miner_hotkey_keypair=miner_keypair,
+                            include_zarr_metadata_in_manifest=True,
+                            chunk_hash_algo_name="xxh64"
+                        )
+                        
+                        if manifest_result:
+                            _manifest_dict, _signature_bytes, manifest_content_sha256_hash = manifest_result
+                            verification_hash = manifest_content_sha256_hash
+                            logger.info(f"[InferenceTask Job {job_id}] Generated verification hash: {verification_hash[:10]}...")
+                        else:
+                            logger.warning(f"[InferenceTask Job {job_id}] Failed to generate manifest and signature.")
                     else:
-                         logger.warning(f"[InferenceTask Job {job_id}] compute_verification_hash returned None for output.")
+                        logger.warning(f"[InferenceTask Job {job_id}] No miner keypair available for manifest signing.")
+                        
+                except Exception as e_manifest:
+                    logger.error(f"[InferenceTask Job {job_id}] Error generating manifest: {e_manifest}", exc_info=True)
+                    verification_hash = None
 
                 return str(output_zarr_path), verification_hash
 
