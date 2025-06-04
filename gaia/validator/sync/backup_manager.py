@@ -9,6 +9,8 @@ from fiber.logging_utils import get_logger
 from gaia.validator.sync.storage_utils import StorageManager, get_storage_manager_for_db_sync, get_storage_backend_name
 # Assuming ValidatorDatabaseManager might be needed for DB config, though pg_dump uses env vars or pgpass
 # from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager 
+from datetime import timedelta, timezone
+from typing import Optional
 
 logger = get_logger(__name__)
 
@@ -26,297 +28,209 @@ PG_DUMP_TIMEOUT_SECONDS = 1800 # Timeout for pg_dump command (30 minutes)
 TARGET_BACKUP_MINUTE = 30 # Target minute of the hour to start backups (e.g., HH:30)
 
 class BackupManager:
-    def __init__(self, storage_manager: StorageManager, 
-                 db_name: str, db_user: str, db_host: str, db_port: str, db_password: str | None,
-                 local_backup_dir: str, backup_prefix: str, 
-                 manifest_filename: str, max_backups: int):
+    def __init__(self, storage_manager: StorageManager, test_mode: bool = False):
+        """
+        Manages database backups using pgBackRest.
+
+        Args:
+            storage_manager: The storage manager for uploading backup metadata or status.
+                             (Note: pgBackRest handles direct backup storage).
+            test_mode: If True, backups run more frequently for testing.
+        """
         self.storage_manager = storage_manager
-        self.storage_backend_name = get_storage_backend_name(storage_manager)
-        self.db_name = db_name
-        self.db_user = db_user
-        self.db_host = db_host
-        self.db_port = db_port
-        self.db_password = db_password # Can be None
-        self.local_backup_dir = local_backup_dir
-        self.backup_prefix = backup_prefix
-        self.manifest_filename = manifest_filename
-        self.max_backups = max_backups
-        os.makedirs(self.local_backup_dir, exist_ok=True)
+        self.test_mode = test_mode
+        self.pgbackrest_stanza = os.getenv("PGBACKREST_STANZA", "main") # Or your default stanza name
         
-        logger.info(f"BackupManager initialized with {self.storage_backend_name} storage backend")
+        self.next_full_backup_time_utc: Optional[datetime] = None
+        self.next_wal_push_time_utc: Optional[datetime] = None
+        self._schedule_initial_backups()
 
-    async def _run_pg_dump(self, backup_file_path: str) -> bool:
-        cmd = [
-            "pg_dump",
-            "-U", self.db_user,
-            "-h", self.db_host,
-            "-p", self.db_port,
-            "-d", self.db_name,
-            "-Fc", # Custom format, compressed
-            "-f", backup_file_path
-        ]
-        logger.info(f"Running pg_dump: {' '.join(cmd)} (Password presence: {'yes' if self.db_password else 'no'})")
+    def _schedule_initial_backups(self):
+        """Calculates and sets the initial next backup times."""
+        now_utc = datetime.now(timezone.utc)
+        self.next_full_backup_time_utc = self._calculate_next_full_backup_time(now_utc)
+        self.next_wal_push_time_utc = self._calculate_next_wal_push_time(now_utc)
+        logger.info(f"Initial backup schedule: Next Full Backup at {self.next_full_backup_time_utc.isoformat()}, Next WAL Push at {self.next_wal_push_time_utc.isoformat()}")
+
+    def _calculate_next_full_backup_time(self, current_time_utc: datetime) -> datetime:
+        """
+        Calculates the next scheduled full backup time (00:10 UTC).
+        If current time is past 00:10 UTC today, it schedules for 00:10 UTC tomorrow.
+        """
+        scheduled_time_today = current_time_utc.replace(hour=0, minute=10, second=0, microsecond=0)
+        if current_time_utc > scheduled_time_today:
+            return scheduled_time_today + timedelta(days=1)
+        return scheduled_time_today
+
+    def _calculate_next_wal_push_time(self, current_time_utc: datetime) -> datetime:
+        """
+        Calculates the next scheduled WAL push time (HH:15 UTC).
+        If current time is past HH:15 UTC for the current hour, it schedules for the next hour.
+        """
+        scheduled_time_this_hour = current_time_utc.replace(minute=15, second=0, microsecond=0)
+        if current_time_utc > scheduled_time_this_hour:
+            return scheduled_time_this_hour + timedelta(hours=1)
+        return scheduled_time_this_hour
+
+    async def _trigger_pgbackrest_command(self, command_args: list[str], operation_name: str) -> bool:
+        """
+        Triggers a pgBackRest command.
         
-        # Prepare environment for the subprocess
-        sub_env = os.environ.copy()
-        if self.db_password:
-            sub_env["PGPASSWORD"] = self.db_password
-        else:
-            # If no password, ensure PGPASSWORD is not set from a higher environment,
-            # to allow other auth methods like .pgpass or peer authentication to work.
-            if "PGPASSWORD" in sub_env:
-                del sub_env["PGPASSWORD"]
-
+        Args:
+            command_args: List of arguments for the pgbackrest command.
+            operation_name: Name of the operation for logging (e.g., "Full Backup", "WAL Push").
+        
+        Returns:
+            True if successful, False otherwise.
+        """
+        full_command = ["pgbackrest"] + command_args
+        logger.info(f"Executing pgBackRest {operation_name}: {' '.join(full_command)}")
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                env=sub_env, # Pass the modified environment
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            # Using asyncio.to_thread to run the blocking subprocess call
+            process = await asyncio.to_thread(
+                subprocess.run,
+                full_command,
+                capture_output=True,
+                text=True,
+                check=False # Don't raise exception on non-zero exit, handle manually
             )
-            
-            logger.info(f"Waiting for pg_dump (PID: {process.pid}) to complete (timeout: {PG_DUMP_TIMEOUT_SECONDS}s)...")
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), 
-                    timeout=PG_DUMP_TIMEOUT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"pg_dump timed out after {PG_DUMP_TIMEOUT_SECONDS} seconds.")
-                try:
-                    process.kill() # Ensure the process is killed
-                    await process.wait() # Wait for the process to terminate
-                except Exception as e_kill:
-                    logger.error(f"Error trying to kill timed-out pg_dump process: {e_kill}")
-                return False # pg_dump failed due to timeout
-            
             if process.returncode == 0:
-                logger.info(f"pg_dump completed successfully for {backup_file_path}.")
-                if stderr:
-                    logger.warning(f"pg_dump stderr (though successful): {stderr.decode().strip()}")
+                logger.info(f"pgBackRest {operation_name} successful. Output:\n{process.stdout}")
                 return True
             else:
-                logger.error(f"pg_dump failed with return code {process.returncode}.")
-                logger.error(f"pg_dump stdout: {stdout.decode().strip()}")
-                logger.error(f"pg_dump stderr: {stderr.decode().strip()}")
+                logger.error(f"pgBackRest {operation_name} failed with code {process.returncode}. Error:\n{process.stderr}\nStdout:\n{process.stdout}")
                 return False
         except FileNotFoundError:
-            logger.error("pg_dump command not found. Ensure PostgreSQL client tools are installed and in PATH.")
+            logger.error(f"pgBackRest command not found. Ensure it's installed and in PATH.")
             return False
         except Exception as e:
-            logger.error(f"An exception occurred while running pg_dump: {e}")
+            logger.error(f"Error during pgBackRest {operation_name}: {e}", exc_info=True)
             return False
 
-    async def _update_latest_backup_manifest(self, latest_dump_blob_name: str) -> bool:
-        logger.info(f"Updating manifest file '{self.manifest_filename}' with new backup: {latest_dump_blob_name}")
-        return await self.storage_manager.upload_blob_content(latest_dump_blob_name, self.manifest_filename)
-
-    async def _prune_old_backups(self) -> None:
-        logger.info(f"Pruning old backups from {self.storage_backend_name} storage...")
-        try:
-            # Assuming dumps are stored with a prefix or in a specific virtual folder for listing
-            blob_list = await self.storage_manager.list_blobs(prefix=f"dumps/{self.backup_prefix}")
-            
-            # Filter and sort backups by timestamp in filename (descending, newest first)
-            # Example filename: dumps/validator_db_backup_20230101_120000.dump
-            backups = []
-            for blob_name in blob_list:
-                try:
-                    filename_part = blob_name.split('/')[-1] # Get filename from full blob path
-                    if filename_part.startswith(self.backup_prefix) and filename_part.endswith(".dump"):
-                        # Extract timestamp string: validator_db_backup_YYYYMMDD_HHMMSS.dump
-                        ts_str = filename_part[len(self.backup_prefix):-len(".dump")]
-                        dt_obj = datetime.datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
-                        backups.append((dt_obj, blob_name))
-                except ValueError as e:
-                    logger.warning(f"Could not parse timestamp from blob name '{blob_name}': {e}")
-            
-            backups.sort(key=lambda item: item[0], reverse=True) # Sort by datetime object, newest first
-            
-            if len(backups) > self.max_backups:
-                backups_to_delete = backups[self.max_backups:]
-                logger.info(f"Found {len(backups_to_delete)} old backups to delete from {self.storage_backend_name}.")
-                for _, blob_name_to_delete in backups_to_delete:
-                    logger.info(f"Deleting old {self.storage_backend_name} backup: {blob_name_to_delete}")
-                    await self.storage_manager.delete_blob(blob_name_to_delete)
-            else:
-                logger.info(f"No old {self.storage_backend_name} backups to prune based on current count and max limit.")
-        except Exception as e:
-            logger.error(f"Error during {self.storage_backend_name} backup pruning: {e}", exc_info=True)
-    
-    def _os_remove_sync(self, file_path: str):
-        """Synchronous wrapper for os.remove."""
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            return True
-        return False
-
-    async def _prune_local_backup(self, local_file_path: str) -> None:
-        try:
-            loop = asyncio.get_event_loop()
-            removed = await loop.run_in_executor(None, self._os_remove_sync, local_file_path)
-            if removed:
-                logger.info(f"Successfully pruned local backup: {local_file_path}")
-            elif os.path.exists(local_file_path): # Check again in case of race or if remove failed silently
-                logger.warning(f"Local backup file still exists after prune attempt: {local_file_path}")
-            else:
-                logger.info(f"Local backup file did not exist or was already pruned: {local_file_path}")
-        except Exception as e:
-            logger.error(f"Error pruning local backup {local_file_path}: {e}")
-
-    async def perform_backup_cycle(self) -> bool:
-        timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        local_dump_filename = f"{self.backup_prefix}{timestamp_str}.dump"
-        local_dump_full_path = os.path.join(self.local_backup_dir, local_dump_filename)
-        storage_blob_name = f"dumps/{local_dump_filename}" # Store in a 'dumps' folder in storage
-
-        logger.info(f"Starting database backup cycle. Target: {local_dump_full_path}, {self.storage_backend_name} Blob: {storage_blob_name}")
-
-        # 1. Run pg_dump
-        logger.info("Step 1: Running pg_dump...")
-        if not await self._run_pg_dump(local_dump_full_path):
-            logger.error("pg_dump failed. Aborting backup cycle.")
-            await self._prune_local_backup(local_dump_full_path) # Clean up failed dump
-            return False
-        logger.info("Step 1: pg_dump successful.")
-
-        # 2. Upload to storage
-        logger.info(f"Step 2: Uploading '{local_dump_full_path}' to {self.storage_backend_name} as '{storage_blob_name}'...")
-        if not await self.storage_manager.upload_blob(local_dump_full_path, storage_blob_name):
-            logger.error(f"{self.storage_backend_name} upload failed. Aborting backup cycle.")
-            await self._prune_local_backup(local_dump_full_path) # Clean up local dump if upload fails
-            return False
-        logger.info(f"Step 2: {self.storage_backend_name} upload successful.")
-
-        # 3. Update manifest
-        logger.info("Step 3: Updating latest backup manifest...")
-        if not await self._update_latest_backup_manifest(storage_blob_name):
-            logger.warning("Failed to update latest backup manifest. Continuing, but replicas might not find this backup immediately.")
-            # Not returning False here as the backup itself is successful and uploaded.
+    async def _trigger_pgbackrest_full_backup(self, is_test: bool):
+        """Triggers a pgBackRest full backup."""
+        backup_type = "full" # Could be "incr" or "diff" for other strategies
+        args = [f"--stanza={self.pgbackrest_stanza}", "backup", f"--type={backup_type}"]
+        if is_test:
+            args.append("--archive-timeout=30") # Example: Shorter timeout for test backups
+            args.append("--compress-level=0") # Faster test backup
+            logger.info(f"[Test Mode] Simulating pgBackRest Full Backup for stanza {self.pgbackrest_stanza}")
+            # In a real test, you might use a dedicated test stanza or log only.
+            # For now, we'll run the command but with test-friendly options if possible.
+        
+        success = await self._trigger_pgbackrest_command(args, "Full Backup")
+        if success:
+            logger.info(f"Full backup for stanza '{self.pgbackrest_stanza}' completed.")
         else:
-            logger.info("Step 3: Manifest update successful.")
+            logger.error(f"Full backup for stanza '{self.pgbackrest_stanza}' failed.")
 
-        # 4. Prune old backups
-        logger.info(f"Step 4: Pruning old {self.storage_backend_name} backups...")
-        await self._prune_old_backups()
-        logger.info(f"Step 4: {self.storage_backend_name} pruning finished.")
 
-        # 5. Prune local dump file
-        logger.info(f"Step 5: Pruning local dump file '{local_dump_full_path}'...")
-        await self._prune_local_backup(local_dump_full_path)
-        logger.info("Step 5: Local pruning finished.")
-        
-        logger.info(f"Database backup cycle completed successfully for {storage_blob_name}.")
-        return True
+    async def _trigger_pgbackrest_wal_push(self, is_test: bool):
+        """Triggers a pgBackRest WAL push."""
+        # This command pushes already archived WAL files from the PG archive_status
+        # directory to the pgBackRest repository. This is useful if archive_async is used
+        # or to ensure WALs are pushed promptly.
+        args = [f"--stanza={self.pgbackrest_stanza}", "archive-push"]
+        if is_test:
+            logger.info(f"[Test Mode] Simulating pgBackRest WAL Push for stanza {self.pgbackrest_stanza}")
+            # For actual testing, this might verify WAL segments are created and pushed.
 
-    async def start_periodic_backups(self, interval_hours: int):
-        if interval_hours <= 0:
-            logger.warning("DB Sync Backup interval is not positive. Periodic backups will not run.")
-            return
+        success = await self._trigger_pgbackrest_command(args, "WAL Push")
+        if success:
+            logger.info(f"WAL push for stanza '{self.pgbackrest_stanza}' completed.")
+        else:
+            logger.error(f"WAL push for stanza '{self.pgbackrest_stanza}' failed.")
 
-        logger.info(f"Starting periodic database backups, aiming for {TARGET_BACKUP_MINUTE} minutes past the hour, every {interval_hours} hour(s).")
-        
+
+    async def start_periodic_backups(self, check_interval_hours: float):
+        """
+        Starts the periodic backup process.
+        In test mode, it triggers backups based on check_interval_hours.
+        In production, it schedules daily full backups and hourly WAL pushes.
+        """
+        logger.info(
+            f"BackupManager started. Test mode: {self.test_mode}. "
+            f"Stanza: {self.pgbackrest_stanza}. "
+            f"Base check interval: {check_interval_hours} hours."
+        )
+
         while True:
-            now = datetime.datetime.now(datetime.timezone.utc)
-            
-            # Calculate the next target start time
-            next_run_hour = now.hour
-            if now.minute >= TARGET_BACKUP_MINUTE:
-                # If current minute is past the target, schedule for the next interval_hours block
-                # This logic needs to be careful if interval_hours is not 1
-                # For simplicity with interval_hours, let's assume we just advance to next scheduled slot based on current hour.
-                # More robust: consider the last run time if we stored it.
-                # Current simple approach: if it's 10:45 and interval is 1h, next is 11:30.
-                # If it's 10:15 and interval is 1h, next is 10:30.
-                # If interval_hours > 1, this needs to be smarter about which hour is next.
-                # For now, let's just align to the *next* HH:TARGET_BACKUP_MINUTE that also respects the interval.
-                
-                # Simpler approach: Calculate time to next HH:MM, then if that time is too soon for the interval, add interval.
-                # This will drift if perform_backup_cycle takes significant time.
-                
-                # Revised approach for better alignment with interval:
-                # Calculate how many 'interval_hours' blocks have passed since midnight UTC for the current day for the target minute.
-                # Example: interval_hours = 3. Runs at 00:30, 03:30, 06:30, etc.
-                # If current time is 05:00, target is 06:30.
-                # If current time is 02:50, target is 03:30.
-                # If current time is 03:35, target is 06:30.
-
-                # Determine the 'current' or 'next' valid slot based on interval_hours and TARGET_BACKUP_MINUTE
-                current_hour_block = now.hour // interval_hours 
-                next_potential_hour = current_hour_block * interval_hours
-                
-                target_datetime_this_block = now.replace(hour=next_potential_hour, minute=TARGET_BACKUP_MINUTE, second=0, microsecond=0)
-                
-                if now >= target_datetime_this_block:
-                    # We are past the target time for the current block, or right at it.
-                    # Move to the next interval block.
-                    next_run_base_hour = (current_hour_block + 1) * interval_hours
-                    # Handle day overflow if next_run_base_hour >= 24
-                    days_to_add = next_run_base_hour // 24
-                    final_target_hour = next_run_base_hour % 24
-                    target_run_time = now.replace(hour=final_target_hour, minute=TARGET_BACKUP_MINUTE, second=0, microsecond=0) + datetime.timedelta(days=days_to_add)
-                else:
-                    # The target time in the current block is still in the future.
-                    target_run_time = target_datetime_this_block
-            else: # now.minute < TARGET_BACKUP_MINUTE
-                # Target minute is in the future for the current hour (or a past hour if interval > 1, handled by block logic above)
-                current_hour_block = now.hour // interval_hours
-                target_base_hour_this_block = current_hour_block * interval_hours 
-                # Ensure we are targeting a valud hour slot based on interval
-                target_run_time = now.replace(hour=target_base_hour_this_block, minute=TARGET_BACKUP_MINUTE, second=0, microsecond=0)
-                if target_run_time < now : # If this calculated time is in the past (e.g. now is 05:00, interval 3, target_base_hour is 03:00)
-                    # Move to the next interval block.
-                    next_run_base_hour = (current_hour_block + 1) * interval_hours
-                    days_to_add = next_run_base_hour // 24
-                    final_target_hour = next_run_base_hour % 24
-                    target_run_time = now.replace(hour=final_target_hour, minute=TARGET_BACKUP_MINUTE, second=0, microsecond=0) + datetime.timedelta(days=days_to_add)
-
-
-            wait_seconds = (target_run_time - now).total_seconds()
-            if wait_seconds < 0 : # Should ideally not happen with the logic above, but as a safeguard
-                logger.warning(f"Calculated wait time is negative ({wait_seconds}s). Scheduling for next interval. This might indicate a logic issue in scheduling.")
-                wait_seconds = interval_hours * 3600 # Fallback to simple interval sleep
-            
-            logger.info(f"Next backup cycle scheduled for {target_run_time.strftime('%Y-%m-%d %H:%M:%S %Z')}. Waiting for {wait_seconds / 3600:.2f} hours.")
-            await asyncio.sleep(wait_seconds)
-
             try:
-                await self.perform_backup_cycle()
+                sleep_duration_seconds = check_interval_hours * 3600
+                
+                current_time_utc = datetime.now(timezone.utc)
+
+                if self.test_mode:
+                    # In test mode, trigger both operations based on the short check_interval_hours
+                    logger.info(f"[Test Mode] Interval reached. Triggering test operations at {current_time_utc.isoformat()}")
+                    await self._trigger_pgbackrest_full_backup(is_test=True)
+                    await self._trigger_pgbackrest_wal_push(is_test=True)
+                    # Sleep for the short test interval
+                    await asyncio.sleep(sleep_duration_seconds)
+                    continue # Restart loop for next test cycle
+
+                # Non-test mode: Check against scheduled times
+                # Determine the earliest next operation to calculate sleep time
+                next_op_time = min(self.next_full_backup_time_utc, self.next_wal_push_time_utc)
+                
+                time_until_next_op_seconds = (next_op_time - current_time_utc).total_seconds()
+
+                if time_until_next_op_seconds <= 0: # If an operation is due or overdue
+                    if self.next_full_backup_time_utc <= current_time_utc:
+                        logger.info(f"Scheduled time for FULL backup reached: {current_time_utc.isoformat()}")
+                        await self._trigger_pgbackrest_full_backup(is_test=False)
+                        self.next_full_backup_time_utc = self._calculate_next_full_backup_time(current_time_utc + timedelta(minutes=1)) # Schedule for next occurrence
+                        logger.info(f"Next FULL backup scheduled for: {self.next_full_backup_time_utc.isoformat()}")
+
+                    if self.next_wal_push_time_utc <= current_time_utc:
+                        logger.info(f"Scheduled time for WAL push reached: {current_time_utc.isoformat()}")
+                        await self._trigger_pgbackrest_wal_push(is_test=False)
+                        self.next_wal_push_time_utc = self._calculate_next_wal_push_time(current_time_utc + timedelta(minutes=1)) # Schedule for next occurrence
+                        logger.info(f"Next WAL push scheduled for: {self.next_wal_push_time_utc.isoformat()}")
+                    
+                    # After handling due operations, recalculate sleep for the *new* earliest next operation
+                    next_op_time_after_run = min(self.next_full_backup_time_utc, self.next_wal_push_time_utc)
+                    actual_sleep_duration = max(60, (next_op_time_after_run - datetime.now(timezone.utc)).total_seconds()) # Sleep at least 60s
+                else:
+                    # Sleep until the earliest next operation, or for the check_interval, whichever is shorter, but at least 60s
+                    actual_sleep_duration = max(60, min(time_until_next_op_seconds, sleep_duration_seconds))
+
+                logger.debug(f"Backup manager sleeping for {actual_sleep_duration:.2f} seconds.")
+                await asyncio.sleep(actual_sleep_duration)
+
+            except asyncio.CancelledError:
+                logger.info("BackupManager task was cancelled.")
+                break
             except Exception as e:
-                logger.error(f"Critical error during periodic backup cycle: {e}", exc_info=True)
+                logger.error(f"Error in BackupManager loop: {e}", exc_info=True)
+                # Avoid rapid cicllying on error
+                await asyncio.sleep(300) # Sleep for 5 minutes before retrying
 
     async def close(self):
         # The storage_manager is passed in, so its lifecycle is managed externally (e.g., by GaiaValidator)
         logger.info("BackupManager closed. (Storage client lifecycle managed externally)")
 
-async def get_backup_manager(storage_manager: StorageManager) -> BackupManager | None:
-    if not storage_manager:
-        logger.error("StorageManager instance is required to create BackupManager.")
-        return None
+async def get_backup_manager(storage_manager: StorageManager, test_mode: bool = False) -> Optional[BackupManager]:
+    """
+    Factory function to create a BackupManager instance.
+    This function primarily exists to match the pattern of get_restore_manager
+    and to allow for potential future pre-configuration checks.
+    """
+    if not os.getenv("PGBACKREST_STANZA"):
+        logger.warning("PGBACKREST_STANZA environment variable not set. BackupManager might not function correctly without a stanza.")
+        # Depending on strictness, could return None here.
+        # For now, allow it to proceed and log error later if pgbackrest command fails.
 
-    db_name = os.getenv("DB_NAME", DB_NAME_DEFAULT) # Using DB_NAME from env
-    db_user = os.getenv("DB_USER", DB_USER_DEFAULT) # Using DB_USER from env
-    db_host = os.getenv("DB_HOST", DB_HOST_DEFAULT) # Using DB_HOST from env
-    db_port = os.getenv("DB_PORT", DB_PORT_DEFAULT) # Using DB_PORT from env
-    db_password = os.getenv("DB_PASS") # Using DB_PASS from env (can be None)
-    
-    local_backup_dir = os.getenv("DB_SYNC_BACKUP_DIR", BACKUP_DIR_DEFAULT)
-    backup_prefix = os.getenv("DB_SYNC_BACKUP_PREFIX", BACKUP_PREFIX_DEFAULT)
-    manifest_filename = os.getenv("DB_SYNC_MANIFEST_FILENAME", MANIFEST_FILENAME_DEFAULT)
-    max_backups = int(os.getenv("DB_SYNC_MAX_BACKUPS", MAX_BACKUPS_DEFAULT))
-
-    return BackupManager(
-        storage_manager=storage_manager,
-        db_name=db_name,
-        db_user=db_user,
-        db_host=db_host,
-        db_port=db_port,
-        db_password=db_password,
-        local_backup_dir=local_backup_dir,
-        backup_prefix=backup_prefix,
-        manifest_filename=manifest_filename,
-        max_backups=max_backups
-    )
+    # You could add checks here to ensure pgbackrest is installed, config exists, etc.
+    # For example:
+    # try:
+    #     subprocess.run(["pgbackrest", "info"], capture_output=True, text=True, check=True)
+    # except (FileNotFoundError, subprocess.CalledProcessError) as e:
+    #     logger.error(f"pgBackRest not configured or not found: {e}. BackupManager will not be started.")
+    #     return None
+        
+    logger.info(f"Creating BackupManager. Test mode: {test_mode}")
+    return BackupManager(storage_manager, test_mode=test_mode)
 
 
 # Example Usage (for testing)

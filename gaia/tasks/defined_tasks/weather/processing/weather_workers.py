@@ -437,6 +437,28 @@ async def run_inference_background(task_instance: 'WeatherTask',job_id: str,):
                 if os.path.exists(output_zarr_path):
                     shutil.rmtree(output_zarr_path)
                 
+                # --- Fix for datetime64[ns, UTC] issue ---
+                if combined_forecast_ds is not None:
+                    logger.debug(f"[InferenceTask Job {job_id}] Checking and converting timezone-aware datetime64 dtypes before saving to Zarr...")
+                    for coord_name in list(combined_forecast_ds.coords):
+                        coord = combined_forecast_ds.coords[coord_name]
+                        if pd.api.types.is_datetime64_any_dtype(coord.dtype) and getattr(coord.dtype, 'tz', None) is not None:
+                            logger.info(f"[InferenceTask Job {job_id}] Converting coordinate '{coord_name}' from {coord.dtype} to datetime64[ns].")
+                            combined_forecast_ds = combined_forecast_ds.assign_coords(**{coord_name: coord.variable.astype('datetime64[ns]')})
+                        elif str(coord.dtype) == 'datetime64[ns, UTC]': # Fallback for direct numpy dtypes if tz attribute is not present
+                            logger.info(f"[InferenceTask Job {job_id}] Converting coordinate '{coord_name}' from {coord.dtype} (direct check) to datetime64[ns].")
+                            combined_forecast_ds = combined_forecast_ds.assign_coords(**{coord_name: coord.variable.astype('datetime64[ns]')})
+                    
+                    for var_name in list(combined_forecast_ds.data_vars):
+                        data_array = combined_forecast_ds[var_name]
+                        if pd.api.types.is_datetime64_any_dtype(data_array.dtype) and getattr(data_array.dtype, 'tz', None) is not None:
+                            logger.info(f"[InferenceTask Job {job_id}] Converting data variable '{var_name}' from {data_array.dtype} to datetime64[ns].")
+                            combined_forecast_ds[var_name] = data_array.astype('datetime64[ns]')
+                        elif str(data_array.dtype) == 'datetime64[ns, UTC]':
+                            logger.info(f"[InferenceTask Job {job_id}] Converting data variable '{var_name}' from {data_array.dtype} (direct check) to datetime64[ns].")
+                            combined_forecast_ds[var_name] = data_array.astype('datetime64[ns]')
+                # --- End fix ---
+
                 combined_forecast_ds.to_zarr(
                     output_zarr_path,
                     encoding=encoding,

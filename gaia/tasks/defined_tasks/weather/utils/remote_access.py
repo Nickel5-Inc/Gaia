@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 import fsspec
 import xarray as xr
 import psutil
+import pandas as pd
 from fiber.logging_utils import get_logger
 
 try:
@@ -131,6 +132,31 @@ def _synchronous_open_with_verifying_mapper(
     try:
         logger.info(f"Job {verifying_mapper.job_id_for_logging}: xr.open_zarr called with VerifyingChunkMapper.")
         ds = xr.open_zarr(verifying_mapper, consolidated=consolidated, chunks="auto")
+        
+        if ds is not None and 'time' in ds.coords:
+            time_coord = ds.coords['time']
+            # Check if dtype is datetime64[ns] and it's timezone-naive
+            if pd.api.types.is_datetime64_ns_dtype(time_coord.dtype) and getattr(time_coord.dt, 'tz', None) is None:
+                logger.info(f"Job {verifying_mapper.job_id_for_logging}: Time coordinate is datetime64[ns] and timezone-naive. Localizing to UTC.")
+                try:
+                    # Ensure we are operating on a copy if necessary, or directly assign if xarray handles it
+                    ds = ds.assign_coords(time=ds.time.dt.tz_localize('UTC'))
+                    logger.info(f"Job {verifying_mapper.job_id_for_logging}: Successfully localized time coordinate to UTC. New dtype: {ds.time.dtype}")
+                except Exception as e_tz_localize:
+                    logger.warning(f"Job {verifying_mapper.job_id_for_logging}: Failed to localize time coordinate to UTC: {e_tz_localize}. Proceeding with naive time.")
+            elif pd.api.types.is_datetime64_any_dtype(time_coord.dtype) and getattr(time_coord.dt, 'tz', None) is not None:
+                if str(getattr(time_coord.dt, 'tz')) != 'UTC':
+                    logger.info(f"Job {verifying_mapper.job_id_for_logging}: Time coordinate is already timezone-aware ({time_coord.dtype}) but not UTC. Converting to UTC.")
+                    try:
+                        ds = ds.assign_coords(time=ds.time.dt.tz_convert('UTC'))
+                        logger.info(f"Job {verifying_mapper.job_id_for_logging}: Successfully converted time coordinate to UTC. New dtype: {ds.time.dtype}")
+                    except Exception as e_tz_convert:
+                        logger.warning(f"Job {verifying_mapper.job_id_for_logging}: Failed to convert time coordinate to UTC: {e_tz_convert}. Proceeding with original timezone.")
+                else:
+                    logger.info(f"Job {verifying_mapper.job_id_for_logging}: Time coordinate is already timezone-aware and UTC: {time_coord.dtype}. No localization needed.")
+            else:
+                logger.info(f"Job {verifying_mapper.job_id_for_logging}: Time coordinate is not a timezone-naive datetime64[ns] (dtype: {time_coord.dtype}). Skipping UTC localization/conversion.")
+
         logger.info(f"Job {verifying_mapper.job_id_for_logging}: Successfully opened Zarr dataset with VerifyingChunkMapper.")
         return ds
     except Exception as e:

@@ -353,10 +353,18 @@ class GaiaValidator:
         self.restore_manager: RestoreManager | None = None
         
         self.is_source_validator_for_db_sync = os.getenv("IS_SOURCE_VALIDATOR_FOR_DB_SYNC", "False").lower() == "true"
-        self.db_sync_interval_hours = int(os.getenv("DB_SYNC_INTERVAL_HOURS", "1")) # Default to 1 hour
-        if self.db_sync_interval_hours <= 0 : # Ensure positive interval
-            logger.warning(f"DB_SYNC_INTERVAL_HOURS is {self.db_sync_interval_hours}, defaulting to 1 hour for safety.")
-            self.db_sync_interval_hours = 1
+        
+        # DB Sync interval & mode
+        if self.args.test:
+            self.db_sync_interval_hours = 0.25 # 15 minutes for testing
+            logger.info(f"Test mode enabled: DB sync interval set to {self.db_sync_interval_hours} hours (15 minutes).")
+        else:
+            # Default to 1 hour, allow override by env var for non-test mode
+            self.db_sync_interval_hours = int(os.getenv("DB_SYNC_INTERVAL_HOURS", "1"))
+            if self.db_sync_interval_hours <= 0:
+                logger.warning(f"DB_SYNC_INTERVAL_HOURS ('{os.getenv('DB_SYNC_INTERVAL_HOURS')}') is invalid ({self.db_sync_interval_hours}). Defaulting to 1 hour.")
+                self.db_sync_interval_hours = 1
+            logger.info(f"DB sync interval set to {self.db_sync_interval_hours} hours.")
 
         # For database monitor plotting
         self.db_monitor_history = []
@@ -1701,7 +1709,7 @@ class GaiaValidator:
             logger.info("Database tables initialized.")
             
             # Initialize DB Sync Components - AFTER DB init
-            # await self._initialize_db_sync_components()
+            await self._initialize_db_sync_components()
 
             #logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
             await handle_db_wipe(self.database_manager)
@@ -1763,15 +1771,15 @@ class GaiaValidator:
             ]
 
             # Add DB Sync tasks conditionally
-            # if self.is_source_validator_for_db_sync and self.backup_manager:
-            #     logger.info(f"Adding DB Sync Backup task (interval: {self.db_sync_interval_hours}h).")
-            #     # Using insert to make it one of the earlier tasks, but order might not be critical.
-            #     tasks.insert(0, lambda: self.backup_manager.start_periodic_backups(self.db_sync_interval_hours))
-            # elif not self.is_source_validator_for_db_sync and self.restore_manager:
-            #     logger.info(f"Adding DB Sync Restore task (interval: {self.db_sync_interval_hours}h).")
-            #     tasks.insert(0, lambda: self.restore_manager.start_periodic_restores(self.db_sync_interval_hours))
-            # else:
-            #     logger.info("DB Sync is not active for this node (either source or replica manager failed to init, not configured, or Azure manager failed).")
+            if self.is_source_validator_for_db_sync and self.backup_manager:
+                logger.info(f"Adding DB Sync Backup task (interval: {self.db_sync_interval_hours}h).")
+                # Using insert to make it one of the earlier tasks, but order might not be critical.
+                tasks.insert(0, lambda: self.backup_manager.start_periodic_backups(self.db_sync_interval_hours))
+            elif not self.is_source_validator_for_db_sync and self.restore_manager:
+                logger.info(f"Adding DB Sync Restore task (interval: {self.db_sync_interval_hours}h).")
+                tasks.insert(0, lambda: self.restore_manager.start_periodic_restores(self.db_sync_interval_hours))
+            else:
+                logger.info("DB Sync is not active for this node (either source or replica manager failed to init, not configured, or Azure manager failed).")
 
             
             # Conditionally add miner_score_sender task
@@ -2610,12 +2618,18 @@ class GaiaValidator:
 
         if self.is_source_validator_for_db_sync:
             logger.info("This node is configured as the SOURCE for DB Sync.")
-            self.backup_manager = await get_backup_manager(self.storage_manager_for_sync)
+            self.backup_manager = await get_backup_manager(
+                self.storage_manager_for_sync,
+                test_mode=self.args.test  # Pass test_mode
+            )
             if not self.backup_manager:
                 logger.error("Failed to initialize BackupManager. DB Sync (source) will be disabled.")
         else:
             logger.info("This node is configured as a REPLICA for DB Sync.")
-            self.restore_manager = await get_restore_manager(self.storage_manager_for_sync)
+            self.restore_manager = await get_restore_manager(
+                self.storage_manager_for_sync,
+                test_mode=self.args.test  # Pass test_mode
+            )
             if not self.restore_manager:
                 logger.error("Failed to initialize RestoreManager. DB Sync (replica) will be disabled.")
         logger.info("DB Sync components initialization attempt finished.")
