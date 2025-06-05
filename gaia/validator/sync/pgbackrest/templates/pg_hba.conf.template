@@ -44,11 +44,6 @@ host    all             postgres        10.0.0.0/8              md5
 host    all             gaia_user       10.0.0.0/8              md5
 host    replication     postgres        10.0.0.0/8              md5
 
-# Azure Virtual Network default ranges
-host    all             postgres        172.16.0.0/12           md5
-host    all             gaia_user       172.16.0.0/12           md5
-host    replication     postgres        172.16.0.0/12           md5
-
 # Google Cloud VPC default ranges
 host    all             postgres        192.168.0.0/16          md5
 host    all             gaia_user       192.168.0.0/16          md5

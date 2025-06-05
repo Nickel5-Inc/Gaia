@@ -389,61 +389,77 @@ async def fetch_gfs_analysis_data(
             warnings.filterwarnings("ignore", category=xr.SerializationWarning)
             
             for target_time in target_times:
-                full_ds = None
+                processed_one_successfully_for_target = False
                 try:
                     base_url = _get_gfs_cycle_url(target_time)
                     if not base_url:
                         logger.error(f"Could not get URL for GFS cycle {target_time}. Skipping.")
                         continue
                         
-                    logger.info(f"Opening GFS cycle {target_time_dt_utc.strftime('%Y-%m-%d %H:%M:%S')} from {base_url} for analysis (T+0h)...")
-                    full_ds = xr.open_dataset(base_url, decode_times=False, chunks={})
-                    logger.info(f"Successfully opened GFS dataset with decode_times=False. Raw time variable attributes: {full_ds.time.attrs}")
-                    logger.info(f"Raw time variable sample values: {full_ds.time.values[:5] if len(full_ds.time.values) > 5 else full_ds.time.values}")
-                    
-                    # Attempt to decode time manually to see if we can handle it with cftime directly
-                    try:
-                        time_decoded = xr.coding.times.decode_cf_datetime(full_ds.time, units=full_ds.time.attrs.get('units'), calendar=full_ds.time.attrs.get('calendar', 'standard'), use_cftime=True)
-                        logger.info(f"Manually decoded time with cftime (sample): {time_decoded.values[:5] if len(time_decoded.values) > 5 else time_decoded.values}")
-                        full_ds['time'] = time_decoded # Replace the time coordinate
-                    except Exception as e_manual_decode:
-                        logger.error(f"Failed to manually decode time with cftime: {e_manual_decode}", exc_info=True)
-                        logger.warning("Proceeding with undecoded time coordinate. Downstream processing might fail or use incorrect times.")
+                    logger.info(f"Opening GFS cycle {target_time.strftime('%Y-%m-%d %H:%M:%S')} from {base_url} for analysis (T+0h)...")
+                    with xr.open_dataset(base_url, decode_times=False, chunks={}) as full_ds:
+                        logger.info(f"Successfully opened GFS dataset with decode_times=False. Raw time variable attributes: {full_ds.time.attrs}")
+                        logger.info(f"Raw time variable sample values: {full_ds.time.values[:5] if len(full_ds.time.values) > 5 else full_ds.time.values}")
+                        
+                        # Attempt to decode time manually to see if we can handle it with cftime directly
+                        try:
+                            time_decoded = xr.coding.times.decode_cf_datetime(full_ds.time, units=full_ds.time.attrs.get('units'), calendar=full_ds.time.attrs.get('calendar', 'standard'), use_cftime=True)
+                            # Corrected logging for NumPy array
+                            logger.info(f"Manually decoded time with cftime (sample): {time_decoded[:5] if len(time_decoded) > 5 else time_decoded}")
+                            full_ds['time'] = time_decoded # Replace the time coordinate
+                        except Exception as e_manual_decode:
+                            logger.error(f"Failed to manually decode time with cftime: {e_manual_decode}", exc_info=True)
+                            logger.warning("Proceeding with undecoded time coordinate. Downstream processing might fail or use incorrect times.")
 
-                    # Select the single time point (T+0h)
-                    # Need to select based on the raw numerical time values if decode_times=False was used and manual decode failed
-                    analysis_select_time_np = np.datetime64(target_time.replace(tzinfo=None))
+                        # Select the single time point (T+0h)
+                        # Need to select based on the raw numerical time values if decode_times=False was used and manual decode failed
+                        analysis_select_time_np = np.datetime64(target_time.replace(tzinfo=None))
 
-                    analysis_slice = full_ds.sel(time=analysis_select_time_np, method='nearest')
-                    
-                    if abs(analysis_slice.time.values - analysis_select_time_np) > np.timedelta64(1, 'h'):
-                        logger.error(f"Nearest time found ({analysis_slice.time.values}) is too far from requested analysis time {target_time} for cycle {target_time}. Skipping.")
-                        continue
+                        analysis_slice = full_ds.sel(time=analysis_select_time_np, method='nearest')
+                        
+                        # Ensure the time values from the slice are datetime64 for comparison
+                        slice_time_values = analysis_slice.time.values
+                        
+                        # If we have a cftime object (dtype='O'), we need to convert it to np.datetime64 for comparison.
+                        slice_time_values_for_comp = slice_time_values
+                        if not np.issubdtype(slice_time_values.dtype, np.datetime64):
+                            logger.warning(f"Time values in analysis_slice are not datetime64 (dtype: {slice_time_values.dtype}). Attempting conversion from cftime object.")
+                            try:
+                                # .sel(..., method='nearest') should return a 0-d array with the cftime object.
+                                cftime_obj = slice_time_values.item()
+                                # Convert cftime to standard datetime, then to numpy.datetime64
+                                dt_obj = datetime(cftime_obj.year, cftime_obj.month, cftime_obj.day, cftime_obj.hour, cftime_obj.minute, cftime_obj.second)
+                                slice_time_values_for_comp = np.datetime64(dt_obj)
+                                logger.info(f"Successfully converted cftime object to datetime64 for comparison.")
+                            except Exception as e_conv:
+                                logger.error(f"Failed to convert cftime object to datetime: {e_conv}. Comparison will likely fail.", exc_info=True)
 
-                    current_surface_vars = target_surface_vars if target_surface_vars is not None else GFS_SURFACE_VARS
-                    current_atmos_vars = target_atmos_vars if target_atmos_vars is not None else GFS_ATMOS_VARS
-                    
-                    vars_to_load_final = [v for v in current_surface_vars + current_atmos_vars if v in full_ds]
-                    
-                    if not vars_to_load_final:
-                         logger.warning(f"No targeted GFS variables found in dataset for cycle {target_time}. Surface tried: {current_surface_vars}, Atmos tried: {current_atmos_vars}. Skipping analysis for this time.")
-                         continue
-                    logger.info(f"For cycle {target_time}, attempting to load variables: {vars_to_load_final}")
-                         
-                    loaded_slice = analysis_slice[vars_to_load_final].load()
-                    loaded_slice = loaded_slice.expand_dims(dim='time', axis=0)
-                    target_time_utc_naive = target_time.replace(tzinfo=None)
-                    loaded_slice['time'] = [np.datetime64(target_time_utc_naive, 'ns')]
-                    
-                    logger.info(f"Loaded analysis slice for original target {target_time}")
-                    analysis_slices.append(loaded_slice)
+                        if abs(slice_time_values_for_comp - analysis_select_time_np) > np.timedelta64(1, 'h'):
+                            logger.error(f"Nearest time found ({slice_time_values_for_comp}) is too far from requested analysis time {target_time} for cycle {target_time}. Skipping.")
+                            continue
+
+                        current_surface_vars = target_surface_vars if target_surface_vars is not None else GFS_SURFACE_VARS
+                        current_atmos_vars = target_atmos_vars if target_atmos_vars is not None else GFS_ATMOS_VARS
+                        
+                        vars_to_load_final = [v for v in current_surface_vars + current_atmos_vars if v in full_ds]
+                        
+                        if not vars_to_load_final:
+                             logger.warning(f"No targeted GFS variables found in dataset for cycle {target_time}. Surface tried: {current_surface_vars}, Atmos tried: {current_atmos_vars}. Skipping analysis for this time.")
+                             continue
+                        logger.info(f"For cycle {target_time}, attempting to load variables: {vars_to_load_final}")
+                             
+                        loaded_slice = analysis_slice[vars_to_load_final].load()
+                        loaded_slice = loaded_slice.expand_dims(dim='time', axis=0)
+                        target_time_naive = target_time.replace(tzinfo=None)
+                        loaded_slice['time'] = [np.datetime64(target_time_naive, 'ns')]
+                        
+                        logger.info(f"Loaded analysis slice for original target {target_time}")
+                        analysis_slices.append(loaded_slice)
+
+                        processed_one_successfully_for_target = True
 
                 except Exception as e:
                     logger.error(f"Failed to fetch/process analysis for original target {target_time}: {e}", exc_info=True)
-                finally:
-                    if full_ds:
-                        try: full_ds.close()
-                        except: pass
 
         if not analysis_slices:
             logger.error("Failed to fetch any valid GFS analysis slices.")

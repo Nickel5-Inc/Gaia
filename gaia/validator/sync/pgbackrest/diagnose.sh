@@ -141,18 +141,19 @@ echo -e "${BLUE}=== PGBACKREST CONNECTIVITY ===${NC}"
 if command -v pgbackrest &> /dev/null; then
     echo -e "${GREEN}✓ pgBackRest is installed${NC}"
     
-    echo "Testing Azure connectivity..."
-    if sudo -u postgres pgbackrest --stanza="$STANZA_NAME" check &>/dev/null; then
-        echo -e "${GREEN}✓ Azure connectivity OK${NC}"
+    echo "Testing R2 connectivity via pgBackRest..."
+    if sudo -u postgres pgbackrest --stanza=${PGBACKREST_STANZA_NAME:-gaia} check; then
+        echo -e "${GREEN}✓ R2 connectivity and stanza check OK${NC}"
     else
-        echo -e "${RED}✗ Azure connectivity failed${NC}"
-        echo "Detailed error:"
-        sudo -u postgres pgbackrest --stanza="$STANZA_NAME" check 2>&1 | tail -10 || echo "Could not get error details"
+        echo -e "${RED}✗ R2 connectivity or stanza check failed${NC}"
+        echo "  - Verify R2 credentials in .env file (PGBACKREST_R2_...)"
+        echo "  - Ensure the stanza '${PGBACKREST_STANZA_NAME:-gaia}' has been created on the primary node."
+        echo "  - Check network connectivity to ${PGBACKREST_R2_ENDPOINT}"
     fi
     
     echo ""
     echo "Stanza information:"
-    sudo -u postgres pgbackrest --stanza="$STANZA_NAME" info 2>/dev/null || echo "Could not retrieve stanza info"
+    sudo -u postgres pgbackrest --stanza=${PGBACKREST_STANZA_NAME:-gaia} info 2>/dev/null || echo "Could not retrieve stanza info"
     
 else
     echo -e "${RED}✗ pgBackRest is not installed${NC}"

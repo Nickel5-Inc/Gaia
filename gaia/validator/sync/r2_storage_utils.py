@@ -1,7 +1,7 @@
 import os
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List, Union
+from typing import Optional, List, Union, AsyncGenerator, Dict, Any
 import aioboto3
 import boto3
 from botocore.config import Config
@@ -256,39 +256,20 @@ class R2StorageManager:
             logger.error(f"Failed to download '{blob_name}' from R2 to '{local_file_path}': {e}")
             return False
 
-    async def list_blobs(self, prefix: Optional[str] = None) -> List[str]:
+    async def list_blobs(self, prefix: str) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        List objects in R2 bucket with optional prefix.
-        Compatible with Azure blob interface.
+        Lists blobs in the storage bucket with a given prefix.
+        Compatible with S3 interface.
         """
-        blob_names = []
-        try:
-            session = await self._get_session()
-            async with session.client('s3', 
-                                      endpoint_url=self.endpoint_url,
-                                      config=self.config) as s3:
-                
-                kwargs = {'Bucket': self.bucket_name}
-                if prefix:
-                    kwargs['Prefix'] = prefix
-                
-                paginator = s3.get_paginator('list_objects_v2')
-                async for page in paginator.paginate(**kwargs):
-                    if 'Contents' in page:
-                        for obj in page['Contents']:
-                            blob_names.append(obj['Key'])
-                
-                logger.debug(f"Listed {len(blob_names)} objects with prefix '{prefix}'")
-                return blob_names
-                
-        except Exception as e:
-            logger.error(f"Failed to list blobs with prefix '{prefix}': {e}")
-            return []
+        paginator = self._get_sync_client().get_paginator('list_objects_v2')
+        async for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                yield obj['Key']
 
     async def delete_blob(self, blob_name: str) -> bool:
         """
-        Delete an object from R2 storage.
-        Compatible with Azure blob interface.
+        Deletes a blob from the container.
+        Compatible with S3 interface.
         """
         try:
             session = await self._get_session()
@@ -306,8 +287,8 @@ class R2StorageManager:
 
     async def read_blob_content(self, blob_name: str) -> Optional[str]:
         """
-        Read text content from R2 object.
-        Compatible with Azure blob interface.
+        Reads the content of a blob and returns it as a string.
+        Compatible with S3 interface.
         """
         try:
             session = await self._get_session()
@@ -317,8 +298,8 @@ class R2StorageManager:
                 
                 try:
                     response = await s3.get_object(Bucket=self.bucket_name, Key=blob_name)
-                    content_bytes = await response['Body'].read()
-                    return content_bytes.decode('utf-8').strip()
+                    content = await response['Body'].read()
+                    return content.decode('utf-8').strip()
                 except ClientError as e:
                     if e.response['Error']['Code'] == 'NoSuchKey':
                         logger.warning(f"Object '{blob_name}' does not exist in R2")

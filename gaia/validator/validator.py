@@ -1794,7 +1794,7 @@ class GaiaValidator:
                     # The MinerScoreSender task will be added conditionally below
                     lambda: self.manage_earthdata_token(),
                     lambda: self.monitor_client_health(),  # Added HTTP client monitoring
-                    #lambda: self.database_monitor(),
+                    lambda: self.database_monitor(),
                     #lambda: self.plot_database_metrics_periodically() # Added plotting task
                 ]
                 if not memray_active: # Add tracemalloc snapshot taker only if memray is not active
@@ -2667,8 +2667,7 @@ class GaiaValidator:
         else:
             logger.info("This node is configured as a REPLICA for DB Sync.")
             self.restore_manager = await get_restore_manager(
-                self.storage_manager_for_sync,
-                test_mode=self.args.test  # Pass test_mode
+                self.storage_manager_for_sync
             )
             if not self.restore_manager:
                 logger.error("Failed to initialize RestoreManager. DB Sync (replica) will be disabled.")
