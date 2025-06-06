@@ -3148,7 +3148,12 @@ if __name__ == "__main__":
             db_user = os.getenv("DB_USER", "postgres")
             db_password = os.getenv("DB_PASSWORD", "postgres")
             # Use psycopg2 for synchronous Alembic operations instead of asyncpg
-            db_url = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+            if db_host.startswith('/'):
+                # Handle Unix socket connection
+                db_url = f"postgresql+psycopg2://{db_user}:{db_password}@/{db_name}?host={db_host}"
+            else:
+                # Handle TCP/IP connection
+                db_url = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
             
             # Safety check: Verify no data-destructive migrations are pending
             try:
