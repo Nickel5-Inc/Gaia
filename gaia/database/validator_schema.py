@@ -23,6 +23,7 @@ node_table = sa.Table('node_table', validator_metadata,
     sa.CheckConstraint('uid >= 0 AND uid < 256', name='node_table_uid_check'),
     comment="Table storing information about registered nodes (miners/validators)."
 )
+sa.Index('idx_node_hotkey_on_node_table', node_table.c.hotkey) # For faster lookups by hotkey
 
 score_table = sa.Table('score_table', validator_metadata,
     sa.Column('task_name', sa.VARCHAR(255), nullable=True, comment="Name of the task being scored"), # Added length
@@ -36,6 +37,7 @@ score_table = sa.Table('score_table', validator_metadata,
     comment="Table to store scores for various tasks."
 )
 sa.Index('idx_score_created_at_on_score_table', score_table.c.created_at) # Explicit index definition
+sa.Index('idx_score_task_name_created_at_desc_on_score_table', score_table.c.task_name, score_table.c.created_at.desc())
 
 baseline_predictions_table = sa.Table('baseline_predictions', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True, comment="Serial ID for the prediction entry"),
