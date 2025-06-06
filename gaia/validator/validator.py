@@ -710,7 +710,7 @@ class GaiaValidator:
             logger.info(f"Starting queries for {len(miners_to_query)} miners with concurrency limit: {concurrency_limit}")
 
             # Configuration for immediate retries
-            max_retries_per_miner = 3  # Increased from 2 to 3
+            max_retries_per_miner = 2  # Total of 2 attempts (1 initial + 1 retry)
             base_timeout = 15.0
             
             # Track miners and their attempt counts
@@ -772,7 +772,7 @@ class GaiaValidator:
                                 if attempt < max_retries_per_miner - 1:
                                     await asyncio.sleep(0.5 * (attempt + 1))  # Brief delay before retry
                                     continue
-                                return None
+                                return {"hotkey": miner_hotkey, "status": "failed", "reason": "Handshake Error", "details": f"{type(hs_err).__name__}"}
 
                             handshake_duration = time.time() - handshake_start_time
                             logger.debug(f"Handshake with {miner_hotkey} completed in {handshake_duration:.2f}s (attempt {attempt + 1})")
@@ -836,11 +836,13 @@ class GaiaValidator:
                                 
                                 if resp and resp.status_code < 400:
                                     response_data = {
+                                        "status": "success",
                                         "text": resp.text,
                                         "status_code": resp.status_code,
                                         "hotkey": miner_hotkey,
                                         "port": node.port,
                                         "ip": node.ip,
+                                        "duration": request_duration,
                                         "content_length": len(resp.content) if resp.content else 0,
                                         "attempts_used": attempt + 1
                                     }
@@ -851,8 +853,14 @@ class GaiaValidator:
                                     if attempt < max_retries_per_miner - 1:
                                         await asyncio.sleep(0.5 * (attempt + 1))
                                         continue # Go to next attempt for this miner
-                                    return None # Max retries reached for this miner
+                                    return {"hotkey": miner_hotkey, "status": "failed", "reason": "Bad Response", "details": f"Status code {resp.status_code if resp else 'N/A'}"}
 
+                            except asyncio.TimeoutError:
+                                # This is a specific type of request error, so we can categorize it
+                                if attempt < max_retries_per_miner - 1:
+                                    await asyncio.sleep(0.5 * (attempt + 1))
+                                    continue
+                                return {"hotkey": miner_hotkey, "status": "failed", "reason": "Request Timeout", "details": "Timeout during non-streamed POST"}
                             except Exception as request_error:
                                 # Enhanced cleanup on error
                                 try:
@@ -873,18 +881,18 @@ class GaiaValidator:
                                 if attempt < max_retries_per_miner - 1:
                                     await asyncio.sleep(0.5 * (attempt + 1))
                                     continue # Go to next attempt for this miner
-                                return None # Max retries reached for this miner
+                                return {"hotkey": miner_hotkey, "status": "failed", "reason": "Request Error", "details": f"{type(request_error).__name__}"}
                                 
                         except Exception as outer_error: # Catch errors within the attempt loop but outside handshake/request
                             logger.debug(f"Outer error for {miner_hotkey} attempt {attempt + 1}: {type(outer_error).__name__} - {outer_error}")
                             if attempt < max_retries_per_miner - 1:
                                 await asyncio.sleep(0.5 * (attempt + 1))
                                 continue # Go to next attempt for this miner
-                            return None # Max retries reached for this miner
+                            return {"hotkey": miner_hotkey, "status": "failed", "reason": "Outer Error", "details": f"{type(outer_error).__name__}"}
                     
                     # If loop finishes, all attempts for this miner failed (should be caught by returns above but as a fallback)
                     logger.debug(f"All {max_retries_per_miner} attempts failed for {miner_hotkey} (fallback).")
-                    return None
+                    return {"hotkey": miner_hotkey, "status": "failed", "reason": "All Attempts Failed", "details": "Fell through retry loop"}
                 # Semaphore is automatically released when async with block exits
 
             # Launch all queries immediately - semaphore in query_single_miner_with_retries will handle concurrency
@@ -917,9 +925,8 @@ class GaiaValidator:
                     logger.warning(f"Skipping miner {hotkey} - missing IP or port")
 
             # Process responses as they complete using asyncio.as_completed for maximum speed
-            responses = {}
+            all_results = []
             completed_count = 0
-            failed_count = 0
             
             logger.info(f"Processing {len(tasks)} responses as they arrive...")
             
@@ -930,35 +937,76 @@ class GaiaValidator:
             for completed_task in asyncio.as_completed(just_tasks):
                 completed_count += 1
                 try:
-                    # Get the hotkey for this completed task
-                    task_hotkey = task_to_hotkey.get(completed_task, "unknown")
-                    
                     result = await completed_task
-                    if result:
-                        responses[result['hotkey']] = result
-                        logger.debug(f"Response {completed_count}/{len(tasks)}: SUCCESS from {task_hotkey}")
-                    else:
-                        failed_count += 1
-                        logger.debug(f"Response {completed_count}/{len(tasks)}: FAILED from {task_hotkey}")
+                    all_results.append(result)
                         
                     # Log progress every 10 completions
                     if completed_count % 10 == 0:
                         elapsed = time.time() - start_time
                         rate = completed_count / elapsed if elapsed > 0 else 0
+                        successful_so_far = sum(1 for r in all_results if r and r.get('status') == 'success')
+                        failed_so_far = len(all_results) - successful_so_far
                         logger.info(f"Progress: {completed_count}/{len(tasks)} completed, "
-                                  f"{len(responses)} successful, {failed_count} failed, "
+                                  f"{successful_so_far} successful, {failed_so_far} failed, "
                                   f"Rate: {rate:.1f}/sec, Elapsed: {elapsed:.1f}s")
                         
                 except Exception as e:
-                    failed_count += 1
+                    task_hotkey = task_to_hotkey.get(completed_task, "unknown")
+                    all_results.append({"hotkey": task_hotkey, "status": "failed", "reason": "Task Exception", "details": str(e)})
                     logger.debug(f"Exception processing response {completed_count}: {e}")
 
             total_time = time.time() - start_time
-            success_rate = len(responses) / len(tasks) * 100 if tasks else 0
-            avg_rate = len(tasks) / total_time if total_time > 0 else 0
             
-            logger.info(f"High-concurrency query completed: {len(responses)}/{len(tasks)} successful "
-                       f"({success_rate:.1f}%) in {total_time:.2f}s, avg rate: {avg_rate:.1f}/sec")
+            # --- Start of Detailed Logging ---
+            successful_results = [r for r in all_results if r and r.get('status') == 'success']
+            failed_results = [r for r in all_results if not r or r.get('status') == 'failed']
+            
+            responses = {res['hotkey']: res for res in successful_results} # Keep original responses dict for return value
+            
+            total_queries = len(tasks)
+            success_count = len(successful_results)
+            failed_count = len(failed_results)
+            success_rate = success_count / total_queries * 100 if total_queries > 0 else 0
+            avg_rate = total_queries / total_time if total_time > 0 else 0
+
+            summary_log = f"\n--- Miner Query Summary (Endpoint: {endpoint}) ---\n"
+            summary_log += "Overall:\n"
+            summary_log += f"  - Total Queries: {total_queries}\n"
+            summary_log += f"  - Successful: {success_count} ({success_rate:.1f}%)\n"
+            summary_log += f"  - Failed: {failed_count} ({100-success_rate:.1f}%)\n"
+            summary_log += f"  - Total Time: {total_time:.2f}s\n"
+            summary_log += f"  - Average Rate: {avg_rate:.1f} queries/sec\n"
+
+            if successful_results:
+                durations = [r['duration'] for r in successful_results]
+                summary_log += "\nTiming (Successful Queries):\n"
+                summary_log += f"  - Min Duration: {np.min(durations):.2f}s\n"
+                summary_log += f"  - Max Duration: {np.max(durations):.2f}s\n"
+                summary_log += f"  - Avg Duration: {np.mean(durations):.2f}s\n"
+                summary_log += f"  - Median Duration: {np.median(durations):.2f}s\n"
+                summary_log += f"  - 95th Percentile: {np.percentile(durations, 95):.2f}s\n"
+
+            if failed_results:
+                summary_log += f"\nFailures ({failed_count} miners):\n"
+                failures_by_reason = defaultdict(list)
+                for failure in failed_results:
+                    reason = failure.get('reason', 'Unknown Reason')
+                    failures_by_reason[reason].append(failure)
+                
+                # Sort reasons by number of failures
+                sorted_reasons = sorted(failures_by_reason.items(), key=lambda item: len(item[1]), reverse=True)
+
+                for reason, fails in sorted_reasons:
+                    summary_log += f"  - {reason} ({len(fails)}):\n"
+                    # Log up to 5 hotkeys for brevity
+                    for fail in fails[:5]:
+                        summary_log += f"    - {fail.get('hotkey', 'N/A')[:12]}... (Details: {fail.get('details', 'N/A')})\n"
+                    if len(fails) > 5:
+                        summary_log += f"    - ... and {len(fails) - 5} more\n"
+            
+            summary_log += "--- End of Summary ---\n"
+            logger.info(summary_log)
+            # --- End of Detailed Logging ---
             
             # Aggressive memory cleanup after large payload processing
             try:
@@ -3139,7 +3187,7 @@ if __name__ == "__main__":
 
         alembic_auto_upgrade_val = os.getenv("ALEMBIC_AUTO_UPGRADE", "True").lower() in ["true", "1", "yes"]
         if alembic_auto_upgrade_val:
-            print(f"[Startup] Validator: ALEMBIC_AUTO_UPGRADE is True. Attempting to upgrade to head...")
+            print(f"[Startup] Validator: ALEMBIC_AUTO_UPGRADE is True. Checking database schema status...")
             
             # Construct database URL for Alembic check - use psycopg2 for synchronous operations
             db_host = os.getenv("DB_HOST", "localhost")
@@ -3167,24 +3215,36 @@ if __name__ == "__main__":
                     context = MigrationContext.configure(conn)
                     current_rev = context.get_current_revision()
                     
-                print(f"[Startup] Current database revision: {current_rev}")
-                print(f"[Startup] Target revision: head")
+                print(f"[Startup] Current database revision: {current_rev or 'None (new database)'}")
                 
-                # Get pending migrations
-                if current_rev:
+                # Determine pending migrations
+                pending_revisions = []
+                if current_rev is None: # New database
+                    # All revisions are pending
+                    pending_revisions = list(script_dir.walk_revisions(head="head"))
+                else:
+                    # Some revisions may be pending
                     pending_revisions = list(script_dir.walk_revisions(base=current_rev, head="head"))
-                    if pending_revisions:
-                        print(f"[Startup] Found {len(pending_revisions)} pending migration(s)")
-                        for rev in pending_revisions:
-                            print(f"[Startup] Pending: {rev.revision} - {rev.doc}")
-                    else:
-                        print("[Startup] No pending migrations - database is up to date")
+
+                if pending_revisions:
+                    print(f"[Startup] Found {len(pending_revisions)} pending migration(s).")
+                    for rev in pending_revisions:
+                        print(f"[Startup]  -> Pending: {rev.revision} ({rev.doc})")
+                    print("[Startup] Applying pending migrations...")
+                    command.upgrade(alembic_cfg_val, "head")
+                    print("[Startup] Database schema upgraded to head successfully.")
+                else:
+                    print("[Startup] Database schema is already up-to-date.")
                         
             except Exception as e:
-                print(f"[Startup] Warning: Could not check migration status: {e}")
-            
-            command.upgrade(alembic_cfg_val, "head")
-            print("[Startup] Validator: Database schema is up-to-date (or upgrade attempted).")
+                print(f"[Startup] Warning: Could not reliably check for pending migrations: {e}")
+                print("[Startup] Attempting to run 'alembic upgrade head' as a fallback...")
+                try:
+                    command.upgrade(alembic_cfg_val, "head")
+                    print("[Startup] Fallback upgrade command completed.")
+                except Exception as upgrade_err:
+                    print(f"[Startup] ERROR: Fallback upgrade command failed: {upgrade_err}")
+
         else:
             print("[Startup] Validator: ALEMBIC_AUTO_UPGRADE is False. Skipping auto schema upgrade.")
 
