@@ -3167,7 +3167,7 @@ if __name__ == "__main__":
                 
                 # Get pending migrations
                 if current_rev:
-                    pending_revisions = script_dir.get_revisions(current_rev, "head")
+                    pending_revisions = list(script_dir.walk_revisions(base=current_rev, head="head"))
                     if pending_revisions:
                         print(f"[Startup] Found {len(pending_revisions)} pending migration(s)")
                         for rev in pending_revisions:
