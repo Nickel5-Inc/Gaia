@@ -3,8 +3,6 @@ import asyncio
 import os
 import subprocess # For running pgBackRest
 from fiber.logging_utils import get_logger
-# StorageManager might not be needed if manifest is gone
-# from gaia.validator.sync.storage_utils import StorageManager 
 from datetime import datetime, timezone # Keep for logging or potential future use
 from typing import Optional
 

@@ -74,9 +74,9 @@ from alembic.util import CommandError # Import CommandError
 from sqlalchemy import create_engine, pool
 
 # New imports for DB Sync
-from gaia.validator.sync.storage_utils import get_storage_manager_for_db_sync, StorageManager
 from gaia.validator.sync.backup_manager import get_backup_manager, BackupManager
 from gaia.validator.sync.restore_manager import get_restore_manager, RestoreManager
+from gaia.validator.sync.auto_sync_manager import get_auto_sync_manager
 import random # for staggering db sync tasks
 
 logger = get_logger(__name__)
@@ -352,9 +352,9 @@ class GaiaValidator:
         logger.info("BaseModelEvaluator initialized")
         
         # DB Sync components
-        self.storage_manager_for_sync: StorageManager | None = None
         self.backup_manager: BackupManager | None = None
         self.restore_manager: RestoreManager | None = None
+        self.auto_sync_manager = None  # New streamlined sync manager
         
         self.is_source_validator_for_db_sync = os.getenv("IS_SOURCE_VALIDATOR_FOR_DB_SYNC", "False").lower() == "true"
         
@@ -713,27 +713,30 @@ class GaiaValidator:
                     ),
                 )
 
-            # Reintroduce Semaphore for concurrency control
-            concurrency_limit = 30  # Limit to 30 concurrent miner queries
-            semaphore = asyncio.Semaphore(concurrency_limit)
-            logger.info(f"Starting queries for {len(miners_to_query)} miners with concurrency limit: {concurrency_limit}")
+            # Use chunked processing to reduce database contention and memory spikes
+            chunk_size = 50  # Process miners in chunks of 50
+            chunk_concurrency = 15  # Lower concurrency per chunk to reduce DB pressure
+            chunks = []
+            
+            # Split miners into chunks
+            miners_list = list(miners_to_query.items())
+            for i in range(0, len(miners_list), chunk_size):
+                chunk = dict(miners_list[i:i + chunk_size])
+                chunks.append(chunk)
+            
+            logger.info(f"Processing {len(miners_to_query)} miners in {len(chunks)} chunks of {chunk_size} (concurrency: {chunk_concurrency} per chunk)")
 
             # Configuration for immediate retries
             max_retries_per_miner = 2  # Total of 2 attempts (1 initial + 1 retry)
             base_timeout = 15.0
             
-            # Track miners and their attempt counts
-            miners_to_attempt = {hotkey: {"node": node, "attempts": 0} for hotkey, node in miners_to_query.items()}
-            
-            async def query_single_miner_with_retries(miner_hotkey: str, miner_info: dict) -> Optional[Dict]:
+            async def query_single_miner_with_retries(miner_hotkey: str, node, semaphore: asyncio.Semaphore) -> Optional[Dict]:
                 """Query a single miner with immediate retries on failure."""
-                node = miner_info["node"]
                 base_url = f"https://{node.ip}:{node.port}"
                 process = psutil.Process() if PSUTIL_AVAILABLE else None
                 
                 async with semaphore: # Acquire semaphore before starting attempts for a miner
                     for attempt in range(max_retries_per_miner):
-                        miner_info["attempts"] = attempt + 1
                         attempt_timeout = base_timeout + (attempt * 5.0)  # Progressive timeout
                         
                         try:
@@ -904,9 +907,10 @@ class GaiaValidator:
                     return {"hotkey": miner_hotkey, "status": "failed", "reason": "All Attempts Failed", "details": "Fell through retry loop"}
                 # Semaphore is automatically released when async with block exits
 
-            # Launch all queries immediately - semaphore in query_single_miner_with_retries will handle concurrency
-            logger.info(f"Launching {len(miners_to_attempt)} miner query tasks (concurrency managed by semaphore)...")
+            # Process miners in chunks to reduce database contention and memory usage
+            logger.info(f"Starting chunked processing of {len(chunks)} chunks...")
             start_time = time.time()
+            all_results = []
             
             # Log memory before launching queries
             self._log_memory_usage("query_miners_start")
@@ -915,54 +919,77 @@ class GaiaValidator:
             try:
                 import sys
                 total_payload_size = sys.getsizeof(payload) / (1024 * 1024)
-                estimated_total_memory = total_payload_size * len(miners_to_attempt)
-                if estimated_total_memory > 500:  # Warn if > 500MB total
-                    logger.warning(f"Large memory usage expected: {len(miners_to_attempt)} miners × {total_payload_size:.1f}MB = {estimated_total_memory:.1f}MB total")
+                estimated_chunk_memory = total_payload_size * chunk_size
+                logger.info(f"Payload memory per chunk: {chunk_size} miners × {total_payload_size:.1f}MB = {estimated_chunk_memory:.1f}MB")
             except Exception:
                 pass
             
-            # Create all tasks immediately - let HTTP client connection limits provide natural throttling
-            tasks = []
-            for hotkey, miner_info in miners_to_attempt.items():
-                if miner_info["node"].ip and miner_info["node"].port:
-                    task = asyncio.create_task(
-                        query_single_miner_with_retries(hotkey, miner_info),
-                        name=f"query_{hotkey[:8]}"
-                    )
-                    tasks.append((hotkey, task))
-                else:
-                    logger.warning(f"Skipping miner {hotkey} - missing IP or port")
+            for chunk_idx, chunk_miners in enumerate(chunks):
+                chunk_start_time = time.time()
+                logger.info(f"Processing chunk {chunk_idx + 1}/{len(chunks)} with {len(chunk_miners)} miners...")
+                
+                # Create semaphore for this chunk
+                chunk_semaphore = asyncio.Semaphore(chunk_concurrency)
+                
+                # Create tasks for this chunk only
+                chunk_tasks = []
+                for hotkey, node in chunk_miners.items():
+                    if node.ip and node.port:
+                        task = asyncio.create_task(
+                            query_single_miner_with_retries(hotkey, node, chunk_semaphore),
+                            name=f"query_chunk{chunk_idx}_{hotkey[:8]}"
+                        )
+                        chunk_tasks.append((hotkey, task))
+                    else:
+                        logger.warning(f"Skipping miner {hotkey} - missing IP or port")
+                        all_results.append({"hotkey": hotkey, "status": "failed", "reason": "Missing IP/Port", "details": "No IP or port available"})
 
-            # Process responses as they complete using asyncio.as_completed for maximum speed
-            all_results = []
-            completed_count = 0
-            
-            logger.info(f"Processing {len(tasks)} responses as they arrive...")
-            
-            # Create a mapping to track which task belongs to which hotkey
-            task_to_hotkey = {task: hotkey for hotkey, task in tasks}
-            just_tasks = [task for _, task in tasks]
-            
-            for completed_task in asyncio.as_completed(just_tasks):
-                completed_count += 1
+                # Process this chunk's responses
+                chunk_results = []
+                completed_count = 0
+                
+                # Create a mapping for this chunk
+                task_to_hotkey = {task: hotkey for hotkey, task in chunk_tasks}
+                just_tasks = [task for _, task in chunk_tasks]
+                
+                if just_tasks:  # Only process if we have tasks
+                    for completed_task in asyncio.as_completed(just_tasks):
+                        completed_count += 1
+                        try:
+                            result = await completed_task
+                            chunk_results.append(result)
+                            all_results.append(result)
+                        except Exception as e:
+                            task_hotkey = task_to_hotkey.get(completed_task, "unknown")
+                            error_result = {"hotkey": task_hotkey, "status": "failed", "reason": "Task Exception", "details": str(e)}
+                            chunk_results.append(error_result)
+                            all_results.append(error_result)
+                            logger.debug(f"Exception processing response in chunk {chunk_idx + 1}: {e}")
+
+                chunk_time = time.time() - chunk_start_time
+                chunk_successful = sum(1 for r in chunk_results if r and r.get('status') == 'success')
+                chunk_failed = len(chunk_results) - chunk_successful
+                logger.info(f"Chunk {chunk_idx + 1}/{len(chunks)} completed: {chunk_successful} successful, {chunk_failed} failed in {chunk_time:.2f}s")
+                
+                # Memory cleanup between chunks
                 try:
-                    result = await completed_task
-                    all_results.append(result)
-                        
-                    # Log progress every 10 completions
-                    if completed_count % 10 == 0:
-                        elapsed = time.time() - start_time
-                        rate = completed_count / elapsed if elapsed > 0 else 0
-                        successful_so_far = sum(1 for r in all_results if r and r.get('status') == 'success')
-                        failed_so_far = len(all_results) - successful_so_far
-                        logger.info(f"Progress: {completed_count}/{len(tasks)} completed, "
-                                  f"{successful_so_far} successful, {failed_so_far} failed, "
-                                  f"Rate: {rate:.1f}/sec, Elapsed: {elapsed:.1f}s")
-                        
-                except Exception as e:
-                    task_hotkey = task_to_hotkey.get(completed_task, "unknown")
-                    all_results.append({"hotkey": task_hotkey, "status": "failed", "reason": "Task Exception", "details": str(e)})
-                    logger.debug(f"Exception processing response {completed_count}: {e}")
+                    del chunk_tasks
+                    del task_to_hotkey
+                    del just_tasks
+                    del chunk_results
+                    del chunk_semaphore
+                    
+                    # Force garbage collection between chunks to manage memory
+                    import gc
+                    collected = gc.collect()
+                    if collected > 20:
+                        logger.debug(f"GC collected {collected} objects after chunk {chunk_idx + 1}")
+                except Exception as cleanup_err:
+                    logger.debug(f"Error during chunk cleanup: {cleanup_err}")
+                
+                # Small delay between chunks to allow database recovery
+                if chunk_idx < len(chunks) - 1:  # Don't delay after the last chunk
+                    await asyncio.sleep(0.5)  # 500ms delay between chunks
 
             total_time = time.time() - start_time
             
@@ -972,7 +999,7 @@ class GaiaValidator:
             
             responses = {res['hotkey']: res for res in successful_results} # Keep original responses dict for return value
             
-            total_queries = len(tasks)
+            total_queries = len(all_results)
             success_count = len(successful_results)
             failed_count = len(failed_results)
             success_rate = success_count / total_queries * 100 if total_queries > 0 else 0
@@ -1019,14 +1046,9 @@ class GaiaValidator:
             
             # Aggressive memory cleanup after large payload processing
             try:
-                # Clear all task references
-                for hotkey, task in tasks:
-                    if not task.done():
-                        task.cancel()
-                del tasks
-                del task_to_hotkey
-                del just_tasks
-                del miners_to_attempt
+                # Clear chunk references
+                del chunks
+                del miners_list
                 
                 # Clear payload reference - critical for large payloads
                 if 'payload' in locals():
@@ -1440,6 +1462,14 @@ class GaiaValidator:
                     logger.info("Cleaned up substrate connection manager")
             except Exception as e:
                 logger.debug(f"Error cleaning up substrate manager: {e}")
+
+            # Clean up AutoSyncManager
+            try:
+                if hasattr(self, 'auto_sync_manager') and self.auto_sync_manager:
+                    await self.auto_sync_manager.shutdown()
+                    logger.info("Cleaned up AutoSyncManager")
+            except Exception as e:
+                logger.debug(f"Error cleaning up AutoSyncManager: {e}")
 
             # Aggressive fsspec/gcsfs cleanup to prevent session errors blocking PM2 restart
             try:
@@ -2594,13 +2624,13 @@ class GaiaValidator:
 
             params = {"start_time": one_day_ago}
             
-            # Fetch all data concurrently but with limits to prevent memory overload
+            # Fetch all data concurrently using threaded approach for heavy operations
             try:
                 weather_results, geomagnetic_results, soil_results, validator_nodes_list = await asyncio.gather(
-                    self.database_manager.fetch_all(weather_query, params),
-                    self.database_manager.fetch_all(geomagnetic_query, params),
-                    self.database_manager.fetch_all(soil_query, params),
-                    self.database_manager.fetch_all(validator_nodes_query),
+                    self.database_manager.fetch_all_threaded(weather_query, params),
+                    self.database_manager.fetch_all_threaded(geomagnetic_query, params),
+                    self.database_manager.fetch_all_threaded(soil_query, params),
+                    self.database_manager.fetch_all_threaded(validator_nodes_query),
                     return_exceptions=True
                 )
                 
@@ -2712,31 +2742,40 @@ class GaiaValidator:
         db_sync_enabled_str = os.getenv("DB_SYNC_ENABLED", "True") # Default to True if not set
         if db_sync_enabled_str.lower() != "true":
             logger.info("DB_SYNC_ENABLED is not 'true'. Database synchronization feature will be disabled.")
-            self.storage_manager_for_sync = None
             self.backup_manager = None
             self.restore_manager = None
+            self.auto_sync_manager = None
             return
 
-        self.storage_manager_for_sync = await get_storage_manager_for_db_sync()
-        if not self.storage_manager_for_sync:
-            logger.error("Failed to initialize StorageManager for DB Sync. DB Sync will be disabled.")
-            return
+        # Initialize AutoSyncManager (new streamlined sync system)
+        try:
+            logger.info("Initializing AutoSyncManager (streamlined sync system)...")
+            self.auto_sync_manager = await get_auto_sync_manager(test_mode=self.args.test)
+            if self.auto_sync_manager:
+                logger.info("✅ AutoSyncManager initialized successfully")
+                logger.info("🔧 AutoSyncManager provides automated setup and application-controlled scheduling")
+                logger.info("📝 To set up database sync, run: python gaia/validator/sync/setup_auto_sync.py --primary (or --replica)")
+                return
+            else:
+                logger.warning("AutoSyncManager failed to initialize - check environment variables")
+        except Exception as e:
+            logger.warning(f"AutoSyncManager initialization failed: {e}")
 
+        # Initialize standalone backup/restore managers if AutoSyncManager isn't available
+        logger.info("Initializing standalone backup/restore managers...")
+        
         if self.is_source_validator_for_db_sync:
             logger.info("This node is configured as the SOURCE for DB Sync.")
-            self.backup_manager = await get_backup_manager(
-                test_mode=self.args.test  # Pass test_mode
-            )
+            self.backup_manager = await get_backup_manager(test_mode=self.args.test)
             if not self.backup_manager:
                 logger.error("Failed to initialize BackupManager. DB Sync (source) will be disabled.")
         else:
             logger.info("This node is configured as a REPLICA for DB Sync.")
-            self.restore_manager = await get_restore_manager(
-                self.storage_manager_for_sync
-            )
+            self.restore_manager = await get_restore_manager(test_mode=self.args.test)
             if not self.restore_manager:
                 logger.error("Failed to initialize RestoreManager. DB Sync (replica) will be disabled.")
-        logger.info("DB Sync components initialization attempt finished.")
+        
+        logger.info("DB Sync components initialization completed.")
 
     async def database_monitor(self):
         """Periodically query and log database statistics from a consistent snapshot."""

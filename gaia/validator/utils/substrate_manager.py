@@ -1,5 +1,5 @@
 import time
-from typing import Optional
+from typing import Optional, Dict, Tuple
 from fiber.chain.interface import get_substrate
 from substrateinterface import SubstrateInterface
 from fiber.logging_utils import get_logger
@@ -11,15 +11,44 @@ class SubstrateConnectionManager:
     """
     Manages substrate connections to prevent memory leaks from frequent reconnections.
     Reuses connections when possible and properly cleans up old ones.
+    Implements singleton pattern to ensure only one manager per network/endpoint combination.
     """
     
+    _instances: Dict[Tuple[str, str], 'SubstrateConnectionManager'] = {}
+    _lock = None
+    
+    def __new__(cls, subtensor_network: str, chain_endpoint: str):
+        """Ensure singleton behavior per network/endpoint combination."""
+        import threading
+        
+        # Initialize lock if not exists (thread-safe)
+        if cls._lock is None:
+            cls._lock = threading.Lock()
+        
+        key = (subtensor_network, chain_endpoint)
+        
+        with cls._lock:
+            if key not in cls._instances:
+                instance = super().__new__(cls)
+                cls._instances[key] = instance
+                logger.info(f"Created new SubstrateConnectionManager singleton for {subtensor_network}@{chain_endpoint}")
+            else:
+                logger.debug(f"Reusing existing SubstrateConnectionManager for {subtensor_network}@{chain_endpoint}")
+            
+            return cls._instances[key]
+    
     def __init__(self, subtensor_network: str, chain_endpoint: str):
+        # Prevent re-initialization of singleton instances
+        if hasattr(self, '_initialized'):
+            return
+            
         self.subtensor_network = subtensor_network
         self.chain_endpoint = chain_endpoint
         self._connection: Optional[SubstrateInterface] = None
         self._last_used = 0
         self._max_age = 3600  # 1 hour before connection refresh
         self._connection_count = 0
+        self._initialized = True
         logger.info(f"SubstrateConnectionManager initialized for network: {subtensor_network}")
     
     def get_connection(self) -> SubstrateInterface:
@@ -106,4 +135,22 @@ class SubstrateConnectionManager:
             "has_connection": self._connection is not None,
             "last_used": self._last_used,
             "max_age": self._max_age
-        } 
+        }
+    
+    @classmethod
+    def get_all_instances(cls) -> Dict[Tuple[str, str], 'SubstrateConnectionManager']:
+        """Get all active singleton instances (useful for debugging/monitoring)."""
+        return cls._instances.copy()
+    
+    @classmethod
+    def cleanup_all(cls):
+        """Clean up all singleton instances (useful for shutdown)."""
+        with cls._lock:
+            for key, instance in cls._instances.items():
+                try:
+                    instance.cleanup()
+                    logger.info(f"Cleaned up SubstrateConnectionManager for {key[0]}@{key[1]}")
+                except Exception as e:
+                    logger.error(f"Error cleaning up instance {key}: {e}")
+            cls._instances.clear()
+            logger.info("All SubstrateConnectionManager instances cleaned up") 
