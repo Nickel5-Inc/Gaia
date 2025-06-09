@@ -213,29 +213,34 @@ async def evaluate_miner_forecast_day1(
                     ref_var_da_unaligned = gfs_reference_lead[var_name]
 
                     if var_level:
-                        # Handle different pressure level dimension names
-                        pressure_dim = None
-                        for dim_name in ['pressure_level', 'plev', 'level']:
-                            if dim_name in miner_var_da_unaligned.dims:
-                                pressure_dim = dim_name
-                                break
+                        # Handle different pressure level dimension names for each dataset
+                        def find_pressure_dim(data_array, dataset_name="dataset"):
+                            for dim_name in ['pressure_level', 'plev', 'level']:
+                                if dim_name in data_array.dims:
+                                    return dim_name
+                            logger.warning(f"No pressure level dimension found in {dataset_name} for {var_key} level {var_level}. Available dims: {data_array.dims}")
+                            return None
                         
-                        if not pressure_dim:
-                            logger.warning(f"No pressure level dimension found for {var_key} level {var_level}. Available dims: {miner_var_da_unaligned.dims}. Skipping.")
+                        miner_pressure_dim = find_pressure_dim(miner_var_da_unaligned, "miner")
+                        truth_pressure_dim = find_pressure_dim(truth_var_da_unaligned, "truth")
+                        ref_pressure_dim = find_pressure_dim(ref_var_da_unaligned, "reference")
+                        
+                        if not all([miner_pressure_dim, truth_pressure_dim, ref_pressure_dim]):
+                            logger.warning(f"Missing pressure dimensions for {var_key} level {var_level}. Skipping.")
                             continue
                             
-                        miner_var_da_selected = miner_var_da_unaligned.sel({pressure_dim: var_level}, method="nearest")
-                        truth_var_da_selected = truth_var_da_unaligned.sel({pressure_dim: var_level}, method="nearest")
-                        ref_var_da_selected = ref_var_da_unaligned.sel({pressure_dim: var_level}, method="nearest")
+                        miner_var_da_selected = miner_var_da_unaligned.sel({miner_pressure_dim: var_level}, method="nearest")
+                        truth_var_da_selected = truth_var_da_unaligned.sel({truth_pressure_dim: var_level}, method="nearest")
+                        ref_var_da_selected = ref_var_da_unaligned.sel({ref_pressure_dim: var_level}, method="nearest")
                         
-                        if abs(truth_var_da_selected[pressure_dim].item() - var_level) > 10:
-                             logger.warning(f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected[pressure_dim].item()}). Skipping.")
+                        if abs(truth_var_da_selected[truth_pressure_dim].item() - var_level) > 10:
+                             logger.warning(f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected[truth_pressure_dim].item()}). Skipping.")
                              continue
-                        if abs(miner_var_da_selected[pressure_dim].item() - var_level) > 10:
-                             logger.warning(f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected[pressure_dim].item()}). Skipping.")
+                        if abs(miner_var_da_selected[miner_pressure_dim].item() - var_level) > 10:
+                             logger.warning(f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected[miner_pressure_dim].item()}). Skipping.")
                              continue
-                        if abs(ref_var_da_selected[pressure_dim].item() - var_level) > 10:
-                             logger.warning(f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected[pressure_dim].item()}). Skipping.")
+                        if abs(ref_var_da_selected[ref_pressure_dim].item() - var_level) > 10:
+                             logger.warning(f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected[ref_pressure_dim].item()}). Skipping.")
                              continue
                     else:
                         miner_var_da_selected = miner_var_da_unaligned
@@ -330,6 +335,7 @@ async def evaluate_miner_forecast_day1(
                         logger.warning(f"[Day1Score] GFS Clone Suspect: {var_key} at {effective_lead_h}h for {miner_hotkey}. "
                                      f"Distance MSE {clone_distance_mse_val:.4f} < Delta {delta_for_var:.4f}. Penalty: {clone_penalty:.4f}")
                         day1_results["qc_passed_all_vars_leads"] = False
+                        logger.info(f"[Day1Score] QC FAILURE REASON: Clone penalty triggered for {var_key}")
                     day1_results["lead_time_scores"][time_key_for_results][var_key]["clone_penalty_applied"] = clone_penalty
 
                     clim_dayofyear = pd.Timestamp(valid_time_dt).dayofyear
@@ -378,6 +384,9 @@ async def evaluate_miner_forecast_day1(
                        not sanity_results.get("pattern_correlation_passed"):
                         logger.warning(f"[Day1Score] Sanity check failed for {var_key} at {effective_lead_h}h. Skipping metrics.")
                         day1_results["qc_passed_all_vars_leads"] = False
+                        logger.info(f"[Day1Score] QC FAILURE REASON: Sanity check failed for {var_key} - "
+                                   f"Climatology passed: {sanity_results.get('climatology_passed')}, "
+                                   f"Pattern correlation passed: {sanity_results.get('pattern_correlation_passed')}")
                         continue
 
                     # Bias Correction
