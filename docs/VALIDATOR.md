@@ -196,4 +196,88 @@ To enable and configure the database synchronization system, set the following e
 ### Required Dependencies
 
 *   **Python Package**: `azure-storage-blob` (install via `pip install azure-storage-blob`)
-*   **Command-Line Tools**: `pg_dump`, `
+*   **Command-Line Tools**: `pg_dump`, `pg_restore`, and PostgreSQL client tools
+
+---
+
+## Database Migration
+
+The system uses separate Alembic configurations for miner and validator databases:
+
+### Validator Database Migration
+```bash
+# Check current schema version
+DB_CONNECTION_TYPE=socket alembic -c alembic_validator.ini current
+
+# Upgrade to latest schema
+DB_CONNECTION_TYPE=socket alembic -c alembic_validator.ini upgrade head
+
+# View migration history
+DB_CONNECTION_TYPE=socket alembic -c alembic_validator.ini history
+```
+
+**Core validator tables**: `node_table`, `score_table`, `weather_forecast_runs`, `weather_miner_responses`
+
+**Migration Safety**: All migrations preserve existing data and validate required tables exist.
+
+---
+
+## R2 Backup Alternative (pgBackRest)
+
+For validators preferring Cloudflare R2 over Azure, configure database backup using pgBackRest:
+
+### Environment Variables for R2 Backup
+```bash
+# pgBackRest with R2 configuration
+PGBACKREST_STANZA_NAME=gaia
+PGBACKREST_R2_BUCKET=<your-r2-bucket>
+PGBACKREST_R2_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+PGBACKREST_R2_ACCESS_KEY_ID=<your-access-key>
+PGBACKREST_R2_SECRET_ACCESS_KEY=<your-secret-key>
+PGBACKREST_R2_REGION=auto
+PGBACKREST_PGDATA=/var/lib/postgresql/data
+PGBACKREST_PGPORT=5432
+PGBACKREST_PGUSER=postgres
+
+# Primary validator (source)
+IS_SOURCE_VALIDATOR_FOR_DB_SYNC=True
+# Replica validators
+IS_SOURCE_VALIDATOR_FOR_DB_SYNC=False
+```
+
+### Setup Commands
+```bash
+# Primary validator setup
+sudo bash gaia/validator/sync/pgbackrest/setup-primary.sh
+
+# Replica validator setup
+sudo bash gaia/validator/sync/pgbackrest/setup-replica.sh
+
+# Check backup status
+sudo -u postgres pgbackrest --stanza=gaia info
+
+# Manual restore (replicas)
+sudo systemctl stop postgresql
+sudo -u postgres pgbackrest --stanza=gaia restore
+sudo systemctl start postgresql
+```
+
+---
+
+## Custom Models (Advanced)
+
+Validators can benefit from miners using custom models for better performance:
+
+### Encouraging Custom Models
+- Miners with custom models typically provide better predictions
+- Custom models can be task-specific (geomagnetic, soil moisture, weather)
+- Improved accuracy leads to better rewards for miners
+
+### Model Requirements
+- **Soil Moisture**: Must output 11x11 arrays for surface/rootzone moisture (0-1 range)
+- **Geomagnetic**: Must predict next-hour DST index with UTC timestamp
+- **Weather**: Must generate 40-step forecasts in Zarr format
+
+Custom model files must follow naming conventions and implement specific methods (`run_inference()`).
+
+---

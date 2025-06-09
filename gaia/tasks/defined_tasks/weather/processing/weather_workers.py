@@ -1455,7 +1455,27 @@ async def poll_runpod_job_worker(task_instance: 'WeatherTask', job_id: str, runp
                             raise ValueError("Completed job manifest missing 'output_r2_object_key_prefix'.")
                         
                         logger.info(f"[{job_id}] Inference successful. Output prefix: {output_prefix}.")
-                        await update_job_paths(task_instance, job_id, netcdf_path=output_prefix)
+                        
+                        # Check file serving mode to determine next steps
+                        file_serving_mode = task_instance.config.get('file_serving_mode', 'local')
+                        
+                        if file_serving_mode == 'local':
+                            # Download files from R2 to local storage for serving
+                            logger.info(f"[{job_id}] File serving mode is 'local'. Downloading forecast files from R2...")
+                            local_zarr_path = await _download_forecast_from_r2_to_local(task_instance, job_id, output_prefix)
+                            
+                            if local_zarr_path:
+                                logger.info(f"[{job_id}] Successfully downloaded forecast to local storage: {local_zarr_path}")
+                                await update_job_paths(task_instance, job_id, netcdf_path=local_zarr_path)
+                            else:
+                                logger.error(f"[{job_id}] Failed to download forecast from R2 to local storage.")
+                                await update_job_status(task_instance, job_id, 'error', "Failed to download forecast from R2")
+                                return
+                        else:
+                            # R2 proxy mode - store the R2 prefix for proxying
+                            logger.info(f"[{job_id}] File serving mode is 'r2_proxy'. Storing R2 prefix for proxy serving.")
+                            await update_job_paths(task_instance, job_id, netcdf_path=output_prefix)
+                        
                         await update_job_status(task_instance, job_id, 'completed')
                         return # Success, exit worker
 
@@ -1491,3 +1511,388 @@ async def poll_runpod_job_worker(task_instance: 'WeatherTask', job_id: str, runp
         error_message = f"RunPod poller failed: {e}"
         logger.error(f"[RunPodPoller Job {job_id}] {error_message}", exc_info=True)
         await update_job_status(task_instance, job_id, 'failed', error_message)
+
+async def weather_job_status_logger(task_instance: 'WeatherTask'):
+    """
+    Periodic worker that logs a comprehensive status overview of all weather jobs.
+    Shows running jobs, queued jobs, validator info, timesteps, and summary statistics.
+    """
+    logger.info("[JobStatusLogger] Weather job status logger started.")
+    
+    # Configurable interval (default: 5 minutes)
+    status_log_interval = task_instance.config.get('job_status_log_interval_seconds', 300)
+    
+    while True:
+        try:
+            await asyncio.sleep(status_log_interval)
+            
+            if task_instance.node_type != 'miner':
+                logger.debug("[JobStatusLogger] Skipping status log (not a miner node).")
+                continue
+                
+            # Query all jobs from the last 24 hours
+            query = """
+                SELECT 
+                    id,
+                    status,
+                    validator_hotkey,
+                    gfs_init_time_utc,
+                    gfs_t_minus_6_time_utc,
+                    validator_request_time,
+                    processing_start_time,
+                    processing_end_time,
+                    error_message,
+                    updated_at
+                FROM weather_miner_jobs 
+                WHERE validator_request_time >= NOW() - INTERVAL '24 hours'
+                ORDER BY validator_request_time DESC
+            """
+            
+            jobs = await task_instance.db_manager.fetch_all(query, {})
+            
+            if not jobs:
+                logger.info("[JobStatusLogger] 📊 No weather jobs found in the last 24 hours.")
+                continue
+            
+            # Categorize jobs by status
+            status_groups = {}
+            validator_stats = {}
+            total_jobs = len(jobs)
+            
+            for job in jobs:
+                status = job['status']
+                validator = job['validator_hotkey'] or 'Unknown'
+                
+                # Group by status
+                if status not in status_groups:
+                    status_groups[status] = []
+                status_groups[status].append(job)
+                
+                # Count by validator
+                if validator not in validator_stats:
+                    validator_stats[validator] = {'total': 0, 'completed': 0, 'failed': 0, 'running': 0}
+                validator_stats[validator]['total'] += 1
+                
+                if status == 'completed':
+                    validator_stats[validator]['completed'] += 1
+                elif status in ['error', 'failed', 'fetch_error', 'input_hash_mismatch']:
+                    validator_stats[validator]['failed'] += 1
+                elif status in ['processing', 'running_inference', 'processing_input', 'processing_output']:
+                    validator_stats[validator]['running'] += 1
+            
+            # Build status summary
+            logger.info("=" * 80)
+            logger.info("🌦️  WEATHER JOBS STATUS OVERVIEW")
+            logger.info("=" * 80)
+            logger.info(f"📈 Total jobs (24h): {total_jobs}")
+            
+            # Status breakdown
+            status_summary = []
+            priority_statuses = ['running_inference', 'processing', 'processing_input', 'processing_output', 
+                               'fetch_queued', 'fetching_gfs', 'input_hashed_awaiting_validation', 
+                               'completed', 'error', 'failed', 'fetch_error']
+            
+            for status in priority_statuses:
+                if status in status_groups:
+                    count = len(status_groups[status])
+                    status_summary.append(f"{status}: {count}")
+            
+            # Add any other statuses not in priority list
+            for status, jobs_list in status_groups.items():
+                if status not in priority_statuses:
+                    count = len(jobs_list)
+                    status_summary.append(f"{status}: {count}")
+            
+            logger.info(f"📊 Status breakdown: {' | '.join(status_summary)}")
+            
+            # Active jobs details
+            active_statuses = ['running_inference', 'processing', 'processing_input', 'processing_output', 
+                             'fetch_queued', 'fetching_gfs', 'input_hashed_awaiting_validation']
+            active_jobs = []
+            for status in active_statuses:
+                if status in status_groups:
+                    active_jobs.extend(status_groups[status])
+            
+            if active_jobs:
+                logger.info(f"🔄 Active jobs ({len(active_jobs)}):")
+                for job in active_jobs[:10]:  # Show up to 10 active jobs
+                    job_id_short = job['id'][:8]
+                    validator_short = (job['validator_hotkey'] or 'Unknown')[:8]
+                    gfs_time = job['gfs_init_time_utc'].strftime('%m-%d %H:%M') if job['gfs_init_time_utc'] else 'N/A'
+                    duration = ""
+                    if job['processing_start_time']:
+                        from datetime import datetime, timezone
+                        start_time = job['processing_start_time']
+                        current_time = datetime.now(timezone.utc)
+                        duration_mins = int((current_time - start_time).total_seconds() / 60)
+                        duration = f" ({duration_mins}m)"
+                    
+                    logger.info(f"   • {job_id_short} | {job['status']:<20} | Val: {validator_short} | GFS: {gfs_time}{duration}")
+                
+                if len(active_jobs) > 10:
+                    logger.info(f"   ... and {len(active_jobs) - 10} more active jobs")
+            
+            # Recent completions
+            completed_jobs = status_groups.get('completed', [])
+            if completed_jobs:
+                recent_completed = completed_jobs[:5]  # Last 5 completed
+                logger.info(f"✅ Recent completions ({len(completed_jobs)} total):")
+                for job in recent_completed:
+                    job_id_short = job['id'][:8]
+                    validator_short = (job['validator_hotkey'] or 'Unknown')[:8]
+                    gfs_time = job['gfs_init_time_utc'].strftime('%m-%d %H:%M') if job['gfs_init_time_utc'] else 'N/A'
+                    completed_time = job['processing_end_time'].strftime('%H:%M') if job['processing_end_time'] else 'N/A'
+                    logger.info(f"   • {job_id_short} | Val: {validator_short} | GFS: {gfs_time} | Done: {completed_time}")
+            
+            # Recent failures
+            failed_statuses = ['error', 'failed', 'fetch_error', 'input_hash_mismatch']
+            failed_jobs = []
+            for status in failed_statuses:
+                if status in status_groups:
+                    failed_jobs.extend(status_groups[status])
+            
+            if failed_jobs:
+                recent_failed = sorted(failed_jobs, key=lambda x: x['updated_at'] or x['validator_request_time'], reverse=True)[:3]
+                logger.info(f"❌ Recent failures ({len(failed_jobs)} total):")
+                for job in recent_failed:
+                    job_id_short = job['id'][:8]
+                    validator_short = (job['validator_hotkey'] or 'Unknown')[:8]
+                    gfs_time = job['gfs_init_time_utc'].strftime('%m-%d %H:%M') if job['gfs_init_time_utc'] else 'N/A'
+                    error_preview = (job['error_message'] or 'No details')[:50] + ('...' if len(job['error_message'] or '') > 50 else '')
+                    logger.info(f"   • {job_id_short} | {job['status']:<12} | Val: {validator_short} | GFS: {gfs_time}")
+                    logger.info(f"     └─ {error_preview}")
+            
+            # Validator statistics
+            if validator_stats:
+                logger.info("🏗️  Validator performance:")
+                # Sort by total jobs
+                sorted_validators = sorted(validator_stats.items(), key=lambda x: x[1]['total'], reverse=True)
+                for validator, stats in sorted_validators[:5]:  # Top 5 validators
+                    validator_short = validator[:12] if validator != 'Unknown' else validator
+                    success_rate = (stats['completed'] / stats['total'] * 100) if stats['total'] > 0 else 0
+                    logger.info(f"   • {validator_short:<12} | Total: {stats['total']:>2} | ✅ {stats['completed']:>2} | ❌ {stats['failed']:>2} | 🔄 {stats['running']:>2} | Success: {success_rate:.0f}%")
+            
+            logger.info("=" * 80)
+            
+        except asyncio.CancelledError:
+            logger.info("[JobStatusLogger] Weather job status logger has been cancelled.")
+            break
+        except Exception as e:
+            logger.error(f"[JobStatusLogger] Error in weather job status logger: {e}", exc_info=True)
+            logger.info("[JobStatusLogger] Status logger will sleep for 60 seconds before retrying.")
+            await asyncio.sleep(60)
+    
+    logger.info("[JobStatusLogger] Weather job status logger has stopped.")
+
+async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_id: str, r2_output_prefix: str) -> Optional[str]:
+    """
+    Downloads forecast NetCDF files from R2 and combines them into a local zarr store.
+    Used when file_serving_mode is 'local' to enable direct serving to validators.
+    
+    Returns:
+        Path to the local zarr store if successful, None if failed.
+    """
+    try:
+        # Get R2 client
+        s3_client = await task_instance._get_r2_s3_client()
+        if not s3_client:
+            logger.error(f"[{job_id}] Cannot download from R2: S3 client not available")
+            return None
+            
+        bucket_name = task_instance.r2_config.get("r2_bucket_name")
+        if not bucket_name:
+            logger.error(f"[{job_id}] Cannot download from R2: bucket name not configured")
+            return None
+        
+        logger.info(f"[{job_id}] Listing files in R2 prefix: s3://{bucket_name}/{r2_output_prefix}")
+        
+        # List all NetCDF files in the R2 prefix
+        try:
+            response = await asyncio.to_thread(
+                s3_client.list_objects_v2,
+                Bucket=bucket_name,
+                Prefix=r2_output_prefix
+            )
+            
+            if 'Contents' not in response:
+                logger.error(f"[{job_id}] No files found in R2 prefix: {r2_output_prefix}")
+                return None
+                
+            nc_files = []
+            for obj in response['Contents']:
+                key = obj['Key']
+                if key.endswith('.nc'):
+                    nc_files.append(key)
+                    
+            if not nc_files:
+                logger.error(f"[{job_id}] No .nc files found in R2 prefix: {r2_output_prefix}")
+                return None
+                
+            logger.info(f"[{job_id}] Found {len(nc_files)} NetCDF files to download")
+            
+        except Exception as e_list:
+            logger.error(f"[{job_id}] Error listing R2 objects: {e_list}", exc_info=True)
+            return None
+        
+        # Create temporary directory for downloads
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix=f"forecast_download_{job_id[:8]}_") as temp_dir:
+            temp_path = Path(temp_dir)
+            downloaded_files = []
+            
+            # Download all NetCDF files
+            logger.info(f"[{job_id}] Downloading {len(nc_files)} files from R2...")
+            download_tasks = []
+            
+            for nc_key in nc_files:
+                local_file_path = temp_path / Path(nc_key).name
+                download_tasks.append(_download_single_file_from_r2(s3_client, bucket_name, nc_key, local_file_path))
+            
+            # Execute downloads in parallel with some concurrency control
+            semaphore = asyncio.Semaphore(10)  # Limit concurrent downloads
+            
+            async def download_with_semaphore(task):
+                async with semaphore:
+                    return await task
+            
+            results = await asyncio.gather(*[download_with_semaphore(task) for task in download_tasks], return_exceptions=True)
+            
+            # Check results and collect successful downloads
+            for i, result in enumerate(results):
+                if result is True:
+                    downloaded_files.append(temp_path / Path(nc_files[i]).name)
+                else:
+                    logger.error(f"[{job_id}] Failed to download {nc_files[i]}: {result}")
+            
+            if not downloaded_files:
+                logger.error(f"[{job_id}] No files successfully downloaded from R2")
+                return None
+                
+            logger.info(f"[{job_id}] Successfully downloaded {len(downloaded_files)} files. Combining into zarr store...")
+            
+            # Load and combine NetCDF files into a single zarr store
+            try:
+                import xarray as xr
+                import pandas as pd
+                from pathlib import Path as PathlibPath
+                
+                # Load all datasets
+                datasets = []
+                for file_path in sorted(downloaded_files):
+                    try:
+                        ds = xr.open_dataset(file_path)
+                        datasets.append(ds)
+                    except Exception as e_open:
+                        logger.error(f"[{job_id}] Failed to open {file_path}: {e_open}")
+                
+                if not datasets:
+                    logger.error(f"[{job_id}] No datasets could be loaded from downloaded files")
+                    return None
+                
+                # Combine datasets along time dimension
+                combined_ds = xr.concat(datasets, dim='time')
+                combined_ds = combined_ds.sortby('time')
+                
+                # Create local zarr path
+                gfs_init_time = None
+                try:
+                    # Get GFS init time from job database
+                    job_details = await task_instance.db_manager.fetch_one(
+                        "SELECT gfs_init_time_utc FROM weather_miner_jobs WHERE id = :job_id",
+                        {"job_id": job_id}
+                    )
+                    if job_details:
+                        gfs_init_time = job_details['gfs_init_time_utc']
+                except Exception as e_job_details:
+                    logger.warning(f"[{job_id}] Could not get GFS init time from DB: {e_job_details}")
+                
+                # Generate zarr store path
+                if gfs_init_time:
+                    gfs_time_str = gfs_init_time.strftime('%Y%m%d%H')
+                else:
+                    gfs_time_str = "unknown"
+                
+                miner_hotkey_for_filename = "unknown_miner_hk"
+                if task_instance.keypair and task_instance.keypair.ss58_address:
+                    miner_hotkey_for_filename = task_instance.keypair.ss58_address
+                
+                unique_suffix = job_id.split('-')[0]
+                dirname_zarr = f"weather_forecast_{gfs_time_str}_miner_hk_{miner_hotkey_for_filename[:10]}_{unique_suffix}.zarr"
+                
+                # Use the same forecast directory as local inference
+                from gaia.tasks.defined_tasks.weather.weather_task import MINER_FORECAST_DIR_BG
+                MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
+                output_zarr_path = MINER_FORECAST_DIR_BG / dirname_zarr
+                
+                # Configure chunking for zarr
+                import numcodecs
+                encoding = {}
+                for var_name, da in combined_ds.data_vars.items():
+                    chunks_for_var = {}
+                    
+                    time_dim_in_var = next((d for d in da.dims if d.lower() == 'time'), None)
+                    lat_dim_in_var = next((d for d in da.dims if d.lower() in ('lat', 'latitude')), None)
+                    lon_dim_in_var = next((d for d in da.dims if d.lower() in ('lon', 'longitude')), None)
+                    level_dim_in_var = next((d for d in da.dims if d.lower() in ('pressure_level', 'level', 'plev', 'isobaricinhpa')), None)
+
+                    if time_dim_in_var:
+                        chunks_for_var[time_dim_in_var] = 1
+                    if level_dim_in_var:
+                        chunks_for_var[level_dim_in_var] = 1 
+                    if lat_dim_in_var:
+                        chunks_for_var[lat_dim_in_var] = combined_ds.sizes[lat_dim_in_var]
+                    if lon_dim_in_var:
+                        chunks_for_var[lon_dim_in_var] = combined_ds.sizes[lon_dim_in_var]
+                    
+                    ordered_chunks_list = []
+                    for dim_name_in_da in da.dims:
+                        ordered_chunks_list.append(chunks_for_var.get(dim_name_in_da, combined_ds.sizes[dim_name_in_da]))
+                    
+                    encoding[var_name] = {
+                        'chunks': tuple(ordered_chunks_list),
+                        'compressor': numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
+                    }
+                
+                # Remove existing zarr store if it exists
+                if output_zarr_path.exists():
+                    import shutil
+                    shutil.rmtree(output_zarr_path)
+                
+                # Save to zarr
+                combined_ds.to_zarr(
+                    output_zarr_path,
+                    encoding=encoding,
+                    consolidated=True,
+                    compute=True
+                )
+                
+                # Close datasets to free memory
+                for ds in datasets:
+                    ds.close()
+                combined_ds.close()
+                
+                logger.info(f"[{job_id}] Successfully created local zarr store: {output_zarr_path}")
+                return str(output_zarr_path)
+                
+            except Exception as e_combine:
+                logger.error(f"[{job_id}] Error combining NetCDF files into zarr: {e_combine}", exc_info=True)
+                return None
+    
+    except Exception as e:
+        logger.error(f"[{job_id}] Error downloading forecast from R2: {e}", exc_info=True)
+        return None
+
+
+async def _download_single_file_from_r2(s3_client, bucket_name: str, object_key: str, local_path: Path) -> bool:
+    """Helper function to download a single file from R2."""
+    try:
+        await asyncio.to_thread(
+            s3_client.download_file,
+            bucket_name,
+            object_key,
+            str(local_path)
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to download {object_key}: {e}")
+        return False

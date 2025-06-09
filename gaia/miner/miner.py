@@ -233,14 +233,9 @@ class Miner:
                     "r2_bucket_name": r2_bucket_name
                 }
                 weather_task_args["r2_config"] = r2_config
-                logger.info("R2 configuration loaded successfully and will be passed to WeatherTask.")
+                self.logger.info("Loaded complete R2 configuration from environment variables during startup.")
             else:
-                missing_vars = []
-                if not r2_endpoint_url: missing_vars.append("R2_ENDPOINT_URL")
-                if not r2_access_key_id: missing_vars.append("R2_ACCESS_KEY")
-                if not r2_secret_access_key: missing_vars.append("R2_SECRET_ACCESS_KEY")
-                if not r2_bucket_name: missing_vars.append("R2_BUCKET")
-                logger.warning(f"R2 configuration incomplete. Missing environment variables: {missing_vars}. WeatherTask will not be able to use R2 storage.")
+                self.logger.warning("Incomplete R2 configuration found during startup. WeatherTask will proceed without R2 upload capabilities.")
             
             try:
                 self.weather_task = WeatherTask(**weather_task_args)
@@ -480,6 +475,13 @@ class Miner:
                                 }
                             self.weather_task.keypair = self.keypair
                             self.logger.info("WeatherTask re-configured with neuron details during startup.")
+                            
+                            # Start background workers for the WeatherTask
+                            try:
+                                await self.weather_task.start_background_workers()
+                                self.logger.info("Started WeatherTask background workers for re-initialized WeatherTask.")
+                            except Exception as worker_err:
+                                self.logger.error(f"Failed to start WeatherTask background workers for re-initialized task: {worker_err}", exc_info=True)
                         else:
                             self.logger.warning("Miner self.config not found during startup, WeatherTask config might be incomplete.")
                     else:

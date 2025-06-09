@@ -65,7 +65,8 @@ from .processing.weather_workers import (
     run_inference_background,
     fetch_and_hash_gfs_task,
     r2_cleanup_worker,
-    poll_runpod_job_worker
+    poll_runpod_job_worker,
+    weather_job_status_logger
 )
 from gaia.tasks.defined_tasks.weather.utils.inference_class import WeatherInferenceRunner
 logger = get_logger(__name__)
@@ -246,6 +247,8 @@ class WeatherTask(Task):
         self.cleanup_workers = []
         self.r2_cleanup_worker_running = False # For R2 cleanup
         self.r2_cleanup_workers = [] # For R2 cleanup
+        self.job_status_logger_running = False # For job status logging
+        self.job_status_logger_workers = [] # For job status logging
         
         self.test_mode_run_scored_event = asyncio.Event()
         self.last_test_mode_run_id = None
@@ -256,7 +259,22 @@ class WeatherTask(Task):
         self.era5_scoring_semaphore = asyncio.Semaphore(era5_scoring_concurrency)
         logger.info(f"ERA5 scoring concurrency for validator set to: {era5_scoring_concurrency}")
 
-        self.inference_runner = None 
+        # Configure file serving mode for miners
+        if self.node_type == "miner":
+            file_serving_mode = os.getenv("WEATHER_FILE_SERVING_MODE", "local").lower()
+            if file_serving_mode not in ["local", "r2_proxy"]:
+                logger.warning(f"Invalid WEATHER_FILE_SERVING_MODE: {file_serving_mode}. Defaulting to 'local'.")
+                file_serving_mode = "local"
+            
+            self.config['file_serving_mode'] = file_serving_mode
+            logger.info(f"Weather file serving mode: {file_serving_mode}")
+            
+            if file_serving_mode == "local":
+                logger.info("Files will be downloaded from R2 to local storage and served via HTTP/zarr")
+            else:
+                logger.info("Files will be served by proxying requests to R2 (no local storage)")
+
+        self.inference_runner = None
         if self.node_type == "miner":
             try:
                 # Inference type from .env or defaults
@@ -1657,6 +1675,7 @@ class WeatherTask(Task):
     async def handle_start_inference(self, job_id: str) -> Dict[str, Any]:
         """
         Handles a request from a validator to start the inference process for a given job_id.
+        This method should return quickly after launching the background inference task.
         """
         if not job_id:
             return {"status": "error", "message": "job_id is required."}
@@ -1664,52 +1683,41 @@ class WeatherTask(Task):
         logger.info(f"Miner received request to start inference for job_id: {job_id}")
 
         try:
-            async with self.gpu_semaphore:
-                logger.info(f"GPU semaphore acquired for job_id: {job_id}.")
+            # Check job status and existing runpod_job_id to prevent duplicates
+            job_query = "SELECT status, runpod_job_id FROM weather_miner_jobs WHERE id = :job_id"
+            job_details = await self.db_manager.fetch_one(job_query, {"job_id": job_id})
 
-                # Check job status and existing runpod_job_id to prevent duplicates
-                job_query = "SELECT status, runpod_job_id FROM weather_miner_jobs WHERE id = :job_id"
-                job_details = await self.db_manager.fetch_one(job_query, {"job_id": job_id})
+            if not job_details:
+                return {"status": "error", "message": f"Job ID {job_id} not found."}
 
-                if not job_details:
-                    return {"status": "error", "message": f"Job ID {job_id} not found."}
+            if job_details['runpod_job_id'] and job_details['status'] == 'in_progress':
+                logger.warning(f"[{job_id}] Received start_inference call for a job already in progress on RunPod. Acknowledging.")
+                return {"status": "inference_started", "message": "Inference already in progress."}
 
-                if job_details['runpod_job_id'] and job_details['status'] == 'in_progress':
-                    logger.warning(f"[{job_id}] Received start_inference call for a job already in progress on RunPod. Acknowledging.")
-                    return {"status": "success", "message": "Inference already in progress."}
+            inference_type = self.config.get('weather_inference_type', 'local_model')
+            logger.info(f"Launching inference for job {job_id} using type: {inference_type}")
 
-                inference_type = self.config.get('weather_inference_type', 'local_model')
-                logger.info(f"Executing inference for job {job_id} using type: {inference_type}")
+            if inference_type == "http_service":
+                # Launch background task for HTTP service inference
+                asyncio.create_task(self._run_inference_via_http_service(job_id))
+                return {"status": "inference_started", "message": "HTTP inference process initiated."}
 
-                if inference_type == "http_service":
-                    # This function now returns True if the async poller was launched successfully
-                    success = await self._run_inference_via_http_service(job_id)
-                    if success:
-                        return {"status": "success", "message": "Inference process started."}
-                    else:
-                        return {"status": "error", "message": "Failed to start inference process."}
-
-                elif inference_type == "local_model":
-                    if not self.inference_runner or not self.inference_runner.model:
-                        msg = "Local model selected but not loaded."
-                        logger.error(f"[{job_id}] {msg}")
-                        await update_job_status(self, job_id, 'failed', msg)
-                        return {"status": "error", "message": msg}
-                    
-                    await run_inference_background(task_instance=self, job_id=job_id)
-                    job_status_rec = await self.db_manager.fetch_one("SELECT status FROM weather_miner_jobs WHERE id = :job_id", {"job_id": job_id})
-                    final_status = job_status_rec['status'] if job_status_rec else 'unknown'
-
-                    if final_status == 'completed':
-                        return {"status": "success", "message": "Inference process completed."}
-                    else:
-                        return {"status": "error", "message": "Inference process failed."}
-                
-                else:
-                    msg = f"Unsupported inference type: {inference_type}"
+            elif inference_type == "local_model":
+                if not self.inference_runner or not self.inference_runner.model:
+                    msg = "Local model selected but not loaded."
                     logger.error(f"[{job_id}] {msg}")
                     await update_job_status(self, job_id, 'failed', msg)
                     return {"status": "error", "message": msg}
+                
+                # Launch background task for local model inference
+                asyncio.create_task(run_inference_background(task_instance=self, job_id=job_id))
+                return {"status": "inference_started", "message": "Local inference process initiated."}
+            
+            else:
+                msg = f"Unsupported inference type: {inference_type}"
+                logger.error(f"[{job_id}] {msg}")
+                await update_job_status(self, job_id, 'failed', msg)
+                return {"status": "error", "message": msg}
 
         except Exception as e:
             logger.error(f"Unexpected error in handle_start_inference for job {job_id}: {e}", exc_info=True)
@@ -1857,64 +1865,58 @@ class WeatherTask(Task):
         logger.info("Stopped all cleanup workers")
         
     async def start_background_workers(self, num_ensemble_workers=1, num_initial_scoring_workers=1, num_final_scoring_workers=1, num_cleanup_workers=1):
-         """Starts all background worker types."""
-         await self.start_initial_scoring_workers(num_initial_scoring_workers)
-         await self.start_final_scoring_workers(num_final_scoring_workers)
-         await self.start_cleanup_workers(num_cleanup_workers)
-         
+        if self.node_type == "validator":
+            await self.start_initial_scoring_workers(num_workers=num_initial_scoring_workers)
+            await self.start_final_scoring_workers(num_workers=num_final_scoring_workers)
+            await self.start_cleanup_workers(num_workers=num_cleanup_workers)
+        elif self.node_type == "miner":
+            if self.config.get('r2_cleanup_enabled', False):
+                await self.start_r2_cleanup_workers(num_workers=1)
+            else:
+                logger.info("R2 cleanup worker is disabled by configuration.")
+            
+            # Start job status logger for miners (enabled by default)
+            if self.config.get('job_status_logger_enabled', True):
+                await self.start_job_status_logger_workers(num_workers=1)
+            else:
+                logger.info("Job status logger worker is disabled by configuration.")
+
     async def stop_background_workers(self):
-        """Stops all background worker types with proper task cleanup."""
-        logger.info("Stopping all background workers...")
+        if self.node_type == "validator":
+            await self.stop_initial_scoring_workers()
+            await self.stop_final_scoring_workers()
+            await self.stop_cleanup_workers()
+        elif self.node_type == "miner":
+            if self.r2_cleanup_worker_running:
+                await self.stop_r2_cleanup_workers()
+            if self.job_status_logger_running:
+                await self.stop_job_status_logger_workers()
 
-        async def _stop_worker_list(worker_list, worker_name):
-            """Helper to properly stop a list of worker tasks."""
-            if not worker_list:
-                return
-            
-            logger.info(f"Stopping {len(worker_list)} {worker_name} worker(s)...")
-            
-            # Cancel all tasks
-            for worker in worker_list:
-                if not worker.done():
-                    worker.cancel()
-            
-            # Wait for cancellation to complete with timeout
-            if worker_list:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*worker_list, return_exceptions=True),
-                        timeout=5.0
-                    )
-                    logger.info(f"Successfully stopped {worker_name} workers")
-                except asyncio.TimeoutError:
-                    logger.warning(f"Timeout stopping {worker_name} workers, forcing cleanup")
-                except Exception as e:
-                    logger.warning(f"Error stopping {worker_name} workers: {e}")
-
-        # Stop each worker type
-        try: 
-            await _stop_worker_list(self.initial_scoring_workers, "initial_scoring")
-            self.initial_scoring_workers = []
-            self.initial_scoring_worker_running = False
-        except Exception as e: 
-            logger.error(f"Error stopping initial scoring workers: {e}")
-            
-        try: 
-            await _stop_worker_list(self.final_scoring_workers, "final_scoring")
-            self.final_scoring_workers = []
-            self.final_scoring_worker_running = False
-        except Exception as e: 
-            logger.error(f"Error stopping final scoring workers: {e}")
-            
-        try: 
-            await _stop_worker_list(self.cleanup_workers, "cleanup")
-            self.cleanup_workers = []
-            self.cleanup_worker_running = False
-        except Exception as e: 
-            logger.error(f"Error stopping cleanup workers: {e}")
-
-        logger.info("All background workers stopped")
+    async def _stop_worker_list(self, worker_list, worker_name):
+        """Helper to properly stop a list of worker tasks."""
+        if not worker_list:
+            return
         
+        logger.info(f"Stopping {len(worker_list)} {worker_name} worker(s)...")
+        
+        # Cancel all tasks
+        for worker in worker_list:
+            if not worker.done():
+                worker.cancel()
+        
+        # Wait for cancellation to complete with timeout
+        if worker_list:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*worker_list, return_exceptions=True),
+                    timeout=5.0
+                )
+                logger.info(f"Successfully stopped {worker_name} workers")
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout stopping {worker_name} workers, forcing cleanup")
+            except Exception as e:
+                logger.warning(f"Error stopping {worker_name} workers: {e}")
+
     async def miner_fetch_hash_worker(self):
         """Worker that periodically checks for jobs awaiting input hash verification."""
         CHECK_INTERVAL_SECONDS = 10 if self.test_mode else 60
@@ -2015,75 +2017,20 @@ class WeatherTask(Task):
             self.r2_cleanup_workers.append(task)
         logger.info(f"Started {num_workers} R2 cleanup workers.")
 
-    async def start_background_workers(self, num_ensemble_workers=1, num_initial_scoring_workers=1, num_final_scoring_workers=1, num_cleanup_workers=1):
-        if self.node_type == "validator":
-            await self.start_initial_scoring_workers(num_workers=num_initial_scoring_workers)
-            await self.start_final_scoring_workers(num_workers=num_final_scoring_workers)
-            await self.start_cleanup_workers(num_workers=num_cleanup_workers)
-        elif self.node_type == "miner":
-            if self.config.get('r2_cleanup_enabled', False):
-                await self.start_r2_cleanup_workers(num_workers=1)
-            else:
-                logger.info("R2 cleanup worker is disabled by configuration.")
+    async def start_job_status_logger_workers(self, num_workers=1):
+        if self.job_status_logger_running:
+            logger.info("Job status logger workers are already running.")
+            return
+        self.job_status_logger_running = True
+        for i in range(num_workers):
+            task = asyncio.create_task(weather_job_status_logger(self))
+            self.job_status_logger_workers.append(task)
+        logger.info(f"Started {num_workers} job status logger workers.")
 
+    async def stop_job_status_logger_workers(self):
+        await self._stop_worker_list(self.job_status_logger_workers, "Job Status Logger")
+        self.job_status_logger_running = False
 
-    async def stop_background_workers(self):
-        if self.node_type == "validator":
-            await self.stop_initial_scoring_workers()
-            await self.stop_final_scoring_workers()
-            await self.stop_cleanup_workers()
-        elif self.node_type == "miner":
-            if self.r2_cleanup_worker_running:
-                await self.stop_r2_cleanup_workers()
-
-        async def _stop_worker_list(worker_list, worker_name):
-            if not worker_list:
-                return
-            
-            logger.info(f"Stopping {len(worker_list)} {worker_name} worker(s)...")
-            
-            # Cancel all tasks
-            for worker in worker_list:
-                if not worker.done():
-                    worker.cancel()
-            
-            # Wait for cancellation to complete with timeout
-            if worker_list:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*worker_list, return_exceptions=True),
-                        timeout=5.0
-                    )
-                    logger.info(f"Successfully stopped {worker_name} workers")
-                except asyncio.TimeoutError:
-                    logger.warning(f"Timeout stopping {worker_name} workers, forcing cleanup")
-                except Exception as e:
-                    logger.warning(f"Error stopping {worker_name} workers: {e}")
-
-        # Stop each worker type
-        try: 
-            await _stop_worker_list(self.initial_scoring_workers, "initial_scoring")
-            self.initial_scoring_workers = []
-            self.initial_scoring_worker_running = False
-        except Exception as e: 
-            logger.error(f"Error stopping initial scoring workers: {e}")
-            
-        try: 
-            await _stop_worker_list(self.final_scoring_workers, "final_scoring")
-            self.final_scoring_workers = []
-            self.final_scoring_worker_running = False
-        except Exception as e: 
-            logger.error(f"Error stopping final scoring workers: {e}")
-            
-        try: 
-            await _stop_worker_list(self.cleanup_workers, "cleanup")
-            self.cleanup_workers = []
-            self.cleanup_worker_running = False
-        except Exception as e: 
-            logger.error(f"Error stopping cleanup workers: {e}")
-
-        logger.info("All background workers stopped")
-        
     async def _load_batch_from_db(self, job_id: str) -> Optional[Batch]:
         """Loads the initial batch object from the pickle file path stored in the database."""
         logger.info(f"[{job_id}] Loading initial batch from database path.")

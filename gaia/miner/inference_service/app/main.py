@@ -34,13 +34,19 @@ import sys # Ensure sys is imported if you use it for stdout/stderr explicitly l
 
 import boto3 # For R2
 from botocore.exceptions import ClientError # For R2 error handling
+from botocore.config import Config
 
 # --- Global Variables to be populated at startup --- 
-APP_CONFIG: Dict[str, Any] = {}
-EXPECTED_API_KEY: Optional[str] = None
+APP_CONFIG = None
+EXPECTED_API_KEY = None
 INITIALIZED = False # Flag for lazy initialization
-S3_CLIENT: Optional[boto3.client] = None # For R2
-R2_CONFIG: Dict[str, Any] = {} # For R2 connection details
+S3_CLIENT = None  # Will be set to a boto3 S3 client if R2 is configured
+R2_CONFIG = {}    # Will be set to a dict with R2 config if available
+MODEL_HANDLER = None # Will be set to model handler if inference is enabled
+INFERENCE_CONFIG = None
+
+# Semaphore to limit concurrent R2 uploads (prevents connection pool exhaustion)
+R2_UPLOAD_SEMAPHORE = asyncio.Semaphore(20)  # Allow max 20 concurrent uploads
 
 # --- Logging Configuration (Initial basic setup) ---
 _log_level_str = os.getenv("LOG_LEVEL", "DEBUG").upper()
@@ -271,20 +277,23 @@ async def _upload_to_r2(object_key: str, file_path: Path) -> bool:
 
     bucket_name = R2_CONFIG['bucket_name']
     _logger.info(f"Attempting to upload {file_path} to s3://{bucket_name}/{object_key}")
-    try:
-        await asyncio.to_thread(
-            S3_CLIENT.upload_file,
-            str(file_path),
-            bucket_name,
-            object_key
-        )
-        _logger.info(f"Successfully uploaded {file_path} to s3://{bucket_name}/{object_key}")
-        return True
-    except ClientError as e_ce:
-        _logger.error(f"ClientError during R2 upload of {file_path} to s3://{bucket_name}/{object_key}: {e_ce.response.get('Error', {}).get('Message', str(e_ce))}", exc_info=True)
-    except Exception as e:
-        _logger.error(f"Unexpected error during R2 upload of {file_path} to s3://{bucket_name}/{object_key}: {e}", exc_info=True)
-    return False
+    
+    # Use semaphore to limit concurrent uploads
+    async with R2_UPLOAD_SEMAPHORE:
+        try:
+            await asyncio.to_thread(
+                S3_CLIENT.upload_file,
+                str(file_path),
+                bucket_name,
+                object_key
+            )
+            _logger.info(f"Successfully uploaded {file_path} to s3://{bucket_name}/{object_key}")
+            return True
+        except ClientError as e_ce:
+            _logger.error(f"ClientError during R2 upload of {file_path} to s3://{bucket_name}/{object_key}: {e_ce.response.get('Error', {}).get('Message', str(e_ce))}", exc_info=True)
+        except Exception as e:
+            _logger.error(f"Unexpected error during R2 upload of {file_path} to s3://{bucket_name}/{object_key}: {e}", exc_info=True)
+        return False
 
 async def _upload_bytes_to_r2(object_key: str, data: bytes) -> bool:
     """Uploads a bytes object to the configured R2 bucket."""
@@ -298,21 +307,24 @@ async def _upload_bytes_to_r2(object_key: str, data: bytes) -> bool:
 
     bucket_name = R2_CONFIG['bucket_name']
     _logger.info(f"Attempting to upload {len(data)} bytes to s3://{bucket_name}/{object_key}")
-    try:
-        with io.BytesIO(data) as f:
-            await asyncio.to_thread(
-                S3_CLIENT.upload_fileobj,
-                f,
-                bucket_name,
-                object_key
-            )
-        _logger.info(f"Successfully uploaded bytes to s3://{bucket_name}/{object_key}")
-        return True
-    except ClientError as e_ce:
-        _logger.error(f"ClientError during R2 bytes upload to s3://{bucket_name}/{object_key}: {e_ce.response.get('Error', {}).get('Message', str(e_ce))}", exc_info=True)
-    except Exception as e:
-        _logger.error(f"Unexpected error during R2 bytes upload to s3://{bucket_name}/{object_key}: {e}", exc_info=True)
-    return False
+    
+    # Use semaphore to limit concurrent uploads
+    async with R2_UPLOAD_SEMAPHORE:
+        try:
+            with io.BytesIO(data) as f:
+                await asyncio.to_thread(
+                    S3_CLIENT.upload_fileobj,
+                    f,
+                    bucket_name,
+                    object_key
+                )
+            _logger.info(f"Successfully uploaded bytes to s3://{bucket_name}/{object_key}")
+            return True
+        except ClientError as e_ce:
+            _logger.error(f"ClientError during R2 bytes upload to s3://{bucket_name}/{object_key}: {e_ce.response.get('Error', {}).get('Message', str(e_ce))}", exc_info=True)
+        except Exception as e:
+            _logger.error(f"Unexpected error during R2 bytes upload to s3://{bucket_name}/{object_key}: {e}", exc_info=True)
+        return False
 
 # --- Pydantic Models for API (can be kept for structure, though not directly used by RunPod handler) ---
 class InferencePayload(BaseModel):
@@ -415,18 +427,21 @@ async def _process_and_upload_steps(
         return 0, output_r2_prefix, "No steps were successfully processed for upload."
 
     # --- Execute all uploads in parallel ---
-    _logger.info(f"[{job_run_uuid}] Submitting {len(upload_tasks)} upload tasks to R2 for prefix '{output_r2_prefix}'.")
+    _logger.info(f"[{job_run_uuid}] Submitting {len(upload_tasks)} upload tasks to R2 for prefix '{output_r2_prefix}' (max {R2_UPLOAD_SEMAPHORE._value} concurrent).")
     results = await asyncio.gather(*upload_tasks, return_exceptions=True)
 
     # Process results
     successful_uploads = 0
     failed_uploads = 0
-    for res in results:
+    for i, res in enumerate(results):
         if res is True:
             successful_uploads += 1
+            # Log progress every 10 successful uploads to reduce log noise
+            if successful_uploads % 10 == 0 or successful_uploads == len(results):
+                _logger.info(f"[{job_run_uuid}] Upload progress: {successful_uploads}/{len(upload_tasks)} completed")
         else:
             failed_uploads += 1
-            _logger.error(f"[{job_run_uuid}] An upload task failed. Result/Exception: {res}")
+            _logger.error(f"[{job_run_uuid}] Upload task {i+1} failed. Result/Exception: {res}")
             
     num_steps_uploaded = successful_uploads
 
@@ -816,15 +831,27 @@ async def initialize_app_for_runpod():
                 
                 try:
                     _logger.info(f"R2_INIT_INFO: Attempting to initialize S3 client for R2. Endpoint: {R2_CONFIG['endpoint_url']}, Bucket: {R2_CONFIG['bucket_name']}")
+                    
+                    # Configure boto3 for high-concurrency uploads
+                    r2_config = Config(
+                        signature_version='s3v4',
+                        max_pool_connections=50,  # Increase from default 10 to handle concurrent uploads
+                        retries={
+                            'max_attempts': 3,
+                            'mode': 'adaptive'
+                        },
+                        tcp_keepalive=True,
+                        region_name='auto'
+                    )
+                    
                     S3_CLIENT = boto3.client(
                         's3',
                         endpoint_url=R2_CONFIG['endpoint_url'],
                         aws_access_key_id=R2_CONFIG['aws_access_key_id'],
                         aws_secret_access_key=R2_CONFIG['aws_secret_access_key'],
-                        config=boto3.session.Config(signature_version='s3v4'), # Important for R2
-                        region_name='auto' # R2 is region-less, 'auto' is often fine or can be omitted
+                        config=r2_config
                     )
-                    _logger.info("R2_INIT_SUCCESS: S3 client for R2 initialized successfully.")
+                    _logger.info("R2_INIT_SUCCESS: S3 client for R2 initialized successfully with high-concurrency config.")
                     # Test connection by listing buckets (optional, can be noisy, but good for debugging now)
                     # try:
                     #     response = S3_CLIENT.list_buckets()
