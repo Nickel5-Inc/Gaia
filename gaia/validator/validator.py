@@ -64,6 +64,7 @@ import numpy as np
 from gaia.validator.basemodel_evaluator import BaseModelEvaluator
 from gaia.validator.utils.db_wipe import handle_db_wipe
 from gaia.validator.utils.earthdata_tokens import ensure_valid_earthdata_token
+from gaia.validator.utils.substrate_manager import SubstrateConnectionManager
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 
 # Imports for Alembic check
@@ -396,6 +397,8 @@ class GaiaValidator:
             if not math.isclose(sum(weights_dict.values()), 1.0):
                 logger.error(f"Task weights for threshold {dt_thresh.isoformat()} do not sum to 1.0! Sum: {sum(weights_dict.values())}. Fix configuration.")
 
+        # Initialize substrate connection manager (will be set up in setup_neuron)
+        self.substrate_manager: Optional[SubstrateConnectionManager] = None
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -600,6 +603,12 @@ class GaiaValidator:
                     [self.netuid, self.keypair.ss58_address]
                 ).value
             validator_uid = self.validator_uid
+
+            # Initialize substrate connection manager
+            self.substrate_manager = SubstrateConnectionManager(
+                subtensor_network=self.subtensor_network,
+                chain_endpoint=self.subtensor_chain_endpoint
+            )
 
             return True
         except Exception as e:
@@ -1360,6 +1369,8 @@ class GaiaValidator:
     async def _sync_metagraph(self):
         """Sync the metagraph."""
         sync_start = time.time()
+        # Use managed substrate connection for metagraph operations
+        self.substrate = self.substrate_manager.get_connection()
         self.metagraph.sync_nodes()
         sync_duration = time.time() - sync_start
         self.last_metagraph_sync = time.time()
@@ -1421,6 +1432,14 @@ class GaiaValidator:
                     logger.info("Cleaned up WeatherTask resources")
             except Exception as e:
                 logger.debug(f"Error cleaning up WeatherTask: {e}")
+
+            # Clean up substrate connection manager
+            try:
+                if hasattr(self, 'substrate_manager') and self.substrate_manager:
+                    self.substrate_manager.cleanup()
+                    logger.info("Cleaned up substrate connection manager")
+            except Exception as e:
+                logger.debug(f"Error cleaning up substrate manager: {e}")
 
             # Aggressive fsspec/gcsfs cleanup to prevent session errors blocking PM2 restart
             try:
@@ -1491,7 +1510,7 @@ class GaiaValidator:
             elif task_name == "geomagnetic":
                 await self.geomagnetic_task.cleanup_resources()
             elif task_name == "scoring":
-                self.substrate = interface.get_substrate(subtensor_network=self.subtensor_network)
+                self.substrate = self.substrate_manager.force_reconnect()
                 self.metagraph.sync_nodes()
             elif task_name == "deregistration":
                 self.metagraph.sync_nodes()
@@ -1851,12 +1870,13 @@ class GaiaValidator:
 
                 # Add DB Sync tasks conditionally
                 if self.is_source_validator_for_db_sync and self.backup_manager:
-                    logger.info(f"Adding DB Sync Backup task (interval: {self.db_sync_interval_hours}h).")
-                    # Using insert to make it one of the earlier tasks, but order might not be critical.
-                    tasks_lambdas.insert(0, lambda: self.backup_manager.start_periodic_backups(self.db_sync_interval_hours))
+                    logger.info(f"DB Sync Backup task available but handled by cron (interval: {self.db_sync_interval_hours}h).")
+                    # Note: Periodic backups are now handled by cron jobs (see setup-primary.sh)
+                    # BackupManager provides ad-hoc backup capabilities only
                 elif not self.is_source_validator_for_db_sync and self.restore_manager:
-                    logger.info(f"Adding DB Sync Restore task (interval: {self.db_sync_interval_hours}h).")
-                    tasks_lambdas.insert(0, lambda: self.restore_manager.start_periodic_restores(self.db_sync_interval_hours))
+                    logger.info(f"DB Sync Restore task available for ad-hoc operations (interval: {self.db_sync_interval_hours}h).")
+                    # Note: Periodic restores don't fit pgBackRest model well - replicas should use streaming replication
+                    # RestoreManager provides ad-hoc restore capabilities only
                 else:
                     logger.info("DB Sync is not active for this node (either source or replica manager failed to init, not configured, or Azure manager failed).")
 
@@ -1970,6 +1990,7 @@ class GaiaValidator:
             wallet_name=self.wallet_name,
             hotkey_name=self.hotkey_name,
             network=self.subtensor_network,
+            substrate_manager=self.substrate_manager,
         )
 
         while True:
@@ -2087,7 +2108,7 @@ class GaiaValidator:
                 logger.error("Weight setting operation timed out - restarting cycle")
                 await self.update_task_status('scoring', 'error')
                 try:
-                    self.substrate = await interface.async_get_substrate(subtensor_network=self.subtensor_network)
+                    self.substrate = self.substrate_manager.force_reconnect()
                 except Exception as e:
                     logger.error(f"Failed to reconnect to substrate: {e}")
                 await asyncio.sleep(12)
@@ -2120,10 +2141,7 @@ class GaiaValidator:
                 except Exception as block_error:
 
                     try:
-                        self.substrate = get_substrate(
-                            subtensor_network=self.subtensor_network,
-                            subtensor_address=self.subtensor_chain_endpoint
-                        )
+                        self.substrate = self.substrate_manager.get_connection()
                     except Exception as e:
                         logger.error(f"Failed to reconnect to substrate: {e}")
 
@@ -2707,7 +2725,6 @@ class GaiaValidator:
         if self.is_source_validator_for_db_sync:
             logger.info("This node is configured as the SOURCE for DB Sync.")
             self.backup_manager = await get_backup_manager(
-                self.storage_manager_for_sync,
                 test_mode=self.args.test  # Pass test_mode
             )
             if not self.backup_manager:

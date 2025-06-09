@@ -17,9 +17,13 @@ from gaia import __spec_version__
 logger = get_logger(__name__)
 
 
-async def get_active_validator_uids(netuid, subtensor_network="finney", chain_endpoint=None, recent_blocks=500):
+async def get_active_validator_uids(netuid, substrate_manager=None, subtensor_network="finney", chain_endpoint=None, recent_blocks=500):
     try:
-        substrate = SubstrateInterface(url=chain_endpoint) if chain_endpoint else get_substrate(subtensor_network=subtensor_network)
+        # Use managed connection if available, otherwise create a new one
+        if substrate_manager:
+            substrate = substrate_manager.get_connection()
+        else:
+            substrate = SubstrateInterface(url=chain_endpoint) if chain_endpoint else get_substrate(subtensor_network=subtensor_network)
         
         loop = asyncio.get_event_loop()
         validator_permits = await loop.run_in_executor(
@@ -55,11 +59,17 @@ class FiberWeightSetter:
             hotkey_name: str = "default",
             network: str = "finney",
             timeout: int = 30,
+            substrate_manager=None,
     ):
-        """Initialize the weight setter with fiber"""
+        """Initialize the weight setter with fiber and optional substrate manager"""
         self.netuid = netuid
         self.network = network
-        self.substrate = interface.get_substrate(subtensor_network=network)
+        self.substrate_manager = substrate_manager
+        # Use managed connection if available, otherwise create a new one
+        if self.substrate_manager:
+            self.substrate = self.substrate_manager.get_connection()
+        else:
+            self.substrate = interface.get_substrate(subtensor_network=network)
         self.nodes = None
         self.keypair = chain_utils.load_hotkey_keypair(
             wallet_name=wallet_name, hotkey_name=hotkey_name
@@ -181,7 +191,11 @@ class FiberWeightSetter:
 
             logger.info(f"\nSetting weights for subnet {self.netuid}...")
 
-            self.substrate = interface.get_substrate(subtensor_network=self.network)
+            # Use managed connection if available, otherwise create a new one
+            if self.substrate_manager:
+                self.substrate = self.substrate_manager.get_connection()
+            else:
+                self.substrate = interface.get_substrate(subtensor_network=self.network)
             self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
             logger.info(f"Found {len(self.nodes)} nodes in subnet")
 
@@ -197,7 +211,11 @@ class FiberWeightSetter:
                 logger.error("❗Validator not found in nodes list")
                 return False
 
-            active_validator_uids = await get_active_validator_uids(netuid=self.netuid, subtensor_network=self.network)
+            active_validator_uids = await get_active_validator_uids(
+                netuid=self.netuid, 
+                substrate_manager=self.substrate_manager,
+                subtensor_network=self.network
+            )
             logger.info(f"Found {len(active_validator_uids)} active validators - zeroing their weights")
             
             weights_copy = weights.copy()
