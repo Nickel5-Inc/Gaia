@@ -212,6 +212,65 @@ async def evaluate_miner_forecast_day1(
                     truth_var_da_unaligned = gfs_analysis_lead[var_name]
                     ref_var_da_unaligned = gfs_reference_lead[var_name]
 
+                    # Add detailed diagnostics for potential unit mismatches
+                    logger.info(f"[Day1Score] RAW DATA DIAGNOSTICS for {var_key} at {valid_time_dt}:")
+                    
+                    # Log data ranges before any processing
+                    miner_min, miner_max, miner_mean = float(miner_var_da_unaligned.min()), float(miner_var_da_unaligned.max()), float(miner_var_da_unaligned.mean())
+                    truth_min, truth_max, truth_mean = float(truth_var_da_unaligned.min()), float(truth_var_da_unaligned.max()), float(truth_var_da_unaligned.mean())
+                    ref_min, ref_max, ref_mean = float(ref_var_da_unaligned.min()), float(ref_var_da_unaligned.max()), float(ref_var_da_unaligned.mean())
+                    
+                    logger.info(f"[Day1Score] Miner {var_key}: range=[{miner_min:.1f}, {miner_max:.1f}], mean={miner_mean:.1f}, units={miner_var_da_unaligned.attrs.get('units', 'unknown')}")
+                    logger.info(f"[Day1Score] Truth {var_key}: range=[{truth_min:.1f}, {truth_max:.1f}], mean={truth_mean:.1f}, units={truth_var_da_unaligned.attrs.get('units', 'unknown')}")
+                    logger.info(f"[Day1Score] Ref   {var_key}: range=[{ref_min:.1f}, {ref_max:.1f}], mean={ref_mean:.1f}, units={ref_var_da_unaligned.attrs.get('units', 'unknown')}")
+                    
+                    # Check for potential unit mismatch indicators
+                    if var_name == 'z' and var_level == 500:
+                        # For z500, geopotential should be ~49000-58000 m²/s²
+                        # If it's geopotential height, it would be ~5000-6000 m
+                        miner_ratio = miner_mean / 9.80665  # If miner is geopotential, this ratio should be ~5000-6000
+                        truth_ratio = truth_mean / 9.80665
+                        logger.info(f"[Day1Score] z500 UNIT CHECK - If geopotential (m²/s²): miner_mean/g={miner_ratio:.1f}m, truth_mean/g={truth_ratio:.1f}m")
+                        
+                        if miner_mean < 10000:  # Much smaller than expected geopotential
+                            logger.warning(f"[Day1Score] POTENTIAL UNIT MISMATCH: Miner z500 mean ({miner_mean:.1f}) suggests geopotential height (m) rather than geopotential (m²/s²)")
+                        elif truth_mean > 40000 and miner_mean > 40000:
+                            logger.info(f"[Day1Score] Unit check OK: Both miner and truth z500 appear to be geopotential (m²/s²)")
+                    
+                    elif var_name == '2t':
+                        # Temperature should be ~200-320 K
+                        if miner_mean < 200 or miner_mean > 350:
+                            logger.warning(f"[Day1Score] POTENTIAL UNIT ISSUE: Miner 2t mean ({miner_mean:.1f}) outside expected range for Kelvin")
+                            
+                    elif var_name == 'msl':
+                        # Mean sea level pressure should be ~90000-110000 Pa
+                        if miner_mean < 50000 or miner_mean > 150000:
+                            logger.warning(f"[Day1Score] POTENTIAL UNIT ISSUE: Miner msl mean ({miner_mean:.1f}) outside expected range for Pa")
+
+                    # AUTOMATIC UNIT CONVERSION: Convert geopotential height to geopotential if needed
+                    if var_name == 'z' and miner_mean < 10000 and truth_mean > 40000:
+                        logger.warning(f"[Day1Score] AUTOMATIC UNIT CONVERSION: Converting miner z from geopotential height (m) to geopotential (m²/s²)")
+                        miner_var_da_unaligned = miner_var_da_unaligned * 9.80665
+                        miner_var_da_unaligned.attrs['units'] = 'm2 s-2'
+                        miner_var_da_unaligned.attrs['long_name'] = 'Geopotential (auto-converted from height)'
+                        logger.info(f"[Day1Score] After conversion: miner z range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}")
+
+                    # Check for temperature unit conversions (Celsius to Kelvin)
+                    elif var_name in ['2t', 't'] and miner_mean < 100 and truth_mean > 200:
+                        logger.warning(f"[Day1Score] AUTOMATIC UNIT CONVERSION: Converting miner {var_name} from Celsius to Kelvin")
+                        miner_var_da_unaligned = miner_var_da_unaligned + 273.15
+                        miner_var_da_unaligned.attrs['units'] = 'K'
+                        miner_var_da_unaligned.attrs['long_name'] = f'{miner_var_da_unaligned.attrs.get("long_name", var_name)} (auto-converted from Celsius)'
+                        logger.info(f"[Day1Score] After conversion: miner {var_name} range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}")
+
+                    # Check for pressure unit conversions (hPa to Pa)
+                    elif var_name == 'msl' and miner_mean < 2000 and truth_mean > 50000:
+                        logger.warning(f"[Day1Score] AUTOMATIC UNIT CONVERSION: Converting miner msl from hPa to Pa")
+                        miner_var_da_unaligned = miner_var_da_unaligned * 100.0
+                        miner_var_da_unaligned.attrs['units'] = 'Pa'
+                        miner_var_da_unaligned.attrs['long_name'] = 'Mean sea level pressure (auto-converted from hPa)'
+                        logger.info(f"[Day1Score] After conversion: miner msl range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}")
+
                     if var_level:
                         # Handle different pressure level dimension names for each dataset
                         def find_pressure_dim(data_array, dataset_name="dataset"):
