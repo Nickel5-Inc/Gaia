@@ -1706,7 +1706,7 @@ class WeatherTask(Task):
             # If hashing is done and we are waiting for the validator to trigger inference,
             # report the specific status the validator is looking for.
             if status_to_report == 'in_progress' and result.get('input_data_hash'):
-                status_to_report = WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION
+                status_to_report = WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION.value
 
             response = {
                 "job_id": job_id,
@@ -2175,11 +2175,18 @@ class WeatherTask(Task):
             logger.error(f"Response validation failed: expected dict, got {type(response_dict)}")
             return {"status": WeatherTaskStatus.ERROR.value, "message": "Invalid response format"}
         
-        # Convert any WeatherTaskStatus enum values to strings
-        if "status" in response_dict:
-            if isinstance(response_dict["status"], WeatherTaskStatus):
-                response_dict["status"] = response_dict["status"].value
-                logger.debug(f"Converted enum status to string: {response_dict['status']}")
+        # Convert any WeatherTaskStatus enum values to strings throughout the entire dictionary
+        def convert_enums_to_strings(obj):
+            if isinstance(obj, WeatherTaskStatus):
+                return obj.value
+            elif isinstance(obj, dict):
+                return {k: convert_enums_to_strings(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_enums_to_strings(item) for item in obj]
+            else:
+                return obj
+        
+        response_dict = convert_enums_to_strings(response_dict)
         
         # Check for required fields
         missing_fields = [field for field in expected_fields if field not in response_dict]
