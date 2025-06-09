@@ -244,6 +244,9 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                 await update_job_status(task_instance, job_id, "error", err_msg)
                 return
 
+            # DIAGNOSTIC: Add detailed logging to compare data processing paths
+            logger.info(f"[InferenceTask Job {job_id}] DIAGNOSTIC - LOCAL MODEL INFERENCE PIPELINE STARTED")
+
             logger.info(f"[InferenceTask Job {job_id}] Fetching GFS data for local model (T0={gfs_init_time_utc}, T-6={gfs_t_minus_6_time_utc})...")
             ds_t0 = await fetch_gfs_analysis_data([gfs_init_time_utc], cache_dir=local_gfs_cache_dir)
             ds_t_minus_6 = await fetch_gfs_analysis_data([gfs_t_minus_6_time_utc], cache_dir=local_gfs_cache_dir)
@@ -253,17 +256,82 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                 await update_job_status(task_instance, job_id, "error", err_msg)
                 return
             
+            logger.info(f"[InferenceTask Job {job_id}] DIAGNOSTIC - LOCAL MODEL - Raw GFS data loaded:")
+            logger.info(f"[InferenceTask Job {job_id}]   - ds_t0 variables: {list(ds_t0.data_vars.keys())}")
+            logger.info(f"[InferenceTask Job {job_id}]   - ds_t0 dims: {dict(ds_t0.dims)}")
+            logger.info(f"[InferenceTask Job {job_id}]   - ds_t_minus_6 variables: {list(ds_t_minus_6.data_vars.keys())}")
+            logger.info(f"[InferenceTask Job {job_id}]   - ds_t_minus_6 dims: {dict(ds_t_minus_6.dims)}")
+            
             logger.info(f"[InferenceTask Job {job_id}] Preparing Aurora batch from GFS data for local model...")
             gfs_concat_data_for_batch_prep = xr.concat([ds_t0, ds_t_minus_6], dim='time').sortby('time')
-            prepared_batch = await asyncio.to_thread( # Assign to prepared_batch
-                create_aurora_batch_from_gfs, 
-                gfs_data=gfs_concat_data_for_batch_prep
+            
+            # DIAGNOSTIC: Log combined dataset details
+            logger.info(f"[InferenceTask Job {job_id}] DIAGNOSTIC - LOCAL MODEL - Combined GFS data:")
+            logger.info(f"[InferenceTask Job {job_id}]   - Combined variables: {list(gfs_concat_data_for_batch_prep.data_vars.keys())}")
+            logger.info(f"[InferenceTask Job {job_id}]   - Combined dims: {dict(gfs_concat_data_for_batch_prep.dims)}")
+            logger.info(f"[InferenceTask Job {job_id}]   - Time values: {gfs_concat_data_for_batch_prep.time.values}")
+            if 'lat' in gfs_concat_data_for_batch_prep.coords:
+                lat_vals = gfs_concat_data_for_batch_prep.lat.values
+                logger.info(f"[InferenceTask Job {job_id}]   - Lat range: [{lat_vals.min():.3f}, {lat_vals.max():.3f}], shape: {lat_vals.shape}")
+            if 'lon' in gfs_concat_data_for_batch_prep.coords:
+                lon_vals = gfs_concat_data_for_batch_prep.lon.values
+                logger.info(f"[InferenceTask Job {job_id}]   - Lon range: [{lon_vals.min():.3f}, {lon_vals.max():.3f}], shape: {lon_vals.shape}")
+            
+            # Log sample variable data to check for potential issues
+            for var_name in ['2t', 'msl', 'z', 't']:
+                if var_name in gfs_concat_data_for_batch_prep:
+                    var_data = gfs_concat_data_for_batch_prep[var_name]
+                    var_min, var_max, var_mean = float(var_data.min()), float(var_data.max()), float(var_data.mean())
+                    logger.info(f"[InferenceTask Job {job_id}]     - GFS {var_name}: shape={var_data.shape}, range=[{var_min:.6f}, {var_max:.6f}], mean={var_mean:.6f}")
+            
+            prepared_batch = await asyncio.to_thread(
+                create_aurora_batch_from_gfs,
+                gfs_data=gfs_concat_data_for_batch_prep,
+                resolution='0.25',
+                download_dir='./static_data',
+                history_steps=2
             )
             if prepared_batch is None:
                 err_msg = "Failed to create Aurora batch for local model from GFS data."
                 logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
                 await update_job_status(task_instance, job_id, "error", err_msg)
                 return
+            
+            # DIAGNOSTIC: Log batch details to compare with HTTP processing
+            try:
+                logger.info(f"[InferenceTask Job {job_id}] DIAGNOSTIC - LOCAL MODEL BATCH CREATED:")
+                logger.info(f"[InferenceTask Job {job_id}]   - Type: {type(prepared_batch)}")
+                if hasattr(prepared_batch, 'metadata'):
+                    if hasattr(prepared_batch.metadata, 'time'):
+                        logger.info(f"[InferenceTask Job {job_id}]   - Metadata time: {prepared_batch.metadata.time}")
+                    if hasattr(prepared_batch.metadata, 'lat'):
+                        logger.info(f"[InferenceTask Job {job_id}]   - Lat shape: {prepared_batch.metadata.lat.shape}, range: [{float(prepared_batch.metadata.lat.min()):.3f}, {float(prepared_batch.metadata.lat.max()):.3f}]")
+                    if hasattr(prepared_batch.metadata, 'lon'):
+                        logger.info(f"[InferenceTask Job {job_id}]   - Lon shape: {prepared_batch.metadata.lon.shape}, range: [{float(prepared_batch.metadata.lon.min()):.3f}, {float(prepared_batch.metadata.lon.max()):.3f}]")
+                    if hasattr(prepared_batch.metadata, 'atmos_levels'):
+                        logger.info(f"[InferenceTask Job {job_id}]   - Pressure levels: {prepared_batch.metadata.atmos_levels}")
+                
+                if hasattr(prepared_batch, 'surf_vars'):
+                    logger.info(f"[InferenceTask Job {job_id}]   - Surface variables: {list(prepared_batch.surf_vars.keys())}")
+                    for var_name, tensor in prepared_batch.surf_vars.items():
+                        var_min, var_max, var_mean = float(tensor.min()), float(tensor.max()), float(tensor.mean())
+                        logger.info(f"[InferenceTask Job {job_id}]     - {var_name}: shape={tensor.shape}, range=[{var_min:.6f}, {var_max:.6f}], mean={var_mean:.6f}")
+                
+                if hasattr(prepared_batch, 'atmos_vars'):
+                    logger.info(f"[InferenceTask Job {job_id}]   - Atmospheric variables: {list(prepared_batch.atmos_vars.keys())}")
+                    for var_name, tensor in prepared_batch.atmos_vars.items():
+                        var_min, var_max, var_mean = float(tensor.min()), float(tensor.max()), float(tensor.mean())
+                        logger.info(f"[InferenceTask Job {job_id}]     - {var_name}: shape={tensor.shape}, range=[{var_min:.6f}, {var_max:.6f}], mean={var_mean:.6f}")
+                
+                if hasattr(prepared_batch, 'static_vars'):
+                    logger.info(f"[InferenceTask Job {job_id}]   - Static variables: {list(prepared_batch.static_vars.keys())}")
+                    for var_name, tensor in prepared_batch.static_vars.items():
+                        var_min, var_max, var_mean = float(tensor.min()), float(tensor.max()), float(tensor.mean())
+                        logger.info(f"[InferenceTask Job {job_id}]     - {var_name}: shape={tensor.shape}, range=[{var_min:.6f}, {var_max:.6f}], mean={var_mean:.6f}")
+                        
+            except Exception as e:
+                logger.warning(f"[InferenceTask Job {job_id}] Error during local batch diagnostics: {e}")
+            
             logger.info(f"[InferenceTask Job {job_id}] Aurora batch prepared for local model. Type: {type(prepared_batch)}")
         
         else:
@@ -1258,7 +1326,10 @@ async def fetch_and_hash_gfs_task(
         gfs_concat_data_for_batch_prep = xr.concat([ds_t0, ds_t_minus_6], dim='time').sortby('time')
         initial_batch = await asyncio.to_thread(
             create_aurora_batch_from_gfs,
-            gfs_data=gfs_concat_data_for_batch_prep
+            gfs_data=gfs_concat_data_for_batch_prep,
+            resolution='0.25',
+            download_dir='./static_data',
+            history_steps=2
         )
         if initial_batch is None:
             logger.error(f"[FetchHashTask Job {job_id}] Failed to create Aurora Batch (create_aurora_batch_from_gfs returned None).")

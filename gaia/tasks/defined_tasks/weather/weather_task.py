@@ -594,6 +594,9 @@ class WeatherTask(Task):
         """
         logger.info(f"[{job_id}] Starting async inference via HTTP service.")
         
+        # DIAGNOSTIC: Add detailed logging to compare data processing paths
+        logger.info(f"[{job_id}] DIAGNOSTIC - HTTP SERVICE INFERENCE PIPELINE STARTED")
+        
         # Check for duplicates before expensive operations
         try:
             # Get job details including GFS timestep
@@ -609,6 +612,8 @@ class WeatherTask(Task):
             current_status = job_check_details['status']
             gfs_init_time = job_check_details['gfs_init_time_utc']
             existing_runpod_id = job_check_details['runpod_job_id']
+            
+            logger.info(f"[{job_id}] DIAGNOSTIC - Job status: {current_status}, GFS time: {gfs_init_time}")
             
             # Check if this job already has a RunPod job running
             if existing_runpod_id and current_status == 'in_progress':
@@ -642,7 +647,8 @@ class WeatherTask(Task):
         except Exception as e:
             logger.error(f"[{job_id}] Error during HTTP inference duplicate check: {e}", exc_info=True)
             # Continue with inference if duplicate check fails to avoid blocking valid jobs
-        
+
+        logger.info(f"[{job_id}] DIAGNOSTIC - HTTP SERVICE - Loading data from batch pickle path...")
         s3_client = await self._get_r2_s3_client()
         if not s3_client:
             await update_job_status(self, job_id, 'failed', "R2 client configuration invalid.")
@@ -652,6 +658,41 @@ class WeatherTask(Task):
         if not initial_batch:
             await update_job_status(self, job_id, 'failed', "Failed to load initial data batch.")
             return False
+
+        # DIAGNOSTIC: Log batch details to compare with local processing
+        try:
+            logger.info(f"[{job_id}] DIAGNOSTIC - HTTP SERVICE BATCH LOADED:")
+            logger.info(f"[{job_id}]   - Type: {type(initial_batch)}")
+            if hasattr(initial_batch, 'metadata'):
+                if hasattr(initial_batch.metadata, 'time'):
+                    logger.info(f"[{job_id}]   - Metadata time: {initial_batch.metadata.time}")
+                if hasattr(initial_batch.metadata, 'lat'):
+                    logger.info(f"[{job_id}]   - Lat shape: {initial_batch.metadata.lat.shape}, range: [{float(initial_batch.metadata.lat.min()):.3f}, {float(initial_batch.metadata.lat.max()):.3f}]")
+                if hasattr(initial_batch.metadata, 'lon'):
+                    logger.info(f"[{job_id}]   - Lon shape: {initial_batch.metadata.lon.shape}, range: [{float(initial_batch.metadata.lon.min()):.3f}, {float(initial_batch.metadata.lon.max()):.3f}]")
+                if hasattr(initial_batch.metadata, 'atmos_levels'):
+                    logger.info(f"[{job_id}]   - Pressure levels: {initial_batch.metadata.atmos_levels}")
+            
+            if hasattr(initial_batch, 'surf_vars'):
+                logger.info(f"[{job_id}]   - Surface variables: {list(initial_batch.surf_vars.keys())}")
+                for var_name, tensor in initial_batch.surf_vars.items():
+                    var_min, var_max, var_mean = float(tensor.min()), float(tensor.max()), float(tensor.mean())
+                    logger.info(f"[{job_id}]     - {var_name}: shape={tensor.shape}, range=[{var_min:.6f}, {var_max:.6f}], mean={var_mean:.6f}")
+            
+            if hasattr(initial_batch, 'atmos_vars'):
+                logger.info(f"[{job_id}]   - Atmospheric variables: {list(initial_batch.atmos_vars.keys())}")
+                for var_name, tensor in initial_batch.atmos_vars.items():
+                    var_min, var_max, var_mean = float(tensor.min()), float(tensor.max()), float(tensor.mean())
+                    logger.info(f"[{job_id}]     - {var_name}: shape={tensor.shape}, range=[{var_min:.6f}, {var_max:.6f}], mean={var_mean:.6f}")
+            
+            if hasattr(initial_batch, 'static_vars'):
+                logger.info(f"[{job_id}]   - Static variables: {list(initial_batch.static_vars.keys())}")
+                for var_name, tensor in initial_batch.static_vars.items():
+                    var_min, var_max, var_mean = float(tensor.min()), float(tensor.max()), float(tensor.mean())
+                    logger.info(f"[{job_id}]     - {var_name}: shape={tensor.shape}, range=[{var_min:.6f}, {var_max:.6f}], mean={var_mean:.6f}")
+                    
+        except Exception as e:
+            logger.warning(f"[{job_id}] Error during batch diagnostics: {e}")
 
         input_r2_key = await self._upload_input_to_r2(s3_client, job_id, initial_batch)
         if not input_r2_key:
