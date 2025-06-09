@@ -55,7 +55,7 @@ echo "Environment Configuration ($ENV_FILE):"
 if [[ -f "$ENV_FILE" ]]; then
     echo -e "${GREEN}✓ Found${NC}"
     echo "Key variables:"
-    grep -E "^(AZURE_STORAGE_ACCOUNT|AZURE_CONTAINER|STANZA_NAME|PGDATA)=" "$ENV_FILE" 2>/dev/null | sed 's/AZURE_STORAGE_KEY=.*/AZURE_STORAGE_KEY=***HIDDEN***/' || echo "Could not read variables"
+    grep -E "^(PGBACKREST_R2_BUCKET|PGBACKREST_R2_ENDPOINT|PGBACKREST_STANZA_NAME|PGBACKREST_PGDATA)=" "$ENV_FILE" 2>/dev/null | sed 's/PGBACKREST_R2_SECRET_ACCESS_KEY=.*/PGBACKREST_R2_SECRET_ACCESS_KEY=***HIDDEN***/' || echo "Could not read variables"
 else
     echo -e "${RED}✗ Not found${NC}"
 fi
@@ -65,7 +65,7 @@ echo "pgBackRest Configuration (/etc/pgbackrest/pgbackrest.conf):"
 if [[ -f "/etc/pgbackrest/pgbackrest.conf" ]]; then
     echo -e "${GREEN}✓ Found${NC}"
     echo "Configuration preview:"
-    sed 's/repo1-azure-key=.*/repo1-azure-key=***HIDDEN***/' /etc/pgbackrest/pgbackrest.conf 2>/dev/null | head -20 || echo "Could not read configuration"
+    sed 's/repo1-s3-key-secret=.*/repo1-s3-key-secret=***HIDDEN***/' /etc/pgbackrest/pgbackrest.conf 2>/dev/null | head -20 || echo "Could not read configuration"
 else
     echo -e "${RED}✗ Not found${NC}"
 fi

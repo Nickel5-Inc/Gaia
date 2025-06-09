@@ -74,8 +74,7 @@ from alembic.util import CommandError # Import CommandError
 from sqlalchemy import create_engine, pool
 
 # New imports for DB Sync
-from gaia.validator.sync.backup_manager import get_backup_manager, BackupManager
-from gaia.validator.sync.restore_manager import get_restore_manager, RestoreManager
+# Legacy backup/restore managers removed - using AutoSyncManager only
 from gaia.validator.sync.auto_sync_manager import get_auto_sync_manager
 import random # for staggering db sync tasks
 
@@ -352,9 +351,7 @@ class GaiaValidator:
         logger.info("BaseModelEvaluator initialized")
         
         # DB Sync components
-        self.backup_manager: BackupManager | None = None
-        self.restore_manager: RestoreManager | None = None
-        self.auto_sync_manager = None  # New streamlined sync manager
+        self.auto_sync_manager = None  # Streamlined sync system using pgBackRest + R2
         
         self.is_source_validator_for_db_sync = os.getenv("IS_SOURCE_VALIDATOR_FOR_DB_SYNC", "False").lower() == "true"
         
@@ -454,7 +451,7 @@ class GaiaValidator:
             for task_name in ['soil', 'geomagnetic', 'weather', 'scoring', 'deregistration', 'status_logger', 'db_sync_backup', 'db_sync_restore', 'miner_score_sender', 'earthdata_token', 'db_monitor', 'plot_db_metrics']:
                 try:
                     # Check if task exists in health tracking before updating
-                    if task_name in self.task_health or hasattr(self, f"{task_name}_task") or (task_name.startswith("db_sync") and (self.backup_manager or self.restore_manager)):
+                    if task_name in self.task_health or hasattr(self, f"{task_name}_task") or (task_name.startswith("db_sync") and self.auto_sync_manager):
                         await self.update_task_status(task_name, 'stopping')
                     else:
                         logger.debug(f"Skipping status update for non-existent/inactive task: {task_name}")
@@ -1899,16 +1896,11 @@ class GaiaValidator:
 
 
                 # Add DB Sync tasks conditionally
-                if self.is_source_validator_for_db_sync and self.backup_manager:
-                    logger.info(f"DB Sync Backup task available but handled by cron (interval: {self.db_sync_interval_hours}h).")
-                    # Note: Periodic backups are now handled by cron jobs (see setup-primary.sh)
-                    # BackupManager provides ad-hoc backup capabilities only
-                elif not self.is_source_validator_for_db_sync and self.restore_manager:
-                    logger.info(f"DB Sync Restore task available for ad-hoc operations (interval: {self.db_sync_interval_hours}h).")
-                    # Note: Periodic restores don't fit pgBackRest model well - replicas should use streaming replication
-                    # RestoreManager provides ad-hoc restore capabilities only
+                if self.auto_sync_manager:
+                    logger.info(f"AutoSyncManager is active - DB sync tasks are handled by application scheduling (interval: {self.db_sync_interval_hours}h).")
+                    logger.info(f"DB Sync Configuration: Primary={self.is_source_validator_for_db_sync}")
                 else:
-                    logger.info("DB Sync is not active for this node (either source or replica manager failed to init, not configured, or Azure manager failed).")
+                    logger.info("AutoSyncManager is not active for this node (initialization failed or not configured).")
 
                 
                 # Conditionally add miner_score_sender task
@@ -2624,13 +2616,13 @@ class GaiaValidator:
 
             params = {"start_time": one_day_ago}
             
-            # Fetch all data concurrently using threaded approach for heavy operations
+            # Fetch all data concurrently using regular async approach
             try:
                 weather_results, geomagnetic_results, soil_results, validator_nodes_list = await asyncio.gather(
-                    self.database_manager.fetch_all_threaded(weather_query, params),
-                    self.database_manager.fetch_all_threaded(geomagnetic_query, params),
-                    self.database_manager.fetch_all_threaded(soil_query, params),
-                    self.database_manager.fetch_all_threaded(validator_nodes_query),
+                    self.database_manager.fetch_all(weather_query, params),
+                    self.database_manager.fetch_all(geomagnetic_query, params),
+                    self.database_manager.fetch_all(soil_query, params),
+                    self.database_manager.fetch_all(validator_nodes_query),
                     return_exceptions=True
                 )
                 
@@ -2742,12 +2734,10 @@ class GaiaValidator:
         db_sync_enabled_str = os.getenv("DB_SYNC_ENABLED", "True") # Default to True if not set
         if db_sync_enabled_str.lower() != "true":
             logger.info("DB_SYNC_ENABLED is not 'true'. Database synchronization feature will be disabled.")
-            self.backup_manager = None
-            self.restore_manager = None
             self.auto_sync_manager = None
             return
 
-        # Initialize AutoSyncManager (new streamlined sync system)
+        # Initialize AutoSyncManager (streamlined sync system using pgBackRest + R2)
         try:
             logger.info("Initializing AutoSyncManager (streamlined sync system)...")
             self.auto_sync_manager = await get_auto_sync_manager(test_mode=self.args.test)
@@ -2760,22 +2750,13 @@ class GaiaValidator:
                 logger.warning("AutoSyncManager failed to initialize - check environment variables")
         except Exception as e:
             logger.warning(f"AutoSyncManager initialization failed: {e}")
-
-        # Initialize standalone backup/restore managers if AutoSyncManager isn't available
-        logger.info("Initializing standalone backup/restore managers...")
+            logger.info("💡 To enable DB sync, configure PGBACKREST_R2_* environment variables")
+            logger.info("   - PGBACKREST_R2_BUCKET")
+            logger.info("   - PGBACKREST_R2_ENDPOINT") 
+            logger.info("   - PGBACKREST_R2_ACCESS_KEY_ID")
+            logger.info("   - PGBACKREST_R2_SECRET_ACCESS_KEY")
         
-        if self.is_source_validator_for_db_sync:
-            logger.info("This node is configured as the SOURCE for DB Sync.")
-            self.backup_manager = await get_backup_manager(test_mode=self.args.test)
-            if not self.backup_manager:
-                logger.error("Failed to initialize BackupManager. DB Sync (source) will be disabled.")
-        else:
-            logger.info("This node is configured as a REPLICA for DB Sync.")
-            self.restore_manager = await get_restore_manager(test_mode=self.args.test)
-            if not self.restore_manager:
-                logger.error("Failed to initialize RestoreManager. DB Sync (replica) will be disabled.")
-        
-        logger.info("DB Sync components initialization completed.")
+        logger.info("DB Sync initialization completed (not active).")
 
     async def database_monitor(self):
         """Periodically query and log database statistics from a consistent snapshot."""
