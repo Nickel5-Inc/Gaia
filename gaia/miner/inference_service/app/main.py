@@ -233,6 +233,15 @@ async def _download_from_r2(object_key: str, download_path: Path) -> bool:
     bucket_name = R2_CONFIG['bucket_name']
     _logger.info(f"Attempting to download s3://{bucket_name}/{object_key} to {download_path}")
     try:
+        # Log disk space before download
+        try:
+            root_stat = shutil.disk_usage("/")
+            network_vol_stat = shutil.disk_usage(str(download_path.parent)) # Check space on the target volume
+            _logger.info(f"Disk space before download: Root (/) - Total: {root_stat.total // (1024**3)}GB, Used: {root_stat.used // (1024**3)}GB, Free: {root_stat.free // (1024**3)}GB")
+            _logger.info(f"Disk space before download: Target Vol ({download_path.parent}) - Total: {network_vol_stat.total // (1024**3)}GB, Used: {network_vol_stat.used // (1024**3)}GB, Free: {network_vol_stat.free // (1024**3)}GB")
+        except Exception as e_stat:
+            _logger.warning(f"Could not get disk usage stats: {e_stat}")
+
         # Ensure parent directory for the download path exists
         download_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -277,6 +286,34 @@ async def _upload_to_r2(object_key: str, file_path: Path) -> bool:
         _logger.error(f"Unexpected error during R2 upload of {file_path} to s3://{bucket_name}/{object_key}: {e}", exc_info=True)
     return False
 
+async def _upload_bytes_to_r2(object_key: str, data: bytes) -> bool:
+    """Uploads a bytes object to the configured R2 bucket."""
+    global S3_CLIENT, R2_CONFIG
+    if not S3_CLIENT or not R2_CONFIG.get('bucket_name'):
+        _logger.error("S3_CLIENT not initialized or R2 bucket_name not configured. Cannot upload bytes to R2.")
+        return False
+    if not data:
+        _logger.error(f"Data for R2 upload to {object_key} is empty.")
+        return False
+
+    bucket_name = R2_CONFIG['bucket_name']
+    _logger.info(f"Attempting to upload {len(data)} bytes to s3://{bucket_name}/{object_key}")
+    try:
+        with io.BytesIO(data) as f:
+            await asyncio.to_thread(
+                S3_CLIENT.upload_fileobj,
+                f,
+                bucket_name,
+                object_key
+            )
+        _logger.info(f"Successfully uploaded bytes to s3://{bucket_name}/{object_key}")
+        return True
+    except ClientError as e_ce:
+        _logger.error(f"ClientError during R2 bytes upload to s3://{bucket_name}/{object_key}: {e_ce.response.get('Error', {}).get('Message', str(e_ce))}", exc_info=True)
+    except Exception as e:
+        _logger.error(f"Unexpected error during R2 bytes upload to s3://{bucket_name}/{object_key}: {e}", exc_info=True)
+    return False
+
 # --- Pydantic Models for API (can be kept for structure, though not directly used by RunPod handler) ---
 class InferencePayload(BaseModel):
     # serialized_aurora_batch: str = Field(..., description="Base64 encoded pickled aurora.Batch object.")
@@ -307,81 +344,109 @@ async def health_check():
         model_status_str = "runner_not_initialized_sdk_was_available"
     return HealthResponse(status="ok", model_status=model_status_str)
 
-async def stream_gzipped_netcdf_steps(
-    predictions: List[Batch], 
-    input_batch_base_time: pd.Timestamp, 
+async def _process_and_upload_steps(
+    predictions: List[Batch],
+    input_batch_base_time: pd.Timestamp,
+    job_run_uuid: str,
     config: Dict[str, Any],
-    tar_archive_path: Path # Path to write the tar.gz file to
-) -> Tuple[int, Optional[str]]: # Returns (number_of_steps_archived, error_message_if_any)
-    if not predictions:
-        _logger.warning("No predictions to stream into archive.")
-        return 0, "No predictions provided."
+) -> Tuple[int, Optional[str], Optional[str]]:
+    """
+    Serializes prediction batches into individual NetCDF files (in memory) and uploads them to R2 in parallel.
 
-    forecast_steps_count = 0
-    try:
-        with tarfile.open(tar_archive_path, "w:gz") as tar:
-            _logger.info(f"Opened tar archive {tar_archive_path} for writing.")
-            for i, prediction_step_batch in enumerate(predictions):
-                try:
-                    step_filename = f"forecast_step_{i:02d}.nc.gz"
-                    # Use the serialization function that produces gzipped NetCDF bytes directly
-                    gzipped_netcdf_bytes: Optional[bytes] = None
-                    with io.BytesIO() as nc_buffer:
-                        # Assuming prediction_step_batch is xr.Dataset or convertible
-                        # This needs robust conversion if prediction_step_batch is Aurora Batch
-                        if not isinstance(prediction_step_batch, xr.Dataset):
-                             # Placeholder conversion logic (similar to serialize_batch_step_to_base64_gzipped_netcdf)
-                            if _AURORA_AVAILABLE and isinstance(prediction_step_batch, Batch): # type: ignore
-                                _logger.warning(f"Step {i} is Aurora Batch, needs conversion to xr.Dataset for tar.gz. Placeholder conversion used.")
-                                data_vars = {}
-                                if hasattr(prediction_step_batch, 'data') and isinstance(prediction_step_batch.data, np.ndarray):
-                                    data_vars['forecast'] = (('time', 'lat', 'lon'), prediction_step_batch.data)
-                                else: data_vars['forecast'] = (('time', 'lat', 'lon'), np.random.rand(1,10,10))
-                                forecast_hour_step = config.get('forecast_step_hours', 6)
-                                current_step_time = input_batch_base_time + timedelta(hours=(i + 1) * forecast_hour_step)
-                                coords = {'time': pd.to_datetime([current_step_time]), 'lat': np.linspace(-90,90,10), 'lon': np.linspace(0,359,10)}
-                                temp_xr_step = xr.Dataset(data_vars, coords=coords)
-                                temp_xr_step.to_netcdf(nc_buffer, engine="h5netcdf")
-                            else:
-                                _logger.error(f"Step {i} type {type(prediction_step_batch)} not xr.Dataset, cannot serialize to NetCDF.")
-                                continue # Skip this step
-                        else:
-                             prediction_step_batch.to_netcdf(nc_buffer, engine="h5netcdf")
-                        
-                        nc_bytes = nc_buffer.getvalue()
-                    
-                    with io.BytesIO() as gz_buffer:
-                        with gzip.GzipFile(fileobj=gz_buffer, mode='wb') as gz_file:
-                            gz_file.write(nc_bytes)
-                        gzipped_netcdf_bytes = gz_buffer.getvalue()
+    Returns:
+        A tuple containing (number_of_steps_uploaded, output_r2_prefix, optional_error_message).
+    """
+    _logger.info(f"[{job_run_uuid}] Starting to process and upload {len(predictions)} prediction steps to R2.")
+    forecast_step_hours = config.get('model', {}).get('forecast_step_hours', 6)
+    output_r2_prefix = f"outputs/{job_run_uuid}"
+    upload_tasks = []
+    processing_errors = []
 
-                    if not gzipped_netcdf_bytes:
-                        _logger.warning(f"Gzipped NetCDF serialization of step {i} returned empty. Skipping.")
-                        continue
-                    
-                    tarinfo = tarfile.TarInfo(name=step_filename)
-                    tarinfo.size = len(gzipped_netcdf_bytes)
-                    tarinfo.mtime = int(time.time())
-                    with io.BytesIO(gzipped_netcdf_bytes) as step_fileobj:
-                        tar.addfile(tarinfo, step_fileobj)
-                    _logger.info(f"Added {step_filename} (size: {tarinfo.size}) to archive {tar_archive_path}.")
-                    forecast_steps_count += 1
+    for i, step_batch in enumerate(predictions):
+        try:
+            step_lead_hours = (i + 1) * forecast_step_hours
+            
+            # --- Convert aurora.Batch to xarray.Dataset ---
+            data_vars = {}
+            coords = {
+                'lat': step_batch.metadata.lat.numpy(),
+                'lon': step_batch.metadata.lon.numpy(),
+                'time': np.datetime64(pd.to_datetime(step_batch.metadata.time[0]).tz_localize(None), 'ns')
+            }
 
-                except Exception as e_step:
-                    _logger.error(f"Error processing prediction step {i} for archive: {e_step}", exc_info=True)
-                    # Optionally, continue to next step or re-raise to abort
-            _logger.info(f"Finished adding {forecast_steps_count} steps to archive {tar_archive_path}.")
-        return forecast_steps_count, None
-    except Exception as e_tar:
-        _logger.error(f"Failed to create or write to tar archive {tar_archive_path}: {e_tar}", exc_info=True)
-        return forecast_steps_count, str(e_tar)
+            for var_name, tensor in step_batch.surf_vars.items():
+                data_vars[var_name] = (('lat', 'lon'), tensor.squeeze().numpy())
 
-async def _perform_inference_and_archive_locally(
+            if step_batch.atmos_vars:
+                coords['plev'] = np.array(step_batch.metadata.atmos_levels)
+                for var_name, tensor in step_batch.atmos_vars.items():
+                    data_vars[var_name] = (('plev', 'lat', 'lon'), tensor.squeeze().numpy())
+            
+            temp_xr_step = xr.Dataset(data_vars, coords)
+            
+            # --- Serialize to bytes ---
+            nc_bytes = temp_xr_step.to_netcdf(engine="scipy")
+
+            if not nc_bytes:
+                _logger.warning(f"[{job_run_uuid}] Step {i} produced empty netcdf bytes. Skipping upload.")
+                continue
+            
+            # --- Define R2 key and create upload task ---
+            object_key = f"{output_r2_prefix}/step_{(i+1):03d}_T+{step_lead_hours:03d}h.nc"
+            upload_tasks.append(
+                _upload_bytes_to_r2(object_key=object_key, data=nc_bytes)
+            )
+
+        except Exception as e_step:
+            error_msg = f"Error processing prediction step {i} for R2 upload: {e_step}"
+            _logger.error(f"[{job_run_uuid}] {error_msg}", exc_info=True)
+            processing_errors.append(error_msg)
+            # Continue processing other steps even if one fails
+        
+        finally:
+            if 'temp_xr_step' in locals(): del temp_xr_step
+            if 'nc_bytes' in locals(): del nc_bytes
+
+    if processing_errors:
+        _logger.warning(f"[{job_run_uuid}] Encountered {len(processing_errors)} errors during processing steps. Will attempt to upload successfully processed steps.")
+
+    if not upload_tasks:
+        _logger.error(f"[{job_run_uuid}] No upload tasks were created for {len(predictions)} predictions. Processing errors: {'; '.join(processing_errors)}")
+        return 0, output_r2_prefix, "No steps were successfully processed for upload."
+
+    # --- Execute all uploads in parallel ---
+    _logger.info(f"[{job_run_uuid}] Submitting {len(upload_tasks)} upload tasks to R2 for prefix '{output_r2_prefix}'.")
+    results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+
+    # Process results
+    successful_uploads = 0
+    failed_uploads = 0
+    for res in results:
+        if res is True:
+            successful_uploads += 1
+        else:
+            failed_uploads += 1
+            _logger.error(f"[{job_run_uuid}] An upload task failed. Result/Exception: {res}")
+            
+    num_steps_uploaded = successful_uploads
+
+    if failed_uploads > 0:
+        error_msg = f"Failed to upload all steps. Succeeded: {num_steps_uploaded}/{len(upload_tasks)}. Failures: {failed_uploads}."
+        if processing_errors:
+            error_msg += f" Pre-upload processing errors: {'; '.join(processing_errors)}"
+        _logger.error(f"[{job_run_uuid}] {error_msg}")
+        return num_steps_uploaded, output_r2_prefix, error_msg
+    else:
+        _logger.info(f"[{job_run_uuid}] Successfully uploaded all {num_steps_uploaded} processed steps to R2 under prefix: {output_r2_prefix}")
+        final_error_message = f"Processing errors occurred but all processed steps uploaded. Details: {'; '.join(processing_errors)}" if processing_errors else None
+        return num_steps_uploaded, output_r2_prefix, final_error_message
+
+async def _perform_inference_and_upload(
     local_input_file_path: Path, 
     job_run_uuid: str, 
     app_config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    _logger.info(f"[{job_run_uuid}] Starting local inference and archiving with input: {local_input_file_path}")
+    _logger.info(f"[{job_run_uuid}] Starting inference and direct R2 upload with input: {local_input_file_path}")
 
     initial_batch: Optional[Batch] = None
     base_time_for_coords: Optional[pd.Timestamp] = None
@@ -408,55 +473,48 @@ async def _perform_inference_and_archive_locally(
         prediction_steps_batch_list = await run_model_inference(initial_batch, app_config)
         if prediction_steps_batch_list is None: 
             _logger.error(f"[{job_run_uuid}] run_model_inference returned None.")
-            return {"output_archive_code": "NO_ARCHIVE_EMPTY_PREDICTIONS", "base_time": base_time_for_coords.isoformat() if base_time_for_coords else "ERROR_BASE_TIME_UNKNOWN", "job_run_uuid": job_run_uuid, "archive_filename": "", "num_steps_archived": 0, "info": "Inference returned no predictions."}
+            return {"output_r2_prefix": f"outputs/{job_run_uuid}", "base_time": base_time_for_coords.isoformat() if base_time_for_coords else "ERROR_BASE_TIME_UNKNOWN", "job_run_uuid": job_run_uuid, "num_steps_uploaded": 0, "info": "Inference returned no predictions."}
         if not prediction_steps_batch_list: 
             _logger.warning(f"[{job_run_uuid}] run_model_inference returned empty list.")
-            return {"output_archive_code": "NO_ARCHIVE_EMPTY_PREDICTIONS", "base_time": base_time_for_coords.isoformat() if base_time_for_coords else "ERROR_BASE_TIME_UNKNOWN", "job_run_uuid": job_run_uuid, "archive_filename": "", "num_steps_archived": 0, "info": "Inference returned empty list of predictions."}
+            return {"output_r2_prefix": f"outputs/{job_run_uuid}", "base_time": base_time_for_coords.isoformat() if base_time_for_coords else "ERROR_BASE_TIME_UNKNOWN", "job_run_uuid": job_run_uuid, "num_steps_uploaded": 0, "info": "Inference returned empty list of predictions."}
     except Exception as e_run_model:
         _logger.error(f"[{job_run_uuid}] Exception during run_model_inference: {e_run_model}", exc_info=True)
         return {"error": f"Exception during model inference: {e_run_model}"}
     _logger.info(f"[{job_run_uuid}] run_model_inference completed. Received {len(prediction_steps_batch_list)} prediction steps.")
 
-    # Use a temporary directory on the network volume for creating the archive before sending
-    network_volume_temp_outputs_base = Path("/network-volume") / "runpod_temp_outputs"
-    network_volume_temp_outputs_base.mkdir(parents=True, exist_ok=True) # Ensure base exists
-    
-    temp_output_archive_dir = Path(tempfile.mkdtemp(prefix=f"runpod_output_{job_run_uuid}_", dir=str(network_volume_temp_outputs_base)))
-    archive_filename = "forecast_archive.tar.gz"
-    archive_file_to_send = temp_output_archive_dir / archive_filename
-    _logger.info(f"[{job_run_uuid}] Output archive will be temporarily created at: {archive_file_to_send}")
-
-    forecast_steps_count, error_msg_archiving = await stream_gzipped_netcdf_steps(
+    # New direct-to-R2 upload logic
+    num_steps, output_prefix, error_msg = await _process_and_upload_steps(
         predictions=prediction_steps_batch_list,
         input_batch_base_time=base_time_for_coords,
-        config=app_config,
-        tar_archive_path=archive_file_to_send
+        job_run_uuid=job_run_uuid,
+        config=app_config
     )
-    if error_msg_archiving or forecast_steps_count == 0:
-        _logger.error(f"[{job_run_uuid}] Archiving failed or produced empty archive. Steps: {forecast_steps_count}, Error: {error_msg_archiving}")
-        if temp_output_archive_dir.exists(): shutil.rmtree(temp_output_archive_dir)
-        return {"error": "ARCHIVE_CREATION_FAILED", "base_time": base_time_for_coords.isoformat() if base_time_for_coords else "ERROR_BASE_TIME_UNKNOWN", "job_run_uuid": job_run_uuid, "error_details": error_msg_archiving or "No steps archived"}
-
-    if not archive_file_to_send.exists() or archive_file_to_send.stat().st_size == 0:
-        _logger.error(f"[{job_run_uuid}] Failed to create archive {archive_file_to_send}. It might be empty or not created.")
-        if temp_output_archive_dir.exists():
-            shutil.rmtree(temp_output_archive_dir)
-        return {"error": "Archive creation failed or archive is empty.", "base_time": base_time_for_coords.isoformat() if base_time_for_coords else "ERROR_BASE_TIME_UNKNOWN", "job_run_uuid": job_run_uuid}
     
-    _logger.info(f"[{job_run_uuid}] Successfully created local archive: {archive_file_to_send}")
-
     base_time_iso = "ERROR_BASE_TIME_UNKNOWN"
     if base_time_for_coords: base_time_iso = base_time_for_coords.isoformat()
 
+    # If there was a critical error during upload that resulted in an error message,
+    # or if no steps were uploaded despite having predictions, return an error manifest.
+    if error_msg and num_steps < len(prediction_steps_batch_list):
+        _logger.error(f"[{job_run_uuid}] Uploading steps failed or was incomplete. Steps Uploaded: {num_steps}, Error: {error_msg}")
+        return {
+            "error": "UPLOAD_TO_R2_INCOMPLETE_OR_FAILED",
+            "base_time": base_time_iso,
+            "job_run_uuid": job_run_uuid,
+            "error_details": error_msg,
+            "num_steps_uploaded": num_steps,
+            "output_r2_prefix": output_prefix
+        }
+
+    # Success case: all (or partially processed if that's the logic) steps are uploaded.
     output_manifest = {
-        "local_archive_path": str(archive_file_to_send), # Return path to local archive
-        "temp_archive_parent_dir": str(temp_output_archive_dir), # Return parent dir for cleanup by caller
+        "output_r2_prefix": output_prefix,
         "base_time": base_time_iso,
         "job_run_uuid": job_run_uuid,
-        "archive_filename_on_miner": archive_filename, 
-        "num_steps_archived": forecast_steps_count
+        "num_steps_uploaded": num_steps,
+        "info": f"Upload process finished. See error details for any non-critical issues. Details: {error_msg}" if error_msg else "All steps processed and uploaded successfully."
     }
-    _logger.info(f"[{job_run_uuid}] Local processing and archiving complete. Manifest: {output_manifest}")
+    _logger.info(f"[{job_run_uuid}] Inference and direct R2 upload finished. Manifest: {output_manifest}")
     return output_manifest
 
 async def combined_runpod_handler(job: Dict[str, Any]):
@@ -511,7 +569,7 @@ async def combined_runpod_handler(job: Dict[str, Any]):
     _logger.info(f"Job {job_id}: Effective job_run_uuid for this execution: {job_run_uuid}")
 
     # Use network volume for temporary job data
-    network_volume_base = Path("/network-volume")
+    network_volume_base = Path("/runpod-volume")
     job_temp_base_dir = network_volume_base / "runpod_jobs" / job_run_uuid
     downloaded_input_file_path: Optional[Path] = None # Keep track of downloaded input for cleanup
     
@@ -550,65 +608,26 @@ async def combined_runpod_handler(job: Dict[str, Any]):
             _logger.info(f"Job {job_id}: Successfully downloaded input file to {downloaded_input_file_path}")
 
             # Perform inference using the downloaded file
-            local_processing_manifest = await _perform_inference_and_archive_locally(
+            upload_manifest = await _perform_inference_and_upload(
                 local_input_file_path=downloaded_input_file_path,
                 job_run_uuid=job_run_uuid,
                 app_config=APP_CONFIG
             )
 
-            if "error" in local_processing_manifest or not local_processing_manifest.get("local_archive_path"):
-                _logger.error(f"Job {job_id}: Local inference/archiving failed. Manifest: {local_processing_manifest}")
-                return {"error": f"Local inference/archiving failed: {local_processing_manifest.get('error', 'Unknown error')}"}
+            if "error" in upload_manifest:
+                _logger.error(f"Job {job_id}: Inference/upload process failed. Manifest: {upload_manifest}")
+                # Propagate the detailed error manifest from the upload function
+                return upload_manifest
 
-            local_archive_to_upload = Path(local_processing_manifest["local_archive_path"])
-            original_archive_filename = local_processing_manifest["archive_filename_on_miner"]
-            
-            # Define output R2 object key
-            output_r2_object_key = f"outputs/{job_run_uuid}/{original_archive_filename}" # Example structure
-
-            _logger.info(f"Job {job_id}: Attempting to upload output archive {local_archive_to_upload} to R2: s3://{R2_CONFIG['bucket_name']}/{output_r2_object_key}")
-            upload_success = await _upload_to_r2(
-                object_key=output_r2_object_key,
-                file_path=local_archive_to_upload
-            )
-
-            # Cleanup the locally created archive file AND its parent temp directory after attempting upload
-            temp_archive_parent_dir_str = local_processing_manifest.get("temp_archive_parent_dir")
-            if local_archive_to_upload.exists():
-                try:
-                    local_archive_to_upload.unlink() 
-                    _logger.info(f"Job {job_id}: Cleaned up local output archive file {local_archive_to_upload}")
-                    # Now try to remove the parent directory if its path was provided
-                    if temp_archive_parent_dir_str:
-                        temp_archive_parent_path = Path(temp_archive_parent_dir_str)
-                        if temp_archive_parent_path.exists() and temp_archive_parent_path.is_dir():
-                            shutil.rmtree(temp_archive_parent_path)
-                            _logger.info(f"Job {job_id}: Cleaned up temporary archive parent directory {temp_archive_parent_path}")
-                        else:
-                            _logger.warning(f"Job {job_id}: Temporary archive parent directory {temp_archive_parent_dir_str} not found or not a dir for cleanup.")
-                except Exception as e_clean_archive:
-                    _logger.warning(f"Job {job_id}: Failed during cleanup of local output archive {local_archive_to_upload} or its parent dir: {e_clean_archive}")
-
-
-            if not upload_success:
-                _logger.error(f"Job {job_id}: Failed to upload output archive to R2 (object key: {output_r2_object_key}).")
-                # Return what info we have, but indicate upload failure.
-                return {
-                    "error": f"Failed to upload output archive to R2: {output_r2_object_key}",
-                    "base_time": local_processing_manifest.get("base_time"),
-                    "job_run_uuid": job_run_uuid,
-                    "num_steps_archived": local_processing_manifest.get("num_steps_archived"),
-                }
-
-            _logger.info(f"Job {job_id}: Successfully uploaded output archive to R2.")
+            _logger.info(f"Job {job_id}: Successfully processed and uploaded inference results to R2.")
             
             final_manifest = {
                 "output_r2_bucket_name": R2_CONFIG['bucket_name'],
-                "output_r2_object_key": output_r2_object_key,
-                "base_time": local_processing_manifest.get("base_time"),
+                "output_r2_object_key_prefix": upload_manifest.get("output_r2_prefix"),
+                "base_time": upload_manifest.get("base_time"),
                 "job_run_uuid": job_run_uuid,
-                "num_steps_archived": local_processing_manifest.get("num_steps_archived"),
-                "info": "Inference complete, output uploaded to R2."
+                "num_steps_archived": upload_manifest.get("num_steps_uploaded"), # Using 'num_steps_archived' for compatibility
+                "info": upload_manifest.get("info", "Inference complete, outputs uploaded individually to R2.")
             }
             _logger.info(f"Job {job_id}: R2 inference processing completed. Result manifest: {final_manifest}")
             return final_manifest

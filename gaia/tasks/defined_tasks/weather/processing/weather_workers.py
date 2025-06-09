@@ -1148,6 +1148,7 @@ async def fetch_and_hash_gfs_task(
     """
     logger.info(f"[FetchHashTask Job {job_id}] Starting GFS fetch, batch prep, and input hash computation for T0={t0_run_time}, T-6={t_minus_6_run_time}")
     input_batch_pickle_file_path_str = None # Initialize here for broader scope
+    initial_batch: Optional[BatchType] = None # Initialize initial_batch to None
 
     try:
         await update_job_status(task_instance, job_id, "fetching_gfs")
@@ -1257,8 +1258,236 @@ async def fetch_and_hash_gfs_task(
         if 'gfs_concat_data_for_batch_prep' in locals() and gfs_concat_data_for_batch_prep is not None and hasattr(gfs_concat_data_for_batch_prep, 'close'):
             try: gfs_concat_data_for_batch_prep.close()
             except Exception: pass
-        del initial_batch # Explicitly delete to free memory sooner
+        if initial_batch is not None: # Check if initial_batch was assigned
+            del initial_batch # Explicitly delete to free memory sooner
         gc.collect()
 
 
     logger.info(f"[FetchHashTask Job {job_id}] Task finished.")
+
+async def r2_cleanup_worker(task_instance: 'WeatherTask'):
+    """
+    Periodically cleans up old input and forecast objects from the R2 bucket.
+    """
+    logger.info("R2 cleanup worker started.")
+    
+    while getattr(task_instance, 'r2_cleanup_worker_running', False):
+        try:
+            cleanup_interval = task_instance.config.get('r2_cleanup_interval_seconds', 3600)
+            max_inputs = task_instance.config.get('r2_max_inputs_to_keep', 5)
+            max_forecasts = task_instance.config.get('r2_max_forecasts_to_keep', 5)
+            
+            logger.info(f"[R2Cleanup] Running cleanup. Keeping max {max_inputs} inputs and {max_forecasts} forecasts.")
+
+            s3_client = await task_instance._get_r2_s3_client()
+            if not s3_client:
+                logger.error("[R2Cleanup] Could not get R2 client. Skipping cleanup cycle.")
+                await asyncio.sleep(cleanup_interval)
+                continue
+            
+            bucket_name = os.getenv("R2_BUCKET_NAME")
+            if not bucket_name:
+                logger.error("[R2Cleanup] R2_BUCKET_NAME not set. Skipping cleanup cycle.")
+                await asyncio.sleep(cleanup_interval)
+                continue
+
+            # --- Cleanup Inputs ---
+            try:
+                logger.info(f"[R2Cleanup] Cleaning up 'inputs/' prefix...")
+                paginator = s3_client.get_paginator('list_objects_v2')
+                pages = paginator.paginate(Bucket=bucket_name, Prefix='inputs/')
+                
+                all_input_objects = []
+                for page in pages:
+                    if 'Contents' in page:
+                        all_input_objects.extend(page['Contents'])
+                
+                # Group by job_id (first part of the path)
+                inputs_by_job = {}
+                for obj in all_input_objects:
+                    key = obj['Key']
+                    if key.count('/') > 1:
+                        job_id = key.split('/')[1]
+                        if job_id not in inputs_by_job:
+                            inputs_by_job[job_id] = {'keys': [], 'last_modified': None}
+                        inputs_by_job[job_id]['keys'].append(key)
+                        # Use the latest modified time for the job folder
+                        if inputs_by_job[job_id]['last_modified'] is None or obj['LastModified'] > inputs_by_job[job_id]['last_modified']:
+                            inputs_by_job[job_id]['last_modified'] = obj['LastModified']
+
+                if len(inputs_by_job) > max_inputs:
+                    sorted_inputs = sorted(inputs_by_job.items(), key=lambda item: item[1]['last_modified'], reverse=True)
+                    to_delete_jobs = sorted_inputs[max_inputs:]
+                    logger.info(f"[R2Cleanup] Found {len(inputs_by_job)} input jobs. Deleting {len(to_delete_jobs)} oldest ones.")
+
+                    keys_to_delete = []
+                    for job_id, data in to_delete_jobs:
+                        keys_to_delete.extend(data['keys'])
+                    
+                    if keys_to_delete:
+                        # R2 delete_objects can handle up to 1000 keys at a time
+                        for i in range(0, len(keys_to_delete), 1000):
+                            chunk = keys_to_delete[i:i+1000]
+                            delete_payload = {'Objects': [{'Key': key} for key in chunk]}
+                            await asyncio.to_thread(s3_client.delete_objects, Bucket=bucket_name, Delete=delete_payload)
+                        logger.info(f"[R2Cleanup] Deleted {len(keys_to_delete)} objects from old input jobs.")
+                else:
+                    logger.info(f"[R2Cleanup] Number of input jobs ({len(inputs_by_job)}) is within the limit ({max_inputs}). No inputs deleted.")
+
+            except Exception as e_inputs:
+                logger.error(f"[R2Cleanup] Error during input cleanup: {e_inputs}", exc_info=True)
+
+
+            # --- Cleanup Forecasts ---
+            try:
+                logger.info(f"[R2Cleanup] Cleaning up 'outputs/' prefix...")
+                # In R2, directories are just prefixes. We list objects under 'outputs/'
+                # and infer the "directories" from the prefixes.
+                paginator = s3_client.get_paginator('list_objects_v2')
+                pages = paginator.paginate(Bucket=bucket_name, Prefix='outputs/', Delimiter='/')
+
+                output_prefixes = []
+                for page in pages:
+                    if 'CommonPrefixes' in page:
+                        for prefix_info in page['CommonPrefixes']:
+                            output_prefixes.append(prefix_info['Prefix'])
+
+                if len(output_prefixes) > max_forecasts:
+                    # To sort by date, we need to get the last modified time of an object within each prefix
+                    prefix_mod_times = []
+                    for prefix in output_prefixes:
+                        try:
+                            # Get the most recently modified object in the prefix to represent the folder's "date"
+                            resp = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix, MaxKeys=1, FetchOwner=False)
+                            if 'Contents' in resp and resp['Contents']:
+                                prefix_mod_times.append((prefix, resp['Contents'][0]['LastModified']))
+                            else: # Handle empty prefix case
+                                prefix_mod_times.append((prefix, datetime(1970, 1, 1, tzinfo=timezone.utc)))
+                        except Exception as e_list_obj:
+                             logger.warning(f"[R2Cleanup] Could not get last modified time for prefix {prefix}: {e_list_obj}")
+                    
+                    sorted_forecasts = sorted(prefix_mod_times, key=lambda item: item[1], reverse=True)
+                    to_delete_prefixes = [p for p, t in sorted_forecasts[max_forecasts:]]
+                    
+                    logger.info(f"[R2Cleanup] Found {len(output_prefixes)} forecast prefixes. Deleting {len(to_delete_prefixes)} oldest ones.")
+
+                    for prefix_to_delete in to_delete_prefixes:
+                        # List all objects under the prefix and delete them in batches
+                        logger.info(f"[R2Cleanup] Deleting all objects under prefix: {prefix_to_delete}")
+                        obj_paginator = s3_client.get_paginator('list_objects_v2')
+                        obj_pages = obj_paginator.paginate(Bucket=bucket_name, Prefix=prefix_to_delete)
+                        
+                        keys_to_delete = []
+                        for page in obj_pages:
+                            if 'Contents' in page:
+                                keys_to_delete.extend([{'Key': obj['Key']} for obj in page['Contents']])
+                        
+                        if keys_to_delete:
+                             for i in range(0, len(keys_to_delete), 1000):
+                                chunk = keys_to_delete[i:i+1000]
+                                delete_payload = {'Objects': chunk}
+                                await asyncio.to_thread(s3_client.delete_objects, Bucket=bucket_name, Delete=delete_payload)
+                             logger.info(f"[R2Cleanup] Deleted {len(keys_to_delete)} objects for prefix {prefix_to_delete}")
+
+                else:
+                    logger.info(f"[R2Cleanup] Number of forecast prefixes ({len(output_prefixes)}) is within the limit ({max_forecasts}). No forecasts deleted.")
+
+            except Exception as e_forecasts:
+                logger.error(f"[R2Cleanup] Error during forecast cleanup: {e_forecasts}", exc_info=True)
+
+            logger.info(f"[R2Cleanup] Cleanup cycle finished. Worker sleeping for {cleanup_interval} seconds.")
+            await asyncio.sleep(cleanup_interval)
+
+        except asyncio.CancelledError:
+            logger.info("R2 cleanup worker has been cancelled.")
+            break
+        except Exception as e:
+            logger.error(f"An unexpected error occurred in the R2 cleanup worker: {e}", exc_info=True)
+            logger.info("R2 cleanup worker will sleep for 60 seconds before retrying.")
+            await asyncio.sleep(60)
+
+    logger.info("R2 cleanup worker has stopped.")
+
+
+def get_job_by_gfs_init_time(self, gfs_init_time: datetime) -> Optional[Dict]:
+    """
+    Checks the database for an existing, non-failed job for a specific GFS initialization time.
+    """
+    # Implementation of the method
+    pass
+
+async def poll_runpod_job_worker(task_instance: 'WeatherTask', job_id: str, runpod_job_id: str):
+    """
+    Background worker to poll a RunPod job until it completes or fails.
+    """
+    logger.info(f"[RunPodPoller Job {job_id}] Starting polling for RunPod Job ID: {runpod_job_id}")
+
+    base_url = task_instance.inference_service_url.rsplit('/', 1)[0]
+    status_url = f"{base_url}/status/{runpod_job_id}"
+    headers = {"Authorization": f"Bearer {task_instance.runpod_api_key}"}
+
+    poll_interval = task_instance.config.get('runpod_poll_interval_seconds', 10)
+    max_attempts = task_instance.config.get('runpod_max_poll_attempts', 180) # Default 30 mins
+
+    try:
+        async with httpx.AsyncClient(headers=headers, timeout=60.0) as client:
+            for attempt in range(max_attempts):
+                await asyncio.sleep(poll_interval)
+                
+                # Only log polling status every 6th attempt (every ~60 seconds if poll_interval=10)
+                if (attempt + 1) % 6 == 0 or attempt == 0:
+                    logger.debug(f"[RunPodPoller Job {job_id}] Polling status (Attempt {attempt + 1}/{max_attempts})")
+
+                try:
+                    response = await client.get(status_url)
+                    response.raise_for_status()
+                    status_data = response.json()
+                    current_status = status_data.get("status")
+
+                    if current_status == "COMPLETED":
+                        logger.info(f"[RunPodPoller Job {job_id}] RunPod job COMPLETED.")
+                        manifest = status_data.get("output")
+                        if not manifest or not isinstance(manifest, dict):
+                            raise ValueError(f"RunPod job completed but 'output' is missing or invalid. Full response: {status_data}")
+
+                        output_prefix = manifest.get("output_r2_object_key_prefix")
+                        if not output_prefix:
+                            raise ValueError("Completed job manifest missing 'output_r2_object_key_prefix'.")
+                        
+                        logger.info(f"[{job_id}] Inference successful. Output prefix: {output_prefix}.")
+                        await update_job_paths(task_instance, job_id, netcdf_path=output_prefix)
+                        await update_job_status(task_instance, job_id, 'completed')
+                        return # Success, exit worker
+
+                    elif current_status in ["IN_QUEUE", "IN_PROGRESS"]:
+                        # Only log status periodically to reduce verbosity  
+                        if (attempt + 1) % 6 == 0 or attempt == 0:
+                            logger.debug(f"[RunPodPoller Job {job_id}] RunPod status is '{current_status}'. Continuing (attempt {attempt + 1}/{max_attempts}).")
+                        # No DB update needed, just continue polling
+
+                    elif current_status in ["FAILED", "CANCELLED", "TIMED_OUT"]:
+                        error_output = status_data.get("output", f"No error details provided, but status was {current_status}.")
+                        raise RuntimeError(f"RunPod job terminated with status '{current_status}'. Details: {error_output}")
+
+                    else: # Unhandled status
+                        logger.warning(f"[RunPodPoller Job {job_id}] Unhandled RunPod status '{current_status}'. Treating as temporary. Response: {status_data}")
+
+                except httpx.HTTPStatusError as e:
+                    logger.error(f"[RunPodPoller Job {job_id}] HTTP error polling status: {e.response.status_code} - {e.response.text}")
+                    # Continue polling on server errors (5xx), but might fail fast on others
+                    if 500 <= e.response.status_code < 600:
+                        logger.warning(f"[{job_id}] Server error, will retry.")
+                    else:
+                        raise # Re-raise client errors (4xx) to fail the task
+                except httpx.RequestError as e:
+                    logger.error(f"[RunPodPoller Job {job_id}] Request error polling status: {e}. Will retry.")
+                except (json.JSONDecodeError, ValueError) as e:
+                    raise RuntimeError(f"Error processing RunPod status response: {e}") # Fail on bad data
+
+            # If loop finishes, it's a timeout
+            raise TimeoutError(f"Polling timed out after {max_attempts} attempts.")
+
+    except Exception as e:
+        error_message = f"RunPod poller failed: {e}"
+        logger.error(f"[RunPodPoller Job {job_id}] {error_message}", exc_info=True)
+        await update_job_status(task_instance, job_id, 'failed', error_message)

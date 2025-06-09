@@ -279,7 +279,7 @@ def process_opendap_dataset(ds: xr.Dataset) -> xr.Dataset:
     if 'lat' in new_ds.coords:
         if new_ds.lat.values[0] < new_ds.lat.values[-1]:
             logger.info("Reversing latitude coordinate to be decreasing (90 to -90).")
-            new_ds = new_ds.reindex(lat=new_ds.lat[::-1])
+            new_ds = new_ds.reindex(lat=new_ds.lat.values[::-1].copy())
 
     if 'lon' in new_ds.coords:
         if new_ds.lon.values.min() < -1.0:
@@ -397,66 +397,115 @@ async def fetch_gfs_analysis_data(
                         continue
                         
                     logger.info(f"Opening GFS cycle {target_time.strftime('%Y-%m-%d %H:%M:%S')} from {base_url} for analysis (T+0h)...")
-                    with xr.open_dataset(base_url, decode_times=False, chunks={}) as full_ds:
-                        logger.info(f"Successfully opened GFS dataset with decode_times=False. Raw time variable attributes: {full_ds.time.attrs}")
-                        logger.info(f"Raw time variable sample values: {full_ds.time.values[:5] if len(full_ds.time.values) > 5 else full_ds.time.values}")
+                    full_ds = xr.open_dataset(base_url, decode_times=False, chunks={})
+                    logger.info(f"Successfully opened GFS dataset with decode_times=False. Raw time variable attributes: {full_ds.time.attrs}")
+                    logger.info(f"Raw time variable sample values: {full_ds.time.values[:5] if len(full_ds.time.values) > 5 else full_ds.time.values}")
+                    
+                    time_coordinate_decoded_successfully = False
+                    try:
+                        # Attempt to decode the time coordinate using cftime
+                        decoded_time_values_np_array = xr.coding.times.decode_cf_datetime(
+                            full_ds.time, 
+                            units=full_ds.time.attrs.get('units'), 
+                            calendar=full_ds.time.attrs.get('calendar', 'standard'), 
+                            use_cftime=True
+                        )
+                        # Log the sample of the numpy array directly
+                        logger.info(f"Manually decoded time with cftime (sample numpy array): {decoded_time_values_np_array[:5] if len(decoded_time_values_np_array) > 5 else decoded_time_values_np_array}")
+                        # Replace the time coordinate in full_ds
+                        full_ds = full_ds.assign_coords(time=decoded_time_values_np_array)
+                        time_coordinate_decoded_successfully = True
+                        logger.info(f"Time coordinate in full_ds updated. Sample from full_ds.time.values: {full_ds.time.values[:5] if len(full_ds.time.values) > 5 else full_ds.time.values}")
+                    except Exception as e_manual_decode:
+                        logger.error(f"Failed to manually decode time with cftime: {e_manual_decode}", exc_info=True)
+                        logger.warning("Proceeding with original undecoded (numerical) time coordinate for selection.")
+
+                    analysis_target_dt_np = np.datetime64(target_time.replace(tzinfo=None))
+                    analysis_slice = None # Initialize to ensure it's defined for logging in case of error
+                    time_difference = np.timedelta64(24*3600, 's') # Default to a large diff
+
+                    if time_coordinate_decoded_successfully:
+                        # full_ds.time is now datetime-like (cftime or datetime64)
+                        analysis_slice = full_ds.sel(time=analysis_target_dt_np, method='nearest')
+                        # analysis_slice.time.values is a scalar cftime.DatetimeGregorian (or similar cftime object)
+                        # Convert cftime object to standard Python datetime, then to np.datetime64
+                        cftime_obj = analysis_slice.time.values.item()
                         
-                        # Attempt to decode time manually to see if we can handle it with cftime directly
+                        # Construct standard Python datetime from cftime object components
+                        # Keep it naive, as np.datetime64 is naive and analysis_target_dt_np is also naive.
+                        py_dt = datetime(
+                            year=int(cftime_obj.year), month=int(cftime_obj.month), day=int(cftime_obj.day),
+                            hour=int(cftime_obj.hour), minute=int(cftime_obj.minute), second=int(cftime_obj.second),
+                            microsecond=int(cftime_obj.microsecond)
+                        )
+                        
+                        # Convert the Python datetime to an ISO 8601 string, then to np.datetime64
+                        # This path is often more robust.
+                        iso_str = py_dt.isoformat()
+                        selected_time_from_slice_dt = np.datetime64(iso_str)
+                        
+                        time_difference = abs(selected_time_from_slice_dt - analysis_target_dt_np)
+                    else:
+                        # full_ds.time is numerical (e.g., float64 'days since ...')
+                        # Convert analysis_target_dt_np to this numerical domain for selection
                         try:
-                            time_decoded = xr.coding.times.decode_cf_datetime(full_ds.time, units=full_ds.time.attrs.get('units'), calendar=full_ds.time.attrs.get('calendar', 'standard'), use_cftime=True)
-                            # Corrected logging for NumPy array
-                            logger.info(f"Manually decoded time with cftime (sample): {time_decoded[:5] if len(time_decoded) > 5 else time_decoded}")
-                            full_ds['time'] = time_decoded # Replace the time coordinate
-                        except Exception as e_manual_decode:
-                            logger.error(f"Failed to manually decode time with cftime: {e_manual_decode}", exc_info=True)
-                            logger.warning("Proceeding with undecoded time coordinate. Downstream processing might fail or use incorrect times.")
+                            time_units = full_ds.time.attrs.get('units')
+                            time_calendar = full_ds.time.attrs.get('calendar', 'standard')
+                            if not time_units:
+                                logger.error(f"Time units attribute missing from undecoded time coordinate for target {target_time}. Cannot select accurately.")
+                                continue # Skip this target_time
 
-                        # Select the single time point (T+0h)
-                        # Need to select based on the raw numerical time values if decode_times=False was used and manual decode failed
-                        analysis_select_time_np = np.datetime64(target_time.replace(tzinfo=None))
+                            numerical_target_for_sel = xr.coding.times.encode_cf_datetime(
+                                np.array([analysis_target_dt_np]), 
+                                units=time_units, 
+                                calendar=time_calendar
+                            )[0] 
 
-                        analysis_slice = full_ds.sel(time=analysis_select_time_np, method='nearest')
-                        
-                        # Ensure the time values from the slice are datetime64 for comparison
-                        slice_time_values = analysis_slice.time.values
-                        
-                        # If we have a cftime object (dtype='O'), we need to convert it to np.datetime64 for comparison.
-                        slice_time_values_for_comp = slice_time_values
-                        if not np.issubdtype(slice_time_values.dtype, np.datetime64):
-                            logger.warning(f"Time values in analysis_slice are not datetime64 (dtype: {slice_time_values.dtype}). Attempting conversion from cftime object.")
-                            try:
-                                # .sel(..., method='nearest') should return a 0-d array with the cftime object.
-                                cftime_obj = slice_time_values.item()
-                                # Convert cftime to standard datetime, then to numpy.datetime64
-                                dt_obj = datetime(cftime_obj.year, cftime_obj.month, cftime_obj.day, cftime_obj.hour, cftime_obj.minute, cftime_obj.second)
-                                slice_time_values_for_comp = np.datetime64(dt_obj)
-                                logger.info(f"Successfully converted cftime object to datetime64 for comparison.")
-                            except Exception as e_conv:
-                                logger.error(f"Failed to convert cftime object to datetime: {e_conv}. Comparison will likely fail.", exc_info=True)
+                            analysis_slice = full_ds.sel(time=numerical_target_for_sel, method='nearest')
+                            selected_numerical_time_from_slice = analysis_slice.time.values 
+                            numerical_diff = abs(selected_numerical_time_from_slice - numerical_target_for_sel)
 
-                        if abs(slice_time_values_for_comp - analysis_select_time_np) > np.timedelta64(1, 'h'):
-                            logger.error(f"Nearest time found ({slice_time_values_for_comp}) is too far from requested analysis time {target_time} for cycle {target_time}. Skipping.")
-                            continue
+                            # Convert numerical_diff (in time_units) back to a np.timedelta64
+                            # Decode [0, numerical_diff] in the original units to get two datetime objects, then subtract
+                            time_axis_for_diff_conversion = xr.coding.times.decode_cf_datetime(
+                                np.array([0, numerical_diff]), 
+                                units=time_units, 
+                                calendar=time_calendar, 
+                                use_cftime=True 
+                            )
+                            time_difference = np.abs(np.datetime64(time_axis_for_diff_conversion[1]) - np.datetime64(time_axis_for_diff_conversion[0]))
+                            
+                        except Exception as e_numerical_sel:
+                            logger.error(f"Error during numerical time selection for target {target_time}: {e_numerical_sel}", exc_info=True)
+                            continue 
+                    
+                    actual_selected_time_for_log = "N/A"
+                    if analysis_slice is not None and hasattr(analysis_slice, 'time') and hasattr(analysis_slice.time, 'values'):
+                        actual_selected_time_for_log = analysis_slice.time.values
 
-                        current_surface_vars = target_surface_vars if target_surface_vars is not None else GFS_SURFACE_VARS
-                        current_atmos_vars = target_atmos_vars if target_atmos_vars is not None else GFS_ATMOS_VARS
-                        
-                        vars_to_load_final = [v for v in current_surface_vars + current_atmos_vars if v in full_ds]
-                        
-                        if not vars_to_load_final:
-                             logger.warning(f"No targeted GFS variables found in dataset for cycle {target_time}. Surface tried: {current_surface_vars}, Atmos tried: {current_atmos_vars}. Skipping analysis for this time.")
-                             continue
-                        logger.info(f"For cycle {target_time}, attempting to load variables: {vars_to_load_final}")
-                             
-                        loaded_slice = analysis_slice[vars_to_load_final].load()
-                        loaded_slice = loaded_slice.expand_dims(dim='time', axis=0)
-                        target_time_naive = target_time.replace(tzinfo=None)
-                        loaded_slice['time'] = [np.datetime64(target_time_naive, 'ns')]
-                        
-                        logger.info(f"Loaded analysis slice for original target {target_time}")
-                        analysis_slices.append(loaded_slice)
+                    if time_difference > np.timedelta64(1, 'h'):
+                        logger.error(f"Nearest time found ({actual_selected_time_for_log}) is too far ({time_difference}) from requested analysis time {target_time}. Skipping.")
+                        continue
 
-                        processed_one_successfully_for_target = True
+                    current_surface_vars = target_surface_vars if target_surface_vars is not None else GFS_SURFACE_VARS
+                    current_atmos_vars = target_atmos_vars if target_atmos_vars is not None else GFS_ATMOS_VARS
+                    
+                    vars_to_load_final = [v for v in current_surface_vars + current_atmos_vars if v in full_ds]
+                    
+                    if not vars_to_load_final:
+                         logger.warning(f"No targeted GFS variables found in dataset for cycle {target_time}. Surface tried: {current_surface_vars}, Atmos tried: {current_atmos_vars}. Skipping analysis for this time.")
+                         continue
+                    logger.info(f"For cycle {target_time}, attempting to load variables: {vars_to_load_final}")
+                         
+                    loaded_slice = analysis_slice[vars_to_load_final].load()
+                    loaded_slice = loaded_slice.expand_dims(dim='time', axis=0)
+                    target_time_naive = target_time.replace(tzinfo=None)
+                    loaded_slice['time'] = [np.datetime64(target_time_naive, 'ns')]
+                    
+                    logger.info(f"Loaded analysis slice for original target {target_time}")
+                    analysis_slices.append(loaded_slice)
+
+                    processed_one_successfully_for_target = True
 
                 except Exception as e:
                     logger.error(f"Failed to fetch/process analysis for original target {target_time}: {e}", exc_info=True)
@@ -545,7 +594,7 @@ async def fetch_gfs_analysis_data(
 
         if 'lat' in processed_ds.coords and len(processed_ds.lat) > 1 and processed_ds.lat.values[0] < processed_ds.lat.values[-1]:
             logger.info("Reversing latitude coordinate.")
-            processed_ds = processed_ds.reindex(lat=processed_ds.lat[::-1])
+            processed_ds = processed_ds.reindex(lat=processed_ds.lat.values[::-1].copy())
 
         if 'lon' in processed_ds.coords and processed_ds.lon.values.min() < 0:
             logger.info("Adjusting longitude coordinate to [0, 360).")

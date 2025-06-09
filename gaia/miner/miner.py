@@ -166,10 +166,17 @@ class Miner:
 
         
         self.weather_inference_service_url = os.getenv("WEATHER_INFERENCE_SERVICE_URL")
-        runpod_api_key_from_env = os.getenv("CREDENTIAL")
+        runpod_api_key_from_env = os.getenv("INFERENCE_SERVICE_API_KEY")
         if runpod_api_key_from_env:
             self.weather_runpod_api_key = runpod_api_key_from_env
-            logger.info(f"RunPod API Key loaded from CREDENTIAL env var in __init__.")
+            logger.info("RunPod API Key loaded from INFERENCE_SERVICE_API_KEY env var in __init__.")
+        else:
+            runpod_api_key_from_env = os.getenv("WEATHER_RUNPOD_API_KEY")
+            if runpod_api_key_from_env:
+                self.weather_runpod_api_key = runpod_api_key_from_env
+                logger.info("RunPod API Key loaded from WEATHER_RUNPOD_API_KEY env var in __init__.")
+            else:
+                logger.info("No RunPod API Key found (checked INFERENCE_SERVICE_API_KEY, WEATHER_RUNPOD_API_KEY) in __init__.")
 
         if weather_enabled:
             logger.info("Weather task IS ENABLED based on WEATHER_MINER_ENABLED in __init__.")
@@ -185,12 +192,17 @@ class Miner:
                     self.weather_inference_service_url = service_url_env
                     logger.info(f"HTTP inference service configured in __init__. URL: {self.weather_inference_service_url}")
                     
-                    runpod_api_key_from_env = os.getenv("WEATHER_RUNPOD_API_KEY")
+                    runpod_api_key_from_env = os.getenv("INFERENCE_SERVICE_API_KEY")
                     if runpod_api_key_from_env:
                         self.weather_runpod_api_key = runpod_api_key_from_env
-                        logger.info("RunPod API Key loaded from WEATHER_RUNPOD_API_KEY env var in __init__.")
+                        logger.info("RunPod API Key loaded from INFERENCE_SERVICE_API_KEY env var in __init__.")
                     else:
-                        logger.info("WEATHER_RUNPOD_API_KEY env var not found in __init__.")
+                        runpod_api_key_from_env = os.getenv("WEATHER_RUNPOD_API_KEY")
+                        if runpod_api_key_from_env:
+                            self.weather_runpod_api_key = runpod_api_key_from_env
+                            logger.info("RunPod API Key loaded from WEATHER_RUNPOD_API_KEY env var in __init__.")
+                        else:
+                            logger.info("No RunPod API Key found (checked INFERENCE_SERVICE_API_KEY, WEATHER_RUNPOD_API_KEY) in __init__.")
             
             elif weather_inference_type == "local_model":
                 logger.info(f"Weather inference type is '{weather_inference_type}' in __init__. WeatherTask will use internal model logic.")
@@ -205,6 +217,30 @@ class Miner:
             }
             if self.weather_runpod_api_key:
                 weather_task_args["runpod_api_key"] = self.weather_runpod_api_key
+            
+            # Load R2 configuration from environment variables
+            r2_config = {}
+            r2_endpoint_url = os.getenv("R2_ENDPOINT_URL")
+            r2_access_key_id = os.getenv("R2_ACCESS_KEY")
+            r2_secret_access_key = os.getenv("R2_SECRET_ACCESS_KEY")
+            r2_bucket_name = os.getenv("R2_BUCKET")
+            
+            if all([r2_endpoint_url, r2_access_key_id, r2_secret_access_key, r2_bucket_name]):
+                r2_config = {
+                    "r2_endpoint_url": r2_endpoint_url,
+                    "r2_access_key_id": r2_access_key_id,
+                    "r2_secret_access_key": r2_secret_access_key,
+                    "r2_bucket_name": r2_bucket_name
+                }
+                weather_task_args["r2_config"] = r2_config
+                logger.info("R2 configuration loaded successfully and will be passed to WeatherTask.")
+            else:
+                missing_vars = []
+                if not r2_endpoint_url: missing_vars.append("R2_ENDPOINT_URL")
+                if not r2_access_key_id: missing_vars.append("R2_ACCESS_KEY")
+                if not r2_secret_access_key: missing_vars.append("R2_SECRET_ACCESS_KEY")
+                if not r2_bucket_name: missing_vars.append("R2_BUCKET")
+                logger.warning(f"R2 configuration incomplete. Missing environment variables: {missing_vars}. WeatherTask will not be able to use R2 storage.")
             
             try:
                 self.weather_task = WeatherTask(**weather_task_args)

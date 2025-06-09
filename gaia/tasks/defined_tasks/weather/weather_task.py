@@ -63,7 +63,9 @@ from .processing.weather_workers import (
     finalize_scores_worker, 
     cleanup_worker,
     run_inference_background,
-    fetch_and_hash_gfs_task
+    fetch_and_hash_gfs_task,
+    r2_cleanup_worker,
+    poll_runpod_job_worker
 )
 from gaia.tasks.defined_tasks.weather.utils.inference_class import WeatherInferenceRunner
 logger = get_logger(__name__)
@@ -111,6 +113,13 @@ def _load_config(self):
     config['run_hour_utc'] = int(os.getenv('WEATHER_RUN_HOUR_UTC', '18'))
     config['run_minute_utc'] = int(os.getenv('WEATHER_RUN_MINUTE_UTC', '0'))
     config['validator_hash_wait_minutes'] = int(os.getenv('WEATHER_VALIDATOR_HASH_WAIT_MINUTES', '10'))
+
+    # --- R2 Cleanup Config (Credentials are handled by the Miner, not here) ---
+    config['r2_cleanup_enabled'] = os.getenv('WEATHER_R2_CLEANUP_ENABLED', 'true').lower() in ['true', '1', 'yes']
+    config['r2_cleanup_interval_seconds'] = int(os.getenv('WEATHER_R2_CLEANUP_INTERVAL_S', '3600')) # 1 hour
+    config['r2_max_inputs_to_keep'] = int(os.getenv('WEATHER_R2_MAX_INPUTS_TO_KEEP', '5'))
+    config['r2_max_forecasts_to_keep'] = int(os.getenv('WEATHER_R2_MAX_FORECASTS_TO_KEEP', '5'))
+
 
     config['miner_jwt_secret_key'] = os.getenv("MINER_JWT_SECRET_KEY", "insecure_default_key_for_development_only")
     config['jwt_algorithm'] = os.getenv("MINER_JWT_ALGORITHM", "HS256")
@@ -197,9 +206,13 @@ class WeatherTask(Task):
     def __init__(self, db_manager=None, node_type=None, test_mode=False, keypair=None, 
                  inference_service_url: Optional[str] = None, 
                  runpod_api_key: Optional[str] = None, # For RunPod API Key (if CREDENTIAL was set)
+                 r2_config: Optional[Dict[str, str]] = None,
                  **data):
         loaded_config = self._load_config() 
         
+        # Merge keyword arguments into the loaded config, allowing overrides
+        loaded_config.update(data)
+
         super_data = {
             "name": "WeatherTask",
             "description": "Weather forecast generation and verification task",
@@ -217,6 +230,7 @@ class WeatherTask(Task):
         self.node_type = node_type
         self.test_mode = test_mode
         self.config = loaded_config 
+        self.r2_config = r2_config # Store the dedicated R2 config
         self.validator = data.get('validator')
         self.era5_climatology_ds = None
         self.inference_service_url = inference_service_url # Store the URL
@@ -230,6 +244,8 @@ class WeatherTask(Task):
         self.final_scoring_workers = []
         self.cleanup_worker_running = False
         self.cleanup_workers = []
+        self.r2_cleanup_worker_running = False # For R2 cleanup
+        self.r2_cleanup_workers = [] # For R2 cleanup
         
         self.test_mode_run_scored_event = asyncio.Event()
         self.last_test_mode_run_id = None
@@ -443,251 +459,148 @@ class WeatherTask(Task):
             return False, "", str(e)
 
     async def _get_r2_s3_client(self) -> Optional[boto3.client]:
-        """Initializes and returns an S3 client configured for R2."""
-        # This could be a helper method or part of a class initialization if used more broadly.
-        # For now, let's keep it simple and initialize when first needed by _run_inference_via_http_service.
-        # It can be enhanced to cache the client if called multiple times.
+        """
+        Initializes and returns a boto3 S3 client configured for R2.
+        Credentials are now sourced from self.r2_config, which is provided
+        by the Miner during instantiation.
+        Returns None if configuration is missing.
+        """
+        if not self.r2_config:
+            logger.error("R2 client configuration (self.r2_config) not provided to WeatherTask. Cannot create S3 client.")
+            return None
 
-        r2_bucket = os.getenv("R2_BUCKET")
-        r2_endpoint_url = os.getenv("R2_ENDPOINT_URL")
-        r2_access_key_id = os.getenv("R2_ACCESS_KEY")
-        r2_secret_access_key = os.getenv("R2_SECRET_ACCESS_KEY")
+        endpoint_url = self.r2_config.get("r2_endpoint_url")
+        access_key_id = self.r2_config.get("r2_access_key_id")
+        secret_access_key = self.r2_config.get("r2_secret_access_key")
+        bucket_name = self.r2_config.get("r2_bucket_name")
 
-        if not all([r2_bucket, r2_endpoint_url, r2_access_key_id, r2_secret_access_key]):
-            logger.error("One or more R2 environment variables (R2_BUCKET, R2_ENDPOINT_URL, R2_ACCESS_KEY, R2_SECRET_ACCESS_KEY) are not set. Cannot initialize R2 client.")
+        if not all([endpoint_url, access_key_id, secret_access_key, bucket_name]):
+            logger.error("R2 client configuration is incomplete in self.r2_config. Please ensure R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_BUCKET_NAME are set in the environment for the miner.")
             return None
         
         try:
             s3_client = boto3.client(
                 's3',
-                endpoint_url=r2_endpoint_url,
-                aws_access_key_id=r2_access_key_id,
-                aws_secret_access_key=r2_secret_access_key,
+                endpoint_url=endpoint_url,
+                aws_access_key_id=access_key_id,
+                aws_secret_access_key=secret_access_key,
                 config=boto3.session.Config(signature_version='s3v4'),
-                region_name='auto' 
+                region_name='auto' # R2 is region-less
             )
-            logger.info(f"S3 client for R2 initialized. Endpoint: {r2_endpoint_url}, Bucket: {r2_bucket}")
             return s3_client
         except Exception as e:
-            logger.error(f"Failed to initialize S3 client for R2: {e}", exc_info=True)
+            logger.error(f"Failed to create R2 S3 client: {e}", exc_info=True)
             return None
 
-    async def _run_inference_via_http_service(self, job_id: str, initial_batch: Batch) -> Optional[List[xr.Dataset]]:
-        if not self.inference_service_url:
-            logger.error("HTTP Inference service URL is not configured for WeatherTask.")
+    async def _upload_input_to_r2(self, s3_client: boto3.client, job_id: str, initial_batch: 'Batch') -> Optional[str]:
+        """Uploads the initial batch pickle to R2."""
+        if not self.r2_config or not self.r2_config.get("r2_bucket_name"):
+            logger.error(f"[{job_id}] R2 bucket name not found in self.r2_config. Cannot upload input.")
             return None
+        bucket_name = self.r2_config.get("r2_bucket_name")
 
-        s3_client = await self._get_r2_s3_client()
-        if not s3_client:
-            logger.error("Failed to get R2 S3 client, cannot proceed with inference via HTTP service using R2.")
-            return None
+        object_key = f"inputs/{job_id}/initial_batch.pkl"
         
-        r2_bucket_name = os.getenv("R2_BUCKET") # Already checked in _get_r2_s3_client, but good to have here.
-
-
-        run_uuid = str(uuid.uuid4()) # Unique ID for this specific runpod job and R2 objects
-        logger.info(f"[WeatherTask Run: {run_uuid}] Starting inference via HTTP service for job_id: {job_id}.")
-
-        # --- R2 Input Upload ---
-        temp_input_file_path: Optional[Path] = None
-        input_r2_object_key: Optional[str] = None
-
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl", prefix=f"wt_input_{run_uuid}_") as tmpfile:
-                pickle.dump(initial_batch, tmpfile)
-                temp_input_file_path = Path(tmpfile.name)
-            
-            input_r2_object_key = f"inputs/{run_uuid}/initial_batch_data.pkl"
-            logger.info(f"[WeatherTask Run: {run_uuid}] Uploading serialized input batch {temp_input_file_path} to R2: s3://{r2_bucket_name}/{input_r2_object_key}")
-            
-            await asyncio.to_thread(
-                s3_client.upload_file,
-                str(temp_input_file_path),
-                r2_bucket_name,
-                input_r2_object_key
-            )
-            logger.info(f"[WeatherTask Run: {run_uuid}] Successfully uploaded input to R2.")
+            with io.BytesIO() as f:
+                pickle.dump(initial_batch, f)
+                f.seek(0)
+                await asyncio.to_thread(
+                    s3_client.upload_fileobj,
+                    f,
+                    bucket_name,
+                    object_key
+                )
+            logger.info(f"[{job_id}] Successfully uploaded initial batch to R2: s3://{bucket_name}/{object_key}")
+            return object_key
+        except (BotoClientError, Exception) as e:
+            logger.error(f"[{job_id}] Failed to upload initial batch to R2: {e}", exc_info=True)
+            return None
 
-        except BotoClientError as e_boto_up:
-            logger.error(f"[WeatherTask Run: {run_uuid}] R2 ClientError during input upload: {e_boto_up.response.get('Error', {}).get('Message', str(e_boto_up))}", exc_info=True)
-            if temp_input_file_path and temp_input_file_path.exists(): temp_input_file_path.unlink(missing_ok=True)
+    async def _invoke_inference_service(self, job_id: str, input_r2_key: str) -> Optional[str]:
+        """
+        Invokes the asynchronous inference service (e.g., RunPod) to START a job.
+        Returns the runpod_job_id if successful, otherwise None. Does NOT poll.
+        """
+        if not self.inference_service_url or not self.runpod_api_key:
+            logger.error(f"[{job_id}] Inference service URL or API key is not configured.")
             return None
-        except Exception as e_upload:
-            logger.error(f"[WeatherTask Run: {run_uuid}] Failed to serialize or upload initial batch to R2: {e_upload}", exc_info=True)
-            if temp_input_file_path and temp_input_file_path.exists(): temp_input_file_path.unlink(missing_ok=True)
-            return None
-        finally:
-            if temp_input_file_path and temp_input_file_path.exists(): # Ensure cleanup if upload failed mid-way
-                temp_input_file_path.unlink(missing_ok=True)
+
+        headers = {"Authorization": f"Bearer {self.runpod_api_key}"}
         
-        if not input_r2_object_key: # Should not happen if upload was successful, but as a safeguard
-             logger.error(f"[WeatherTask Run: {run_uuid}] input_r2_object_key was not set after upload attempt. Aborting.")
-             return None
-
-
-        # Prepare payload for RunPod job submission
+        # Ensure the URL is for the 'run' endpoint
+        if not self.inference_service_url.endswith(('/run', '/run/')):
+            logger.error(f"[{job_id}] Inference URL is not a 'run' endpoint: {self.inference_service_url}")
+            return None
+        
         payload = {
             "input": {
-                "action": "run_inference_from_r2", # New action for R2 based workflow
-                "input_r2_object_key": input_r2_object_key,
-                "job_run_uuid": run_uuid # Pass the unique ID for correlation and R2 paths
+                "action": "run_inference_from_r2",
+                "input_r2_object_key": input_r2_key,
+                "job_run_uuid": job_id
             }
         }
-        logger.debug(f"[WeatherTask Run: {run_uuid}] Submitting job to RunPod. Payload: {payload}")
 
-        # --- RunPod Job Submission and Polling ---
-        runpod_job_id: Optional[str] = None
-        try:
-            async with httpx.AsyncClient(timeout=self.config.get('runpod_http_timeout', 60)) as client: # Added timeout
-                # The specific endpoint path might be just the base URL + /run for serverless handlers
-                # or could be different if a custom API gateway is in front.
-                # Assuming self.inference_service_url is the base URL for the serverless worker.
-                base_url = self.inference_service_url.rstrip('/')
-                if base_url.endswith('/run'): # Check if it already ends with /run
-                    target_url = base_url
-                else:
-                    target_url = f"{base_url}/run"
+        async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
+            try:
+                logger.info(f"[{job_id}] Sending inference start request to {self.inference_service_url}")
+                response = await client.post(self.inference_service_url, json=payload)
+                response.raise_for_status()
                 
-                headers = {}
-                if self.runpod_api_key: # This is for RunPod's own API auth if directly hitting RunPod endpoints
-                    headers["Authorization"] = f"Bearer {self.runpod_api_key}"
-                # If the inference service itself has an API key (X-API-Key), it should be added here too.
-                # For now, assuming runpod_api_key is for RunPod platform calls.
+                start_data = response.json()
+                runpod_job_id = start_data.get("id")
 
-                logger.info(f"[WeatherTask Run: {run_uuid}] Posting job to {target_url}")
-                response = await client.post(target_url, json=payload, headers=headers)
-                response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
-                
-                response_data = response.json()
-                logger.debug(f"[WeatherTask Run: {run_uuid}] RunPod job submission response: {response_data}")
-                runpod_job_id = response_data.get("id")
                 if not runpod_job_id:
-                    logger.error(f"[WeatherTask Run: {run_uuid}] Failed to get job ID from RunPod submission response: {response_data}")
+                    logger.error(f"[{job_id}] Service did not return a RunPod job ID. Response: {start_data}")
                     return None
-                logger.info(f"[WeatherTask Run: {run_uuid}] RunPod job submitted. RunPod Job ID: {runpod_job_id}")
-
-                # Polling logic
-                base_status_url = self.inference_service_url.rstrip('/')
-                if base_status_url.endswith('/run'): # if original URL was .../run, replace /run with /status
-                    base_status_url = base_status_url[:-len('/run')].rstrip('/')
                 
-                # Ensure /status is not duplicated if base_status_url already contains it (less likely but good check)
-                if base_status_url.endswith('/status'):
-                     poll_url = f"{base_status_url}/{runpod_job_id}"
-                else:
-                     poll_url = f"{base_status_url.rstrip('/')}/status/{runpod_job_id}"
+                logger.info(f"[{job_id}] Job started on RunPod. RunPod Job ID: {runpod_job_id}")
+                return runpod_job_id
 
-                poll_interval = self.config.get('runpod_poll_interval_seconds', 10)
-                max_attempts = self.config.get('runpod_max_poll_attempts', 900)
-                
-                for attempt in range(max_attempts):
-                    await asyncio.sleep(poll_interval)
-                    logger.info(f"[WeatherTask Run: {run_uuid}] Polling RunPod job {runpod_job_id}, attempt {attempt + 1}/{max_attempts}. URL: {poll_url}")
-                    status_response = await client.get(poll_url, headers=headers) # Use same headers for status
-                    status_response.raise_for_status()
-                    status_data = status_response.json()
-                    logger.debug(f"[WeatherTask Run: {run_uuid}] Poll status response: {status_data}")
-
-                    job_status = status_data.get("status")
-                    if job_status == "COMPLETED":
-                        logger.info(f"[WeatherTask Run: {run_uuid}] RunPod job {runpod_job_id} completed.")
-                        # Output is expected directly in status_data['output'] for COMPLETED jobs
-                        job_output = status_data.get("output")
-                        if not job_output:
-                            logger.error(f"[WeatherTask Run: {run_uuid}] RunPod job {runpod_job_id} COMPLETED but no output found in response.")
-                            return None
-                        
-                        # --- R2 Output Download and Processing ---
-                        output_r2_bucket = job_output.get("output_r2_bucket_name")
-                        output_r2_object_key_from_manifest = job_output.get("output_r2_object_key")
-
-                        if not output_r2_bucket or not output_r2_object_key_from_manifest:
-                            logger.error(f"[WeatherTask Run: {run_uuid}] Job output manifest missing R2 bucket/key. Output: {job_output}")
-                            if job_output.get("error"): logger.error(f"[WeatherTask Run: {run_uuid}] Server-side error: {job_output['error']}")
-                            return None
-
-                        temp_output_archive_path: Optional[Path] = None
-                        try:
-                            # Create a temporary file to download the R2 archive
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz", prefix=f"wt_output_archive_{run_uuid}_") as tmp_archive_file:
-                                temp_output_archive_path = Path(tmp_archive_file.name)
-                            
-                            logger.info(f"[WeatherTask Run: {run_uuid}] Downloading output archive from R2: s3://{output_r2_bucket}/{output_r2_object_key_from_manifest} to {temp_output_archive_path}")
-                            await asyncio.to_thread(
-                                s3_client.download_file,
-                                output_r2_bucket,
-                                output_r2_object_key_from_manifest,
-                                str(temp_output_archive_path)
-                            )
-                            logger.info(f"[WeatherTask Run: {run_uuid}] Successfully downloaded output archive from R2.")
-
-                            # Use existing deserialization logic from weather_http_utils
-                            base_time_str = job_output.get("base_time") # Ensure this is passed in the manifest
-                            if not base_time_str:
-                                logger.error(f"[WeatherTask Run: {run_uuid}] 'base_time' missing from successful job output manifest: {job_output}")
-                                return None
-                            
-                            # Convert base_time_str (ISO format string) to pd.Timestamp
-                            # Assuming it's UTC. If not, timezone handling might be needed.
-                            base_time_for_coords = pd.Timestamp(base_time_str, tz='UTC')
-
-
-                            deserialized_steps = weather_http_utils.deserialize_gzipped_netcdf_archive(
-                                archive_path=temp_output_archive_path,
-                                base_time_for_coords=base_time_for_coords, # Pass the parsed base_time
-                                config=self.config # Pass relevant parts of self.config if needed by deserializer
-                            )
-                            if deserialized_steps:
-                                logger.info(f"[WeatherTask Run: {run_uuid}] Successfully deserialized {len(deserialized_steps)} steps from downloaded archive.")
-                                return deserialized_steps
-                            else:
-                                logger.error(f"[WeatherTask Run: {run_uuid}] Failed to deserialize steps from downloaded R2 archive {temp_output_archive_path}.")
-                                return None
-                        except BotoClientError as e_boto_down:
-                            logger.error(f"[WeatherTask Run: {run_uuid}] R2 ClientError during output download: {e_boto_down.response.get('Error', {}).get('Message', str(e_boto_down))}", exc_info=True)
-                            return None
-                        except pd.errors.ParserError as e_time_parse:
-                            logger.error(f"[WeatherTask Run: {run_uuid}] Failed to parse 'base_time' string '{base_time_str}' from manifest: {e_time_parse}", exc_info=True)
-                            return None
-                        except Exception as e_output_proc:
-                            logger.error(f"[WeatherTask Run: {run_uuid}] Error processing downloaded R2 output: {e_output_proc}", exc_info=True)
-                            return None
-                        finally:
-                            if temp_output_archive_path and temp_output_archive_path.exists():
-                                temp_output_archive_path.unlink(missing_ok=True)
-                                logger.debug(f"[WeatherTask Run: {run_uuid}] Cleaned up temporary output archive: {temp_output_archive_path}")
-
-                    elif job_status in ["IN_PROGRESS", "IN_QUEUE"]:
-                        logger.info(f"[WeatherTask Run: {run_uuid}] RunPod job {runpod_job_id} status: {job_status}. Continuing to poll.")
-                    else: # FAILED, TIMED_OUT, or other unknown status
-                        logger.error(f"[WeatherTask Run: {run_uuid}] RunPod job {runpod_job_id} failed or unexpected status: {job_status}. Response: {status_data}")
-                        job_output = status_data.get("output", {})
-                        if job_output and job_output.get("error"): # Check for error message from worker
-                            logger.error(f"[WeatherTask Run: {run_uuid}] Server-side error from RunPod worker: {job_output['error']}")
-                        return None # Job failed
-
-                logger.warning(f"[WeatherTask Run: {run_uuid}] RunPod job {runpod_job_id} polling timed out after {max_attempts} attempts.")
+            except (httpx.HTTPStatusError, httpx.RequestError, json.JSONDecodeError) as e:
+                logger.error(f"[{job_id}] Error starting inference job: {e}", exc_info=True)
                 return None
 
-        except httpx.HTTPStatusError as e_http:
-            logger.error(f"[WeatherTask Run: {run_uuid}] HTTP error during RunPod operation: {e_http.response.status_code} - {e_http.response.text}", exc_info=True)
-            return None
-        except httpx.RequestError as e_req:
-            logger.error(f"[WeatherTask Run: {run_uuid}] Request error during RunPod operation: {e_req}", exc_info=True)
-            return None
-        except json.JSONDecodeError as e_json:
-            logger.error(f"[WeatherTask Run: {run_uuid}] Failed to decode JSON response from RunPod: {e_json}", exc_info=True)
-            return None
+    async def _run_inference_via_http_service(self, job_id: str) -> bool:
+        """
+        Orchestrates running inference via the HTTP service.
+        This is now fully asynchronous and returns immediately after launching the job.
+        """
+        logger.info(f"[{job_id}] Starting async inference via HTTP service.")
+        s3_client = await self._get_r2_s3_client()
+        if not s3_client:
+            await update_job_status(self, job_id, 'failed', "R2 client configuration invalid.")
+            return False
+
+        initial_batch = await self._load_batch_from_db(job_id)
+        if not initial_batch:
+            await update_job_status(self, job_id, 'failed', "Failed to load initial data batch.")
+            return False
+
+        input_r2_key = await self._upload_input_to_r2(s3_client, job_id, initial_batch)
+        if not input_r2_key:
+            await update_job_status(self, job_id, 'failed', "Failed to upload input to R2.")
+            return False
+
+        runpod_job_id = await self._invoke_inference_service(job_id, input_r2_key)
+        if not runpod_job_id:
+            await update_job_status(self, job_id, 'failed', "Failed to start job on RunPod.")
+            return False
+
+        # Save the RunPod job ID and launch the poller
+        try:
+            query = "UPDATE weather_miner_jobs SET runpod_job_id = :runpod_id WHERE id = :job_id"
+            await self.db_manager.execute(query, {"runpod_id": runpod_job_id, "job_id": job_id})
+            
+            logger.info(f"[{job_id}] Saved RunPod ID {runpod_job_id}. Launching background poller.")
+            asyncio.create_task(poll_runpod_job_worker(self, job_id, runpod_job_id))
+            return True
         except Exception as e:
-            logger.error(f"[WeatherTask Run: {run_uuid}] An unexpected error occurred in _run_inference_via_http_service: {e}", exc_info=True)
-            return None
-        finally:
-            # Any final cleanup specific to this function if needed, beyond temp files handled above
-            logger.info(f"[WeatherTask Run: {run_uuid}] Finished _run_inference_via_http_service for job_id: {job_id}.")
-            # Ensure temp_input_file_path is cleaned up if it wasn't in its own try/finally
-            if 'temp_input_file_path' in locals() and temp_input_file_path and temp_input_file_path.exists():
-                temp_input_file_path.unlink(missing_ok=True)
-                logger.debug(f"[WeatherTask Run: {run_uuid}] Final cleanup of temp input file: {temp_input_file_path}")
+            error_msg = f"DB error after starting RunPod job: {e}"
+            logger.error(f"[{job_id}] {error_msg}", exc_info=True)
+            await update_job_status(self, job_id, 'failed', error_msg)
+            # Should also attempt to cancel the runpod job here if possible
+            return False
 
     ############################################################
     # Validator methods
@@ -1045,7 +958,7 @@ class WeatherTask(Task):
                         new_db_status = None
                         hash_match = None
 
-                        if miner_hash and miner_status in ['input_hashed_awaiting_validation', 'completed']:
+                        if miner_hash and miner_status == 'input_hashed_awaiting_validation':
                             if miner_hash == validator_input_hash:
                                 logger.info(f"[Run {run_id}] Hash MATCH for response ID {resp_id} (Miner status: {miner_status})!")
                                 new_db_status = 'input_validation_complete'
@@ -1608,7 +1521,7 @@ class WeatherTask(Task):
         """
         Handles the /weather-initiate-fetch request.
         Creates a job record and launches the background task for fetching GFS and hashing.
-        CHECKS FOR EXISTING JOBS to avoid duplicate work.
+        If a failed job for the same timestep exists, it will be reset and retried.
         """
         if self.node_type != 'miner':
             logger.error("handle_initiate_fetch called on non-miner node.")
@@ -1623,12 +1536,12 @@ class WeatherTask(Task):
 
             logger.info(f"[Miner] Received initiate_fetch request for T0={t0_run_time}")
 
+            # Find any existing job for this exact time, regardless of status
             existing_job_query = """
                 SELECT id, status, input_data_hash
                 FROM weather_miner_jobs 
                 WHERE gfs_init_time_utc = :gfs_init
                 AND gfs_t_minus_6_time_utc = :gfs_t_minus_6
-                AND status NOT IN ('error', 'fetch_error')
                 ORDER BY validator_request_time DESC
                 LIMIT 1
             """
@@ -1641,19 +1554,37 @@ class WeatherTask(Task):
             if existing_job:
                 job_id = existing_job['id']
                 status = existing_job['status']
-                logger.info(f"[Miner Job {job_id}] Found existing job (status: {status}) for GFS times. Reusing.")
                 
-                response = {
-                    "status": "fetch_accepted", 
-                    "job_id": job_id, 
-                    "message": f"Reusing existing job (status: {status})"
-                }
-                
-                if existing_job.get('input_data_hash'):
-                    response["input_data_hash"] = existing_job['input_data_hash']
+                # If the job is in a recoverable (failed) state, reset and retry it.
+                if status in ['error', 'fetch_error', 'failed', 'input_hash_mismatch', 'input_hash_timeout', 'input_poll_error']:
+                    logger.warning(f"[Miner Job {job_id}] Found existing FAILED job (status: {status}). Resetting and retrying.")
                     
-                return response
+                    # Reset status to 'fetch_queued' and clear any previous error message.
+                    await update_job_status(self, job_id, 'fetch_queued', error_message="")
+                    
+                    # Relaunch the background task to fetch and hash the data.
+                    asyncio.create_task(fetch_and_hash_gfs_task(
+                        task_instance=self,
+                        job_id=job_id,
+                        t0_run_time=t0_run_time,
+                        t_minus_6_run_time=t_minus_6_run_time
+                    ))
+                    
+                    return {"status": "fetch_accepted", "job_id": job_id, "message": f"Retrying existing failed job (previous status: {status})."}
 
+                # If the job is in a valid, non-failed state, reuse it.
+                else:
+                    logger.info(f"[Miner Job {job_id}] Found existing active job (status: {status}). Reusing.")
+                    response = {
+                        "status": "fetch_accepted", 
+                        "job_id": job_id, 
+                        "message": f"Reusing existing job (status: {status})"
+                    }
+                    if existing_job.get('input_data_hash'):
+                        response["input_data_hash"] = existing_job['input_data_hash']
+                    return response
+
+            # If no job exists, create a new one.
             job_id = str(uuid.uuid4())
             logger.info(f"[Miner Job {job_id}] No existing job found. Creating new job for T0={t0_run_time}.")
 
@@ -1688,7 +1619,8 @@ class WeatherTask(Task):
         """
         Handles the /weather-get-input-status request.
         Returns the current status and input hash (if computed) for the job.
-        (Called by the API handler in subnet.py)
+        If the job is ready for inference but hasn't been triggered, it reports
+        the status as 'input_hashed_awaiting_validation' to conform to the validator.
         """
         if self.node_type != 'miner':
             logger.error("handle_get_input_status called on non-miner node.")
@@ -1702,14 +1634,20 @@ class WeatherTask(Task):
             if not result:
                 logger.warning(f"[Miner Job {job_id}] Status requested for non-existent job.")
                 return {"status": "not_found", "job_id": job_id, "message": "Job ID not found."}
+            
+            status_to_report = result['status']
+            # If hashing is done and we are waiting for the validator to trigger inference,
+            # report the specific status the validator is looking for.
+            if status_to_report == 'in_progress' and result.get('input_data_hash'):
+                status_to_report = 'input_hashed_awaiting_validation'
 
             response = {
                 "job_id": job_id,
-                "status": result['status'],
-                "input_data_hash": result.get('input_data_hash'), # Will be None if not computed yet
+                "status": status_to_report,
+                "input_data_hash": result.get('input_data_hash'),
                 "message": result.get('error_message')
             }
-            logger.debug(f"[Miner Job {job_id}] Returning status: {response['status']}, Hash available: {response['input_data_hash'] is not None}")
+            logger.debug(f"[Miner Job {job_id}] Reporting status: {response['status']}, Hash available: {response['input_data_hash'] is not None}")
             return response
 
         except Exception as e:
@@ -1718,78 +1656,65 @@ class WeatherTask(Task):
 
     async def handle_start_inference(self, job_id: str) -> Dict[str, Any]:
         """
-        Handles the /weather-start-inference request.
-        Verifies the job is ready and triggers the main inference background task.
-        CHECKS FOR EXISTING INFERENCE to avoid duplicate work.
-        (Called by the API handler in subnet.py)
+        Handles a request from a validator to start the inference process for a given job_id.
         """
-        if self.node_type != 'miner':
-            logger.error("handle_start_inference called on non-miner node.")
-            return {"status": "error", "message": "Invalid node type"}
+        if not job_id:
+            return {"status": "error", "message": "job_id is required."}
 
-        logger.info(f"[Miner Job {job_id}] Received start_inference request...") 
+        logger.info(f"Miner received request to start inference for job_id: {job_id}")
+
         try:
-            query = "SELECT status FROM weather_miner_jobs WHERE id = :job_id"
-            job_details = await self.db_manager.fetch_one(query, {"job_id": job_id})
+            async with self.gpu_semaphore:
+                logger.info(f"GPU semaphore acquired for job_id: {job_id}.")
 
-            if not job_details:
-                logger.warning(f"[Miner Job {job_id}] Start inference requested for non-existent job.")
-                return {"status": "error", "message": "Job ID not found."}
+                # Check job status and existing runpod_job_id to prevent duplicates
+                job_query = "SELECT status, runpod_job_id FROM weather_miner_jobs WHERE id = :job_id"
+                job_details = await self.db_manager.fetch_one(job_query, {"job_id": job_id})
 
-            current_status = job_details['status']
-            
-            if current_status in ['inference_queued', 'running_inference', 'completed']:
-                logger.info(f"[Miner Job {job_id}] Inference already in progress or completed (status: {current_status}). Not starting duplicate.")
-                return {
-                    "status": "inference_started", 
-                    "message": f"Inference already {current_status}. Reusing existing job."
-                }
-            
-            if current_status == 'error':
-                logger.warning(f"[Miner Job {job_id}] Cannot start inference on errored job.")
-                return {"status": "error", "message": "Job has errored, cannot start inference"}
+                if not job_details:
+                    return {"status": "error", "message": f"Job ID {job_id} not found."}
 
-            if current_status != 'input_hashed_awaiting_validation':
-                logger.warning(f"[Miner Job {job_id}] Start inference requested but job status is '{current_status}' (expected 'input_hashed_awaiting_validation').")
-                return {"status": "error", "message": f"Cannot start inference, job status is {current_status}"}
+                if job_details['runpod_job_id'] and job_details['status'] == 'in_progress':
+                    logger.warning(f"[{job_id}] Received start_inference call for a job already in progress on RunPod. Acknowledging.")
+                    return {"status": "success", "message": "Inference already in progress."}
 
-            update_query = """
-                UPDATE weather_miner_jobs 
-                SET status = 'inference_queued' 
-                WHERE id = :job_id AND status = 'input_hashed_awaiting_validation'
-                RETURNING id
-            """
-            updated = await self.db_manager.fetch_one(update_query, {"job_id": job_id})
-            
-            if not updated:
-                recheck_query = "SELECT status FROM weather_miner_jobs WHERE id = :job_id"
-                recheck_details = await self.db_manager.fetch_one(recheck_query, {"job_id": job_id})
-                new_status = recheck_details['status'] if recheck_details else 'unknown'
+                inference_type = self.config.get('weather_inference_type', 'local_model')
+                logger.info(f"Executing inference for job {job_id} using type: {inference_type}")
+
+                if inference_type == "http_service":
+                    # This function now returns True if the async poller was launched successfully
+                    success = await self._run_inference_via_http_service(job_id)
+                    if success:
+                        return {"status": "success", "message": "Inference process started."}
+                    else:
+                        return {"status": "error", "message": "Failed to start inference process."}
+
+                elif inference_type == "local_model":
+                    if not self.inference_runner or not self.inference_runner.model:
+                        msg = "Local model selected but not loaded."
+                        logger.error(f"[{job_id}] {msg}")
+                        await update_job_status(self, job_id, 'failed', msg)
+                        return {"status": "error", "message": msg}
+                    
+                    await run_inference_background(task_instance=self, job_id=job_id)
+                    job_status_rec = await self.db_manager.fetch_one("SELECT status FROM weather_miner_jobs WHERE id = :job_id", {"job_id": job_id})
+                    final_status = job_status_rec['status'] if job_status_rec else 'unknown'
+
+                    if final_status == 'completed':
+                        return {"status": "success", "message": "Inference process completed."}
+                    else:
+                        return {"status": "error", "message": "Inference process failed."}
                 
-                logger.info(f"[Miner Job {job_id}] Status changed during update attempt. Now: {new_status}. Likely another validator triggered it.")
-                if new_status in ['inference_queued', 'running_inference', 'completed']:
-                    return {
-                        "status": "inference_started", 
-                        "message": f"Inference already triggered by another validator (status: {new_status})"
-                    }
                 else:
-                    return {"status": "error", "message": f"Failed to queue inference, status is now {new_status}"}
-            
-            logger.info(f"[Miner Job {job_id}] Status updated to inference_queued. Launching background inference task.")
-
-            asyncio.create_task(run_inference_background(
-                 task_instance=self,
-                 job_id=job_id,
-            ))
-
-            return {"status": "inference_started", "message": "Inference process initiated."}
+                    msg = f"Unsupported inference type: {inference_type}"
+                    logger.error(f"[{job_id}] {msg}")
+                    await update_job_status(self, job_id, 'failed', msg)
+                    return {"status": "error", "message": msg}
 
         except Exception as e:
-            logger.error(f"[Miner Job {job_id}] Error during handle_start_inference: {e}", exc_info=True)
-            try:
-                await update_job_status(self, job_id, "error", f"Inference start failed: {e}")
-            except: pass
-            return {"status": "error", "message": f"Failed to start inference: {e}"}
+            logger.error(f"Unexpected error in handle_start_inference for job {job_id}: {e}", exc_info=True)
+            await update_job_status(self, job_id, 'failed', f"Unhandled exception: {e}")
+            return {"status": "error", "message": f"An unexpected error occurred: {e}"}
 
     ############################################################
     # Helper Methods
@@ -1797,8 +1722,7 @@ class WeatherTask(Task):
 
     async def cleanup_resources(self):
         """
-        Clean up resources like temporary files or reset database statuses
-        in case of errors or shutdowns.
+        Cleans up old files from the local filesystem.
         """
         logger.info("Cleaning up weather task resources...")
         
@@ -2077,3 +2001,138 @@ class WeatherTask(Task):
                 logger.error(f"Error in miner_fetch_hash_worker: {e}", exc_info=True)
                 await asyncio.sleep(60)
             
+    async def stop_r2_cleanup_workers(self):
+        await self._stop_worker_list(self.r2_cleanup_workers, "R2 Cleanup")
+        self.r2_cleanup_worker_running = False
+
+    async def start_r2_cleanup_workers(self, num_workers=1):
+        if self.r2_cleanup_worker_running:
+            logger.info("R2 cleanup workers are already running.")
+            return
+        self.r2_cleanup_worker_running = True
+        for i in range(num_workers):
+            task = asyncio.create_task(r2_cleanup_worker(self))
+            self.r2_cleanup_workers.append(task)
+        logger.info(f"Started {num_workers} R2 cleanup workers.")
+
+    async def start_background_workers(self, num_ensemble_workers=1, num_initial_scoring_workers=1, num_final_scoring_workers=1, num_cleanup_workers=1):
+        if self.node_type == "validator":
+            await self.start_initial_scoring_workers(num_workers=num_initial_scoring_workers)
+            await self.start_final_scoring_workers(num_workers=num_final_scoring_workers)
+            await self.start_cleanup_workers(num_workers=num_cleanup_workers)
+        elif self.node_type == "miner":
+            if self.config.get('r2_cleanup_enabled', False):
+                await self.start_r2_cleanup_workers(num_workers=1)
+            else:
+                logger.info("R2 cleanup worker is disabled by configuration.")
+
+
+    async def stop_background_workers(self):
+        if self.node_type == "validator":
+            await self.stop_initial_scoring_workers()
+            await self.stop_final_scoring_workers()
+            await self.stop_cleanup_workers()
+        elif self.node_type == "miner":
+            if self.r2_cleanup_worker_running:
+                await self.stop_r2_cleanup_workers()
+
+        async def _stop_worker_list(worker_list, worker_name):
+            if not worker_list:
+                return
+            
+            logger.info(f"Stopping {len(worker_list)} {worker_name} worker(s)...")
+            
+            # Cancel all tasks
+            for worker in worker_list:
+                if not worker.done():
+                    worker.cancel()
+            
+            # Wait for cancellation to complete with timeout
+            if worker_list:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*worker_list, return_exceptions=True),
+                        timeout=5.0
+                    )
+                    logger.info(f"Successfully stopped {worker_name} workers")
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout stopping {worker_name} workers, forcing cleanup")
+                except Exception as e:
+                    logger.warning(f"Error stopping {worker_name} workers: {e}")
+
+        # Stop each worker type
+        try: 
+            await _stop_worker_list(self.initial_scoring_workers, "initial_scoring")
+            self.initial_scoring_workers = []
+            self.initial_scoring_worker_running = False
+        except Exception as e: 
+            logger.error(f"Error stopping initial scoring workers: {e}")
+            
+        try: 
+            await _stop_worker_list(self.final_scoring_workers, "final_scoring")
+            self.final_scoring_workers = []
+            self.final_scoring_worker_running = False
+        except Exception as e: 
+            logger.error(f"Error stopping final scoring workers: {e}")
+            
+        try: 
+            await _stop_worker_list(self.cleanup_workers, "cleanup")
+            self.cleanup_workers = []
+            self.cleanup_worker_running = False
+        except Exception as e: 
+            logger.error(f"Error stopping cleanup workers: {e}")
+
+        logger.info("All background workers stopped")
+        
+    async def _load_batch_from_db(self, job_id: str) -> Optional[Batch]:
+        """Loads the initial batch object from the pickle file path stored in the database."""
+        logger.info(f"[{job_id}] Loading initial batch from database path.")
+        try:
+            query = "SELECT input_batch_pickle_path FROM weather_miner_jobs WHERE id = :job_id"
+            result = await self.db_manager.fetch_one(query, {"job_id": job_id})
+
+            if not result or not result['input_batch_pickle_path']:
+                logger.error(f"[{job_id}] No input_batch_pickle_path found in DB for this job.")
+                return None
+            
+            pickle_path = Path(result['input_batch_pickle_path'])
+            if not pickle_path.exists():
+                logger.error(f"[{job_id}] Pickle file not found at path from DB: {pickle_path}")
+                return None
+
+            with open(pickle_path, "rb") as f:
+                initial_batch = pickle.load(f)
+            
+            logger.info(f"[{job_id}] Successfully loaded batch from {pickle_path}.")
+            return initial_batch
+
+        except Exception as e:
+            logger.error(f"[{job_id}] Error loading batch from DB path: {e}", exc_info=True)
+            return None
+
+    async def recover_incomplete_http_jobs(self):
+        """
+        Finds jobs that were in-progress on RunPod and restarts the polling worker for them.
+        This should be called on miner startup.
+        """
+        if self.node_type != "miner" or self.config.get('weather_inference_type') != 'http_service':
+            return
+        
+        logger.info("Checking for incomplete HTTP jobs to recover...")
+        try:
+            query = "SELECT id, runpod_job_id FROM weather_miner_jobs WHERE status = 'in_progress' AND runpod_job_id IS NOT NULL"
+            incomplete_jobs = await self.db_manager.fetch_all(query)
+            
+            if not incomplete_jobs:
+                logger.info("No incomplete HTTP jobs found.")
+                return
+
+            logger.info(f"Found {len(incomplete_jobs)} incomplete HTTP job(s). Restarting pollers...")
+            for job in incomplete_jobs:
+                job_id = job['id']
+                runpod_job_id = job['runpod_job_id']
+                logger.info(f"  - Restarting poller for Job ID: {job_id}, RunPod ID: {runpod_job_id}")
+                asyncio.create_task(poll_runpod_job_worker(self, job_id, runpod_job_id))
+        except Exception as e:
+            logger.error(f"Error during incomplete HTTP job recovery: {e}", exc_info=True)
+        
