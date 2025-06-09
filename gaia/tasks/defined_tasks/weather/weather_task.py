@@ -1483,7 +1483,7 @@ class WeatherTask(Task):
             if not job:
                 logger.warning(f"Job not found for job_id: {job_id}")
                 return self._validate_and_format_response({
-                    "status": WeatherTaskStatus.NOT_FOUND, 
+                    "status": WeatherTaskStatus.NOT_FOUND.value, 
                     "message": f"Job with ID {job_id} not found"
                 }, ["status", "message"])
                 
@@ -1494,7 +1494,7 @@ class WeatherTask(Task):
                 if not zarr_path_str or not verification_hash:
                     logger.error(f"Job {job_id} completed but missing required path/hash info. Zarr path: {zarr_path_str}, Hash: {verification_hash}")
                     return self._validate_and_format_response({
-                        "status": WeatherTaskStatus.ERROR, 
+                        "status": WeatherTaskStatus.ERROR.value, 
                         "message": "Job completed but data paths or hash missing"
                     }, ["status", "message"])
                 
@@ -1504,7 +1504,7 @@ class WeatherTask(Task):
                 if not zarr_dir_name.endswith(".zarr"):
                     logger.error(f"Expected Zarr directory but found: {zarr_dir_name}")
                     return self._validate_and_format_response({
-                        "status": WeatherTaskStatus.ERROR, 
+                        "status": WeatherTaskStatus.ERROR.value, 
                         "message": "Invalid Zarr store format"
                     }, ["status", "message"])
 
@@ -1532,7 +1532,7 @@ class WeatherTask(Task):
                 zarr_url_for_response = f"/forecasts/{zarr_dir_name}"
                 
                 return self._validate_and_format_response({
-                    "status": WeatherTaskStatus.COMPLETED,
+                    "status": WeatherTaskStatus.COMPLETED.value,
                     "message": "Forecast completed and ready for access",
                     "zarr_store_url": zarr_url_for_response,
                     "verification_hash": verification_hash,
@@ -1542,20 +1542,20 @@ class WeatherTask(Task):
             elif job["status"] == "error":
                 logger.warning(f"[Job {job_id}] Forecast data requested but job failed. Error: {job['error_message'] or 'Unknown error'}")
                 return self._validate_and_format_response({
-                    "status": WeatherTaskStatus.ERROR, 
+                    "status": WeatherTaskStatus.ERROR.value, 
                     "message": f"Job failed: {job['error_message'] or 'Unknown error'}"
                 }, ["status", "message"])
             else:
                 logger.info(f"[Job {job_id}] Forecast data requested but job still processing (status: {job['status']}). Validator will need to retry later.")
                 return self._validate_and_format_response({
-                    "status": WeatherTaskStatus.PROCESSING, 
+                    "status": WeatherTaskStatus.PROCESSING.value, 
                     "message": f"Job is currently in status: {job['status']}"
                 }, ["status", "message"])
                 
         except Exception as e:
             logger.error(f"Error handling forecast data request for job_id {job_id}: {e}", exc_info=True)
             return self._validate_and_format_response({
-                "status": WeatherTaskStatus.ERROR, 
+                "status": WeatherTaskStatus.ERROR.value, 
                 "message": f"Failed to process request: {str(e)}"
             }, ["status", "message"])
 
@@ -1568,7 +1568,7 @@ class WeatherTask(Task):
         if self.node_type != 'miner':
             logger.error("handle_initiate_fetch called on non-miner node.")
             return self._validate_and_format_response({
-                "status": WeatherTaskStatus.ERROR, 
+                "status": WeatherTaskStatus.ERROR.value, 
                 "job_id": None, 
                 "message": "Invalid node type"
             }, ["status", "message"])
@@ -1618,7 +1618,7 @@ class WeatherTask(Task):
                     ))
                     
                     return self._validate_and_format_response({
-                        "status": WeatherTaskStatus.FETCH_ACCEPTED, 
+                        "status": WeatherTaskStatus.FETCH_ACCEPTED.value, 
                         "job_id": job_id, 
                         "message": f"Retrying existing failed job (previous status: {status})."
                     }, ["status", "job_id"])
@@ -1627,7 +1627,7 @@ class WeatherTask(Task):
                 else:
                     logger.info(f"[Miner Job {job_id}] Found existing active job (status: {status}). Reusing.")
                     response = {
-                        "status": WeatherTaskStatus.FETCH_ACCEPTED, 
+                        "status": WeatherTaskStatus.FETCH_ACCEPTED.value, 
                         "job_id": job_id, 
                         "message": f"Reusing existing job (status: {status})"
                     }
@@ -1661,7 +1661,7 @@ class WeatherTask(Task):
             ))
 
             return self._validate_and_format_response({
-                "status": WeatherTaskStatus.FETCH_ACCEPTED, 
+                "status": WeatherTaskStatus.FETCH_ACCEPTED.value, 
                 "job_id": job_id, 
                 "message": "Fetch and hash process initiated."
             }, ["status", "job_id"])
@@ -1669,7 +1669,7 @@ class WeatherTask(Task):
         except Exception as e:
             logger.error(f"[Miner] Error during handle_initiate_fetch: {e}", exc_info=True)
             return self._validate_and_format_response({
-                "status": WeatherTaskStatus.ERROR, 
+                "status": WeatherTaskStatus.ERROR.value, 
                 "job_id": None, 
                 "message": f"Failed to initiate fetch: {e}"
             }, ["status", "message"])
@@ -1684,7 +1684,7 @@ class WeatherTask(Task):
         if self.node_type != 'miner':
             logger.error("handle_get_input_status called on non-miner node.")
             return self._validate_and_format_response({
-                "status": WeatherTaskStatus.ERROR, 
+                "status": WeatherTaskStatus.ERROR.value, 
                 "job_id": job_id, 
                 "message": "Invalid node type"
             }, ["status", "job_id", "message"])
@@ -1697,7 +1697,7 @@ class WeatherTask(Task):
             if not result:
                 logger.warning(f"[Miner Job {job_id}] Status requested for non-existent job.")
                 return self._validate_and_format_response({
-                    "status": WeatherTaskStatus.NOT_FOUND, 
+                    "status": WeatherTaskStatus.NOT_FOUND.value, 
                     "job_id": job_id, 
                     "message": "Job ID not found."
                 }, ["status", "job_id", "message"])
@@ -1720,7 +1720,7 @@ class WeatherTask(Task):
         except Exception as e:
             logger.error(f"[Miner Job {job_id}] Error during handle_get_input_status: {e}", exc_info=True)
             return self._validate_and_format_response({
-                "status": WeatherTaskStatus.ERROR, 
+                "status": WeatherTaskStatus.ERROR.value, 
                 "job_id": job_id, 
                 "message": f"Failed to get status: {e}"
             }, ["status", "job_id", "message"])
@@ -1732,7 +1732,7 @@ class WeatherTask(Task):
         """
         if not job_id:
             return self._validate_and_format_response({
-                "status": WeatherTaskStatus.ERROR, 
+                "status": WeatherTaskStatus.ERROR.value, 
                 "message": "job_id is required."
             }, ["status", "message"])
 
@@ -1745,14 +1745,14 @@ class WeatherTask(Task):
 
             if not job_details:
                 return self._validate_and_format_response({
-                    "status": WeatherTaskStatus.ERROR, 
+                    "status": WeatherTaskStatus.ERROR.value, 
                     "message": f"Job ID {job_id} not found."
                 }, ["status", "message"])
 
             if job_details['runpod_job_id'] and job_details['status'] == 'in_progress':
                 logger.warning(f"[{job_id}] Received start_inference call for a job already in progress on RunPod. Acknowledging.")
                 return self._validate_and_format_response({
-                    "status": WeatherTaskStatus.INFERENCE_STARTED, 
+                    "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
                     "message": "Inference already in progress."
                 }, ["status", "message"])
 
@@ -1763,7 +1763,7 @@ class WeatherTask(Task):
                 # Launch background task for HTTP service inference
                 asyncio.create_task(self._run_inference_via_http_service(job_id))
                 return self._validate_and_format_response({
-                    "status": WeatherTaskStatus.INFERENCE_STARTED, 
+                    "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
                     "message": "HTTP inference process initiated."
                 }, ["status", "message"])
 
@@ -1773,14 +1773,14 @@ class WeatherTask(Task):
                     logger.error(f"[{job_id}] {msg}")
                     await update_job_status(self, job_id, 'failed', msg)
                     return self._validate_and_format_response({
-                        "status": WeatherTaskStatus.ERROR, 
+                        "status": WeatherTaskStatus.ERROR.value, 
                         "message": msg
                     }, ["status", "message"])
                 
                 # Launch background task for local model inference
                 asyncio.create_task(run_inference_background(task_instance=self, job_id=job_id))
                 return self._validate_and_format_response({
-                    "status": WeatherTaskStatus.INFERENCE_STARTED, 
+                    "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
                     "message": "Local inference process initiated."
                 }, ["status", "message"])
             
@@ -1789,7 +1789,7 @@ class WeatherTask(Task):
                 logger.error(f"[{job_id}] {msg}")
                 await update_job_status(self, job_id, 'failed', msg)
                 return self._validate_and_format_response({
-                    "status": WeatherTaskStatus.ERROR, 
+                    "status": WeatherTaskStatus.ERROR.value, 
                     "message": msg
                 }, ["status", "message"])
 
@@ -1797,7 +1797,7 @@ class WeatherTask(Task):
             logger.error(f"Unexpected error in handle_start_inference for job {job_id}: {e}", exc_info=True)
             await update_job_status(self, job_id, 'failed', f"Unhandled exception: {e}")
             return self._validate_and_format_response({
-                "status": WeatherTaskStatus.ERROR, 
+                "status": WeatherTaskStatus.ERROR.value, 
                 "message": f"An unexpected error occurred: {e}"
             }, ["status", "message"])
 
@@ -2173,7 +2173,13 @@ class WeatherTask(Task):
         """
         if not isinstance(response_dict, dict):
             logger.error(f"Response validation failed: expected dict, got {type(response_dict)}")
-            return {"status": WeatherTaskStatus.ERROR, "message": "Invalid response format"}
+            return {"status": WeatherTaskStatus.ERROR.value, "message": "Invalid response format"}
+        
+        # Convert any WeatherTaskStatus enum values to strings
+        if "status" in response_dict:
+            if isinstance(response_dict["status"], WeatherTaskStatus):
+                response_dict["status"] = response_dict["status"].value
+                logger.debug(f"Converted enum status to string: {response_dict['status']}")
         
         # Check for required fields
         missing_fields = [field for field in expected_fields if field not in response_dict]
@@ -2184,7 +2190,7 @@ class WeatherTask(Task):
         # Ensure status is valid if present
         if "status" in response_dict:
             try:
-                # Validate that status is a valid enum value
+                # Validate that status is a valid enum value (by string)
                 WeatherTaskStatus(response_dict["status"])
             except ValueError:
                 logger.warning(f"Unknown status value: {response_dict['status']}")
