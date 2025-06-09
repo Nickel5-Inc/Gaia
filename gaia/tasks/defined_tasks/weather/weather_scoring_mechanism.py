@@ -213,18 +213,29 @@ async def evaluate_miner_forecast_day1(
                     ref_var_da_unaligned = gfs_reference_lead[var_name]
 
                     if var_level:
-                        miner_var_da_selected = miner_var_da_unaligned.sel(pressure_level=var_level, method="nearest")
-                        truth_var_da_selected = truth_var_da_unaligned.sel(pressure_level=var_level, method="nearest")
-                        ref_var_da_selected = ref_var_da_unaligned.sel(pressure_level=var_level, method="nearest")
+                        # Handle different pressure level dimension names
+                        pressure_dim = None
+                        for dim_name in ['pressure_level', 'plev', 'level']:
+                            if dim_name in miner_var_da_unaligned.dims:
+                                pressure_dim = dim_name
+                                break
                         
-                        if abs(truth_var_da_selected.pressure_level.item() - var_level) > 10:
-                             logger.warning(f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected.pressure_level.item()}). Skipping.")
+                        if not pressure_dim:
+                            logger.warning(f"No pressure level dimension found for {var_key} level {var_level}. Available dims: {miner_var_da_unaligned.dims}. Skipping.")
+                            continue
+                            
+                        miner_var_da_selected = miner_var_da_unaligned.sel({pressure_dim: var_level}, method="nearest")
+                        truth_var_da_selected = truth_var_da_unaligned.sel({pressure_dim: var_level}, method="nearest")
+                        ref_var_da_selected = ref_var_da_unaligned.sel({pressure_dim: var_level}, method="nearest")
+                        
+                        if abs(truth_var_da_selected[pressure_dim].item() - var_level) > 10:
+                             logger.warning(f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected[pressure_dim].item()}). Skipping.")
                              continue
-                        if abs(miner_var_da_selected.pressure_level.item() - var_level) > 10:
-                             logger.warning(f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected.pressure_level.item()}). Skipping.")
+                        if abs(miner_var_da_selected[pressure_dim].item() - var_level) > 10:
+                             logger.warning(f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected[pressure_dim].item()}). Skipping.")
                              continue
-                        if abs(ref_var_da_selected.pressure_level.item() - var_level) > 10:
-                             logger.warning(f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected.pressure_level.item()}). Skipping.")
+                        if abs(ref_var_da_selected[pressure_dim].item() - var_level) > 10:
+                             logger.warning(f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected[pressure_dim].item()}). Skipping.")
                              continue
                     else:
                         miner_var_da_selected = miner_var_da_unaligned
@@ -334,10 +345,18 @@ async def evaluate_miner_forecast_day1(
                     clim_var_da_raw_std = _standardize_spatial_dims(clim_var_da_raw)
 
                     clim_var_to_interpolate = clim_var_da_raw_std
-                    if var_level and 'pressure_level' in clim_var_to_interpolate.dims:
-                        clim_var_to_interpolate = await asyncio.to_thread(clim_var_to_interpolate.sel, pressure_level=var_level, method="nearest")
-                        if abs(clim_var_to_interpolate.pressure_level.item() - var_level) > 10:
-                            logger.warning(f"[Day1Score] Climatology for {var_key} at target level {var_level} was found at {clim_var_to_interpolate.pressure_level.item()}. Using this nearest level data.")
+                    if var_level:
+                        # Handle different pressure level dimension names in climatology data
+                        clim_pressure_dim = None
+                        for dim_name in ['pressure_level', 'plev', 'level']:
+                            if dim_name in clim_var_to_interpolate.dims:
+                                clim_pressure_dim = dim_name
+                                break
+                        
+                        if clim_pressure_dim:
+                            clim_var_to_interpolate = await asyncio.to_thread(clim_var_to_interpolate.sel, **{clim_pressure_dim: var_level}, method="nearest")
+                            if abs(clim_var_to_interpolate[clim_pressure_dim].item() - var_level) > 10:
+                                logger.warning(f"[Day1Score] Climatology for {var_key} at target level {var_level} was found at {clim_var_to_interpolate[clim_pressure_dim].item()}. Using this nearest level data.")
                     
                     clim_var_da_aligned = await asyncio.to_thread(
                         clim_var_to_interpolate.interp_like,

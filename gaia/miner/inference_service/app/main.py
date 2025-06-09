@@ -37,7 +37,7 @@ from botocore.exceptions import ClientError # For R2 error handling
 from botocore.config import Config
 
 # --- Global Variables to be populated at startup --- 
-APP_CONFIG = None
+APP_CONFIG = {}
 EXPECTED_API_KEY = None
 INITIALIZED = False # Flag for lazy initialization
 S3_CLIENT = None  # Will be set to a boto3 S3 client if R2 is configured
@@ -718,16 +718,65 @@ async def combined_runpod_handler(job: Dict[str, Any]):
         _logger.error(f"Job {job_id}: Critical error in combined_runpod_handler for action '{action}': {e_handler_main}", exc_info=True)
         return {"error": f"A critical server error occurred: {str(e_handler_main)}"}
     finally:
+        # Comprehensive RunPod volume cleanup
+        _logger.info(f"Job {job_id}: Starting comprehensive cleanup...")
+        
+        # Primary cleanup: Remove the job-specific temporary directory
         if job_temp_base_dir.exists():
             try:
                 shutil.rmtree(job_temp_base_dir)
-                _logger.info(f"Job {job_id}: Successfully cleaned up base temporary directory: {job_temp_base_dir}")
+                _logger.info(f"Job {job_id}: Successfully cleaned up job temporary directory: {job_temp_base_dir}")
             except Exception as e_clean:
-                _logger.error(f"Job {job_id}: Error during cleanup of base temporary directory {job_temp_base_dir}: {e_clean}", exc_info=True)
+                _logger.error(f"Job {job_id}: Error during cleanup of job temporary directory {job_temp_base_dir}: {e_clean}", exc_info=True)
         
-        # The `downloaded_input_file_path` under the R2 workflow is inside `job_temp_base_dir`
-        # so it gets cleaned up when `job_temp_base_dir` is removed.
-        # The `local_archive_to_upload` (output of local processing) is handled for cleanup within the R2 workflow block.
+        # Additional cleanup: Remove any orphaned job directories older than 1 hour
+        orphaned_cleanup_base = network_volume_base / "runpod_jobs"
+        cleanup_count = 0
+        try:
+            if orphaned_cleanup_base.exists():
+                current_time = time.time()
+                for job_dir in orphaned_cleanup_base.iterdir():
+                    if job_dir.is_dir():
+                        try:
+                            # Check if directory is older than 1 hour
+                            dir_age = current_time - job_dir.stat().st_mtime
+                            if dir_age > 3600:  # 1 hour
+                                shutil.rmtree(job_dir)
+                                cleanup_count += 1
+                                _logger.debug(f"Job {job_id}: Cleaned up orphaned job directory: {job_dir}")
+                        except Exception as e_orphan:
+                            _logger.debug(f"Job {job_id}: Could not clean orphaned directory {job_dir}: {e_orphan}")
+                
+                if cleanup_count > 0:
+                    _logger.info(f"Job {job_id}: Cleaned up {cleanup_count} orphaned job directories older than 1 hour")
+        except Exception as e_orphan_cleanup:
+            _logger.debug(f"Job {job_id}: Error during orphaned directory cleanup: {e_orphan_cleanup}")
+        
+        # Final cleanup: Remove runpod_jobs directory entirely if it's empty
+        try:
+            if orphaned_cleanup_base.exists():
+                # Check if directory is empty (no files or subdirectories)
+                if not any(orphaned_cleanup_base.iterdir()):
+                    orphaned_cleanup_base.rmdir()
+                    _logger.info(f"Job {job_id}: Removed empty runpod_jobs directory: {orphaned_cleanup_base}")
+                else:
+                    remaining_items = list(orphaned_cleanup_base.iterdir())
+                    _logger.debug(f"Job {job_id}: runpod_jobs directory not empty, {len(remaining_items)} items remaining")
+        except Exception as e_final_cleanup:
+            _logger.debug(f"Job {job_id}: Error during final runpod_jobs directory cleanup: {e_final_cleanup}")
+        
+        # Memory cleanup: Force garbage collection to free up inference artifacts
+        try:
+            import gc
+            collected = gc.collect()
+            _logger.debug(f"Job {job_id}: Garbage collection freed {collected} objects")
+        except Exception as e_gc:
+            _logger.debug(f"Job {job_id}: Error during garbage collection: {e_gc}")
+        
+        _logger.info(f"Job {job_id}: Cleanup completed successfully")
+        
+        # Note: The downloaded input files and any intermediate processing files are inside 
+        # job_temp_base_dir, so they get cleaned up when that directory is removed.
 
 async def initialize_app_for_runpod():
     """Loads config, sets up logging, and initializes the inference runner."""

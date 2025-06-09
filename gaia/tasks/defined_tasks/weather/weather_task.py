@@ -113,6 +113,7 @@ def _load_config(self):
     config['era5_cache_retention_days'] = int(os.getenv('WEATHER_ERA5_CACHE_RETENTION_DAYS', '30'))
     config['ensemble_retention_days'] = int(os.getenv('WEATHER_ENSEMBLE_RETENTION_DAYS', '14'))
     config['db_run_retention_days'] = int(os.getenv('WEATHER_DB_RUN_RETENTION_DAYS', '90'))
+    config['input_batch_retention_days'] = int(os.getenv('WEATHER_INPUT_BATCH_RETENTION_DAYS', '3'))  # New: retention for input batch pickle files
     config['run_hour_utc'] = int(os.getenv('WEATHER_RUN_HOUR_UTC', '18'))
     config['run_minute_utc'] = int(os.getenv('WEATHER_RUN_MINUTE_UTC', '0'))
     config['validator_hash_wait_minutes'] = int(os.getenv('WEATHER_VALIDATOR_HASH_WAIT_MINUTES', '10'))
@@ -589,8 +590,59 @@ class WeatherTask(Task):
         """
         Orchestrates running inference via the HTTP service.
         This is now fully asynchronous and returns immediately after launching the job.
+        Includes duplicate checking to prevent redundant inference for the same timestep.
         """
         logger.info(f"[{job_id}] Starting async inference via HTTP service.")
+        
+        # Check for duplicates before expensive operations
+        try:
+            # Get job details including GFS timestep
+            job_check_query = """
+                SELECT status, gfs_init_time_utc, runpod_job_id FROM weather_miner_jobs WHERE id = :job_id
+            """
+            job_check_details = await self.db_manager.fetch_one(job_check_query, {"job_id": job_id})
+            
+            if not job_check_details:
+                logger.error(f"[{job_id}] Job not found during HTTP inference duplicate check. Aborting.")
+                return False
+                
+            current_status = job_check_details['status']
+            gfs_init_time = job_check_details['gfs_init_time_utc']
+            existing_runpod_id = job_check_details['runpod_job_id']
+            
+            # Check if this job already has a RunPod job running
+            if existing_runpod_id and current_status == 'in_progress':
+                logger.warning(f"[{job_id}] Job already has RunPod ID {existing_runpod_id} and is in progress. Skipping duplicate HTTP inference.")
+                return True  # Return True since inference is already running
+            
+            # Check if this job is already completed
+            if current_status == 'completed':
+                logger.warning(f"[{job_id}] Job already completed. Skipping duplicate HTTP inference.")
+                return True
+                
+            # Check for other jobs with same timestep that are already in progress or completed
+            if gfs_init_time:
+                duplicate_check_query = """
+                    SELECT id, status, runpod_job_id FROM weather_miner_jobs 
+                    WHERE gfs_init_time_utc = :gfs_time 
+                    AND id != :current_job_id 
+                    AND status IN ('in_progress', 'completed')
+                    ORDER BY id DESC LIMIT 1
+                """
+                duplicate_job = await self.db_manager.fetch_one(duplicate_check_query, {
+                    "gfs_time": gfs_init_time,
+                    "current_job_id": job_id
+                })
+                
+                if duplicate_job:
+                    logger.warning(f"[{job_id}] Found existing job {duplicate_job['id']} for same timestep {gfs_init_time} with status '{duplicate_job['status']}'. Aborting duplicate HTTP inference.")
+                    await update_job_status(self, job_id, "skipped_duplicate", f"Duplicate of job {duplicate_job['id']}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"[{job_id}] Error during HTTP inference duplicate check: {e}", exc_info=True)
+            # Continue with inference if duplicate check fails to avoid blocking valid jobs
+        
         s3_client = await self._get_r2_s3_client()
         if not s3_client:
             await update_job_status(self, job_id, 'failed', "R2 client configuration invalid.")
@@ -1491,11 +1543,51 @@ class WeatherTask(Task):
                 zarr_path_str = job["target_netcdf_path"]
                 verification_hash = job["verification_hash"]
                 
-                if not zarr_path_str or not verification_hash:
-                    logger.error(f"Job {job_id} completed but missing required path/hash info. Zarr path: {zarr_path_str}, Hash: {verification_hash}")
+                # Auto-fix missing verification hash for completed jobs with zarr stores
+                if zarr_path_str and not verification_hash:
+                    logger.warning(f"Job {job_id} completed but missing verification hash. Attempting to auto-generate...")
+                    try:
+                        zarr_path = Path(zarr_path_str)
+                        if zarr_path.exists():
+                            # Generate manifest and signature for the existing zarr store
+                            def _generate_manifest_sync():
+                                from .utils.hashing import generate_manifest_and_signature
+                                return generate_manifest_and_signature(
+                                    zarr_store_path=zarr_path,
+                                    miner_hotkey_keypair=self.keypair if self.keypair else None
+                                )
+                            
+                            manifest_dict, signature_bytes, verification_hash = await asyncio.to_thread(_generate_manifest_sync)
+                            
+                            if verification_hash:
+                                # Update the database with the generated hash
+                                update_query = "UPDATE weather_miner_jobs SET verification_hash = :hash WHERE id = :job_id"
+                                await self.db_manager.execute(update_query, {"hash": verification_hash, "job_id": job_id})
+                                logger.info(f"Job {job_id} auto-generated and saved verification hash: {verification_hash[:16]}...")
+                            else:
+                                logger.error(f"Job {job_id} failed to auto-generate verification hash")
+                                return self._validate_and_format_response({
+                                    "status": WeatherTaskStatus.ERROR.value, 
+                                    "message": "Job completed but failed to generate verification hash"
+                                }, ["status", "message"])
+                        else:
+                            logger.error(f"Job {job_id} zarr path does not exist: {zarr_path_str}")
+                            return self._validate_and_format_response({
+                                "status": WeatherTaskStatus.ERROR.value, 
+                                "message": "Job completed but zarr store not found"
+                            }, ["status", "message"])
+                    except Exception as e:
+                        logger.error(f"Job {job_id} failed to auto-generate verification hash: {e}", exc_info=True)
+                        return self._validate_and_format_response({
+                            "status": WeatherTaskStatus.ERROR.value, 
+                            "message": f"Job completed but failed to generate verification hash: {e}"
+                        }, ["status", "message"])
+                
+                elif not zarr_path_str:
+                    logger.error(f"Job {job_id} completed but missing zarr path")
                     return self._validate_and_format_response({
                         "status": WeatherTaskStatus.ERROR.value, 
-                        "message": "Job completed but data paths or hash missing"
+                        "message": "Job completed but zarr path missing"
                     }, ["status", "message"])
                 
                 zarr_path = Path(zarr_path_str)
@@ -1705,8 +1797,11 @@ class WeatherTask(Task):
             status_to_report = result['status']
             # If hashing is done and we are waiting for the validator to trigger inference,
             # report the specific status the validator is looking for.
-            if status_to_report == 'in_progress' and result.get('input_data_hash'):
-                status_to_report = WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION.value
+            # For completed jobs, also report as awaiting validation so validator includes us in scoring
+            if result.get('input_data_hash'):
+                if status_to_report in ['in_progress', 'completed']:
+                    status_to_report = WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION.value
+                    logger.debug(f"[Miner Job {job_id}] Job status '{result['status']}' with hash converted to '{status_to_report}' for validator compatibility")
 
             response = {
                 "job_id": job_id,
@@ -1729,6 +1824,7 @@ class WeatherTask(Task):
         """
         Handles a request from a validator to start the inference process for a given job_id.
         This method should return quickly after launching the background inference task.
+        Ensures we don't launch duplicate inference for the same timestep.
         """
         if not job_id:
             return self._validate_and_format_response({
@@ -1739,8 +1835,11 @@ class WeatherTask(Task):
         logger.info(f"Miner received request to start inference for job_id: {job_id}")
 
         try:
-            # Check job status and existing runpod_job_id to prevent duplicates
-            job_query = "SELECT status, runpod_job_id FROM weather_miner_jobs WHERE id = :job_id"
+            # Get detailed job information including GFS timesteps
+            job_query = """
+                SELECT status, runpod_job_id, gfs_init_time_utc, gfs_t_minus_6_time_utc, target_netcdf_path
+                FROM weather_miner_jobs WHERE id = :job_id
+            """
             job_details = await self.db_manager.fetch_one(job_query, {"job_id": job_id})
 
             if not job_details:
@@ -1749,11 +1848,52 @@ class WeatherTask(Task):
                     "message": f"Job ID {job_id} not found."
                 }, ["status", "message"])
 
-            if job_details['runpod_job_id'] and job_details['status'] == 'in_progress':
-                logger.warning(f"[{job_id}] Received start_inference call for a job already in progress on RunPod. Acknowledging.")
+            current_status = job_details['status']
+            gfs_init_time = job_details['gfs_init_time_utc']
+            
+            # Check if inference is already running or completed for this job
+            if current_status in ['in_progress', 'completed']:
+                logger.info(f"[{job_id}] Job already in status '{current_status}'. Not starting duplicate inference.")
+                if current_status == 'completed':
+                    # For completed jobs, acknowledge that inference was successful
+                    return self._validate_and_format_response({
+                        "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
+                        "message": f"Inference already completed successfully."
+                    }, ["status", "message"])
+                else:
+                    # For in-progress jobs, acknowledge that inference is ongoing
+                    return self._validate_and_format_response({
+                        "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
+                        "message": f"Inference already in progress."
+                    }, ["status", "message"])
+            
+            # Check for any other jobs with the same GFS timestep that are already running or completed
+            if gfs_init_time:
+                duplicate_check_query = """
+                    SELECT id, status FROM weather_miner_jobs 
+                    WHERE gfs_init_time_utc = :gfs_time 
+                    AND id != :current_job_id 
+                    AND status IN ('in_progress', 'completed')
+                    ORDER BY id DESC LIMIT 1
+                """
+                duplicate_job = await self.db_manager.fetch_one(duplicate_check_query, {
+                    "gfs_time": gfs_init_time,
+                    "current_job_id": job_id
+                })
+                
+                if duplicate_job:
+                    logger.warning(f"[{job_id}] Found existing job {duplicate_job['id']} for same timestep {gfs_init_time} with status '{duplicate_job['status']}'. Not starting duplicate inference.")
+                    return self._validate_and_format_response({
+                        "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
+                        "message": f"Inference for timestep {gfs_init_time} already handled by job {duplicate_job['id']} (status: {duplicate_job['status']})."
+                    }, ["status", "message"])
+
+            # Check RunPod-specific duplicate prevention
+            if job_details['runpod_job_id'] and current_status == 'in_progress':
+                logger.warning(f"[{job_id}] Job already has RunPod ID and is in progress. Acknowledging existing inference.")
                 return self._validate_and_format_response({
                     "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
-                    "message": "Inference already in progress."
+                    "message": "Inference already in progress on RunPod."
                 }, ["status", "message"])
 
             inference_type = self.config.get('weather_inference_type', 'local_model')

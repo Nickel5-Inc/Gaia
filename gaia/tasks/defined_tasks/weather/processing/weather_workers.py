@@ -13,7 +13,7 @@ import shutil
 import time
 import zarr
 import numcodecs
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 import base64
 import pickle
 import httpx
@@ -120,8 +120,52 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
     Background task to run the inference process for a given job_id.
     Uses a semaphore to limit concurrent GPU-intensive operations.
     Handles both local model inference and HTTP service-based inference.
+    Includes duplicate checking to prevent redundant inference for the same timestep.
     """
     logger.info(f"[InferenceTask Job {job_id}] Background inference task initiated.")
+
+    # Check for duplicates before starting expensive operations
+    try:
+        # Get job details including GFS timestep
+        job_check_query = """
+            SELECT status, gfs_init_time_utc FROM weather_miner_jobs WHERE id = :job_id
+        """
+        job_check_details = await task_instance.db_manager.fetch_one(job_check_query, {"job_id": job_id})
+        
+        if not job_check_details:
+            logger.error(f"[InferenceTask Job {job_id}] Job not found during duplicate check. Aborting.")
+            return
+            
+        current_status = job_check_details['status']
+        gfs_init_time = job_check_details['gfs_init_time_utc']
+        
+        # Check if this job is already in progress or completed
+        if current_status in ['in_progress', 'completed']:
+            logger.warning(f"[InferenceTask Job {job_id}] Job already in status '{current_status}'. Skipping duplicate inference.")
+            return
+        
+        # Check for other jobs with same timestep that are already in progress or completed
+        if gfs_init_time:
+            duplicate_check_query = """
+                SELECT id, status FROM weather_miner_jobs 
+                WHERE gfs_init_time_utc = :gfs_time 
+                AND id != :current_job_id 
+                AND status IN ('in_progress', 'completed')
+                ORDER BY id DESC LIMIT 1
+            """
+            duplicate_job = await task_instance.db_manager.fetch_one(duplicate_check_query, {
+                "gfs_time": gfs_init_time,
+                "current_job_id": job_id
+            })
+            
+            if duplicate_job:
+                logger.warning(f"[InferenceTask Job {job_id}] Found existing job {duplicate_job['id']} for same timestep {gfs_init_time} with status '{duplicate_job['status']}'. Aborting duplicate inference.")
+                await update_job_status(task_instance, job_id, "skipped_duplicate", f"Duplicate of job {duplicate_job['id']}")
+                return
+                
+    except Exception as e:
+        logger.error(f"[InferenceTask Job {job_id}] Error during duplicate check: {e}", exc_info=True)
+        # Continue with inference if duplicate check fails to avoid blocking valid jobs
 
     # Initialize variables at the top of the function scope
     prepared_batch: Optional[Batch] = None
@@ -243,56 +287,57 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
         await update_job_status(task_instance, job_id, "running_inference")
         logger.info(f"[InferenceTask Job {job_id}] Waiting for GPU semaphore...")
         
-        async with task_instance.gpu_semaphore:
-            logger.info(f"[InferenceTask Job {job_id}] Acquired GPU semaphore. Running inference...")
-            inference_type_for_call = task_instance.config.get("weather_inference_type", "local_model").lower()
-            logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) Effective inference type for call: {inference_type_for_call}")
+        # Wrap the main inference logic in a try-catch to prevent unhandled ValueErrors
+        try:
+            async with task_instance.gpu_semaphore:
+                logger.info(f"[InferenceTask Job {job_id}] Acquired GPU semaphore. Running inference...")
+                inference_type_for_call = task_instance.config.get("weather_inference_type", "local_model").lower()
+                logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) Effective inference type for call: {inference_type_for_call}")
 
-            if inference_type_for_call == "local_model":
-                if task_instance.inference_runner and task_instance.inference_runner.model:
-                    logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) Running local inference using prepared_batch (type: {type(prepared_batch)})...")
-                    output_steps_datasets = await asyncio.to_thread( # Assign to output_steps_datasets
-                        task_instance.inference_runner.run_multistep_inference,
-                        prepared_batch,
-                        steps=task_instance.config.get('inference_steps', 40)
+                if inference_type_for_call == "local_model":
+                    if task_instance.inference_runner and task_instance.inference_runner.model:
+                        logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) Running local inference using prepared_batch (type: {type(prepared_batch)})...")
+                        output_steps_datasets = await asyncio.to_thread( # Assign to output_steps_datasets
+                            task_instance.inference_runner.run_multistep_inference,
+                            prepared_batch,
+                            steps=task_instance.config.get('inference_steps', 40)
+                        )
+                        logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) Local inference completed. Received {len(output_steps_datasets if output_steps_datasets else [])} steps.")
+                    else:
+                        logger.error(f"[InferenceTask Job {job_id}] (Inside Semaphore) Local model runner/model not available. Cannot run local inference.")
+                        output_steps_datasets = None
+                
+                elif inference_type_for_call == "http_service":
+                    logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) HTTP inference will use prepared_batch (type: {type(prepared_batch)}). Calling _run_inference_via_http_service...")
+                    output_steps_datasets = await task_instance._run_inference_via_http_service( # Assign to output_steps_datasets
+                        job_id=job_id,
+                        initial_batch=prepared_batch 
                     )
-                    logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) Local inference completed. Received {len(output_steps_datasets if output_steps_datasets else [])} steps.")
+                    logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) HTTP inference call completed. Result steps: {len(output_steps_datasets if output_steps_datasets else [])}.")
+                
                 else:
-                    logger.error(f"[InferenceTask Job {job_id}] (Inside Semaphore) Local model runner/model not available. Cannot run local inference.")
+                    logger.error(f"[InferenceTask Job {job_id}] (Inside Semaphore) Unknown inference type for call: '{inference_type_for_call}'. Skipping inference.")
                     output_steps_datasets = None
             
-            elif inference_type_for_call == "http_service":
-                logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) HTTP inference will use prepared_batch (type: {type(prepared_batch)}). Calling _run_inference_via_http_service...")
-                output_steps_datasets = await task_instance._run_inference_via_http_service( # Assign to output_steps_datasets
-                    job_id=job_id,
-                    initial_batch=prepared_batch 
-                )
-                logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) HTTP inference call completed. Result steps: {len(output_steps_datasets if output_steps_datasets else [])}.")
+            logger.info(f"[InferenceTask Job {job_id}] Released GPU semaphore.")
+
+            # selected_predictions_cpu is now output_steps_datasets
+            if output_steps_datasets is None:
+                error_msg_inference = "Inference process failed or returned None."
+                logger.error(f"[InferenceTask Job {job_id}] {error_msg_inference}")
+                await update_job_status(task_instance, job_id, "error", error_msg_inference)
+                # GFS data cleanup happens in finally block
+                return
             
-            else:
-                logger.error(f"[InferenceTask Job {job_id}] (Inside Semaphore) Unknown inference type for call: '{inference_type_for_call}'. Skipping inference.")
-                output_steps_datasets = None
-        
-        logger.info(f"[InferenceTask Job {job_id}] Released GPU semaphore.")
+            if not output_steps_datasets: # Empty list
+                logger.info(f"[InferenceTask Job {job_id}] Inference resulted in an empty list of predictions (0 steps). This may be an expected outcome.")
+                await update_job_status(task_instance, job_id, "completed_no_data", "Inference produced no forecast steps.")
+                # GFS data cleanup happens in finally block
+                return
 
-        # selected_predictions_cpu is now output_steps_datasets
-        if output_steps_datasets is None:
-            error_msg_inference = "Inference process failed or returned None."
-            logger.error(f"[InferenceTask Job {job_id}] {error_msg_inference}")
-            await update_job_status(task_instance, job_id, "error", error_msg_inference)
-            # GFS data cleanup happens in finally block
-            return
-        
-        if not output_steps_datasets: # Empty list
-            logger.info(f"[InferenceTask Job {job_id}] Inference resulted in an empty list of predictions (0 steps). This may be an expected outcome.")
-            await update_job_status(task_instance, job_id, "completed_no_data", "Inference produced no forecast steps.")
-            # GFS data cleanup happens in finally block
-            return
+            logger.info(f"[InferenceTask Job {job_id}] Inference successful. Processing {len(output_steps_datasets)} steps for saving...")
+            await update_job_status(task_instance, job_id, "processing_output")
 
-        logger.info(f"[InferenceTask Job {job_id}] Inference successful. Processing {len(output_steps_datasets)} steps for saving...")
-        await update_job_status(task_instance, job_id, "processing_output")
-
-        try:
             MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
 
             def _blocking_save_and_process():
@@ -321,105 +366,105 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                 else:
                     logger.info(f"[InferenceTask Job {job_id}] Processing list of Batch objects from local/Azure inference.")
                     if not isinstance(output_steps_datasets, list) or not output_steps_datasets:
-                         raise ValueError("Inference returned no prediction steps or unexpected format for batch list.")
-
-                    forecast_datasets = []
-                    lead_times_hours_list = []
-
-                    for i, batch_step in enumerate(output_steps_datasets):
-                        forecast_step_h = task_instance.config.get('forecast_step_hours', 6)
-                        current_lead_time_hours = (i + 1) * forecast_step_h
-                        forecast_time = base_time + timedelta(hours=current_lead_time_hours)
+                        raise ValueError("Inference returned no prediction steps or unexpected format for batch list.")
                         
-                        # Convert timezone-aware datetime to timezone-naive to avoid zarr serialization issues
-                        if hasattr(forecast_time, 'tz_localize'):
-                            # If pandas timestamp
-                            forecast_time_naive = forecast_time.tz_localize(None)
-                        elif hasattr(forecast_time, 'replace'):
-                            # If python datetime
-                            forecast_time_naive = forecast_time.replace(tzinfo=None)
-                        else:
-                            forecast_time_naive = forecast_time
+                forecast_datasets = []
+                lead_times_hours_list = []
 
-                        if not isinstance(batch_step, Batch):
-                            logger.warning(f"[InferenceTask Job {job_id}] Step {i} prediction is not an aurora.Batch (type: {type(batch_step)}), skipping.")
-                            continue
+                for i, batch_step in enumerate(output_steps_datasets):
+                    forecast_step_h = task_instance.config.get('forecast_step_hours', 6)
+                    current_lead_time_hours = (i + 1) * forecast_step_h
+                    forecast_time = base_time + timedelta(hours=current_lead_time_hours)
+                    
+                    # Convert timezone-aware datetime to timezone-naive to avoid zarr serialization issues
+                    if hasattr(forecast_time, 'tz_localize'):
+                        # If pandas timestamp
+                        forecast_time_naive = forecast_time.tz_localize(None)
+                    elif hasattr(forecast_time, 'replace'):
+                        # If python datetime
+                        forecast_time_naive = forecast_time.replace(tzinfo=None)
+                    else:
+                        forecast_time_naive = forecast_time
 
-                        logger.debug(f"Converting prediction Batch step {i+1} (T+{current_lead_time_hours}h) to xarray Dataset...")
-                        data_vars = {}
-                        for var_name, tensor_data in batch_step.surf_vars.items():
-                            try:
-                                np_data = tensor_data.squeeze().cpu().numpy()
-                                data_vars[var_name] = xr.DataArray(np_data, dims=["lat", "lon"], name=var_name)
-                            except Exception as e_surf:
-                                logger.error(f"Error processing surface var {var_name} for step {i+1}: {e_surf}")
-                        
-                        for var_name, tensor_data in batch_step.atmos_vars.items():
-                            try:
-                                np_data = tensor_data.squeeze().cpu().numpy()
-                                data_vars[var_name] = xr.DataArray(np_data, dims=["pressure_level", "lat", "lon"], name=var_name)
-                            except Exception as e_atmos:
-                                logger.error(f"Error processing atmos var {var_name} for step {i+1}: {e_atmos}")
+                    if not isinstance(batch_step, Batch):
+                        logger.warning(f"[InferenceTask Job {job_id}] Step {i} prediction is not an aurora.Batch (type: {type(batch_step)}), skipping.")
+                        continue
 
-                        lat_coords = batch_step.metadata.lat.cpu().numpy()
-                        lon_coords = batch_step.metadata.lon.cpu().numpy()
-                        level_coords = np.array(batch_step.metadata.atmos_levels)
-                        
-                        ds_step = xr.Dataset(
-                            data_vars,
-                            coords={
-                                "time": ([forecast_time_naive]), # Use timezone-naive datetime
-                                "pressure_level": (("pressure_level"), level_coords),
-                                "lat": (("lat"), lat_coords),
-                                "lon": (("lon"), lon_coords),
-                            }
-                        )
-                        forecast_datasets.append(ds_step)
-                        lead_times_hours_list.append(current_lead_time_hours)
+                    logger.debug(f"Converting prediction Batch step {i+1} (T+{current_lead_time_hours}h) to xarray Dataset...")
+                    data_vars = {}
+                    for var_name, tensor_data in batch_step.surf_vars.items():
+                        try:
+                            np_data = tensor_data.squeeze().cpu().numpy()
+                            data_vars[var_name] = xr.DataArray(np_data, dims=["lat", "lon"], name=var_name)
+                        except Exception as e_surf:
+                            logger.error(f"Error processing surface var {var_name} for step {i+1}: {e_surf}")
+                    
+                    for var_name, tensor_data in batch_step.atmos_vars.items():
+                        try:
+                            np_data = tensor_data.squeeze().cpu().numpy()
+                            data_vars[var_name] = xr.DataArray(np_data, dims=["pressure_level", "lat", "lon"], name=var_name)
+                        except Exception as e_atmos:
+                            logger.error(f"Error processing atmos var {var_name} for step {i+1}: {e_atmos}")
 
-                    if not forecast_datasets:
-                        raise ValueError("No forecast datasets created after processing batch prediction steps.")
+                    lat_coords = batch_step.metadata.lat.cpu().numpy()
+                    lon_coords = batch_step.metadata.lon.cpu().numpy()
+                    level_coords = np.array(batch_step.metadata.atmos_levels)
+                    
+                    ds_step = xr.Dataset(
+                        data_vars,
+                        coords={
+                            "time": ([forecast_time_naive]), # Use timezone-naive datetime
+                            "pressure_level": (("pressure_level"), level_coords),
+                            "lat": (("lat"), lat_coords),
+                            "lon": (("lon"), lon_coords),
+                        }
+                    )
+                    forecast_datasets.append(ds_step)
+                    lead_times_hours_list.append(current_lead_time_hours)
 
-                    combined_forecast_ds = xr.concat(forecast_datasets, dim='time')
-                    combined_forecast_ds = combined_forecast_ds.assign_coords(lead_time=('time', lead_times_hours_list))
+                if not forecast_datasets:
+                    raise ValueError("No forecast datasets created after processing batch prediction steps.")
 
-                if combined_forecast_ds is None:
-                    raise ValueError("combined_forecast_ds was not properly assigned.")
+                combined_forecast_ds = xr.concat(forecast_datasets, dim='time')
+                combined_forecast_ds = combined_forecast_ds.assign_coords(lead_time=('time', lead_times_hours_list))
 
-                logger.info(f"[InferenceTask Job {job_id}] Combined forecast dimensions: {combined_forecast_ds.dims}")
+            if combined_forecast_ds is None:
+                raise ValueError("combined_forecast_ds was not properly assigned.")
 
-                gfs_time_str = gfs_init_time_utc.strftime('%Y%m%d%H')
-                unique_suffix = job_id.split('-')[0]
+            logger.info(f"[InferenceTask Job {job_id}] Combined forecast dimensions: {combined_forecast_ds.dims}")
+
+            gfs_time_str = gfs_init_time_utc.strftime('%Y%m%d%H')
+            unique_suffix = job_id.split('-')[0]
+            
+            dirname_zarr = f"weather_forecast_{gfs_time_str}_miner_hk_{miner_hotkey_for_filename[:10]}_{unique_suffix}.zarr"
+            output_zarr_path = MINER_FORECAST_DIR_BG / dirname_zarr
+
+            encoding = {}
+            for var_name, da in combined_forecast_ds.data_vars.items():
+                chunks_for_var = {}
                 
-                dirname_zarr = f"weather_forecast_{gfs_time_str}_miner_hk_{miner_hotkey_for_filename[:10]}_{unique_suffix}.zarr"
-                output_zarr_path = MINER_FORECAST_DIR_BG / dirname_zarr
+                time_dim_in_var = next((d for d in da.dims if d.lower() == 'time'), None)
+                level_dim_in_var = next((d for d in da.dims if d.lower() in ('pressure_level', 'level', 'plev', 'isobaricinhpa')), None)
+                lat_dim_in_var = next((d for d in da.dims if d.lower() in ('lat', 'latitude')), None)
+                lon_dim_in_var = next((d for d in da.dims if d.lower() in ('lon', 'longitude')), None)
 
-                encoding = {}
-                for var_name, da in combined_forecast_ds.data_vars.items():
-                    chunks_for_var = {}
-                    
-                    time_dim_in_var = next((d for d in da.dims if d.lower() == 'time'), None)
-                    level_dim_in_var = next((d for d in da.dims if d.lower() in ('pressure_level', 'level', 'plev', 'isobaricinhpa')), None)
-                    lat_dim_in_var = next((d for d in da.dims if d.lower() in ('lat', 'latitude')), None)
-                    lon_dim_in_var = next((d for d in da.dims if d.lower() in ('lon', 'longitude')), None)
-
-                    if time_dim_in_var:
-                        chunks_for_var[time_dim_in_var] = 1
-                    if level_dim_in_var:
-                        chunks_for_var[level_dim_in_var] = 1 
-                    if lat_dim_in_var:
-                        chunks_for_var[lat_dim_in_var] = combined_forecast_ds.sizes[lat_dim_in_var]
-                    if lon_dim_in_var:
-                        chunks_for_var[lon_dim_in_var] = combined_forecast_ds.sizes[lon_dim_in_var]
-                    
-                    ordered_chunks_list = []
-                    for dim_name_in_da in da.dims:
-                        ordered_chunks_list.append(chunks_for_var.get(dim_name_in_da, combined_forecast_ds.sizes[dim_name_in_da]))
-                    
-                    encoding[var_name] = {
-                        'chunks': tuple(ordered_chunks_list),
-                        'compressor': numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
-                    }
+                if time_dim_in_var:
+                    chunks_for_var[time_dim_in_var] = 1
+                if level_dim_in_var:
+                    chunks_for_var[level_dim_in_var] = 1 
+                if lat_dim_in_var:
+                    chunks_for_var[lat_dim_in_var] = combined_forecast_ds.sizes[lat_dim_in_var]
+                if lon_dim_in_var:
+                    chunks_for_var[lon_dim_in_var] = combined_forecast_ds.sizes[lon_dim_in_var]
+                
+                ordered_chunks_list = []
+                for dim_name_in_da in da.dims:
+                    ordered_chunks_list.append(chunks_for_var.get(dim_name_in_da, combined_forecast_ds.sizes[dim_name_in_da]))
+                
+                encoding[var_name] = {
+                    'chunks': tuple(ordered_chunks_list),
+                    'compressor': numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
+                }
                 
                 logger.info(f"[InferenceTask Job {job_id}] Saving forecast to Zarr store with chunking. Example encoding for {list(encoding.keys())[0] if encoding else 'N/A'}: {list(encoding.values())[0] if encoding else 'N/A'}")
                 
@@ -471,31 +516,34 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                 # Generate manifest and signature for the zarr store
                 verification_hash = None
                 try:
-                    from ..utils.hashing import generate_manifest_and_signature
+                    logger.info(f"[{job_id}] 🔐 Generating manifest and signature for Zarr store...")
                     
                     # Get miner keypair for signing
                     miner_keypair = task_instance.keypair if task_instance.keypair else None
                     
                     if miner_keypair:
-                        logger.info(f"[InferenceTask Job {job_id}] Generating manifest and signature for Zarr store...")
-                        manifest_result = generate_manifest_and_signature(
-                            zarr_store_path=Path(output_zarr_path),
-                            miner_hotkey_keypair=miner_keypair,
-                            include_zarr_metadata_in_manifest=True,
-                            chunk_hash_algo_name="xxh64"
-                        )
+                        def _generate_manifest_sync():
+                            from ..utils.hashing import generate_manifest_and_signature
+                            return generate_manifest_and_signature(
+                                zarr_store_path=Path(output_zarr_path),
+                                miner_hotkey_keypair=miner_keypair,
+                                include_zarr_metadata_in_manifest=True,
+                                chunk_hash_algo_name="xxh64"
+                            )
+                        
+                        manifest_result = await asyncio.to_thread(_generate_manifest_sync)
                         
                         if manifest_result:
                             _manifest_dict, _signature_bytes, manifest_content_sha256_hash = manifest_result
                             verification_hash = manifest_content_sha256_hash
-                            logger.info(f"[InferenceTask Job {job_id}] Generated verification hash: {verification_hash[:10]}...")
+                            logger.info(f"[{job_id}] ✅ Generated verification hash: {verification_hash[:10]}...")
                         else:
-                            logger.warning(f"[InferenceTask Job {job_id}] Failed to generate manifest and signature.")
+                            logger.warning(f"[{job_id}] ⚠️  Failed to generate manifest and signature.")
                     else:
-                        logger.warning(f"[InferenceTask Job {job_id}] No miner keypair available for manifest signing.")
+                        logger.warning(f"[{job_id}] ⚠️  No miner keypair available for manifest signing.")
                         
                 except Exception as e_manifest:
-                    logger.error(f"[InferenceTask Job {job_id}] Error generating manifest: {e_manifest}", exc_info=True)
+                    logger.error(f"[{job_id}] ❌ Error generating manifest: {e_manifest}", exc_info=True)
                     verification_hash = None
 
                 return str(output_zarr_path), verification_hash
@@ -512,9 +560,10 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
             await update_job_status(task_instance, job_id, "completed")
             logger.info(f"[InferenceTask Job {job_id}] Background inference task completed successfully.")
 
-        except Exception as save_err:
-            logger.error(f"[InferenceTask Job {job_id}] Failed to save or process output: {save_err}", exc_info=True)
-            await update_job_status(task_instance, job_id, "error", error_message=f"Output processing error: {save_err}")
+        except Exception as inference_err:
+            # Catch any unhandled exceptions from the main inference logic (including ValueErrors from save/processing)
+            logger.error(f"[InferenceTask Job {job_id}] Unhandled error during inference or processing: {inference_err}", exc_info=True)
+            await update_job_status(task_instance, job_id, "error", error_message=f"Inference error: {inference_err}")
 
     except Exception as e:
         logger.error(f"[InferenceTask Job {job_id}] Background inference task failed unexpectedly: {e}", exc_info=True)
@@ -1099,6 +1148,12 @@ async def cleanup_worker(task_instance: 'WeatherTask'):
                 logger.info("[CleanupWorker] Cleaning up Miner Forecast Zarr stores...")
                 await asyncio.to_thread(_blocking_cleanup_directory, str(MINER_FORECAST_DIR_BG), ENSEMBLE_RETENTION_DAYS, "*.zarr", now_ts)
 
+                # Add cleanup for miner input batches
+                if task_instance.node_type == "miner":
+                    logger.info("[CleanupWorker] Cleaning up Miner Input Batch pickle files...")
+                    await asyncio.to_thread(_blocking_cleanup_directory, str(MINER_INPUT_BATCHES_DIR), 
+                                          task_instance.config.get('input_batch_retention_days', 3), "*.pkl", now_ts)
+
                 logger.info("[CleanupWorker] Cleaning up old database records...")
                 db_cutoff_time = now_dt_utc - timedelta(days=DB_RUN_RETENTION_DAYS)
                 try:
@@ -1562,14 +1617,22 @@ async def poll_runpod_job_worker(task_instance: 'WeatherTask', job_id: str, runp
                         if file_serving_mode == 'local':
                             # Download files from R2 to local storage for serving
                             logger.info(f"[{job_id}] File serving mode is 'local'. Downloading forecast files from R2...")
-                            local_zarr_path = await _download_forecast_from_r2_to_local(task_instance, job_id, output_prefix)
+                            download_result = await _download_forecast_from_r2_to_local(task_instance, job_id, output_prefix)
                             
-                            if local_zarr_path:
+                            if download_result:
+                                local_zarr_path, verification_hash = download_result
                                 logger.info(f"[{job_id}] Successfully downloaded forecast to local storage: {local_zarr_path}")
-                                await update_job_paths(task_instance, job_id, netcdf_path=local_zarr_path)
+                                await update_job_paths(
+                                    task_instance, 
+                                    job_id, 
+                                    netcdf_path=local_zarr_path,
+                                    kerchunk_path=local_zarr_path,  # Same as netcdf for zarr
+                                    verification_hash=verification_hash
+                                )
                             else:
-                                logger.error(f"[{job_id}] Failed to download forecast from R2 to local storage.")
-                                await update_job_status(task_instance, job_id, 'error', "Failed to download forecast from R2")
+                                error_msg = "Failed to download forecast from R2 to local storage"
+                                logger.error(f"[{job_id}] {error_msg}")
+                                await update_job_status(task_instance, job_id, 'failed', error_msg)
                                 return
                         else:
                             # R2 proxy mode - store the R2 prefix for proxying
@@ -1587,30 +1650,46 @@ async def poll_runpod_job_worker(task_instance: 'WeatherTask', job_id: str, runp
 
                     elif current_status in ["FAILED", "CANCELLED", "TIMED_OUT"]:
                         error_output = status_data.get("output", f"No error details provided, but status was {current_status}.")
-                        raise RuntimeError(f"RunPod job terminated with status '{current_status}'. Details: {error_output}")
+                        error_msg = f"RunPod job terminated with status '{current_status}'. Details: {error_output}"
+                        logger.error(f"[RunPodPoller Job {job_id}] {error_msg}")
+                        await update_job_status(task_instance, job_id, 'failed', error_msg)
+                        return  # Exit worker gracefully instead of raising
 
                     else: # Unhandled status
                         logger.warning(f"[RunPodPoller Job {job_id}] Unhandled RunPod status '{current_status}'. Treating as temporary. Response: {status_data}")
 
                 except httpx.HTTPStatusError as e:
                     logger.error(f"[RunPodPoller Job {job_id}] HTTP error polling status: {e.response.status_code} - {e.response.text}")
-                    # Continue polling on server errors (5xx), but might fail fast on others
+                    # Continue polling on server errors (5xx), but fail gracefully on client errors (4xx)
                     if 500 <= e.response.status_code < 600:
                         logger.warning(f"[{job_id}] Server error, will retry.")
                     else:
-                        raise # Re-raise client errors (4xx) to fail the task
+                        error_msg = f"HTTP client error {e.response.status_code}: {e.response.text}"
+                        logger.error(f"[RunPodPoller Job {job_id}] {error_msg}")
+                        await update_job_status(task_instance, job_id, 'failed', error_msg)
+                        return  # Exit worker gracefully instead of raising
                 except httpx.RequestError as e:
                     logger.error(f"[RunPodPoller Job {job_id}] Request error polling status: {e}. Will retry.")
                 except (json.JSONDecodeError, ValueError) as e:
-                    raise RuntimeError(f"Error processing RunPod status response: {e}") # Fail on bad data
+                    error_msg = f"Error processing RunPod status response: {e}"
+                    logger.error(f"[RunPodPoller Job {job_id}] {error_msg}")
+                    await update_job_status(task_instance, job_id, 'failed', error_msg)
+                    return  # Exit worker gracefully instead of raising
 
             # If loop finishes, it's a timeout
-            raise TimeoutError(f"Polling timed out after {max_attempts} attempts.")
+            timeout_msg = f"Polling timed out after {max_attempts} attempts."
+            logger.error(f"[RunPodPoller Job {job_id}] {timeout_msg}")
+            await update_job_status(task_instance, job_id, 'failed', timeout_msg)
 
     except Exception as e:
         error_message = f"RunPod poller failed: {e}"
         logger.error(f"[RunPodPoller Job {job_id}] {error_message}", exc_info=True)
-        await update_job_status(task_instance, job_id, 'failed', error_message)
+        try:
+            await update_job_status(task_instance, job_id, 'failed', error_message)
+        except Exception as db_error:
+            logger.error(f"[RunPodPoller Job {job_id}] Failed to update job status after error: {db_error}")
+    
+    logger.info(f"[RunPodPoller Job {job_id}] Polling worker exited gracefully.")
 
 async def weather_job_status_logger(task_instance: 'WeatherTask'):
     """
@@ -1784,13 +1863,17 @@ async def weather_job_status_logger(task_instance: 'WeatherTask'):
     
     logger.info("[JobStatusLogger] Weather job status logger has stopped.")
 
-async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_id: str, r2_output_prefix: str) -> Optional[str]:
+async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_id: str, r2_output_prefix: str) -> Optional[Tuple[str, str]]:
     """
     Downloads forecast NetCDF files from R2 and combines them into a local zarr store.
-    Used when file_serving_mode is 'local' to enable direct serving to validators.
     
+    Args:
+        task_instance: WeatherTask instance
+        job_id: Job identifier
+        r2_output_prefix: R2 prefix where forecast files are stored
+        
     Returns:
-        Path to the local zarr store if successful, None if failed.
+        Tuple of (zarr_path, verification_hash) if successful, None if failed
     """
     try:
         # Get R2 client
@@ -1851,49 +1934,60 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
             # Execute downloads in parallel with some concurrency control
             semaphore = asyncio.Semaphore(10)  # Limit concurrent downloads
             
-            async def download_with_semaphore(task):
-                async with semaphore:
-                    return await task
+            completed_downloads = 0
+            total_downloads = len(download_tasks)
             
-            results = await asyncio.gather(*[download_with_semaphore(task) for task in download_tasks], return_exceptions=True)
+            async def download_with_semaphore(task, file_index):
+                nonlocal completed_downloads
+                async with semaphore:
+                    result = await task
+                    completed_downloads += 1
+                    
+                    # Log progress every 5 files or on special milestones
+                    if completed_downloads % 5 == 0 or completed_downloads in [1, total_downloads]:
+                        percent_done = (completed_downloads / total_downloads) * 100
+                        logger.info(f"[{job_id}] Download progress: {completed_downloads}/{total_downloads} files ({percent_done:.1f}%) - Latest: {Path(nc_files[file_index]).name}")
+                    
+                    return result
+            
+            # Create tasks with file indices for progress reporting
+            semaphore_tasks = [download_with_semaphore(task, i) for i, task in enumerate(download_tasks)]
+            results = await asyncio.gather(*semaphore_tasks, return_exceptions=True)
             
             # Check results and collect successful downloads
+            successful_count = 0
+            failed_files = []
             for i, result in enumerate(results):
                 if result is True:
                     downloaded_files.append(temp_path / Path(nc_files[i]).name)
+                    successful_count += 1
                 else:
-                    logger.error(f"[{job_id}] Failed to download {nc_files[i]}: {result}")
+                    failed_files.append(nc_files[i])
+                    logger.error(f"[{job_id}] ❌ DOWNLOAD FAILED: {nc_files[i]} - Error: {result}")
             
             if not downloaded_files:
                 logger.error(f"[{job_id}] No files successfully downloaded from R2")
                 return None
+            
+            # Report download summary and fail if incomplete
+            if failed_files:
+                logger.error(f"[{job_id}] ❌ DOWNLOAD INCOMPLETE: {successful_count}/{total_downloads} files successful, {len(failed_files)} FAILED")
+                logger.error(f"[{job_id}] Failed files: {[Path(f).name for f in failed_files]}")
+                logger.error(f"[{job_id}] Cannot create valid forecast with missing timesteps. Aborting zarr creation.")
+                return None  # Fail instead of proceeding with incomplete data
+            else:
+                logger.info(f"[{job_id}] ✅ Download complete! Successfully downloaded {successful_count}/{total_downloads} files.")
                 
-            logger.info(f"[{job_id}] Successfully downloaded {len(downloaded_files)} files. Combining into zarr store...")
+            logger.info(f"[{job_id}] Proceeding with zarr store creation using complete dataset ({successful_count} files)...")
             
             # Load and combine NetCDF files into a single zarr store
             try:
                 import xarray as xr
                 import pandas as pd
                 from pathlib import Path as PathlibPath
+                import gc  # For explicit garbage collection
                 
-                # Load all datasets
-                datasets = []
-                for file_path in sorted(downloaded_files):
-                    try:
-                        ds = xr.open_dataset(file_path)
-                        datasets.append(ds)
-                    except Exception as e_open:
-                        logger.error(f"[{job_id}] Failed to open {file_path}: {e_open}")
-                
-                if not datasets:
-                    logger.error(f"[{job_id}] No datasets could be loaded from downloaded files")
-                    return None
-                
-                # Combine datasets along time dimension
-                combined_ds = xr.concat(datasets, dim='time')
-                combined_ds = combined_ds.sortby('time')
-                
-                # Create local zarr path
+                # Create local zarr path first
                 gfs_init_time = None
                 try:
                     # Get GFS init time from job database
@@ -1924,10 +2018,27 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
                 MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
                 output_zarr_path = MINER_FORECAST_DIR_BG / dirname_zarr
                 
+                # Remove existing zarr store if it exists
+                if output_zarr_path.exists():
+                    logger.info(f"[{job_id}] 🗑️  Removing existing zarr store...")
+                    import shutil
+                    shutil.rmtree(output_zarr_path)
+                
+                # MEMORY-OPTIMIZED APPROACH: Process files in smaller batches and create zarr incrementally
+                logger.info(f"[{job_id}] 📂 Processing {len(downloaded_files)} NetCDF files in memory-efficient batches...")
+                
+                # Sort files to ensure proper time ordering
+                sorted_files = sorted(downloaded_files)
+                
+                # First, open one file to get the structure and create zarr template
+                logger.info(f"[{job_id}] 🔍 Analyzing first file to determine zarr structure...")
+                first_ds = xr.open_dataset(sorted_files[0])
+                
                 # Configure chunking for zarr
+                logger.info(f"[{job_id}] ⚙️  Configuring zarr encoding for {len(first_ds.data_vars)} variables...")
                 import numcodecs
                 encoding = {}
-                for var_name, da in combined_ds.data_vars.items():
+                for var_name, da in first_ds.data_vars.items():
                     chunks_for_var = {}
                     
                     time_dim_in_var = next((d for d in da.dims if d.lower() == 'time'), None)
@@ -1940,25 +2051,82 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
                     if level_dim_in_var:
                         chunks_for_var[level_dim_in_var] = 1 
                     if lat_dim_in_var:
-                        chunks_for_var[lat_dim_in_var] = combined_ds.sizes[lat_dim_in_var]
+                        chunks_for_var[lat_dim_in_var] = first_ds.sizes[lat_dim_in_var]
                     if lon_dim_in_var:
-                        chunks_for_var[lon_dim_in_var] = combined_ds.sizes[lon_dim_in_var]
+                        chunks_for_var[lon_dim_in_var] = first_ds.sizes[lon_dim_in_var]
                     
                     ordered_chunks_list = []
                     for dim_name_in_da in da.dims:
-                        ordered_chunks_list.append(chunks_for_var.get(dim_name_in_da, combined_ds.sizes[dim_name_in_da]))
+                        ordered_chunks_list.append(chunks_for_var.get(dim_name_in_da, first_ds.sizes[dim_name_in_da]))
                     
                     encoding[var_name] = {
                         'chunks': tuple(ordered_chunks_list),
                         'compressor': numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
                     }
                 
-                # Remove existing zarr store if it exists
-                if output_zarr_path.exists():
-                    import shutil
-                    shutil.rmtree(output_zarr_path)
+                # Process files in smaller batches to avoid memory exhaustion
+                batch_size = 8  # Process 8 files at a time to manage memory
+                all_datasets = []
                 
-                # Save to zarr
+                logger.info(f"[{job_id}] 🔄 Processing files in batches of {batch_size}...")
+                for batch_start in range(0, len(sorted_files), batch_size):
+                    batch_end = min(batch_start + batch_size, len(sorted_files))
+                    batch_files = sorted_files[batch_start:batch_end]
+                    
+                    logger.info(f"[{job_id}] Loading batch {batch_start//batch_size + 1}/{(len(sorted_files) + batch_size - 1)//batch_size}: files {batch_start+1}-{batch_end}")
+                    
+                    # Load this batch of files
+                    batch_datasets = []
+                    for file_path in batch_files:
+                        try:
+                            ds = xr.open_dataset(file_path, chunks={'time': 1})  # Use dask chunks
+                            batch_datasets.append(ds)
+                        except Exception as e_open:
+                            logger.error(f"[{job_id}] Failed to open {file_path}: {e_open}")
+                    
+                    if batch_datasets:
+                        # Concatenate this batch
+                        if len(batch_datasets) > 1:
+                            batch_combined = xr.concat(batch_datasets, dim='time')
+                        else:
+                            batch_combined = batch_datasets[0]
+                        
+                        all_datasets.append(batch_combined)
+                        
+                        # Close individual datasets to free memory
+                        for ds in batch_datasets:
+                            if ds != batch_combined:  # Don't close the combined one
+                                ds.close()
+                        del batch_datasets
+                        
+                        # Force garbage collection after each batch
+                        gc.collect()
+                        
+                        percent_complete = (batch_end / len(sorted_files)) * 100
+                        logger.info(f"[{job_id}] Batch processing: {batch_end}/{len(sorted_files)} files ({percent_complete:.1f}%)")
+                
+                if not all_datasets:
+                    logger.error(f"[{job_id}] No datasets could be loaded from downloaded files")
+                    return None
+                
+                # Final concatenation of all batches
+                logger.info(f"[{job_id}] 🔗 Final concatenation of {len(all_datasets)} batches...")
+                combined_ds = xr.concat(all_datasets, dim='time')
+                
+                # Close batch datasets to free memory
+                for ds in all_datasets:
+                    ds.close()
+                del all_datasets
+                gc.collect()
+                
+                logger.info(f"[{job_id}] 📊 Sorting combined dataset by time...")
+                combined_ds = combined_ds.sortby('time')
+                
+                # Save to zarr with memory-efficient approach
+                logger.info(f"[{job_id}] 💾 Writing combined dataset to zarr store: {output_zarr_path.name}")
+                logger.info(f"[{job_id}] 📈 Dataset shape: {dict(combined_ds.sizes)} | Variables: {list(combined_ds.data_vars.keys())}")
+                
+                # Use compute=False to avoid loading everything into memory at once
                 combined_ds.to_zarr(
                     output_zarr_path,
                     encoding=encoding,
@@ -1966,16 +2134,57 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
                     compute=True
                 )
                 
-                # Close datasets to free memory
-                for ds in datasets:
-                    ds.close()
+                # Close and cleanup
+                first_ds.close()
                 combined_ds.close()
+                del combined_ds
+                gc.collect()
                 
-                logger.info(f"[{job_id}] Successfully created local zarr store: {output_zarr_path}")
-                return str(output_zarr_path)
+                # Generate manifest and signature for the zarr store
+                verification_hash = None
+                try:
+                    logger.info(f"[{job_id}] 🔐 Generating manifest and signature for Zarr store...")
+                    
+                    # Get miner keypair for signing
+                    miner_keypair = task_instance.keypair if task_instance.keypair else None
+                    
+                    if miner_keypair:
+                        def _generate_manifest_sync():
+                            from ..utils.hashing import generate_manifest_and_signature
+                            return generate_manifest_and_signature(
+                                zarr_store_path=Path(output_zarr_path),
+                                miner_hotkey_keypair=miner_keypair,
+                                include_zarr_metadata_in_manifest=True,
+                                chunk_hash_algo_name="xxh64"
+                            )
+                        
+                        manifest_result = await asyncio.to_thread(_generate_manifest_sync)
+                        
+                        if manifest_result:
+                            _manifest_dict, _signature_bytes, manifest_content_sha256_hash = manifest_result
+                            verification_hash = manifest_content_sha256_hash
+                            logger.info(f"[{job_id}] ✅ Generated verification hash: {verification_hash[:10]}...")
+                        else:
+                            logger.warning(f"[{job_id}] ⚠️  Failed to generate manifest and signature.")
+                    else:
+                        logger.warning(f"[{job_id}] ⚠️  No miner keypair available for manifest signing.")
+                        
+                except Exception as e_manifest:
+                    logger.error(f"[{job_id}] ❌ Error generating manifest: {e_manifest}", exc_info=True)
+                    verification_hash = None
+
+                return str(output_zarr_path), verification_hash
                 
             except Exception as e_combine:
                 logger.error(f"[{job_id}] Error combining NetCDF files into zarr: {e_combine}", exc_info=True)
+                # Cleanup any partial zarr store
+                try:
+                    if 'output_zarr_path' in locals() and output_zarr_path.exists():
+                        import shutil
+                        shutil.rmtree(output_zarr_path)
+                        logger.info(f"[{job_id}] Cleaned up partial zarr store after error")
+                except:
+                    pass
                 return None
     
     except Exception as e:
@@ -1984,15 +2193,56 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
 
 
 async def _download_single_file_from_r2(s3_client, bucket_name: str, object_key: str, local_path: Path) -> bool:
-    """Helper function to download a single file from R2."""
-    try:
-        await asyncio.to_thread(
-            s3_client.download_file,
-            bucket_name,
-            object_key,
-            str(local_path)
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Failed to download {object_key}: {e}")
-        return False
+    """Helper function to download a single file from R2 with retry logic."""
+    max_retries = 3
+    base_delay = 2.0  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            await asyncio.to_thread(
+                s3_client.download_file,
+                bucket_name,
+                object_key,
+                str(local_path)
+            )
+            
+            # Verify file was actually downloaded and has content
+            if not local_path.exists():
+                error_msg = f"File not found after download: {local_path}"
+                if attempt < max_retries - 1:
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for {object_key}: {error_msg}")
+                    await asyncio.sleep(base_delay * (attempt + 1))
+                    continue
+                return error_msg
+            
+            file_size = local_path.stat().st_size
+            if file_size == 0:
+                error_msg = f"Downloaded file is empty (0 bytes): {object_key}"
+                if attempt < max_retries - 1:
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for {object_key}: {error_msg}")
+                    # Remove empty file before retry
+                    try:
+                        local_path.unlink()
+                    except:
+                        pass
+                    await asyncio.sleep(base_delay * (attempt + 1))
+                    continue
+                return error_msg
+                
+            return True
+            
+        except Exception as e:
+            error_msg = f"Download exception: {type(e).__name__}: {str(e)}"
+            if attempt < max_retries - 1:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for {object_key}: {error_msg}")
+                # Clean up partial file before retry
+                try:
+                    if local_path.exists():
+                        local_path.unlink()
+                except:
+                    pass
+                await asyncio.sleep(base_delay * (attempt + 1))
+                continue
+            return error_msg
+    
+    return f"All {max_retries} download attempts failed for {object_key}"
