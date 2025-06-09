@@ -43,6 +43,7 @@ from ..utils.hashing import compute_verification_hash, compute_input_data_hash, 
 from ..weather_scoring.metrics import calculate_rmse
 from ..weather_scoring_mechanism import evaluate_miner_forecast_day1
 from ..weather_scoring_mechanism import evaluate_miner_forecast_day1
+from ..schemas.weather_outputs import WeatherProgressUpdate
 
 from sqlalchemy import update
 from gaia.database.validator_schema import weather_forecast_runs_table
@@ -1155,7 +1156,6 @@ async def fetch_and_hash_gfs_task(
 
     # Define progress callback
     async def progress_callback(update_dict):
-        from ..schemas.weather_outputs import WeatherProgressUpdate
         update = WeatherProgressUpdate(**update_dict)
         await task_instance._emit_progress(update)
 
@@ -1308,8 +1308,8 @@ async def fetch_and_hash_gfs_task(
             ))
             return
 
-        if computed_hash:
-            logger.info(f"[FetchHashTask Job {job_id}] Successfully computed input hash: {computed_hash[:10]}... Updating DB.")
+        if canonical_input_hash:
+            logger.info(f"[FetchHashTask Job {job_id}] Successfully computed input hash: {canonical_input_hash[:10]}... Updating DB.")
             update_query = """
                 UPDATE weather_miner_jobs
                 SET input_data_hash = :hash,
@@ -1320,7 +1320,7 @@ async def fetch_and_hash_gfs_task(
             """
             await task_instance.db_manager.execute(update_query, {
                 "job_id": job_id,
-                "hash": computed_hash,
+                "hash": canonical_input_hash,
                 "pickle_path": input_batch_pickle_file_path_str, # Store the path
                 "status": "input_hashed_awaiting_validation",
                 "now": datetime.now(timezone.utc)
