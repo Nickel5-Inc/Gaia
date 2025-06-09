@@ -50,7 +50,9 @@ from .utils.kerchunk_utils import generate_kerchunk_json_from_local_file
 from .utils.data_prep import create_aurora_batch_from_gfs
 from .schemas.weather_metadata import WeatherMetadata
 from .schemas.weather_inputs import WeatherInputs, WeatherForecastRequest, WeatherInputData, WeatherInitiateFetchData, WeatherGetInputStatusData, WeatherStartInferenceData
-from .schemas.weather_outputs import WeatherOutputs, WeatherKerchunkResponseData
+from .schemas.weather_outputs import WeatherOutputs, WeatherKerchunkResponseData, WeatherTaskStatus
+from .schemas.weather_outputs import WeatherInitiateFetchResponse, WeatherGetInputStatusResponse, WeatherStartInferenceResponse
+from .schemas.weather_outputs import WeatherProgressUpdate, WeatherFileLocation
 from .weather_scoring.metrics import calculate_rmse
 from .processing.weather_miner_preprocessing import prepare_miner_batch_from_payload
 from .processing.weather_logic import (
@@ -323,6 +325,10 @@ class WeatherTask(Task):
                 self.config['weather_inference_type'] = "local" # Fallback
         else: # Validator
              logger.info("Initialized validator components for WeatherTask")
+
+        # Add progress tracking
+        self.progress_callbacks: List[callable] = []
+        self.current_operations: Dict[str, WeatherProgressUpdate] = {}
 
     _load_config = _load_config
 
@@ -832,7 +838,7 @@ class WeatherTask(Task):
                                  miner_response = {"status": "parse_error", "message": str(json_err)}
                                  
                          if (isinstance(miner_response, dict) and 
-                             miner_response.get("status") == "fetch_accepted" and 
+                             miner_response.get("status") == WeatherTaskStatus.FETCH_ACCEPTED and 
                              miner_response.get("job_id")):
                               miner_uid_result = await self.db_manager.fetch_one("SELECT uid FROM node_table WHERE hotkey = :hk", {"hk": miner_hotkey})
                               miner_uid = miner_uid_result['uid'] if miner_uid_result else -1
@@ -976,7 +982,7 @@ class WeatherTask(Task):
                         new_db_status = None
                         hash_match = None
 
-                        if miner_hash and miner_status == 'input_hashed_awaiting_validation':
+                        if miner_hash and miner_status == WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION:
                             if miner_hash == validator_input_hash:
                                 logger.info(f"[Run {run_id}] Hash MATCH for response ID {resp_id} (Miner status: {miner_status})!")
                                 new_db_status = 'input_validation_complete'
@@ -990,12 +996,12 @@ class WeatherTask(Task):
                                 logger.warning(f"[Run {run_id}] Hash MISMATCH for response ID {resp_id}. Miner: {miner_hash[:10]}... Validator: {validator_input_hash[:10]}... (Miner status: {miner_status})")
                                 new_db_status = 'input_hash_mismatch'
                                 hash_match = False
-                        elif miner_status == 'fetch_error':
+                        elif miner_status == WeatherTaskStatus.FETCH_ERROR:
                             new_db_status = 'input_fetch_error'
-                        elif miner_status in ['fetching_gfs', 'hashing_input', 'fetch_queued']:
+                        elif miner_status in [WeatherTaskStatus.FETCHING_GFS, WeatherTaskStatus.HASHING_INPUT, WeatherTaskStatus.FETCH_QUEUED]:
                             logger.warning(f"[Run {run_id}] Miner for response ID {resp_id} timed out (status: {miner_status}).")
                             new_db_status = 'input_hash_timeout'
-                        elif miner_status in ['validator_poll_failed', 'validator_poll_error']:
+                        elif miner_status in [WeatherTaskStatus.VALIDATOR_POLL_FAILED, WeatherTaskStatus.VALIDATOR_POLL_ERROR]:
                              new_db_status = 'input_poll_error'
                         else:
                             new_db_status = 'input_fetch_error'
@@ -1057,7 +1063,7 @@ class WeatherTask(Task):
                                     logger.warning(f"[Run {run_id}] Failed to parse trigger response text for {miner_hk[:8]}: {json_err}")
                                     parsed_response = {"status": "parse_error", "message": str(json_err)}
                                     
-                            if parsed_response and parsed_response.get('status') == 'inference_started':
+                            if parsed_response and parsed_response.get('status') == WeatherTaskStatus.INFERENCE_STARTED:
                                 logger.info(f"[Run {run_id}] Successfully triggered inference for {miner_hk[:8]} (Job: {miner_job_id}).")
                                 return resp_id, True
                             else:
@@ -1476,7 +1482,10 @@ class WeatherTask(Task):
             
             if not job:
                 logger.warning(f"Job not found for job_id: {job_id}")
-                return {"status": "not_found", "message": f"Job with ID {job_id} not found"}
+                return self._validate_and_format_response({
+                    "status": WeatherTaskStatus.NOT_FOUND, 
+                    "message": f"Job with ID {job_id} not found"
+                }, ["status", "message"])
                 
             if job["status"] == "completed":
                 zarr_path_str = job["target_netcdf_path"]
@@ -1484,14 +1493,20 @@ class WeatherTask(Task):
                 
                 if not zarr_path_str or not verification_hash:
                     logger.error(f"Job {job_id} completed but missing required path/hash info. Zarr path: {zarr_path_str}, Hash: {verification_hash}")
-                    return {"status": "error", "message": "Job completed but data paths or hash missing"}
+                    return self._validate_and_format_response({
+                        "status": WeatherTaskStatus.ERROR, 
+                        "message": "Job completed but data paths or hash missing"
+                    }, ["status", "message"])
                 
                 zarr_path = Path(zarr_path_str)
                 zarr_dir_name = zarr_path.name
                 
                 if not zarr_dir_name.endswith(".zarr"):
                     logger.error(f"Expected Zarr directory but found: {zarr_dir_name}")
-                    return {"status": "error", "message": "Invalid Zarr store format"}
+                    return self._validate_and_format_response({
+                        "status": WeatherTaskStatus.ERROR, 
+                        "message": "Invalid Zarr store format"
+                    }, ["status", "message"])
 
                 logger.info(f"[Job {job_id}] Using Zarr directory for JWT claim: {zarr_dir_name}")
 
@@ -1516,24 +1531,33 @@ class WeatherTask(Task):
                 
                 zarr_url_for_response = f"/forecasts/{zarr_dir_name}"
                 
-                return {
-                    "status": "completed",
+                return self._validate_and_format_response({
+                    "status": WeatherTaskStatus.COMPLETED,
                     "message": "Forecast completed and ready for access",
                     "zarr_store_url": zarr_url_for_response,
                     "verification_hash": verification_hash,
                     "access_token": access_token
-                }
+                }, ["status", "message"])
                 
             elif job["status"] == "error":
                 logger.warning(f"[Job {job_id}] Forecast data requested but job failed. Error: {job['error_message'] or 'Unknown error'}")
-                return {"status": "error", "message": f"Job failed: {job['error_message'] or 'Unknown error'}"}
+                return self._validate_and_format_response({
+                    "status": WeatherTaskStatus.ERROR, 
+                    "message": f"Job failed: {job['error_message'] or 'Unknown error'}"
+                }, ["status", "message"])
             else:
                 logger.info(f"[Job {job_id}] Forecast data requested but job still processing (status: {job['status']}). Validator will need to retry later.")
-                return {"status": "processing", "message": f"Job is currently in status: {job['status']}"}
+                return self._validate_and_format_response({
+                    "status": WeatherTaskStatus.PROCESSING, 
+                    "message": f"Job is currently in status: {job['status']}"
+                }, ["status", "message"])
                 
         except Exception as e:
             logger.error(f"Error handling forecast data request for job_id {job_id}: {e}", exc_info=True)
-            return {"status": "error", "message": f"Failed to process request: {str(e)}"}
+            return self._validate_and_format_response({
+                "status": WeatherTaskStatus.ERROR, 
+                "message": f"Failed to process request: {str(e)}"
+            }, ["status", "message"])
 
     async def handle_initiate_fetch(self, request_data: 'WeatherInitiateFetchData') -> Dict[str, Any]:
         """
@@ -1543,7 +1567,11 @@ class WeatherTask(Task):
         """
         if self.node_type != 'miner':
             logger.error("handle_initiate_fetch called on non-miner node.")
-            return {"status": "error", "job_id": None, "message": "Invalid node type"}
+            return self._validate_and_format_response({
+                "status": WeatherTaskStatus.ERROR, 
+                "job_id": None, 
+                "message": "Invalid node type"
+            }, ["status", "message"])
 
         try:
             t0_run_time = request_data.forecast_start_time
@@ -1573,6 +1601,7 @@ class WeatherTask(Task):
                 job_id = existing_job['id']
                 status = existing_job['status']
                 
+                
                 # If the job is in a recoverable (failed) state, reset and retry it.
                 if status in ['error', 'fetch_error', 'failed', 'input_hash_mismatch', 'input_hash_timeout', 'input_poll_error']:
                     logger.warning(f"[Miner Job {job_id}] Found existing FAILED job (status: {status}). Resetting and retrying.")
@@ -1588,19 +1617,23 @@ class WeatherTask(Task):
                         t_minus_6_run_time=t_minus_6_run_time
                     ))
                     
-                    return {"status": "fetch_accepted", "job_id": job_id, "message": f"Retrying existing failed job (previous status: {status})."}
+                    return self._validate_and_format_response({
+                        "status": WeatherTaskStatus.FETCH_ACCEPTED, 
+                        "job_id": job_id, 
+                        "message": f"Retrying existing failed job (previous status: {status})."
+                    }, ["status", "job_id"])
 
                 # If the job is in a valid, non-failed state, reuse it.
                 else:
                     logger.info(f"[Miner Job {job_id}] Found existing active job (status: {status}). Reusing.")
                     response = {
-                        "status": "fetch_accepted", 
+                        "status": WeatherTaskStatus.FETCH_ACCEPTED, 
                         "job_id": job_id, 
                         "message": f"Reusing existing job (status: {status})"
                     }
                     if existing_job.get('input_data_hash'):
                         response["input_data_hash"] = existing_job['input_data_hash']
-                    return response
+                    return self._validate_and_format_response(response, ["status", "job_id"])
 
             # If no job exists, create a new one.
             job_id = str(uuid.uuid4())
@@ -1627,11 +1660,19 @@ class WeatherTask(Task):
                 t_minus_6_run_time=t_minus_6_run_time
             ))
 
-            return {"status": "fetch_accepted", "job_id": job_id, "message": "Fetch and hash process initiated."}
+            return self._validate_and_format_response({
+                "status": WeatherTaskStatus.FETCH_ACCEPTED, 
+                "job_id": job_id, 
+                "message": "Fetch and hash process initiated."
+            }, ["status", "job_id"])
 
         except Exception as e:
             logger.error(f"[Miner] Error during handle_initiate_fetch: {e}", exc_info=True)
-            return {"status": "error", "job_id": None, "message": f"Failed to initiate fetch: {e}"}
+            return self._validate_and_format_response({
+                "status": WeatherTaskStatus.ERROR, 
+                "job_id": None, 
+                "message": f"Failed to initiate fetch: {e}"
+            }, ["status", "message"])
 
     async def handle_get_input_status(self, job_id: str) -> Dict[str, Any]:
         """
@@ -1642,7 +1683,11 @@ class WeatherTask(Task):
         """
         if self.node_type != 'miner':
             logger.error("handle_get_input_status called on non-miner node.")
-            return {"status": "error", "job_id": job_id, "message": "Invalid node type"}
+            return self._validate_and_format_response({
+                "status": WeatherTaskStatus.ERROR, 
+                "job_id": job_id, 
+                "message": "Invalid node type"
+            }, ["status", "job_id", "message"])
 
         logger.debug(f"[Miner Job {job_id}] Received get_input_status request.")
         try:
@@ -1651,13 +1696,17 @@ class WeatherTask(Task):
 
             if not result:
                 logger.warning(f"[Miner Job {job_id}] Status requested for non-existent job.")
-                return {"status": "not_found", "job_id": job_id, "message": "Job ID not found."}
+                return self._validate_and_format_response({
+                    "status": WeatherTaskStatus.NOT_FOUND, 
+                    "job_id": job_id, 
+                    "message": "Job ID not found."
+                }, ["status", "job_id", "message"])
             
             status_to_report = result['status']
             # If hashing is done and we are waiting for the validator to trigger inference,
             # report the specific status the validator is looking for.
             if status_to_report == 'in_progress' and result.get('input_data_hash'):
-                status_to_report = 'input_hashed_awaiting_validation'
+                status_to_report = WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION
 
             response = {
                 "job_id": job_id,
@@ -1666,11 +1715,15 @@ class WeatherTask(Task):
                 "message": result.get('error_message')
             }
             logger.debug(f"[Miner Job {job_id}] Reporting status: {response['status']}, Hash available: {response['input_data_hash'] is not None}")
-            return response
+            return self._validate_and_format_response(response, ["job_id", "status"])
 
         except Exception as e:
             logger.error(f"[Miner Job {job_id}] Error during handle_get_input_status: {e}", exc_info=True)
-            return {"status": "error", "job_id": job_id, "message": f"Failed to get status: {e}"}
+            return self._validate_and_format_response({
+                "status": WeatherTaskStatus.ERROR, 
+                "job_id": job_id, 
+                "message": f"Failed to get status: {e}"
+            }, ["status", "job_id", "message"])
 
     async def handle_start_inference(self, job_id: str) -> Dict[str, Any]:
         """
@@ -1678,7 +1731,10 @@ class WeatherTask(Task):
         This method should return quickly after launching the background inference task.
         """
         if not job_id:
-            return {"status": "error", "message": "job_id is required."}
+            return self._validate_and_format_response({
+                "status": WeatherTaskStatus.ERROR, 
+                "message": "job_id is required."
+            }, ["status", "message"])
 
         logger.info(f"Miner received request to start inference for job_id: {job_id}")
 
@@ -1688,11 +1744,17 @@ class WeatherTask(Task):
             job_details = await self.db_manager.fetch_one(job_query, {"job_id": job_id})
 
             if not job_details:
-                return {"status": "error", "message": f"Job ID {job_id} not found."}
+                return self._validate_and_format_response({
+                    "status": WeatherTaskStatus.ERROR, 
+                    "message": f"Job ID {job_id} not found."
+                }, ["status", "message"])
 
             if job_details['runpod_job_id'] and job_details['status'] == 'in_progress':
                 logger.warning(f"[{job_id}] Received start_inference call for a job already in progress on RunPod. Acknowledging.")
-                return {"status": "inference_started", "message": "Inference already in progress."}
+                return self._validate_and_format_response({
+                    "status": WeatherTaskStatus.INFERENCE_STARTED, 
+                    "message": "Inference already in progress."
+                }, ["status", "message"])
 
             inference_type = self.config.get('weather_inference_type', 'local_model')
             logger.info(f"Launching inference for job {job_id} using type: {inference_type}")
@@ -1700,29 +1762,44 @@ class WeatherTask(Task):
             if inference_type == "http_service":
                 # Launch background task for HTTP service inference
                 asyncio.create_task(self._run_inference_via_http_service(job_id))
-                return {"status": "inference_started", "message": "HTTP inference process initiated."}
+                return self._validate_and_format_response({
+                    "status": WeatherTaskStatus.INFERENCE_STARTED, 
+                    "message": "HTTP inference process initiated."
+                }, ["status", "message"])
 
             elif inference_type == "local_model":
                 if not self.inference_runner or not self.inference_runner.model:
                     msg = "Local model selected but not loaded."
                     logger.error(f"[{job_id}] {msg}")
                     await update_job_status(self, job_id, 'failed', msg)
-                    return {"status": "error", "message": msg}
+                    return self._validate_and_format_response({
+                        "status": WeatherTaskStatus.ERROR, 
+                        "message": msg
+                    }, ["status", "message"])
                 
                 # Launch background task for local model inference
                 asyncio.create_task(run_inference_background(task_instance=self, job_id=job_id))
-                return {"status": "inference_started", "message": "Local inference process initiated."}
+                return self._validate_and_format_response({
+                    "status": WeatherTaskStatus.INFERENCE_STARTED, 
+                    "message": "Local inference process initiated."
+                }, ["status", "message"])
             
             else:
                 msg = f"Unsupported inference type: {inference_type}"
                 logger.error(f"[{job_id}] {msg}")
                 await update_job_status(self, job_id, 'failed', msg)
-                return {"status": "error", "message": msg}
+                return self._validate_and_format_response({
+                    "status": WeatherTaskStatus.ERROR, 
+                    "message": msg
+                }, ["status", "message"])
 
         except Exception as e:
             logger.error(f"Unexpected error in handle_start_inference for job {job_id}: {e}", exc_info=True)
             await update_job_status(self, job_id, 'failed', f"Unhandled exception: {e}")
-            return {"status": "error", "message": f"An unexpected error occurred: {e}"}
+            return self._validate_and_format_response({
+                "status": WeatherTaskStatus.ERROR, 
+                "message": f"An unexpected error occurred: {e}"
+            }, ["status", "message"])
 
     ############################################################
     # Helper Methods
@@ -2083,3 +2160,226 @@ class WeatherTask(Task):
         except Exception as e:
             logger.error(f"Error during incomplete HTTP job recovery: {e}", exc_info=True)
         
+    def _validate_and_format_response(self, response_dict: Dict[str, Any], expected_fields: List[str]) -> Dict[str, Any]:
+        """
+        Helper method to validate and format responses consistently.
+        
+        Args:
+            response_dict: Raw response dictionary from method
+            expected_fields: List of required fields for this response type
+            
+        Returns:
+            Validated response dictionary
+        """
+        if not isinstance(response_dict, dict):
+            logger.error(f"Response validation failed: expected dict, got {type(response_dict)}")
+            return {"status": WeatherTaskStatus.ERROR, "message": "Invalid response format"}
+        
+        # Check for required fields
+        missing_fields = [field for field in expected_fields if field not in response_dict]
+        if missing_fields:
+            logger.warning(f"Response missing required fields: {missing_fields}")
+            # Don't fail, just log the warning as some fields might be optional
+        
+        # Ensure status is valid if present
+        if "status" in response_dict:
+            try:
+                # Validate that status is a valid enum value
+                WeatherTaskStatus(response_dict["status"])
+            except ValueError:
+                logger.warning(f"Unknown status value: {response_dict['status']}")
+        
+        return response_dict
+
+    async def register_progress_callback(self, callback: callable):
+        """Register a callback function to receive progress updates"""
+        self.progress_callbacks.append(callback)
+    
+    async def _emit_progress(self, update: WeatherProgressUpdate):
+        """Emit progress update to all registered callbacks"""
+        operation_key = f"{update.operation}_{getattr(self, 'current_job_id', 'system')}"
+        self.current_operations[operation_key] = update
+        
+        # Log progress
+        if update.bytes_downloaded and update.bytes_total:
+            percent = (update.bytes_downloaded / update.bytes_total) * 100
+            logger.info(f"[Progress] {update.operation}: {update.stage} - {percent:.1f}% ({update.bytes_downloaded}/{update.bytes_total} bytes) - {update.message}")
+        elif update.files_completed and update.files_total:
+            percent = (update.files_completed / update.files_total) * 100
+            logger.info(f"[Progress] {update.operation}: {update.stage} - {percent:.1f}% ({update.files_completed}/{update.files_total} files) - {update.message}")
+        else:
+            percent = update.progress * 100
+            logger.info(f"[Progress] {update.operation}: {update.stage} - {percent:.1f}% - {update.message}")
+        
+        # Call registered callbacks
+        for callback in self.progress_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(update)
+                else:
+                    callback(update)
+            except Exception as e:
+                logger.warning(f"Progress callback error: {e}")
+
+    async def get_file_locations(self) -> List[WeatherFileLocation]:
+        """Get information about all weather-related file storage locations"""
+        locations = []
+        
+        # Cache directories
+        cache_dirs = [
+            ("gfs_cache", self.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'), "GFS analysis data cache"),
+            ("era5_cache", self.config.get('era5_cache_dir', './era5_cache'), "ERA5 reanalysis data cache"),
+            ("forecast", str(MINER_FORECAST_DIR_BG), "Miner forecast outputs"),
+            ("ensemble", str(VALIDATOR_ENSEMBLE_DIR), "Validator ensemble files"),
+        ]
+        
+        for file_type, path_str, description in cache_dirs:
+            path = Path(path_str)
+            if path.exists():
+                try:
+                    # Calculate directory size
+                    total_size = sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
+                    
+                    locations.append(WeatherFileLocation(
+                        file_type=file_type,
+                        local_path=str(path.absolute()),
+                        size_bytes=total_size,
+                        created_time=datetime.fromtimestamp(path.stat().st_ctime, tz=timezone.utc),
+                        description=description
+                    ))
+                except Exception as e:
+                    logger.warning(f"Error getting info for {path}: {e}")
+                    locations.append(WeatherFileLocation(
+                        file_type=file_type,
+                        local_path=str(path.absolute()),
+                        description=f"{description} (error reading size)"
+                    ))
+            else:
+                locations.append(WeatherFileLocation(
+                    file_type=file_type,
+                    local_path=str(path.absolute()),
+                    size_bytes=0,
+                    description=f"{description} (directory not yet created)"
+                ))
+        
+        return locations
+
+    async def get_storage_summary(self) -> Dict[str, Any]:
+        """Get a summary of storage usage for weather task files"""
+        locations = await self.get_file_locations()
+        summary = {
+            "total_size_bytes": 0,
+            "total_size_mb": 0,
+            "locations": {},
+            "last_updated": datetime.now(timezone.utc).isoformat()
+        }
+        
+        for loc in locations:
+            if loc.size_bytes:
+                summary["total_size_bytes"] += loc.size_bytes
+                summary["locations"][loc.file_type] = {
+                    "path": loc.local_path,
+                    "size_bytes": loc.size_bytes,
+                    "size_mb": round(loc.size_bytes / (1024 * 1024), 2),
+                    "description": loc.description,
+                    "created": loc.created_time.isoformat() if loc.created_time else None
+                }
+        
+        summary["total_size_mb"] = round(summary["total_size_bytes"] / (1024 * 1024), 2)
+        return summary
+
+    def _format_bytes(self, bytes_count: int) -> str:
+        """Format bytes count into human readable string"""
+        if bytes_count < 1024:
+            return f"{bytes_count} B"
+        elif bytes_count < 1024 * 1024:
+            return f"{bytes_count / 1024:.1f} KB"
+        elif bytes_count < 1024 * 1024 * 1024:
+            return f"{bytes_count / (1024 * 1024):.1f} MB"
+        else:
+            return f"{bytes_count / (1024 * 1024 * 1024):.1f} GB"
+
+    def _format_time_remaining(self, seconds: Optional[int]) -> str:
+        """Format time remaining into human readable string"""
+        if seconds is None:
+            return "unknown"
+        
+        if seconds < 60:
+            return f"{seconds}s"
+        elif seconds < 3600:
+            return f"{seconds // 60}m {seconds % 60}s"
+        else:
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            return f"{hours}h {minutes}m"
+
+    async def get_progress_status(self, job_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get current progress status for all operations or a specific job"""
+        if job_id:
+            # Filter for specific job
+            job_operations = {k: v for k, v in self.current_operations.items() 
+                            if job_id in k}
+            return {
+                "job_id": job_id,
+                "operations": {k: v.dict() for k, v in job_operations.items()},
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        else:
+            # Return all current operations
+            return {
+                "all_operations": {k: v.dict() for k, v in self.current_operations.items()},
+                "active_operations_count": len(self.current_operations),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+
+    async def get_detailed_storage_info(self) -> Dict[str, Any]:
+        """Get detailed information about storage locations and their contents"""
+        storage_info = await self.get_storage_summary()
+        
+        # Add configuration information
+        storage_info.update({
+            "configuration": {
+                "gfs_cache_dir": self.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache'),
+                "era5_cache_dir": self.config.get('era5_cache_dir', './era5_cache'),
+                "miner_forecast_dir": str(MINER_FORECAST_DIR_BG),
+                "validator_ensemble_dir": str(VALIDATOR_ENSEMBLE_DIR),
+                "gfs_retention_days": self.config.get('gfs_cache_retention_days', 7),
+                "era5_retention_days": self.config.get('era5_cache_retention_days', 30),
+                "ensemble_retention_days": self.config.get('ensemble_retention_days', 14),
+            },
+            "environment_variables": {
+                "WEATHER_GFS_CACHE_DIR": os.getenv('WEATHER_GFS_CACHE_DIR', 'not set'),
+                "WEATHER_ERA5_CACHE_DIR": os.getenv('WEATHER_ERA5_CACHE_DIR', 'not set'),
+                "MINER_FORECAST_DIR": os.getenv('MINER_FORECAST_DIR', 'not set'),
+            }
+        })
+        
+        # Add file counts and recent files for each location
+        for loc_type, loc_info in storage_info["locations"].items():
+            path = Path(loc_info["path"])
+            if path.exists():
+                try:
+                    files = list(path.rglob('*'))
+                    files = [f for f in files if f.is_file()]
+                    
+                    loc_info.update({
+                        "file_count": len(files),
+                        "recent_files": []
+                    })
+                    
+                    # Get 5 most recently modified files
+                    if files:
+                        recent_files = sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)[:5]
+                        for f in recent_files:
+                            stat = f.stat()
+                            loc_info["recent_files"].append({
+                                "name": f.name,
+                                "relative_path": str(f.relative_to(path)),
+                                "size_bytes": stat.st_size,
+                                "size_formatted": self._format_bytes(stat.st_size),
+                                "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+                            })
+                except Exception as e:
+                    loc_info["error"] = f"Unable to analyze directory: {e}"
+        
+        return storage_info

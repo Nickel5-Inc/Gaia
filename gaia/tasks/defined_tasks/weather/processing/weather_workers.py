@@ -1150,6 +1150,15 @@ async def fetch_and_hash_gfs_task(
     input_batch_pickle_file_path_str = None # Initialize here for broader scope
     initial_batch: Optional[BatchType] = None # Initialize initial_batch to None
 
+    # Set current job for progress tracking
+    task_instance.current_job_id = job_id
+
+    # Define progress callback
+    async def progress_callback(update_dict):
+        from ..schemas.weather_outputs import WeatherProgressUpdate
+        update = WeatherProgressUpdate(**update_dict)
+        await task_instance._emit_progress(update)
+
     try:
         await update_job_status(task_instance, job_id, "fetching_gfs")
 
@@ -1157,24 +1166,41 @@ async def fetch_and_hash_gfs_task(
         gfs_cache_dir = Path(cache_dir_str)
         gfs_cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- Fetch GFS Data ---
+        # --- Fetch GFS Data with Progress Tracking ---
+        await task_instance._emit_progress(WeatherProgressUpdate(
+            operation="gfs_fetch",
+            stage="starting",
+            progress=0.0,
+            message=f"Starting GFS data fetch for job {job_id[:8]}"
+        ))
+
         logger.info(f"[FetchHashTask Job {job_id}] Fetching GFS T0 data ({t0_run_time})...")
-        ds_t0 = await fetch_gfs_analysis_data([t0_run_time], cache_dir=gfs_cache_dir)
+        ds_t0 = await fetch_gfs_analysis_data([t0_run_time], cache_dir=gfs_cache_dir, progress_callback=progress_callback)
+        
         logger.info(f"[FetchHashTask Job {job_id}] Fetching GFS T-6 data ({t_minus_6_run_time})...")
-        ds_t_minus_6 = await fetch_gfs_analysis_data([t_minus_6_run_time], cache_dir=gfs_cache_dir)
+        ds_t_minus_6 = await fetch_gfs_analysis_data([t_minus_6_run_time], cache_dir=gfs_cache_dir, progress_callback=progress_callback)
 
         if ds_t0 is None or ds_t_minus_6 is None:
             logger.error(f"[FetchHashTask Job {job_id}] Failed to fetch GFS data (T0 or T-6 is None).")
             await update_job_status(task_instance, job_id, "fetch_error", "Failed to fetch GFS data for batch preparation.")
+            await task_instance._emit_progress(WeatherProgressUpdate(
+                operation="gfs_fetch",
+                stage="error",
+                progress=0.0,
+                message="Failed to fetch GFS data"
+            ))
             return
 
-        # --- Prepare Aurora Batch ---
+        # --- Prepare Aurora Batch with Progress ---
+        await task_instance._emit_progress(WeatherProgressUpdate(
+            operation="batch_preparation",
+            stage="processing",
+            progress=0.7,
+            message="Preparing Aurora batch from GFS data"
+        ))
+
         logger.info(f"[FetchHashTask Job {job_id}] Preparing Aurora Batch from GFS data...")
-        gfs_concat_data_for_batch_prep = await asyncio.to_thread(
-            lambda d0, d_minus_6: xr.concat([d_minus_6, d0], dim='time').sortby('time'),
-            ds_t0,
-            ds_t_minus_6
-        )
+        gfs_concat_data_for_batch_prep = xr.concat([ds_t0, ds_t_minus_6], dim='time').sortby('time')
         initial_batch = await asyncio.to_thread(
             create_aurora_batch_from_gfs,
             gfs_data=gfs_concat_data_for_batch_prep
@@ -1182,31 +1208,105 @@ async def fetch_and_hash_gfs_task(
         if initial_batch is None:
             logger.error(f"[FetchHashTask Job {job_id}] Failed to create Aurora Batch (create_aurora_batch_from_gfs returned None).")
             await update_job_status(task_instance, job_id, "error", "Failed to prepare initial Aurora batch.")
+            await task_instance._emit_progress(WeatherProgressUpdate(
+                operation="batch_preparation",
+                stage="error",
+                progress=0.0,
+                message="Failed to prepare initial Aurora batch"
+            ))
             return
         logger.info(f"[FetchHashTask Job {job_id}] Aurora Batch prepared successfully.")
+        await task_instance._emit_progress(WeatherProgressUpdate(
+            operation="batch_preparation",
+            stage="completed",
+            progress=1.0,
+            message="Aurora batch prepared successfully"
+        ))
 
-        # --- Save Pickled Aurora Batch ---
-        MINER_INPUT_BATCHES_DIR.mkdir(parents=True, exist_ok=True) # Ensure dir exists
-        input_batch_pickle_filename = f"input_batch_{job_id}.pkl"
-        input_batch_pickle_file_path = MINER_INPUT_BATCHES_DIR / input_batch_pickle_filename
-        input_batch_pickle_file_path_str = str(input_batch_pickle_file_path.resolve())
+        # --- Save Pickled Aurora Batch with Progress ---
+        await task_instance._emit_progress(WeatherProgressUpdate(
+            operation="batch_saving",
+            stage="processing",
+            progress=0.8,
+            message="Saving Aurora batch to local storage"
+        ))
 
-        logger.info(f"[FetchHashTask Job {job_id}] Saving pickled Aurora Batch to {input_batch_pickle_file_path_str}...")
-        def _save_pickle_sync(batch, path):
-            with open(path, "wb") as f:
-                pickle.dump(batch, f)
-        await asyncio.to_thread(_save_pickle_sync, initial_batch, input_batch_pickle_file_path_str)
-        logger.info(f"[FetchHashTask Job {job_id}] Successfully saved pickled Aurora Batch.")
+        job_id_prefix = job_id.split('-')[0]
+        miner_hotkey_for_filename = "unknown_miner_hk"
+        if task_instance.keypair and task_instance.keypair.ss58_address:
+            miner_hotkey_for_filename = task_instance.keypair.ss58_address
+        input_batch_filename = f"input_batch_{t0_run_time.strftime('%Y%m%d%H')}_miner_hk_{miner_hotkey_for_filename[:10]}_{job_id_prefix}.pkl"
+        input_batch_pickle_file_path = MINER_INPUT_BATCHES_DIR / input_batch_filename
         
-        # --- Compute Input Hash (using the original datasets, not the batch object) ---
-        logger.info(f"[FetchHashTask Job {job_id}] Calling compute_input_data_hash...")
-        computed_hash = await compute_input_data_hash(
-            t0_run_time=t0_run_time,
-            t_minus_6_run_time=t_minus_6_run_time,
-            cache_dir=gfs_cache_dir,
-            ds_t0_override=ds_t0, # Pass fetched datasets to avoid re-fetch/re-load
-            ds_t_minus_6_override=ds_t_minus_6
-        )
+        try:
+            with open(input_batch_pickle_file_path, "wb") as f:
+                pickle.dump(initial_batch, f)
+            input_batch_pickle_file_path_str = str(input_batch_pickle_file_path)
+            logger.info(f"[FetchHashTask Job {job_id}] Aurora Batch saved to: {input_batch_pickle_file_path_str}")
+            
+            await task_instance._emit_progress(WeatherProgressUpdate(
+                operation="batch_saving",
+                stage="completed",
+                progress=1.0,
+                message=f"Aurora batch saved ({input_batch_pickle_file_path.stat().st_size} bytes)",
+                bytes_downloaded=input_batch_pickle_file_path.stat().st_size,
+                bytes_total=input_batch_pickle_file_path.stat().st_size
+            ))
+        except Exception as e_save:
+            logger.error(f"[FetchHashTask Job {job_id}] Failed to save Aurora Batch pickle: {e_save}", exc_info=True)
+            await update_job_status(task_instance, job_id, "error", f"Failed to save Aurora Batch: {e_save}")
+            await task_instance._emit_progress(WeatherProgressUpdate(
+                operation="batch_saving",
+                stage="error",
+                progress=0.0,
+                message=f"Failed to save Aurora batch: {e_save}"
+            ))
+            return
+
+        # --- Compute Input Hash with Progress ---
+        await task_instance._emit_progress(WeatherProgressUpdate(
+            operation="hash_computation",
+            stage="processing",
+            progress=0.9,
+            message="Computing canonical input data hash"
+        ))
+
+        await update_job_status(task_instance, job_id, "hashing_input")
+        logger.info(f"[FetchHashTask Job {job_id}] Computing canonical input data hash...")
+        try:
+            canonical_input_hash = await compute_input_data_hash(
+                t0_run_time=t0_run_time,
+                t_minus_6_run_time=t_minus_6_run_time,
+                cache_dir=gfs_cache_dir
+            )
+            if not canonical_input_hash:
+                logger.error(f"[FetchHashTask Job {job_id}] Hash computation returned None/empty.")
+                await update_job_status(task_instance, job_id, "error", "Input data hash computation failed.")
+                await task_instance._emit_progress(WeatherProgressUpdate(
+                    operation="hash_computation",
+                    stage="error",
+                    progress=0.0,
+                    message="Hash computation failed"
+                ))
+                return
+
+            logger.info(f"[FetchHashTask Job {job_id}] Computed input hash: {canonical_input_hash[:16]}...")
+            await task_instance._emit_progress(WeatherProgressUpdate(
+                operation="hash_computation",
+                stage="completed",
+                progress=1.0,
+                message=f"Hash computed: {canonical_input_hash[:16]}..."
+            ))
+        except Exception as e_hash:
+            logger.error(f"[FetchHashTask Job {job_id}] Hash computation error: {e_hash}", exc_info=True)
+            await update_job_status(task_instance, job_id, "error", f"Hash computation failed: {e_hash}")
+            await task_instance._emit_progress(WeatherProgressUpdate(
+                operation="hash_computation",
+                stage="error",
+                progress=0.0,
+                message=f"Hash computation error: {e_hash}"
+            ))
+            return
 
         if computed_hash:
             logger.info(f"[FetchHashTask Job {job_id}] Successfully computed input hash: {computed_hash[:10]}... Updating DB.")

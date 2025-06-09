@@ -324,7 +324,8 @@ async def fetch_gfs_analysis_data(
     cache_dir: Path = Path("./gfs_analysis_cache"),
     target_surface_vars: Optional[List[str]] = None,
     target_atmos_vars: Optional[List[str]] = None,
-    target_pressure_levels_hpa: Optional[List[int]] = None
+    target_pressure_levels_hpa: Optional[List[int]] = None,
+    progress_callback: Optional[callable] = None
 ) -> Optional[xr.Dataset]:
     """
     Fetches GFS ANALYSIS data (T+0h) asynchronously for multiple specific times.
@@ -337,6 +338,7 @@ async def fetch_gfs_analysis_data(
         target_surface_vars: Optional list of surface variable names to fetch.
         target_atmos_vars: Optional list of atmospheric variable names to fetch.
         target_pressure_levels_hpa: Optional list of pressure levels (in hPa) for atmospheric variables.
+        progress_callback: Optional callback function for progress updates.
 
     Returns:
         xr.Dataset: Combined dataset of processed analysis variables for target times, or None.
@@ -344,6 +346,15 @@ async def fetch_gfs_analysis_data(
     if not target_times:
         logger.warning("fetch_gfs_analysis_data called with no target_times.")
         return None
+
+    # Emit initial progress
+    if progress_callback:
+        await progress_callback({
+            "operation": "gfs_download",
+            "stage": "initializing",
+            "progress": 0.0,
+            "message": f"Starting GFS analysis fetch for {len(target_times)} time(s)"
+        })
 
     valid_target_times = []
     for t in target_times:
@@ -365,11 +376,31 @@ async def fetch_gfs_analysis_data(
 
     if cache_filename.exists():
         try:
+            if progress_callback:
+                await progress_callback({
+                    "operation": "gfs_download",
+                    "stage": "loading_cache",
+                    "progress": 0.5,
+                    "message": f"Loading cached GFS analysis from {cache_filename.name}"
+                })
+            
             logger.info(f"Loading cached GFS analysis data from: {cache_filename}")
             ds_cached = xr.open_dataset(cache_filename)
             target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
             if all(t_np_ns in ds_cached.time.values for t_np_ns in target_times_np_ns):
                 logger.info("GFS Analysis cache hit is valid.")
+                
+                if progress_callback:
+                    file_size = cache_filename.stat().st_size if cache_filename.exists() else 0
+                    await progress_callback({
+                        "operation": "gfs_download",
+                        "stage": "completed",
+                        "progress": 1.0,
+                        "message": f"Successfully loaded from cache ({file_size} bytes)",
+                        "bytes_downloaded": file_size,
+                        "bytes_total": file_size
+                    })
+                
                 return ds_cached
             else:
                 logger.warning("Cached GFS analysis file missing requested times. Re-fetching.")
@@ -382,15 +413,36 @@ async def fetch_gfs_analysis_data(
                 except OSError: pass
 
     logger.info(f"GFS Analysis cache miss for times: {time_strings[0]}...{time_strings[-1]}. Fetching from NOMADS.")
+    
+    if progress_callback:
+        await progress_callback({
+            "operation": "gfs_download",
+            "stage": "downloading",
+            "progress": 0.1,
+            "message": f"Fetching GFS analysis data from NOMADS for {len(target_times)} times"
+        })
 
     def _sync_fetch_and_process_analysis():
         analysis_slices = []
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=xr.SerializationWarning)
             
-            for target_time in target_times:
+            total_steps = len(target_times)
+            for idx, target_time in enumerate(target_times):
                 processed_one_successfully_for_target = False
                 try:
+                    # Progress update for each time step
+                    step_progress = 0.1 + (0.7 * (idx / total_steps))  # 10% to 80% for downloading
+                    if progress_callback:
+                        asyncio.create_task(progress_callback({
+                            "operation": "gfs_download",
+                            "stage": "downloading",
+                            "progress": step_progress,
+                            "message": f"Processing time {idx+1}/{total_steps}: {target_time.strftime('%Y-%m-%d %H:%M')}",
+                            "files_completed": idx,
+                            "files_total": total_steps
+                        }))
+                    
                     base_url = _get_gfs_cycle_url(target_time)
                     if not base_url:
                         logger.error(f"Could not get URL for GFS cycle {target_time}. Skipping.")
@@ -609,6 +661,7 @@ async def fetch_gfs_analysis_data(
             logger.info(f"Saving processed GFS analysis data to cache: {cache_filename}")
             cache_dir.mkdir(parents=True, exist_ok=True)
             processed_ds.to_netcdf(cache_filename)
+                
         except Exception as e_cache:
             logger.error(f"Failed to save GFS analysis to cache {cache_filename}: {e_cache}")
             if isinstance(e_cache, PermissionError):
@@ -618,9 +671,29 @@ async def fetch_gfs_analysis_data(
 
     try:
         result_dataset = await asyncio.to_thread(_sync_fetch_and_process_analysis)
+        
+        # Post-processing progress updates
+        if progress_callback and result_dataset is not None:
+            file_size = cache_filename.stat().st_size if cache_filename.exists() else 0
+            await progress_callback({
+                "operation": "gfs_download",
+                "stage": "completed",
+                "progress": 1.0,
+                "message": f"GFS analysis data successfully processed and cached ({file_size} bytes)",
+                "bytes_downloaded": file_size,
+                "bytes_total": file_size
+            })
+        
         return result_dataset
     except Exception as e:
         logger.error(f"Async fetch GFS analysis data failed: {e}")
+        if progress_callback:
+            await progress_callback({
+                "operation": "gfs_download",
+                "stage": "error",
+                "progress": 0.0,
+                "message": f"GFS fetch failed: {str(e)}"
+            })
         return None
 
 async def _test_fetch_analysis():
