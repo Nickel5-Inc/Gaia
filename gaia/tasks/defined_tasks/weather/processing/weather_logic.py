@@ -858,35 +858,89 @@ async def calculate_era5_miner_score(
                     all_metrics_for_db.append(acc_metric_row)
 
                     skill_score_val = None
-                    skill_score_type_gfs = f"era5_skill_gfs_{var_key}_{lead_hours}h"
-                    skill_rec_gfs = await task_instance.db_manager.fetch_one(
-                        "SELECT score FROM weather_miner_scores WHERE response_id = :resp_id AND score_type = :stype",
-                        {"resp_id": response_id, "stype": skill_score_type_gfs}
-                    )
-                    if skill_rec_gfs and skill_rec_gfs['score'] is not None and np.isfinite(skill_rec_gfs['score']):
-                        skill_score_val = skill_rec_gfs['score']
-                        logger.info(f"[FinalScore] UID {miner_uid} - Using GFS-based skill for {var_key} L{lead_hours}h: {skill_score_val:.4f}")
-                    else:
-                        skill_score_type_clim = f"era5_skill_clim_{var_key}_{lead_hours}h"
-                        skill_rec_clim = await task_instance.db_manager.fetch_one(
-                            "SELECT score FROM weather_miner_scores WHERE response_id = :resp_id AND score_type = :stype",
-                            {"resp_id": response_id, "stype": skill_score_type_clim}
-                        )
-                        if skill_rec_clim and skill_rec_clim['score'] is not None and np.isfinite(skill_rec_clim['score']):
-                            skill_score_val = skill_rec_clim['score']
-                            logger.info(f"[FinalScore] UID {miner_uid} - Using CLIM-based skill for {var_key} L{lead_hours}h: {skill_score_val:.4f} (GFS-based not found/valid)")
-                        else:
-                            logger.warning(f"[FinalScore] UID {miner_uid} - No valid GFS or CLIM skill score found for {var_key} L{lead_hours}h.")
+                    
+                    if gfs_op_lead_slice is not None:
+                        try:
+                            gfs_var_name = AURORA_TO_GFS_VAR_MAP.get(var_name)
+                            if gfs_var_name and gfs_var_name in gfs_op_lead_slice:
+                                gfs_var_da_unaligned = gfs_op_lead_slice[gfs_var_name]
 
-                    skill_metric_row = {**db_metric_row_base, 
-                                        "metrics": current_metrics.copy(), 
-                                        "score_type": f"era5_skill_clim_{var_key}_{int(lead_hours)}h", 
-                                        "score": skill_score_val
-                                       }
-                    all_metrics_for_db.append(skill_metric_row)
+                                if var_level:
+                                    gfs_pressure_dim = None
+                                    for dim_name in ['pressure_level', 'plev', 'level', 'isobaricInhPa']:
+                                        if dim_name in gfs_var_da_unaligned.dims:
+                                            gfs_pressure_dim = dim_name
+                                            break
+                                    
+                                    if gfs_pressure_dim:
+                                        gfs_var_da_selected = gfs_var_da_unaligned.sel({gfs_pressure_dim: var_level}, method="nearest")
+                                    else:
+                                        logger.warning(f"[FinalScore] No pressure dimension found in GFS data for {var_key}. Using surface data.")
+                                        gfs_var_da_selected = gfs_var_da_unaligned
+                                else:
+                                    gfs_var_da_selected = gfs_var_da_unaligned
+                                
+                                gfs_var_da_std = _standardize_spatial_dims_final(gfs_var_da_selected)
+                                gfs_var_da_aligned = await asyncio.to_thread(
+                                    gfs_var_da_std.interp_like, truth_var_da_final, method="linear", kwargs={"fill_value": None}
+                                )
+                                
+                                # bias correction
+                                forecast_bc_da = await calculate_bias_corrected_forecast(miner_var_da_aligned, truth_var_da_final)
+                                
+                                # skill score
+                                skill_score_val = await calculate_mse_skill_score(
+                                    forecast_bc_da, truth_var_da_final, gfs_var_da_aligned, lat_weights
+                                )
+                                
+                                if np.isfinite(skill_score_val):
+                                    logger.info(f"[FinalScore] UID {miner_uid} - Calculated GFS-based skill for {var_key} L{lead_hours}h: {skill_score_val:.4f}")
+                                    skill_metric_row = {**db_metric_row_base, 
+                                                       "metrics": current_metrics.copy(), 
+                                                       "score_type": f"era5_skill_gfs_{var_key}_{int(lead_hours)}h", 
+                                                       "score": skill_score_val}
+                                    all_metrics_for_db.append(skill_metric_row)
+                                else:
+                                    logger.warning(f"[FinalScore] UID {miner_uid} - Calculated skill score is non-finite for {var_key} L{lead_hours}h")
+                                    skill_score_val = None
+                            else:
+                                logger.warning(f"[FinalScore] UID {miner_uid} - GFS variable {gfs_var_name} not found in GFS forecast data")
+                        except Exception as e_skill:
+                            logger.error(f"[FinalScore] UID {miner_uid} - Error calculating skill score for {var_key} L{lead_hours}h: {e_skill}", exc_info=True)
+                            skill_score_val = None
+                    else:
+                        logger.warning(f"[FinalScore] UID {miner_uid} - No GFS forecast data available for skill score calculation")
+                    
+                    if skill_score_val is None:
+                        try:
+                            # bias correction
+                            if 'forecast_bc_da' not in locals():
+                                forecast_bc_da = await calculate_bias_corrected_forecast(miner_var_da_aligned, truth_var_da_final)
+                            
+                            # skill score vs climatology
+                            skill_score_val = await calculate_mse_skill_score(
+                                forecast_bc_da, truth_var_da_final, climatology_da_aligned, lat_weights
+                            )
+                            
+                            if np.isfinite(skill_score_val):
+                                logger.info(f"[FinalScore] UID {miner_uid} - Calculated CLIM-based skill for {var_key} L{lead_hours}h: {skill_score_val:.4f}")
+                                skill_metric_row = {**db_metric_row_base, 
+                                                   "metrics": current_metrics.copy(), 
+                                                   "score_type": f"era5_skill_clim_{var_key}_{int(lead_hours)}h", 
+                                                   "score": skill_score_val}
+                                all_metrics_for_db.append(skill_metric_row)
+                            else:
+                                logger.warning(f"[FinalScore] UID {miner_uid} - Calculated climatology skill score is non-finite for {var_key} L{lead_hours}h")
+                                skill_score_val = None
+                        except Exception as e_clim_skill:
+                            logger.error(f"[FinalScore] UID {miner_uid} - Error calculating climatology skill score for {var_key} L{lead_hours}h: {e_clim_skill}", exc_info=True)
+                            skill_score_val = None
+                    
+                    if skill_score_val is None:
+                        logger.warning(f"[FinalScore] UID {miner_uid} - No valid skill score calculated for {var_key} L{lead_hours}h")
                     
                     skill_score_log_str = f"{skill_score_val:.3f}" if skill_score_val is not None else "N/A"
-                    logger.info(f"[FinalScore] Miner {miner_hotkey} V:{var_key} L:{int(lead_hours)}h RMSE:{current_metrics.get('rmse', np.nan):.2f} ACC:{current_metrics.get('acc', np.nan):.3f} SKILL(clim):{skill_score_log_str}")
+                    logger.info(f"[FinalScore] Miner {miner_hotkey} V:{var_key} L:{int(lead_hours)}h RMSE:{current_metrics.get('rmse', np.nan):.2f} ACC:{current_metrics.get('acc', np.nan):.3f} SKILL:{skill_score_log_str}")
 
                 except KeyError as ke:
                     logger.error(f"[FinalScore] Miner {miner_hotkey}: KeyError scoring {var_key} at {valid_time_dt}: {ke}. This often means the variable was not found in one of the datasets (miner, truth, or climatology).", exc_info=True)
