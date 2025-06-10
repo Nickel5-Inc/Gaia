@@ -124,6 +124,11 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
     Includes duplicate checking to prevent redundant inference for the same timestep.
     """
     logger.info(f"[InferenceTask Job {job_id}] Background inference task initiated.")
+    
+    # Set up memory monitoring for this job
+    from ..utils.memory_monitor import get_memory_monitor, log_memory_usage
+    memory_monitor = get_memory_monitor()
+    log_memory_usage(f"job {job_id} start")
 
     # Check for duplicates before starting expensive operations
     try:
@@ -285,6 +290,12 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                     var_min, var_max, var_mean = float(var_data.min()), float(var_data.max()), float(var_data.mean())
                     logger.info(f"[InferenceTask Job {job_id}]     - GFS {var_name}: shape={var_data.shape}, range=[{var_min:.6f}, {var_max:.6f}], mean={var_mean:.6f}")
             
+            # Memory check before batch creation (CPU-intensive)
+            if not memory_monitor.check_memory_pressure(f"job {job_id} pre-batch-creation"):
+                logger.error(f"[InferenceTask Job {job_id}] Aborting due to memory pressure before batch creation")
+                await update_job_status(task_instance, job_id, 'failed', "Memory pressure too high before batch creation")
+                return
+            
             prepared_batch = await asyncio.to_thread(
                 create_aurora_batch_from_gfs,
                 gfs_data=gfs_concat_data_for_batch_prep,
@@ -292,6 +303,23 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                 download_dir='./static_data',
                 history_steps=2
             )
+            
+            # Immediate cleanup of intermediate data after batch creation
+            try:
+                if gfs_concat_data_for_batch_prep is not None:
+                    gfs_concat_data_for_batch_prep.close()
+                    del gfs_concat_data_for_batch_prep
+                if ds_t0 is not None:
+                    ds_t0.close()
+                    del ds_t0
+                if ds_t_minus_6 is not None:
+                    ds_t_minus_6.close()
+                    del ds_t_minus_6
+                gc.collect()
+                log_memory_usage(f"job {job_id} post-batch-creation-cleanup")
+            except Exception as e_cleanup:
+                logger.warning(f"[InferenceTask Job {job_id}] Error during post-batch creation cleanup: {e_cleanup}")
+            
             if prepared_batch is None:
                 err_msg = "Failed to create Aurora batch for local model from GFS data."
                 logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
@@ -356,9 +384,21 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
         await update_job_status(task_instance, job_id, "running_inference")
         logger.info(f"[InferenceTask Job {job_id}] Waiting for GPU semaphore...")
         
+        # Check memory safety before acquiring semaphore
+        if not memory_monitor.check_memory_pressure(f"job {job_id} pre-semaphore"):
+            logger.error(f"[InferenceTask Job {job_id}] Aborting due to memory pressure before semaphore")
+            await update_job_status(task_instance, job_id, 'failed', "Memory pressure too high - preventing OOM")
+            return
+        
         # Wrap the main inference logic in a try-catch to prevent unhandled ValueErrors
         try:
             async with task_instance.gpu_semaphore:
+                # Final memory check after acquiring semaphore
+                log_memory_usage(f"job {job_id} semaphore acquired")
+                if not memory_monitor.check_memory_pressure(f"job {job_id} pre-inference"):
+                    logger.error(f"[InferenceTask Job {job_id}] Aborting due to memory pressure before inference")
+                    await update_job_status(task_instance, job_id, 'failed', "Memory pressure too high - preventing OOM")
+                    return
                 logger.info(f"[InferenceTask Job {job_id}] Acquired GPU semaphore. Running inference...")
                 inference_type_for_call = task_instance.config.get("weather_inference_type", "local_model").lower()
                 logger.info(f"[InferenceTask Job {job_id}] (Inside Semaphore) Effective inference type for call: {inference_type_for_call}")
@@ -499,8 +539,42 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                 if not forecast_datasets:
                     raise ValueError("No forecast datasets created after processing batch prediction steps.")
 
+                # Memory monitoring for local inference concatenation
+                try:
+                    import psutil
+                    process = psutil.Process()
+                    memory_before_local_concat_mb = process.memory_info().rss / (1024 * 1024)
+                    logger.info(f"[InferenceTask Job {job_id}] Memory before local forecast concatenation: {memory_before_local_concat_mb:.1f} MB")
+                    
+                    # Emergency memory check for local inference
+                    if memory_before_local_concat_mb > 12000:
+                        logger.error(f"[InferenceTask Job {job_id}] 🚨 EMERGENCY: Memory too high before concatenation ({memory_before_local_concat_mb:.1f} MB). Aborting.")
+                        # Cleanup forecast datasets before aborting
+                        for ds in forecast_datasets:
+                            try:
+                                ds.close()
+                            except:
+                                pass
+                        del forecast_datasets
+                        gc.collect()
+                        raise RuntimeError("Memory usage too high - preventing OOM")
+                except Exception:
+                    pass
+
                 combined_forecast_ds = xr.concat(forecast_datasets, dim='time')
                 combined_forecast_ds = combined_forecast_ds.assign_coords(lead_time=('time', lead_times_hours_list))
+                
+                # Memory monitoring after concatenation
+                try:
+                    memory_after_local_concat_mb = process.memory_info().rss / (1024 * 1024)
+                    memory_used_local_mb = memory_after_local_concat_mb - memory_before_local_concat_mb
+                    logger.info(f"[InferenceTask Job {job_id}] Memory after local concatenation: {memory_after_local_concat_mb:.1f} MB (used {memory_used_local_mb:+.1f} MB)")
+                    
+                    # Warning for high memory usage
+                    if memory_after_local_concat_mb > 10000:
+                        logger.warning(f"[InferenceTask Job {job_id}] ⚠️  HIGH MEMORY USAGE in local inference: {memory_after_local_concat_mb:.1f} MB")
+                except Exception:
+                    pass
 
             if combined_forecast_ds is None:
                 raise ValueError("combined_forecast_ds was not properly assigned.")
@@ -2612,8 +2686,8 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
                         logger.info(f"[{job_id}] Added explicit time encoding for HTTP service consistency: {encoding['time']}")
                         break
                 
-                # Process files in smaller batches to avoid memory exhaustion
-                batch_size = 8  # Process 8 files at a time to manage memory
+                # Process files in smaller batches to avoid memory exhaustion  
+                batch_size = 4  # Reduce from 8 to 4 files at a time for lower memory usage
                 all_datasets = []
                 
                 logger.info(f"[{job_id}] 🔄 Processing files in batches of {batch_size}...")
@@ -2623,10 +2697,31 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
                     
                     logger.info(f"[{job_id}] Loading batch {batch_start//batch_size + 1}/{(len(sorted_files) + batch_size - 1)//batch_size}: files {batch_start+1}-{batch_end}")
                     
-                    # Load this batch of files
+                    # Load this batch of files with memory monitoring
                     batch_datasets = []
                     for file_path in batch_files:
                         try:
+                            # EMERGENCY CIRCUIT BREAKER: Check memory before loading each file
+                            try:
+                                import psutil
+                                process = psutil.Process()
+                                current_memory_mb = process.memory_info().rss / (1024 * 1024)
+                                
+                                # Emergency memory threshold: 12GB (75% of 16GB system)
+                                if current_memory_mb > 12000:
+                                    logger.error(f"[{job_id}] 🚨 EMERGENCY: Memory usage too high ({current_memory_mb:.1f} MB). Aborting to prevent OOM.")
+                                    # Force cleanup
+                                    for ds in batch_datasets:
+                                        try:
+                                            ds.close()
+                                        except:
+                                            pass
+                                    del batch_datasets
+                                    gc.collect()
+                                    return None
+                            except Exception:
+                                pass
+                            
                             ds = xr.open_dataset(file_path, chunks={'time': 1})  # Use dask chunks
                             batch_datasets.append(ds)
                         except Exception as e_open:
@@ -2659,13 +2754,41 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
                 
                 # Final concatenation of all batches
                 logger.info(f"[{job_id}] 🔗 Final concatenation of {len(all_datasets)} batches...")
+                
+                # Check memory before concatenation
+                try:
+                    import psutil
+                    process = psutil.Process()
+                    memory_before_concat_mb = process.memory_info().rss / (1024 * 1024)
+                    logger.info(f"[{job_id}] Memory before final concatenation: {memory_before_concat_mb:.1f} MB")
+                except Exception:
+                    pass
+                
                 combined_ds = xr.concat(all_datasets, dim='time')
                 
-                # Close batch datasets to free memory
+                # Close batch datasets to free memory IMMEDIATELY
                 for ds in all_datasets:
                     ds.close()
                 del all_datasets
-                gc.collect()
+                
+                # Force multiple GC passes to clean up after large concatenation
+                for gc_pass in range(3):
+                    collected = gc.collect()
+                    if collected == 0:
+                        break
+                    logger.debug(f"[{job_id}] Post-concat GC pass {gc_pass + 1}: collected {collected} objects")
+                
+                # Check memory after concatenation
+                try:
+                    memory_after_concat_mb = process.memory_info().rss / (1024 * 1024)
+                    memory_used_mb = memory_after_concat_mb - memory_before_concat_mb
+                    logger.info(f"[{job_id}] Memory after concatenation: {memory_after_concat_mb:.1f} MB (used {memory_used_mb:+.1f} MB)")
+                    
+                    # Memory pressure warning
+                    if memory_after_concat_mb > 10000:  # 10GB warning threshold
+                        logger.warning(f"[{job_id}] ⚠️  HIGH MEMORY USAGE: {memory_after_concat_mb:.1f} MB - Risk of OOM")
+                except Exception:
+                    pass
                 
                 logger.info(f"[{job_id}] 📊 Sorting combined dataset by time...")
                 combined_ds = combined_ds.sortby('time')
@@ -2674,18 +2797,60 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
                 logger.info(f"[{job_id}] 💾 Writing combined dataset to zarr store: {output_zarr_path.name}")
                 logger.info(f"[{job_id}] 📈 Dataset shape: {dict(combined_ds.sizes)} | Variables: {list(combined_ds.data_vars.keys())}")
                 
-                # Use compute=False to avoid loading everything into memory at once
-                combined_ds.to_zarr(
-                    output_zarr_path,
-                    encoding=encoding,
-                    consolidated=True,
-                    compute=True
-                )
+                # MEMORY-SAFE: Write to zarr in chunks using dask delayed operations
+                try:
+                    # Check memory before zarr write
+                    try:
+                        memory_before_write_mb = process.memory_info().rss / (1024 * 1024)
+                        logger.info(f"[{job_id}] Memory before zarr write: {memory_before_write_mb:.1f} MB")
+                    except Exception:
+                        pass
+                    
+                    # Configure chunking to minimize memory usage during write
+                    rechunked_ds = combined_ds.chunk({
+                        'time': 1,  # One time step at a time
+                        'lat': -1,  # Full latitude
+                        'lon': -1   # Full longitude  
+                    })
+                    
+                    # Use compute=True for immediate write (avoids keeping large dask graph in memory)
+                    rechunked_ds.to_zarr(
+                        output_zarr_path,
+                        encoding=encoding,
+                        consolidated=True,
+                        compute=True
+                    )
+                    
+                    # Check memory after zarr write
+                    try:
+                        memory_after_write_mb = process.memory_info().rss / (1024 * 1024)
+                        memory_used_write_mb = memory_after_write_mb - memory_before_write_mb
+                        logger.info(f"[{job_id}] Memory after zarr write: {memory_after_write_mb:.1f} MB (used {memory_used_write_mb:+.1f} MB)")
+                    except Exception:
+                        pass
+                    
+                except Exception as e_zarr_write:
+                    logger.error(f"[{job_id}] Failed to write zarr store: {e_zarr_write}", exc_info=True)
+                    raise
+                finally:
+                    # Aggressive cleanup of zarr write objects
+                    try:
+                        if 'rechunked_ds' in locals():
+                            rechunked_ds.close()
+                            del rechunked_ds
+                    except Exception:
+                        pass
                 
-                # Close and cleanup
+                # Close and cleanup main dataset
                 combined_ds.close()
                 del combined_ds
-                gc.collect()
+                
+                # Force memory cleanup after zarr write
+                for gc_pass in range(3):
+                    collected = gc.collect()
+                    if collected == 0:
+                        break
+                    logger.debug(f"[{job_id}] Post-zarr-write GC pass {gc_pass + 1}: collected {collected} objects")
                 
                 # Generate manifest and signature for the zarr store
                 verification_hash = None

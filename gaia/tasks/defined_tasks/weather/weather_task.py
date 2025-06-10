@@ -291,6 +291,8 @@ class WeatherTask(Task):
             else:
                 logger.info("Files will be served by proxying requests to R2 (no local storage)")
 
+
+
         self.inference_runner = None
         if self.node_type == "miner":
             try:
@@ -344,6 +346,8 @@ class WeatherTask(Task):
         # Add progress tracking
         self.progress_callbacks: List[callable] = []
         self.current_operations: Dict[str, WeatherProgressUpdate] = {}
+        
+
 
     _load_config = _load_config
 
@@ -2557,6 +2561,8 @@ class WeatherTask(Task):
             hours = seconds // 3600
             minutes = (seconds % 3600) // 60
             return f"{hours}h {minutes}m"
+
+
 
     async def get_progress_status(self, job_id: Optional[str] = None) -> Dict[str, Any]:
         """Get current progress status for all operations or a specific job"""
