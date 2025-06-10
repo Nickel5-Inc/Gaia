@@ -898,8 +898,38 @@ async def calculate_era5_miner_score(
                     all_metrics_for_db.append(error_metric_row)
     finally:
         if miner_forecast_ds:
-            try: miner_forecast_ds.close()
-            except Exception: pass
+            try: 
+                miner_forecast_ds.close()
+                logger.debug(f"[FinalScore] Closed miner forecast dataset for {miner_hotkey}")
+            except Exception: 
+                pass
+        
+        # CRITICAL: Enhanced cleanup per miner for ERA5 scoring
+        try:
+            # Clear any ERA5-specific intermediate objects created during this miner's evaluation
+            miner_specific_objects = [
+                'miner_forecast_ds', 'gfs_operational_fcst_ds', 'miner_forecast_lead_slice', 
+                'era5_truth_lead_slice', 'gfs_op_lead_slice'
+            ]
+            
+            for obj_name in miner_specific_objects:
+                if obj_name in locals():
+                    try:
+                        obj = locals()[obj_name]
+                        if hasattr(obj, 'close'):
+                            obj.close()
+                        del obj
+                    except Exception:
+                        pass
+            
+            # Force cleanup for this miner's processing
+            collected = gc.collect()
+            logger.debug(f"[FinalScore] Cleanup for {miner_hotkey}: collected {collected} objects")
+            
+        except Exception as cleanup_err:
+            logger.debug(f"[FinalScore] Cleanup error for {miner_hotkey}: {cleanup_err}")
+        
+        # Final garbage collection
         gc.collect()
     
     if not all_metrics_for_db:

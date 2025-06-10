@@ -139,9 +139,9 @@ def _synchronous_open_with_verifying_mapper(
             if pd.api.types.is_datetime64_ns_dtype(time_coord.dtype) and getattr(time_coord.dt, 'tz', None) is None:
                 logger.info(f"Job {verifying_mapper.job_id_for_logging}: Time coordinate is datetime64[ns] and timezone-naive. Localizing to UTC.")
                 try:
-                    # Use tz_localize directly on the DataArray
-                    time_localized = ds.time.dt.tz_localize('UTC')
-                    ds = ds.assign_coords(time=time_localized)
+                    # For xarray, we need to use assign_coords with pd.to_datetime
+                    time_values = pd.to_datetime(time_coord.values).tz_localize('UTC')
+                    ds = ds.assign_coords(time=time_values)
                     logger.info(f"Job {verifying_mapper.job_id_for_logging}: Successfully localized time coordinate to UTC. New dtype: {ds.time.dtype}")
                 except Exception as e_tz_localize:
                     logger.warning(f"Job {verifying_mapper.job_id_for_logging}: Failed to localize time coordinate to UTC: {e_tz_localize}. Proceeding with naive time.")
@@ -149,8 +149,9 @@ def _synchronous_open_with_verifying_mapper(
                 if str(getattr(time_coord.dt, 'tz')) != 'UTC':
                     logger.info(f"Job {verifying_mapper.job_id_for_logging}: Time coordinate is already timezone-aware ({time_coord.dtype}) but not UTC. Converting to UTC.")
                     try:
-                        time_converted = ds.time.dt.tz_convert('UTC')
-                        ds = ds.assign_coords(time=time_converted)
+                        # For xarray, we need to use assign_coords with pd.to_datetime
+                        time_values = pd.to_datetime(time_coord.values).tz_convert('UTC')
+                        ds = ds.assign_coords(time=time_values)
                         logger.info(f"Job {verifying_mapper.job_id_for_logging}: Successfully converted time coordinate to UTC. New dtype: {ds.time.dtype}")
                     except Exception as e_tz_convert:
                         logger.warning(f"Job {verifying_mapper.job_id_for_logging}: Failed to convert time coordinate to UTC: {e_tz_convert}. Proceeding with original timezone.")

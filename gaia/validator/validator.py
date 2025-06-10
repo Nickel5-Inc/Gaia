@@ -3545,6 +3545,7 @@ class GaiaValidator:
         """
         Comprehensive memory cleanup that goes beyond standard garbage collection.
         Targets C extension memory, file handles, module caches, and other persistent references.
+        Made more conservative to avoid interfering with running tasks.
         """
         
         # Skip cleanup during early startup to prevent initialization issues
@@ -3566,23 +3567,20 @@ class GaiaValidator:
             sys.last_type = None 
             sys.last_value = None
             
-            # 2. Clear module-level caches that accumulate over time
+            # 2. Clear module-level caches that accumulate over time (more conservative)
             try:
-                # Clear substrate/scalecodec module caches
+                # Only clear specific known-safe cache attributes
                 for module_name in list(sys.modules.keys()):
                     if any(pattern in module_name.lower() for pattern in 
                            ['substrate', 'scalecodec', 'scale_info', 'metadata']):
                         module = sys.modules.get(module_name)
                         if hasattr(module, '__dict__'):
-                            # Clear known cache attributes
+                            # Only clear known safe cache attributes, avoid _registry which might be critical
                             for attr_name in list(module.__dict__.keys()):
-                                if any(cache_pattern in attr_name.lower() for cache_pattern in 
-                                       ['cache', '_cache', 'cached', 'registry', '_registry']):
+                                if attr_name in ['_cache', '__pycache__', '_instance_cache']:
                                     try:
                                         cache_obj = getattr(module, attr_name)
-                                        if hasattr(cache_obj, 'clear'):
-                                            cache_obj.clear()
-                                        elif isinstance(cache_obj, dict):
+                                        if hasattr(cache_obj, 'clear') and isinstance(cache_obj, dict):
                                             cache_obj.clear()
                                     except Exception:
                                         pass
@@ -3642,23 +3640,8 @@ class GaiaValidator:
             except Exception as e:
                 logger.debug(f"Error clearing database caches: {e}")
             
-            # 6. Clear asyncio task references
-            try:
-                # Get current event loop and clear completed task references
-                loop = asyncio.get_event_loop()
-                if hasattr(loop, '_ready'):
-                    loop._ready.clear()
-                if hasattr(loop, '_scheduled'):
-                    # Don't clear scheduled tasks, but remove completed ones
-                    completed_tasks = [task for task in getattr(loop, '_scheduled', []) if task.cancelled()]
-                    for task in completed_tasks:
-                        if hasattr(loop, '_scheduled'):
-                            try:
-                                loop._scheduled.remove(task)
-                            except ValueError:
-                                pass
-            except Exception as e:
-                logger.debug(f"Error clearing asyncio references: {e}")
+            # 6. REMOVED: Asyncio task references cleanup - too dangerous while tasks are running
+            # This was likely causing the task cancellations
             
             # 7. Force multiple garbage collection passes with different strategies
             import gc
@@ -3677,37 +3660,8 @@ class GaiaValidator:
                 collected = gc.collect(generation)
                 collected_total += collected
             
-            # 8. Final aggressive cleanup for specific object types (skip during startup)
-            try:
-                # Only do expensive object iteration if we're not in early startup
-                if context != "emergency_startup" and hasattr(self, 'last_metagraph_sync'):
-                    # Force cleanup of specific problematic object types
-                    objects_cleaned = 0
-                    for obj in gc.get_objects():
-                        if objects_cleaned > 1000:  # Limit cleanup to prevent hanging
-                            break
-                        obj_type = type(obj).__name__
-                        # Target known problematic types
-                        if any(pattern in obj_type.lower() for pattern in 
-                               ['substrate', 'scale', 'metadata', 'dataset', 'dataarray']):
-                            if hasattr(obj, 'close'):
-                                try:
-                                    obj.close()
-                                    objects_cleaned += 1
-                                except:
-                                    pass
-                            elif hasattr(obj, 'clear'):
-                                try:
-                                    obj.clear()
-                                    objects_cleaned += 1
-                                except:
-                                    pass
-            except Exception as e:
-                logger.debug(f"Error in aggressive object cleanup: {e}")
-            
-            # 9. Final garbage collection
-            final_collected = gc.collect()
-            collected_total += final_collected
+            # 8. REMOVED: Aggressive object cleanup - too dangerous while tasks are running
+            # The gc.get_objects() iteration could close objects still in use by active tasks
             
             try:
                 final_memory = self._get_memory_usage()

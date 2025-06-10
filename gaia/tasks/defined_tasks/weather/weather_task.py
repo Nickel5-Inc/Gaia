@@ -854,8 +854,8 @@ class WeatherTask(Task):
                 await validator.update_task_status('weather', 'processing', 'initializing_run')
 
                 if self.test_mode:
-                    logger.info(f"Test mode enabled. Adjusting GFS init time by -1 day from {now_utc.strftime('%Y-%m-%d %H:%M')} UTC.")
-                    now_utc -= timedelta(days=1)
+                    logger.info(f"Test mode enabled. Adjusting GFS init time by -8 days from {now_utc.strftime('%Y-%m-%d %H:%M')} UTC.")
+                    now_utc -= timedelta(days=8)
                     logger.info(f"Adjusted GFS init time for test mode: {now_utc.strftime('%Y-%m-%d %H:%M')} UTC.")
                     
                 gfs_t0_run_time = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)

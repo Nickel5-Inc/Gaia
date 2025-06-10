@@ -39,15 +39,24 @@ class AutoSyncManager:
         self.health_check_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
         
-        # Backup scheduling configuration
-        self.backup_schedule = {
-            'full_backup_time': '02:00',  # Daily at 2 AM
-            'diff_backup_interval': 4,    # Every 4 hours
-            'check_interval': 60,         # Every hour
-            'health_check_interval': 300  # Every 5 minutes
-        }
+        # Backup scheduling configuration (adjusted for test mode)
+        if self.test_mode:
+            self.backup_schedule = {
+                'full_backup_time': None,     # No scheduled time in test mode
+                'diff_backup_interval': 0.25, # Every 15 minutes for testing
+                'check_interval': 5,          # Every 5 minutes
+                'health_check_interval': 60   # Every minute
+            }
+        else:
+            self.backup_schedule = {
+                'full_backup_time': '02:00',  # Daily at 2 AM
+                'diff_backup_interval': 4,    # Every 4 hours
+                'check_interval': 60,         # Every hour
+                'health_check_interval': 300  # Every 5 minutes
+            }
         
         logger.info(f"AutoSyncManager initialized - Mode: {'Primary' if self.is_primary else 'Replica'}, Test: {test_mode}")
+        logger.info(f"Backup schedule: {self.backup_schedule}")
 
     def _load_config(self) -> Dict:
         """Load and validate configuration from environment."""
@@ -508,7 +517,13 @@ pg1-user={self.config['pguser']}
         """Start application-controlled backup scheduling."""
         if self.is_primary:
             logger.info("Starting backup scheduling...")
+            if self.test_mode:
+                logger.info("TEST MODE: Differential backups every 15 minutes, health checks every 5 minutes")
+            else:
+                logger.info("PRODUCTION MODE: Full backups daily at 2:00 AM, differential backups every 4 hours")
             self.backup_task = asyncio.create_task(self._backup_scheduler())
+        else:
+            logger.info("Replica mode: No backup scheduling, only health monitoring")
         
         logger.info("Starting health monitoring...")
         self.health_check_task = asyncio.create_task(self._health_monitor())
@@ -519,35 +534,50 @@ pg1-user={self.config['pguser']}
         last_diff_backup = datetime.now()
         last_check = datetime.now()
         
+        logger.info(f"Backup scheduler started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
         while not self._shutdown_event.is_set():
             try:
                 now = datetime.now()
                 
-                # Full backup daily at specified time
-                if (now.strftime('%H:%M') == self.backup_schedule['full_backup_time'] and 
+                # Full backup daily at specified time (skip in test mode)
+                if (self.backup_schedule['full_backup_time'] and 
+                    now.strftime('%H:%M') == self.backup_schedule['full_backup_time'] and 
                     now.date() > last_full_backup):
-                    logger.info("Triggering scheduled full backup...")
+                    logger.info("⏰ Scheduled full backup time reached - triggering backup...")
                     if await self._trigger_backup('full'):
                         last_full_backup = now.date()
+                        logger.info(f"✅ Full backup completed, next full backup: tomorrow at {self.backup_schedule['full_backup_time']}")
                 
                 # Differential backup every N hours
                 hours_since_diff = (now - last_diff_backup).total_seconds() / 3600
                 if hours_since_diff >= self.backup_schedule['diff_backup_interval']:
-                    logger.info("Triggering scheduled differential backup...")
+                    logger.info(f"⏰ {hours_since_diff:.1f} hours since last diff backup (threshold: {self.backup_schedule['diff_backup_interval']}) - triggering backup...")
                     if await self._trigger_backup('diff'):
                         last_diff_backup = now
+                        next_diff_time = now + timedelta(hours=self.backup_schedule['diff_backup_interval'])
+                        logger.info(f"✅ Differential backup completed, next diff backup: {next_diff_time.strftime('%H:%M:%S')}")
+                else:
+                    if self.test_mode and (int(now.minute) % 5 == 0 and now.second < 10):  # Log every 5 minutes in test mode
+                        time_until_next = self.backup_schedule['diff_backup_interval'] - hours_since_diff
+                        logger.info(f"📊 Next diff backup in {time_until_next:.1f} hours (last: {last_diff_backup.strftime('%H:%M:%S')})")
                 
                 # Health check every hour
                 minutes_since_check = (now - last_check).total_seconds() / 60
                 if minutes_since_check >= self.backup_schedule['check_interval']:
-                    logger.info("Running scheduled health check...")
-                    await self._trigger_check()
+                    logger.info(f"🔍 {minutes_since_check:.1f} minutes since last check (threshold: {self.backup_schedule['check_interval']}) - running health check...")
+                    check_success = await self._trigger_check()
                     last_check = now
+                    if check_success:
+                        logger.info("✅ Health check passed")
+                    else:
+                        logger.warning("❌ Health check failed")
                 
                 # Sleep for 1 minute before next check
                 await asyncio.sleep(60)
                 
             except asyncio.CancelledError:
+                logger.info("Backup scheduler cancelled")
                 break
             except Exception as e:
                 logger.error(f"Error in backup scheduler: {e}")
@@ -555,31 +585,44 @@ pg1-user={self.config['pguser']}
 
     async def _health_monitor(self):
         """Monitor backup system health."""
+        logger.info(f"Health monitor started - checking every {self.backup_schedule['health_check_interval']} seconds")
+        
         while not self._shutdown_event.is_set():
             try:
                 # Check pgBackRest status
+                logger.debug("🔍 Running health monitor check...")
                 status = await self.get_backup_status()
                 
                 if not status['healthy']:
-                    logger.warning("Backup system health check failed, attempting recovery...")
+                    logger.warning(f"❌ Backup system health check failed: {status.get('error', 'Unknown error')}")
+                    logger.warning("🔧 Attempting recovery...")
                     await self._attempt_recovery()
+                else:
+                    logger.debug("✅ Health monitor check passed")
                 
                 await asyncio.sleep(self.backup_schedule['health_check_interval'])
                 
             except asyncio.CancelledError:
+                logger.info("Health monitor cancelled")
                 break
             except Exception as e:
                 logger.error(f"Error in health monitor: {e}")
                 await asyncio.sleep(300)
 
     async def _trigger_backup(self, backup_type: str) -> bool:
-        """Trigger a backup of specified type."""
+        """Trigger a backup of specified type with progress tracking."""
         try:
+            logger.info(f"🚀 Starting {backup_type.upper()} backup...")
+            start_time = datetime.now()
+            
             cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
                   f'--stanza={self.config["stanza_name"]}', 'backup', f'--type={backup_type}']
             
             if self.test_mode:
                 cmd.extend(['--archive-timeout=30s', '--compress-level=0'])
+                logger.info("📦 Test mode: Using fast compression and short timeouts")
+            
+            logger.info(f"🔄 Running command: {' '.join(cmd)}")
             
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -588,11 +631,18 @@ pg1-user={self.config['pguser']}
             )
             stdout, stderr = await process.communicate()
             
+            duration = datetime.now() - start_time
+            
             if process.returncode == 0:
-                logger.info(f"✅ {backup_type.upper()} backup completed successfully")
+                logger.info(f"✅ {backup_type.upper()} backup completed successfully in {duration.total_seconds():.1f} seconds")
+                if stdout:
+                    logger.debug(f"Backup output: {stdout.decode()}")
                 return True
             else:
-                logger.error(f"❌ {backup_type.upper()} backup failed: {stderr.decode()}")
+                logger.error(f"❌ {backup_type.upper()} backup failed after {duration.total_seconds():.1f} seconds")
+                logger.error(f"Error output: {stderr.decode()}")
+                if stdout:
+                    logger.debug(f"Backup stdout: {stdout.decode()}")
                 return False
                 
         except Exception as e:
@@ -600,8 +650,9 @@ pg1-user={self.config['pguser']}
             return False
 
     async def _trigger_check(self) -> bool:
-        """Run pgBackRest check."""
+        """Run pgBackRest check with detailed logging."""
         try:
+            logger.debug("🔍 Running pgBackRest check...")
             cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
                   f'--stanza={self.config["stanza_name"]}', 'check']
             
@@ -612,7 +663,18 @@ pg1-user={self.config['pguser']}
             )
             stdout, stderr = await process.communicate()
             
-            return process.returncode == 0
+            if process.returncode == 0:
+                logger.debug("✅ pgBackRest check completed successfully")
+                if stdout:
+                    logger.debug(f"Check output: {stdout.decode()}")
+                return True
+            else:
+                logger.warning(f"❌ pgBackRest check failed with return code {process.returncode}")
+                if stderr:
+                    logger.warning(f"Check error: {stderr.decode()}")
+                if stdout:
+                    logger.debug(f"Check stdout: {stdout.decode()}")
+                return False
             
         except Exception as e:
             logger.error(f"Error running check: {e}")

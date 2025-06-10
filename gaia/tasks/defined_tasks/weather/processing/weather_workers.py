@@ -20,6 +20,7 @@ import httpx
 import gzip
 import httpx
 import gzip
+import psutil
 
 from fiber.logging_utils import get_logger
 from aurora import Batch
@@ -874,6 +875,124 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: Created {len(scoring_tasks)} scoring tasks.")
                 evaluation_results = await asyncio.gather(*scoring_tasks, return_exceptions=True)
                 
+                # CRITICAL: Comprehensive cleanup after all miners processed
+                logger.info(f"[Day1ScoringWorker] Run {run_id}: Starting comprehensive cleanup after scoring all miners...")
+                
+                # Check memory before cleanup
+                try:
+                    process = psutil.Process()
+                    memory_before_mb = process.memory_info().rss / (1024 * 1024)
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Memory before cleanup: {memory_before_mb:.1f} MB")
+                except Exception:
+                    memory_before_mb = None
+                
+                # AGGRESSIVE MEMORY CLEANUP inspired by substrate manager approach
+                try:
+                    import sys
+                    
+                    # 1. Clear xarray/dask/numpy module-level caches
+                    for module_name in list(sys.modules.keys()):
+                        if any(pattern in module_name.lower() for pattern in 
+                               ['xarray', 'dask', 'numpy', 'pandas', 'fsspec', 'zarr', 'netcdf4', 'h5py', 'scipy']):
+                            module = sys.modules.get(module_name)
+                            if hasattr(module, '__dict__'):
+                                for attr_name in list(module.__dict__.keys()):
+                                    if any(cache_pattern in attr_name.lower() for cache_pattern in 
+                                           ['cache', 'registry', '_cached', '__pycache__', '_instance_cache']):
+                                        try:
+                                            cache_obj = getattr(module, attr_name)
+                                            if hasattr(cache_obj, 'clear'):
+                                                cache_obj.clear()
+                                                logger.debug(f"[Day1ScoringWorker] Run {run_id}: Cleared {module_name}.{attr_name}")
+                                            elif isinstance(cache_obj, dict):
+                                                cache_obj.clear()
+                                                logger.debug(f"[Day1ScoringWorker] Run {run_id}: Cleared dict {module_name}.{attr_name}")
+                                        except Exception:
+                                            pass
+                    
+                    # 2. Force multiple garbage collection passes (like substrate manager)
+                    collected_total = 0
+                    for gc_pass in range(5):  # Multiple passes to catch circular references
+                        collected = gc.collect()
+                        collected_total += collected
+                        if collected == 0:
+                            break  # No more objects to collect
+                        logger.debug(f"[Day1ScoringWorker] Run {run_id}: GC pass {gc_pass + 1} collected {collected} objects")
+                    
+                    # 3. Clear Python's internal caches
+                    try:
+                        import sys
+                        if hasattr(sys, '_clear_type_cache'):
+                            sys._clear_type_cache()
+                            logger.debug(f"[Day1ScoringWorker] Run {run_id}: Cleared Python type cache")
+                    except Exception:
+                        pass
+                    
+                    # 4. Try to force memory defragmentation
+                    try:
+                        # Force malloc trim on Linux (returns memory to OS)
+                        import ctypes
+                        try:
+                            libc = ctypes.CDLL("libc.so.6")
+                            libc.malloc_trim(0)
+                            logger.debug(f"[Day1ScoringWorker] Run {run_id}: Performed malloc_trim")
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    
+                    # 5. Clear netCDF4/HDF5 caches if possible
+                    try:
+                        import netCDF4
+                        if hasattr(netCDF4, '_default_fillvals'):
+                            netCDF4._default_fillvals.clear()
+                    except Exception:
+                        pass
+                    
+                    # 6. Clear numpy internal caches
+                    try:
+                        import numpy as np
+                        if hasattr(np, '_NoValue'):
+                            # Clear numpy's internal caches
+                            for attr in ['_TypeCodes', '_names', '_typestr', '_ctypes']:
+                                if hasattr(np, attr):
+                                    obj = getattr(np, attr)
+                                    if hasattr(obj, 'clear'):
+                                        obj.clear()
+                    except Exception:
+                        pass
+                    
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Aggressive cleanup collected {collected_total} objects")
+                    
+                except Exception as cleanup_err:
+                    logger.debug(f"[Day1ScoringWorker] Run {run_id}: Error in aggressive cleanup: {cleanup_err}")
+                
+                # Final garbage collection
+                gc.collect()
+                
+                # Check memory after cleanup and report effectiveness
+                try:
+                    if memory_before_mb is not None:
+                        process = psutil.Process()
+                        memory_after_mb = process.memory_info().rss / (1024 * 1024)
+                        memory_freed_mb = memory_before_mb - memory_after_mb
+                        logger.info(f"[Day1ScoringWorker] Run {run_id}: Memory after cleanup: {memory_after_mb:.1f} MB")
+                        if memory_freed_mb > 0:
+                            logger.info(f"[Day1ScoringWorker] Run {run_id}: ✅ Memory freed: {memory_freed_mb:.1f} MB ({memory_freed_mb/memory_before_mb*100:.1f}%)")
+                        else:
+                            logger.warning(f"[Day1ScoringWorker] Run {run_id}: ❌ Memory not freed - increased by {abs(memory_freed_mb):.1f} MB")
+                            
+                        # Check for memory-mapped files that might be holding memory
+                        try:
+                            open_files = process.open_files()
+                            zarr_files = [f for f in open_files if '.zarr' in f.path or 'cache' in f.path]
+                            if zarr_files:
+                                logger.warning(f"[Day1ScoringWorker] Run {run_id}: Found {len(zarr_files)} open cache/zarr files: {[f.path for f in zarr_files[:3]]}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: evaluation_results count: {len(evaluation_results)}")
                 successful_scores = 0
                 db_update_tasks = []
@@ -953,8 +1072,50 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                     logger.info(f"[Day1ScoringWorker] TEST MODE: Signaling scoring completion for run {run_id}.")
                     task_instance.test_mode_run_scored_event.set()
                 
-                gc.collect()
+                # CRITICAL: Cleanup after successful run completion (moved from finally block)
+                logger.info(f"[Day1ScoringWorker] Run {run_id}: Starting comprehensive cleanup after successful run completion...")
                 
+                # Close shared datasets immediately after each run
+                if gfs_analysis_ds_for_run and hasattr(gfs_analysis_ds_for_run, 'close'):
+                    try: 
+                        gfs_analysis_ds_for_run.close()
+                        logger.debug(f"[Day1ScoringWorker] Run {run_id}: Closed GFS analysis dataset")
+                    except Exception: 
+                        pass
+                if gfs_reference_ds_for_run and hasattr(gfs_reference_ds_for_run, 'close'):
+                    try: 
+                        gfs_reference_ds_for_run.close()
+                        logger.debug(f"[Day1ScoringWorker] Run {run_id}: Closed GFS reference dataset")
+                    except Exception: 
+                        pass
+                
+                # Clear large objects from this run
+                try:
+                    large_objects = [
+                        'gfs_analysis_ds_for_run', 'gfs_reference_ds_for_run', 'evaluation_results',
+                        'scoring_tasks', 'responses', 'db_update_tasks'
+                    ]
+                    
+                    for obj_name in large_objects:
+                        if obj_name in locals():
+                            try:
+                                obj = locals()[obj_name]
+                                if hasattr(obj, 'close') and obj_name != 'era5_climatology_ds':
+                                    obj.close()
+                                del obj
+                                logger.debug(f"[Day1ScoringWorker] Run {run_id}: Cleared {obj_name}")
+                            except Exception:
+                                pass
+                    
+                    # Force garbage collection after each run 
+                    final_collected = gc.collect()
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: End-of-run cleanup collected {final_collected} objects")
+                    
+                except Exception as cleanup_err:
+                    logger.debug(f"[Day1ScoringWorker] Run {run_id}: Error in end-of-run cleanup: {cleanup_err}")
+                
+                gc.collect()
+
             except Exception as e:
                 logger.error(f"[Day1ScoringWorker] Unexpected error processing run {run_id}: {e}", exc_info=True)
                 if run_id:
@@ -965,13 +1126,20 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 if task_instance.initial_scoring_queue._unfinished_tasks > 0:
                     task_instance.initial_scoring_queue.task_done()
             finally:
+                # Simplified cleanup for exception cases only (main cleanup happens after successful completion)
+                logger.debug(f"[Day1ScoringWorker] Run {run_id}: Emergency cleanup in finally block...")
+                
                 if gfs_analysis_ds_for_run and hasattr(gfs_analysis_ds_for_run, 'close'):
-                    try: gfs_analysis_ds_for_run.close()
-                    except Exception: pass
+                    try: 
+                        gfs_analysis_ds_for_run.close()
+                    except Exception: 
+                        pass
                 if gfs_reference_ds_for_run and hasattr(gfs_reference_ds_for_run, 'close'):
-                    try: gfs_reference_ds_for_run.close()
-                    except Exception: pass
-                    
+                    try: 
+                        gfs_reference_ds_for_run.close()
+                    except Exception: 
+                        pass
+
     except asyncio.CancelledError:
         logger.info("[InitialScoringWorker] Worker cancelled, shutting down gracefully")
         task_instance.initial_scoring_worker_running = False
@@ -1110,6 +1278,110 @@ async def finalize_scores_worker(self):
 
                     miner_scoring_results = await asyncio.gather(*scoring_execution_tasks)
                     successful_final_scores_count = 0
+                    
+                    # CRITICAL: Memory cleanup after ERA5 scoring - similar to initial scoring
+                    logger.info(f"[FinalizeWorker] Run {run_id}: Starting comprehensive memory cleanup after ERA5 scoring...")
+                    
+                    # Check memory before cleanup
+                    try:
+                        process = psutil.Process()
+                        memory_before_mb = process.memory_info().rss / (1024 * 1024)
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Memory before ERA5 cleanup: {memory_before_mb:.1f} MB")
+                    except Exception:
+                        memory_before_mb = None
+                    
+                    # AGGRESSIVE MEMORY CLEANUP for ERA5 data
+                    try:
+                        import sys
+                        
+                        # 1. Clear ERA5/xarray/dask/numpy module-level caches
+                        for module_name in list(sys.modules.keys()):
+                            if any(pattern in module_name.lower() for pattern in 
+                                   ['xarray', 'dask', 'numpy', 'pandas', 'fsspec', 'zarr', 'netcdf4', 'h5py', 'scipy', 'era5']):
+                                module = sys.modules.get(module_name)
+                                if hasattr(module, '__dict__'):
+                                    for attr_name in list(module.__dict__.keys()):
+                                        if any(cache_pattern in attr_name.lower() for cache_pattern in 
+                                               ['cache', 'registry', '_cached', '__pycache__', '_instance_cache']):
+                                            try:
+                                                cache_obj = getattr(module, attr_name)
+                                                if hasattr(cache_obj, 'clear'):
+                                                    cache_obj.clear()
+                                                    logger.debug(f"[FinalizeWorker] Run {run_id}: Cleared {module_name}.{attr_name}")
+                                                elif isinstance(cache_obj, dict):
+                                                    cache_obj.clear()
+                                                    logger.debug(f"[FinalizeWorker] Run {run_id}: Cleared dict {module_name}.{attr_name}")
+                                            except Exception:
+                                                pass
+                        
+                        # 2. Force multiple garbage collection passes
+                        collected_total = 0
+                        for gc_pass in range(5):  # Multiple passes for circular references
+                            collected = gc.collect()
+                            collected_total += collected
+                            if collected == 0:
+                                break
+                            logger.debug(f"[FinalizeWorker] Run {run_id}: GC pass {gc_pass + 1} collected {collected} objects")
+                        
+                        # 3. Clear Python's internal caches
+                        try:
+                            import sys
+                            if hasattr(sys, '_clear_type_cache'):
+                                sys._clear_type_cache()
+                                logger.debug(f"[FinalizeWorker] Run {run_id}: Cleared Python type cache")
+                        except Exception:
+                            pass
+                        
+                        # 4. Force memory defragmentation for large ERA5 datasets
+                        try:
+                            import ctypes
+                            try:
+                                libc = ctypes.CDLL("libc.so.6")
+                                libc.malloc_trim(0)
+                                logger.debug(f"[FinalizeWorker] Run {run_id}: Performed malloc_trim")
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                        
+                        # 5. Clear netCDF4/HDF5 caches (important for ERA5 data)
+                        try:
+                            import netCDF4
+                            if hasattr(netCDF4, '_default_fillvals'):
+                                netCDF4._default_fillvals.clear()
+                        except Exception:
+                            pass
+                        
+                        logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 aggressive cleanup collected {collected_total} objects")
+                        
+                    except Exception as cleanup_err:
+                        logger.debug(f"[FinalizeWorker] Run {run_id}: Error in ERA5 aggressive cleanup: {cleanup_err}")
+                    
+                    # Final garbage collection
+                    gc.collect()
+                    
+                    # Check memory after cleanup and report effectiveness
+                    try:
+                        if memory_before_mb is not None:
+                            process = psutil.Process()
+                            memory_after_mb = process.memory_info().rss / (1024 * 1024)
+                            memory_freed_mb = memory_before_mb - memory_after_mb
+                            logger.info(f"[FinalizeWorker] Run {run_id}: Memory after ERA5 cleanup: {memory_after_mb:.1f} MB")
+                            if memory_freed_mb > 0:
+                                logger.info(f"[FinalizeWorker] Run {run_id}: ✅ ERA5 memory freed: {memory_freed_mb:.1f} MB ({memory_freed_mb/memory_before_mb*100:.1f}%)")
+                            else:
+                                logger.warning(f"[FinalizeWorker] Run {run_id}: ❌ ERA5 memory not freed - increased by {abs(memory_freed_mb):.1f} MB")
+                                
+                            # Check for lingering ERA5/zarr files
+                            try:
+                                open_files = process.open_files()
+                                era5_files = [f for f in open_files if any(pattern in f.path.lower() for pattern in ['.zarr', 'era5', 'cache', '.nc'])]
+                                if era5_files:
+                                    logger.warning(f"[FinalizeWorker] Run {run_id}: Found {len(era5_files)} open ERA5/cache files: {[f.path for f in era5_files[:3]]}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
 
                     for i_resp, miner_score_task_succeeded in enumerate(miner_scoring_results): # Process results
                         resp_rec_inner = verified_responses_for_run[i_resp]
