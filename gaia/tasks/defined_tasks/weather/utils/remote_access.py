@@ -13,13 +13,15 @@ from fiber.logging_utils import get_logger
 try:
     import blosc
     import numcodecs
-    # Force registration of blosc codec
-    numcodecs.blosc.register_codec()
-    print(f"Blosc codec successfully imported and registered. Version: {blosc.__version__}")
+    # Force registration of blosc codec - correct way is to just import it
+    import numcodecs.blosc
+    # Verify the codec is available
+    codec = numcodecs.registry.get_codec({'id': 'blosc'})
+    print(f"Blosc codec successfully imported and available. Version: {blosc.__version__}")
 except ImportError as e:
     print(f"Failed to import blosc codec: {e}. Zarr datasets using blosc compression may fail to open.")
 except Exception as e:
-    print(f"Failed to register blosc codec: {e}. Zarr datasets using blosc compression may fail to open.")
+    print(f"Failed to verify blosc codec availability: {e}. Zarr datasets using blosc compression may fail to open.")
 
 try:
     from .hashing import get_trusted_manifest, VerifyingChunkMapper
