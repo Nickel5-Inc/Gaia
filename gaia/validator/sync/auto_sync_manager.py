@@ -58,16 +58,54 @@ class AutoSyncManager:
         logger.info(f"AutoSyncManager initialized - Mode: {'Primary' if self.is_primary else 'Replica'}, Test: {test_mode}")
         logger.info(f"Backup schedule: {self.backup_schedule}")
 
+    def _find_pgdata_path(self) -> str:
+        """Find the data directory of the active PostgreSQL instance."""
+        try:
+            result = subprocess.run(
+                ['sudo', '-u', 'postgres', 'psql', '-t', '-c', 'SHOW data_directory;'],
+                capture_output=True, text=True, check=True
+            )
+            pgdata_path = result.stdout.strip()
+            if pgdata_path and os.path.exists(pgdata_path):
+                logger.info(f"Discovered active PostgreSQL data directory at: {pgdata_path}")
+                return pgdata_path
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.warning(f"Could not get data_directory from running PostgreSQL. Reason: {e}")
+
+        logger.info("Falling back to checking common PostgreSQL installation paths for pg_control.")
+        common_paths = [
+            '/var/lib/postgresql/14/main',
+            '/var/lib/postgresql/data',
+            '/var/lib/pgsql/data',
+        ]
+        for path in common_paths:
+            if os.path.exists(os.path.join(path, 'pg_control')):
+                logger.info(f"Found pg_control in data directory: {path}")
+                return path
+        
+        pgdata_env = os.getenv('PGBACKREST_PGDATA')
+        if pgdata_env:
+            logger.warning(f"Could not find a valid pgdata path. Using PGBACKREST_PGDATA from environment: {pgdata_env}")
+            return pgdata_env
+            
+        raise FileNotFoundError("Could not determine PostgreSQL data directory. Please ensure PostgreSQL is running or set PGBACKREST_PGDATA.")
+
     def _load_config(self) -> Dict:
         """Load and validate configuration from environment."""
+        
+        pgdata_path = self._find_pgdata_path()
+
+        r2_region_raw = os.getenv('PGBACKREST_R2_REGION', 'auto')
+        r2_region = r2_region_raw.split('#')[0].strip()
+
         config = {
             'stanza_name': os.getenv('PGBACKREST_STANZA_NAME', 'gaia'),
             'r2_bucket': os.getenv('PGBACKREST_R2_BUCKET'),
             'r2_endpoint': os.getenv('PGBACKREST_R2_ENDPOINT'),
             'r2_access_key': os.getenv('PGBACKREST_R2_ACCESS_KEY_ID'),
             'r2_secret_key': os.getenv('PGBACKREST_R2_SECRET_ACCESS_KEY'),
-            'r2_region': os.getenv('PGBACKREST_R2_REGION', 'auto'),
-            'pgdata': os.getenv('PGBACKREST_PGDATA', '/var/lib/postgresql/data'),
+            'r2_region': r2_region,
+            'pgdata': pgdata_path,
             'pgport': int(os.getenv('PGBACKREST_PGPORT', '5432')),
             'pguser': os.getenv('PGBACKREST_PGUSER', 'postgres'),
             'pgpassword': os.getenv('PGBACKREST_PGPASSWORD'),  # Optional password
@@ -109,9 +147,10 @@ class AutoSyncManager:
             if not await self._configure_pgbackrest():
                 return False
             
-            # 5. Test and fix WAL archiving
-            if not await self._setup_wal_archiving():
-                return False
+            # 5. Test and fix WAL archiving (Primary only)
+            if self.is_primary:
+                if not await self._setup_wal_archiving():
+                    return False
             
             # 6. Initialize pgBackRest (primary only)
             if self.is_primary:
