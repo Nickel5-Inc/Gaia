@@ -120,9 +120,9 @@ def _load_config(self):
 
     # --- R2 Cleanup Config (Credentials are handled by the Miner, not here) ---
     config['r2_cleanup_enabled'] = os.getenv('WEATHER_R2_CLEANUP_ENABLED', 'true').lower() in ['true', '1', 'yes']
-    config['r2_cleanup_interval_seconds'] = int(os.getenv('WEATHER_R2_CLEANUP_INTERVAL_S', '3600')) # 1 hour
-    config['r2_max_inputs_to_keep'] = int(os.getenv('WEATHER_R2_MAX_INPUTS_TO_KEEP', '5'))
-    config['r2_max_forecasts_to_keep'] = int(os.getenv('WEATHER_R2_MAX_FORECASTS_TO_KEEP', '5'))
+    config['r2_cleanup_interval_seconds'] = int(os.getenv('WEATHER_R2_CLEANUP_INTERVAL_S', '1800')) # 30 minutes - more frequent cleanup
+    config['r2_max_inputs_to_keep'] = int(os.getenv('WEATHER_R2_MAX_INPUTS_TO_KEEP', '0'))  # Keep NO inputs (delete immediately)
+    config['r2_max_forecasts_to_keep'] = int(os.getenv('WEATHER_R2_MAX_FORECASTS_TO_KEEP', '1'))  # Keep only 1 forecast per timestep
 
 
     config['miner_jwt_secret_key'] = os.getenv("MINER_JWT_SECRET_KEY", "insecure_default_key_for_development_only")
@@ -1910,24 +1910,39 @@ class WeatherTask(Task):
             
             # Check for any other jobs with the same GFS timestep that are already running or completed
             if gfs_init_time:
+                # Enhanced duplicate check - look for jobs in more statuses and within a reasonable time window
                 duplicate_check_query = """
-                    SELECT id, status FROM weather_miner_jobs 
+                    SELECT id, status, validator_request_time, processing_start_time FROM weather_miner_jobs 
                     WHERE gfs_init_time_utc = :gfs_time 
                     AND id != :current_job_id 
-                    AND status IN ('in_progress', 'completed')
-                    ORDER BY id DESC LIMIT 1
+                    AND status IN ('in_progress', 'completed', 'processing', 'running_inference', 'processing_input', 'processing_output')
+                    AND validator_request_time >= NOW() - INTERVAL '6 hours'  -- Only check recent jobs
+                    ORDER BY validator_request_time DESC LIMIT 5
                 """
-                duplicate_job = await self.db_manager.fetch_one(duplicate_check_query, {
+                duplicate_jobs = await self.db_manager.fetch_all(duplicate_check_query, {
                     "gfs_time": gfs_init_time,
                     "current_job_id": job_id
                 })
                 
-                if duplicate_job:
-                    logger.warning(f"[{job_id}] Found existing job {duplicate_job['id']} for same timestep {gfs_init_time} with status '{duplicate_job['status']}'. Not starting duplicate inference.")
-                    return self._validate_and_format_response({
-                        "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
-                        "message": f"Inference for timestep {gfs_init_time} already handled by job {duplicate_job['id']} (status: {duplicate_job['status']})."
-                    }, ["status", "message"])
+                if duplicate_jobs:
+                    logger.warning(f"[{job_id}] Found {len(duplicate_jobs)} recent job(s) for same timestep {gfs_init_time}:")
+                    for dup_job in duplicate_jobs:
+                        hours_ago = (datetime.now(timezone.utc) - dup_job['validator_request_time']).total_seconds() / 3600
+                        logger.warning(f"[{job_id}]   - Job {dup_job['id']}: status='{dup_job['status']}', requested {hours_ago:.1f}h ago")
+                    
+                    # Only block if there's a recent active job (not failed/error)
+                    active_duplicates = [j for j in duplicate_jobs if j['status'] in ('in_progress', 'completed', 'processing', 'running_inference', 'processing_input', 'processing_output')]
+                    if active_duplicates:
+                        recent_job = active_duplicates[0]
+                        logger.warning(f"[{job_id}] Blocking duplicate inference - active job {recent_job['id']} with status '{recent_job['status']}' for same timestep.")
+                        return self._validate_and_format_response({
+                            "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
+                            "message": f"Inference for timestep {gfs_init_time} already handled by job {recent_job['id']} (status: {recent_job['status']})."
+                        }, ["status", "message"])
+                    else:
+                        logger.info(f"[{job_id}] Found duplicate jobs for timestep but all are failed/error - allowing new inference to proceed.")
+                else:
+                    logger.info(f"[{job_id}] No recent duplicate jobs found for timestep {gfs_init_time} - proceeding with inference.")
 
             # Check RunPod-specific duplicate prevention
             if job_details['runpod_job_id'] and current_status == 'in_progress':

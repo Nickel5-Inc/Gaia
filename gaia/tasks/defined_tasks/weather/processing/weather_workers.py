@@ -400,6 +400,11 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
             if not output_steps_datasets: # Empty list
                 logger.info(f"[InferenceTask Job {job_id}] Inference resulted in an empty list of predictions (0 steps). This may be an expected outcome.")
                 await update_job_status(task_instance, job_id, "completed_no_data", "Inference produced no forecast steps.")
+                
+                # Immediately cleanup R2 inputs for completed job
+                if task_instance.config.get('weather_inference_type') == 'http_service':
+                    asyncio.create_task(_immediate_r2_input_cleanup(task_instance, job_id))
+                
                 # GFS data cleanup happens in finally block
                 return
 
@@ -534,6 +539,17 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                     'compressor': numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
                 }
                 
+                # Add explicit time encoding to ensure consistency between local and HTTP service paths
+                for coord_name in combined_forecast_ds.coords:
+                    if coord_name.lower() == 'time' and pd.api.types.is_datetime64_any_dtype(combined_forecast_ds.coords[coord_name].dtype):
+                        encoding['time'] = {
+                            'units': f'hours since {base_time.strftime("%Y-%m-%d %H:%M:%S")}',
+                            'calendar': 'standard',
+                            'dtype': 'float64'
+                        }
+                        logger.info(f"[InferenceTask Job {job_id}] Added explicit time encoding for consistency: {encoding['time']}")
+                        break
+                
                 logger.info(f"[InferenceTask Job {job_id}] Saving forecast to Zarr store with chunking. Example encoding for {list(encoding.keys())[0] if encoding else 'N/A'}: {list(encoding.values())[0] if encoding else 'N/A'}")
                 
                 if os.path.exists(output_zarr_path):
@@ -626,12 +642,21 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                 verification_hash=v_hash
             )
             await update_job_status(task_instance, job_id, "completed")
+            
+            # Immediately cleanup R2 inputs for completed job
+            if task_instance.config.get('weather_inference_type') == 'http_service':
+                asyncio.create_task(_immediate_r2_input_cleanup(task_instance, job_id))
+            
             logger.info(f"[InferenceTask Job {job_id}] Background inference task completed successfully.")
 
         except Exception as inference_err:
             # Catch any unhandled exceptions from the main inference logic (including ValueErrors from save/processing)
             logger.error(f"[InferenceTask Job {job_id}] Unhandled error during inference or processing: {inference_err}", exc_info=True)
             await update_job_status(task_instance, job_id, "error", error_message=f"Inference error: {inference_err}")
+            
+            # Cleanup R2 inputs for failed job
+            if task_instance.config.get('weather_inference_type') == 'http_service':
+                asyncio.create_task(_immediate_r2_input_cleanup(task_instance, job_id))
 
     except Exception as e:
         logger.error(f"[InferenceTask Job {job_id}] Background inference task failed unexpectedly: {e}", exc_info=True)
@@ -639,6 +664,10 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
              await update_job_status(task_instance, job_id, "error", error_message=f"Unexpected task error: {e}")
         except Exception as final_db_err:
              logger.error(f"[InferenceTask Job {job_id}] Failed to update job status to error after task failure: {final_db_err}")
+        
+        # Cleanup R2 inputs for failed job
+        if task_instance.config.get('weather_inference_type') == 'http_service':
+            asyncio.create_task(_immediate_r2_input_cleanup(task_instance, job_id))
     finally:
         # Comprehensive cleanup of large GFS datasets and other objects
         logger.debug(f"[InferenceTask Job {job_id}] Entering finally block for cleanup.")
@@ -1494,16 +1523,20 @@ async def fetch_and_hash_gfs_task(
 async def r2_cleanup_worker(task_instance: 'WeatherTask'):
     """
     Periodically cleans up old input and forecast objects from the R2 bucket.
+    Enhanced aggressive cleanup:
+    - Immediately deletes inputs after inference completion
+    - Groups outputs by GFS timestep and keeps only the latest one per timestep
+    - Cleans up old testing data and junk files
     """
-    logger.info("R2 cleanup worker started.")
+    logger.info("R2 cleanup worker started with enhanced aggressive cleanup.")
     
     while getattr(task_instance, 'r2_cleanup_worker_running', False):
         try:
-            cleanup_interval = task_instance.config.get('r2_cleanup_interval_seconds', 3600)
-            max_inputs = task_instance.config.get('r2_max_inputs_to_keep', 5)
-            max_forecasts = task_instance.config.get('r2_max_forecasts_to_keep', 5)
+            cleanup_interval = task_instance.config.get('r2_cleanup_interval_seconds', 1800)  # Reduced to 30 minutes for more frequent cleanup
+            max_inputs = 0  # Changed: Keep NO inputs (delete immediately after use)
+            max_outputs_per_timestep = 1  # Changed: Keep only 1 output per GFS timestep
             
-            logger.info(f"[R2Cleanup] Running cleanup. Keeping max {max_inputs} inputs and {max_forecasts} forecasts.")
+            logger.info(f"[R2Cleanup] Running ENHANCED cleanup. Keeping {max_inputs} inputs and {max_outputs_per_timestep} output per timestep.")
 
             s3_client = await task_instance._get_r2_s3_client()
             if not s3_client:
@@ -1511,24 +1544,35 @@ async def r2_cleanup_worker(task_instance: 'WeatherTask'):
                 await asyncio.sleep(cleanup_interval)
                 continue
             
-            bucket_name = os.getenv("R2_BUCKET_NAME")
+            bucket_name = task_instance.r2_config.get("r2_bucket_name") if task_instance.r2_config else None
             if not bucket_name:
-                logger.error("[R2Cleanup] R2_BUCKET_NAME not set. Skipping cleanup cycle.")
+                logger.error("[R2Cleanup] R2 bucket name not configured. Skipping cleanup cycle.")
                 await asyncio.sleep(cleanup_interval)
                 continue
 
-            # --- Cleanup Inputs ---
+            # --- AGGRESSIVE INPUT CLEANUP: Delete ALL inputs immediately ---
             try:
-                logger.info(f"[R2Cleanup] Cleaning up 'inputs/' prefix...")
+                logger.info(f"[R2Cleanup] AGGRESSIVE: Cleaning up ALL 'inputs/' (keeping max {max_inputs})...")
+                
+                # Check if we have any completed jobs that no longer need their inputs
+                completed_jobs_with_inputs = await task_instance.db_manager.fetch_all("""
+                    SELECT DISTINCT id FROM weather_miner_jobs 
+                    WHERE status IN ('completed', 'error', 'failed') 
+                    AND created_at < NOW() - INTERVAL '1 hour'  -- Only cleanup inputs for jobs older than 1 hour
+                """)
+                
+                # Get all input objects
                 paginator = s3_client.get_paginator('list_objects_v2')
                 pages = paginator.paginate(Bucket=bucket_name, Prefix='inputs/')
                 
+                inputs_to_delete = []
                 all_input_objects = []
+                
                 for page in pages:
                     if 'Contents' in page:
                         all_input_objects.extend(page['Contents'])
                 
-                # Group by job_id (first part of the path)
+                # Group by job_id and check if job is completed
                 inputs_by_job = {}
                 for obj in all_input_objects:
                     key = obj['Key']
@@ -1537,38 +1581,55 @@ async def r2_cleanup_worker(task_instance: 'WeatherTask'):
                         if job_id not in inputs_by_job:
                             inputs_by_job[job_id] = {'keys': [], 'last_modified': None}
                         inputs_by_job[job_id]['keys'].append(key)
-                        # Use the latest modified time for the job folder
                         if inputs_by_job[job_id]['last_modified'] is None or obj['LastModified'] > inputs_by_job[job_id]['last_modified']:
                             inputs_by_job[job_id]['last_modified'] = obj['LastModified']
 
-                if len(inputs_by_job) > max_inputs:
-                    sorted_inputs = sorted(inputs_by_job.items(), key=lambda item: item[1]['last_modified'], reverse=True)
-                    to_delete_jobs = sorted_inputs[max_inputs:]
-                    logger.info(f"[R2Cleanup] Found {len(inputs_by_job)} input jobs. Deleting {len(to_delete_jobs)} oldest ones.")
+                # Check each job's status and mark for deletion if completed
+                for job_id, data in inputs_by_job.items():
+                    try:
+                        job_status = await task_instance.db_manager.fetch_one(
+                            "SELECT status FROM weather_miner_jobs WHERE id = :job_id",
+                            {"job_id": job_id}
+                        )
+                        
+                        # Delete inputs for completed/failed jobs OR if max_inputs is 0 (always delete)
+                        if max_inputs == 0 or (job_status and job_status['status'] in ['completed', 'error', 'failed']):
+                            inputs_to_delete.extend(data['keys'])
+                            status_str = job_status['status'] if job_status else 'unknown'
+                            logger.info(f"[R2Cleanup] Marking job {job_id} inputs for deletion (status: {status_str})")
+                        
+                    except Exception as e_job_check:
+                        logger.warning(f"[R2Cleanup] Could not check status for job {job_id}, will keep inputs: {e_job_check}")
 
-                    keys_to_delete = []
-                    for job_id, data in to_delete_jobs:
-                        keys_to_delete.extend(data['keys'])
+                # Also delete inputs older than 7 days regardless of job status (cleanup testing junk)
+                cutoff_time = datetime.now(timezone.utc) - timedelta(days=7)
+                for job_id, data in inputs_by_job.items():
+                    if data['last_modified'] < cutoff_time:
+                        inputs_to_delete.extend(data['keys'])
+                        logger.info(f"[R2Cleanup] Marking old job {job_id} inputs for deletion (older than 7 days)")
+
+                if inputs_to_delete:
+                    # Remove duplicates
+                    inputs_to_delete = list(set(inputs_to_delete))
+                    logger.info(f"[R2Cleanup] Deleting {len(inputs_to_delete)} input objects from {len(inputs_by_job)} total jobs.")
                     
-                    if keys_to_delete:
-                        # R2 delete_objects can handle up to 1000 keys at a time
-                        for i in range(0, len(keys_to_delete), 1000):
-                            chunk = keys_to_delete[i:i+1000]
-                            delete_payload = {'Objects': [{'Key': key} for key in chunk]}
-                            await asyncio.to_thread(s3_client.delete_objects, Bucket=bucket_name, Delete=delete_payload)
-                        logger.info(f"[R2Cleanup] Deleted {len(keys_to_delete)} objects from old input jobs.")
+                    # Delete in batches of 1000 (R2 limit)
+                    for i in range(0, len(inputs_to_delete), 1000):
+                        chunk = inputs_to_delete[i:i+1000]
+                        delete_payload = {'Objects': [{'Key': key} for key in chunk]}
+                        await asyncio.to_thread(s3_client.delete_objects, Bucket=bucket_name, Delete=delete_payload)
+                    logger.info(f"[R2Cleanup] Successfully deleted {len(inputs_to_delete)} input objects.")
                 else:
-                    logger.info(f"[R2Cleanup] Number of input jobs ({len(inputs_by_job)}) is within the limit ({max_inputs}). No inputs deleted.")
+                    logger.info(f"[R2Cleanup] No input objects to delete (total jobs: {len(inputs_by_job)}).")
 
             except Exception as e_inputs:
-                logger.error(f"[R2Cleanup] Error during input cleanup: {e_inputs}", exc_info=True)
+                logger.error(f"[R2Cleanup] Error during enhanced input cleanup: {e_inputs}", exc_info=True)
 
-
-            # --- Cleanup Forecasts ---
+            # --- ENHANCED OUTPUT CLEANUP: Group by GFS timestep and keep only latest per timestep ---
             try:
-                logger.info(f"[R2Cleanup] Cleaning up 'outputs/' prefix...")
-                # In R2, directories are just prefixes. We list objects under 'outputs/'
-                # and infer the "directories" from the prefixes.
+                logger.info(f"[R2Cleanup] ENHANCED: Cleaning up 'outputs/' grouped by GFS timestep (keeping {max_outputs_per_timestep} per timestep)...")
+                
+                # Get all output prefixes (job directories)
                 paginator = s3_client.get_paginator('list_objects_v2')
                 pages = paginator.paginate(Bucket=bucket_name, Prefix='outputs/', Delimiter='/')
 
@@ -1578,61 +1639,156 @@ async def r2_cleanup_worker(task_instance: 'WeatherTask'):
                         for prefix_info in page['CommonPrefixes']:
                             output_prefixes.append(prefix_info['Prefix'])
 
-                if len(output_prefixes) > max_forecasts:
-                    # To sort by date, we need to get the last modified time of an object within each prefix
-                    prefix_mod_times = []
+                if not output_prefixes:
+                    logger.info("[R2Cleanup] No output prefixes found.")
+                else:
+                    logger.info(f"[R2Cleanup] Found {len(output_prefixes)} output prefixes to analyze.")
+                    
+                    # Get job details for timestep grouping
+                    prefix_to_timestep = {}
+                    prefix_to_modified = {}
+                    
                     for prefix in output_prefixes:
                         try:
-                            # Get the most recently modified object in the prefix to represent the folder's "date"
-                            resp = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix, MaxKeys=1, FetchOwner=False)
+                            # Extract job_id from prefix (outputs/job_id/)
+                            job_id = prefix.rstrip('/').split('/')[-1]
+                            
+                            # Get GFS timestep for this job
+                            job_info = await task_instance.db_manager.fetch_one(
+                                "SELECT gfs_init_time_utc FROM weather_miner_jobs WHERE id = :job_id",
+                                {"job_id": job_id}
+                            )
+                            
+                            # Get most recent modification time for the prefix
+                            resp = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix, MaxKeys=1)
                             if 'Contents' in resp and resp['Contents']:
-                                prefix_mod_times.append((prefix, resp['Contents'][0]['LastModified']))
-                            else: # Handle empty prefix case
-                                prefix_mod_times.append((prefix, datetime(1970, 1, 1, tzinfo=timezone.utc)))
-                        except Exception as e_list_obj:
-                             logger.warning(f"[R2Cleanup] Could not get last modified time for prefix {prefix}: {e_list_obj}")
+                                mod_time = resp['Contents'][0]['LastModified']
+                            else:
+                                mod_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
+                            
+                            if job_info and job_info['gfs_init_time_utc']:
+                                timestep = job_info['gfs_init_time_utc']
+                                prefix_to_timestep[prefix] = timestep
+                                prefix_to_modified[prefix] = mod_time
+                                logger.debug(f"[R2Cleanup] Mapped prefix {prefix} to timestep {timestep}")
+                            else:
+                                # If no job info found, treat as testing junk - delete if older than 3 days
+                                cutoff_for_junk = datetime.now(timezone.utc) - timedelta(days=3)
+                                if mod_time < cutoff_for_junk:
+                                    logger.info(f"[R2Cleanup] Marking orphaned/testing prefix for deletion: {prefix} (no job info, older than 3 days)")
+                                    prefix_to_timestep[prefix] = None  # Mark for deletion
+                                    prefix_to_modified[prefix] = mod_time
+                                
+                        except Exception as e_prefix:
+                            logger.warning(f"[R2Cleanup] Error processing prefix {prefix}: {e_prefix}")
                     
-                    sorted_forecasts = sorted(prefix_mod_times, key=lambda item: item[1], reverse=True)
-                    to_delete_prefixes = [p for p, t in sorted_forecasts[max_forecasts:]]
+                    # Group prefixes by timestep
+                    timestep_groups = {}
+                    orphaned_prefixes = []
                     
-                    logger.info(f"[R2Cleanup] Found {len(output_prefixes)} forecast prefixes. Deleting {len(to_delete_prefixes)} oldest ones.")
-
-                    for prefix_to_delete in to_delete_prefixes:
-                        # List all objects under the prefix and delete them in batches
-                        logger.info(f"[R2Cleanup] Deleting all objects under prefix: {prefix_to_delete}")
-                        obj_paginator = s3_client.get_paginator('list_objects_v2')
-                        obj_pages = obj_paginator.paginate(Bucket=bucket_name, Prefix=prefix_to_delete)
+                    for prefix, timestep in prefix_to_timestep.items():
+                        if timestep is None:
+                            orphaned_prefixes.append(prefix)
+                        else:
+                            if timestep not in timestep_groups:
+                                timestep_groups[timestep] = []
+                            timestep_groups[timestep].append(prefix)
+                    
+                    # For each timestep, keep only the most recent prefix(es)
+                    prefixes_to_delete = []
+                    
+                    for timestep, prefixes in timestep_groups.items():
+                        if len(prefixes) > max_outputs_per_timestep:
+                            # Sort by modification time, keep most recent
+                            sorted_prefixes = sorted(prefixes, key=lambda p: prefix_to_modified[p], reverse=True)
+                            to_keep = sorted_prefixes[:max_outputs_per_timestep]
+                            to_delete = sorted_prefixes[max_outputs_per_timestep:]
+                            
+                            prefixes_to_delete.extend(to_delete)
+                            logger.info(f"[R2Cleanup] Timestep {timestep}: keeping {len(to_keep)} most recent, deleting {len(to_delete)} older outputs")
+                    
+                    # Add orphaned prefixes to deletion list
+                    prefixes_to_delete.extend(orphaned_prefixes)
+                    if orphaned_prefixes:
+                        logger.info(f"[R2Cleanup] Deleting {len(orphaned_prefixes)} orphaned/testing prefixes")
+                    
+                    # Delete the marked prefixes
+                    if prefixes_to_delete:
+                        logger.info(f"[R2Cleanup] Deleting {len(prefixes_to_delete)} output prefixes total.")
                         
-                        keys_to_delete = []
-                        for page in obj_pages:
-                            if 'Contents' in page:
-                                keys_to_delete.extend([{'Key': obj['Key']} for obj in page['Contents']])
-                        
-                        if keys_to_delete:
-                             for i in range(0, len(keys_to_delete), 1000):
-                                chunk = keys_to_delete[i:i+1000]
-                                delete_payload = {'Objects': chunk}
-                                await asyncio.to_thread(s3_client.delete_objects, Bucket=bucket_name, Delete=delete_payload)
-                             logger.info(f"[R2Cleanup] Deleted {len(keys_to_delete)} objects for prefix {prefix_to_delete}")
+                        for prefix_to_delete in prefixes_to_delete:
+                            logger.info(f"[R2Cleanup] Deleting all objects under prefix: {prefix_to_delete}")
+                            
+                            # List all objects under the prefix and delete them in batches
+                            obj_paginator = s3_client.get_paginator('list_objects_v2')
+                            obj_pages = obj_paginator.paginate(Bucket=bucket_name, Prefix=prefix_to_delete)
+                            
+                            keys_to_delete = []
+                            for page in obj_pages:
+                                if 'Contents' in page:
+                                    keys_to_delete.extend([{'Key': obj['Key']} for obj in page['Contents']])
+                            
+                            if keys_to_delete:
+                                for i in range(0, len(keys_to_delete), 1000):
+                                    chunk = keys_to_delete[i:i+1000]
+                                    delete_payload = {'Objects': chunk}
+                                    await asyncio.to_thread(s3_client.delete_objects, Bucket=bucket_name, Delete=delete_payload)
+                                logger.info(f"[R2Cleanup] Deleted {len(keys_to_delete)} objects for prefix {prefix_to_delete}")
+                    else:
+                        logger.info("[R2Cleanup] No output prefixes need deletion.")
 
+            except Exception as e_outputs:
+                logger.error(f"[R2Cleanup] Error during enhanced output cleanup: {e_outputs}", exc_info=True)
+
+            # --- CLEANUP TESTING JUNK: Delete any files not following expected patterns ---
+            try:
+                logger.info("[R2Cleanup] Cleaning up testing junk and malformed objects...")
+                
+                # Look for objects not in inputs/ or outputs/ prefixes
+                all_objects_paginator = s3_client.get_paginator('list_objects_v2')
+                all_pages = all_objects_paginator.paginate(Bucket=bucket_name)
+                
+                junk_objects = []
+                cutoff_for_junk = datetime.now(timezone.utc) - timedelta(days=1)  # Delete junk older than 1 day
+                
+                for page in all_pages:
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            key = obj['Key']
+                            # Skip expected patterns
+                            if key.startswith('inputs/') or key.startswith('outputs/'):
+                                continue
+                            
+                            # Mark as junk if it doesn't follow expected patterns and is old enough
+                            if obj['LastModified'] < cutoff_for_junk:
+                                junk_objects.append(key)
+                                logger.debug(f"[R2Cleanup] Marking junk object for deletion: {key}")
+                
+                if junk_objects:
+                    logger.info(f"[R2Cleanup] Deleting {len(junk_objects)} junk objects.")
+                    for i in range(0, len(junk_objects), 1000):
+                        chunk = junk_objects[i:i+1000]
+                        delete_payload = {'Objects': [{'Key': key} for key in chunk]}
+                        await asyncio.to_thread(s3_client.delete_objects, Bucket=bucket_name, Delete=delete_payload)
+                    logger.info(f"[R2Cleanup] Successfully deleted {len(junk_objects)} junk objects.")
                 else:
-                    logger.info(f"[R2Cleanup] Number of forecast prefixes ({len(output_prefixes)}) is within the limit ({max_forecasts}). No forecasts deleted.")
+                    logger.info("[R2Cleanup] No junk objects found for cleanup.")
+                    
+            except Exception as e_junk:
+                logger.error(f"[R2Cleanup] Error during junk cleanup: {e_junk}", exc_info=True)
 
-            except Exception as e_forecasts:
-                logger.error(f"[R2Cleanup] Error during forecast cleanup: {e_forecasts}", exc_info=True)
-
-            logger.info(f"[R2Cleanup] Cleanup cycle finished. Worker sleeping for {cleanup_interval} seconds.")
+            logger.info(f"[R2Cleanup] Enhanced cleanup cycle finished. Worker sleeping for {cleanup_interval} seconds.")
             await asyncio.sleep(cleanup_interval)
 
         except asyncio.CancelledError:
             logger.info("R2 cleanup worker has been cancelled.")
             break
         except Exception as e:
-            logger.error(f"An unexpected error occurred in the R2 cleanup worker: {e}", exc_info=True)
+            logger.error(f"An unexpected error occurred in the enhanced R2 cleanup worker: {e}", exc_info=True)
             logger.info("R2 cleanup worker will sleep for 60 seconds before retrying.")
             await asyncio.sleep(60)
 
-    logger.info("R2 cleanup worker has stopped.")
+    logger.info("Enhanced R2 cleanup worker has stopped.")
 
 
 def get_job_by_gfs_init_time(self, gfs_init_time: datetime) -> Optional[Dict]:
@@ -1711,6 +1867,10 @@ async def poll_runpod_job_worker(task_instance: 'WeatherTask', job_id: str, runp
                             await update_job_paths(task_instance, job_id, netcdf_path=output_prefix)
                         
                         await update_job_status(task_instance, job_id, 'completed')
+                        
+                        # Immediately cleanup R2 inputs for completed job
+                        asyncio.create_task(_immediate_r2_input_cleanup(task_instance, job_id))
+                        
                         return # Success, exit worker
 
                     elif current_status in ["IN_QUEUE", "IN_PROGRESS"]:
@@ -2135,6 +2295,19 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
                         'compressor': numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
                     }
                 
+                # Add explicit time encoding to ensure consistency between local and HTTP service paths
+                for coord_name in first_ds.coords:
+                    if coord_name.lower() == 'time' and pd.api.types.is_datetime64_any_dtype(first_ds.coords[coord_name].dtype):
+                        # Extract base time from the first dataset's time coordinate
+                        first_time = pd.to_datetime(first_ds.time.values[0])
+                        encoding['time'] = {
+                            'units': f'hours since {first_time.strftime("%Y-%m-%d %H:%M:%S")}',
+                            'calendar': 'standard',
+                            'dtype': 'float64'
+                        }
+                        logger.info(f"[{job_id}] Added explicit time encoding for HTTP service consistency: {encoding['time']}")
+                        break
+                
                 # Process files in smaller batches to avoid memory exhaustion
                 batch_size = 8  # Process 8 files at a time to manage memory
                 all_datasets = []
@@ -2206,7 +2379,6 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
                 )
                 
                 # Close and cleanup
-                first_ds.close()
                 combined_ds.close()
                 del combined_ds
                 gc.collect()
@@ -2317,3 +2489,46 @@ async def _download_single_file_from_r2(s3_client, bucket_name: str, object_key:
             return error_msg
     
     return f"All {max_retries} download attempts failed for {object_key}"
+
+async def _immediate_r2_input_cleanup(task_instance: 'WeatherTask', job_id: str):
+    """
+    Immediately cleans up input files from R2 after a job completes inference.
+    This is called directly from the job completion logic to avoid waiting for periodic cleanup.
+    """
+    try:
+        s3_client = await task_instance._get_r2_s3_client()
+        if not s3_client:
+            logger.warning(f"[{job_id}] Cannot cleanup R2 inputs: S3 client not available")
+            return
+
+        bucket_name = task_instance.r2_config.get("r2_bucket_name") if task_instance.r2_config else None
+        if not bucket_name:
+            logger.warning(f"[{job_id}] Cannot cleanup R2 inputs: bucket name not configured")
+            return
+
+        input_prefix = f"inputs/{job_id}/"
+        logger.info(f"[{job_id}] Immediately cleaning up R2 inputs at prefix: {input_prefix}")
+
+        # List all objects under the job's input prefix
+        response = await asyncio.to_thread(
+            s3_client.list_objects_v2,
+            Bucket=bucket_name,
+            Prefix=input_prefix
+        )
+
+        if 'Contents' not in response:
+            logger.info(f"[{job_id}] No input objects found to cleanup")
+            return
+
+        # Delete all objects for this job
+        keys_to_delete = [{'Key': obj['Key']} for obj in response['Contents']]
+        
+        if keys_to_delete:
+            delete_payload = {'Objects': keys_to_delete}
+            await asyncio.to_thread(s3_client.delete_objects, Bucket=bucket_name, Delete=delete_payload)
+            logger.info(f"[{job_id}] Successfully deleted {len(keys_to_delete)} input objects from R2")
+        else:
+            logger.info(f"[{job_id}] No input objects to delete")
+
+    except Exception as e:
+        logger.error(f"[{job_id}] Error during immediate R2 input cleanup: {e}", exc_info=True)
