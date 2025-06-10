@@ -177,6 +177,7 @@ class GaiaValidator:
         """
         Initialize the GaiaValidator with provided arguments.
         """
+        print("[STARTUP DEBUG] Starting GaiaValidator.__init__")
         self.args = args
         self.metagraph = None
         self.config = None
@@ -390,12 +391,15 @@ class GaiaValidator:
 
         self.tracemalloc_snapshot1: Optional[tracemalloc.Snapshot] = None # Initialize for the snapshot taker task
 
+        print("[STARTUP DEBUG] Validating task weight schedule")
         for dt_thresh, weights_dict in self.task_weight_schedule:
             if not math.isclose(sum(weights_dict.values()), 1.0):
                 logger.error(f"Task weights for threshold {dt_thresh.isoformat()} do not sum to 1.0! Sum: {sum(weights_dict.values())}. Fix configuration.")
 
         # Initialize substrate connection manager (will be set up in setup_neuron)
+        print("[STARTUP DEBUG] Initializing substrate manager")
         self.substrate_manager: Optional[SubstrateConnectionManager] = None
+        print("[STARTUP DEBUG] GaiaValidator.__init__ completed")
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -564,10 +568,15 @@ class GaiaValidator:
             
             w.blocks_since_last_update = blocks_since_wrapper
 
+            # Initialize substrate connection manager FIRST
+            self.substrate_manager = SubstrateConnectionManager(
+                subtensor_network=self.subtensor_network,
+                chain_endpoint=self.subtensor_chain_endpoint
+            )
+
             try:
-                self.substrate = get_substrate(
-                    subtensor_network=self.subtensor_network,
-                    subtensor_address=self.subtensor_chain_endpoint)
+                # Use managed connection instead of direct get_substrate()
+                self.substrate = self.substrate_manager.get_connection()
             except Exception as e_sub_init:
                 logger.error(f"CRITICAL: Failed to initialize SubstrateInterface with endpoint {self.subtensor_chain_endpoint}: {e_sub_init}", exc_info=True)
                 return False
@@ -581,6 +590,9 @@ class GaiaValidator:
 
             # Standard Metagraph Sync
             try:
+                # Use direct sync here since _sync_metagraph is async and we're in sync method
+                # But ensure substrate connection is current
+                self.substrate = self.substrate_manager.get_connection()
                 self.metagraph.sync_nodes()  # Sync nodes after initialization
                 logger.info(f"Successfully synced {len(self.metagraph.nodes) if self.metagraph.nodes else '0'} nodes from the network.")
             except Exception as e_meta_sync:
@@ -600,12 +612,6 @@ class GaiaValidator:
                     [self.netuid, self.keypair.ss58_address]
                 ).value
             validator_uid = self.validator_uid
-
-            # Initialize substrate connection manager
-            self.substrate_manager = SubstrateConnectionManager(
-                subtensor_network=self.subtensor_network,
-                chain_endpoint=self.subtensor_chain_endpoint
-            )
 
             return True
         except Exception as e:
@@ -1138,34 +1144,73 @@ class GaiaValidator:
             logger.debug(f"Error during connection cleanup: {e}")
 
     def _log_memory_usage(self, context: str, threshold_mb: float = 100.0):
-        """Log current memory usage if above threshold or if significant change detected."""
+        """Enhanced memory logging with detailed breakdown and automatic cleanup."""
+        if not PSUTIL_AVAILABLE:
+            return
+            
         try:
-            if not PSUTIL_AVAILABLE:
-                return
-                
             process = psutil.Process()
-            current_memory_mb = process.memory_info().rss / (1024 * 1024)
+            current_memory = process.memory_info().rss / (1024 * 1024)
             
-            # Check if we have a previous measurement for this context
-            if not hasattr(self, '_memory_baselines'):
-                self._memory_baselines = {}
+            # Calculate memory change
+            if not hasattr(self, '_last_memory'):
+                self._last_memory = current_memory
+                memory_change = 0
+            else:
+                memory_change = current_memory - self._last_memory
+                self._last_memory = current_memory
             
-            previous_memory = self._memory_baselines.get(context)
-            self._memory_baselines[context] = current_memory_mb
-            
-            # Log if above threshold or significant change
-            should_log = current_memory_mb > threshold_mb
-            
-            if previous_memory:
-                memory_change = current_memory_mb - previous_memory
-                if abs(memory_change) > 50:  # 50MB change threshold
-                    should_log = True
-                    change_str = f"(+{memory_change:.1f}MB)" if memory_change > 0 else f"({memory_change:.1f}MB)"
-                    logger.info(f"Memory usage [{context}]: {current_memory_mb:.1f}MB {change_str}")
-                elif should_log:
-                    logger.debug(f"Memory usage [{context}]: {current_memory_mb:.1f}MB")
-            elif should_log:
-                logger.info(f"Memory usage [{context}]: {current_memory_mb:.1f}MB (baseline)")
+            # Enhanced logging for significant changes
+            if abs(memory_change) > threshold_mb or context in ['calc_weights_start', 'calc_weights_after_cleanup']:
+                # Get additional memory details
+                memory_info = process.memory_info()
+                try:
+                    # Try to get memory percentage
+                    memory_percent = process.memory_percent()
+                    
+                    # Get thread and file handle counts
+                    num_threads = process.num_threads()
+                    open_files = len(process.open_files())
+                    
+                    # Check if we have tracemalloc data
+                    tracemalloc_info = ""
+                    if tracemalloc.is_tracing():
+                        try:
+                            current, peak = tracemalloc.get_traced_memory()
+                            tracemalloc_info = f", Traced: {current/(1024*1024):.1f}MB (peak: {peak/(1024*1024):.1f}MB)"
+                        except Exception:
+                            pass
+                    
+                    logger.info(
+                        f"Memory usage [{context}]: {current_memory:.1f}MB "
+                        f"({'+' if memory_change > 0 else ''}{memory_change:.1f}MB), "
+                        f"RSS: {memory_info.rss/(1024*1024):.1f}MB, "
+                        f"VMS: {memory_info.vms/(1024*1024):.1f}MB, "
+                        f"Percent: {memory_percent:.1f}%, "
+                        f"Threads: {num_threads}, "
+                        f"Files: {open_files}"
+                        f"{tracemalloc_info}"
+                    )
+                    
+                    # Trigger comprehensive cleanup for large memory increases (but not during startup)
+                    if (memory_change > 200 and 
+                        hasattr(self, 'substrate_manager') and 
+                        self.substrate_manager is not None and
+                        hasattr(self, 'last_metagraph_sync')):  # Only after validator is fully running
+                        logger.warning(f"Large memory increase detected ({memory_change:.1f}MB), forcing comprehensive cleanup")
+                        memory_freed = self._comprehensive_memory_cleanup(f"emergency_{context}")
+                        
+                        # Check memory again after comprehensive cleanup
+                        new_memory = process.memory_info().rss / (1024 * 1024)
+                        total_savings = current_memory - new_memory
+                        logger.info(f"Emergency comprehensive cleanup freed {memory_freed:.1f}MB (total reduction: {total_savings:.1f}MB)")
+                    elif memory_change > 200:
+                        logger.info(f"Large memory increase detected during startup ({memory_change:.1f}MB) - skipping cleanup until fully initialized")
+                        
+                except Exception as e:
+                    logger.info(f"Memory usage [{context}]: {current_memory:.1f}MB ({'+' if memory_change > 0 else ''}{memory_change:.1f}MB) - detailed info error: {e}")
+            else:
+                logger.debug(f"Memory usage [{context}]: {current_memory:.1f}MB ({'+' if memory_change > 0 else ''}{memory_change:.1f}MB)")
                 
         except Exception as e:
             logger.debug(f"Error logging memory usage for {context}: {e}")
@@ -1385,16 +1430,129 @@ class GaiaValidator:
                         logger.error(traceback.format_exc())
                         health['errors'] += 1
 
+    async def _fetch_nodes_managed(self, netuid):
+        """
+        Fetch nodes using get_nodes_for_netuid but with aggressive connection management.
+        Use cached nodes when possible to avoid any substrate calls.
+        """
+        try:
+            logger.debug(f"Fetching nodes for netuid {netuid} using ultra-aggressive memory management")
+            
+            # First, try to use cached nodes from metagraph if available and recent
+            if (hasattr(self, 'metagraph') and self.metagraph and 
+                hasattr(self.metagraph, 'nodes') and self.metagraph.nodes and
+                hasattr(self, 'last_metagraph_sync') and 
+                time.time() - self.last_metagraph_sync < 300):  # Use cache if less than 5 minutes old
+                
+                logger.info(f"✅ Using cached metagraph nodes ({len(self.metagraph.nodes)} nodes) - NO substrate calls needed")
+                # Convert metagraph nodes dict to list format expected by callers
+                cached_nodes = []
+                for hotkey, node in self.metagraph.nodes.items():
+                    if hasattr(node, 'node_id'):
+                        cached_nodes.append(node)
+                    else:
+                        # Create a simple node object if metagraph node doesn't have the right format
+                        simple_node = type('Node', (), {
+                            'node_id': getattr(node, 'uid', 0),
+                            'hotkey': hotkey,
+                            'ip': getattr(node, 'ip', '0.0.0.0'),
+                            'port': getattr(node, 'port', 0),
+                            'ip_type': getattr(node, 'ip_type', 4),
+                            'protocol': getattr(node, 'protocol', 4),
+                            'placeholder1': 0,
+                            'placeholder2': 0,
+                        })()
+                        cached_nodes.append(simple_node)
+                return cached_nodes
+            
+            # If no cache available, reluctantly make the substrate call
+            logger.warning("No cached nodes available - making substrate call (potential memory leak)")
+            
+            # More aggressive patching - patch multiple possible import locations
+            import fiber.chain.interface as fiber_interface
+            import fiber.chain.fetch_nodes as fetch_nodes_module
+            
+            # Store originals
+            original_get_substrate = fiber_interface.get_substrate
+            original_fetch_get_substrate = getattr(fetch_nodes_module, 'get_substrate', None)
+            
+            def ultra_patched_get_substrate(*args, **kwargs):
+                logger.warning("!!! SUBSTRATE CONNECTION INTERCEPTED - using managed connection instead !!!")
+                return self.substrate
+            
+            # Apply patches everywhere
+            fiber_interface.get_substrate = ultra_patched_get_substrate
+            if original_fetch_get_substrate:
+                fetch_nodes_module.get_substrate = ultra_patched_get_substrate
+            
+            try:
+                # Force substrate manager to use fresh connection
+                self.substrate = self.substrate_manager.get_connection()
+                nodes = get_nodes_for_netuid(self.substrate, netuid)
+                logger.info(f"⚠️ Fetched {len(nodes) if nodes else 0} nodes with substrate call (check for new connections in logs)")
+                return nodes
+            finally:
+                # Always restore originals
+                fiber_interface.get_substrate = original_get_substrate
+                if original_fetch_get_substrate:
+                    fetch_nodes_module.get_substrate = original_fetch_get_substrate
+                
+        except Exception as e:
+            logger.error(f"Error in ultra-aggressive node fetching: {e}")
+            logger.error(traceback.format_exc())
+            # Final fallback
+            logger.error("CRITICAL: All node fetching approaches failed - using direct call")
+            return get_nodes_for_netuid(self.substrate, netuid)
+
     async def _sync_metagraph(self):
-        """Sync the metagraph."""
+        """Sync the metagraph using managed substrate connection with custom implementation to prevent memory leaks."""
         sync_start = time.time()
         # Use managed substrate connection for metagraph operations
+        old_substrate = getattr(self, 'substrate', None)
         self.substrate = self.substrate_manager.get_connection()
-        self.metagraph.sync_nodes()
+        
+        # Ensure metagraph uses the managed connection and update substrate reference
+        if hasattr(self, 'metagraph') and self.metagraph:
+            self.metagraph.substrate = self.substrate
+        
+        # CRITICAL FIX: Use our custom node fetching that truly uses managed connections
+        try:
+            if hasattr(self, 'metagraph') and self.metagraph:
+                # Use our ultra-aggressive caching to prevent memory leaks
+                logger.debug("Using ultra-aggressive caching with minimal substrate calls to prevent memory leaks")
+                active_nodes_list = await self._fetch_nodes_managed(self.metagraph.netuid)
+                
+                if active_nodes_list:
+                    # Update metagraph nodes manually instead of calling sync_nodes()
+                    self.metagraph.nodes = {node.hotkey: node for node in active_nodes_list}
+                    logger.info(f"✅ Custom metagraph sync: Updated with {len(self.metagraph.nodes)} nodes using managed connection (NO memory leak)")
+                else:
+                    logger.warning("No nodes returned from custom node fetching")
+                    self.metagraph.nodes = {}
+            else:
+                logger.error("Metagraph not initialized, cannot sync nodes")
+                return
+        except Exception as e:
+            logger.error(f"Error during custom metagraph sync: {e}")
+            logger.error(traceback.format_exc())
+            # Fallback to regular sync_nodes if our custom method fails, but log the issue
+            logger.warning("Falling back to regular metagraph.sync_nodes() - this may create memory leaks")
+            if hasattr(self, 'metagraph') and self.metagraph:
+                self.metagraph.sync_nodes()
+            
         sync_duration = time.time() - sync_start
         self.last_metagraph_sync = time.time()
+        
+        # Enhanced logging
         if sync_duration > 30:  # Log slow syncs
             logger.warning(f"Slow metagraph sync: {sync_duration:.2f}s")
+        
+        # Log substrate connection status
+        connection_changed = old_substrate != self.substrate
+        logger.debug(f"Custom metagraph sync completed in {sync_duration:.2f}s using managed connection (connection changed: {connection_changed})")
+        
+        if connection_changed:
+            logger.info("Substrate connection refreshed during metagraph sync")
 
     async def cleanup_resources(self):
         """Clean up any resources used by the validator during recovery."""
@@ -1538,9 +1696,9 @@ class GaiaValidator:
                 await self.geomagnetic_task.cleanup_resources()
             elif task_name == "scoring":
                 self.substrate = self.substrate_manager.force_reconnect()
-                self.metagraph.sync_nodes()
+                await self._sync_metagraph()  # Use managed connection instead of direct sync
             elif task_name == "deregistration":
-                self.metagraph.sync_nodes()
+                await self._sync_metagraph()  # Use managed connection instead of direct sync
                 self.nodes = {}
             
             # Reset task health
@@ -1574,14 +1732,14 @@ class GaiaValidator:
 
             # 1. Fetch Current Metagraph State
             logger.info("Syncing metagraph for stale history check...")
-            self.metagraph.sync_nodes()
+            await self._sync_metagraph()  # Use managed connection instead of direct sync
             
-            # Fetch the list of nodes directly since Metagraph object doesn't store a UID-indexed list
+            # Fetch the list of nodes directly using our managed implementation
             try:
-                active_nodes_list = get_nodes_for_netuid(self.substrate, self.metagraph.netuid)
+                active_nodes_list = await self._fetch_nodes_managed(self.metagraph.netuid)
                 if active_nodes_list is None:
                     active_nodes_list = [] # Ensure it's an iterable if None is returned
-                    logger.warning("get_nodes_for_netuid returned None, proceeding with empty list for stale history check.")
+                    logger.warning("Managed node fetching returned None, proceeding with empty list for stale history check.")
             except Exception as e_fetch_nodes:
                 logger.error(f"Failed to fetch nodes for stale history check: {e_fetch_nodes}", exc_info=True)
                 active_nodes_list = [] # Proceed with empty list to avoid further errors here
@@ -1889,6 +2047,8 @@ class GaiaValidator:
                     lambda: self.manage_earthdata_token(),
                     lambda: self.monitor_client_health(),  # Added HTTP client monitoring
                     lambda: self.database_monitor(),
+                    lambda: self.periodic_substrate_cleanup(),  # Added substrate cleanup task
+                    lambda: self.aggressive_memory_cleanup(),  # Added aggressive memory cleanup task
                     #lambda: self.plot_database_metrics_periodically() # Added plotting task
                 ]
                 if not memray_active: # Add tracemalloc snapshot taker only if memray is not active
@@ -2169,13 +2329,28 @@ class GaiaValidator:
 
                 active_nodes = len(self.metagraph.nodes) if self.metagraph else 0
 
+                # Get substrate connection manager stats
+                substrate_stats = ""
+                if hasattr(self, 'substrate_manager') and self.substrate_manager:
+                    try:
+                        stats = self.substrate_manager.get_stats()
+                        substrate_stats = (
+                            f"Substrate Connections: {stats['connection_count']}, "
+                            f"Queries: {stats['query_count']}, "
+                            f"Age: {stats['connection_age']:.1f}s, "
+                            f"Cleanup: {stats['time_since_cleanup']:.1f}s ago"
+                        )
+                    except Exception as e:
+                        substrate_stats = f"Substrate Stats Error: {e}"
+
                 logger.info(
                     f"\n"
                     f"---Status Update ---\n"
                     f"Time (UTC): {formatted_time} | \n"
                     f"Block: {self.current_block} | \n"
                     f"Nodes: {active_nodes}/256 | \n"
-                    f"Weights Set: {blocks_since_weights} blocks ago"
+                    f"Weights Set: {blocks_since_weights} blocks ago\n"
+                    f"{substrate_stats}"
                 )
 
             except Exception as e:
@@ -2197,7 +2372,7 @@ class GaiaValidator:
                     continue # Wait for metagraph to be initialized
                 
                 logger.info("Syncing metagraph for miner state update...")
-                self.metagraph.sync_nodes()
+                await self._sync_metagraph()  # Use managed connection instead of direct sync
                 if not self.metagraph.nodes:
                     logger.warning("Metagraph empty after sync, skipping miner state update.")
                     await asyncio.sleep(600)  # Sleep before retrying
@@ -2206,12 +2381,12 @@ class GaiaValidator:
                 async with self.miner_table_lock:
                     logger.info("Performing miner hotkey change check and info update...")
                     
-                    # Get current UIDs and hotkeys from the chain's metagraph
+                    # Get current UIDs and hotkeys from the chain's metagraph using managed fetching
                     try:
-                        active_nodes_list = get_nodes_for_netuid(self.substrate, self.metagraph.netuid)
+                        active_nodes_list = await self._fetch_nodes_managed(self.metagraph.netuid)
                         if active_nodes_list is None:
                             active_nodes_list = [] # Ensure it's an iterable
-                            logger.warning("get_nodes_for_netuid returned None in handle_miner_deregistration_loop.")
+                            logger.warning("Managed node fetching returned None in handle_miner_deregistration_loop.")
                     except Exception as e_fetch_nodes_dereg:
                         logger.error(f"Failed to fetch nodes in handle_miner_deregistration_loop: {e_fetch_nodes_dereg}", exc_info=True)
                         active_nodes_list = []
@@ -2409,172 +2584,238 @@ class GaiaValidator:
     def _perform_weight_calculations_sync(self, weather_results, geomagnetic_results, soil_results, now, validator_nodes_by_uid_list):
         """
         Synchronous helper to perform CPU-bound weight calculations.
+        Memory-optimized version with explicit cleanup.
         """
         logger.info("Synchronous weight calculation: Processing fetched scores...")
-        # Initialize score arrays
-        weather_scores = np.full(256, np.nan)
-        geomagnetic_scores = np.full(256, np.nan)
-        soil_scores = np.full(256, np.nan)
-
-        # Count raw scores per UID
-        weather_counts = [0] * 256
-        geo_counts = [0] * 256
-        soil_counts = [0] * 256
         
-        if weather_results:
-            for result in weather_results:
-                # Ensure 'score' key exists and is a list of appropriate length
-                scores = result.get('score', [np.nan]*256)
-                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+        try:
+            # Initialize score arrays
+            weather_scores = np.full(256, np.nan)
+            geomagnetic_scores = np.full(256, np.nan)
+            soil_scores = np.full(256, np.nan)
+
+            # Count raw scores per UID - use numpy for better memory efficiency
+            weather_counts = np.zeros(256, dtype=int)
+            geo_counts = np.zeros(256, dtype=int)
+            soil_counts = np.zeros(256, dtype=int)
+        
+            if weather_results:
+                for result in weather_results:
+                    # Ensure 'score' key exists and is a list of appropriate length
+                    scores = result.get('score', [np.nan]*256)
+                    if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                    for uid in range(256):
+                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                            weather_counts[uid] += 1
+            
+            if geomagnetic_results:
+                for result in geomagnetic_results:
+                    scores = result.get('score', [np.nan]*256)
+                    if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                    for uid in range(256):
+                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                            geo_counts[uid] += 1
+
+            if soil_results:
+                for result in soil_results:
+                    scores = result.get('score', [np.nan]*256)
+                    if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                    for uid in range(256):
+                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                            soil_counts[uid] += 1
+
+            if geomagnetic_results:
+                # Process geomagnetic scores with memory-efficient approach
+                zero_scores_count = 0
                 for uid in range(256):
-                    if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
-                        weather_counts[uid] += 1
-        
-        if geomagnetic_results:
-            for result in geomagnetic_results:
-                scores = result.get('score', [np.nan]*256)
+                    uid_scores = []
+                    uid_weights = []
+                    
+                    # Collect scores for this UID across all results
+                    for result in geomagnetic_results:
+                        age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                        decay = np.exp(-age_days * np.log(2))
+                        scores = result.get('score', [np.nan]*256)
+                        if not isinstance(scores, list) or len(scores) != 256: 
+                            scores = [np.nan]*256 # Defensive
+                        
+                        score_val = scores[uid]
+                        if isinstance(score_val, str) or np.isnan(score_val): 
+                            score_val = 0.0
+                        if score_val == 0.0: 
+                            zero_scores_count += 1
+                        
+                        uid_scores.append(score_val)
+                        uid_weights.append(decay)
+                        geo_counts[uid] += (score_val != 0.0)
+                    
+                    # Calculate weighted average for this UID
+                    if uid_scores:
+                        s_arr = np.array(uid_scores)
+                        w_arr = np.array(uid_weights)
+                        non_zero_mask = s_arr != 0.0
+                        
+                        if np.any(non_zero_mask):
+                            masked_s = s_arr[non_zero_mask]
+                            masked_w = w_arr[non_zero_mask]
+                            weight_sum = np.sum(masked_w)
+                            if weight_sum > 0:
+                                geomagnetic_scores[uid] = np.sum(masked_s * masked_w) / weight_sum
+                            else:
+                                geomagnetic_scores[uid] = 0.0
+                        else:
+                            geomagnetic_scores[uid] = 0.0
+                    
+                    # Clean up temporary arrays immediately
+                    del uid_scores, uid_weights
+                
+                logger.info(f"Processed {len(geomagnetic_results)} geomagnetic records with {zero_scores_count} zero scores")
+
+            if weather_results:
+                latest_result = weather_results[0]
+                scores = latest_result.get('score', [np.nan]*256)
                 if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                score_age_days = (now - latest_result['created_at']).total_seconds() / (24 * 3600)
+                logger.info(f"Using latest weather score from {latest_result['created_at']} ({score_age_days:.1f} days ago)")
                 for uid in range(256):
-                    if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
-                        geo_counts[uid] += 1
+                    if isinstance(scores[uid], str) or np.isnan(scores[uid]): weather_scores[uid] = 0.0
+                    else: weather_scores[uid] = scores[uid]; weather_counts[uid] += (scores[uid] != 0.0)
+                logger.info(f"Weather scores: {sum(1 for s in weather_scores if s == 0.0)} UIDs have zero score")
 
-        if soil_results:
-            for result in soil_results:
-                scores = result.get('score', [np.nan]*256)
-                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+            if soil_results:
+                # Process soil scores with memory-efficient approach
+                zero_soil_scores = 0
                 for uid in range(256):
-                    if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
-                        soil_counts[uid] += 1
+                    uid_scores = []
+                    uid_weights = []
+                    
+                    # Collect scores for this UID across all results
+                    for result in soil_results:
+                        age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                        decay = np.exp(-age_days * np.log(2))
+                        scores = result.get('score', [np.nan]*256)
+                        if not isinstance(scores, list) or len(scores) != 256: 
+                            scores = [np.nan]*256 # Defensive
+                        
+                        score_val = scores[uid]
+                        if isinstance(score_val, str) or np.isnan(score_val): 
+                            score_val = 0.0
+                        if score_val == 0.0: 
+                            zero_soil_scores += 1
+                        
+                        uid_scores.append(score_val)
+                        uid_weights.append(decay)
+                        soil_counts[uid] += (score_val != 0.0)
+                    
+                    # Calculate weighted average for this UID
+                    if uid_scores:
+                        s_arr = np.array(uid_scores)
+                        w_arr = np.array(uid_weights)
+                        non_zero_mask = s_arr != 0.0
+                        
+                        if np.any(non_zero_mask):
+                            masked_s = s_arr[non_zero_mask]
+                            masked_w = w_arr[non_zero_mask]
+                            weight_sum = np.sum(masked_w)
+                            if weight_sum > 0:
+                                soil_scores[uid] = np.sum(masked_s * masked_w) / weight_sum
+                            else:
+                                soil_scores[uid] = 0.0
+                        else:
+                            soil_scores[uid] = 0.0
+                    
+                    # Clean up temporary arrays immediately
+                    del uid_scores, uid_weights
+                
+                logger.info(f"Processed {len(soil_results)} soil records with {zero_soil_scores} zero scores")
 
-        if geomagnetic_results:
-            geo_scores_by_uid = [[] for _ in range(256)]
-            zero_scores_count = 0
-            for result in geomagnetic_results:
-                age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                decay = np.exp(-age_days * np.log(2))
-                scores = result.get('score', [np.nan]*256)
-                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
-                for uid in range(256):
-                    if isinstance(scores[uid], str) or np.isnan(scores[uid]): scores[uid] = 0.0
-                    geo_scores_by_uid[uid].append((scores[uid], decay))
-                    if scores[uid] == 0.0: zero_scores_count += 1
-            logger.info(f"Loaded {len(geomagnetic_results)} geomagnetic score records with {zero_scores_count} zero scores")
-            zeros_after = 0
-            for uid in range(256):
-                if geo_scores_by_uid[uid]:
-                    s_vals, d_weights = zip(*geo_scores_by_uid[uid])
-                    s_arr, w_arr = np.array(s_vals), np.array(d_weights)
-                    zero_mask, total_count = (s_arr == 0.0), len(s_arr)
-                    if np.all(zero_mask): geomagnetic_scores[uid], zeros_after = 0.0, zeros_after + 1; logger.debug(f"UID {uid}: All {total_count} geo scores zeroed"); continue
-                    masked_s, masked_w = s_arr[~zero_mask], w_arr[~zero_mask]
-                    if np.any(zero_mask): logger.debug(f"UID {uid}: Masked {np.sum(zero_mask)}/{total_count} zero geo scores")
-                    weight_sum = np.sum(masked_w)
-                    if weight_sum > 0: geomagnetic_scores[uid] = np.sum(masked_s * masked_w) / weight_sum; zeros_after += (geomagnetic_scores[uid] == 0.0)
-                    else: geomagnetic_scores[uid], zeros_after = 0.0, zeros_after + 1
-            logger.info(f"Geomagnetic masked array processing: {zeros_after} UIDs have zero final score")
+            logger.info("Aggregate scores calculated. Proceeding to weight normalization...")
+            def sigmoid(x, k=20, x0=0.93): return 1 / (1 + math.exp(-k * (x - x0)))
+            weights_final = np.zeros(256)
+            for idx in range(256):
+                w_s, g_s, sm_s = weather_scores[idx], geomagnetic_scores[idx], soil_scores[idx]
+                if np.isnan(w_s) or w_s==0: w_s=np.nan
+                if np.isnan(g_s) or g_s==0: g_s=np.nan
+                if np.isnan(sm_s) or sm_s==0: sm_s=np.nan
+                node_obj, hk_chain = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None, "N/A"
+                if node_obj: hk_chain = node_obj.get('hotkey', 'N/A')
+                if np.isnan(w_s) and np.isnan(g_s) and np.isnan(sm_s): weights_final[idx] = 0.0
+                else:
+                    wc, gc, sc, total_w_avail = 0.0,0.0,0.0,0.0
+                    if not np.isnan(w_s): wc,total_w_avail = 0.70*w_s, total_w_avail+0.70
+                    if not np.isnan(g_s): gc,total_w_avail = 0.15*sigmoid(g_s), total_w_avail+0.15
+                    if not np.isnan(sm_s): sc,total_w_avail = 0.15*sm_s, total_w_avail+0.15
+                    weights_final[idx] = (wc+gc+sc)/total_w_avail if total_w_avail>0 else 0.0
+                # Reduce logging to prevent memory pressure - only log every 32nd UID or non-zero weights
+                if idx % 32 == 0 or weights_final[idx] > 0.0:
+                    logger.debug(f"UID {idx} (HK: {hk_chain}): Wea={w_s if not np.isnan(w_s) else '-'} ({weather_counts[idx]} scores), Geo={g_s if not np.isnan(g_s) else '-'} ({geo_counts[idx]} scores), Soil={sm_s if not np.isnan(sm_s) else '-'} ({soil_counts[idx]} scores), AggW={weights_final[idx]:.4f}")
+            logger.info(f"Weights before normalization: Min={np.min(weights_final):.4f}, Max={np.max(weights_final):.4f}, Mean={np.mean(weights_final):.4f}")
+            
+            non_zero_mask = weights_final != 0.0
+            if not np.any(non_zero_mask): logger.warning("No non-zero weights to normalize!"); return None
+            
+            nz_weights = weights_final[non_zero_mask]
+            max_w_val = np.max(nz_weights)
+            if max_w_val == 0: logger.warning("Max weight is 0, cannot normalize."); return None
+            
+            norm_weights = np.copy(weights_final); norm_weights[non_zero_mask] /= max_w_val
+            positives = norm_weights[norm_weights > 0]
+            if not positives.any(): logger.warning("No positive weights after initial normalization!"); return None
+            
+            M = np.percentile(positives, 80); logger.info(f"Using 80th percentile ({M:.8f}) as curve midpoint")
+            b,Q,v,k,a,slope = 70,8,0.3,0.98,0.0,0.01
+            transformed_w = np.zeros_like(weights_final)
+            nz_indices = np.where(weights_final > 0.0)[0]
+            if not nz_indices.any(): logger.warning("No positive weight indices for transformation!"); return None
 
-        if weather_results:
-            latest_result = weather_results[0]
-            scores = latest_result.get('score', [np.nan]*256)
-            if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
-            score_age_days = (now - latest_result['created_at']).total_seconds() / (24 * 3600)
-            logger.info(f"Using latest weather score from {latest_result['created_at']} ({score_age_days:.1f} days ago)")
-            for uid in range(256):
-                if isinstance(scores[uid], str) or np.isnan(scores[uid]): weather_scores[uid] = 0.0
-                else: weather_scores[uid] = scores[uid]; weather_counts[uid] += (scores[uid] != 0.0)
-            logger.info(f"Weather scores: {sum(1 for s in weather_scores if s == 0.0)} UIDs have zero score")
+            for idx in nz_indices:
+                sig_p = a+(k-a)/np.power(1+Q*np.exp(-b*(norm_weights[idx]-M)),1/v)
+                transformed_w[idx] = sig_p + slope*norm_weights[idx]
+            
+            trans_nz = transformed_w[transformed_w > 0]
+            if trans_nz.any(): logger.info(f"Transformed weights: Min={np.min(trans_nz):.4f}, Max={np.max(trans_nz):.4f}, Mean={np.mean(trans_nz):.4f}")
+            else: logger.warning("No positive weights after sigmoid transformation!"); # Continue to rank-based if needed or return None
 
-        if soil_results:
-            soil_scores_by_uid = [[] for _ in range(256)]
-            for result in soil_results:
-                age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                decay = np.exp(-age_days * np.log(2))
-                scores = result.get('score', [np.nan]*256)
-                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
-                for uid in range(256):
-                    if isinstance(scores[uid], str) or np.isnan(scores[uid]): scores[uid] = 0.0
-                    soil_scores_by_uid[uid].append((scores[uid], decay))
-            zero_soil_scores = sum(s == 0.0 for res in soil_results for s_list in [res.get('score')] if isinstance(s_list, list) for s in s_list if isinstance(s, (int, float)))
-            logger.info(f"Loaded {len(soil_results)} soil records with {zero_soil_scores}/{len(soil_results)*256} zero scores")
-            zeros_after = 0
-            for uid in range(256):
-                if soil_scores_by_uid[uid]:
-                    s_vals, d_weights = zip(*soil_scores_by_uid[uid])
-                    s_arr, w_arr = np.array(s_vals), np.array(d_weights)
-                    zero_mask, total_count = (s_arr == 0.0), len(s_arr)
-                    if np.all(zero_mask): soil_scores[uid], zeros_after = 0.0, zeros_after + 1; logger.debug(f"UID {uid}: All {total_count} soil scores zeroed"); continue
-                    masked_s, masked_w = s_arr[~zero_mask], w_arr[~zero_mask]
-                    if np.any(zero_mask): logger.debug(f"UID {uid}: Masked {np.sum(zero_mask)}/{total_count} zero soil scores")
-                    weight_sum = np.sum(masked_w)
-                    if weight_sum > 0: soil_scores[uid] = np.sum(masked_s * masked_w) / weight_sum; zeros_after += (soil_scores[uid] == 0.0)
-                    else: soil_scores[uid], zeros_after = 0.0, zeros_after + 1
-            logger.info(f"Soil task: {zeros_after} UIDs have zero final score after masked array processing")
-
-        logger.info("Aggregate scores calculated. Proceeding to weight normalization...")
-        def sigmoid(x, k=20, x0=0.93): return 1 / (1 + math.exp(-k * (x - x0)))
-        weights_final = np.zeros(256)
-        for idx in range(256):
-            w_s, g_s, sm_s = weather_scores[idx], geomagnetic_scores[idx], soil_scores[idx]
-            if np.isnan(w_s) or w_s==0: w_s=np.nan
-            if np.isnan(g_s) or g_s==0: g_s=np.nan
-            if np.isnan(sm_s) or sm_s==0: sm_s=np.nan
-            node_obj, hk_chain = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None, "N/A"
-            if node_obj: hk_chain = node_obj.get('hotkey', 'N/A')
-            if np.isnan(w_s) and np.isnan(g_s) and np.isnan(sm_s): weights_final[idx] = 0.0
-            else:
-                wc, gc, sc, total_w_avail = 0.0,0.0,0.0,0.0
-                if not np.isnan(w_s): wc,total_w_avail = 0.70*w_s, total_w_avail+0.70
-                if not np.isnan(g_s): gc,total_w_avail = 0.15*sigmoid(g_s), total_w_avail+0.15
-                if not np.isnan(sm_s): sc,total_w_avail = 0.15*sm_s, total_w_avail+0.15
-                weights_final[idx] = (wc+gc+sc)/total_w_avail if total_w_avail>0 else 0.0
-            logger.info(f"UID {idx} (HK: {hk_chain}): Wea={w_s if not np.isnan(w_s) else '-'} ({weather_counts[idx]} scores), Geo={g_s if not np.isnan(g_s) else '-'} ({geo_counts[idx]} scores), Soil={sm_s if not np.isnan(sm_s) else '-'} ({soil_counts[idx]} scores), AggW={weights_final[idx]:.4f}")
-        logger.info(f"Weights before normalization: Min={np.min(weights_final):.4f}, Max={np.max(weights_final):.4f}, Mean={np.mean(weights_final):.4f}")
+            if len(trans_nz) > 1 and np.std(trans_nz) < 0.01:
+                logger.warning(f"Transformed weights too uniform (std={np.std(trans_nz):.4f}), switching to rank-based.")
+                sorted_indices = np.argsort(-weights_final); transformed_w = np.zeros_like(weights_final)
+                pos_count = np.sum(weights_final > 0)
+                for i,idx_val in enumerate(sorted_indices[:pos_count]): transformed_w[idx_val] = 1.0/((i+1)**1.2)
+                rank_nz = transformed_w[transformed_w > 0]
+                if rank_nz.any(): logger.info(f"Rank-based: Min={np.min(rank_nz):.4f}, Max={np.max(rank_nz):.4f}, Mean={np.mean(rank_nz):.4f}")
+            
+            final_sum = np.sum(transformed_w); final_weights_list = None
+            if final_sum > 0:
+                transformed_w /= final_sum
+                final_nz_vals = transformed_w[transformed_w > 0]
+                if final_nz_vals.any():
+                    logger.info(f"Final Norm Weights: Count={len(final_nz_vals)}, Min={np.min(final_nz_vals):.4f}, Max={np.max(final_nz_vals):.4f}, Std={np.std(final_nz_vals):.4f}")
+                    if len(np.unique(final_nz_vals)) < len(final_nz_vals)/2 : logger.warning(f"Low unique weights! {len(np.unique(final_nz_vals))}/{len(final_nz_vals)}")
+                    if final_nz_vals.max() > 0.90: logger.warning(f"Max weight {final_nz_vals.max():.4f} is very high!")
+                final_weights_list = transformed_w.tolist()
+                logger.info("Final normalized weights calculated.")
+            else: 
+                logger.warning("Sum of weights is zero, cannot normalize! Returning None.")
+                final_weights_list = None
+            
+            # Clean up all intermediate arrays to prevent memory leaks
+            try:
+                del weather_scores, geomagnetic_scores, soil_scores
+                del weather_counts, geo_counts, soil_counts
+                del weights_final, transformed_w
+                if 'nz_weights' in locals(): del nz_weights
+                if 'norm_weights' in locals(): del norm_weights
+                if 'positives' in locals(): del positives
+                if 'trans_nz' in locals(): del trans_nz
+                if 'sorted_indices' in locals(): del sorted_indices
+            except Exception as cleanup_e:
+                logger.warning(f"Error during sync weight calculation cleanup: {cleanup_e}")
+            
+            return final_weights_list
         
-        non_zero_mask = weights_final != 0.0
-        if not np.any(non_zero_mask): logger.warning("No non-zero weights to normalize!"); return None
-        
-        nz_weights = weights_final[non_zero_mask]
-        max_w_val = np.max(nz_weights)
-        if max_w_val == 0: logger.warning("Max weight is 0, cannot normalize."); return None
-        
-        norm_weights = np.copy(weights_final); norm_weights[non_zero_mask] /= max_w_val
-        positives = norm_weights[norm_weights > 0]
-        if not positives.any(): logger.warning("No positive weights after initial normalization!"); return None
-        
-        M = np.percentile(positives, 80); logger.info(f"Using 80th percentile ({M:.8f}) as curve midpoint")
-        b,Q,v,k,a,slope = 70,8,0.3,0.98,0.0,0.01
-        transformed_w = np.zeros_like(weights_final)
-        nz_indices = np.where(weights_final > 0.0)[0]
-        if not nz_indices.any(): logger.warning("No positive weight indices for transformation!"); return None
-
-        for idx in nz_indices:
-            sig_p = a+(k-a)/np.power(1+Q*np.exp(-b*(norm_weights[idx]-M)),1/v)
-            transformed_w[idx] = sig_p + slope*norm_weights[idx]
-        
-        trans_nz = transformed_w[transformed_w > 0]
-        if trans_nz.any(): logger.info(f"Transformed weights: Min={np.min(trans_nz):.4f}, Max={np.max(trans_nz):.4f}, Mean={np.mean(trans_nz):.4f}")
-        else: logger.warning("No positive weights after sigmoid transformation!"); # Continue to rank-based if needed or return None
-
-        if len(trans_nz) > 1 and np.std(trans_nz) < 0.01:
-            logger.warning(f"Transformed weights too uniform (std={np.std(trans_nz):.4f}), switching to rank-based.")
-            sorted_indices = np.argsort(-weights_final); transformed_w = np.zeros_like(weights_final)
-            pos_count = np.sum(weights_final > 0)
-            for i,idx_val in enumerate(sorted_indices[:pos_count]): transformed_w[idx_val] = 1.0/((i+1)**1.2)
-            rank_nz = transformed_w[transformed_w > 0]
-            if rank_nz.any(): logger.info(f"Rank-based: Min={np.min(rank_nz):.4f}, Max={np.max(rank_nz):.4f}, Mean={np.mean(rank_nz):.4f}")
-        
-        final_sum = np.sum(transformed_w); final_weights_list = None
-        if final_sum > 0:
-            transformed_w /= final_sum
-            final_nz_vals = transformed_w[transformed_w > 0]
-            if final_nz_vals.any():
-                logger.info(f"Final Norm Weights: Count={len(final_nz_vals)}, Min={np.min(final_nz_vals):.4f}, Max={np.max(final_nz_vals):.4f}, Std={np.std(final_nz_vals):.4f}")
-                if len(np.unique(final_nz_vals)) < len(final_nz_vals)/2 : logger.warning(f"Low unique weights! {len(np.unique(final_nz_vals))}/{len(final_nz_vals)}")
-                if final_nz_vals.max() > 0.90: logger.warning(f"Max weight {final_nz_vals.max():.4f} is very high!")
-            final_weights_list = transformed_w.tolist()
-            logger.info("Final normalized weights calculated.")
-        else: logger.warning("Sum of weights is zero, cannot normalize! Returning None.")
-        return final_weights_list
+        except Exception as calc_error:
+            logger.error(f"Error in sync weight calculation: {calc_error}")
+            return None
 
     async def _calc_task_weights(self):
         """Calculate weights based on recent task scores. Async part fetches data."""
@@ -2618,6 +2859,7 @@ class GaiaValidator:
             
             # Fetch all data concurrently using regular async approach
             try:
+                self._log_memory_usage("calc_weights_before_db_fetch")
                 weather_results, geomagnetic_results, soil_results, validator_nodes_list = await asyncio.gather(
                     self.database_manager.fetch_all(weather_query, params),
                     self.database_manager.fetch_all(geomagnetic_query, params),
@@ -2625,6 +2867,22 @@ class GaiaValidator:
                     self.database_manager.fetch_all(validator_nodes_query),
                     return_exceptions=True
                 )
+                self._log_memory_usage("calc_weights_after_db_fetch")
+                
+                # Log individual dataset sizes
+                if weather_results and not isinstance(weather_results, Exception):
+                    logger.info(f"Weather dataset: {len(weather_results)} records")
+                if geomagnetic_results and not isinstance(geomagnetic_results, Exception):
+                    logger.info(f"Geomagnetic dataset: {len(geomagnetic_results)} records")
+                if soil_results and not isinstance(soil_results, Exception):
+                    logger.info(f"Soil dataset: {len(soil_results)} records")
+                    # Check soil record size (they contain large score arrays)
+                    if soil_results:
+                        sample_soil = soil_results[0]
+                        if 'score' in sample_soil and isinstance(sample_soil['score'], list):
+                            logger.info(f"Soil score array size per record: {len(sample_soil['score'])} elements")
+                if validator_nodes_list and not isinstance(validator_nodes_list, Exception):
+                    logger.info(f"Validator nodes dataset: {len(validator_nodes_list)} records")
                 
                 # Check for exceptions in results
                 for i, result in enumerate([weather_results, geomagnetic_results, soil_results, validator_nodes_list]):
@@ -2650,13 +2908,16 @@ class GaiaValidator:
                 logger.info(f"Fetched scores: Weather={len(weather_results)}, Geo={len(geomagnetic_results)}, Soil={len(soil_results)}")
                 
                 # Convert to list for the sync calculation
+                self._log_memory_usage("calc_weights_before_node_conversion")
                 validator_nodes_by_uid_list = [None] * 256
                 for node_dict in validator_nodes_list:
                     uid = node_dict.get('uid')
                     if uid is not None and 0 <= uid < 256:
                         validator_nodes_by_uid_list[uid] = node_dict
+                self._log_memory_usage("calc_weights_after_node_conversion")
 
                 # Perform CPU-bound weight calculation in thread pool to avoid blocking
+                self._log_memory_usage("calc_weights_before_sync_calc")
                 loop = asyncio.get_event_loop()
                 final_weights_list = await loop.run_in_executor(
                     None,
@@ -2667,6 +2928,7 @@ class GaiaValidator:
                     now,
                     validator_nodes_by_uid_list
                 )
+                self._log_memory_usage("calc_weights_after_sync_calc")
 
                 # Aggressive memory cleanup after weight calculation
                 try:
@@ -2677,12 +2939,18 @@ class GaiaValidator:
                     del validator_nodes_list
                     del validator_nodes_by_uid_list
                     
-                    # Force garbage collection after processing large datasets
-                    import gc
-                    collected = gc.collect()
-                    if collected > 50:
-                        logger.info(f"Weight calculation cleanup: GC collected {collected} objects")
-                        
+                    # Force comprehensive cleanup for weight calculation (if fully initialized)
+                    if (hasattr(self, 'substrate_manager') and 
+                        self.substrate_manager is not None and
+                        hasattr(self, 'last_metagraph_sync')):
+                        memory_freed = self._comprehensive_memory_cleanup("weight_calculation")
+                    else:
+                        # Fallback to basic cleanup during startup
+                        import gc
+                        collected = gc.collect()
+                        logger.info(f"Basic GC cleanup during startup: collected {collected} objects")
+                        memory_freed = 0
+                    
                     # Log memory after cleanup
                     self._log_memory_usage("calc_weights_after_cleanup")
                     
@@ -3173,6 +3441,291 @@ class GaiaValidator:
                 logger.error(f"Error in memory_snapshot_taker: {e}", exc_info=True)
                 await asyncio.sleep(60) # Wait a bit before retrying if an error occurs
 
+    async def periodic_substrate_cleanup(self):
+        """Periodically force substrate connection cleanup to prevent memory leaks."""
+        while True:
+            try:
+                await asyncio.sleep(300)  # Run every 5 minutes (more frequent cleanup)
+                
+                if hasattr(self, 'substrate_manager') and self.substrate_manager:
+                    try:
+                        stats_before = self.substrate_manager.get_stats()
+                        logger.debug(f"Substrate cleanup - Before: queries={stats_before['query_count']}, age={stats_before['connection_age']:.1f}s")
+                        
+                        # Force cleanup if query count is high or connection is old  
+                        if stats_before['query_count'] > 150 or stats_before['connection_age'] > 400:  # 6.7 minutes
+                            logger.info("Forcing substrate connection refresh due to high usage/age")
+                            self.substrate = self.substrate_manager.force_reconnect()
+                            
+                        # Always force garbage collection
+                        self.substrate_manager._force_garbage_collection()
+                        
+                        stats_after = self.substrate_manager.get_stats()
+                        logger.debug(f"Substrate cleanup - After: queries={stats_after['query_count']}, age={stats_after['connection_age']:.1f}s")
+                        
+                    except Exception as e:
+                        logger.debug(f"Error during periodic substrate cleanup: {e}")
+                
+            except asyncio.CancelledError:
+                logger.info("Periodic substrate cleanup task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in periodic substrate cleanup: {e}")
+                await asyncio.sleep(60)  # Shorter retry on error
+
+    async def aggressive_memory_cleanup(self):
+        """Aggressive memory cleanup to prevent memory leaks."""
+        while True:
+            try:
+                await asyncio.sleep(120)  # Run every 2 minutes
+                
+                # Get memory before cleanup
+                if PSUTIL_AVAILABLE:
+                    process = psutil.Process()
+                    memory_before = process.memory_info().rss / (1024 * 1024)
+                    
+                    # Perform garbage collection
+                    import gc
+                    collected = gc.collect()
+                    
+                    # Clear any module-level caches if available
+                    try:
+                        # Clear httpx connection pools more aggressively
+                        if hasattr(self, 'miner_client') and self.miner_client and not self.miner_client.is_closed:
+                            # Force close idle connections
+                            await self._cleanup_idle_connections()
+                        
+                        # Clear any fsspec caches
+                        try:
+                            import fsspec
+                            if hasattr(fsspec, 'config') and hasattr(fsspec.config, 'conf'):
+                                fsspec.config.conf.clear()
+                            if hasattr(fsspec, 'filesystem') and hasattr(fsspec.filesystem, '_cache'):
+                                fsspec.filesystem._cache.clear()
+                        except ImportError:
+                            pass
+                        
+                        # Clear any xarray caches
+                        try:
+                            import xarray as xr
+                            if hasattr(xr, 'backends') and hasattr(xr.backends, 'list_engines'):
+                                # Force cleanup of any xarray backend caches
+                                pass
+                        except ImportError:
+                            pass
+                            
+                    except Exception as cache_clear_error:
+                        logger.debug(f"Error clearing caches: {cache_clear_error}")
+                    
+                    # Get memory after cleanup
+                    memory_after = process.memory_info().rss / (1024 * 1024)
+                    memory_freed = memory_before - memory_after
+                    
+                    # Use comprehensive cleanup instead of just GC for better results (if fully initialized)
+                    if (hasattr(self, 'substrate_manager') and 
+                        self.substrate_manager is not None and
+                        hasattr(self, 'last_metagraph_sync')):
+                        comp_memory_freed = self._comprehensive_memory_cleanup("periodic_aggressive")
+                    else:
+                        comp_memory_freed = 0  # Skip during startup
+                    
+                    if collected > 50 or comp_memory_freed > 10:
+                        logger.info(f"Memory cleanup: GC collected {collected} objects, comprehensive freed {comp_memory_freed:.1f}MB")
+                    else:
+                        logger.debug(f"Memory cleanup: GC collected {collected} objects, comprehensive freed {comp_memory_freed:.1f}MB")
+                        
+            except asyncio.CancelledError:
+                logger.info("Aggressive memory cleanup task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in aggressive memory cleanup: {e}")
+                await asyncio.sleep(30)  # Shorter retry on error
+
+    def _comprehensive_memory_cleanup(self, context: str = "general"):
+        """
+        Comprehensive memory cleanup that goes beyond standard garbage collection.
+        Targets C extension memory, file handles, module caches, and other persistent references.
+        """
+        
+        # Skip cleanup during early startup to prevent initialization issues
+        if not hasattr(self, 'substrate_manager') or self.substrate_manager is None:
+            logger.debug(f"Skipping comprehensive cleanup for {context} - validator not fully initialized")
+            return 0
+            
+        logger.info(f"Starting comprehensive memory cleanup for context: {context}")
+        try:
+            initial_memory = self._get_memory_usage()
+        except Exception:
+            # Fallback if memory monitoring isn't available yet
+            initial_memory = 0
+        
+        try:
+            # 1. Clear exception tracebacks (major memory holder)
+            import sys
+            sys.last_traceback = None
+            sys.last_type = None 
+            sys.last_value = None
+            
+            # 2. Clear module-level caches that accumulate over time
+            try:
+                # Clear substrate/scalecodec module caches
+                for module_name in list(sys.modules.keys()):
+                    if any(pattern in module_name.lower() for pattern in 
+                           ['substrate', 'scalecodec', 'scale_info', 'metadata']):
+                        module = sys.modules.get(module_name)
+                        if hasattr(module, '__dict__'):
+                            # Clear known cache attributes
+                            for attr_name in list(module.__dict__.keys()):
+                                if any(cache_pattern in attr_name.lower() for cache_pattern in 
+                                       ['cache', '_cache', 'cached', 'registry', '_registry']):
+                                    try:
+                                        cache_obj = getattr(module, attr_name)
+                                        if hasattr(cache_obj, 'clear'):
+                                            cache_obj.clear()
+                                        elif isinstance(cache_obj, dict):
+                                            cache_obj.clear()
+                                    except Exception:
+                                        pass
+            except Exception as e:
+                logger.debug(f"Error clearing module caches: {e}")
+            
+            # 3. Clear numpy/xarray memory more aggressively
+            try:
+                import numpy as np
+                # Force numpy to release cached memory
+                if hasattr(np, '_get_ndarray_cache'):
+                    np._get_ndarray_cache().clear()
+                    
+                # Clear any xarray caches
+                try:
+                    import xarray as xr
+                    if hasattr(xr.backends, 'plugins') and hasattr(xr.backends.plugins, 'clear'):
+                        xr.backends.plugins.clear()
+                except ImportError:
+                    pass
+            except Exception as e:
+                logger.debug(f"Error clearing numpy/xarray caches: {e}")
+            
+            # 4. Clear HTTP client caches (only if they exist)
+            try:
+                if hasattr(self, 'miner_http_client') and getattr(self, 'miner_http_client', None):
+                    # Clear any response caches
+                    if hasattr(self.miner_http_client, '_transport'):
+                        transport = self.miner_http_client._transport
+                        if hasattr(transport, '_pool'):
+                            transport._pool.clear()
+                            
+                if hasattr(self, 'validator_http_client') and getattr(self, 'validator_http_client', None):
+                    if hasattr(self.validator_http_client, '_transport'):
+                        transport = self.validator_http_client._transport
+                        if hasattr(transport, '_pool'):
+                            transport._pool.clear()
+            except Exception as e:
+                logger.debug(f"Error clearing HTTP client caches: {e}")
+            
+            # 5. Clear database connection pool caches (only if fully initialized)
+            try:
+                if hasattr(self, 'database_manager') and getattr(self, 'database_manager', None):
+                    # Force database manager to clear any cached connections/results
+                    if hasattr(self.database_manager, 'pool') and getattr(self.database_manager, 'pool', None):
+                        # Clear any cached query results or metadata
+                        pool = self.database_manager.pool
+                        if hasattr(pool, '_queue') and hasattr(pool._queue, 'empty'):
+                            # Clear connection pool queue
+                            try:
+                                while not pool._queue.empty():
+                                    conn = pool._queue.get_nowait()
+                                    if hasattr(conn, 'invalidate'):
+                                        conn.invalidate()
+                            except:
+                                pass  # Queue might be empty or connection pool not ready
+            except Exception as e:
+                logger.debug(f"Error clearing database caches: {e}")
+            
+            # 6. Clear asyncio task references
+            try:
+                # Get current event loop and clear completed task references
+                loop = asyncio.get_event_loop()
+                if hasattr(loop, '_ready'):
+                    loop._ready.clear()
+                if hasattr(loop, '_scheduled'):
+                    # Don't clear scheduled tasks, but remove completed ones
+                    completed_tasks = [task for task in getattr(loop, '_scheduled', []) if task.cancelled()]
+                    for task in completed_tasks:
+                        if hasattr(loop, '_scheduled'):
+                            try:
+                                loop._scheduled.remove(task)
+                            except ValueError:
+                                pass
+            except Exception as e:
+                logger.debug(f"Error clearing asyncio references: {e}")
+            
+            # 7. Force multiple garbage collection passes with different strategies
+            import gc
+            collected_total = 0
+            
+            # First pass: standard collection
+            collected = gc.collect()
+            collected_total += collected
+            
+            # Second pass: collect generation 0 (youngest objects)
+            collected = gc.collect(0)
+            collected_total += collected
+            
+            # Third pass: collect all generations
+            for generation in range(3):
+                collected = gc.collect(generation)
+                collected_total += collected
+            
+            # 8. Final aggressive cleanup for specific object types (skip during startup)
+            try:
+                # Only do expensive object iteration if we're not in early startup
+                if context != "emergency_startup" and hasattr(self, 'last_metagraph_sync'):
+                    # Force cleanup of specific problematic object types
+                    objects_cleaned = 0
+                    for obj in gc.get_objects():
+                        if objects_cleaned > 1000:  # Limit cleanup to prevent hanging
+                            break
+                        obj_type = type(obj).__name__
+                        # Target known problematic types
+                        if any(pattern in obj_type.lower() for pattern in 
+                               ['substrate', 'scale', 'metadata', 'dataset', 'dataarray']):
+                            if hasattr(obj, 'close'):
+                                try:
+                                    obj.close()
+                                    objects_cleaned += 1
+                                except:
+                                    pass
+                            elif hasattr(obj, 'clear'):
+                                try:
+                                    obj.clear()
+                                    objects_cleaned += 1
+                                except:
+                                    pass
+            except Exception as e:
+                logger.debug(f"Error in aggressive object cleanup: {e}")
+            
+            # 9. Final garbage collection
+            final_collected = gc.collect()
+            collected_total += final_collected
+            
+            try:
+                final_memory = self._get_memory_usage()
+                memory_freed = initial_memory - final_memory
+            except Exception:
+                # Fallback if memory monitoring fails
+                final_memory = 0
+                memory_freed = 0
+            
+            logger.info(f"Comprehensive cleanup for {context}: "
+                       f"freed {memory_freed:.1f}MB, collected {collected_total} objects")
+            
+            return memory_freed
+            
+        except Exception as e:
+            logger.error(f"Error during comprehensive memory cleanup: {e}")
+            return 0
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -3199,7 +3752,7 @@ if __name__ == "__main__":
     logger.info(f"[Startup] Using validator-specific Alembic configuration")
 
     try:
-        print("[Startup] Checking database schema version using Alembic...")
+        print("[STARTUP DEBUG] Checking database schema version using Alembic...")
         # Construct path relative to this script file to find alembic_validator.ini at project root
         # Assumes validator.py is in project_root/gaia/validator/validator.py
         current_script_dir_val = os.path.dirname(os.path.abspath(__file__))
@@ -3207,24 +3760,24 @@ if __name__ == "__main__":
         alembic_ini_path_val = os.path.join(project_root_val, "alembic_validator.ini")
 
         if not os.path.exists(alembic_ini_path_val):
-            print(f"[Startup] ERROR: alembic_validator.ini not found at expected path: {alembic_ini_path_val}")
+            print(f"[STARTUP DEBUG] ERROR: alembic_validator.ini not found at expected path: {alembic_ini_path_val}")
             sys.exit("Alembic validator configuration not found.")
 
         alembic_cfg_val = Config(alembic_ini_path_val)
-        print(f"[Startup] Validator: Using Alembic configuration from: {alembic_ini_path_val}")
-
+        print(f"[STARTUP DEBUG] Validator: Using Alembic configuration from: {alembic_ini_path_val}")
+        
         # Diagnostic block for validator
         try:
             from alembic.script import ScriptDirectory
             script_dir_instance_val = ScriptDirectory.from_config(alembic_cfg_val)
-            print(f"[Startup] Validator DIAGNOSTIC: ScriptDirectory main path: {script_dir_instance_val.dir}")
-            print(f"[Startup] Validator DIAGNOSTIC: ScriptDirectory version_locations: {script_dir_instance_val.version_locations}")
+            print(f"[STARTUP DEBUG] Validator DIAGNOSTIC: ScriptDirectory main path: {script_dir_instance_val.dir}")
+            print(f"[STARTUP DEBUG] Validator DIAGNOSTIC: ScriptDirectory version_locations: {script_dir_instance_val.version_locations}")
         except Exception as e_diag_val:
-            print(f"[Startup] Validator DIAGNOSTIC: Error: {e_diag_val}")
+            print(f"[STARTUP DEBUG] Validator DIAGNOSTIC: Error: {e_diag_val}")
 
         alembic_auto_upgrade_val = os.getenv("ALEMBIC_AUTO_UPGRADE", "True").lower() in ["true", "1", "yes"]
         if alembic_auto_upgrade_val:
-            print(f"[Startup] Validator: ALEMBIC_AUTO_UPGRADE is True. Checking database schema status...")
+            print(f"[STARTUP DEBUG] Validator: ALEMBIC_AUTO_UPGRADE is True. Checking database schema status...")
             
             # Construct database URL for Alembic check - use psycopg2 for synchronous operations
             db_host = os.getenv("DB_HOST", "localhost")
@@ -3252,7 +3805,7 @@ if __name__ == "__main__":
                     context = MigrationContext.configure(conn)
                     current_rev = context.get_current_revision()
                     
-                print(f"[Startup] Current database revision: {current_rev or 'None (new database)'}")
+                print(f"[STARTUP DEBUG] Current database revision: {current_rev or 'None (new database)'}")
                 
                 # Determine pending migrations
                 pending_revisions = []
@@ -3264,31 +3817,31 @@ if __name__ == "__main__":
                     pending_revisions = list(script_dir.walk_revisions(base=current_rev, head="head"))
 
                 if pending_revisions:
-                    print(f"[Startup] Found {len(pending_revisions)} pending migration(s).")
+                    print(f"[STARTUP DEBUG] Found {len(pending_revisions)} pending migration(s).")
                     for rev in pending_revisions:
-                        print(f"[Startup]  -> Pending: {rev.revision} ({rev.doc})")
-                    print("[Startup] Applying pending migrations...")
+                        print(f"[STARTUP DEBUG]  -> Pending: {rev.revision} ({rev.doc})")
+                    print("[STARTUP DEBUG] Applying pending migrations...")
                     command.upgrade(alembic_cfg_val, "head")
-                    print("[Startup] Database schema upgraded to head successfully.")
+                    print("[STARTUP DEBUG] Database schema upgraded to head successfully.")
                 else:
-                    print("[Startup] Database schema is already up-to-date.")
+                    print("[STARTUP DEBUG] Database schema is already up-to-date.")
                         
             except Exception as e:
-                print(f"[Startup] Warning: Could not reliably check for pending migrations: {e}")
-                print("[Startup] Attempting to run 'alembic upgrade head' as a fallback...")
+                print(f"[STARTUP DEBUG] Warning: Could not reliably check for pending migrations: {e}")
+                print("[STARTUP DEBUG] Attempting to run 'alembic upgrade head' as a fallback...")
                 try:
                     command.upgrade(alembic_cfg_val, "head")
-                    print("[Startup] Fallback upgrade command completed.")
+                    print("[STARTUP DEBUG] Fallback upgrade command completed.")
                 except Exception as upgrade_err:
-                    print(f"[Startup] ERROR: Fallback upgrade command failed: {upgrade_err}")
+                    print(f"[STARTUP DEBUG] ERROR: Fallback upgrade command failed: {upgrade_err}")
 
         else:
-            print("[Startup] Validator: ALEMBIC_AUTO_UPGRADE is False. Skipping auto schema upgrade.")
+            print("[STARTUP DEBUG] Validator: ALEMBIC_AUTO_UPGRADE is False. Skipping auto schema upgrade.")
 
     except CommandError as e_val:
-         print(f"[Startup] Validator: ERROR: Alembic command failed: {e_val}")
+         print(f"[STARTUP DEBUG] Validator: ERROR: Alembic command failed: {e_val}")
     except Exception as e_val_outer: # Catch other potential errors like path issues
-        print(f"[Startup] Validator: ERROR during Alembic setup: {e_val_outer}", exc_info=True)
+        print(f"[STARTUP DEBUG] Validator: ERROR during Alembic setup: {e_val_outer}", exc_info=True)
 
     logger.info("Validator Alembic check complete. Starting main validator application...")
     # --- End Alembic check code for Validator ---
@@ -3299,7 +3852,7 @@ if __name__ == "__main__":
         import sys
         
         logger.info("Ensuring Python requirements are up to date...")
-        print("[Startup] Installing/updating requirements from requirements.txt...")
+        print("[STARTUP DEBUG] Installing/updating requirements from requirements.txt...")
         
         # Construct path to requirements.txt relative to this script
         current_script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -3308,7 +3861,7 @@ if __name__ == "__main__":
         
         if not os.path.exists(requirements_path):
             logger.warning(f"requirements.txt not found at {requirements_path}, skipping pip install")
-            print(f"[Startup] Warning: requirements.txt not found at {requirements_path}")
+            print(f"[STARTUP DEBUG] Warning: requirements.txt not found at {requirements_path}")
         else:
             # Run pip install with timeout to prevent hanging
             result = subprocess.run(
@@ -3321,33 +3874,37 @@ if __name__ == "__main__":
             
             if result.returncode == 0:
                 logger.info("Successfully updated Python requirements")
-                print("[Startup] Python requirements updated successfully")
+                print("[STARTUP DEBUG] Python requirements updated successfully")
                 if result.stdout:
                     logger.debug(f"Pip install output: {result.stdout}")
             else:
                 logger.warning(f"Pip install returned non-zero exit code {result.returncode}")
-                print(f"[Startup] Warning: pip install failed with exit code {result.returncode}")
+                print(f"[STARTUP DEBUG] Warning: pip install failed with exit code {result.returncode}")
                 if result.stderr:
                     logger.warning(f"Pip install stderr: {result.stderr}")
-                    print(f"[Startup] Pip error output: {result.stderr}")
+                    print(f"[STARTUP DEBUG] Pip error output: {result.stderr}")
                     
     except subprocess.TimeoutExpired:
         logger.warning("Pip install timed out after 5 minutes, continuing with startup")
-        print("[Startup] Warning: pip install timed out, continuing with startup")
+        print("[STARTUP DEBUG] Warning: pip install timed out, continuing with startup")
     except Exception as e:
         logger.warning(f"Error during pip install: {e}, continuing with startup")
-        print(f"[Startup] Warning: Error during pip install: {e}")
+        print(f"[STARTUP DEBUG] Warning: Error during pip install: {e}")
     # --- End requirements update ---
 
+    print("[STARTUP DEBUG] Creating GaiaValidator instance")
     validator = GaiaValidator(args)
     try:
+        print("[STARTUP DEBUG] Starting validator.main()")
         asyncio.run(validator.main())
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received, shutting down...")
+        print("[STARTUP DEBUG] Keyboard interrupt received")
     except Exception as e:
         logger.critical(f"Unhandled exception in main loop: {e}", exc_info=True)
+        print(f"[STARTUP DEBUG] Unhandled exception: {e}")
     finally:
-
+        print("[STARTUP DEBUG] Entering finally block")
         if hasattr(validator, '_cleanup_done') and not validator._cleanup_done:
              try:
                  loop = asyncio.get_event_loop()
@@ -3357,3 +3914,5 @@ if __name__ == "__main__":
                  loop.run_until_complete(validator._initiate_shutdown())
              except Exception as cleanup_e:
                  logger.error(f"Error during final cleanup: {cleanup_e}")
+                 print(f"[STARTUP DEBUG] Error during final cleanup: {cleanup_e}")
+        print("[STARTUP DEBUG] Startup sequence completed")

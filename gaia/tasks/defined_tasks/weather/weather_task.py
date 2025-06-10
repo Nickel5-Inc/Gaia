@@ -170,8 +170,8 @@ def _load_config(self):
     config['day1_clone_penalty_gamma'] = float(os.getenv('WEATHER_DAY1_CLONE_PENALTY_GAMMA', '1.0'))
     default_clone_delta_thresholds = {
         "2t": 0.01,  # (RMSE 0.1K)^2
-        "msl": 20000, # (RMSE 100Pa or 1hPa)^2
-        "z500": 10000,   # (RMSE 100 m^2/s^2)^2 for geopotential
+        "msl": 10000, # (RMSE 100Pa or 1hPa)^2
+        "z500": 1500,   # (RMSE 100 m^2/s^2)^2 for geopotential
         "t850": 0.25    # (RMSE 0.5K)^2 
     }
     try:

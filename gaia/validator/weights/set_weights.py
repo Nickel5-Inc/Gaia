@@ -49,6 +49,13 @@ async def get_active_validator_uids(netuid, substrate_manager=None, subtensor_ne
         logger.error(f"Error getting active validators: {e}")
         logger.error(traceback.format_exc())
         return []
+    finally:
+        # Clean up substrate connection if we created it locally
+        if not substrate_manager and 'substrate' in locals():
+            try:
+                substrate.close()
+            except Exception as cleanup_error:
+                logger.debug(f"Error cleaning up substrate connection: {cleanup_error}")
 
 
 class FiberWeightSetter:
@@ -65,16 +72,36 @@ class FiberWeightSetter:
         self.netuid = netuid
         self.network = network
         self.substrate_manager = substrate_manager
-        # Use managed connection if available, otherwise create a new one
+        # Always prefer substrate manager to prevent memory leaks
         if self.substrate_manager:
             self.substrate = self.substrate_manager.get_connection()
         else:
+            # This should rarely happen in production - log warning
+            logger.warning("Creating unmanaged substrate connection in FiberWeightSetter.__init__ - potential memory leak")
             self.substrate = interface.get_substrate(subtensor_network=network)
         self.nodes = None
         self.keypair = chain_utils.load_hotkey_keypair(
             wallet_name=wallet_name, hotkey_name=hotkey_name
         )
         self.timeout = timeout
+
+    def cleanup(self):
+        """Clean up substrate connection if it's unmanaged."""
+        if not self.substrate_manager and hasattr(self, 'substrate') and self.substrate:
+            try:
+                logger.debug("Cleaning up unmanaged substrate connection in FiberWeightSetter")
+                self.substrate.close()
+                self.substrate = None
+            except Exception as e:
+                logger.debug(f"Error cleaning up substrate connection: {e}")
+
+    def __del__(self):
+        """Destructor to ensure cleanup happens when object is destroyed."""
+        try:
+            self.cleanup()
+        except Exception:
+            pass  # Ignore errors in destructor
+
 
 
     def calculate_weights(self, weights: List[float] = None) -> tuple[torch.Tensor, List[int]]:
@@ -191,10 +218,19 @@ class FiberWeightSetter:
 
             logger.info(f"\nSetting weights for subnet {self.netuid}...")
 
-            # Use managed connection if available, otherwise create a new one
+            # Always refresh substrate connection from manager to ensure it's current
             if self.substrate_manager:
                 self.substrate = self.substrate_manager.get_connection()
+                logger.debug("Using managed substrate connection for weight setting")
             else:
+                # This creates an unmanaged connection - should only be used as fallback
+                logger.warning("No substrate manager provided - creating unmanaged connection (potential memory leak)")
+                # Clean up any existing unmanaged connection first
+                if hasattr(self, 'substrate') and self.substrate:
+                    try:
+                        self.substrate.close()
+                    except Exception as e:
+                        logger.debug(f"Error closing old unmanaged connection: {e}")
                 self.substrate = interface.get_substrate(subtensor_network=self.network)
             self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
             logger.info(f"Found {len(self.nodes)} nodes in subnet")
