@@ -2037,8 +2037,8 @@ class GaiaValidator:
                 logger.info("Auto-updater task started independently")
                 
                 tasks_lambdas = [ # Renamed to avoid conflict if tasks variable is used elsewhere
-                    #lambda: self.geomagnetic_task.validator_execute(self),
-                    #lambda: self.soil_task.validator_execute(self),
+                    lambda: self.geomagnetic_task.validator_execute(self),
+                    lambda: self.soil_task.validator_execute(self),
                     lambda: self.weather_task.validator_execute(self),
                     lambda: self.status_logger(),
                     lambda: self.main_scoring(),
@@ -2046,7 +2046,7 @@ class GaiaValidator:
                     # The MinerScoreSender task will be added conditionally below
                     lambda: self.manage_earthdata_token(),
                     lambda: self.monitor_client_health(),  # Added HTTP client monitoring
-                    lambda: self.database_monitor(),
+                    #lambda: self.database_monitor(),
                     lambda: self.periodic_substrate_cleanup(),  # Added substrate cleanup task
                     lambda: self.aggressive_memory_cleanup(),  # Added aggressive memory cleanup task
                     #lambda: self.plot_database_metrics_periodically() # Added plotting task

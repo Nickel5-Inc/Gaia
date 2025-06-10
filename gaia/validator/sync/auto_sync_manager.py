@@ -32,6 +32,16 @@ class AutoSyncManager:
     """
     
     def __init__(self, test_mode: bool = False):
+        """
+        Initialize AutoSyncManager.
+        
+        Args:
+            test_mode: If True, uses faster scheduling for testing (15min diffs vs 4hr)
+                      This parameter comes from:
+                      - Validator application: Passed based on --test flag or default mode
+                      - Standalone script: Passed based on --test flag when run directly
+                      - Both use the same test_mode parameter, no override occurs
+        """
         self.test_mode = test_mode
         self.config = self._load_config()
         self.is_primary = self.config.get('is_primary', False)
@@ -55,8 +65,15 @@ class AutoSyncManager:
                 'health_check_interval': 300  # Every 5 minutes
             }
         
-        logger.info(f"AutoSyncManager initialized - Mode: {'Primary' if self.is_primary else 'Replica'}, Test: {test_mode}")
-        logger.info(f"Backup schedule: {self.backup_schedule}")
+        # VERY OBVIOUS STARTUP LOGGING
+        print("=" * 80)
+        print("🚀 AUTO SYNC MANAGER STARTING UP 🚀")
+        print("=" * 80)
+        logger.info("🚀" * 10 + " AUTO SYNC MANAGER INITIALIZATION " + "🚀" * 10)
+        logger.info(f"🏠 MODE: {'PRIMARY DATABASE' if self.is_primary else 'REPLICA DATABASE'}")
+        logger.info(f"🧪 TEST MODE: {'ENABLED (Fast scheduling for testing)' if test_mode else 'DISABLED (Production scheduling)'}")
+        logger.info(f"📋 BACKUP SCHEDULE: {self.backup_schedule}")
+        logger.info("=" * 80)
 
     def _find_pgdata_path(self) -> str:
         """Find the data directory of the active PostgreSQL instance."""
@@ -554,18 +571,26 @@ pg1-user={self.config['pguser']}
 
     async def start_scheduling(self):
         """Start application-controlled backup scheduling."""
+        print("\n" + "🔥" * 80)
+        print("🔥 AUTO SYNC MANAGER SCHEDULING STARTED 🔥")
+        print("🔥" * 80)
+        
         if self.is_primary:
-            logger.info("Starting backup scheduling...")
+            logger.info("🔥" * 10 + " BACKUP SCHEDULING ACTIVE " + "🔥" * 10)
             if self.test_mode:
-                logger.info("TEST MODE: Differential backups every 15 minutes, health checks every 5 minutes")
+                logger.info("⚡ TEST MODE ACTIVE: Differential backups every 15 minutes, health checks every 5 minutes ⚡")
+                print("⚡ TEST MODE: FAST BACKUP SCHEDULE ENABLED FOR TESTING ⚡")
             else:
-                logger.info("PRODUCTION MODE: Full backups daily at 2:00 AM, differential backups every 4 hours")
+                logger.info("🏭 PRODUCTION MODE: Full backups daily at 2:00 AM, differential backups every 4 hours 🏭")
+                print("🏭 PRODUCTION MODE: STANDARD BACKUP SCHEDULE ACTIVE 🏭")
             self.backup_task = asyncio.create_task(self._backup_scheduler())
         else:
-            logger.info("Replica mode: No backup scheduling, only health monitoring")
+            logger.info("🔄 REPLICA MODE: No backup scheduling, only health monitoring 🔄")
+            print("🔄 REPLICA MODE: MONITORING ONLY (NO BACKUPS) 🔄")
         
-        logger.info("Starting health monitoring...")
+        logger.info("💚 HEALTH MONITORING ACTIVE 💚")
         self.health_check_task = asyncio.create_task(self._health_monitor())
+        print("🔥" * 80 + "\n")
 
     async def _backup_scheduler(self):
         """Application-controlled backup scheduling (replaces cron)."""
@@ -573,7 +598,12 @@ pg1-user={self.config['pguser']}
         last_diff_backup = datetime.now()
         last_check = datetime.now()
         
-        logger.info(f"Backup scheduler started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("\n" + "⏰" * 60)
+        print("⏰ BACKUP SCHEDULER MAIN LOOP STARTED ⏰")
+        print(f"⏰ STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ⏰")
+        print("⏰" * 60)
+        logger.info("⏰" * 15 + " BACKUP SCHEDULER LOOP ACTIVE " + "⏰" * 15)
+        logger.info(f"⏰ SCHEDULER START TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         while not self._shutdown_event.is_set():
             try:
@@ -591,14 +621,20 @@ pg1-user={self.config['pguser']}
                 # Differential backup every N hours
                 hours_since_diff = (now - last_diff_backup).total_seconds() / 3600
                 if hours_since_diff >= self.backup_schedule['diff_backup_interval']:
-                    logger.info(f"⏰ {hours_since_diff:.1f} hours since last diff backup (threshold: {self.backup_schedule['diff_backup_interval']}) - triggering backup...")
+                    print("\n" + "🚨" * 50)
+                    print("🚨 DIFFERENTIAL BACKUP TRIGGERED 🚨")
+                    print(f"🚨 {hours_since_diff:.1f} HOURS SINCE LAST BACKUP 🚨")
+                    print("🚨" * 50)
+                    logger.info(f"🚨 BACKUP TRIGGER: {hours_since_diff:.1f} hours since last diff backup (threshold: {self.backup_schedule['diff_backup_interval']}) - triggering backup... 🚨")
                     if await self._trigger_backup('diff'):
                         last_diff_backup = now
                         next_diff_time = now + timedelta(hours=self.backup_schedule['diff_backup_interval'])
+                        print("✅ DIFFERENTIAL BACKUP COMPLETED SUCCESSFULLY ✅")
                         logger.info(f"✅ Differential backup completed, next diff backup: {next_diff_time.strftime('%H:%M:%S')}")
                 else:
                     if self.test_mode and (int(now.minute) % 5 == 0 and now.second < 10):  # Log every 5 minutes in test mode
                         time_until_next = self.backup_schedule['diff_backup_interval'] - hours_since_diff
+                        print(f"📊 BACKUP STATUS: Next diff backup in {time_until_next:.1f} hours (last: {last_diff_backup.strftime('%H:%M:%S')})")
                         logger.info(f"📊 Next diff backup in {time_until_next:.1f} hours (last: {last_diff_backup.strftime('%H:%M:%S')})")
                 
                 # Health check every hour
@@ -624,7 +660,12 @@ pg1-user={self.config['pguser']}
 
     async def _health_monitor(self):
         """Monitor backup system health."""
-        logger.info(f"Health monitor started - checking every {self.backup_schedule['health_check_interval']} seconds")
+        print("\n" + "💚" * 60)
+        print("💚 HEALTH MONITOR MAIN LOOP STARTED 💚")
+        print(f"💚 CHECKING EVERY {self.backup_schedule['health_check_interval']} SECONDS 💚")
+        print("💚" * 60)
+        logger.info("💚" * 15 + " HEALTH MONITOR LOOP ACTIVE " + "💚" * 15)
+        logger.info(f"💚 HEALTH CHECK INTERVAL: {self.backup_schedule['health_check_interval']} seconds")
         
         while not self._shutdown_event.is_set():
             try:
@@ -851,14 +892,44 @@ pg1-user={self.config['pguser']}
         self.backup_schedule.update(new_schedule)
         logger.info(f"Backup schedule updated: {self.backup_schedule}")
 
+    def print_current_status(self):
+        """Print very obvious status information for debugging."""
+        print("\n" + "🔍" * 80)
+        print("🔍 AUTO SYNC MANAGER CURRENT STATUS 🔍")
+        print("🔍" * 80)
+        print(f"🏠 MODE: {'PRIMARY' if self.is_primary else 'REPLICA'}")
+        print(f"🧪 TEST MODE: {'ACTIVE' if self.test_mode else 'INACTIVE'}")
+        print(f"📋 CURRENT SCHEDULE: {self.backup_schedule}")
+        print(f"🔄 BACKUP TASK RUNNING: {self.backup_task is not None and not self.backup_task.done()}")
+        print(f"💚 HEALTH TASK RUNNING: {self.health_check_task is not None and not self.health_check_task.done()}")
+        print(f"⏹️  SHUTDOWN REQUESTED: {self._shutdown_event.is_set()}")
+        print("🔍" * 80 + "\n")
+
 
 # Factory function for easy integration
 async def get_auto_sync_manager(test_mode: bool = False) -> Optional[AutoSyncManager]:
-    """Create and initialize AutoSyncManager."""
+    """
+    Create and initialize AutoSyncManager.
+    
+    Args:
+        test_mode: Enable test mode (fast scheduling). 
+                  - When called from validator: Reflects validator's --test flag
+                  - When called from standalone script: Reflects script's --test flag
+                  - No override occurs - whatever is passed is used
+    """
     try:
+        print("\n" + "🏗️" * 60)
+        print("🏗️ CREATING AUTO SYNC MANAGER 🏗️")
+        print(f"🏗️ TEST MODE: {'ENABLED' if test_mode else 'DISABLED'} 🏗️")
+        print("🏗️" * 60)
+        
         manager = AutoSyncManager(test_mode=test_mode)
-        logger.info("AutoSyncManager created successfully")
+        
+        print("✅ AUTO SYNC MANAGER CREATED SUCCESSFULLY ✅")
+        logger.info("✅ AutoSyncManager factory: Created successfully")
         return manager
     except Exception as e:
-        logger.error(f"Failed to create AutoSyncManager: {e}")
+        print("❌ FAILED TO CREATE AUTO SYNC MANAGER ❌")
+        print(f"❌ ERROR: {e} ❌")
+        logger.error(f"❌ AutoSyncManager factory: Failed to create - {e}")
         return None 

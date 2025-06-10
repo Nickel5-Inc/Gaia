@@ -1383,6 +1383,27 @@ async def finalize_scores_worker(self):
                     except Exception:
                         pass
 
+                    # CRITICAL: Close large datasets before aggregate calculation 
+                    # The aggregate score calculation only needs database records, not the large datasets
+                    logger.info(f"[FinalizeWorker] Run {run_id}: Closing large ERA5 datasets before aggregate calculations...")
+                    try:
+                        if era5_ds_for_run:
+                            era5_ds_for_run.close()
+                            logger.debug(f"[FinalizeWorker] Run {run_id}: Closed era5_ds_for_run")
+                            era5_ds_for_run = None
+                            
+                        if 'era5_climatology_ds_for_cycle' in locals():
+                            era5_climatology_ds_for_cycle.close()
+                            logger.debug(f"[FinalizeWorker] Run {run_id}: Closed era5_climatology_ds_for_cycle")
+                            era5_climatology_ds_for_cycle = None
+                            
+                        # Force garbage collection after closing large datasets
+                        collected = gc.collect()
+                        logger.info(f"[FinalizeWorker] Run {run_id}: 🗑️ Closed large ERA5 datasets, GC collected {collected} objects before aggregate calculations")
+                        
+                    except Exception as close_err:
+                        logger.debug(f"[FinalizeWorker] Run {run_id}: Error closing datasets: {close_err}")
+
                     for i_resp, miner_score_task_succeeded in enumerate(miner_scoring_results): # Process results
                         resp_rec_inner = verified_responses_for_run[i_resp]
                         if miner_score_task_succeeded: 
@@ -1418,9 +1439,15 @@ async def finalize_scores_worker(self):
                          logger.warning(f"[FinalizeWorker] Run {run_id}: No miners successfully scored against ERA5. Skipping combined score update.")
                     processed_run_ids.add(run_id)
                     
-                    if era5_ds_for_run:
-                        try: era5_ds_for_run.close()
-                        except Exception: pass
+                    # Final cleanup for any remaining dataset references (defensive)
+                    logger.debug(f"[FinalizeWorker] Run {run_id}: Final cleanup - ensuring all datasets are closed")
+                    for ds_name in ['era5_ds_for_run', 'era5_climatology_ds_for_cycle']:
+                        if ds_name in locals() and locals()[ds_name] is not None:
+                            try: 
+                                locals()[ds_name].close()
+                                logger.debug(f"[FinalizeWorker] Run {run_id}: Final cleanup closed {ds_name}")
+                            except Exception: 
+                                pass
 
                 if work_done:
                     gc.collect()

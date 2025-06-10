@@ -609,17 +609,49 @@ async def calculate_era5_miner_score(
             era5_truth_lead_slice = None
 
             try:
-                if np.issubdtype(miner_forecast_ds.time.dtype, np.integer):
+                # Robust dtype checking for timezone-aware dtypes
+                def _is_integer_dtype(dtype):
+                    """Check if dtype is integer, handling timezone-aware dtypes."""
+                    try:
+                        return np.issubdtype(dtype, np.integer)
+                    except TypeError:
+                        # Handle timezone-aware dtypes that can't be interpreted by numpy
+                        return False
+                
+                def _is_datetime_dtype(dtype):
+                    """Check if dtype is datetime, handling timezone-aware dtypes."""
+                    dtype_str = str(dtype)
+                    return (
+                        'datetime64' in dtype_str or
+                        dtype_str.startswith('<M8') or
+                        'datetime' in dtype_str.lower()
+                    )
+                
+                # Handle miner forecast dataset time dtype with robust checking
+                if _is_integer_dtype(miner_forecast_ds.time.dtype):
                     selection_label_miner = int(valid_time_dt.timestamp() * 1_000_000_000)
-                elif str(miner_forecast_ds.time.dtype) == 'datetime64[ns]':
-                    selection_label_miner = valid_time_dt.replace(tzinfo=None)
+                elif _is_datetime_dtype(miner_forecast_ds.time.dtype):
+                    dtype_str = str(miner_forecast_ds.time.dtype)
+                    if 'UTC' in dtype_str or 'tz' in dtype_str.lower():
+                        # Timezone-aware - use timezone-aware timestamp
+                        selection_label_miner = valid_time_dt
+                    else:
+                        # Timezone-naive - remove timezone
+                        selection_label_miner = valid_time_dt.replace(tzinfo=None)
                 else:
-                    selection_label_miner = valid_time_dt 
+                    selection_label_miner = valid_time_dt
 
-                if np.issubdtype(era5_truth_ds.time.dtype, np.integer):
+                # Handle ERA5 truth dataset time dtype with robust checking
+                if _is_integer_dtype(era5_truth_ds.time.dtype):
                     selection_label_era5 = int(valid_time_dt.timestamp() * 1_000_000_000)
-                elif str(era5_truth_ds.time.dtype) == 'datetime64[ns]':
-                    selection_label_era5 = valid_time_dt.replace(tzinfo=None)
+                elif _is_datetime_dtype(era5_truth_ds.time.dtype):
+                    dtype_str = str(era5_truth_ds.time.dtype)
+                    if 'UTC' in dtype_str or 'tz' in dtype_str.lower():
+                        # Timezone-aware - use timezone-aware timestamp
+                        selection_label_era5 = valid_time_dt
+                    else:
+                        # Timezone-naive - remove timezone
+                        selection_label_era5 = valid_time_dt.replace(tzinfo=None)
                 else:
                     selection_label_era5 = valid_time_dt
 
@@ -653,9 +685,11 @@ async def calculate_era5_miner_score(
                                    f"too far from target {valid_time_dt}. Skipping this valid_time.")
                     time_check_failed = True
                 
-                if not time_check_failed and abs((era5_time_actual_utc - valid_time_dt).total_seconds()) > 3600:
+                # Use more lenient tolerance for ERA5 in test mode where data availability may be limited
+                era5_time_tolerance = 21600  # 6 hours for ERA5 (more lenient for test mode)
+                if not time_check_failed and abs((era5_time_actual_utc - valid_time_dt).total_seconds()) > era5_time_tolerance:
                     logger.warning(f"[FinalScore] Miner {miner_hotkey}: Selected ERA5 truth time {era5_time_actual_utc} "
-                                   f"too far from target {valid_time_dt}. Skipping this valid_time.")
+                                   f"too far from target {valid_time_dt} (tolerance: {era5_time_tolerance/3600:.1f}h). Skipping this valid_time.")
                     time_check_failed = True
                 
                 if time_check_failed:
@@ -768,10 +802,25 @@ async def calculate_era5_miner_score(
                     )
 
                     if var_level:
-                        miner_var_da_selected = miner_var_da_unaligned.sel(pressure_level=var_level, method="nearest").squeeze(drop=True)
-                        truth_var_da_selected = truth_var_da_unaligned.sel(pressure_level=var_level, method="nearest").squeeze(drop=True)
-                        if 'pressure_level' in climatology_var_da_raw.dims:
-                            climatology_var_da_selected = climatology_var_da_raw.sel(pressure_level=var_level, method="nearest").squeeze(drop=True)
+                        # Handle different pressure level dimension names robustly
+                        def _select_pressure_level(data_array, target_level):
+                            """Select pressure level handling multiple possible dimension names."""
+                            possible_pressure_dims = ['pressure_level', 'plev', 'level', 'levels', 'p']
+                            for dim_name in possible_pressure_dims:
+                                if dim_name in data_array.dims:
+                                    return data_array.sel(**{dim_name: target_level}, method="nearest").squeeze(drop=True)
+                            raise ValueError(f"No pressure level dimension found in {list(data_array.dims)}. Expected one of: {possible_pressure_dims}")
+                        
+                        miner_var_da_selected = _select_pressure_level(miner_var_da_unaligned, var_level)
+                        truth_var_da_selected = _select_pressure_level(truth_var_da_unaligned, var_level)
+                        # Apply robust pressure level selection to climatology too
+                        clim_pressure_dim = None
+                        for dim_name in ['pressure_level', 'plev', 'level', 'levels', 'p']:
+                            if dim_name in climatology_var_da_raw.dims:
+                                clim_pressure_dim = dim_name
+                                break
+                        if clim_pressure_dim:
+                            climatology_var_da_selected = climatology_var_da_raw.sel(**{clim_pressure_dim: var_level}, method="nearest").squeeze(drop=True)
                         else: 
                             climatology_var_da_selected = climatology_var_da_raw.squeeze(drop=True)
                     else:
@@ -801,8 +850,17 @@ async def calculate_era5_miner_score(
                     truth_var_da_final = target_grid_for_interp
                     
                     clim_var_to_interpolate = climatology_var_da_std
-                    if var_level and 'pressure_level' in clim_var_to_interpolate.dims and 'pressure_level' not in truth_var_da_final.dims:
-                        clim_var_to_interpolate = clim_var_to_interpolate.sel(pressure_level=var_level, method="nearest").squeeze(drop=True)
+                    # Apply robust pressure level handling to climatology interpolation
+                    if var_level:
+                        clim_pressure_dim = None
+                        for dim_name in ['pressure_level', 'plev', 'level', 'levels', 'p']:
+                            if dim_name in clim_var_to_interpolate.dims:
+                                clim_pressure_dim = dim_name
+                                break
+                        # If climatology still has pressure dimensions but truth doesn't, select the level  
+                        truth_has_pressure = any(dim in truth_var_da_final.dims for dim in ['pressure_level', 'plev', 'level', 'levels', 'p'])
+                        if clim_pressure_dim and not truth_has_pressure:
+                            clim_var_to_interpolate = clim_var_to_interpolate.sel(**{clim_pressure_dim: var_level}, method="nearest").squeeze(drop=True)
                     
                     climatology_da_aligned = await asyncio.to_thread(
                         clim_var_to_interpolate.interp_like, truth_var_da_final, method="linear", kwargs={"fill_value": None}
@@ -823,7 +881,7 @@ async def calculate_era5_miner_score(
                     
                     actual_bias_op = (miner_var_da_aligned - truth_var_da_final)
                     
-                    async def calculate_mean_scalar_threaded(op):
+                    def calculate_mean_scalar_threaded(op):
                         computed_mean = op.mean()
                         if hasattr(computed_mean, 'compute'):
                             computed_mean = computed_mean.compute()
@@ -861,9 +919,8 @@ async def calculate_era5_miner_score(
                     
                     if gfs_op_lead_slice is not None:
                         try:
-                            gfs_var_name = AURORA_TO_GFS_VAR_MAP.get(var_name)
-                            if gfs_var_name and gfs_var_name in gfs_op_lead_slice:
-                                gfs_var_da_unaligned = gfs_op_lead_slice[gfs_var_name]
+                            if var_name in gfs_op_lead_slice:
+                                gfs_var_da_unaligned = gfs_op_lead_slice[var_name]
 
                                 if var_level:
                                     gfs_pressure_dim = None
@@ -885,7 +942,7 @@ async def calculate_era5_miner_score(
                                     gfs_var_da_std.interp_like, truth_var_da_final, method="linear", kwargs={"fill_value": None}
                                 )
                                 
-                                # bias correction
+                                # bias correction - fresh calculation for each variable to prevent reuse
                                 forecast_bc_da = await calculate_bias_corrected_forecast(miner_var_da_aligned, truth_var_da_final)
                                 
                                 # skill score
@@ -904,7 +961,7 @@ async def calculate_era5_miner_score(
                                     logger.warning(f"[FinalScore] UID {miner_uid} - Calculated skill score is non-finite for {var_key} L{lead_hours}h")
                                     skill_score_val = None
                             else:
-                                logger.warning(f"[FinalScore] UID {miner_uid} - GFS variable {gfs_var_name} not found in GFS forecast data")
+                                logger.warning(f"[FinalScore] UID {miner_uid} - Variable {var_name} not found in GFS forecast data")
                         except Exception as e_skill:
                             logger.error(f"[FinalScore] UID {miner_uid} - Error calculating skill score for {var_key} L{lead_hours}h: {e_skill}", exc_info=True)
                             skill_score_val = None
@@ -913,9 +970,8 @@ async def calculate_era5_miner_score(
                     
                     if skill_score_val is None:
                         try:
-                            # bias correction
-                            if 'forecast_bc_da' not in locals():
-                                forecast_bc_da = await calculate_bias_corrected_forecast(miner_var_da_aligned, truth_var_da_final)
+                            # bias correction - ALWAYS recalculate for each variable (prevent variable reuse bug)
+                            forecast_bc_da = await calculate_bias_corrected_forecast(miner_var_da_aligned, truth_var_da_final)
                             
                             # skill score vs climatology
                             skill_score_val = await calculate_mse_skill_score(

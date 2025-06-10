@@ -52,6 +52,24 @@ def _synchronous_zarr_open_unverified(
     Opens a Zarr store over HTTP synchronously WITHOUT manifest/chunk verification.
     Returns xr.Dataset or None on failure.
     """
+    # CRITICAL: Ensure blosc codec is available in this executor thread
+    try:
+        import blosc
+        import numcodecs
+        import numcodecs.blosc
+        
+        # Force registration by adding to registry manually if not present
+        if 'blosc' not in numcodecs.registry.codec_registry:
+            from numcodecs.blosc import Blosc
+            numcodecs.registry.codec_registry['blosc'] = Blosc
+            logger.info(f"SYNC_ZARR_OPEN_UNVERIFIED: Manually registered blosc codec in executor thread")
+        
+        # Verify blosc is now available
+        codec = numcodecs.registry.get_codec({'id': 'blosc'})
+        logger.debug(f"SYNC_ZARR_OPEN_UNVERIFIED: Blosc codec verified in executor thread: {type(codec)}")
+    except Exception as e:
+        logger.warning(f"SYNC_ZARR_OPEN_UNVERIFIED: Failed to ensure blosc codec in executor thread: {e}")
+    
     if zarr_store_url.endswith(".zarr") and not zarr_store_url.endswith("/"):
         zarr_store_url += '/'
     elif not zarr_store_url.endswith('/'):
@@ -144,6 +162,24 @@ def _synchronous_open_with_verifying_mapper(
         consolidated: bool
     ) -> Optional[xr.Dataset]:
     """Synchronous helper to open dataset with the VerifyingChunkMapper."""
+    # CRITICAL: Ensure blosc codec is available in this executor thread
+    try:
+        import blosc
+        import numcodecs
+        import numcodecs.blosc
+        
+        # Force registration by adding to registry manually if not present
+        if 'blosc' not in numcodecs.registry.codec_registry:
+            from numcodecs.blosc import Blosc
+            numcodecs.registry.codec_registry['blosc'] = Blosc
+            logger.info(f"Job {verifying_mapper.job_id_for_logging}: Manually registered blosc codec in executor thread")
+        
+        # Verify blosc is now available
+        codec = numcodecs.registry.get_codec({'id': 'blosc'})
+        logger.debug(f"Job {verifying_mapper.job_id_for_logging}: Blosc codec verified in executor thread: {type(codec)}")
+    except Exception as e:
+        logger.warning(f"Job {verifying_mapper.job_id_for_logging}: Failed to ensure blosc codec in executor thread: {e}")
+    
     try:
         logger.info(f"Job {verifying_mapper.job_id_for_logging}: xr.open_zarr called with VerifyingChunkMapper.")
         ds = xr.open_zarr(verifying_mapper, consolidated=consolidated, chunks="auto")

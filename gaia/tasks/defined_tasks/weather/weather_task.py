@@ -183,10 +183,10 @@ def _load_config(self):
     # Quality Control Config - I need to tune these values
     config['day1_clone_penalty_gamma'] = float(os.getenv('WEATHER_DAY1_CLONE_PENALTY_GAMMA', '1.0'))
     default_clone_delta_thresholds = {
-        "2t": 0.01,  # (RMSE 0.1K)^2
-        "msl": 10000, # (RMSE 100Pa or 1hPa)^2
-        "z500": 1500,   # (RMSE 100 m^2/s^2)^2 for geopotential
-        "t850": 0.25    # (RMSE 0.5K)^2 
+        "2t": 0.0025,  # (RMSE 0.1K)^2
+        "msl": 400, # (RMSE 100Pa or 1hPa)^2
+        "z500": 100,   # (RMSE 100 m^2/s^2)^2 for geopotential
+        "t850": 0.04    # (RMSE 0.5K)^2 
     }
     try:
         clone_delta_json = os.getenv('WEATHER_DAY1_CLONE_DELTA_THRESHOLDS_JSON')
@@ -737,6 +737,28 @@ class WeatherTask(Task):
     # Validator methods
     ############################################################
 
+    def _load_era5_climatology_sync(self, climatology_path: str) -> Optional[xr.Dataset]:
+        """Synchronous helper to load ERA5 climatology with blosc support."""
+        # CRITICAL: Ensure blosc codec is available in this executor thread
+        try:
+            import blosc
+            import numcodecs
+            import numcodecs.blosc
+            
+            # Force registration by adding to registry manually if not present
+            if 'blosc' not in numcodecs.registry.codec_registry:
+                from numcodecs.blosc import Blosc
+                numcodecs.registry.codec_registry['blosc'] = Blosc
+                logger.info(f"ERA5 climatology: Manually registered blosc codec in executor thread")
+            
+            # Verify blosc is now available
+            codec = numcodecs.registry.get_codec({'id': 'blosc'})
+            logger.debug(f"ERA5 climatology: Blosc codec verified in executor thread: {type(codec)}")
+        except Exception as e:
+            logger.warning(f"Failed to ensure blosc codec in ERA5 climatology executor thread: {e}")
+        
+        return xr.open_zarr(climatology_path, consolidated=True)
+
     async def _get_or_load_era5_climatology(self) -> Optional[xr.Dataset]:
         if self.era5_climatology_ds is None:
             climatology_path = self.config.get("era5_climatology_path")
@@ -744,7 +766,7 @@ class WeatherTask(Task):
                 try:
                     logger.info(f"Loading ERA5 climatology from: {climatology_path}")
                     self.era5_climatology_ds = await asyncio.to_thread(
-                        xr.open_zarr, climatology_path, consolidated=True 
+                        self._load_era5_climatology_sync, climatology_path
                     )
                     logger.info("ERA5 climatology loaded successfully.")
                 except Exception as e:
