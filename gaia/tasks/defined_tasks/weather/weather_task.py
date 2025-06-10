@@ -43,6 +43,18 @@ import boto3 # For R2
 from botocore.exceptions import ClientError as BotoClientError # For R2 error handling, aliased to avoid conflict if other ClientError exists
 from . import weather_http_utils
 
+# Ensure blosc codec is available for zarr operations
+try:
+    import blosc
+    import numcodecs
+    # Force registration of blosc codec
+    numcodecs.blosc.register_codec()
+    print(f"[WeatherTask] Blosc codec successfully imported and registered. Version: {blosc.__version__}")
+except ImportError as e:
+    print(f"[WeatherTask] Failed to import blosc codec: {e}. Zarr datasets using blosc compression may fail to open.")
+except Exception as e:
+    print(f"[WeatherTask] Failed to register blosc codec: {e}. Zarr datasets using blosc compression may fail to open.")
+
 from .utils.era5_api import fetch_era5_data
 from .utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data
 from .utils.hashing import compute_verification_hash, compute_input_data_hash

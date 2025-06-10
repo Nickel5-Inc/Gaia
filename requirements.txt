@@ -63,6 +63,8 @@ bittensor-commit-reveal==0.1.0
     # via fiber
 bittensor-wallet==3.0.10
     # via async-substrate-interface
+blosc==1.11.3
+    # via -r requirements.in
 boto3==1.37.3
     # via
     #   -r requirements.in

@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 import traceback
 from typing import Dict, List, Optional
@@ -7,6 +8,18 @@ import xarray as xr
 import psutil
 import pandas as pd
 from fiber.logging_utils import get_logger
+
+# Ensure blosc codec is available for zarr operations
+try:
+    import blosc
+    import numcodecs
+    # Force registration of blosc codec
+    numcodecs.blosc.register_codec()
+    print(f"Blosc codec successfully imported and registered. Version: {blosc.__version__}")
+except ImportError as e:
+    print(f"Failed to import blosc codec: {e}. Zarr datasets using blosc compression may fail to open.")
+except Exception as e:
+    print(f"Failed to register blosc codec: {e}. Zarr datasets using blosc compression may fail to open.")
 
 try:
     from .hashing import get_trusted_manifest, VerifyingChunkMapper
