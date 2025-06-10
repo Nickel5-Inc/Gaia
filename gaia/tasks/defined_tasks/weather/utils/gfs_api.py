@@ -424,6 +424,8 @@ async def fetch_gfs_analysis_data(
 
     def _sync_fetch_and_process_analysis():
         analysis_slices = []
+        progress_info = {"processed_files": 0, "total_files": len(target_times)}
+        
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=xr.SerializationWarning)
             
@@ -431,17 +433,14 @@ async def fetch_gfs_analysis_data(
             for idx, target_time in enumerate(target_times):
                 processed_one_successfully_for_target = False
                 try:
-                    # Progress update for each time step
+                    # Update progress info (to be reported back to async context)
                     step_progress = 0.1 + (0.7 * (idx / total_steps))  # 10% to 80% for downloading
-                    if progress_callback:
-                        asyncio.create_task(progress_callback({
-                            "operation": "gfs_download",
-                            "stage": "downloading",
-                            "progress": step_progress,
-                            "message": f"Processing time {idx+1}/{total_steps}: {target_time.strftime('%Y-%m-%d %H:%M')}",
-                            "files_completed": idx,
-                            "files_total": total_steps
-                        }))
+                    progress_info.update({
+                        "current_step": idx + 1,
+                        "step_progress": step_progress,
+                        "current_time": target_time.strftime('%Y-%m-%d %H:%M'),
+                        "files_completed": idx
+                    })
                     
                     base_url = _get_gfs_cycle_url(target_time)
                     if not base_url:
@@ -564,14 +563,14 @@ async def fetch_gfs_analysis_data(
 
         if not analysis_slices:
             logger.error("Failed to fetch any valid GFS analysis slices.")
-            return None
+            return None, progress_info
 
         try:
             logger.info(f"Combining {len(analysis_slices)} analysis slices...")
             combined_ds = xr.concat(analysis_slices, dim='time')
         except Exception as e_concat:
              logger.error(f"Failed to combine analysis slices: {e_concat}")
-             return None
+             return None, progress_info
              
         logger.debug("Starting analysis dataset processing...")
         
@@ -666,23 +665,52 @@ async def fetch_gfs_analysis_data(
             logger.error(f"Failed to save GFS analysis to cache {cache_filename}: {e_cache}")
             if isinstance(e_cache, PermissionError):
                  logger.error(f"** PERMISSION DENIED saving to {cache_dir}. Please check directory permissions. **")
-            
-        return processed_ds
+        
+        # Update final progress info
+        progress_info.update({
+            "processed_files": len(analysis_slices),
+            "completed": True,
+            "step_progress": 0.8  # Processing complete, ready for caching
+        })
+        
+        return processed_ds, progress_info
 
     try:
-        result_dataset = await asyncio.to_thread(_sync_fetch_and_process_analysis)
+        result_dataset, final_progress_info = await asyncio.to_thread(_sync_fetch_and_process_analysis)
         
-        # Post-processing progress updates
-        if progress_callback and result_dataset is not None:
-            file_size = cache_filename.stat().st_size if cache_filename.exists() else 0
-            await progress_callback({
-                "operation": "gfs_download",
-                "stage": "completed",
-                "progress": 1.0,
-                "message": f"GFS analysis data successfully processed and cached ({file_size} bytes)",
-                "bytes_downloaded": file_size,
-                "bytes_total": file_size
-            })
+        # Emit progress updates based on what happened in the sync function
+        if progress_callback and final_progress_info:
+            if final_progress_info.get("completed"):
+                # Emit intermediate progress for files processed
+                if final_progress_info.get("processed_files", 0) > 0:
+                    await progress_callback({
+                        "operation": "gfs_download",
+                        "stage": "processing",
+                        "progress": final_progress_info.get("step_progress", 0.8),
+                        "message": f"Processed {final_progress_info['processed_files']}/{final_progress_info['total_files']} GFS analysis time steps",
+                        "files_completed": final_progress_info["processed_files"],
+                        "files_total": final_progress_info["total_files"]
+                    })
+                
+                # Final completion progress
+                if result_dataset is not None:
+                    file_size = cache_filename.stat().st_size if cache_filename.exists() else 0
+                    await progress_callback({
+                        "operation": "gfs_download",
+                        "stage": "completed",
+                        "progress": 1.0,
+                        "message": f"GFS analysis data successfully processed and cached ({file_size} bytes)",
+                        "bytes_downloaded": file_size,
+                        "bytes_total": file_size
+                    })
+            else:
+                # Processing failed partway through
+                await progress_callback({
+                    "operation": "gfs_download",
+                    "stage": "error",
+                    "progress": final_progress_info.get("step_progress", 0.0),
+                    "message": f"Processing failed after {final_progress_info.get('files_completed', 0)}/{final_progress_info['total_files']} files"
+                })
         
         return result_dataset
     except Exception as e:

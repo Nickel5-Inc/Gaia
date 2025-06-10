@@ -2571,7 +2571,12 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
                 for coord_name in first_ds.coords:
                     if coord_name.lower() == 'time' and pd.api.types.is_datetime64_any_dtype(first_ds.coords[coord_name].dtype):
                         # Extract base time from the first dataset's time coordinate
-                        first_time = pd.to_datetime(first_ds.time.values[0])
+                        # Handle both scalar and array time coordinates
+                        time_values = first_ds.time.values
+                        if time_values.ndim == 0:  # Scalar time coordinate
+                            first_time = pd.to_datetime(time_values.item())
+                        else:  # Array time coordinate
+                            first_time = pd.to_datetime(time_values[0])
                         encoding['time'] = {
                             'units': f'hours since {first_time.strftime("%Y-%m-%d %H:%M:%S")}',
                             'calendar': 'standard',
