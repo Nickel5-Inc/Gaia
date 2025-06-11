@@ -55,6 +55,11 @@ class AutoSyncManager:
                       - Both use the same test_mode parameter, no override occurs
         """
         self.test_mode = test_mode
+        
+        # Perform system detection first
+        self.system_info = self._detect_system_configuration()
+        logger.info(f"🔍 System Detection Results: {self.system_info}")
+        
         self.config = self._load_config()
         self.is_primary = self.config.get('is_primary', False)
         self.backup_task: Optional[asyncio.Task] = None
@@ -97,9 +102,193 @@ class AutoSyncManager:
         print("=" * 80)
         logger.info("🚀" * 10 + " AUTO SYNC MANAGER INITIALIZATION " + "🚀" * 10)
         logger.info(f"🏠 MODE: {'PRIMARY DATABASE' if self.is_primary else 'REPLICA DATABASE'}")
-        logger.info(f"🧪 TEST MODE: {'ENABLED (Fast scheduling for testing)' if test_mode else 'DISABLED (Production scheduling)'}")
+        logger.info(f"🧪 TEST MODE: {'ENABLED (Fast scheduling)' if self.test_mode else 'DISABLED (Production scheduling)'}")
         logger.info(f"📋 BACKUP SCHEDULE: {self.backup_schedule}")
         logger.info("=" * 80)
+
+    def _detect_system_configuration(self) -> Dict:
+        """Detect system configuration for adaptive setup."""
+        try:
+            logger.info("🔍 Detecting system configuration...")
+            
+            system_info = {
+                'os_type': 'unknown',
+                'os_version': 'unknown',
+                'package_manager': 'unknown',
+                'postgresql_version': 'unknown',
+                'postgresql_service': 'postgresql',
+                'postgresql_user': 'postgres',
+                'postgresql_group': 'postgres',
+                'config_locations': {},
+                'installation_type': 'unknown',
+                'systemd_available': False,
+                'docker_detected': False
+            }
+            
+            # Detect OS
+            try:
+                import platform
+                system_info['os_type'] = platform.system().lower()
+                system_info['os_version'] = platform.release()
+                
+                # Try to get more specific distribution info
+                try:
+                    with open('/etc/os-release', 'r') as f:
+                        for line in f:
+                            if line.startswith('ID='):
+                                system_info['distribution'] = line.split('=')[1].strip().strip('"')
+                            elif line.startswith('VERSION_ID='):
+                                system_info['distribution_version'] = line.split('=')[1].strip().strip('"')
+                except FileNotFoundError:
+                    pass
+                    
+                logger.info(f"🐧 OS: {system_info['os_type']} {system_info['os_version']}")
+                
+            except Exception as e:
+                logger.debug(f"OS detection failed: {e}")
+            
+            # Detect package manager
+            package_managers = [
+                ('apt-get', 'apt'),
+                ('yum', 'yum'),
+                ('dnf', 'dnf'),
+                ('pacman', 'pacman'),
+                ('brew', 'brew')
+            ]
+            
+            for cmd, name in package_managers:
+                try:
+                    result = subprocess.run(['which', cmd], capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        system_info['package_manager'] = name
+                        logger.info(f"📦 Package manager: {name}")
+                        break
+                except Exception:
+                    continue
+            
+            # Detect systemd
+            try:
+                result = subprocess.run(['systemctl', '--version'], capture_output=True, text=True, timeout=5)
+                system_info['systemd_available'] = result.returncode == 0
+                logger.info(f"⚙️ Systemd: {'Available' if system_info['systemd_available'] else 'Not available'}")
+            except Exception:
+                pass
+            
+            # Detect Docker environment
+            try:
+                if os.path.exists('/.dockerenv') or os.path.exists('/proc/1/cgroup'):
+                    with open('/proc/1/cgroup', 'r') as f:
+                        if 'docker' in f.read():
+                            system_info['docker_detected'] = True
+                            logger.info("🐳 Docker environment detected")
+            except Exception:
+                pass
+            
+            # Detect PostgreSQL installation
+            system_info.update(self._detect_postgresql_installation())
+            
+            return system_info
+            
+        except Exception as e:
+            logger.warning(f"System detection failed: {e}")
+            return system_info
+
+    def _detect_postgresql_installation(self) -> Dict:
+        """Detect PostgreSQL installation details."""
+        pg_info = {
+            'postgresql_version': 'unknown',
+            'postgresql_service': 'postgresql',
+            'postgresql_user': 'postgres',
+            'postgresql_group': 'postgres',
+            'installation_type': 'unknown',
+            'service_variations': [],
+            'config_locations': {}
+        }
+        
+        try:
+            # Try to detect PostgreSQL version and service
+            service_variations = [
+                'postgresql',
+                'postgresql-14',
+                'postgresql-15', 
+                'postgresql-16',
+                'postgres',
+                'pgsql'
+            ]
+            
+            for service in service_variations:
+                try:
+                    result = subprocess.run(['systemctl', 'is-active', service], 
+                                          capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0 or 'inactive' in result.stdout:
+                        pg_info['service_variations'].append(service)
+                        if pg_info['postgresql_service'] == 'postgresql':
+                            pg_info['postgresql_service'] = service
+                            logger.info(f"🐘 PostgreSQL service: {service}")
+                except Exception:
+                    continue
+            
+            # Try to get PostgreSQL version from different methods
+            version_commands = [
+                ['sudo', '-u', 'postgres', 'psql', '--version'],
+                ['postgres', '--version'],
+                ['psql', '--version']
+            ]
+            
+            for cmd in version_commands:
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                    if result.returncode == 0 and result.stdout:
+                        version_line = result.stdout.strip()
+                        # Extract version number (e.g., "psql (PostgreSQL) 14.10")
+                        import re
+                        match = re.search(r'(\d+)\.(\d+)', version_line)
+                        if match:
+                            major_version = match.group(1)
+                            pg_info['postgresql_version'] = major_version
+                            logger.info(f"🐘 PostgreSQL version: {major_version}")
+                            
+                            # Update service name if we found a version-specific one
+                            version_service = f"postgresql-{major_version}"
+                            if version_service in pg_info['service_variations']:
+                                pg_info['postgresql_service'] = version_service
+                            break
+                except Exception as e:
+                    logger.debug(f"Version detection command failed: {cmd} - {e}")
+                    continue
+            
+            # Detect installation type
+            installation_indicators = [
+                ('/var/lib/postgresql', 'package'),
+                ('/usr/local/pgsql', 'source'),
+                ('/opt/postgresql', 'custom'),
+                ('/home/postgres', 'user_install')
+            ]
+            
+            for path, install_type in installation_indicators:
+                if os.path.exists(path):
+                    pg_info['installation_type'] = install_type
+                    logger.info(f"🐘 Installation type: {install_type}")
+                    break
+            
+            # Try to detect user/group variations
+            user_variations = ['postgres', 'postgresql', 'pgsql']
+            for user in user_variations:
+                try:
+                    result = subprocess.run(['id', user], capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        pg_info['postgresql_user'] = user
+                        # Usually group has same name as user
+                        pg_info['postgresql_group'] = user
+                        logger.info(f"🐘 PostgreSQL user/group: {user}")
+                        break
+                except Exception:
+                    continue
+            
+        except Exception as e:
+            logger.debug(f"PostgreSQL detection failed: {e}")
+        
+        return pg_info
 
     def _find_pgdata_path(self) -> str:
         """Find the data directory of the active PostgreSQL instance."""
@@ -336,9 +525,10 @@ class AutoSyncManager:
             return False
 
     async def _install_dependencies(self) -> bool:
-        """Install pgBackRest and required dependencies."""
+        """Install pgBackRest and required dependencies adaptively based on system detection."""
         try:
             logger.info("📦 Installing pgBackRest and dependencies...")
+            logger.info(f"🔍 System: {self.system_info.get('os_type', 'unknown')} with {self.system_info.get('package_manager', 'unknown')} package manager")
             
             # Check if already installed
             try:
@@ -353,17 +543,40 @@ class AutoSyncManager:
                 )
                 stdout, stderr = await result.communicate()
                 if result.returncode == 0:
-                    logger.info("✅ pgBackRest already installed")
+                    version_info = stdout.decode().strip()
+                    logger.info(f"✅ pgBackRest already installed: {version_info}")
                     return True
                 else:
                     logger.info("❌ pgBackRest not found, will install...")
             except (FileNotFoundError, asyncio.TimeoutError):
                 logger.info("❌ pgBackRest not found, will install...")
             
-            # Install via apt with timeout for each command
+            # Adaptive installation based on package manager
+            package_manager = self.system_info.get('package_manager', 'unknown')
+            
+            if package_manager == 'apt':
+                return await self._install_dependencies_apt()
+            elif package_manager in ['yum', 'dnf']:
+                return await self._install_dependencies_rhel()
+            elif package_manager == 'pacman':
+                return await self._install_dependencies_arch()
+            else:
+                logger.warning(f"⚠️ Unsupported package manager: {package_manager}")
+                logger.info("💡 Attempting fallback installation...")
+                return await self._install_dependencies_fallback()
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to install dependencies: {e}")
+            return False
+
+    async def _install_dependencies_apt(self) -> bool:
+        """Install dependencies using apt (Debian/Ubuntu)."""
+        try:
+            logger.info("📦 Installing using apt (Debian/Ubuntu)...")
+            
             commands = [
-                (['apt-get', 'update'], 120, "Updating package lists"),  # 2 minute timeout
-                (['apt-get', 'install', '-y', 'pgbackrest', 'postgresql-client'], 300, "Installing packages")  # 5 minute timeout
+                (['apt-get', 'update'], 120, "Updating package lists"),
+                (['apt-get', 'install', '-y', 'pgbackrest', 'postgresql-client'], 300, "Installing pgBackRest and PostgreSQL client")
             ]
             
             for cmd, timeout, description in commands:
@@ -389,47 +602,202 @@ class AutoSyncManager:
                     logger.error(f"❌ {description} timed out after {timeout} seconds")
                     return False
             
-            # Verify installation
-            try:
-                logger.info("🔍 Verifying pgBackRest installation...")
-                result = await asyncio.wait_for(
-                    asyncio.create_subprocess_exec(
-                        'pgbackrest', 'version',
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    ),
-                    timeout=10
-                )
-                stdout, stderr = await result.communicate()
-                if result.returncode == 0:
-                    version_info = stdout.decode().strip()
-                    logger.info(f"✅ pgBackRest installed successfully: {version_info}")
-                    return True
-                else:
-                    logger.error(f"❌ pgBackRest verification failed: {stderr.decode()}")
-                    return False
-            except asyncio.TimeoutError:
-                logger.error("❌ pgBackRest verification timed out")
-                return False
+            return await self._verify_installation()
             
         except Exception as e:
-            logger.error(f"❌ Failed to install dependencies: {e}")
+            logger.error(f"❌ APT installation failed: {e}")
+            return False
+
+    async def _install_dependencies_rhel(self) -> bool:
+        """Install dependencies using yum/dnf (RHEL/CentOS/Fedora)."""
+        try:
+            package_cmd = self.system_info.get('package_manager', 'yum')
+            logger.info(f"📦 Installing using {package_cmd} (RHEL/CentOS/Fedora)...")
+            
+            commands = [
+                ([package_cmd, 'install', '-y', 'epel-release'], 120, "Installing EPEL repository"),
+                ([package_cmd, 'update', '-y'], 180, "Updating packages"),
+                ([package_cmd, 'install', '-y', 'pgbackrest', 'postgresql'], 300, "Installing pgBackRest and PostgreSQL")
+            ]
+            
+            for cmd, timeout, description in commands:
+                logger.info(f"🔄 {description}: {' '.join(cmd)}")
+                try:
+                    process = await asyncio.wait_for(
+                        asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        ),
+                        timeout=timeout
+                    )
+                    stdout, stderr = await process.communicate()
+                    
+                    if process.returncode != 0:
+                        # EPEL might already be installed, continue
+                        error_output = stderr.decode().lower()
+                        if "already installed" in error_output or "nothing to do" in error_output:
+                            logger.info(f"✅ {description} (already installed)")
+                        else:
+                            logger.warning(f"⚠️ {description} had issues: {stderr.decode()}")
+                            # Continue anyway for EPEL, as it might not be needed
+                            if "epel" not in description.lower():
+                                return False
+                    else:
+                        logger.info(f"✅ {description} completed successfully")
+                        
+                except asyncio.TimeoutError:
+                    logger.error(f"❌ {description} timed out after {timeout} seconds")
+                    return False
+            
+            return await self._verify_installation()
+            
+        except Exception as e:
+            logger.error(f"❌ RHEL installation failed: {e}")
+            return False
+
+    async def _install_dependencies_arch(self) -> bool:
+        """Install dependencies using pacman (Arch Linux)."""
+        try:
+            logger.info("📦 Installing using pacman (Arch Linux)...")
+            
+            commands = [
+                (['pacman', '-Sy'], 120, "Updating package database"),
+                (['pacman', '-S', '--noconfirm', 'pgbackrest', 'postgresql'], 300, "Installing pgBackRest and PostgreSQL")
+            ]
+            
+            for cmd, timeout, description in commands:
+                logger.info(f"🔄 {description}: {' '.join(cmd)}")
+                try:
+                    process = await asyncio.wait_for(
+                        asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        ),
+                        timeout=timeout
+                    )
+                    stdout, stderr = await process.communicate()
+                    
+                    if process.returncode != 0:
+                        logger.error(f"❌ {description} failed: {stderr.decode()}")
+                        return False
+                    else:
+                        logger.info(f"✅ {description} completed successfully")
+                        
+                except asyncio.TimeoutError:
+                    logger.error(f"❌ {description} timed out after {timeout} seconds")
+                    return False
+            
+            return await self._verify_installation()
+            
+        except Exception as e:
+            logger.error(f"❌ Pacman installation failed: {e}")
+            return False
+
+    async def _install_dependencies_fallback(self) -> bool:
+        """Fallback installation method when package manager is unknown."""
+        try:
+            logger.warning("⚠️ Unknown package manager, attempting fallback installation...")
+            
+            # Try apt first (most common)
+            try:
+                return await self._install_dependencies_apt()
+            except Exception:
+                pass
+            
+            # Try yum/dnf
+            try:
+                return await self._install_dependencies_rhel()
+            except Exception:
+                pass
+            
+            logger.error("❌ All installation methods failed")
+            logger.error("💡 Please install pgBackRest manually:")
+            logger.error("   - Debian/Ubuntu: apt-get install pgbackrest")
+            logger.error("   - RHEL/CentOS: yum install pgbackrest")
+            logger.error("   - Fedora: dnf install pgbackrest")
+            logger.error("   - From source: https://pgbackrest.org/user-guide.html#installation")
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Fallback installation failed: {e}")
+            return False
+
+    async def _verify_installation(self) -> bool:
+        """Verify pgBackRest installation."""
+        try:
+            logger.info("🔍 Verifying pgBackRest installation...")
+            result = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    'pgbackrest', 'version',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                ),
+                timeout=10
+            )
+            stdout, stderr = await result.communicate()
+            if result.returncode == 0:
+                version_info = stdout.decode().strip()
+                logger.info(f"✅ pgBackRest installed successfully: {version_info}")
+                return True
+            else:
+                logger.error(f"❌ pgBackRest verification failed: {stderr.decode()}")
+                return False
+        except asyncio.TimeoutError:
+            logger.error("❌ pgBackRest verification timed out")
             return False
 
     async def _configure_postgresql(self) -> bool:
-        """Configure PostgreSQL for pgBackRest."""
+        """Configure PostgreSQL for pgBackRest using detected system configuration."""
         try:
             logger.info("Configuring PostgreSQL...")
+            logger.info(f"🔍 PostgreSQL version: {self.system_info.get('postgresql_version', 'unknown')}")
+            logger.info(f"🔍 PostgreSQL service: {self.system_info.get('postgresql_service', 'postgresql')}")
             
-            postgres_conf = Path(self.config['pgdata']) / 'postgresql.conf'
-            hba_conf = Path(self.config['pgdata']) / 'pg_hba.conf'
+            # Detect PostgreSQL configuration file location dynamically
+            logger.info("🔍 Detecting PostgreSQL configuration file location...")
+            postgres_user = self.system_info.get('postgresql_user', 'postgres')
+            
+            config_cmd = ['sudo', '-u', postgres_user, 'psql', '-t', '-c', 'SHOW config_file;']
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *config_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                
+                if process.returncode != 0:
+                    logger.error(f"Failed to detect config file location: {stderr.decode()}")
+                    logger.info("💡 Trying fallback config detection...")
+                    postgres_conf = await self._fallback_config_detection()
+                else:
+                    postgres_conf_path = stdout.decode().strip()
+                    postgres_conf = Path(postgres_conf_path)
+                    logger.info(f"📋 PostgreSQL config file: {postgres_conf}")
+                    
+            except Exception as e:
+                logger.warning(f"Config detection failed: {e}, trying fallback...")
+                postgres_conf = await self._fallback_config_detection()
+            
+            if not postgres_conf or not postgres_conf.exists():
+                logger.error(f"❌ Could not find PostgreSQL configuration file")
+                return False
+            
+            # For pg_hba.conf, it's usually in the same directory as postgresql.conf
+            hba_conf = postgres_conf.parent / 'pg_hba.conf'
+            logger.info(f"📋 PostgreSQL HBA file: {hba_conf}")
             
             # Backup existing config
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             if postgres_conf.exists():
                 shutil.copy2(postgres_conf, f"{postgres_conf}.backup.{timestamp}")
+                logger.info(f"📋 Backed up config to: {postgres_conf}.backup.{timestamp}")
             if hba_conf.exists():
                 shutil.copy2(hba_conf, f"{hba_conf}.backup.{timestamp}")
+                logger.info(f"📋 Backed up HBA to: {hba_conf}.backup.{timestamp}")
             
             # PostgreSQL configuration with network-aware stanza
             archive_cmd = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
@@ -494,20 +862,85 @@ class AutoSyncManager:
             # Write updated configuration
             with open(postgres_conf, 'w') as f:
                 f.writelines(updated_lines)
+            logger.info(f"✅ Updated PostgreSQL configuration file: {postgres_conf}")
             
             # Update pg_hba.conf for replication
-            with open(hba_conf, 'r') as f:
-                hba_content = f.read()
+            if hba_conf.exists():
+                with open(hba_conf, 'r') as f:
+                    hba_content = f.read()
+                
+                replication_line = "host replication postgres 0.0.0.0/0 md5"
+                if replication_line not in hba_content:
+                    with open(hba_conf, 'a') as f:
+                        f.write(f"\n# Added by AutoSyncManager for pgBackRest\n{replication_line}\n")
+                    logger.info("Added replication entry to pg_hba.conf")
+            else:
+                logger.warning(f"⚠️ pg_hba.conf not found at expected location: {hba_conf}")
             
-            replication_line = "host replication postgres 0.0.0.0/0 md5"
-            if replication_line not in hba_content:
-                with open(hba_conf, 'a') as f:
-                    f.write(f"\n# Added by AutoSyncManager for pgBackRest\n{replication_line}\n")
-                logger.info("Added replication entry to pg_hba.conf")
+            # Restart PostgreSQL using detected service name
+            service_name = self.system_info.get('postgresql_service', 'postgresql')
+            await self._restart_postgresql_service(service_name)
             
-            # Restart PostgreSQL to apply changes
-            logger.info("Restarting PostgreSQL...")
-            restart_cmd = ['systemctl', 'restart', 'postgresql']
+            # Wait for PostgreSQL to be ready and verify archive_mode
+            logger.info("🔍 Verifying archive_mode is enabled...")
+            return await self._verify_postgresql_configuration(postgres_user)
+            
+        except Exception as e:
+            logger.error(f"Failed to configure PostgreSQL: {e}")
+            return False
+
+    async def _fallback_config_detection(self) -> Optional[Path]:
+        """Fallback method to detect PostgreSQL config file location."""
+        try:
+            logger.info("🔍 Using fallback config detection...")
+            
+            # Common PostgreSQL config locations by distribution/version
+            config_paths = [
+                # Debian/Ubuntu
+                '/etc/postgresql/16/main/postgresql.conf',
+                '/etc/postgresql/15/main/postgresql.conf', 
+                '/etc/postgresql/14/main/postgresql.conf',
+                '/etc/postgresql/13/main/postgresql.conf',
+                '/etc/postgresql/12/main/postgresql.conf',
+                
+                # RHEL/CentOS/Fedora
+                '/var/lib/pgsql/data/postgresql.conf',
+                '/var/lib/pgsql/16/data/postgresql.conf',
+                '/var/lib/pgsql/15/data/postgresql.conf',
+                '/var/lib/pgsql/14/data/postgresql.conf',
+                
+                # Generic locations
+                '/usr/local/pgsql/data/postgresql.conf',
+                '/opt/postgresql/data/postgresql.conf',
+                
+                # Data directory fallback
+                f"{self.config.get('pgdata', '')}/postgresql.conf"
+            ]
+            
+            for config_path in config_paths:
+                if config_path and Path(config_path).exists():
+                    logger.info(f"✅ Found config at: {config_path}")
+                    return Path(config_path)
+            
+            logger.error("❌ No PostgreSQL config file found in common locations")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Fallback config detection failed: {e}")
+            return None
+
+    async def _restart_postgresql_service(self, service_name: str) -> bool:
+        """Restart PostgreSQL service using appropriate method."""
+        try:
+            logger.info(f"Restarting PostgreSQL service: {service_name}...")
+            
+            if self.system_info.get('systemd_available', False):
+                # Use systemctl
+                restart_cmd = ['systemctl', 'restart', service_name]
+            else:
+                # Fallback to service command
+                restart_cmd = ['service', service_name, 'restart']
+            
             process = await asyncio.create_subprocess_exec(
                 *restart_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -517,71 +950,96 @@ class AutoSyncManager:
             
             if process.returncode != 0:
                 logger.error(f"Failed to restart PostgreSQL: {stderr.decode()}")
-                return False
-            
-            # Wait for PostgreSQL to be ready and verify archive_mode
-            logger.info("🔍 Verifying archive_mode is enabled...")
-            max_retries = 10
-            for attempt in range(max_retries):
-                try:
-                    await asyncio.sleep(2)  # Wait for PostgreSQL to fully start
-                    
-                    # Check archive_mode setting
-                    check_cmd = ['sudo', '-u', 'postgres', 'psql', '-t', '-c', 'SHOW archive_mode;']
-                    process = await asyncio.create_subprocess_exec(
-                        *check_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    stdout, stderr = await process.communicate()
-                    
-                    if process.returncode == 0:
-                        archive_mode = stdout.decode().strip()
-                        logger.info(f"📋 Current archive_mode: {archive_mode}")
-                        
-                        if archive_mode == 'on':
-                            logger.info("✅ archive_mode is properly enabled")
-                            
-                            # Also verify archive_command
-                            check_cmd = ['sudo', '-u', 'postgres', 'psql', '-t', '-c', 'SHOW archive_command;']
-                            process = await asyncio.create_subprocess_exec(
-                                *check_cmd,
+                
+                # Try alternative service names
+                alternative_services = self.system_info.get('service_variations', [])
+                for alt_service in alternative_services:
+                    if alt_service != service_name:
+                        logger.info(f"Trying alternative service name: {alt_service}")
+                        try:
+                            alt_cmd = ['systemctl', 'restart', alt_service] if self.system_info.get('systemd_available') else ['service', alt_service, 'restart']
+                            alt_process = await asyncio.create_subprocess_exec(
+                                *alt_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE
                             )
-                            stdout, stderr = await process.communicate()
-                            
-                            if process.returncode == 0:
-                                current_archive_cmd = stdout.decode().strip()
-                                logger.info(f"📋 Current archive_command: {current_archive_cmd}")
-                                
-                                if self.config['stanza_name'] in current_archive_cmd:
-                                    logger.info("✅ PostgreSQL configured successfully")
-                                    return True
-                                else:
-                                    logger.warning(f"⚠️ Archive command doesn't contain expected stanza: {self.config['stanza_name']}")
-                            
-                        else:
-                            logger.warning(f"⚠️ archive_mode is '{archive_mode}' instead of 'on' (attempt {attempt + 1}/{max_retries})")
-                            if attempt < max_retries - 1:
-                                logger.info("🔄 Waiting for PostgreSQL configuration to take effect...")
-                                continue
-                    else:
-                        logger.warning(f"⚠️ Failed to check archive_mode (attempt {attempt + 1}/{max_retries}): {stderr.decode()}")
-                        
-                except Exception as e:
-                    logger.warning(f"⚠️ Error checking archive_mode (attempt {attempt + 1}/{max_retries}): {e}")
-                    
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(3)
-            
-            logger.error("❌ Failed to verify that archive_mode is enabled after PostgreSQL restart")
-            logger.error("💡 Manual intervention may be required to enable archive_mode")
-            return False
-            
+                            alt_stdout, alt_stderr = await alt_process.communicate()
+                            if alt_process.returncode == 0:
+                                logger.info(f"✅ Successfully restarted using: {alt_service}")
+                                # Update the detected service name for future use
+                                self.system_info['postgresql_service'] = alt_service
+                                return True
+                        except Exception as e:
+                            logger.debug(f"Alternative service {alt_service} failed: {e}")
+                            continue
+                return False
+            else:
+                logger.info("✅ PostgreSQL restarted successfully")
+                return True
+                
         except Exception as e:
-            logger.error(f"Failed to configure PostgreSQL: {e}")
+            logger.error(f"Error restarting PostgreSQL: {e}")
             return False
+
+    async def _verify_postgresql_configuration(self, postgres_user: str) -> bool:
+        """Verify PostgreSQL configuration is correct."""
+        max_retries = 10
+        for attempt in range(max_retries):
+            try:
+                await asyncio.sleep(2)  # Wait for PostgreSQL to fully start
+                
+                # Check archive_mode setting
+                check_cmd = ['sudo', '-u', postgres_user, 'psql', '-t', '-c', 'SHOW archive_mode;']
+                process = await asyncio.create_subprocess_exec(
+                    *check_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                
+                if process.returncode == 0:
+                    archive_mode = stdout.decode().strip()
+                    logger.info(f"📋 Current archive_mode: {archive_mode}")
+                    
+                    if archive_mode == 'on':
+                        logger.info("✅ archive_mode is properly enabled")
+                        
+                        # Also verify archive_command
+                        check_cmd = ['sudo', '-u', postgres_user, 'psql', '-t', '-c', 'SHOW archive_command;']
+                        process = await asyncio.create_subprocess_exec(
+                            *check_cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        stdout, stderr = await process.communicate()
+                        
+                        if process.returncode == 0:
+                            current_archive_cmd = stdout.decode().strip()
+                            logger.info(f"📋 Current archive_command: {current_archive_cmd}")
+                            
+                            if self.config['stanza_name'] in current_archive_cmd:
+                                logger.info("✅ PostgreSQL configured successfully")
+                                return True
+                            else:
+                                logger.warning(f"⚠️ Archive command doesn't contain expected stanza: {self.config['stanza_name']}")
+                        
+                    else:
+                        logger.warning(f"⚠️ archive_mode is '{archive_mode}' instead of 'on' (attempt {attempt + 1}/{max_retries})")
+                        if attempt < max_retries - 1:
+                            logger.info("🔄 Waiting for PostgreSQL configuration to take effect...")
+                            continue
+                else:
+                    logger.warning(f"⚠️ Failed to check archive_mode (attempt {attempt + 1}/{max_retries}): {stderr.decode()}")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Error checking archive_mode (attempt {attempt + 1}/{max_retries}): {e}")
+                
+            if attempt < max_retries - 1:
+                await asyncio.sleep(3)
+        
+        logger.error("❌ Failed to verify that archive_mode is enabled after PostgreSQL restart")
+        logger.error("💡 Manual intervention may be required to enable archive_mode")
+        return False
 
     async def _setup_postgres_auth(self) -> bool:
         """Setup PostgreSQL authentication for pgBackRest."""
