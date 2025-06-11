@@ -2057,8 +2057,35 @@ class GaiaValidator:
 
                 # Add DB Sync tasks conditionally
                 if self.auto_sync_manager:
-                    logger.info(f"AutoSyncManager is active - DB sync tasks are handled by application scheduling (interval: {self.db_sync_interval_hours}h).")
+                    logger.info(f"AutoSyncManager is active - Starting setup and scheduling...")
                     logger.info(f"DB Sync Configuration: Primary={self.is_source_validator_for_db_sync}")
+                    
+                    # Setup AutoSyncManager (includes system configuration AND scheduling)
+                    try:
+                        logger.info("🚀 Setting up AutoSyncManager (includes system config and scheduling)...")
+                        setup_success = await self.auto_sync_manager.setup()
+                        if setup_success:
+                            logger.info("✅ AutoSyncManager setup and scheduling completed successfully!")
+                        else:
+                            logger.warning("⚠️ AutoSyncManager setup failed - attempting fallback scheduling for basic monitoring...")
+                            # If setup failed, try just starting scheduling for monitoring
+                            try:
+                                await self.auto_sync_manager.start_scheduling()
+                                logger.info("✅ AutoSyncManager fallback scheduling started successfully!")
+                            except Exception as fallback_e:
+                                logger.error(f"❌ AutoSyncManager fallback scheduling also failed: {fallback_e}")
+                                self.auto_sync_manager = None
+                    except Exception as e:
+                        logger.error(f"❌ AutoSyncManager setup failed with exception: {e}")
+                        logger.info("🔄 Attempting fallback scheduling for basic monitoring...")
+                        # If setup completely failed, try just starting scheduling
+                        try:
+                            await self.auto_sync_manager.start_scheduling()
+                            logger.info("✅ AutoSyncManager fallback scheduling started successfully!")
+                        except Exception as fallback_e:
+                            logger.error(f"❌ AutoSyncManager fallback scheduling also failed: {fallback_e}")
+                            logger.error("🚫 AutoSyncManager will be completely disabled")
+                            self.auto_sync_manager = None
                 else:
                     logger.info("AutoSyncManager is not active for this node (initialization failed or not configured).")
 

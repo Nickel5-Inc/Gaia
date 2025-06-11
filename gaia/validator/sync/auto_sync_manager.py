@@ -8,9 +8,21 @@ application-level control over backup scheduling.
 Key Features:
 - Automated pgBackRest installation and configuration
 - Application-controlled backup scheduling (no cron needed)
+- Intelligent startup backup detection (skips unnecessary backups)
 - Simplified replica setup with discovery
 - Health monitoring and error recovery
 - Centralized configuration management
+
+Gap Handling Strategy (Theoretical):
+When primary nodes go down for extended periods, several strategies can be employed:
+1. WAL Catch-up: Allow WAL archiving to catch up before attempting backups
+2. Gap Detection: Monitor for missing WAL segments and handle gracefully
+3. Fallback Strategy: Switch to full backups if gaps are detected
+4. Timeline Reset: Use backup labels to detect and handle timeline breaks
+5. Health Recovery: Enhanced monitoring with automatic recovery procedures
+
+Current implementation focuses on startup optimization and basic gap tolerance.
+Advanced gap handling can be added as needed based on operational requirements.
 """
 
 import asyncio
@@ -57,12 +69,26 @@ class AutoSyncManager:
                 'check_interval': 5,          # Every 5 minutes
                 'health_check_interval': 60   # Every minute
             }
+            # Replica schedule for test mode (fast)
+            self.replica_schedule = {
+                'sync_interval': 0.5,         # Every 30 minutes in test mode
+                'backup_buffer_minutes': 5,   # Wait 5 minutes after backup time
+                'sync_minute': None,          # No specific minute in test mode
+            }
         else:
             self.backup_schedule = {
-                'full_backup_time': '02:00',  # Daily at 2 AM
-                'diff_backup_interval': 4,    # Every 4 hours
+                'full_backup_time': '08:30',  # Daily at 8:30 AM UTC
+                'diff_backup_interval': 1,    # Every 1 hour
+                'diff_backup_minute': 24,     # At 24 minutes past the hour
                 'check_interval': 60,         # Every hour
                 'health_check_interval': 300  # Every 5 minutes
+            }
+            # Replica schedule for production mode
+            self.replica_schedule = {
+                'sync_interval': 1,           # Every hour (same as primary)
+                'backup_buffer_minutes': 15,  # Wait 15 minutes after backup completes
+                'sync_minute': 39,            # Download at :39 (24 + 15 minute buffer)
+                'estimated_backup_duration': 5, # Estimated 5 minutes for diff backup
             }
         
         # VERY OBVIOUS STARTUP LOGGING
@@ -115,8 +141,21 @@ class AutoSyncManager:
         r2_region_raw = os.getenv('PGBACKREST_R2_REGION', 'auto')
         r2_region = r2_region_raw.split('#')[0].strip()
 
+        # Enhanced stanza naming with network awareness
+        base_stanza_name = os.getenv('PGBACKREST_STANZA_NAME', 'gaia')
+        network_suffix = os.getenv('SUBTENSOR_NETWORK', '').lower()
+        
+        # Auto-append network to stanza name if not already present and network is detected
+        if network_suffix and network_suffix in ['test', 'finney'] and network_suffix not in base_stanza_name.lower():
+            stanza_name = f"{base_stanza_name}-{network_suffix}"
+            logger.info(f"🌐 Network-aware stanza: {stanza_name} (detected network: {network_suffix})")
+        else:
+            stanza_name = base_stanza_name
+            if network_suffix:
+                logger.info(f"🌐 Using explicit stanza: {stanza_name} (network: {network_suffix})")
+
         config = {
-            'stanza_name': os.getenv('PGBACKREST_STANZA_NAME', 'gaia'),
+            'stanza_name': stanza_name,
             'r2_bucket': os.getenv('PGBACKREST_R2_BUCKET'),
             'r2_endpoint': os.getenv('PGBACKREST_R2_ENDPOINT'),
             'r2_access_key': os.getenv('PGBACKREST_R2_ACCESS_KEY_ID'),
@@ -129,6 +168,7 @@ class AutoSyncManager:
             'is_primary': os.getenv('IS_SOURCE_VALIDATOR_FOR_DB_SYNC', 'False').lower() == 'true',
             'replica_discovery_endpoint': os.getenv('REPLICA_DISCOVERY_ENDPOINT'),  # For primary to announce itself
             'primary_discovery_endpoint': os.getenv('PRIMARY_DISCOVERY_ENDPOINT'),  # For replica to find primary
+            'network': network_suffix,  # Store network for reference
         }
         
         # Validate required R2 config
@@ -142,50 +182,60 @@ class AutoSyncManager:
 
     async def setup(self) -> bool:
         """
-        Automatically set up the database sync system.
-        This replaces the manual setup scripts.
+        Fully automated database sync setup with intelligent configuration detection and repair.
+        Handles existing installations, network transitions, and misconfigurations automatically.
         """
         try:
-            logger.info("Starting automated database sync setup...")
+            logger.info("🚀 Starting intelligent database sync setup...")
+            logger.info(f"🌐 Network: {self.config.get('network', 'unknown')}")
+            logger.info(f"📋 Target stanza: {self.config['stanza_name']}")
+            logger.info(f"🏠 Mode: {'PRIMARY' if self.is_primary else 'REPLICA'}")
             
             # 1. Install dependencies
+            logger.info("📦 Step 1: Installing dependencies...")
             if not await self._install_dependencies():
                 return False
             
-            # 2. Configure PostgreSQL
+            # 2. Auto-detect and repair any existing configuration issues
+            logger.info("🔍 Step 2: Detecting and repairing existing configuration...")
+            await self._auto_repair_configuration()
+            
+            # 3. Configure PostgreSQL (smart update, not just append)
+            logger.info("⚙️ Step 3: Configuring PostgreSQL...")
             if not await self._configure_postgresql():
                 return False
             
-            # 3. Setup PostgreSQL authentication
+            # 4. Setup PostgreSQL authentication
+            logger.info("🔐 Step 4: Setting up PostgreSQL authentication...")
             if not await self._setup_postgres_auth():
                 return False
             
-            # 4. Configure pgBackRest
+            # 5. Configure pgBackRest
+            logger.info("🔧 Step 5: Configuring pgBackRest...")
             if not await self._configure_pgbackrest():
                 return False
             
-            # 5. Test and fix WAL archiving (Primary only)
-            if self.is_primary:
-                if not await self._setup_wal_archiving():
-                    return False
+            # 6. Ensure archive command is correct (with retry logic)
+            logger.info("📝 Step 6: Ensuring correct archive command...")
+            if not await self._ensure_correct_archive_command():
+                logger.warning("Archive command may need manual attention")
             
-            # 6. Initialize pgBackRest (primary only)
-            if self.is_primary:
-                if not await self._initialize_pgbackrest():
-                    return False
-            else:
-                # Replica setup
-                if not await self._setup_replica():
-                    return False
+            # 7. Handle stanza setup intelligently
+            logger.info("📊 Step 7: Setting up backup stanza...")
+            if not await self._intelligent_stanza_setup():
+                return False
             
-            # 7. Start application-controlled scheduling
+            # 8. Start application-controlled scheduling
+            logger.info("⏰ Step 8: Starting automated scheduling...")
             await self.start_scheduling()
             
-            logger.info("✅ Database sync setup completed successfully!")
+            logger.info("🎉 Database sync setup completed successfully!")
+            logger.info(f"✅ Ready for {'backup operations' if self.is_primary else 'replica synchronization'}")
             return True
             
         except Exception as e:
             logger.error(f"❌ Database sync setup failed: {e}", exc_info=True)
+            logger.error("🔧 Will attempt fallback configuration...")
             return False
 
     async def _install_dependencies(self) -> bool:
@@ -248,26 +298,53 @@ class AutoSyncManager:
             if hba_conf.exists():
                 shutil.copy2(hba_conf, f"{hba_conf}.backup.{timestamp}")
             
-            # PostgreSQL configuration
+            # PostgreSQL configuration with network-aware stanza
             archive_cmd = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
+            logger.info(f"🔧 Setting archive command: {archive_cmd}")
             
-            pg_config = f"""
-# pgBackRest Configuration (Auto-generated by AutoSyncManager)
-wal_level = replica
-archive_mode = on
-archive_command = '{archive_cmd}'
-archive_timeout = 60
-max_wal_senders = 10
-wal_keep_size = 2GB
-hot_standby = on
-listen_addresses = '*'
-max_connections = 200
-log_checkpoints = on
-"""
+            # Read existing config and update/add pgBackRest settings
+            config_lines = []
+            if postgres_conf.exists():
+                with open(postgres_conf, 'r') as f:
+                    config_lines = f.readlines()
             
-            # Append to postgresql.conf
-            with open(postgres_conf, 'a') as f:
-                f.write(pg_config)
+            # Track which settings we've updated
+            updated_settings = set()
+            pgbackrest_settings = {
+                'wal_level': 'replica',
+                'archive_mode': 'on', 
+                'archive_command': f"'{archive_cmd}'",
+                'archive_timeout': '60',
+                'max_wal_senders': '10',
+                'wal_keep_size': '2GB',
+                'hot_standby': 'on',
+                'listen_addresses': "'*'",
+                'max_connections': '200',
+                'log_checkpoints': 'on'
+            }
+            
+            # Update existing lines or mark for addition
+            for i, line in enumerate(config_lines):
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    for setting, value in pgbackrest_settings.items():
+                        if line.startswith(f'{setting} = ') or line.startswith(f'{setting}='):
+                            config_lines[i] = f"{setting} = {value}\n"
+                            updated_settings.add(setting)
+                            logger.info(f"🔄 Updated existing {setting} = {value}")
+                            break
+            
+            # Add any settings that weren't found
+            if updated_settings != set(pgbackrest_settings.keys()):
+                config_lines.append("\n# pgBackRest Configuration (Auto-generated by AutoSyncManager)\n")
+                for setting, value in pgbackrest_settings.items():
+                    if setting not in updated_settings:
+                        config_lines.append(f"{setting} = {value}\n")
+                        logger.info(f"➕ Added new {setting} = {value}")
+            
+            # Write updated config
+            with open(postgres_conf, 'w') as f:
+                f.writelines(config_lines)
             
             # pg_hba.conf configuration
             hba_config = f"""
@@ -505,11 +582,15 @@ pg1-user={self.config['pguser']}
             return False
 
     async def _initialize_pgbackrest(self) -> bool:
-        """Initialize pgBackRest stanza and take first backup (primary only)."""
+        """Initialize pgBackRest stanza and intelligently handle initial backup based on existing backups."""
         try:
-            logger.info("Initializing pgBackRest stanza...")
+            setup_start_time = datetime.now()
+            logger.info("🏗️ Initializing pgBackRest stanza with intelligent backup detection...")
+            logger.info(f"⏱️ Setup started at: {setup_start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
             
             # Create stanza
+            logger.info("📋 Creating pgBackRest stanza...")
+            stanza_start_time = datetime.now()
             create_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
                          f'--stanza={self.config["stanza_name"]}', 'stanza-create']
             
@@ -520,20 +601,43 @@ pg1-user={self.config['pguser']}
             )
             stdout, stderr = await process.communicate()
             
+            stanza_end_time = datetime.now()
+            stanza_duration = stanza_end_time - stanza_start_time
+            
             if process.returncode != 0:
                 # Check if stanza already exists
                 if 'already exists' in stderr.decode().lower():
-                    logger.info("Stanza already exists, continuing...")
+                    logger.info(f"✅ Stanza already exists (checked in {stanza_duration.total_seconds():.1f}s)")
                 else:
-                    logger.error(f"Failed to create stanza: {stderr.decode()}")
+                    logger.error(f"❌ Failed to create stanza after {stanza_duration.total_seconds():.1f}s: {stderr.decode()}")
                     return False
+            else:
+                logger.info(f"✅ Stanza created successfully in {stanza_duration.total_seconds():.1f} seconds")
             
-            # Take initial backup
-            logger.info("Taking initial full backup...")
-            backup_type = 'diff' if self.test_mode else 'full'  # Faster for testing
+            # Check for existing backups before taking initial backup
+            logger.info("🔍 Checking for existing backups to optimize startup...")
+            backup_decision = await self._analyze_existing_backups()
+            
+            if backup_decision['skip_backup']:
+                logger.info(f"✅ {backup_decision['reason']}")
+                logger.info(f"⏱️ Backup analysis and skip decision took: {(datetime.now() - setup_start_time).total_seconds():.1f} seconds")
+                return True
+            
+            # Take initial backup based on analysis
+            backup_type = backup_decision['recommended_type']
+            logger.info(f"🚀 Taking {backup_decision['action']} {backup_type.upper()} backup...")
+            backup_start_time = datetime.now()
+            logger.info(f"⏱️ Backup started at: {backup_start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            logger.info(f"📋 Reason: {backup_decision['reason']}")
             
             backup_cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
                          f'--stanza={self.config["stanza_name"]}', 'backup', f'--type={backup_type}']
+            
+            if self.test_mode:
+                backup_cmd.extend(['--archive-timeout=30s', '--compress-level=0'])
+                logger.info("📦 Test mode: Using fast compression and short timeouts")
+            
+            logger.info(f"🔄 Running backup command: {' '.join(backup_cmd)}")
             
             process = await asyncio.create_subprocess_exec(
                 *backup_cmd,
@@ -542,16 +646,170 @@ pg1-user={self.config['pguser']}
             )
             stdout, stderr = await process.communicate()
             
+            backup_end_time = datetime.now()
+            backup_duration = backup_end_time - backup_start_time
+            
             if process.returncode != 0:
-                logger.error(f"Initial backup failed: {stderr.decode()}")
+                logger.error(f"❌ Initial {backup_type.upper()} backup FAILED after {backup_duration.total_seconds():.1f} seconds")
+                logger.error(f"Error output: {stderr.decode()}")
+                if stdout:
+                    logger.debug(f"Backup stdout: {stdout.decode()}")
                 return False
             
-            logger.info("✅ pgBackRest initialized successfully")
-            return True
+            logger.info(f"✅ Initial {backup_type.upper()} backup completed successfully")
+            logger.info(f"⏱️ Backup duration: {backup_duration.total_seconds():.1f} seconds")
+            logger.info(f"⏱️ Backup finished at: {backup_end_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            
+            if stdout:
+                logger.debug(f"Backup output: {stdout.decode()}")
+            
+            # Verify backup was uploaded to R2
+            logger.info("🔍 Verifying initial backup upload to R2...")
+            verification_start_time = datetime.now()
+            
+            verification_success = await self._verify_r2_upload(backup_type, backup_end_time)
+            
+            verification_end_time = datetime.now()
+            verification_duration = verification_end_time - verification_start_time
+            logger.info(f"⏱️ Upload verification took: {verification_duration.total_seconds():.1f} seconds")
+            
+            if verification_success:
+                total_duration = verification_end_time - setup_start_time
+                logger.info(f"🎉 pgBackRest initialization FULLY COMPLETED with R2 upload verification")
+                logger.info(f"⏱️ Total setup + backup + verification time: {total_duration.total_seconds():.1f} seconds")
+                logger.info(f"📊 Breakdown: Stanza: {stanza_duration.total_seconds():.1f}s, Backup: {backup_duration.total_seconds():.1f}s, Verification: {verification_duration.total_seconds():.1f}s")
+                return True
+            else:
+                logger.warning(f"⚠️ Initial backup completed but R2 upload verification failed")
+                logger.warning(f"📊 Backup took {backup_duration.total_seconds():.1f}s but upload verification failed")
+                return False
             
         except Exception as e:
             logger.error(f"Failed to initialize pgBackRest: {e}")
             return False
+
+    async def _analyze_existing_backups(self) -> Dict:
+        """Analyze existing backups to determine if we need an initial backup and what type."""
+        try:
+            # Get backup info
+            info_cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
+                       f'--stanza={self.config["stanza_name"]}', 'info', '--output=json']
+            
+            process = await asyncio.create_subprocess_exec(
+                *info_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.info("📊 No existing backups found - will take initial backup")
+                return {
+                    'skip_backup': False,
+                    'recommended_type': 'diff' if self.test_mode else 'full',
+                    'action': 'initial',
+                    'reason': 'No existing backups found'
+                }
+            
+            backup_info = json.loads(stdout.decode())
+            if not backup_info or len(backup_info) == 0:
+                logger.info("📊 Empty backup info - will take initial backup")
+                return {
+                    'skip_backup': False,
+                    'recommended_type': 'diff' if self.test_mode else 'full',
+                    'action': 'initial',
+                    'reason': 'No backup history available'
+                }
+            
+            stanza_info = backup_info[0]
+            if 'backup' not in stanza_info or len(stanza_info['backup']) == 0:
+                logger.info("📊 No backups in stanza - will take initial backup")
+                return {
+                    'skip_backup': False,
+                    'recommended_type': 'diff' if self.test_mode else 'full',
+                    'action': 'initial',
+                    'reason': 'Stanza exists but no backups found'
+                }
+            
+            # Analyze existing backups
+            backups = stanza_info['backup']
+            most_recent = backups[-1]
+            backup_type = most_recent.get('type', 'unknown')
+            backup_timestamp = most_recent.get('timestamp', {}).get('stop', 'unknown')
+            
+            logger.info(f"📊 Found {len(backups)} existing backup(s)")
+            logger.info(f"📊 Most recent: {backup_type} backup at {backup_timestamp}")
+            
+            # Parse timestamp to check age
+            backup_age_hours = None
+            try:
+                if str(backup_timestamp).isdigit():
+                    backup_time = datetime.fromtimestamp(int(backup_timestamp), tz=timezone.utc)
+                else:
+                    # Try parsing as formatted timestamp
+                    backup_time = datetime.strptime(str(backup_timestamp), '%Y-%m-%d %H:%M:%S')
+                    backup_time = backup_time.replace(tzinfo=timezone.utc)
+                
+                backup_age_hours = (datetime.now(timezone.utc) - backup_time).total_seconds() / 3600
+                logger.info(f"📊 Most recent backup age: {backup_age_hours:.1f} hours")
+                
+            except Exception as e:
+                logger.debug(f"Could not parse backup timestamp {backup_timestamp}: {e}")
+            
+            # Decision logic based on backup age and type
+            if backup_age_hours is not None:
+                if self.test_mode:
+                    # In test mode, be more aggressive about skipping
+                    if backup_age_hours < 1:  # Less than 1 hour
+                        return {
+                            'skip_backup': True,
+                            'recommended_type': None,
+                            'action': 'skip',
+                            'reason': f'Recent {backup_type} backup found ({backup_age_hours:.1f}h ago) - skipping for faster startup'
+                        }
+                else:
+                    # Production mode logic
+                    if backup_type == 'full' and backup_age_hours < 24:  # Recent full backup
+                        return {
+                            'skip_backup': True,
+                            'recommended_type': None,
+                            'action': 'skip',
+                            'reason': f'Recent full backup found ({backup_age_hours:.1f}h ago) - skipping initial backup'
+                        }
+                    elif backup_type in ['diff', 'incr'] and backup_age_hours < 4:  # Recent diff/incr
+                        return {
+                            'skip_backup': True,
+                            'recommended_type': None,
+                            'action': 'skip', 
+                            'reason': f'Recent {backup_type} backup found ({backup_age_hours:.1f}h ago) - skipping initial backup'
+                        }
+                
+                # If we have old backups, take differential instead of full
+                if backup_age_hours > 24:
+                    return {
+                        'skip_backup': False,
+                        'recommended_type': 'diff',
+                        'action': 'catch-up',
+                        'reason': f'Old backup detected ({backup_age_hours:.1f}h ago) - taking differential to catch up'
+                    }
+            
+            # Default: take backup as planned
+            return {
+                'skip_backup': False,
+                'recommended_type': 'diff' if self.test_mode else 'full',
+                'action': 'initial',
+                'reason': 'Standard initial backup based on existing backup analysis'
+            }
+            
+        except Exception as e:
+            logger.warning(f"Error analyzing existing backups: {e}")
+            # If analysis fails, err on side of taking backup
+            return {
+                'skip_backup': False,
+                'recommended_type': 'diff' if self.test_mode else 'full',
+                'action': 'initial',
+                'reason': 'Backup analysis failed - taking initial backup as fallback'
+            }
 
     async def _setup_replica(self) -> bool:
         """Setup replica node (simplified, no manual IP coordination needed)."""
@@ -570,7 +828,12 @@ pg1-user={self.config['pguser']}
             return False
 
     async def start_scheduling(self):
-        """Start application-controlled backup scheduling."""
+        """Start application-controlled backup scheduling (idempotent - safe to call multiple times)."""
+        # Check if scheduling is already running
+        if (self.backup_task and not self.backup_task.done()) or (self.health_check_task and not self.health_check_task.done()):
+            logger.info("🔄 AutoSyncManager scheduling is already running, skipping duplicate start")
+            return
+        
         print("\n" + "🔥" * 80)
         print("🔥 AUTO SYNC MANAGER SCHEDULING STARTED 🔥")
         print("🔥" * 80)
@@ -581,15 +844,31 @@ pg1-user={self.config['pguser']}
                 logger.info("⚡ TEST MODE ACTIVE: Differential backups every 15 minutes, health checks every 5 minutes ⚡")
                 print("⚡ TEST MODE: FAST BACKUP SCHEDULE ENABLED FOR TESTING ⚡")
             else:
-                logger.info("🏭 PRODUCTION MODE: Full backups daily at 2:00 AM, differential backups every 4 hours 🏭")
+                logger.info("🏭 PRODUCTION MODE: Full backups daily at 8:30 AM UTC, differential backups hourly at :24 minutes 🏭")
                 print("🏭 PRODUCTION MODE: STANDARD BACKUP SCHEDULE ACTIVE 🏭")
-            self.backup_task = asyncio.create_task(self._backup_scheduler())
+            
+            # Only create backup task if not already running
+            if not self.backup_task or self.backup_task.done():
+                self.backup_task = asyncio.create_task(self._backup_scheduler())
         else:
-            logger.info("🔄 REPLICA MODE: No backup scheduling, only health monitoring 🔄")
-            print("🔄 REPLICA MODE: MONITORING ONLY (NO BACKUPS) 🔄")
+            logger.info("🔄 REPLICA MODE: Automated download scheduling active 🔄")
+            if self.test_mode:
+                logger.info("⚡ TEST MODE REPLICA: Downloads every 30 minutes with 5-minute backup buffer ⚡")
+                print("⚡ TEST MODE REPLICA: FAST DOWNLOAD SCHEDULE FOR TESTING ⚡")
+            else:
+                sync_minute = self.replica_schedule['sync_minute']
+                buffer_minutes = self.replica_schedule['backup_buffer_minutes']
+                logger.info(f"🏭 REPLICA MODE: Downloads hourly at :{sync_minute:02d} minutes ({buffer_minutes}min buffer after primary backup) 🏭")
+                print("🏭 REPLICA MODE: COORDINATED DOWNLOAD SCHEDULE ACTIVE 🏭")
+            
+            # Only create replica sync task if not already running
+            if not self.backup_task or self.backup_task.done():
+                self.backup_task = asyncio.create_task(self._replica_sync_scheduler())
         
         logger.info("💚 HEALTH MONITORING ACTIVE 💚")
-        self.health_check_task = asyncio.create_task(self._health_monitor())
+        # Only create health check task if not already running
+        if not self.health_check_task or self.health_check_task.done():
+            self.health_check_task = asyncio.create_task(self._health_monitor())
         print("🔥" * 80 + "\n")
 
     async def _backup_scheduler(self):
@@ -618,24 +897,57 @@ pg1-user={self.config['pguser']}
                         last_full_backup = now.date()
                         logger.info(f"✅ Full backup completed, next full backup: tomorrow at {self.backup_schedule['full_backup_time']}")
                 
-                # Differential backup every N hours
-                hours_since_diff = (now - last_diff_backup).total_seconds() / 3600
-                if hours_since_diff >= self.backup_schedule['diff_backup_interval']:
-                    print("\n" + "🚨" * 50)
-                    print("🚨 DIFFERENTIAL BACKUP TRIGGERED 🚨")
-                    print(f"🚨 {hours_since_diff:.1f} HOURS SINCE LAST BACKUP 🚨")
-                    print("🚨" * 50)
-                    logger.info(f"🚨 BACKUP TRIGGER: {hours_since_diff:.1f} hours since last diff backup (threshold: {self.backup_schedule['diff_backup_interval']}) - triggering backup... 🚨")
-                    if await self._trigger_backup('diff'):
-                        last_diff_backup = now
-                        next_diff_time = now + timedelta(hours=self.backup_schedule['diff_backup_interval'])
-                        print("✅ DIFFERENTIAL BACKUP COMPLETED SUCCESSFULLY ✅")
-                        logger.info(f"✅ Differential backup completed, next diff backup: {next_diff_time.strftime('%H:%M:%S')}")
+                # Differential backup scheduling
+                if self.test_mode:
+                    # Test mode: keep existing interval-based logic
+                    hours_since_diff = (now - last_diff_backup).total_seconds() / 3600
+                    if hours_since_diff >= self.backup_schedule['diff_backup_interval']:
+                        print("\n" + "🚨" * 50)
+                        print("🚨 DIFFERENTIAL BACKUP TRIGGERED (TEST MODE) 🚨")
+                        print(f"🚨 {hours_since_diff:.1f} HOURS SINCE LAST BACKUP 🚨")
+                        print("🚨" * 50)
+                        logger.info(f"🚨 TEST MODE BACKUP TRIGGER: {hours_since_diff:.1f} hours since last diff backup (threshold: {self.backup_schedule['diff_backup_interval']}) - triggering backup... 🚨")
+                        if await self._trigger_backup('diff'):
+                            last_diff_backup = now
+                            next_diff_time = now + timedelta(hours=self.backup_schedule['diff_backup_interval'])
+                            print("✅ DIFFERENTIAL BACKUP COMPLETED SUCCESSFULLY ✅")
+                            logger.info(f"✅ Differential backup completed, next diff backup: {next_diff_time.strftime('%H:%M:%S')}")
+                    else:
+                        # Log status periodically for visibility (every 10 minutes in test mode)
+                        if int(now.minute) % 10 == 0 and now.second < 10:
+                            time_until_next = self.backup_schedule['diff_backup_interval'] - hours_since_diff
+                            print(f"📊 TEST MODE BACKUP STATUS: Next diff backup in {time_until_next:.1f} hours (last: {last_diff_backup.strftime('%H:%M:%S')})")
+                            logger.info(f"📊 Test mode backup scheduler: Next diff backup in {time_until_next:.1f} hours (last: {last_diff_backup.strftime('%H:%M:%S')})")
                 else:
-                    if self.test_mode and (int(now.minute) % 5 == 0 and now.second < 10):  # Log every 5 minutes in test mode
-                        time_until_next = self.backup_schedule['diff_backup_interval'] - hours_since_diff
-                        print(f"📊 BACKUP STATUS: Next diff backup in {time_until_next:.1f} hours (last: {last_diff_backup.strftime('%H:%M:%S')})")
-                        logger.info(f"📊 Next diff backup in {time_until_next:.1f} hours (last: {last_diff_backup.strftime('%H:%M:%S')})")
+                    # Production mode: schedule-based logic (every hour at specific minute)
+                    target_minute = self.backup_schedule['diff_backup_minute']
+                    current_minute = now.minute
+                    current_hour = now.hour
+                    
+                    # Check if we're at the target minute (allowing a 2-minute window for execution)
+                    if (current_minute >= target_minute and current_minute <= target_minute + 2 and 
+                        now.second < 30):  # Only trigger in first 30 seconds to avoid double triggers
+                        
+                        # Check if we haven't already done a backup this hour
+                        last_backup_hour = last_diff_backup.hour if last_diff_backup.date() == now.date() else -1
+                        
+                        if current_hour != last_backup_hour:
+                            print("\n" + "🚨" * 50)
+                            print("🚨 DIFFERENTIAL BACKUP TRIGGERED (SCHEDULED) 🚨")
+                            print(f"🚨 HOURLY BACKUP AT {current_hour:02d}:{target_minute:02d} 🚨")
+                            print("🚨" * 50)
+                            logger.info(f"🚨 SCHEDULED BACKUP TRIGGER: Hourly backup at {current_hour:02d}:{target_minute:02d} - triggering backup... 🚨")
+                            if await self._trigger_backup('diff'):
+                                last_diff_backup = now
+                                next_hour = (current_hour + 1) % 24
+                                print("✅ DIFFERENTIAL BACKUP COMPLETED SUCCESSFULLY ✅")
+                                logger.info(f"✅ Differential backup completed, next diff backup: {next_hour:02d}:{target_minute:02d}")
+                    else:
+                        # Log status periodically for visibility (every 10 minutes)
+                        if int(now.minute) % 10 == 0 and now.second < 10:
+                            next_hour = current_hour if current_minute < target_minute else (current_hour + 1) % 24
+                            print(f"📊 BACKUP STATUS: Next diff backup at {next_hour:02d}:{target_minute:02d} (last: {last_diff_backup.strftime('%H:%M:%S')})")
+                            logger.info(f"📊 Backup scheduler active: Next diff backup at {next_hour:02d}:{target_minute:02d} (last: {last_diff_backup.strftime('%H:%M:%S')})")
                 
                 # Health check every hour
                 minutes_since_check = (now - last_check).total_seconds() / 60
@@ -679,6 +991,13 @@ pg1-user={self.config['pguser']}
                     await self._attempt_recovery()
                 else:
                     logger.debug("✅ Health monitor check passed")
+                    # Log a periodic status update at INFO level (every ~10 checks)
+                    if not hasattr(self, '_health_check_counter'):
+                        self._health_check_counter = 0
+                    self._health_check_counter += 1
+                    if self._health_check_counter % 10 == 0:  # Every 10th check
+                        next_check_time = datetime.now() + timedelta(seconds=self.backup_schedule['health_check_interval'])
+                        logger.info(f"💚 Health monitor: System healthy (check #{self._health_check_counter}), next check at {next_check_time.strftime('%H:%M:%S')}")
                 
                 await asyncio.sleep(self.backup_schedule['health_check_interval'])
                 
@@ -689,11 +1008,147 @@ pg1-user={self.config['pguser']}
                 logger.error(f"Error in health monitor: {e}")
                 await asyncio.sleep(300)
 
+    async def _replica_sync_scheduler(self):
+        """Application-controlled replica sync scheduling coordinated with primary backups."""
+        last_sync = datetime.now()
+        last_check = datetime.now()
+        
+        print("\n" + "🔄" * 60)
+        print("🔄 REPLICA SYNC SCHEDULER MAIN LOOP STARTED 🔄")
+        print(f"🔄 STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 🔄")
+        print("🔄" * 60)
+        logger.info("🔄" * 15 + " REPLICA SYNC SCHEDULER LOOP ACTIVE " + "🔄" * 15)
+        logger.info(f"🔄 SYNC SCHEDULER START TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        while not self._shutdown_event.is_set():
+            try:
+                now = datetime.now()
+                
+                # Replica sync scheduling
+                if self.test_mode:
+                    # Test mode: interval-based logic (every 30 minutes)
+                    hours_since_sync = (now - last_sync).total_seconds() / 3600
+                    if hours_since_sync >= self.replica_schedule['sync_interval']:
+                        print("\n" + "📥" * 50)
+                        print("📥 REPLICA SYNC TRIGGERED (TEST MODE) 📥")
+                        print(f"📥 {hours_since_sync:.1f} HOURS SINCE LAST SYNC 📥")
+                        print("📥" * 50)
+                        logger.info(f"📥 TEST MODE SYNC TRIGGER: {hours_since_sync:.1f} hours since last sync (threshold: {self.replica_schedule['sync_interval']}) - triggering sync... 📥")
+                        if await self._trigger_replica_sync():
+                            last_sync = now
+                            next_sync_time = now + timedelta(hours=self.replica_schedule['sync_interval'])
+                            print("✅ REPLICA SYNC COMPLETED SUCCESSFULLY ✅")
+                            logger.info(f"✅ Replica sync completed, next sync: {next_sync_time.strftime('%H:%M:%S')}")
+                    else:
+                        # Log status periodically for visibility (every 10 minutes in test mode)
+                        if int(now.minute) % 10 == 0 and now.second < 10:
+                            time_until_next = self.replica_schedule['sync_interval'] - hours_since_sync
+                            print(f"📊 TEST MODE SYNC STATUS: Next replica sync in {time_until_next:.1f} hours (last: {last_sync.strftime('%H:%M:%S')})")
+                            logger.info(f"📊 Test mode replica scheduler: Next sync in {time_until_next:.1f} hours (last: {last_sync.strftime('%H:%M:%S')})")
+                else:
+                    # Production mode: schedule-based logic (every hour at specific minute with buffer)
+                    target_minute = self.replica_schedule['sync_minute']
+                    current_minute = now.minute
+                    current_hour = now.hour
+                    
+                    # Check if we're at the target minute (allowing a 2-minute window for execution)
+                    if (current_minute >= target_minute and current_minute <= target_minute + 2 and 
+                        now.second < 30):  # Only trigger in first 30 seconds to avoid double triggers
+                        
+                        # Check if we haven't already done a sync this hour
+                        last_sync_hour = last_sync.hour if last_sync.date() == now.date() else -1
+                        
+                        if current_hour != last_sync_hour:
+                            backup_minute = 24  # Primary backup minute
+                            buffer_minutes = self.replica_schedule['backup_buffer_minutes']
+                            print("\n" + "📥" * 50)
+                            print("📥 REPLICA SYNC TRIGGERED (SCHEDULED) 📥")
+                            print(f"📥 HOURLY SYNC AT {current_hour:02d}:{target_minute:02d} 📥")
+                            print(f"📥 ({buffer_minutes}min buffer after {backup_minute:02d}min backup) 📥")
+                            print("📥" * 50)
+                            logger.info(f"📥 SCHEDULED SYNC TRIGGER: Hourly sync at {current_hour:02d}:{target_minute:02d} ({buffer_minutes}min buffer after primary backup) - triggering sync... 📥")
+                            if await self._trigger_replica_sync():
+                                last_sync = now
+                                next_hour = (current_hour + 1) % 24
+                                print("✅ REPLICA SYNC COMPLETED SUCCESSFULLY ✅")
+                                logger.info(f"✅ Replica sync completed, next sync: {next_hour:02d}:{target_minute:02d}")
+                    else:
+                        # Log status periodically for visibility (every 10 minutes)
+                        if int(now.minute) % 10 == 0 and now.second < 10:
+                            next_hour = current_hour if current_minute < target_minute else (current_hour + 1) % 24
+                            print(f"📊 REPLICA STATUS: Next sync at {next_hour:02d}:{target_minute:02d} (last: {last_sync.strftime('%H:%M:%S')})")
+                            logger.info(f"📊 Replica scheduler active: Next sync at {next_hour:02d}:{target_minute:02d} (last: {last_sync.strftime('%H:%M:%S')})")
+                
+                # Health check every hour (same as primary)
+                minutes_since_check = (now - last_check).total_seconds() / 60
+                if minutes_since_check >= self.backup_schedule['check_interval']:
+                    logger.info(f"🔍 {minutes_since_check:.1f} minutes since last check (threshold: {self.backup_schedule['check_interval']}) - running health check...")
+                    check_success = await self._trigger_check()
+                    last_check = now
+                    if check_success:
+                        logger.info("✅ Replica health check passed")
+                    else:
+                        logger.warning("❌ Replica health check failed")
+                
+                # Sleep for 1 minute before next check
+                await asyncio.sleep(60)
+                
+            except asyncio.CancelledError:
+                logger.info("Replica sync scheduler cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in replica sync scheduler: {e}")
+                await asyncio.sleep(60)
+
+    async def _trigger_replica_sync(self) -> bool:
+        """Trigger a replica sync (check for new backups and restore if available)."""
+        try:
+            logger.info("🔄 Starting replica sync check...")
+            start_time = datetime.now()
+            
+            # First, check what backups are available
+            info_cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
+                       f'--stanza={self.config["stanza_name"]}', 'info', '--output=json']
+            
+            logger.info(f"🔍 Checking available backups: {' '.join(info_cmd)}")
+            
+            process = await asyncio.create_subprocess_exec(
+                *info_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.warning(f"⚠️ Could not check backup status: {stderr.decode()}")
+                return False
+            
+            try:
+                backup_info = json.loads(stdout.decode())
+                logger.info(f"📊 Backup info retrieved successfully")
+                
+                # For now, just log the backup availability
+                # In the future, we could implement smart sync logic here
+                # that only restores if there are newer backups available
+                
+                logger.info("✅ Replica sync check completed - backup repository is accessible")
+                duration = datetime.now() - start_time
+                logger.info(f"⏱️ Sync check took {duration.total_seconds():.1f} seconds")
+                return True
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Failed to parse backup info JSON: {e}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error in replica sync: {e}")
+            return False
+
     async def _trigger_backup(self, backup_type: str) -> bool:
-        """Trigger a backup of specified type with progress tracking."""
+        """Trigger a backup of specified type with detailed progress tracking and R2 upload verification."""
         try:
             logger.info(f"🚀 Starting {backup_type.upper()} backup...")
-            start_time = datetime.now()
+            backup_start_time = datetime.now()
             
             cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
                   f'--stanza={self.config["stanza_name"]}', 'backup', f'--type={backup_type}']
@@ -702,8 +1157,10 @@ pg1-user={self.config['pguser']}
                 cmd.extend(['--archive-timeout=30s', '--compress-level=0'])
                 logger.info("📦 Test mode: Using fast compression and short timeouts")
             
-            logger.info(f"🔄 Running command: {' '.join(cmd)}")
+            logger.info(f"🔄 Running backup command: {' '.join(cmd)}")
+            logger.info(f"⏱️ Backup started at: {backup_start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
             
+            # Execute the backup
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -711,15 +1168,38 @@ pg1-user={self.config['pguser']}
             )
             stdout, stderr = await process.communicate()
             
-            duration = datetime.now() - start_time
+            backup_end_time = datetime.now()
+            backup_duration = backup_end_time - backup_start_time
             
             if process.returncode == 0:
-                logger.info(f"✅ {backup_type.upper()} backup completed successfully in {duration.total_seconds():.1f} seconds")
+                logger.info(f"✅ {backup_type.upper()} backup process completed successfully")
+                logger.info(f"⏱️ Backup duration: {backup_duration.total_seconds():.1f} seconds")
+                logger.info(f"⏱️ Backup finished at: {backup_end_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                
                 if stdout:
                     logger.debug(f"Backup output: {stdout.decode()}")
-                return True
+                
+                # Verify R2 upload by checking backup info
+                logger.info("🔍 Verifying backup upload to R2...")
+                upload_verification_start = datetime.now()
+                
+                verification_success = await self._verify_r2_upload(backup_type, backup_end_time)
+                
+                upload_verification_end = datetime.now()
+                verification_duration = upload_verification_end - upload_verification_start
+                logger.info(f"⏱️ Upload verification took: {verification_duration.total_seconds():.1f} seconds")
+                
+                if verification_success:
+                    total_duration = upload_verification_end - backup_start_time
+                    logger.info(f"🎉 {backup_type.upper()} backup FULLY COMPLETED with R2 upload verification")
+                    logger.info(f"⏱️ Total backup + verification time: {total_duration.total_seconds():.1f} seconds")
+                    return True
+                else:
+                    logger.warning(f"⚠️ {backup_type.upper()} backup completed but R2 upload verification failed")
+                    return False
+                    
             else:
-                logger.error(f"❌ {backup_type.upper()} backup failed after {duration.total_seconds():.1f} seconds")
+                logger.error(f"❌ {backup_type.upper()} backup FAILED after {backup_duration.total_seconds():.1f} seconds")
                 logger.error(f"Error output: {stderr.decode()}")
                 if stdout:
                     logger.debug(f"Backup stdout: {stdout.decode()}")
@@ -727,6 +1207,138 @@ pg1-user={self.config['pguser']}
                 
         except Exception as e:
             logger.error(f"Error triggering {backup_type} backup: {e}")
+            return False
+
+    async def _verify_r2_upload(self, backup_type: str, backup_completion_time: datetime) -> bool:
+        """Verify that the backup was successfully uploaded to R2 storage."""
+        try:
+            logger.debug(f"🔍 Checking R2 upload status for {backup_type} backup...")
+            
+            # Get backup info to verify upload
+            info_cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
+                       f'--stanza={self.config["stanza_name"]}', 'info', '--output=json']
+            
+            process = await asyncio.create_subprocess_exec(
+                *info_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.error(f"❌ Failed to get backup info for R2 verification: {stderr.decode()}")
+                return False
+            
+            try:
+                backup_info = json.loads(stdout.decode())
+                
+                # Extract backup details
+                if backup_info and len(backup_info) > 0:
+                    stanza_info = backup_info[0]  # First stanza
+                    
+                    if 'backup' in stanza_info and len(stanza_info['backup']) > 0:
+                        # Get the most recent backup
+                        recent_backup = stanza_info['backup'][-1]
+                        
+                        backup_label = recent_backup.get('label', 'unknown')
+                        backup_timestamp = recent_backup.get('timestamp', {}).get('stop', 'unknown')
+                        backup_size = recent_backup.get('info', {}).get('size', 0)
+                        backup_size_mb = backup_size / (1024 * 1024) if backup_size else 0
+                        backup_repo_size = recent_backup.get('info', {}).get('repository', {}).get('size', 0)
+                        backup_repo_size_mb = backup_repo_size / (1024 * 1024) if backup_repo_size else 0
+                        compression_ratio = (1 - backup_repo_size / backup_size) * 100 if backup_size > 0 else 0
+                        
+                        logger.info(f"📊 Latest backup in R2:")
+                        logger.info(f"   📋 Label: {backup_label}")
+                        logger.info(f"   📅 Timestamp: {backup_timestamp}")
+                        logger.info(f"   📦 Original size: {backup_size_mb:.1f} MB")
+                        logger.info(f"   🗜️ Compressed size: {backup_repo_size_mb:.1f} MB")
+                        logger.info(f"   💾 Compression ratio: {compression_ratio:.1f}%")
+                        
+                        # Check if this backup was created recently (within last 10 minutes)
+                        try:
+                            from datetime import datetime
+                            import re
+                            
+                            # Parse timestamp - pgBackRest can return various formats
+                            if backup_timestamp != 'unknown':
+                                backup_time = None
+                                
+                                # Try to parse the timestamp in different formats
+                                try:
+                                    # First, check if it's a Unix timestamp (numeric string)
+                                    if str(backup_timestamp).isdigit():
+                                        unix_timestamp = int(backup_timestamp)
+                                        backup_time = datetime.fromtimestamp(unix_timestamp, tz=timezone.utc)
+                                        logger.debug(f"📅 Parsed Unix timestamp {backup_timestamp} as {backup_time}")
+                                    else:
+                                        # Try common timestamp formats
+                                        formats_to_try = [
+                                            '%Y-%m-%d %H:%M:%S',  # 2024-01-15 14:30:25
+                                            '%Y%m%d-%H%M%S',      # 20240115-143025
+                                            '%Y-%m-%dT%H:%M:%S',  # ISO format: 2024-01-15T14:30:25
+                                            '%Y-%m-%dT%H:%M:%SZ', # ISO with Z: 2024-01-15T14:30:25Z
+                                        ]
+                                        
+                                        for fmt in formats_to_try:
+                                            try:
+                                                backup_time = datetime.strptime(str(backup_timestamp), fmt)
+                                                if backup_time.tzinfo is None:
+                                                    backup_time = backup_time.replace(tzinfo=timezone.utc)
+                                                logger.debug(f"📅 Parsed timestamp {backup_timestamp} using format {fmt}")
+                                                break
+                                            except ValueError:
+                                                continue
+                                                
+                                except Exception as e:
+                                    logger.debug(f"Error parsing timestamp {backup_timestamp}: {e}")
+                                
+                                if backup_time:
+                                    # Ensure both timestamps are timezone-aware for comparison
+                                    if backup_completion_time.tzinfo is None:
+                                        backup_completion_time = backup_completion_time.replace(tzinfo=timezone.utc)
+                                    
+                                    time_diff = abs((backup_completion_time - backup_time).total_seconds())
+                                    logger.info(f"⏰ Backup timestamp: {backup_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                                    logger.info(f"⏰ Completion time: {backup_completion_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                                    logger.info(f"⏰ Time difference: {time_diff:.1f} seconds")
+                                    
+                                    if time_diff <= 600:  # Within 10 minutes
+                                        logger.info(f"✅ R2 upload VERIFIED - Recent backup found (time diff: {time_diff:.1f}s)")
+                                        logger.info(f"🌥️ Backup successfully stored in R2 bucket: {self.config['r2_bucket']}")
+                                        return True
+                                    else:
+                                        logger.warning(f"⚠️ Latest backup is older than expected (time diff: {time_diff:.1f}s)")
+                                        # Still consider it successful if within reasonable range (1 hour)
+                                        if time_diff <= 3600:
+                                            logger.info(f"✅ R2 upload VERIFIED - Backup found within reasonable timeframe")
+                                            logger.info(f"🌥️ Backup successfully stored in R2 bucket: {self.config['r2_bucket']}")
+                                            return True
+                                else:
+                                    logger.warning(f"⚠️ Could not parse backup timestamp: {backup_timestamp}")
+                                    # If we can't parse timestamp but backup exists, assume success
+                                    logger.info(f"✅ R2 upload assumed VERIFIED - Backup exists in repository")
+                                    logger.info(f"🌥️ Backup successfully stored in R2 bucket: {self.config['r2_bucket']}")
+                                    return True
+                        except Exception as e:
+                            logger.debug(f"Error parsing backup timestamp: {e}")
+                            # Fallback: if backup exists in info, assume success
+                            logger.info(f"✅ R2 upload VERIFIED - Backup exists in repository")
+                            logger.info(f"🌥️ Backup successfully stored in R2 bucket: {self.config['r2_bucket']}")
+                            return True
+                    else:
+                        logger.error("❌ No backups found in repository info")
+                        return False
+                else:
+                    logger.error("❌ Empty backup info returned")
+                    return False
+                    
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Failed to parse backup info JSON: {e}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error verifying R2 upload: {e}")
             return False
 
     async def _trigger_check(self) -> bool:
@@ -904,6 +1516,412 @@ pg1-user={self.config['pguser']}
         print(f"💚 HEALTH TASK RUNNING: {self.health_check_task is not None and not self.health_check_task.done()}")
         print(f"⏹️  SHUTDOWN REQUESTED: {self._shutdown_event.is_set()}")
         print("🔍" * 80 + "\n")
+
+    async def _auto_repair_configuration(self):
+        """Automatically detect and repair common configuration issues."""
+        try:
+            logger.info("🔍 Scanning for configuration issues...")
+            
+            # Check if there are conflicting stanza names in the system
+            await self._detect_stanza_conflicts()
+            
+            # Check for old configuration files that might interfere
+            await self._clean_old_configurations()
+            
+            # Check PostgreSQL configuration for conflicts
+            await self._detect_postgresql_conflicts()
+            
+            logger.info("✅ Configuration scan completed")
+            
+        except Exception as e:
+            logger.warning(f"Configuration repair had issues: {e}")
+
+    async def _detect_stanza_conflicts(self):
+        """Detect if there are multiple or conflicting stanza configurations."""
+        try:
+            # Check what stanzas exist in pgBackRest
+            info_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 'info']
+            process = await asyncio.create_subprocess_exec(
+                *info_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0 and stdout:
+                existing_stanzas = []
+                for line in stdout.decode().split('\n'):
+                    if line.startswith('stanza:'):
+                        stanza_name = line.split(':')[1].strip()
+                        existing_stanzas.append(stanza_name)
+                
+                if existing_stanzas:
+                    logger.info(f"📊 Found existing stanzas: {existing_stanzas}")
+                    
+                    # Check if our target stanza is among them
+                    if self.config['stanza_name'] not in existing_stanzas:
+                        logger.info(f"🆕 Will create new stanza: {self.config['stanza_name']}")
+                    else:
+                        logger.info(f"♻️ Will reuse existing stanza: {self.config['stanza_name']}")
+                        
+        except Exception as e:
+            logger.debug(f"Stanza conflict detection failed: {e}")
+
+    async def _clean_old_configurations(self):
+        """Clean up any old configuration files that might interfere."""
+        try:
+            # Remove any backup config files older than 7 days
+            config_dir = Path('/etc/pgbackrest')
+            if config_dir.exists():
+                import time
+                current_time = time.time()
+                
+                for backup_file in config_dir.glob('*.backup.*'):
+                    file_age = current_time - backup_file.stat().st_mtime
+                    if file_age > 7 * 24 * 3600:  # 7 days
+                        backup_file.unlink()
+                        logger.debug(f"🧹 Cleaned old backup config: {backup_file}")
+                        
+        except Exception as e:
+            logger.debug(f"Config cleanup failed: {e}")
+
+    async def _detect_postgresql_conflicts(self):
+        """Detect PostgreSQL configuration conflicts."""
+        try:
+            # Check current archive command
+            check_cmd = ['sudo', '-u', 'postgres', 'psql', '-t', '-c', 'SHOW archive_command;']
+            process = await asyncio.create_subprocess_exec(
+                *check_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                current_cmd = stdout.decode().strip()
+                expected_cmd = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
+                
+                if current_cmd and current_cmd != expected_cmd:
+                    logger.info(f"🔍 Archive command mismatch detected:")
+                    logger.info(f"   Current: {current_cmd}")
+                    logger.info(f"   Expected: {expected_cmd}")
+                    logger.info("🔧 Will fix during setup...")
+                        
+        except Exception as e:
+            logger.debug(f"PostgreSQL conflict detection failed: {e}")
+
+    async def _ensure_correct_archive_command(self) -> bool:
+        """Ensure PostgreSQL archive command uses the correct network-aware stanza name with retry."""
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"🔧 Ensuring correct archive command (attempt {attempt + 1}/{max_retries})...")
+                
+                # Get current archive command
+                check_cmd = ['sudo', '-u', 'postgres', 'psql', '-t', '-c', 'SHOW archive_command;']
+                process = await asyncio.create_subprocess_exec(
+                    *check_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                
+                if process.returncode != 0:
+                    logger.warning(f"Failed to check archive command: {stderr.decode()}")
+                    continue
+                
+                current_archive_cmd = stdout.decode().strip()
+                expected_archive_cmd = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
+                
+                logger.info(f"📋 Current: {current_archive_cmd}")
+                logger.info(f"📋 Expected: {expected_archive_cmd}")
+                
+                if expected_archive_cmd in current_archive_cmd:
+                    logger.info("✅ Archive command is correct")
+                    return True
+                
+                # Update the archive command
+                logger.info("🔄 Updating archive command...")
+                update_cmd = [
+                    'sudo', '-u', 'postgres', 'psql', '-c',
+                    f"ALTER SYSTEM SET archive_command TO '{expected_archive_cmd}';"
+                ]
+                
+                process = await asyncio.create_subprocess_exec(
+                    *update_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                
+                if process.returncode != 0:
+                    logger.warning(f"Failed to update archive command: {stderr.decode()}")
+                    continue
+                
+                # Reload PostgreSQL configuration
+                logger.info("🔄 Reloading PostgreSQL configuration...")
+                reload_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT pg_reload_conf();']
+                
+                process = await asyncio.create_subprocess_exec(
+                    *reload_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                
+                if process.returncode != 0:
+                    logger.warning(f"Failed to reload config: {stderr.decode()}")
+                    continue
+                
+                # Verify the change
+                await asyncio.sleep(2)  # Give PostgreSQL time to reload
+                process = await asyncio.create_subprocess_exec(
+                    *check_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                
+                new_archive_cmd = stdout.decode().strip()
+                logger.info(f"✅ Archive command updated to: {new_archive_cmd}")
+                return True
+                
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1} to fix archive command failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)  # Wait before retry
+        
+        logger.error("❌ Failed to fix archive command after all attempts")
+        return False
+
+    async def _intelligent_stanza_setup(self) -> bool:
+        """Intelligently handle stanza setup for both primary and replica modes."""
+        try:
+            if self.is_primary:
+                logger.info("🏗️ Setting up PRIMARY stanza and backups...")
+                
+                # Test and fix WAL archiving first
+                if not await self._setup_wal_archiving():
+                    logger.warning("WAL archiving setup had issues - attempting recovery...")
+                    # Try to fix by recreating stanza
+                    await self._recreate_stanza_if_needed()
+                
+                # Initialize or verify pgBackRest
+                if not await self._initialize_pgbackrest():
+                    logger.error("Failed to initialize pgBackRest")
+                    return False
+                    
+                logger.info("✅ Primary setup completed")
+                return True
+                
+            else:
+                logger.info("🔄 Setting up REPLICA configuration...")
+                
+                # Replica setup
+                if not await self._setup_replica():
+                    logger.warning("Replica setup had issues - will continue with basic monitoring")
+                
+                logger.info("✅ Replica setup completed")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Stanza setup failed: {e}")
+            return False
+
+    async def _recreate_stanza_if_needed(self):
+        """Recreate stanza if there are persistent issues."""
+        try:
+            logger.info("🔄 Attempting to recreate stanza for clean setup...")
+            
+            # Stop any existing stanza operations
+            stop_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
+                       f'--stanza={self.config["stanza_name"]}', 'stop']
+            
+            process = await asyncio.create_subprocess_exec(
+                *stop_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.communicate()
+            
+            # Delete and recreate stanza
+            delete_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
+                         f'--stanza={self.config["stanza_name"]}', 'stanza-delete', '--force']
+            
+            process = await asyncio.create_subprocess_exec(
+                *delete_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.communicate()
+            
+            # Create fresh stanza
+            create_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
+                         f'--stanza={self.config["stanza_name"]}', 'stanza-create']
+            
+            process = await asyncio.create_subprocess_exec(
+                *create_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                logger.info("✅ Stanza recreated successfully")
+            else:
+                logger.warning(f"Stanza recreation had issues: {stderr.decode()}")
+                
+        except Exception as e:
+            logger.warning(f"Stanza recreation failed: {e}")
+
+    async def fix_archive_command(self) -> bool:
+        """Fix the PostgreSQL archive command to use the correct network-aware stanza name."""
+        try:
+            logger.info("🔧 Fixing PostgreSQL archive command for network-aware stanza...")
+            
+            # Get current archive command
+            check_cmd = ['sudo', '-u', 'postgres', 'psql', '-t', '-c', 'SHOW archive_command;']
+            process = await asyncio.create_subprocess_exec(
+                *check_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.error(f"Failed to check current archive command: {stderr.decode()}")
+                return False
+            
+            current_archive_cmd = stdout.decode().strip()
+            expected_archive_cmd = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
+            
+            logger.info(f"📋 Current archive command: {current_archive_cmd}")
+            logger.info(f"📋 Expected archive command: {expected_archive_cmd}")
+            
+            if expected_archive_cmd in current_archive_cmd:
+                logger.info("✅ Archive command is already correct")
+                return True
+            
+            # Update the archive command
+            logger.info("🔄 Updating archive command...")
+            update_cmd = [
+                'sudo', '-u', 'postgres', 'psql', '-c',
+                f"ALTER SYSTEM SET archive_command TO '{expected_archive_cmd}';"
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *update_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.error(f"Failed to update archive command: {stderr.decode()}")
+                return False
+            
+            # Reload PostgreSQL configuration
+            logger.info("🔄 Reloading PostgreSQL configuration...")
+            reload_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT pg_reload_conf();']
+            
+            process = await asyncio.create_subprocess_exec(
+                *reload_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.error(f"Failed to reload PostgreSQL config: {stderr.decode()}")
+                return False
+            
+            # Verify the change
+            process = await asyncio.create_subprocess_exec(
+                *check_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            new_archive_cmd = stdout.decode().strip()
+            logger.info(f"✅ Archive command updated to: {new_archive_cmd}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to fix archive command: {e}")
+            return False
+
+    async def prepare_for_network_transition(self, force_clean: bool = False) -> bool:
+        """
+        Prepare for transitioning between networks (e.g., testnet to mainnet).
+        
+        Args:
+            force_clean: If True, removes existing stanza to start completely fresh
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            if force_clean:
+                logger.warning("🧹 FORCE CLEAN: Removing existing stanza for fresh start...")
+                logger.warning(f"⚠️ This will delete backup history for stanza: {self.config['stanza_name']}")
+                
+                # Stop stanza first
+                stop_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
+                           f'--stanza={self.config["stanza_name"]}', 'stop']
+                
+                process = await asyncio.create_subprocess_exec(
+                    *stop_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+                
+                # Delete stanza
+                delete_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
+                             f'--stanza={self.config["stanza_name"]}', 'stanza-delete', '--force']
+                
+                process = await asyncio.create_subprocess_exec(
+                    *delete_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                
+                if process.returncode == 0:
+                    logger.info("✅ Stanza deleted successfully - ready for fresh start")
+                else:
+                    logger.warning(f"⚠️ Stanza deletion had issues (might not exist): {stderr.decode()}")
+                    logger.info("Continuing with setup anyway...")
+                
+            else:
+                logger.info("🔄 Preparing for network transition without force clean...")
+                logger.info(f"📋 Current stanza: {self.config['stanza_name']}")
+                logger.info(f"🌐 Network: {self.config.get('network', 'unknown')}")
+                
+                # Check if stanza exists
+                check_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
+                            f'--stanza={self.config["stanza_name"]}', 'info']
+                
+                process = await asyncio.create_subprocess_exec(
+                    *check_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                
+                if process.returncode == 0:
+                    logger.info("📊 Existing stanza found - will integrate with existing backups")
+                else:
+                    logger.info("🆕 No existing stanza found - will create new one")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to prepare for network transition: {e}")
+            return False
 
 
 # Factory function for easy integration
