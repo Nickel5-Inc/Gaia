@@ -1,4 +1,5 @@
 from gaia.tasks.base.task import Task
+from gaia.tasks.base.deterministic_job_id import DeterministicJobID
 from datetime import datetime, timedelta, timezone
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
@@ -307,6 +308,8 @@ class SoilMoistureTask(Task):
                                                     target_smap_time_utc = target_smap_time.replace(tzinfo=timezone.utc)
                                             else:
                                                 target_smap_time_utc = target_smap_time
+                                            # Using timestamp-based deterministic task ID (already deterministic)
+                                            # Could optionally use: DeterministicJobID.generate_task_id("soil_moisture", target_smap_time_utc, region_id)
                                             task_id = str(target_smap_time_utc.timestamp())
                                             baseline_prediction = await validator.basemodel_evaluator.predict_soil_and_store(
                                                 data=model_inputs,

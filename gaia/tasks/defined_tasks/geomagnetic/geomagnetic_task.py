@@ -3,6 +3,7 @@ from typing import Any, Dict, Optional, Union, List
 import uuid
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from gaia.tasks.base.task import Task
+from gaia.tasks.base.deterministic_job_id import DeterministicJobID
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_metadata import (
     GeomagneticMetadata,
 )
@@ -798,6 +799,8 @@ class GeomagneticTask(Task):
         """
         try:
             # Prepare parameters
+            # NOTE: Using random UUID for prediction record ID (database primary key)
+            # Task IDs elsewhere use deterministic timestamp-based IDs
             params = {
                 "id": str(uuid.uuid4()),
                 "miner_uid": miner_uid,

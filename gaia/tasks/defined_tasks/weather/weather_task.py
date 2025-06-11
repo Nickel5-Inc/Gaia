@@ -9,6 +9,7 @@ import json
 from pydantic import Field, ConfigDict
 from fiber.logging_utils import get_logger
 from gaia.tasks.base.task import Task
+from gaia.tasks.base.deterministic_job_id import DeterministicJobID
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 import uuid
@@ -1511,17 +1512,11 @@ class WeatherTask(Task):
         Checks for existing jobs for the same forecast time to avoid redundant runs.
         """
         logger.info("Miner execute called for WeatherTask")
-        new_job_id = str(uuid.uuid4())
-
-        if self.inference_runner is None:
-             logger.error(f"[New Job Attempt {new_job_id}] Cannot execute: Inference Runner not available.")
-             return {"status": "error", "message": "Miner inference component not ready"}
-        if not data or 'data' not in data:
-             logger.error(f"[New Job Attempt {new_job_id}] Invalid or missing payload data.")
-             return {"status": "error", "message": "Invalid payload structure"}
-
+        
+        # Extract validator and miner hotkeys for deterministic job ID generation
         validator_hotkey = data.get("sender_hotkey", "unknown")
-        payload_data = data['data']
+        miner_hotkey = self.keypair.ss58_address if self.keypair else "unknown_miner"
+        payload_data = data.get('data', {})
 
         try:
             gfs_init_time = payload_data.get('forecast_start_time')
@@ -1537,20 +1532,43 @@ class WeatherTask(Task):
                          gfs_init_time = gfs_init_time.astimezone(timezone.utc)
 
                  except (ValueError, TypeError) as parse_err:
-                     logger.error(f"[New Job Attempt {new_job_id}] Invalid forecast_start_time format: {gfs_init_time}. Error: {parse_err}")
+                     logger.error(f"[Miner Execute] Invalid forecast_start_time format: {gfs_init_time}. Error: {parse_err}")
                      return {"status": "error", "message": f"Invalid forecast_start_time format: {parse_err}"}
 
+            # Generate deterministic job ID using scheduled GFS time
+            job_id = DeterministicJobID.generate_weather_job_id(
+                gfs_init_time=gfs_init_time,  # SCHEDULED time, not processing time
+                miner_hotkey=miner_hotkey,
+                validator_hotkey=validator_hotkey,
+                job_type="forecast"
+            )
+            
             logger.info(f"Processing request for GFS init time: {gfs_init_time}")
+            logger.info(f"Generated deterministic job ID: {job_id}")
+
+            # Basic validation checks after job ID generation
+            if self.inference_runner is None:
+                 logger.error(f"[Job {job_id}] Cannot execute: Inference Runner not available.")
+                 return {"status": "error", "message": "Miner inference component not ready"}
+            if not data or 'data' not in data:
+                 logger.error(f"[Job {job_id}] Invalid or missing payload data.")
+                 return {"status": "error", "message": "Invalid payload structure"}
 
             existing_job = await self.get_job_by_gfs_init_time(gfs_init_time)
 
             if existing_job:
                 existing_job_id = existing_job['id']
                 existing_status = existing_job['status']
-                logger.info(f"[Job {existing_job_id}] Found existing {existing_status} job for GFS init time {gfs_init_time}. Reusing this job ID.")
+                logger.info(f"[Job {existing_job_id}] Found existing {existing_status} job for GFS init time {gfs_init_time}. Expected deterministic ID: {job_id}")
+                
+                # Verify the existing job ID matches our deterministic generation
+                if existing_job_id == job_id:
+                    logger.info(f"[Job {job_id}] ✅ Existing job ID matches deterministic generation. Reusing.")
+                else:
+                    logger.warning(f"[Job {job_id}] ⚠️  Existing job ID {existing_job_id} doesn't match deterministic ID {job_id}. This might be from before deterministic upgrade.")
+                
                 return {"status": "accepted", "job_id": existing_job_id, "message": f"Accepted. Reusing existing {existing_status} job."}
 
-            job_id = new_job_id
             logger.info(f"[Job {job_id}] No suitable existing job found. Creating new job for GFS init time {gfs_init_time}.")
 
             logger.info(f"[Job {job_id}] Starting preprocessing...")
@@ -1585,8 +1603,9 @@ class WeatherTask(Task):
             return {"status": "accepted", "job_id": job_id, "message": "Weather forecast job accepted for processing."}
 
         except Exception as e:
-            job_id_for_error = new_job_id
-            logger.error(f"[Job {job_id_for_error}] Error during initial miner_execute: {e}", exc_info=True)
+            # Use temporary job ID for error logging if we couldn't generate the deterministic one
+            temp_job_id = f"error_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+            logger.error(f"[Job {temp_job_id}] Error during initial miner_execute: {e}", exc_info=True)
             return {"status": "error", "job_id": None, "message": f"Failed to initiate job: {e}"}
 
     async def handle_kerchunk_request(self, job_id: str) -> Dict[str, Any]:
@@ -1808,9 +1827,20 @@ class WeatherTask(Task):
                         response["input_data_hash"] = existing_job['input_data_hash']
                     return self._validate_and_format_response(response, ["status", "job_id"])
 
-            # If no job exists, create a new one.
-            job_id = str(uuid.uuid4())
-            logger.info(f"[Miner Job {job_id}] No existing job found. Creating new job for T0={t0_run_time}.")
+            # If no job exists, create a new one using deterministic job ID
+            # Extract miner hotkey for deterministic generation
+            miner_hotkey = self.keypair.ss58_address if self.keypair else "unknown_miner"
+            # For fetch jobs, we don't have validator hotkey, so we'll use a consistent placeholder
+            # or extract it from the request context if available
+            validator_hotkey = getattr(request_data, 'validator_hotkey', 'unknown_validator')
+            
+            job_id = DeterministicJobID.generate_weather_job_id(
+                gfs_init_time=t0_run_time,  # SCHEDULED GFS time
+                miner_hotkey=miner_hotkey,
+                validator_hotkey=validator_hotkey,
+                job_type="fetch"
+            )
+            logger.info(f"[Miner Job {job_id}] No existing job found. Creating new deterministic job for T0={t0_run_time}.")
 
             insert_query = """
                 INSERT INTO weather_miner_jobs
