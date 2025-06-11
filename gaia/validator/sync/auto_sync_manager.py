@@ -2045,14 +2045,138 @@ pg1-user={self.config['pguser']}
                 return True
             else:
                 logger.warning(f"❌ pgBackRest check failed with return code {process.returncode}")
+                error_msg = stderr.decode() if stderr else ""
                 if stderr:
-                    logger.warning(f"Check error: {stderr.decode()}")
+                    logger.warning(f"Check error: {error_msg}")
                 if stdout:
                     logger.debug(f"Check stdout: {stdout.decode()}")
+                
+                # Handle specific case: stanza mismatch after replica sync
+                if (process.returncode == 28 and 
+                    "backup and archive info files exist but do not match the database" in error_msg):
+                    logger.warning("🔄 Detected stanza mismatch after replica sync - attempting repair...")
+                    return await self._handle_stanza_mismatch_after_sync()
+                
                 return False
             
         except Exception as e:
             logger.error(f"Error running check: {e}")
+            return False
+
+    async def _handle_stanza_mismatch_after_sync(self) -> bool:
+        """
+        Handle stanza mismatch that occurs after replica sync.
+        When a replica syncs its database from primary, the pgBackRest stanza info 
+        files become outdated and need to be reinitialized.
+        """
+        try:
+            logger.info("🔧 Handling stanza mismatch after replica sync...")
+            
+            # Stop archiving temporarily to prevent conflicts
+            logger.info("🛑 Temporarily disabling archive command...")
+            await self._set_archive_command("off")
+            
+            # Delete existing stanza to clean up inconsistent state
+            logger.info("🗑️  Removing existing stanza configuration...")
+            delete_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
+                         f'--stanza={self.config["stanza_name"]}', 'stanza-delete', '--force']
+            
+            process = await asyncio.create_subprocess_exec(
+                *delete_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.warning(f"Stanza delete warning (expected): {stderr.decode() if stderr else 'unknown'}")
+            
+            # Wait a moment for cleanup
+            await asyncio.sleep(2)
+            
+            # Create fresh stanza for the synced database
+            logger.info("🆕 Creating fresh stanza for synced database...")
+            create_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
+                         f'--stanza={self.config["stanza_name"]}', 'stanza-create']
+            
+            process = await asyncio.create_subprocess_exec(
+                *create_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.error(f"Failed to create fresh stanza: {stderr.decode() if stderr else 'unknown'}")
+                return False
+            
+            logger.info("✅ Fresh stanza created successfully")
+            
+            # Re-enable archive command
+            logger.info("🔄 Re-enabling archive command...")
+            archive_command = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
+            await self._set_archive_command(archive_command)
+            
+            # Verify the fix worked
+            logger.info("🔍 Verifying stanza repair...")
+            check_cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
+                        f'--stanza={self.config["stanza_name"]}', 'check']
+            
+            process = await asyncio.create_subprocess_exec(
+                *check_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                logger.info("🎉 Stanza mismatch repair completed successfully!")
+                return True
+            else:
+                logger.error(f"Stanza repair verification failed: {stderr.decode() if stderr else 'unknown'}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to handle stanza mismatch: {e}")
+            return False
+
+    async def _set_archive_command(self, command: str) -> bool:
+        """Set PostgreSQL archive_command dynamically."""
+        try:
+            if command == "off":
+                sql_command = "ALTER SYSTEM SET archive_command = ''"
+                log_msg = "Disabling archive command"
+            else:
+                sql_command = f"ALTER SYSTEM SET archive_command = '{command}'"
+                log_msg = f"Setting archive command to: {command}"
+            
+            logger.debug(log_msg)
+            
+            # Execute SQL command
+            process = await asyncio.create_subprocess_exec(
+                'sudo', '-u', 'postgres', 'psql', '-c', sql_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.error(f"Failed to set archive command: {stderr.decode()}")
+                return False
+            
+            # Reload configuration
+            reload_process = await asyncio.create_subprocess_exec(
+                'sudo', '-u', 'postgres', 'psql', '-c', 'SELECT pg_reload_conf()',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await reload_process.communicate()
+            
+            logger.debug("Archive command updated and configuration reloaded")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error setting archive command: {e}")
             return False
 
     async def get_backup_status(self) -> Dict:
