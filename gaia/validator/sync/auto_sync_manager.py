@@ -104,39 +104,76 @@ class AutoSyncManager:
     def _find_pgdata_path(self) -> str:
         """Find the data directory of the active PostgreSQL instance."""
         try:
+            logger.info("🔍 Attempting to discover PostgreSQL data directory from running instance...")
+            # Add timeout to prevent hanging
             result = subprocess.run(
                 ['sudo', '-u', 'postgres', 'psql', '-t', '-c', 'SHOW data_directory;'],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=10  # 10 second timeout
             )
             pgdata_path = result.stdout.strip()
             if pgdata_path and os.path.exists(pgdata_path):
-                logger.info(f"Discovered active PostgreSQL data directory at: {pgdata_path}")
+                logger.info(f"✅ Discovered active PostgreSQL data directory at: {pgdata_path}")
                 return pgdata_path
+        except subprocess.TimeoutExpired:
+            logger.warning("⏱️ PostgreSQL query timed out after 10 seconds - PostgreSQL may not be running")
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            logger.warning(f"Could not get data_directory from running PostgreSQL. Reason: {e}")
+            logger.warning(f"❌ Could not get data_directory from running PostgreSQL. Reason: {e}")
 
-        logger.info("Falling back to checking common PostgreSQL installation paths for pg_control.")
+        logger.info("🔍 Falling back to checking common PostgreSQL installation paths for pg_control...")
         common_paths = [
             '/var/lib/postgresql/14/main',
+            '/var/lib/postgresql/15/main',
+            '/var/lib/postgresql/16/main',
             '/var/lib/postgresql/data',
             '/var/lib/pgsql/data',
         ]
         for path in common_paths:
             if os.path.exists(os.path.join(path, 'pg_control')):
-                logger.info(f"Found pg_control in data directory: {path}")
+                logger.info(f"✅ Found pg_control in data directory: {path}")
                 return path
         
         pgdata_env = os.getenv('PGBACKREST_PGDATA')
         if pgdata_env:
-            logger.warning(f"Could not find a valid pgdata path. Using PGBACKREST_PGDATA from environment: {pgdata_env}")
+            logger.warning(f"⚠️ Could not find a valid pgdata path. Using PGBACKREST_PGDATA from environment: {pgdata_env}")
             return pgdata_env
             
+        logger.error("❌ Could not determine PostgreSQL data directory through any method")
         raise FileNotFoundError("Could not determine PostgreSQL data directory. Please ensure PostgreSQL is running or set PGBACKREST_PGDATA.")
 
     def _load_config(self) -> Dict:
         """Load and validate configuration from environment."""
         
-        pgdata_path = self._find_pgdata_path()
+        logger.info("🔧 Loading AutoSyncManager configuration...")
+        
+        # Debug environment variables
+        env_vars = {
+            'PGBACKREST_STANZA_NAME': os.getenv('PGBACKREST_STANZA_NAME'),
+            'SUBTENSOR_NETWORK': os.getenv('SUBTENSOR_NETWORK'),
+            'IS_SOURCE_VALIDATOR_FOR_DB_SYNC': os.getenv('IS_SOURCE_VALIDATOR_FOR_DB_SYNC'),
+            'PGBACKREST_R2_BUCKET': os.getenv('PGBACKREST_R2_BUCKET'),
+            'PGBACKREST_R2_ENDPOINT': os.getenv('PGBACKREST_R2_ENDPOINT'),
+            'PGBACKREST_R2_ACCESS_KEY_ID': os.getenv('PGBACKREST_R2_ACCESS_KEY_ID'),
+            'PGBACKREST_R2_SECRET_ACCESS_KEY': '***' if os.getenv('PGBACKREST_R2_SECRET_ACCESS_KEY') else None,
+            'PGBACKREST_PGDATA': os.getenv('PGBACKREST_PGDATA'),
+            'PGBACKREST_PGPORT': os.getenv('PGBACKREST_PGPORT'),
+            'PGBACKREST_PGUSER': os.getenv('PGBACKREST_PGUSER'),
+        }
+        
+        logger.info("📋 Environment variables:")
+        for key, value in env_vars.items():
+            if value:
+                logger.info(f"   ✅ {key}: {value}")
+            else:
+                logger.info(f"   ❌ {key}: Not set")
+        
+        try:
+            pgdata_path = self._find_pgdata_path()
+            logger.info(f"✅ PostgreSQL data directory: {pgdata_path}")
+        except Exception as e:
+            logger.error(f"❌ Failed to find PostgreSQL data directory: {e}")
+            # Don't raise immediately - let's see what other config we can gather
+            pgdata_path = "/var/lib/postgresql/14/main"  # Default fallback
+            logger.warning(f"⚠️ Using fallback PostgreSQL data directory: {pgdata_path}")
 
         r2_region_raw = os.getenv('PGBACKREST_R2_REGION', 'auto')
         r2_region = r2_region_raw.split('#')[0].strip()
@@ -176,8 +213,18 @@ class AutoSyncManager:
         missing_vars = [var for var in required_r2_vars if not config[var]]
         
         if missing_vars:
+            logger.error(f"❌ Missing required R2 configuration: {missing_vars}")
+            logger.error("💡 To enable DB sync, configure these environment variables:")
+            for var in missing_vars:
+                env_var_name = f"PGBACKREST_{var.upper().replace('_', '_')}"
+                if var == 'r2_access_key':
+                    env_var_name = 'PGBACKREST_R2_ACCESS_KEY_ID'
+                elif var == 'r2_secret_key':
+                    env_var_name = 'PGBACKREST_R2_SECRET_ACCESS_KEY'
+                logger.error(f"   - {env_var_name}")
             raise ValueError(f"Missing required R2 configuration: {missing_vars}")
         
+        logger.info("✅ Configuration loaded successfully")
         return config
 
     async def setup(self) -> bool:
@@ -191,43 +238,93 @@ class AutoSyncManager:
             logger.info(f"📋 Target stanza: {self.config['stanza_name']}")
             logger.info(f"🏠 Mode: {'PRIMARY' if self.is_primary else 'REPLICA'}")
             
-            # 1. Install dependencies
+            # 1. Install dependencies with timeout
             logger.info("📦 Step 1: Installing dependencies...")
-            if not await self._install_dependencies():
+            try:
+                install_success = await asyncio.wait_for(self._install_dependencies(), timeout=300)  # 5 minute timeout
+                if not install_success:
+                    logger.error("❌ Dependency installation failed")
+                    return False
+                logger.info("✅ Step 1 completed successfully")
+            except asyncio.TimeoutError:
+                logger.error("❌ Step 1 timed out after 5 minutes")
                 return False
             
-            # 2. Auto-detect and repair any existing configuration issues
+            # 2. Auto-detect and repair any existing configuration issues with timeout
             logger.info("🔍 Step 2: Detecting and repairing existing configuration...")
-            await self._auto_repair_configuration()
+            try:
+                await asyncio.wait_for(self._auto_repair_configuration(), timeout=60)  # 1 minute timeout
+                logger.info("✅ Step 2 completed successfully")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Step 2 timed out after 1 minute - continuing anyway")
             
-            # 3. Configure PostgreSQL (smart update, not just append)
+            # 3. Configure PostgreSQL (smart update, not just append) with timeout
             logger.info("⚙️ Step 3: Configuring PostgreSQL...")
-            if not await self._configure_postgresql():
+            try:
+                config_success = await asyncio.wait_for(self._configure_postgresql(), timeout=120)  # 2 minute timeout
+                if not config_success:
+                    logger.error("❌ PostgreSQL configuration failed")
+                    return False
+                logger.info("✅ Step 3 completed successfully")
+            except asyncio.TimeoutError:
+                logger.error("❌ Step 3 timed out after 2 minutes")
                 return False
             
-            # 4. Setup PostgreSQL authentication
+            # 4. Setup PostgreSQL authentication with timeout
             logger.info("🔐 Step 4: Setting up PostgreSQL authentication...")
-            if not await self._setup_postgres_auth():
+            try:
+                auth_success = await asyncio.wait_for(self._setup_postgres_auth(), timeout=60)  # 1 minute timeout
+                if not auth_success:
+                    logger.error("❌ PostgreSQL authentication setup failed")
+                    return False
+                logger.info("✅ Step 4 completed successfully")
+            except asyncio.TimeoutError:
+                logger.error("❌ Step 4 timed out after 1 minute")
                 return False
             
-            # 5. Configure pgBackRest
+            # 5. Configure pgBackRest with timeout
             logger.info("🔧 Step 5: Configuring pgBackRest...")
-            if not await self._configure_pgbackrest():
+            try:
+                pgbackrest_success = await asyncio.wait_for(self._configure_pgbackrest(), timeout=60)  # 1 minute timeout
+                if not pgbackrest_success:
+                    logger.error("❌ pgBackRest configuration failed")
+                    return False
+                logger.info("✅ Step 5 completed successfully")
+            except asyncio.TimeoutError:
+                logger.error("❌ Step 5 timed out after 1 minute")
                 return False
             
-            # 6. Ensure archive command is correct (with retry logic)
+            # 6. Ensure archive command is correct (with retry logic) with timeout
             logger.info("📝 Step 6: Ensuring correct archive command...")
-            if not await self._ensure_correct_archive_command():
-                logger.warning("Archive command may need manual attention")
+            try:
+                archive_success = await asyncio.wait_for(self._ensure_correct_archive_command(), timeout=60)  # 1 minute timeout
+                if not archive_success:
+                    logger.warning("⚠️ Archive command may need manual attention")
+                else:
+                    logger.info("✅ Step 6 completed successfully")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Step 6 timed out after 1 minute - archive command may need manual attention")
             
-            # 7. Handle stanza setup intelligently
+            # 7. Handle stanza setup intelligently with timeout
             logger.info("📊 Step 7: Setting up backup stanza...")
-            if not await self._intelligent_stanza_setup():
+            try:
+                stanza_success = await asyncio.wait_for(self._intelligent_stanza_setup(), timeout=600)  # 10 minute timeout
+                if not stanza_success:
+                    logger.error("❌ Stanza setup failed")
+                    return False
+                logger.info("✅ Step 7 completed successfully")
+            except asyncio.TimeoutError:
+                logger.error("❌ Step 7 timed out after 10 minutes")
                 return False
             
             # 8. Start application-controlled scheduling
             logger.info("⏰ Step 8: Starting automated scheduling...")
-            await self.start_scheduling()
+            try:
+                await asyncio.wait_for(self.start_scheduling(), timeout=30)  # 30 second timeout
+                logger.info("✅ Step 8 completed successfully")
+            except asyncio.TimeoutError:
+                logger.error("❌ Step 8 timed out after 30 seconds")
+                return False
             
             logger.info("🎉 Database sync setup completed successfully!")
             logger.info(f"✅ Ready for {'backup operations' if self.is_primary else 'replica synchronization'}")
@@ -241,46 +338,82 @@ class AutoSyncManager:
     async def _install_dependencies(self) -> bool:
         """Install pgBackRest and required dependencies."""
         try:
-            logger.info("Installing pgBackRest and dependencies...")
+            logger.info("📦 Installing pgBackRest and dependencies...")
             
             # Check if already installed
             try:
-                result = await asyncio.create_subprocess_exec(
-                    'pgbackrest', 'version',
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                logger.info("🔍 Checking if pgBackRest is already installed...")
+                result = await asyncio.wait_for(
+                    asyncio.create_subprocess_exec(
+                        'pgbackrest', 'version',
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    ),
+                    timeout=10
                 )
-                await result.communicate()
+                stdout, stderr = await result.communicate()
                 if result.returncode == 0:
-                    logger.info("pgBackRest already installed")
+                    logger.info("✅ pgBackRest already installed")
                     return True
-            except FileNotFoundError:
-                pass
+                else:
+                    logger.info("❌ pgBackRest not found, will install...")
+            except (FileNotFoundError, asyncio.TimeoutError):
+                logger.info("❌ pgBackRest not found, will install...")
             
-            # Install via apt
+            # Install via apt with timeout for each command
             commands = [
-                ['apt-get', 'update'],
-                ['apt-get', 'install', '-y', 'pgbackrest', 'postgresql-client']
+                (['apt-get', 'update'], 120, "Updating package lists"),  # 2 minute timeout
+                (['apt-get', 'install', '-y', 'pgbackrest', 'postgresql-client'], 300, "Installing packages")  # 5 minute timeout
             ]
             
-            for cmd in commands:
-                logger.info(f"Running: {' '.join(cmd)}")
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await process.communicate()
-                
-                if process.returncode != 0:
-                    logger.error(f"Command failed: {stderr.decode()}")
+            for cmd, timeout, description in commands:
+                logger.info(f"🔄 {description}: {' '.join(cmd)}")
+                try:
+                    process = await asyncio.wait_for(
+                        asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        ),
+                        timeout=timeout
+                    )
+                    stdout, stderr = await process.communicate()
+                    
+                    if process.returncode != 0:
+                        logger.error(f"❌ {description} failed: {stderr.decode()}")
+                        return False
+                    else:
+                        logger.info(f"✅ {description} completed successfully")
+                        
+                except asyncio.TimeoutError:
+                    logger.error(f"❌ {description} timed out after {timeout} seconds")
                     return False
             
-            logger.info("✅ Dependencies installed successfully")
-            return True
+            # Verify installation
+            try:
+                logger.info("🔍 Verifying pgBackRest installation...")
+                result = await asyncio.wait_for(
+                    asyncio.create_subprocess_exec(
+                        'pgbackrest', 'version',
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    ),
+                    timeout=10
+                )
+                stdout, stderr = await result.communicate()
+                if result.returncode == 0:
+                    version_info = stdout.decode().strip()
+                    logger.info(f"✅ pgBackRest installed successfully: {version_info}")
+                    return True
+                else:
+                    logger.error(f"❌ pgBackRest verification failed: {stderr.decode()}")
+                    return False
+            except asyncio.TimeoutError:
+                logger.error("❌ pgBackRest verification timed out")
+                return False
             
         except Exception as e:
-            logger.error(f"Failed to install dependencies: {e}")
+            logger.error(f"❌ Failed to install dependencies: {e}")
             return False
 
     async def _configure_postgresql(self) -> bool:
@@ -1941,13 +2074,24 @@ async def get_auto_sync_manager(test_mode: bool = False) -> Optional[AutoSyncMan
         print(f"🏗️ TEST MODE: {'ENABLED' if test_mode else 'DISABLED'} 🏗️")
         print("🏗️" * 60)
         
+        logger.info("🏗️ Creating AutoSyncManager instance...")
         manager = AutoSyncManager(test_mode=test_mode)
         
         print("✅ AUTO SYNC MANAGER CREATED SUCCESSFULLY ✅")
         logger.info("✅ AutoSyncManager factory: Created successfully")
         return manager
+    except ValueError as ve:
+        print("❌ CONFIGURATION ERROR ❌")
+        print(f"❌ ERROR: {ve} ❌")
+        logger.error(f"❌ AutoSyncManager factory: Configuration error - {ve}")
+        return None
+    except FileNotFoundError as fe:
+        print("❌ POSTGRESQL NOT FOUND ❌")
+        print(f"❌ ERROR: {fe} ❌")
+        logger.error(f"❌ AutoSyncManager factory: PostgreSQL not found - {fe}")
+        return None
     except Exception as e:
         print("❌ FAILED TO CREATE AUTO SYNC MANAGER ❌")
         print(f"❌ ERROR: {e} ❌")
-        logger.error(f"❌ AutoSyncManager factory: Failed to create - {e}")
+        logger.error(f"❌ AutoSyncManager factory: Failed to create - {e}", exc_info=True)
         return None 
