@@ -687,8 +687,8 @@ class ComprehensiveDatabaseSetup:
         logger.warning("Could not detect PostgreSQL service name")
         return None
 
-    async def _test_database_connection(self) -> bool:
-        """Test database connection"""
+    async def _test_database_connection(self, max_fix_attempts: int = 1) -> bool:
+        """Test database connection with circuit breaker to prevent infinite loops"""
         try:
             # First try with cluster specification
             cmd = ['sudo', '-u', 'postgres', 'psql', '--cluster', f'{self.config.postgres_version}/main', '-c', 'SELECT version();']
@@ -706,18 +706,16 @@ class ComprehensiveDatabaseSetup:
                 logger.info("✅ Database connection test successful (without cluster)")
                 return True
             
-            # If both fail, try to fix the cluster configuration
-            logger.warning(f"Database connection failed: {stderr}")
-            logger.info("🔧 Attempting to fix cluster configuration...")
-            
-            if await self._fix_cluster_configuration():
-                # Try connection again after fix
-                cmd = ['sudo', '-u', 'postgres', 'psql', '--cluster', f'{self.config.postgres_version}/main', '-c', 'SELECT version();']
-                success, stdout, stderr = await self._run_command(cmd, timeout=10)
+            # If both fail, try to fix the cluster configuration (with circuit breaker)
+            if max_fix_attempts > 0:
+                logger.warning(f"Database connection failed: {stderr}")
+                logger.info("🔧 Attempting to fix cluster configuration...")
                 
-                if success and 'PostgreSQL' in stdout:
-                    logger.info("✅ Database connection test successful (after cluster fix)")
-                    return True
+                if await self._fix_cluster_configuration():
+                    # Try connection again after fix (recursive call with decremented attempts)
+                    return await self._test_database_connection(max_fix_attempts - 1)
+            else:
+                logger.error("❌ Maximum cluster fix attempts reached, giving up")
             
             logger.error(f"Database connection test failed: {stderr}")
             return False
@@ -760,6 +758,11 @@ class ComprehensiveDatabaseSetup:
             else:
                 logger.warning(f"Cluster {cluster_name} not properly registered")
                 
+                # If cluster configuration is corrupted, remove it completely and recreate
+                if "Error: cluster configuration already exists" in stderr or "Invalid data directory" in stderr:
+                    logger.warning("🗑️ Cluster configuration corrupted, removing and recreating...")
+                    return await self._remove_and_recreate_cluster()
+                
                 # Try to create/register the cluster
                 cmd = ['sudo', 'pg_createcluster', self.config.postgres_version, 'main', 
                        '--datadir', self.config.data_directory]
@@ -779,11 +782,64 @@ class ComprehensiveDatabaseSetup:
                         logger.error(f"Failed to start new cluster: {stderr}")
                 else:
                     logger.error(f"Failed to create cluster: {stderr}")
+                    # If creation failed, try the aggressive cleanup
+                    if "already exists" in stderr:
+                        logger.warning("🗑️ Cluster configuration exists but corrupted, removing and recreating...")
+                        return await self._remove_and_recreate_cluster()
             
             return False
             
         except Exception as e:
             logger.error(f"Error fixing cluster configuration: {e}", exc_info=True)
+            return False
+
+    async def _remove_and_recreate_cluster(self) -> bool:
+        """Aggressively remove corrupted cluster configuration and recreate"""
+        try:
+            logger.warning("🗑️ Removing corrupted cluster configuration...")
+            
+            # Stop all PostgreSQL services
+            await self._stop_postgresql_service()
+            
+            # Remove cluster configuration files
+            config_dir = Path(self.config.config_directory)
+            if config_dir.exists():
+                logger.info(f"🗑️ Removing config directory: {config_dir}")
+                shutil.rmtree(config_dir, ignore_errors=True)
+            
+            # Remove data directory
+            data_dir = Path(self.config.data_directory)
+            if data_dir.exists():
+                logger.info(f"🗑️ Removing data directory: {data_dir}")
+                shutil.rmtree(data_dir, ignore_errors=True)
+            
+            # Wait a moment for filesystem operations to complete
+            await asyncio.sleep(2)
+            
+            # Create fresh cluster
+            logger.info("🆕 Creating fresh cluster...")
+            cmd = ['sudo', 'pg_createcluster', self.config.postgres_version, 'main']
+            success, stdout, stderr = await self._run_command(cmd, timeout=60)
+            
+            if not success:
+                logger.error(f"Failed to create fresh cluster: {stderr}")
+                return False
+            
+            logger.info("✅ Fresh cluster created successfully")
+            
+            # Start the cluster
+            cmd = ['sudo', 'pg_ctlcluster', self.config.postgres_version, 'main', 'start']
+            success, stdout, stderr = await self._run_command(cmd, timeout=30)
+            
+            if success:
+                logger.info("✅ Fresh cluster started successfully")
+                return True
+            else:
+                logger.error(f"Failed to start fresh cluster: {stderr}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error removing and recreating cluster: {e}", exc_info=True)
             return False
 
     async def _setup_database_and_users(self) -> bool:
