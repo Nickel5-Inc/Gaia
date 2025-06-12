@@ -783,11 +783,15 @@ class AutoSyncManager:
             if not self.is_primary:
                 logger.info("🔄 REPLICA MODE: Minimal PostgreSQL configuration (will be overwritten by restore)")
                 
-                # First, check if archiver is failing and fix it
+                # CRITICAL: Set up authentication FIRST before any PostgreSQL commands
+                logger.info("🔐 Setting up PostgreSQL authentication for replica...")
+                postgres_user = self.system_info.get('postgresql_user', 'postgres')
+                await self._setup_early_authentication(postgres_user)
+                
+                # Check if archiver is failing and fix it
                 await self._fix_failing_archiver()
                 
                 # Just ensure basic connectivity and skip complex configuration
-                postgres_user = self.system_info.get('postgresql_user', 'postgres')
                 return await self._verify_postgresql_configuration(postgres_user)
             
             # Check and fix failing archiver first (can cause hangs)
@@ -1029,25 +1033,24 @@ class AutoSyncManager:
 
     async def _verify_postgresql_configuration(self, postgres_user: str) -> bool:
         """Verify PostgreSQL configuration is correct."""
+        logger.info("🔍 Verifying PostgreSQL configuration...")
+        logger.info(f"🔍 Using PostgreSQL user: {postgres_user}")
+        
         max_retries = 10
         for attempt in range(max_retries):
             try:
+                logger.debug(f"🔍 Verification attempt {attempt + 1}/{max_retries}")
                 await asyncio.sleep(2)  # Wait for PostgreSQL to fully start
                 
                 # Check archive_mode setting with timeout
                 check_cmd = ['sudo', '-u', postgres_user, 'psql', '-t', '-c', 'SHOW archive_mode;']
-                process = await asyncio.create_subprocess_exec(
-                    *check_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), 
-                    timeout=15  # 15 second timeout
+                
+                returncode, stdout_text, stderr_text = await self._run_postgres_command_with_logging(
+                    check_cmd, timeout=15, description=f"Archive mode check (attempt {attempt + 1})"
                 )
                 
-                if process.returncode == 0:
-                    archive_mode = stdout.decode().strip()
+                if returncode == 0:
+                    archive_mode = stdout_text.strip()
                     logger.info(f"📋 Current archive_mode: {archive_mode}")
                     
                     if archive_mode == 'on':
@@ -1055,18 +1058,13 @@ class AutoSyncManager:
                         
                         # Also verify archive_command with timeout
                         check_cmd = ['sudo', '-u', postgres_user, 'psql', '-t', '-c', 'SHOW archive_command;']
-                        process = await asyncio.create_subprocess_exec(
-                            *check_cmd,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE
-                        )
-                        stdout, stderr = await asyncio.wait_for(
-                            process.communicate(), 
-                            timeout=15  # 15 second timeout
+                        
+                        cmd_returncode, cmd_stdout_text, cmd_stderr_text = await self._run_postgres_command_with_logging(
+                            check_cmd, timeout=15, description="Archive command check"
                         )
                         
-                        if process.returncode == 0:
-                            current_archive_cmd = stdout.decode().strip()
+                        if cmd_returncode == 0:
+                            current_archive_cmd = cmd_stdout_text.strip()
                             logger.info(f"📋 Current archive_command: {current_archive_cmd}")
                             
                             if self.config['stanza_name'] in current_archive_cmd:
@@ -1081,17 +1079,48 @@ class AutoSyncManager:
                             logger.info("🔄 Waiting for PostgreSQL configuration to take effect...")
                             continue
                 else:
-                    logger.warning(f"⚠️ Failed to check archive_mode (attempt {attempt + 1}/{max_retries}): {stderr.decode()}")
+                    logger.warning(f"⚠️ Failed to check archive_mode (attempt {attempt + 1}/{max_retries}): {stderr_text}")
                     
             except asyncio.TimeoutError:
                 logger.warning(f"⚠️ Timeout checking archive_mode (attempt {attempt + 1}/{max_retries})")
+                    
             except Exception as e:
                 logger.warning(f"⚠️ Error checking archive_mode (attempt {attempt + 1}/{max_retries}): {e}")
                 
             if attempt < max_retries - 1:
+                logger.info(f"⏳ Waiting 3 seconds before retry {attempt + 2}/{max_retries}...")
                 await asyncio.sleep(3)
         
         logger.error("❌ Failed to verify that archive_mode is enabled after PostgreSQL restart")
+        logger.error("💡 Attempting emergency PostgreSQL restart to fix hanging issues...")
+        
+        # Emergency restart attempt
+        if await self._emergency_postgresql_restart():
+            logger.info("🔄 Emergency restart completed - trying verification one more time...")
+            try:
+                check_cmd = ['sudo', '-u', postgres_user, 'psql', '-t', '-c', 'SHOW archive_mode;']
+                
+                final_returncode, final_stdout_text, final_stderr_text = await self._run_postgres_command_with_logging(
+                    check_cmd, timeout=10, description="Final verification after emergency restart"
+                )
+                
+                if final_returncode == 0:
+                    archive_mode = final_stdout_text.strip()
+                    logger.info(f"✅ Final verification - archive_mode: {archive_mode}")
+                    if archive_mode == 'on':
+                        logger.info("✅ Emergency restart fixed the issue!")
+                        return True
+                    else:
+                        logger.warning(f"⚠️ archive_mode is still '{archive_mode}' after emergency restart")
+                else:
+                    logger.warning(f"⚠️ Final verification failed: {final_stderr_text}")
+                    
+            except asyncio.TimeoutError:
+                logger.error("❌ Final verification still timed out after emergency restart")
+            except Exception as e:
+                logger.error(f"❌ Final verification error: {e}")
+        
+        logger.error("❌ All attempts to verify PostgreSQL configuration failed")
         logger.error("💡 Manual intervention may be required to enable archive_mode")
         return False
 
@@ -2716,22 +2745,64 @@ pg1-user={self.config['pguser']}
             
             # Check PostgreSQL process status for failing archiver
             ps_cmd = ['ps', 'aux']
+            logger.debug(f"🔍 Running command: {' '.join(ps_cmd)}")
             process = await asyncio.create_subprocess_exec(
                 *ps_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+            logger.debug(f"🔍 ps command completed with return code: {process.returncode}")
             
             if process.returncode == 0:
                 ps_output = stdout.decode()
-                if 'archiver failed' in ps_output:
+                logger.debug(f"🔍 ps output length: {len(ps_output)} characters")
+                
+                # Look for PostgreSQL processes and archiver status
+                postgres_lines = [line for line in ps_output.split('\n') if 'postgres' in line.lower()]
+                logger.info(f"🔍 Found {len(postgres_lines)} PostgreSQL-related processes")
+                
+                archiver_failed_lines = [line for line in postgres_lines if 'archiver failed' in line]
+                if archiver_failed_lines:
                     logger.warning("⚠️ Detected failing PostgreSQL archiver - this can cause hangs")
+                    for line in archiver_failed_lines:
+                        logger.warning(f"⚠️ Failing archiver process: {line.strip()}")
+                    
                     logger.info("🔧 Temporarily disabling archive_mode to fix archiver...")
+                    
+                    # First, try to connect and see if PostgreSQL responds
+                    logger.info("🔍 Testing PostgreSQL connectivity before disabling archiver...")
+                    test_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT 1;']
+                    logger.debug(f"🔍 Running test command: {' '.join(test_cmd)}")
+                    
+                    try:
+                        test_process = await asyncio.create_subprocess_exec(
+                            *test_cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        test_stdout, test_stderr = await asyncio.wait_for(test_process.communicate(), timeout=10)
+                        logger.debug(f"🔍 Test command completed with return code: {test_process.returncode}")
+                        
+                        # Echo test command output
+                        test_stdout_text = test_stdout.decode().strip()
+                        test_stderr_text = test_stderr.decode().strip()
+                        if test_stdout_text:
+                            logger.info(f"📤 Test STDOUT: {test_stdout_text}")
+                        if test_stderr_text:
+                            logger.info(f"📤 Test STDERR: {test_stderr_text}")
+                        
+                        if test_process.returncode == 0:
+                            logger.info("✅ PostgreSQL responds to simple queries")
+                        else:
+                            logger.warning(f"⚠️ PostgreSQL test query failed: {test_stderr_text}")
+                    except asyncio.TimeoutError:
+                        logger.warning("⚠️ PostgreSQL test query timed out - confirming archiver is causing hangs")
                     
                     # Disable archiving temporarily
                     disable_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 
                                  "ALTER SYSTEM SET archive_mode = 'off';"]
+                    logger.debug(f"🔍 Running disable command: {' '.join(disable_cmd)}")
                     
                     process = await asyncio.create_subprocess_exec(
                         *disable_cmd,
@@ -2739,20 +2810,44 @@ pg1-user={self.config['pguser']}
                         stderr=asyncio.subprocess.PIPE
                     )
                     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+                    logger.debug(f"🔍 Disable command completed with return code: {process.returncode}")
                     
                     if process.returncode == 0:
                         logger.info("✅ Disabled archive_mode")
                         
                         # Reload PostgreSQL configuration
+                        logger.info("🔄 Reloading PostgreSQL configuration...")
                         await self._reload_postgresql_config()
                         
                         # Wait for archiver to stop failing
+                        logger.info("⏳ Waiting for archiver to stabilize...")
                         await asyncio.sleep(3)
                         logger.info("✅ Fixed failing archiver - PostgreSQL should respond normally now")
                     else:
                         logger.warning(f"⚠️ Failed to disable archive_mode: {stderr.decode()}")
                 else:
-                    logger.debug("✅ No failing archiver detected")
+                    logger.debug("✅ No failing archiver detected in process list")
+                    
+                    # Still check if PostgreSQL is responsive
+                    logger.info("🔍 Testing PostgreSQL responsiveness...")
+                    test_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT 1;']
+                    logger.debug(f"🔍 Running responsiveness test: {' '.join(test_cmd)}")
+                    
+                    try:
+                        test_process = await asyncio.create_subprocess_exec(
+                            *test_cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        test_stdout, test_stderr = await asyncio.wait_for(test_process.communicate(), timeout=5)
+                        logger.debug(f"🔍 Responsiveness test completed with return code: {test_process.returncode}")
+                        
+                        if test_process.returncode == 0:
+                            logger.info("✅ PostgreSQL is responsive")
+                        else:
+                            logger.warning(f"⚠️ PostgreSQL responsiveness test failed: {test_stderr.decode()}")
+                    except asyncio.TimeoutError:
+                        logger.warning("⚠️ PostgreSQL responsiveness test timed out")
             else:
                 logger.warning(f"⚠️ Could not check for failing archiver: {stderr.decode()}")
                 
@@ -3000,6 +3095,251 @@ pg1-user={self.config['pguser']}
                 
         except Exception as e:
             logger.warning(f"⚠️ Error updating pg_hba.conf to md5: {e}")
+
+    async def _run_postgres_command_with_logging(self, cmd: list, timeout: int = 15, description: str = "PostgreSQL command") -> tuple:
+        """Run a PostgreSQL command with detailed logging and output echoing."""
+        logger.debug(f"🔍 Running {description}: {' '.join(cmd)}")
+        
+        import time
+        start_time = time.time()
+        
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            logger.debug(f"🔍 Process created, PID: {process.pid}")
+            
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), 
+                timeout=timeout
+            )
+            
+            elapsed = time.time() - start_time
+            logger.debug(f"🔍 {description} completed in {elapsed:.2f} seconds with return code: {process.returncode}")
+            
+            # Echo command output
+            stdout_text = stdout.decode().strip()
+            stderr_text = stderr.decode().strip()
+            if stdout_text:
+                logger.info(f"📤 {description} STDOUT: {stdout_text}")
+            if stderr_text:
+                logger.info(f"📤 {description} STDERR: {stderr_text}")
+            
+            return process.returncode, stdout_text, stderr_text
+            
+        except asyncio.TimeoutError:
+            elapsed = time.time() - start_time
+            logger.warning(f"⚠️ {description} timed out after {elapsed:.2f} seconds")
+            
+            # Try to kill the hanging process
+            try:
+                if process and process.returncode is None:
+                    logger.warning(f"🔪 Killing hanging process PID: {process.pid}")
+                    process.kill()
+                    await process.wait()
+            except Exception as kill_error:
+                logger.warning(f"⚠️ Error killing hanging process: {kill_error}")
+            
+            raise
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(f"❌ {description} failed after {elapsed:.2f} seconds: {e}")
+            raise
+
+    async def _setup_early_authentication(self, postgres_user: str):
+        """Set up PostgreSQL authentication early to prevent hanging commands."""
+        try:
+            logger.info("🔐 Setting up early PostgreSQL authentication...")
+            
+            # Check if we can connect without authentication first
+            logger.info("🔍 Testing current PostgreSQL authentication...")
+            test_cmd = ['sudo', '-u', postgres_user, 'psql', '-c', 'SELECT 1;']
+            
+            try:
+                returncode, stdout_text, stderr_text = await self._run_postgres_command_with_logging(
+                    test_cmd, timeout=5, description="Authentication test"
+                )
+                
+                if returncode == 0:
+                    logger.info("✅ PostgreSQL authentication already working")
+                    return
+                else:
+                    logger.warning("⚠️ PostgreSQL authentication test failed - setting up authentication")
+                    
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ PostgreSQL authentication test timed out - likely password prompt")
+                logger.info("🔧 Setting up authentication to prevent password prompts...")
+            
+            # Set up .pgpass file for password-less authentication
+            await self._create_pgpass_file(postgres_user)
+            
+            # Also try to set pg_hba.conf to trust for local connections temporarily
+            await self._setup_temporary_trust_auth()
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Error setting up early authentication: {e}")
+
+    async def _create_pgpass_file(self, postgres_user: str):
+        """Create .pgpass file for password-less PostgreSQL access."""
+        try:
+            logger.info("📝 Creating .pgpass file for password-less access...")
+            
+            # Determine postgres home directory
+            postgres_home_candidates = [
+                '/var/lib/postgresql',
+                f'/home/{postgres_user}',
+                '/root'  # Fallback for root access
+            ]
+            
+            postgres_home = None
+            for home_dir in postgres_home_candidates:
+                if os.path.exists(home_dir):
+                    postgres_home = home_dir
+                    break
+            
+            if not postgres_home:
+                logger.warning("⚠️ Could not find postgres home directory")
+                return
+            
+            pgpass_file = os.path.join(postgres_home, '.pgpass')
+            logger.info(f"📝 Creating .pgpass at: {pgpass_file}")
+            
+            # Create .pgpass content with common configurations
+            pgpass_content = f"""# Auto-generated by AutoSyncManager
+localhost:5432:*:postgres:postgres
+127.0.0.1:5432:*:postgres:postgres
+*:5432:*:postgres:postgres
+localhost:5433:*:postgres:postgres
+127.0.0.1:5433:*:postgres:postgres
+*:5433:*:postgres:postgres
+"""
+            
+            # Write .pgpass file
+            with open(pgpass_file, 'w') as f:
+                f.write(pgpass_content)
+            
+            # Set correct permissions
+            os.chmod(pgpass_file, 0o600)
+            
+            # Try to set ownership to postgres user
+            try:
+                shutil.chown(pgpass_file, user=postgres_user, group=postgres_user)
+                logger.info(f"✅ Created .pgpass file with postgres ownership: {pgpass_file}")
+            except Exception as chown_error:
+                logger.warning(f"⚠️ Could not set postgres ownership on .pgpass: {chown_error}")
+                logger.info(f"✅ Created .pgpass file (root ownership): {pgpass_file}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Error creating .pgpass file: {e}")
+
+    async def _setup_temporary_trust_auth(self):
+        """Temporarily set pg_hba.conf to trust authentication for setup."""
+        try:
+            logger.info("🔧 Setting up temporary trust authentication...")
+            
+            # Find pg_hba.conf file
+            hba_locations = [
+                '/etc/postgresql/14/main/pg_hba.conf',
+                '/etc/postgresql/15/main/pg_hba.conf',
+                '/etc/postgresql/16/main/pg_hba.conf',
+                '/var/lib/postgresql/14/main/pg_hba.conf',
+                '/var/lib/postgresql/15/main/pg_hba.conf',
+                '/var/lib/postgresql/16/main/pg_hba.conf',
+            ]
+            
+            hba_conf_path = None
+            for hba_path in hba_locations:
+                if os.path.exists(hba_path):
+                    hba_conf_path = Path(hba_path)
+                    break
+            
+            if not hba_conf_path:
+                logger.warning("⚠️ Could not find pg_hba.conf file")
+                return
+            
+            logger.info(f"📝 Found pg_hba.conf at: {hba_conf_path}")
+            
+            # Backup original file
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_path = f"{hba_conf_path}.backup.{timestamp}"
+            shutil.copy2(hba_conf_path, backup_path)
+            logger.info(f"📦 Backed up pg_hba.conf to: {backup_path}")
+            
+            # Read current content
+            with open(hba_conf_path, 'r') as f:
+                content = f.read()
+            
+            # Replace authentication methods with trust for local connections
+            lines = content.split('\n')
+            updated_lines = []
+            
+            for line in lines:
+                if line.strip().startswith('local') and 'postgres' in line:
+                    # Replace peer/md5 with trust for postgres user
+                    if 'peer' in line or 'md5' in line:
+                        updated_line = line.replace('peer', 'trust').replace('md5', 'trust')
+                        updated_lines.append(updated_line)
+                        logger.info(f"🔄 Updated: {line.strip()} → {updated_line.strip()}")
+                    else:
+                        updated_lines.append(line)
+                else:
+                    updated_lines.append(line)
+            
+            # Write updated content
+            with open(hba_conf_path, 'w') as f:
+                f.write('\n'.join(updated_lines))
+            
+            logger.info("✅ Updated pg_hba.conf for temporary trust authentication")
+            
+            # Reload PostgreSQL configuration
+            await self._reload_postgresql_config()
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Error setting up temporary trust auth: {e}")
+
+    async def _emergency_postgresql_restart(self) -> bool:
+        """Emergency PostgreSQL restart to fix hanging issues."""
+        try:
+            logger.warning("🚨 Performing emergency PostgreSQL restart...")
+            
+            # First, try to stop PostgreSQL gracefully
+            logger.info("🛑 Attempting graceful PostgreSQL stop...")
+            await self._stop_postgresql_service()
+            
+            # Wait a moment
+            await asyncio.sleep(2)
+            
+            # Kill any remaining PostgreSQL processes
+            logger.info("🔪 Killing any remaining PostgreSQL processes...")
+            try:
+                killall_cmd = ['sudo', 'killall', '-9', 'postgres']
+                process = await asyncio.create_subprocess_exec(
+                    *killall_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(process.communicate(), timeout=10)
+                logger.debug("🔪 Killall postgres completed")
+            except Exception as e:
+                logger.debug(f"🔪 Killall postgres failed (may be normal): {e}")
+            
+            # Wait for processes to die
+            await asyncio.sleep(3)
+            
+            # Start PostgreSQL
+            logger.info("🚀 Starting PostgreSQL after emergency cleanup...")
+            if await self._ensure_postgresql_running():
+                logger.info("✅ Emergency restart successful")
+                return True
+            else:
+                logger.error("❌ Emergency restart failed")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Emergency restart error: {e}")
+            return False
 
     async def _stop_postgresql_service(self):
         """Stop PostgreSQL service using detected service name."""
