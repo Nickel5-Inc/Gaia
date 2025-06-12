@@ -1533,10 +1533,17 @@ pg1-user={self.config['pguser']}
                     else:
                         logger.warning("⚠️ STARTUP SYNC FAILED: Continuing with scheduled operations anyway")
                         print("⚠️ STARTUP SYNC FAILED: Will retry on schedule ⚠️")
+                        
+                        # Ensure PostgreSQL is running even if sync failed
+                        await self._ensure_postgresql_running()
+                        
                 except Exception as e:
                     logger.error(f"❌ STARTUP SYNC ERROR: {e}")
                     print(f"❌ STARTUP SYNC ERROR: {e} ❌")
                     logger.info("🔄 Continuing with scheduled operations despite startup sync failure")
+                    
+                    # Ensure PostgreSQL is running even if sync failed with exception
+                    await self._ensure_postgresql_running()
             else:
                 logger.info("⏭️ REPLICA STARTUP: Immediate sync disabled (REPLICA_STARTUP_SYNC=false)")
                 print("⏭️ REPLICA STARTUP: Skipping immediate sync - will wait for scheduled sync ⏭️")
@@ -2253,18 +2260,47 @@ pg1-user={self.config['pguser']}
         try:
             logger.info("Starting database restore...")
             
-            # Stop PostgreSQL
+            # Stop PostgreSQL with proper service detection
             logger.info("Stopping PostgreSQL...")
-            stop_cmd = ['systemctl', 'stop', 'postgresql']
-            await asyncio.create_subprocess_exec(*stop_cmd)
+            postgres_service = self.system_info.get('postgresql_service', 'postgresql')
+            stop_cmd = ['systemctl', 'stop', postgres_service]
+            stop_process = await asyncio.create_subprocess_exec(
+                *stop_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await stop_process.communicate()
             
-            # Clear data directory
+            # Wait a moment for PostgreSQL to fully stop
+            await asyncio.sleep(2)
+            
+            # Clear data directory with better error handling
             logger.info("Clearing data directory...")
             data_path = Path(self.config['pgdata'])
             if data_path.exists():
-                shutil.rmtree(data_path)
-            data_path.mkdir(parents=True, exist_ok=True)
-            shutil.chown(data_path, user='postgres', group='postgres')
+                try:
+                    shutil.rmtree(data_path)
+                    logger.info(f"✅ Removed existing data directory: {data_path}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Error removing data directory: {e}")
+                    # Try to continue anyway
+            
+            # Create new data directory with proper permissions
+            try:
+                data_path.mkdir(parents=True, exist_ok=True)
+                logger.info(f"✅ Created data directory: {data_path}")
+                
+                # Try to set ownership, but don't fail if it doesn't work
+                try:
+                    shutil.chown(data_path, user='postgres', group='postgres')
+                    logger.info("✅ Set postgres ownership on data directory")
+                except Exception as chown_error:
+                    logger.warning(f"⚠️ Could not set postgres ownership: {chown_error}")
+                    # Continue anyway - pgbackrest restore might handle this
+                    
+            except Exception as mkdir_error:
+                logger.error(f"❌ Failed to create data directory: {mkdir_error}")
+                return False
             
             # Restore command
             restore_cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
@@ -2273,6 +2309,7 @@ pg1-user={self.config['pguser']}
             if target_time:
                 restore_cmd.extend([f'--target-time={target_time}'])
             
+            logger.info(f"🔄 Running restore command: {' '.join(restore_cmd)}")
             process = await asyncio.create_subprocess_exec(
                 *restore_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -2281,19 +2318,59 @@ pg1-user={self.config['pguser']}
             stdout, stderr = await process.communicate()
             
             if process.returncode != 0:
-                logger.error(f"Restore failed: {stderr.decode()}")
+                logger.error(f"❌ pgBackRest restore failed: {stderr.decode()}")
+                if stdout:
+                    logger.error(f"Restore stdout: {stdout.decode()}")
+                return False
+            else:
+                logger.info("✅ pgBackRest restore completed successfully")
+                if stdout:
+                    logger.debug(f"Restore output: {stdout.decode()}")
+            
+            # Start PostgreSQL with proper service detection
+            logger.info("Starting PostgreSQL...")
+            start_cmd = ['systemctl', 'start', postgres_service]
+            start_process = await asyncio.create_subprocess_exec(
+                *start_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            start_stdout, start_stderr = await start_process.communicate()
+            
+            if start_process.returncode != 0:
+                logger.error(f"❌ Failed to start PostgreSQL: {start_stderr.decode()}")
                 return False
             
-            # Start PostgreSQL
-            logger.info("Starting PostgreSQL...")
-            start_cmd = ['systemctl', 'start', 'postgresql']
-            await asyncio.create_subprocess_exec(*start_cmd)
+            # Wait for PostgreSQL to be ready
+            logger.info("⏳ Waiting for PostgreSQL to be ready...")
+            await asyncio.sleep(5)
             
-            logger.info("✅ Database restore completed successfully")
-            return True
+            # Verify PostgreSQL is running
+            status_cmd = ['systemctl', 'is-active', postgres_service]
+            status_process = await asyncio.create_subprocess_exec(
+                *status_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            status_stdout, _ = await status_process.communicate()
+            
+            if status_stdout.decode().strip() == 'active':
+                logger.info("✅ Database restore completed successfully - PostgreSQL is running")
+                return True
+            else:
+                logger.error("❌ PostgreSQL failed to start after restore")
+                return False
             
         except Exception as e:
             logger.error(f"Failed to restore database: {e}")
+            # Try to restart PostgreSQL even if restore failed
+            try:
+                postgres_service = self.system_info.get('postgresql_service', 'postgresql')
+                restart_cmd = ['systemctl', 'start', postgres_service]
+                await asyncio.create_subprocess_exec(*restart_cmd)
+                logger.info("🔄 Attempted to restart PostgreSQL after restore failure")
+            except:
+                pass
             return False
 
     async def _attempt_recovery(self):
@@ -2445,6 +2522,44 @@ pg1-user={self.config['pguser']}
                         
         except Exception as e:
             logger.debug(f"PostgreSQL conflict detection failed: {e}")
+
+    async def _ensure_postgresql_running(self):
+        """Ensure PostgreSQL is running, attempting to start it if not."""
+        try:
+            postgres_service = self.system_info.get('postgresql_service', 'postgresql')
+            
+            # Check if PostgreSQL is running
+            status_cmd = ['systemctl', 'is-active', postgres_service]
+            status_process = await asyncio.create_subprocess_exec(
+                *status_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            status_stdout, _ = await status_process.communicate()
+            
+            if status_stdout.decode().strip() == 'active':
+                logger.info("✅ PostgreSQL is already running")
+                return
+            
+            # PostgreSQL is not running, try to start it
+            logger.info("🔄 PostgreSQL not running, attempting to start...")
+            start_cmd = ['systemctl', 'start', postgres_service]
+            start_process = await asyncio.create_subprocess_exec(
+                *start_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            start_stdout, start_stderr = await start_process.communicate()
+            
+            if start_process.returncode == 0:
+                logger.info("✅ Successfully started PostgreSQL")
+                # Wait a moment for it to be ready
+                await asyncio.sleep(3)
+            else:
+                logger.error(f"❌ Failed to start PostgreSQL: {start_stderr.decode()}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error ensuring PostgreSQL is running: {e}")
 
     async def _ensure_correct_archive_command(self) -> bool:
         """Ensure PostgreSQL archive command uses the correct network-aware stanza name with retry."""
