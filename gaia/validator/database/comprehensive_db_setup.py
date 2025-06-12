@@ -486,6 +486,9 @@ class ComprehensiveDatabaseSetup:
         
         # Base configuration
         config_settings = {
+            'data_directory': f"'{self.config.data_directory}'",
+            'hba_file': f"'{Path(self.config.config_directory) / 'pg_hba.conf'}'",
+            'ident_file': f"'{Path(self.config.config_directory) / 'pg_ident.conf'}'",
             'listen_addresses': "'*'",
             'port': str(self.config.port),
             'max_connections': str(self.config.max_connections),
