@@ -1127,19 +1127,22 @@ async def setup_comprehensive_database(test_mode: bool = False, config: Optional
         # Run the complete setup
         success = await setup_manager.setup_complete_database_system()
         
+        if not success:
+            logger.error("💥 Main database setup failed. Attempting emergency repair...")
+            repaired = await setup_manager.emergency_repair()
+            
+            if repaired:
+                logger.info("✅ Emergency repair successful. Re-running setup on the fresh cluster...")
+                # After repair, we MUST run the setup again to configure the new cluster.
+                success = await setup_manager.setup_complete_database_system()
+            else:
+                logger.error("❌ Emergency repair also failed! The system is in a non-recoverable state.")
+                success = False
+        
         if success:
             logger.info("🎉 Comprehensive Database Setup completed successfully!")
         else:
-            logger.error("💥 Comprehensive Database Setup failed!")
-            
-            # Attempt emergency repair if main setup failed
-            logger.info("🚨 Attempting emergency repair...")
-            success = await setup_manager.emergency_repair()
-            
-            if success:
-                logger.info("✅ Emergency repair successful!")
-            else:
-                logger.error("❌ Emergency repair also failed!")
+            logger.error("💥 Comprehensive Database Setup FAILED, even after repair attempts.")
         
         return success
         
