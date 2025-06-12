@@ -1601,9 +1601,24 @@ pg1-user={self.config['pguser']}
                 logger.info(f"🏭 REPLICA MODE: Downloads hourly at :{sync_minute:02d} minutes ({buffer_minutes}min buffer after primary backup) 🏭")
                 print("🏭 REPLICA MODE: COORDINATED DOWNLOAD SCHEDULE ACTIVE 🏭")
             
-            # NOTE: Initial sync is now handled by pre-validator sync process
-            logger.info("⏭️ REPLICA STARTUP: Initial sync handled by pre-validator process")
-            print("⏭️ REPLICA STARTUP: Initial sync completed by pre-validator process ⏭️")
+            # For replica nodes, we'll perform a sync on startup if configured
+            if not self.is_primary:
+                # Check if initial sync on startup is requested
+                if self.config.get('replica_startup_sync', False):
+                    logger.info("🚀 REPLICA STARTUP: Initial sync requested. Attempting to restore from latest backup...")
+                    restore_success = await self.restore_from_backup()
+                    if not restore_success:
+                        logger.critical("💥 Initial replica sync FAILED. The validator cannot start with a stale database. Please resolve the issue and restart.")
+                        # Prevent further scheduling since startup sync failed
+                        return
+                    else:
+                        logger.info("✅ Initial replica sync successful. Continuing with normal operation.")
+                else:
+                    logger.info("⏭️ REPLICA STARTUP: Skipping initial sync as per configuration (REPLICA_STARTUP_SYNC is not 'true').")
+
+            logger.info("🔥" * 30)
+            logger.info("🔥 AUTO SYNC MANAGER SCHEDULING STARTED 🔥")
+            logger.info("🔥" * 30)
             
             # Only create replica sync task if not already running
             if not self.backup_task or self.backup_task.done():
