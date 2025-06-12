@@ -1061,10 +1061,10 @@ class ComprehensiveDatabaseSetup:
         """Emergency repair function for critical database issues"""
         logger.warning("🚨 Starting emergency database repair...")
         
-        # The main setup flow is now robust enough to handle this.
-        # Calling it again will trigger the necessary repair steps.
-        logger.info("🚨 Re-running main setup process for emergency repair...")
-        return await self.setup_complete_database_system()
+        # The most robust repair is to completely remove and recreate the cluster.
+        # This avoids loops and ensures a clean state.
+        logger.info("🚨 Aggressively removing and recreating cluster for emergency repair...")
+        return await self._remove_and_recreate_cluster()
 
     async def _emergency_stop_postgresql(self):
         """Emergency stop of all PostgreSQL processes"""
