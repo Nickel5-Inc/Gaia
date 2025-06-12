@@ -1575,6 +1575,10 @@ pg1-user={self.config['pguser']}
         print("🔥 AUTO SYNC MANAGER SCHEDULING STARTED 🔥")
         print("🔥" * 80)
         
+        # Note: Database setup is now handled by the comprehensive database setup system
+        # We can proceed directly to scheduling since the database should be ready
+        logger.info("✅ Database setup handled by comprehensive system - starting scheduling")
+        
         if self.is_primary:
             logger.info("🔥" * 10 + " BACKUP SCHEDULING ACTIVE " + "🔥" * 10)
             if self.test_mode:
@@ -1598,51 +1602,9 @@ pg1-user={self.config['pguser']}
                 logger.info(f"🏭 REPLICA MODE: Downloads hourly at :{sync_minute:02d} minutes ({buffer_minutes}min buffer after primary backup) 🏭")
                 print("🏭 REPLICA MODE: COORDINATED DOWNLOAD SCHEDULE ACTIVE 🏭")
             
-            # Trigger immediate sync on startup for replica nodes (if enabled)
-            startup_sync_enabled = os.getenv('REPLICA_STARTUP_SYNC', 'true').lower() in ['true', '1', 'yes']
-            if startup_sync_enabled:
-                logger.info("🚀 REPLICA STARTUP: Triggering immediate sync to get latest data from primary...")
-                print("\n" + "🚀" * 50)
-                print("🚀 REPLICA STARTUP: IMMEDIATE SYNC INITIATED 🚀")
-                print("🚀 DOWNLOADING LATEST BACKUP FROM PRIMARY 🚀")
-                print("🚀" * 50)
-                
-                try:
-                    # Pre-flight validation to prevent corruption
-                    logger.info("🔍 STARTUP SYNC: Running pre-flight validation...")
-                    validation_passed = await self._validate_system_before_sync()
-                    
-                    if not validation_passed:
-                        logger.error("❌ STARTUP SYNC ABORTED: Pre-flight validation failed")
-                        print("❌ STARTUP SYNC ABORTED: System not ready for sync operations ❌")
-                        logger.info("🔄 Continuing with scheduled operations (sync will retry later)")
-                    else:
-                        logger.info("✅ Pre-flight validation passed - proceeding with startup sync")
-                        startup_sync_success = await self._trigger_replica_sync()
-                        if startup_sync_success:
-                            logger.info("✅ STARTUP SYNC COMPLETED: Replica has latest data from primary")
-                            print("✅ STARTUP SYNC SUCCESS: Ready for scheduled operations ✅")
-                        else:
-                            logger.warning("⚠️ STARTUP SYNC FAILED: Continuing with scheduled operations anyway")
-                            print("⚠️ STARTUP SYNC FAILED: Will retry on schedule ⚠️")
-                except Exception as e:
-                    logger.error(f"❌ STARTUP SYNC ERROR: {e}")
-                    print(f"❌ STARTUP SYNC ERROR: {e} ❌")
-                    logger.info("🔄 Continuing with scheduled operations despite startup sync failure")
-                    # Ensure PostgreSQL is running after any failure
-                    try:
-                        await self._ensure_postgresql_running()
-                    except Exception as recovery_error:
-                        logger.error(f"❌ Failed to ensure PostgreSQL is running after startup sync failure: {recovery_error}")
-                        print(f"❌ CRITICAL: PostgreSQL may not be running! ❌")
-            else:
-                logger.info("⏭️ REPLICA STARTUP: Immediate sync disabled (REPLICA_STARTUP_SYNC=false)")
-                print("⏭️ REPLICA STARTUP: Skipping immediate sync - will wait for scheduled sync ⏭️")
-                # Still ensure PostgreSQL is running even if we skip startup sync
-                try:
-                    await self._ensure_postgresql_running()
-                except Exception as e:
-                    logger.error(f"❌ Failed to ensure PostgreSQL is running: {e}")
+            # NOTE: Initial sync is now handled by pre-validator sync process
+            logger.info("⏭️ REPLICA STARTUP: Initial sync handled by pre-validator process")
+            print("⏭️ REPLICA STARTUP: Initial sync completed by pre-validator process ⏭️")
             
             # Only create replica sync task if not already running
             if not self.backup_task or self.backup_task.done():
@@ -1653,6 +1615,9 @@ pg1-user={self.config['pguser']}
         if not self.health_check_task or self.health_check_task.done():
             self.health_check_task = asyncio.create_task(self._health_monitor())
         print("🔥" * 80 + "\n")
+
+    # Note: Pre-validator sync status checking is no longer needed
+    # Database setup is now handled by the comprehensive database setup system
 
     async def _backup_scheduler(self):
         """Application-controlled backup scheduling (replaces cron)."""

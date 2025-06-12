@@ -3728,104 +3728,59 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # --- Alembic check code for Validator ---
-    # No need to set DB_TARGET since we have separate configurations now
-    logger.info(f"[Startup] Using validator-specific Alembic configuration")
+    # --- Database Setup Note ---
+    # Database installation, configuration, and Alembic migrations are now handled
+    # by the comprehensive database setup system below
+    logger.info("Starting comprehensive database setup and validator application...")
+    # --- End Database Setup Note ---
 
-    try:
-        print("[STARTUP DEBUG] Checking database schema version using Alembic...")
-        # Construct path relative to this script file to find alembic_validator.ini at project root
-        # Assumes validator.py is in project_root/gaia/validator/validator.py
-        current_script_dir_val = os.path.dirname(os.path.abspath(__file__))
-        project_root_val = os.path.abspath(os.path.join(current_script_dir_val, "..", ".."))
-        alembic_ini_path_val = os.path.join(project_root_val, "alembic_validator.ini")
-
-        if not os.path.exists(alembic_ini_path_val):
-            print(f"[STARTUP DEBUG] ERROR: alembic_validator.ini not found at expected path: {alembic_ini_path_val}")
-            sys.exit("Alembic validator configuration not found.")
-
-        alembic_cfg_val = Config(alembic_ini_path_val)
-        print(f"[STARTUP DEBUG] Validator: Using Alembic configuration from: {alembic_ini_path_val}")
-        
-        # Diagnostic block for validator
+    # --- Comprehensive Database Setup ---
+    async def run_comprehensive_database_setup():
         try:
-            from alembic.script import ScriptDirectory
-            script_dir_instance_val = ScriptDirectory.from_config(alembic_cfg_val)
-            print(f"[STARTUP DEBUG] Validator DIAGNOSTIC: ScriptDirectory main path: {script_dir_instance_val.dir}")
-            print(f"[STARTUP DEBUG] Validator DIAGNOSTIC: ScriptDirectory version_locations: {script_dir_instance_val.version_locations}")
-        except Exception as e_diag_val:
-            print(f"[STARTUP DEBUG] Validator DIAGNOSTIC: Error: {e_diag_val}")
-
-        alembic_auto_upgrade_val = os.getenv("ALEMBIC_AUTO_UPGRADE", "True").lower() in ["true", "1", "yes"]
-        if alembic_auto_upgrade_val:
-            print(f"[STARTUP DEBUG] Validator: ALEMBIC_AUTO_UPGRADE is True. Checking database schema status...")
+            logger.info("🚀 Starting comprehensive database setup and validation...")
+            print("\n" + "🔧" * 80)
+            print("🔧 COMPREHENSIVE DATABASE SETUP STARTING 🔧")
+            print("🔧" * 80)
             
-            # Construct database URL for Alembic check - use psycopg2 for synchronous operations
-            db_host = os.getenv("DB_HOST", "localhost")
-            db_port = os.getenv("DB_PORT", "5432")
-            db_name = os.getenv("DB_NAME", "validator_db")
-            db_user = os.getenv("DB_USER", "postgres")
-            db_password = os.getenv("DB_PASSWORD", "postgres")
-            # Use psycopg2 for synchronous Alembic operations instead of asyncpg
-            if db_host.startswith('/'):
-                # Handle Unix socket connection
-                db_url = f"postgresql+psycopg2://{db_user}:{db_password}@/{db_name}?host={db_host}"
-            else:
-                # Handle TCP/IP connection
-                db_url = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+            # Import the comprehensive database setup
+            from gaia.validator.database.comprehensive_db_setup import setup_comprehensive_database, DatabaseConfig
             
-            # Safety check: Verify no data-destructive migrations are pending
-            try:
-                from alembic.script import ScriptDirectory
-                from alembic.runtime.migration import MigrationContext
-                
-                script_dir = ScriptDirectory.from_config(alembic_cfg_val)
-                
-                # Check current revision using synchronous engine
-                with create_engine(db_url, poolclass=pool.NullPool).connect() as conn:
-                    context = MigrationContext.configure(conn)
-                    current_rev = context.get_current_revision()
-                    
-                print(f"[STARTUP DEBUG] Current database revision: {current_rev or 'None (new database)'}")
-                
-                # Determine pending migrations
-                pending_revisions = []
-                if current_rev is None: # New database
-                    # All revisions are pending
-                    pending_revisions = list(script_dir.walk_revisions(head="head"))
-                else:
-                    # Some revisions may be pending
-                    pending_revisions = list(script_dir.walk_revisions(base=current_rev, head="head"))
-
-                if pending_revisions:
-                    print(f"[STARTUP DEBUG] Found {len(pending_revisions)} pending migration(s).")
-                    for rev in pending_revisions:
-                        print(f"[STARTUP DEBUG]  -> Pending: {rev.revision} ({rev.doc})")
-                    print("[STARTUP DEBUG] Applying pending migrations...")
-                    command.upgrade(alembic_cfg_val, "head")
-                    print("[STARTUP DEBUG] Database schema upgraded to head successfully.")
-                else:
-                    print("[STARTUP DEBUG] Database schema is already up-to-date.")
-                        
-            except Exception as e:
-                print(f"[STARTUP DEBUG] Warning: Could not reliably check for pending migrations: {e}")
-                print("[STARTUP DEBUG] Attempting to run 'alembic upgrade head' as a fallback...")
-                try:
-                    command.upgrade(alembic_cfg_val, "head")
-                    print("[STARTUP DEBUG] Fallback upgrade command completed.")
-                except Exception as upgrade_err:
-                    print(f"[STARTUP DEBUG] ERROR: Fallback upgrade command failed: {upgrade_err}")
-
-        else:
-            print("[STARTUP DEBUG] Validator: ALEMBIC_AUTO_UPGRADE is False. Skipping auto schema upgrade.")
-
-    except CommandError as e_val:
-         print(f"[STARTUP DEBUG] Validator: ERROR: Alembic command failed: {e_val}")
-    except Exception as e_val_outer: # Catch other potential errors like path issues
-        print(f"[STARTUP DEBUG] Validator: ERROR during Alembic setup: {e_val_outer}", exc_info=True)
-
-    logger.info("Validator Alembic check complete. Starting main validator application...")
-    # --- End Alembic check code for Validator ---
+            # Create database configuration from environment variables
+            db_config = DatabaseConfig(
+                database_name=os.getenv("DB_NAME", "gaia_validator"),
+                postgres_version=os.getenv("POSTGRES_VERSION", "14"),
+                postgres_password=os.getenv("DB_PASSWORD", "postgres"),
+                postgres_user=os.getenv("DB_USER", "postgres"),
+                port=int(os.getenv("DB_PORT", "5432")),
+                data_directory=os.getenv("POSTGRES_DATA_DIR", "/var/lib/postgresql/14/main"),
+                config_directory=os.getenv("POSTGRES_CONFIG_DIR", "/etc/postgresql/14/main")
+            )
+            
+            logger.info(f"Database configuration: {db_config.database_name} on port {db_config.port}")
+            
+            # Run comprehensive database setup
+            setup_success = await setup_comprehensive_database(
+                test_mode=args.test,
+                config=db_config
+            )
+            
+            if not setup_success:
+                logger.error("❌ Comprehensive database setup failed - validator cannot start safely")
+                print("❌ DATABASE SETUP FAILED - EXITING ❌")
+                sys.exit(1)
+            
+            logger.info("✅ Comprehensive database setup completed successfully")
+            print("✅ DATABASE SETUP COMPLETED - STARTING VALIDATOR ✅")
+            print("🔧" * 80 + "\n")
+            
+        except Exception as e:
+            logger.error(f"❌ Critical error in comprehensive database setup: {e}", exc_info=True)
+            print(f"❌ CRITICAL DATABASE ERROR: {e} ❌")
+            sys.exit(1)
+    
+    # Run the comprehensive database setup
+    asyncio.run(run_comprehensive_database_setup())
+    # --- End Comprehensive Database Setup ---
 
     # --- Ensure requirements are up to date on every restart ---
     try:
