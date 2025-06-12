@@ -36,6 +36,7 @@ from typing import Optional, Dict, List, Tuple
 from pathlib import Path
 from fiber.logging_utils import get_logger
 import time
+import re
 
 logger = get_logger(__name__)
 
@@ -437,6 +438,25 @@ class AutoSyncManager:
             raise ValueError(f"Missing required R2 configuration: {missing_vars}")
         
         logger.info("✅ Configuration loaded successfully")
+
+        # Add derived paths for configuration, essential for post-restore config
+        pg_version = self.system_info.get('postgresql_version')
+        if pg_version:
+            config['config_directory'] = f"/etc/postgresql/{pg_version}/main"
+        else:
+            # Attempt to find a version from service name if detection failed
+            service_name = self.system_info.get('postgresql_service', '')
+            match = re.search(r'(\d+)', service_name)
+            if match:
+                pg_version = match.group(1)
+                config['config_directory'] = f"/etc/postgresql/{pg_version}/main"
+                logger.info(f"Derived pg_version '{pg_version}' from service name for config path.")
+            else:
+                logger.warning("Could not determine PostgreSQL version for config path. Re-apply may fail.")
+                config['config_directory'] = None 
+        
+        config['socket_directory'] = '/var/run/postgresql'
+        
         return config
 
     async def setup(self) -> bool:
