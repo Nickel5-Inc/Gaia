@@ -35,6 +35,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
 from fiber.logging_utils import get_logger
+import time
 
 logger = get_logger(__name__)
 
@@ -206,7 +207,7 @@ class AutoSyncManager:
         }
         
         try:
-            # Try to detect PostgreSQL version and service
+            # Try to detect PostgreSQL version and service, including cluster-specific services
             service_variations = [
                 'postgresql',
                 'postgresql-14',
@@ -216,6 +217,26 @@ class AutoSyncManager:
                 'pgsql'
             ]
             
+            # First check for cluster-specific services (e.g., postgresql@14-main)
+            try:
+                result = subprocess.run(['systemctl', 'list-units', '--all', '--type=service'], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    lines = result.stdout.split('\n')
+                    for line in lines:
+                        if 'postgresql@' in line and ('loaded' in line or 'active' in line):
+                            # Extract service name like "postgresql@14-main.service"
+                            parts = line.split()
+                            if parts and parts[0].endswith('.service'):
+                                cluster_service = parts[0].replace('.service', '')
+                                pg_info['service_variations'].append(cluster_service)
+                                pg_info['postgresql_service'] = cluster_service
+                                logger.info(f"🐘 Found cluster-specific PostgreSQL service: {cluster_service}")
+                                break
+            except Exception as e:
+                logger.debug(f"Error detecting cluster-specific PostgreSQL service: {e}")
+            
+            # Check standard service variations if no cluster service found
             for service in service_variations:
                 try:
                     result = subprocess.run(['systemctl', 'is-active', service], 
@@ -1526,24 +1547,33 @@ pg1-user={self.config['pguser']}
                 print("🚀" * 50)
                 
                 try:
-                    startup_sync_success = await self._trigger_replica_sync()
-                    if startup_sync_success:
-                        logger.info("✅ STARTUP SYNC COMPLETED: Replica has latest data from primary")
-                        print("✅ STARTUP SYNC SUCCESS: Ready for scheduled operations ✅")
+                    # Pre-flight validation to prevent corruption
+                    logger.info("🔍 STARTUP SYNC: Running pre-flight validation...")
+                    validation_passed = await self._validate_system_before_sync()
+                    
+                    if not validation_passed:
+                        logger.error("❌ STARTUP SYNC ABORTED: Pre-flight validation failed")
+                        print("❌ STARTUP SYNC ABORTED: System not ready for sync operations ❌")
+                        logger.info("🔄 Continuing with scheduled operations (sync will retry later)")
                     else:
-                        logger.warning("⚠️ STARTUP SYNC FAILED: Continuing with scheduled operations anyway")
-                        print("⚠️ STARTUP SYNC FAILED: Will retry on schedule ⚠️")
-                        
-                        # Ensure PostgreSQL is running even if sync failed
-                        await self._ensure_postgresql_running()
-                        
+                        logger.info("✅ Pre-flight validation passed - proceeding with startup sync")
+                        startup_sync_success = await self._trigger_replica_sync()
+                        if startup_sync_success:
+                            logger.info("✅ STARTUP SYNC COMPLETED: Replica has latest data from primary")
+                            print("✅ STARTUP SYNC SUCCESS: Ready for scheduled operations ✅")
+                        else:
+                            logger.warning("⚠️ STARTUP SYNC FAILED: Continuing with scheduled operations anyway")
+                            print("⚠️ STARTUP SYNC FAILED: Will retry on schedule ⚠️")
                 except Exception as e:
                     logger.error(f"❌ STARTUP SYNC ERROR: {e}")
                     print(f"❌ STARTUP SYNC ERROR: {e} ❌")
                     logger.info("🔄 Continuing with scheduled operations despite startup sync failure")
-                    
-                    # Ensure PostgreSQL is running even if sync failed with exception
-                    await self._ensure_postgresql_running()
+                    # Ensure PostgreSQL is running after any failure
+                    try:
+                        await self._ensure_postgresql_running()
+                    except Exception as recovery_error:
+                        logger.error(f"❌ Failed to ensure PostgreSQL is running after startup sync failure: {recovery_error}")
+                        print(f"❌ CRITICAL: PostgreSQL may not be running! ❌")
             else:
                 logger.info("⏭️ REPLICA STARTUP: Immediate sync disabled (REPLICA_STARTUP_SYNC=false)")
                 print("⏭️ REPLICA STARTUP: Skipping immediate sync - will wait for scheduled sync ⏭️")
@@ -2253,16 +2283,44 @@ pg1-user={self.config['pguser']}
     async def restore_from_backup(self, target_time: Optional[str] = None) -> bool:
         """
         Restore database from backup (replica nodes).
+        Enhanced with corruption prevention and rollback capabilities.
         
         Args:
             target_time: Optional point-in-time recovery target
         """
+        postgres_service = self.system_info.get('postgresql_service', 'postgresql')
+        data_path = Path(self.config['pgdata'])
+        backup_path = None
+        
         try:
-            logger.info("Starting database restore...")
+            logger.info("🔄 Starting database restore with corruption prevention...")
             
-            # Stop PostgreSQL with proper service detection
-            logger.info("Stopping PostgreSQL...")
-            postgres_service = self.system_info.get('postgresql_service', 'postgresql')
+            # Step 1: Verify PostgreSQL is currently running and create a safety backup
+            logger.info("📋 Step 1: Creating safety backup of current state...")
+            try:
+                # Check if PostgreSQL is running
+                status_cmd = ['systemctl', 'is-active', postgres_service]
+                status_process = await asyncio.create_subprocess_exec(
+                    *status_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                status_stdout, _ = await status_process.communicate()
+                
+                if status_stdout.decode().strip() == 'active':
+                    # Create a safety backup of the current data directory
+                    backup_path = data_path.parent / f"{data_path.name}_safety_backup_{int(time.time())}"
+                    logger.info(f"📦 Creating safety backup at: {backup_path}")
+                    shutil.copytree(data_path, backup_path)
+                    logger.info("✅ Safety backup created successfully")
+                else:
+                    logger.warning("⚠️ PostgreSQL not running - skipping safety backup")
+            except Exception as backup_error:
+                logger.warning(f"⚠️ Could not create safety backup: {backup_error}")
+                # Continue anyway, but note the risk
+            
+            # Step 2: Stop PostgreSQL with proper service detection
+            logger.info("📋 Step 2: Stopping PostgreSQL...")
             stop_cmd = ['systemctl', 'stop', postgres_service]
             stop_process = await asyncio.create_subprocess_exec(
                 *stop_cmd,
@@ -2271,21 +2329,27 @@ pg1-user={self.config['pguser']}
             )
             await stop_process.communicate()
             
-            # Wait a moment for PostgreSQL to fully stop
-            await asyncio.sleep(2)
+            # Wait for PostgreSQL to fully stop
+            await asyncio.sleep(3)
             
-            # Clear data directory with better error handling
-            logger.info("Clearing data directory...")
-            data_path = Path(self.config['pgdata'])
+            # Step 3: Clear data directory with better error handling
+            logger.info("📋 Step 3: Clearing data directory...")
             if data_path.exists():
                 try:
                     shutil.rmtree(data_path)
                     logger.info(f"✅ Removed existing data directory: {data_path}")
                 except Exception as e:
-                    logger.warning(f"⚠️ Error removing data directory: {e}")
-                    # Try to continue anyway
+                    logger.error(f"❌ Error removing data directory: {e}")
+                    # This is a critical failure - restore from backup if available
+                    if backup_path and backup_path.exists():
+                        logger.info("🔄 Restoring from safety backup due to removal failure...")
+                        shutil.copytree(backup_path, data_path)
+                        await self._ensure_postgresql_running()
+                        return False
+                    raise
             
-            # Create new data directory with proper permissions
+            # Step 4: Create new data directory with proper permissions
+            logger.info("📋 Step 4: Creating new data directory...")
             try:
                 data_path.mkdir(parents=True, exist_ok=True)
                 logger.info(f"✅ Created data directory: {data_path}")
@@ -2300,9 +2364,15 @@ pg1-user={self.config['pguser']}
                     
             except Exception as mkdir_error:
                 logger.error(f"❌ Failed to create data directory: {mkdir_error}")
+                # Restore from backup if available
+                if backup_path and backup_path.exists():
+                    logger.info("🔄 Restoring from safety backup due to directory creation failure...")
+                    shutil.copytree(backup_path, data_path)
+                    await self._ensure_postgresql_running()
                 return False
             
-            # Restore command
+            # Step 5: Run pgBackRest restore
+            logger.info("📋 Step 5: Running pgBackRest restore...")
             restore_cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
                           f'--stanza={self.config["stanza_name"]}', 'restore']
             
@@ -2321,56 +2391,98 @@ pg1-user={self.config['pguser']}
                 logger.error(f"❌ pgBackRest restore failed: {stderr.decode()}")
                 if stdout:
                     logger.error(f"Restore stdout: {stdout.decode()}")
-                return False
+                
+                # Critical failure - restore from safety backup
+                if backup_path and backup_path.exists():
+                    logger.info("🔄 Restoring from safety backup due to pgBackRest failure...")
+                    if data_path.exists():
+                        shutil.rmtree(data_path)
+                    shutil.copytree(backup_path, data_path)
+                    await self._ensure_postgresql_running()
+                    return False
+                else:
+                    logger.error("❌ No safety backup available - system may be in corrupted state!")
+                    return False
             else:
                 logger.info("✅ pgBackRest restore completed successfully")
                 if stdout:
                     logger.debug(f"Restore output: {stdout.decode()}")
             
-            # Start PostgreSQL with proper service detection
-            logger.info("Starting PostgreSQL...")
-            start_cmd = ['systemctl', 'start', postgres_service]
-            start_process = await asyncio.create_subprocess_exec(
-                *start_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            start_stdout, start_stderr = await start_process.communicate()
+            # Step 6: Start PostgreSQL and verify it's working
+            logger.info("📋 Step 6: Starting PostgreSQL and verifying...")
+            await self._ensure_postgresql_running()
             
-            if start_process.returncode != 0:
-                logger.error(f"❌ Failed to start PostgreSQL: {start_stderr.decode()}")
+            # Step 7: Verify PostgreSQL is actually working by running a test query
+            logger.info("📋 Step 7: Testing database connectivity...")
+            try:
+                test_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT 1;']
+                test_process = await asyncio.create_subprocess_exec(
+                    *test_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                test_stdout, test_stderr = await test_process.communicate()
+                
+                if test_process.returncode != 0:
+                    logger.error(f"❌ Database connectivity test failed: {test_stderr.decode()}")
+                    # Restore from safety backup
+                    if backup_path and backup_path.exists():
+                        logger.info("🔄 Restoring from safety backup due to connectivity failure...")
+                        await asyncio.create_subprocess_exec('systemctl', 'stop', postgres_service)
+                        await asyncio.sleep(2)
+                        if data_path.exists():
+                            shutil.rmtree(data_path)
+                        shutil.copytree(backup_path, data_path)
+                        await self._ensure_postgresql_running()
+                        return False
+                    return False
+                else:
+                    logger.info("✅ Database connectivity test passed")
+            except Exception as test_error:
+                logger.error(f"❌ Error during connectivity test: {test_error}")
                 return False
             
-            # Wait for PostgreSQL to be ready
-            logger.info("⏳ Waiting for PostgreSQL to be ready...")
-            await asyncio.sleep(5)
+            # Step 8: Clean up safety backup on success
+            if backup_path and backup_path.exists():
+                try:
+                    shutil.rmtree(backup_path)
+                    logger.info("🧹 Cleaned up safety backup after successful restore")
+                except Exception as cleanup_error:
+                    logger.warning(f"⚠️ Could not clean up safety backup: {cleanup_error}")
             
-            # Verify PostgreSQL is running
-            status_cmd = ['systemctl', 'is-active', postgres_service]
-            status_process = await asyncio.create_subprocess_exec(
-                *status_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            status_stdout, _ = await status_process.communicate()
-            
-            if status_stdout.decode().strip() == 'active':
-                logger.info("✅ Database restore completed successfully - PostgreSQL is running")
-                return True
-            else:
-                logger.error("❌ PostgreSQL failed to start after restore")
-                return False
+            logger.info("✅ Database restore completed successfully with all verifications passed")
+            return True
             
         except Exception as e:
-            logger.error(f"Failed to restore database: {e}")
-            # Try to restart PostgreSQL even if restore failed
-            try:
-                postgres_service = self.system_info.get('postgresql_service', 'postgresql')
-                restart_cmd = ['systemctl', 'start', postgres_service]
-                await asyncio.create_subprocess_exec(*restart_cmd)
-                logger.info("🔄 Attempted to restart PostgreSQL after restore failure")
-            except:
-                pass
+            logger.error(f"❌ Critical error during database restore: {e}")
+            
+            # Emergency recovery - restore from safety backup if available
+            if backup_path and backup_path.exists():
+                try:
+                    logger.info("🚨 EMERGENCY RECOVERY: Restoring from safety backup...")
+                    # Stop PostgreSQL if running
+                    try:
+                        await asyncio.create_subprocess_exec('systemctl', 'stop', postgres_service)
+                        await asyncio.sleep(2)
+                    except:
+                        pass
+                    
+                    # Remove corrupted data and restore backup
+                    if data_path.exists():
+                        shutil.rmtree(data_path)
+                    shutil.copytree(backup_path, data_path)
+                    
+                    # Try to start PostgreSQL
+                    await self._ensure_postgresql_running()
+                    logger.info("✅ Emergency recovery completed - system restored to previous state")
+                    
+                except Exception as recovery_error:
+                    logger.error(f"❌ CRITICAL: Emergency recovery failed: {recovery_error}")
+                    logger.error("❌ SYSTEM MAY BE IN CORRUPTED STATE - MANUAL INTERVENTION REQUIRED")
+            else:
+                logger.error("❌ CRITICAL: No safety backup available for emergency recovery")
+                logger.error("❌ SYSTEM MAY BE IN CORRUPTED STATE - MANUAL INTERVENTION REQUIRED")
+            
             return False
 
     async def _attempt_recovery(self):
@@ -2872,6 +2984,194 @@ pg1-user={self.config['pguser']}
             
         except Exception as e:
             logger.error(f"Failed to prepare for network transition: {e}")
+            return False
+
+    async def _validate_system_before_sync(self) -> bool:
+        """
+        Validate that the system is properly configured before attempting sync operations.
+        This prevents corruption by ensuring all prerequisites are met.
+        """
+        try:
+            logger.info("🔍 Pre-flight validation: Checking system readiness for sync operations...")
+            
+            # Check 1: Verify PostgreSQL service detection
+            postgres_service = self.system_info.get('postgresql_service', 'postgresql')
+            logger.info(f"🔍 Detected PostgreSQL service: {postgres_service}")
+            
+            # Check 2: Verify data directory exists and is accessible
+            data_path = Path(self.config['pgdata'])
+            if not data_path.exists():
+                logger.error(f"❌ PostgreSQL data directory does not exist: {data_path}")
+                return False
+            
+            if not os.access(data_path, os.R_OK):
+                logger.error(f"❌ PostgreSQL data directory is not readable: {data_path}")
+                return False
+            
+            logger.info(f"✅ PostgreSQL data directory verified: {data_path}")
+            
+            # Check 3: Verify PostgreSQL is running
+            status_cmd = ['systemctl', 'is-active', postgres_service]
+            status_process = await asyncio.create_subprocess_exec(
+                *status_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            status_stdout, _ = await status_process.communicate()
+            
+            if status_stdout.decode().strip() != 'active':
+                logger.error(f"❌ PostgreSQL service is not active: {postgres_service}")
+                # Try to start it
+                logger.info("🔄 Attempting to start PostgreSQL...")
+                await self._ensure_postgresql_running()
+                
+                # Re-check
+                status_process = await asyncio.create_subprocess_exec(
+                    *status_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                status_stdout, _ = await status_process.communicate()
+                
+                if status_stdout.decode().strip() != 'active':
+                    logger.error("❌ Failed to start PostgreSQL - sync operations unsafe")
+                    return False
+            
+            logger.info("✅ PostgreSQL service is running")
+            
+            # Check 4: Verify database connectivity
+            try:
+                test_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT 1;']
+                test_process = await asyncio.create_subprocess_exec(
+                    *test_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                test_stdout, test_stderr = await test_process.communicate()
+                
+                if test_process.returncode != 0:
+                    logger.error(f"❌ Database connectivity test failed: {test_stderr.decode()}")
+                    return False
+                
+                logger.info("✅ Database connectivity verified")
+            except Exception as test_error:
+                logger.error(f"❌ Database connectivity test error: {test_error}")
+                return False
+            
+            # Check 5: Verify pgBackRest configuration
+            try:
+                check_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
+                           f'--stanza={self.config["stanza_name"]}', 'check']
+                check_process = await asyncio.create_subprocess_exec(
+                    *check_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                check_stdout, check_stderr = await check_process.communicate()
+                
+                if check_process.returncode != 0:
+                    logger.warning(f"⚠️ pgBackRest check failed: {check_stderr.decode()}")
+                    logger.warning("⚠️ Sync operations may fail - consider running setup again")
+                    # Don't fail validation for this, but warn
+                else:
+                    logger.info("✅ pgBackRest configuration verified")
+            except Exception as check_error:
+                logger.warning(f"⚠️ pgBackRest check error: {check_error}")
+                # Don't fail validation for this
+            
+            # Check 6: Verify sufficient disk space (at least 1GB free)
+            try:
+                statvfs = os.statvfs(data_path)
+                free_bytes = statvfs.f_frsize * statvfs.f_bavail
+                free_gb = free_bytes / (1024**3)
+                
+                if free_gb < 1.0:
+                    logger.error(f"❌ Insufficient disk space: {free_gb:.2f}GB free (minimum 1GB required)")
+                    return False
+                
+                logger.info(f"✅ Sufficient disk space: {free_gb:.2f}GB free")
+            except Exception as space_error:
+                logger.warning(f"⚠️ Could not check disk space: {space_error}")
+                # Don't fail validation for this
+            
+            logger.info("✅ Pre-flight validation passed - system ready for sync operations")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Pre-flight validation failed: {e}")
+            return False
+
+    async def _trigger_replica_sync(self) -> bool:
+        """Trigger a replica sync (check for new backups and restore if newer than local data)."""
+        try:
+            logger.info("🔄 Starting replica sync...")
+            start_time = datetime.now()
+            
+            # First, check what backups are available
+            info_cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
+                       f'--stanza={self.config["stanza_name"]}', 'info', '--output=json']
+            
+            logger.info(f"🔍 Checking available backups from primary...")
+            
+            process = await asyncio.create_subprocess_exec(
+                *info_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.warning(f"⚠️ Could not check backup status: {stderr.decode()}")
+                return False
+            
+            try:
+                backup_info = json.loads(stdout.decode())
+                logger.info(f"📊 Backup info retrieved successfully")
+                
+                # Check if there are any backups available
+                if not backup_info or len(backup_info) == 0:
+                    logger.warning("⚠️ No backup information available")
+                    return False
+                
+                stanza_info = backup_info[0] if isinstance(backup_info, list) else backup_info
+                if 'backup' not in stanza_info or len(stanza_info['backup']) == 0:
+                    logger.warning("⚠️ No backups found in repository")
+                    return False
+                
+                # Get the latest backup
+                latest_backup = stanza_info['backup'][-1]  # Last backup is latest
+                backup_type = latest_backup.get('type', 'unknown')
+                backup_timestamp = latest_backup.get('timestamp', {}).get('stop', 'unknown')
+                
+                logger.info(f"📦 Latest backup found: {backup_type} backup from {backup_timestamp}")
+                
+                # For replicas, we want to restore from the latest backup to ensure 
+                # complete synchronization with primary (primary is source of truth)
+                logger.info("🎯 REPLICA STRATEGY: Complete database overwrite with primary data")
+                logger.info("⚠️ WARNING: This will DESTROY all local replica data")
+                logger.info("✅ Primary database is the ABSOLUTE source of truth")
+                
+                # Perform the complete database restore
+                logger.info("🔄 Initiating complete database restore from primary backup...")
+                restore_success = await self.restore_from_backup()
+                
+                if restore_success:
+                    duration = datetime.now() - start_time
+                    logger.info(f"🎉 REPLICA SYNC COMPLETED: Database completely replaced with primary data")
+                    logger.info(f"⏱️ Total sync time: {duration.total_seconds():.1f} seconds")
+                    logger.info(f"📊 Restored from: {backup_type} backup (timestamp: {backup_timestamp})")
+                    logger.info("✅ Replica now has identical data to primary")
+                    return True
+                else:
+                    logger.error("❌ Database restore failed - replica sync incomplete")
+                    return False
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Failed to parse backup info JSON: {e}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Error in replica sync: {e}")
             return False
 
 
