@@ -532,10 +532,14 @@ class AutoSyncManager:
             # 8. Start application-controlled scheduling
             logger.info("⏰ Step 8: Starting automated scheduling...")
             try:
-                await asyncio.wait_for(self.start_scheduling(), timeout=30)  # 30 second timeout
+                # Add timeout to this step
+                await asyncio.wait_for(
+                    self.start_scheduling(),
+                    timeout=1800.0  # 30 minutes, restore can take a while
+                )
                 logger.info("✅ Step 8 completed successfully")
             except asyncio.TimeoutError:
-                logger.error("❌ Step 8 timed out after 30 seconds")
+                logger.error("❌ Step 8 timed out after 30 minutes")
                 return False
             
             logger.info("🎉 Database sync setup completed successfully!")
