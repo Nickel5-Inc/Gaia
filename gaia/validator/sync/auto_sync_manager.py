@@ -3077,11 +3077,7 @@ pg1-user={self.config['pguser']}
         try:
             logger.info("🔍 Pre-flight validation: Checking system readiness for sync operations...")
             
-            # Check 1: Verify PostgreSQL service detection
-            postgres_service = self.system_info.get('postgresql_service', 'postgresql')
-            logger.info(f"🔍 Detected PostgreSQL service: {postgres_service}")
-            
-            # Check 2: Verify data directory exists and is accessible
+            # Check 1: Verify data directory exists and is accessible
             data_path = Path(self.config['pgdata'])
             if not data_path.exists():
                 logger.error(f"❌ PostgreSQL data directory does not exist: {data_path}")
@@ -3093,30 +3089,55 @@ pg1-user={self.config['pguser']}
             
             logger.info(f"✅ PostgreSQL data directory verified: {data_path}")
             
-            # Check 3: Verify PostgreSQL is running
-            status_cmd = ['systemctl', 'is-active', postgres_service]
-            status_process = await asyncio.create_subprocess_exec(
-                *status_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            status_stdout, _ = await status_process.communicate()
+            # Check 2: Verify PostgreSQL is running (use same logic as _ensure_postgresql_running)
+            service_candidates = [
+                f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",  # Ubuntu cluster-specific
+                self.system_info.get('postgresql_service', 'postgresql'),              # From system detection
+                f"postgresql-{self.system_info.get('postgresql_version', '14')}",      # Version-specific
+                "postgresql",                                                           # Generic
+            ]
             
-            if status_stdout.decode().strip() != 'active':
-                logger.error(f"❌ PostgreSQL service is not active: {postgres_service}")
-                # Try to start it
-                logger.info("🔄 Attempting to start PostgreSQL...")
+            active_service = None
+            for service_name in service_candidates:
+                try:
+                    status_cmd = ['systemctl', 'is-active', service_name]
+                    status_process = await asyncio.create_subprocess_exec(
+                        *status_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    status_stdout, _ = await status_process.communicate()
+                    
+                    if status_stdout.decode().strip() == 'active':
+                        logger.info(f"✅ PostgreSQL is running via service: {service_name}")
+                        active_service = service_name
+                        break
+                except Exception:
+                    continue
+            
+            if not active_service:
+                logger.warning("⚠️ PostgreSQL is not running - attempting to start...")
                 await self._ensure_postgresql_running()
                 
-                # Re-check
-                status_process = await asyncio.create_subprocess_exec(
-                    *status_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                status_stdout, _ = await status_process.communicate()
+                # Re-check all services
+                for service_name in service_candidates:
+                    try:
+                        status_cmd = ['systemctl', 'is-active', service_name]
+                        status_process = await asyncio.create_subprocess_exec(
+                            *status_cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        status_stdout, _ = await status_process.communicate()
+                        
+                        if status_stdout.decode().strip() == 'active':
+                            logger.info(f"✅ PostgreSQL started successfully via service: {service_name}")
+                            active_service = service_name
+                            break
+                    except Exception:
+                        continue
                 
-                if status_stdout.decode().strip() != 'active':
+                if not active_service:
                     logger.error("❌ Failed to start PostgreSQL - sync operations unsafe")
                     return False
             
