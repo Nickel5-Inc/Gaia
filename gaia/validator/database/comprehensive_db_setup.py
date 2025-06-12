@@ -872,58 +872,55 @@ class ComprehensiveDatabaseSetup:
             return False
 
     async def _initialize_alembic(self) -> bool:
-        """Initialize Alembic if needed"""
-        try:
-            # Check if alembic_version table exists
-            check_cmd = [
-                'sudo', '-u', 'postgres', 'psql', '-d', self.config.database_name, '-c',
-                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'alembic_version');"
-            ]
-            
-            success, stdout, stderr = await self._run_command(check_cmd, timeout=10)
-            if success and 'true' in stdout.lower():
-                logger.info("✅ Alembic already initialized")
-                return True
-            
-            # Initialize Alembic
-            logger.info("🔧 Initializing Alembic...")
-            init_cmd = ['alembic', 'stamp', 'head']
-            
-            success, stdout, stderr = await self._run_command(init_cmd, timeout=30)
-            if success:
-                logger.info("✅ Alembic initialized")
-                return True
-            else:
-                logger.error(f"Failed to initialize Alembic: {stderr}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error initializing Alembic: {e}")
+        """Initialize Alembic and stamp the database to the latest version"""
+        logger.info("🔧 Initializing Alembic...")
+        
+        # We need to run alembic from the project root directory
+        # so it can find the alembic.ini file and other resources.
+        project_root_dir = str(project_root)
+        
+        # Command to stamp the database with the latest revision
+        # Use sys.executable to ensure we're using the alembic from our venv
+        cmd = [
+            sys.executable, '-m', 'alembic',
+            '--config', str(self.alembic_config_path),
+            'stamp', 'head'
+        ]
+        
+        success, stdout, stderr = await self._run_command(cmd, timeout=60, cwd=project_root_dir)
+        
+        if success:
+            logger.info("✅ Alembic stamped to head successfully")
+            return True
+        else:
+            logger.error(f"Failed to initialize Alembic: {stderr}")
             return False
 
     async def _run_alembic_migrations(self) -> bool:
-        """Run Alembic migrations"""
-        try:
-            logger.info("🔄 Running Alembic migrations...")
-            
-            # Run upgrade to head
-            upgrade_cmd = ['alembic', 'upgrade', 'head']
-            
-            success, stdout, stderr = await self._run_command(upgrade_cmd, timeout=120)
-            if success:
-                logger.info("✅ Alembic migrations completed")
-                logger.info(f"Migration output: {stdout}")
-                return True
-            else:
-                logger.error(f"Alembic migrations failed: {stderr}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error running Alembic migrations: {e}")
+        """Run alembic migrations to upgrade the database schema"""
+        logger.info("🔧 Running Alembic migrations...")
+        
+        project_root_dir = str(project_root)
+        
+        # Command to upgrade the database to the latest revision
+        # Use sys.executable to ensure we're using the alembic from our venv
+        cmd = [
+            sys.executable, '-m', 'alembic',
+            '--config', str(self.alembic_config_path),
+            'upgrade', 'head'
+        ]
+        
+        success, stdout, stderr = await self._run_command(cmd, timeout=120, cwd=project_root_dir)
+        
+        if success:
+            logger.info("✅ Alembic migrations run successfully")
+            return True
+        else:
+            logger.error(f"Failed to run Alembic migrations: {stderr}")
             return False
 
     async def _setup_backup_system(self) -> bool:
-        """Setup backup system (pgBackRest) - non-blocking"""
+        """Setup pgBackRest for database backups (placeholder)"""
         logger.info("💾 Setting up backup system...")
         
         try:
