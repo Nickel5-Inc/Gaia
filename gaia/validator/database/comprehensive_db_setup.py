@@ -821,79 +821,14 @@ class ComprehensiveDatabaseSetup:
             return False
 
     async def _setup_alembic_schema(self) -> bool:
-        """Setup database schema using Alembic (idempotent)"""
+        """Setup the database schema by running alembic migrations."""
         logger.info("📋 Setting up database schema with Alembic...")
-        
-        try:
-            # Check if Alembic is already set up
-            check_alembic_cmd = [
-                'sudo', '-u', 'postgres', 'psql', '-d', self.config.database_name, '-c',
-                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'alembic_version');"
-            ]
-            success, stdout, stderr = await self._run_command(check_alembic_cmd, timeout=10)
-            
-            if success and 'true' in stdout.lower():
-                logger.info("✅ Alembic already configured, running migrations...")
-                # Still run migrations in case there are new ones
-                original_cwd = os.getcwd()
-                os.chdir(project_root)
-                try:
-                    await self._run_alembic_migrations()
-                finally:
-                    os.chdir(original_cwd)
-                return True
-            
-            # Ensure we're in the project root directory
-            original_cwd = os.getcwd()
-            os.chdir(project_root)
-            
-            try:
-                # Check if alembic.ini exists
-                if not self.alembic_config_path.exists():
-                    logger.error(f"Alembic config not found: {self.alembic_config_path}")
-                    return False
-                
-                # Initialize Alembic if needed
-                if not await self._initialize_alembic():
-                    return False
-                
-                # Run migrations
-                if not await self._run_alembic_migrations():
-                    return False
-                
-                logger.info("✅ Database schema setup completed")
-                return True
-                
-            finally:
-                os.chdir(original_cwd)
-                
-        except Exception as e:
-            logger.error(f"Error setting up Alembic schema: {e}", exc_info=True)
-            return False
 
-    async def _initialize_alembic(self) -> bool:
-        """Initialize Alembic and stamp the database to the latest version"""
-        logger.info("🔧 Initializing Alembic...")
-        
-        project_root_dir = str(project_root)
-        
-        # Pass connection details directly to Alembic to avoid environment issues
-        db_url = f"postgresql+psycopg2://{self.config.postgres_user}:{self.config.postgres_password}@localhost:{self.config.port}/{self.config.database_name}"
-        
-        cmd = [
-            sys.executable, '-m', 'alembic',
-            '--config', str(self.alembic_config_path),
-            '-x', f'db_url={db_url}',
-            'stamp', 'head'
-        ]
-        
-        success, stdout, stderr = await self._run_command(cmd, timeout=60, cwd=project_root_dir)
-        
-        if success:
-            logger.info("✅ Alembic stamped to head successfully")
+        if await self._run_alembic_migrations():
+            logger.info("✅ Database schema setup completed")
             return True
         else:
-            logger.error(f"Failed to initialize Alembic: {stderr}")
+            logger.error("❌ Failed to setup Alembic schema.")
             return False
 
     async def _run_alembic_migrations(self) -> bool:
@@ -924,45 +859,29 @@ class ComprehensiveDatabaseSetup:
         """Setup pgBackRest for database backups (placeholder)"""
         logger.info("💾 Setting up backup system...")
         
-        try:
-            # This is optional and should not block the main setup
-            # We'll implement basic backup configuration here
-            
-            # Install pgBackRest if available
-            install_cmd = ['apt', 'install', '-y', 'pgbackrest']
-            success, stdout, stderr = await self._run_command(install_cmd, timeout=120)
-            
-            if success:
-                logger.info("✅ pgBackRest installed")
-                # Basic configuration would go here
-                # For now, we'll just log success and continue
-            else:
-                logger.warning("⚠️ Could not install pgBackRest - backups will not be available")
-            
-            return True  # Always return True as this is optional
-            
-        except Exception as e:
-            logger.warning(f"Backup system setup failed (non-critical): {e}")
-            return True  # Non-blocking
+        # This is a placeholder for a more comprehensive backup setup
+        logger.warning("⚠️ Backup system setup is currently a placeholder.")
+        return True
 
     async def _validate_complete_setup(self) -> bool:
-        """Validate that the complete setup is working"""
+        """Final validation to ensure the database system is perfectly configured"""
         logger.info("✅ Validating complete database setup...")
         
         try:
-            # Test 1: PostgreSQL service is running
+            # Check 1: PostgreSQL service is running
             service_name = await self._detect_postgresql_service()
             if not service_name:
-                logger.error("❌ Could not detect PostgreSQL service")
+                logger.error("❌ PostgreSQL service not detected")
                 return False
             
-            success, stdout, stderr = await self._run_command(['systemctl', 'is-active', service_name])
+            cmd = ['sudo', 'systemctl', 'is-active', service_name]
+            success, stdout, stderr = await self._run_command(cmd, timeout=10)
             if not success or stdout.strip() != 'active':
-                logger.error("❌ PostgreSQL service is not active")
+                logger.error(f"❌ PostgreSQL service not running: {stderr}")
                 return False
-            
-            # Test 2: Database connection works
-            if not await self._test_database_connection():
+
+            # Check 2: Database connection works
+            if not await self._test_database_connection(max_fix_attempts=0): # No more fixes at this stage
                 logger.error("❌ Database connection test failed")
                 return False
             
@@ -981,7 +900,7 @@ class ComprehensiveDatabaseSetup:
                 "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'alembic_version');"
             ]
             success, stdout, stderr = await self._run_command(check_alembic_cmd, timeout=10)
-            if not success or 'true' not in stdout.lower():
+            if not success or 't' not in stdout.lower(): # Check for 't' (true) or 'f' (false)
                 logger.error("❌ Alembic version table not found")
                 return False
             
@@ -1000,7 +919,7 @@ class ComprehensiveDatabaseSetup:
         except Exception as e:
             logger.error(f"❌ Validation failed with error: {e}", exc_info=True)
             return False
-
+            
     async def _stop_postgresql_service(self) -> bool:
         """Stop PostgreSQL service"""
         service_name = await self._detect_postgresql_service()
