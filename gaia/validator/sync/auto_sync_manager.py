@@ -339,6 +339,7 @@ class AutoSyncManager:
             'PGBACKREST_STANZA_NAME': os.getenv('PGBACKREST_STANZA_NAME'),
             'SUBTENSOR_NETWORK': os.getenv('SUBTENSOR_NETWORK'),
             'IS_SOURCE_VALIDATOR_FOR_DB_SYNC': os.getenv('IS_SOURCE_VALIDATOR_FOR_DB_SYNC'),
+            'REPLICA_STARTUP_SYNC': os.getenv('REPLICA_STARTUP_SYNC'),
             'PGBACKREST_R2_BUCKET': os.getenv('PGBACKREST_R2_BUCKET'),
             'PGBACKREST_R2_ENDPOINT': os.getenv('PGBACKREST_R2_ENDPOINT'),
             'PGBACKREST_R2_ACCESS_KEY_ID': os.getenv('PGBACKREST_R2_ACCESS_KEY_ID'),
@@ -395,6 +396,7 @@ class AutoSyncManager:
             'replica_discovery_endpoint': os.getenv('REPLICA_DISCOVERY_ENDPOINT'),  # For primary to announce itself
             'primary_discovery_endpoint': os.getenv('PRIMARY_DISCOVERY_ENDPOINT'),  # For replica to find primary
             'network': network_suffix,  # Store network for reference
+            'replica_startup_sync': os.getenv('REPLICA_STARTUP_SYNC', 'true').lower() == 'true',  # Enable immediate sync on startup
         }
         
         # Validate required R2 config
@@ -1515,6 +1517,30 @@ pg1-user={self.config['pguser']}
                 logger.info(f"🏭 REPLICA MODE: Downloads hourly at :{sync_minute:02d} minutes ({buffer_minutes}min buffer after primary backup) 🏭")
                 print("🏭 REPLICA MODE: COORDINATED DOWNLOAD SCHEDULE ACTIVE 🏭")
             
+            # Trigger immediate sync on startup for replica nodes (if enabled)
+            if self.config.get('replica_startup_sync', True):
+                logger.info("🚀 REPLICA STARTUP: Triggering immediate sync to get latest data from primary...")
+                print("\n" + "🚀" * 50)
+                print("🚀 REPLICA STARTUP: IMMEDIATE SYNC INITIATED 🚀")
+                print("🚀 DOWNLOADING LATEST BACKUP FROM PRIMARY 🚀")
+                print("🚀" * 50)
+                
+                try:
+                    startup_sync_success = await self._trigger_replica_sync()
+                    if startup_sync_success:
+                        logger.info("✅ STARTUP SYNC COMPLETED: Replica has latest data from primary")
+                        print("✅ STARTUP SYNC SUCCESS: Ready for scheduled operations ✅")
+                    else:
+                        logger.warning("⚠️ STARTUP SYNC FAILED: Continuing with scheduled operations anyway")
+                        print("⚠️ STARTUP SYNC FAILED: Will retry on schedule ⚠️")
+                except Exception as e:
+                    logger.error(f"❌ STARTUP SYNC ERROR: {e}")
+                    print(f"❌ STARTUP SYNC ERROR: {e} ❌")
+                    logger.info("🔄 Continuing with scheduled operations despite startup sync failure")
+            else:
+                logger.info("⏭️ REPLICA STARTUP: Immediate sync disabled (REPLICA_STARTUP_SYNC=false)")
+                print("⏭️ REPLICA STARTUP: Skipping immediate sync - will wait for scheduled sync ⏭️")
+            
             # Only create replica sync task if not already running
             if not self.backup_task or self.backup_task.done():
                 self.backup_task = asyncio.create_task(self._replica_sync_scheduler())
@@ -1664,8 +1690,11 @@ pg1-user={self.config['pguser']}
 
     async def _replica_sync_scheduler(self):
         """Application-controlled replica sync scheduling coordinated with primary backups."""
+        # Initialize last_sync - if we just did a startup sync, we don't need to sync again immediately
         last_sync = datetime.now()
         last_check = datetime.now()
+        
+        logger.info("🔄 Replica sync scheduler starting - will coordinate with primary backup schedule")
         
         print("\n" + "🔄" * 60)
         print("🔄 REPLICA SYNC SCHEDULER MAIN LOOP STARTED 🔄")
