@@ -875,15 +875,15 @@ class ComprehensiveDatabaseSetup:
         """Initialize Alembic and stamp the database to the latest version"""
         logger.info("🔧 Initializing Alembic...")
         
-        # We need to run alembic from the project root directory
-        # so it can find the alembic.ini file and other resources.
         project_root_dir = str(project_root)
         
-        # Command to stamp the database with the latest revision
-        # Use sys.executable to ensure we're using the alembic from our venv
+        # Pass connection details directly to Alembic to avoid environment issues
+        db_url = f"postgresql+psycopg2://{self.config.postgres_user}:{self.config.postgres_password}@localhost:{self.config.port}/{self.config.database_name}"
+        
         cmd = [
             sys.executable, '-m', 'alembic',
             '--config', str(self.alembic_config_path),
+            '-x', f'db_url={db_url}',
             'stamp', 'head'
         ]
         
@@ -902,11 +902,12 @@ class ComprehensiveDatabaseSetup:
         
         project_root_dir = str(project_root)
         
-        # Command to upgrade the database to the latest revision
-        # Use sys.executable to ensure we're using the alembic from our venv
+        db_url = f"postgresql+psycopg2://{self.config.postgres_user}:{self.config.postgres_password}@localhost:{self.config.port}/{self.config.database_name}"
+        
         cmd = [
             sys.executable, '-m', 'alembic',
             '--config', str(self.alembic_config_path),
+            '-x', f'db_url={db_url}',
             'upgrade', 'head'
         ]
         
