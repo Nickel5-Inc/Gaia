@@ -76,7 +76,7 @@ class ComprehensiveDatabaseSetup:
         self.postgres_info = self._detect_postgresql()
         
         # Paths and configuration
-        self.alembic_config_path = project_root / "alembic.ini"
+        self.alembic_config_path = project_root / "alembic_validator.ini"
         self.migrations_dir = project_root / "alembic" / "versions"
         
         logger.info(f"🔧 Comprehensive Database Setup initialized")
