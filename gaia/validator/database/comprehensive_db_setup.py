@@ -561,6 +561,7 @@ class ComprehensiveDatabaseSetup:
             "",
             "# Local connections",
             "local   all             postgres                                trust",
+            "local   all             root                                    trust",
             "local   all             all                                     md5",
             "",
             "# IPv4 local connections:",
@@ -1022,12 +1023,18 @@ class ComprehensiveDatabaseSetup:
         cmd_str = ' '.join(cmd)
         logger.debug(f"🔧 Running command: {cmd_str}")
         
+        effective_cwd = cwd
+        # If running as postgres user and no cwd is set, use /tmp to avoid permission errors
+        if 'sudo' in cmd and '-u' in cmd and 'postgres' in cmd and cwd is None:
+            effective_cwd = '/tmp'
+            logger.debug(f"🔧 Overriding cwd to '{effective_cwd}' for postgres user command")
+
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=cwd
+                cwd=effective_cwd
             )
             
             try:
