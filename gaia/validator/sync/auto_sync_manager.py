@@ -788,11 +788,10 @@ class AutoSyncManager:
                 postgres_user = self.system_info.get('postgresql_user', 'postgres')
                 await self._setup_early_authentication(postgres_user)
                 
-                # Check if archiver is failing and fix it
-                await self._fix_failing_archiver()
-                
-                # Just ensure basic connectivity and skip complex configuration
-                return await self._verify_postgresql_configuration(postgres_user)
+                # For replicas, we just ensure the service can start.
+                # The full configuration will be applied during the restore process.
+                logger.info("✅ Replica pre-configuration complete. Ready for restore.")
+                return True
             
             # Check and fix failing archiver first (can cause hangs)
             await self._fix_failing_archiver()
@@ -3072,7 +3071,8 @@ pg1-user={self.config['pguser']}
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                cwd='/tmp'
             )
             logger.debug(f"🔍 Process created, PID: {process.pid}")
             
