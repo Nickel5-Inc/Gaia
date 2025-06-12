@@ -1539,7 +1539,8 @@ pg1-user={self.config['pguser']}
                 print("🏭 REPLICA MODE: COORDINATED DOWNLOAD SCHEDULE ACTIVE 🏭")
             
             # Trigger immediate sync on startup for replica nodes (if enabled)
-            if self.config.get('replica_startup_sync', True):
+            startup_sync_enabled = os.getenv('REPLICA_STARTUP_SYNC', 'true').lower() in ['true', '1', 'yes']
+            if startup_sync_enabled:
                 logger.info("🚀 REPLICA STARTUP: Triggering immediate sync to get latest data from primary...")
                 print("\n" + "🚀" * 50)
                 print("🚀 REPLICA STARTUP: IMMEDIATE SYNC INITIATED 🚀")
@@ -1577,6 +1578,11 @@ pg1-user={self.config['pguser']}
             else:
                 logger.info("⏭️ REPLICA STARTUP: Immediate sync disabled (REPLICA_STARTUP_SYNC=false)")
                 print("⏭️ REPLICA STARTUP: Skipping immediate sync - will wait for scheduled sync ⏭️")
+                # Still ensure PostgreSQL is running even if we skip startup sync
+                try:
+                    await self._ensure_postgresql_running()
+                except Exception as e:
+                    logger.error(f"❌ Failed to ensure PostgreSQL is running: {e}")
             
             # Only create replica sync task if not already running
             if not self.backup_task or self.backup_task.done():
@@ -2380,12 +2386,49 @@ pg1-user={self.config['pguser']}
                 restore_cmd.extend([f'--target-time={target_time}'])
             
             logger.info(f"🔄 Running restore command: {' '.join(restore_cmd)}")
+            
+            # Create process with signal protection
             process = await asyncio.create_subprocess_exec(
                 *restore_cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=None  # Don't inherit signal handlers
             )
-            stdout, stderr = await process.communicate()
+            
+            logger.info(f"🔄 Restore process started with PID: {process.pid}")
+            
+            # Wait for restore with timeout but handle interruption gracefully
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), 
+                    timeout=7200  # 2 hours timeout
+                )
+            except asyncio.CancelledError:
+                logger.warning("⚠️ Restore process was cancelled - attempting graceful cleanup")
+                try:
+                    # Try to terminate gracefully first
+                    process.terminate()
+                    await asyncio.wait_for(process.wait(), timeout=30)
+                    logger.info("✅ Restore process terminated gracefully")
+                except asyncio.TimeoutError:
+                    logger.warning("⚠️ Graceful termination timed out - force killing restore process")
+                    process.kill()
+                    await process.wait()
+                    logger.info("✅ Restore process force killed")
+                
+                # Re-raise the cancellation
+                raise
+                
+            except asyncio.TimeoutError:
+                logger.error("❌ Restore process timed out after 2 hours")
+                try:
+                    process.terminate()
+                    await asyncio.wait_for(process.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+                # Set stderr to indicate timeout
+                stderr = b"Restore process timed out after 2 hours"
             
             if process.returncode != 0:
                 logger.error(f"❌ pgBackRest restore failed: {stderr.decode()}")
@@ -2638,37 +2681,77 @@ pg1-user={self.config['pguser']}
     async def _ensure_postgresql_running(self):
         """Ensure PostgreSQL is running, attempting to start it if not."""
         try:
-            postgres_service = self.system_info.get('postgresql_service', 'postgresql')
+            # Try different possible service names in order of preference
+            service_candidates = [
+                f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",  # Ubuntu cluster-specific
+                self.system_info.get('postgresql_service', 'postgresql'),              # From system detection
+                f"postgresql-{self.system_info.get('postgresql_version', '14')}",      # Version-specific
+                "postgresql",                                                           # Generic
+            ]
             
-            # Check if PostgreSQL is running
-            status_cmd = ['systemctl', 'is-active', postgres_service]
-            status_process = await asyncio.create_subprocess_exec(
-                *status_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            status_stdout, _ = await status_process.communicate()
+            active_service = None
             
-            if status_stdout.decode().strip() == 'active':
-                logger.info("✅ PostgreSQL is already running")
+            # First, check if any service is already running
+            for service_name in service_candidates:
+                try:
+                    status_cmd = ['systemctl', 'is-active', service_name]
+                    status_process = await asyncio.create_subprocess_exec(
+                        *status_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    status_stdout, _ = await status_process.communicate()
+                    
+                    if status_stdout.decode().strip() == 'active':
+                        logger.info(f"✅ PostgreSQL is already running via service: {service_name}")
+                        active_service = service_name
+                        break
+                except Exception:
+                    continue
+            
+            if active_service:
                 return
             
-            # PostgreSQL is not running, try to start it
+            # No service is running, try to start one
             logger.info("🔄 PostgreSQL not running, attempting to start...")
-            start_cmd = ['systemctl', 'start', postgres_service]
-            start_process = await asyncio.create_subprocess_exec(
-                *start_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            start_stdout, start_stderr = await start_process.communicate()
             
-            if start_process.returncode == 0:
-                logger.info("✅ Successfully started PostgreSQL")
-                # Wait a moment for it to be ready
-                await asyncio.sleep(3)
-            else:
-                logger.error(f"❌ Failed to start PostgreSQL: {start_stderr.decode()}")
+            for service_name in service_candidates:
+                try:
+                    logger.info(f"🔍 Trying to start service: {service_name}")
+                    start_cmd = ['sudo', 'systemctl', 'start', service_name]
+                    start_process = await asyncio.create_subprocess_exec(
+                        *start_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    start_stdout, start_stderr = await start_process.communicate()
+                    
+                    if start_process.returncode == 0:
+                        logger.info(f"✅ Successfully started PostgreSQL via service: {service_name}")
+                        # Wait a moment for it to be ready
+                        await asyncio.sleep(3)
+                        
+                        # Verify it's actually running
+                        status_process = await asyncio.create_subprocess_exec(
+                            'systemctl', 'is-active', service_name,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        status_stdout, _ = await status_process.communicate()
+                        
+                        if status_stdout.decode().strip() == 'active':
+                            logger.info(f"✅ Confirmed PostgreSQL is running via: {service_name}")
+                            return
+                        else:
+                            logger.warning(f"⚠️ Service {service_name} started but not showing as active")
+                    else:
+                        logger.debug(f"❌ Failed to start {service_name}: {start_stderr.decode().strip()}")
+                        
+                except Exception as e:
+                    logger.debug(f"❌ Exception trying to start {service_name}: {e}")
+                    continue
+            
+            logger.error("❌ Failed to start PostgreSQL with any known service name")
                 
         except Exception as e:
             logger.error(f"❌ Error ensuring PostgreSQL is running: {e}")
