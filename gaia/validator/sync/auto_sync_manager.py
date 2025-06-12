@@ -2493,7 +2493,11 @@ pg1-user={self.config['pguser']}
                 logger.info("✅ pgBackRest restore completed successfully")
                 if stdout:
                     logger.debug(f"Restore output: {stdout.decode()}")
-            
+
+            logger.info("📋 Step 5a: Re-applying local configurations post-restore...")
+            if not await self._reapply_local_configuration_post_restore():
+                logger.error("❌ Failed to re-apply local configurations. The database may not be accessible.")
+                
             # Step 6: Start PostgreSQL and verify it's working
             logger.info("📋 Step 6: Starting PostgreSQL and verifying...")
             await self._ensure_postgresql_running()
@@ -4031,6 +4035,73 @@ localhost:5433:*:postgres:postgres
                 
         except Exception as e:
             logger.error(f"❌ Error in replica sync: {e}")
+            return False
+
+    async def _reapply_local_configuration_post_restore(self):
+        """
+        Re-applies essential local configurations after a restore has wiped them out.
+        This is critical to ensure the restored database is reachable and configured
+        for the current machine.
+        """
+        logger.info("🔧 Re-applying local PostgreSQL configurations post-restore...")
+        try:
+            # 1. Re-create the custom Gaia configuration in conf.d
+            custom_config_dir = Path(self.config['config_directory']) / 'conf.d'
+            custom_config_dir.mkdir(parents=True, exist_ok=True)
+            custom_config_file = custom_config_dir / '99-gaia-reapplied.conf'
+            
+            config_settings = {
+                'unix_socket_directories': f"'{self.config['socket_directory']}'",
+                'listen_addresses': "'*'",
+                'max_connections': '250',
+                'shared_buffers': "'1GB'",
+                'effective_cache_size': "'3GB'",
+                'maintenance_work_mem': "'256MB'",
+                'checkpoint_completion_target': '0.9',
+                'wal_buffers': "'16MB'",
+                'default_statistics_target': '100',
+                'random_page_cost': '1.1',
+                'effective_io_concurrency': '200',
+                'work_mem': "'8MB'",
+                'min_wal_size': "'1GB'",
+                'max_wal_size': "'4GB'",
+                'log_line_prefix': "'%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '",
+                'log_checkpoints': 'on',
+                'log_connections': 'on',
+                'log_disconnections': 'on',
+                'log_lock_waits': 'on',
+                'log_temp_files': '0',
+                'log_autovacuum_min_duration': '0',
+                'log_error_verbosity': "'default'"
+            }
+            config_lines = [f"{key} = {value}" for key, value in config_settings.items()]
+            with open(custom_config_file, 'w') as f:
+                f.write("# Re-applied by Gaia AutoSync post-restore\n")
+                f.write('\n'.join(config_lines))
+            logger.info(f"✅ Re-applied custom configuration to {custom_config_file}")
+
+            # 2. Re-apply pg_hba.conf settings
+            hba_conf_path = Path(self.config['config_directory']) / 'pg_hba.conf'
+            if hba_conf_path.exists():
+                hba_entry = "local   all             all                                     trust"
+                with open(hba_conf_path, 'r+') as f:
+                    content = f.read()
+                    if hba_entry not in content:
+                        f.write(f"\n# Re-applied by Gaia AutoSync for local connections\n{hba_entry}\n")
+                        logger.info("✅ Re-applied local trust authentication to pg_hba.conf")
+            else:
+                logger.warning(f"⚠️ Could not find pg_hba.conf at {hba_conf_path} to re-apply settings.")
+
+            # 3. Ensure correct ownership
+            postgres_user = self.system_info.get('postgresql_user', 'postgres')
+            chown_cmd = ['sudo', 'chown', '-R', f'{postgres_user}:{postgres_user}', self.config['config_directory']]
+            process = await asyncio.create_subprocess_exec(*chown_cmd)
+            await process.wait()
+            logger.info("✅ Ensured correct ownership of configuration directory.")
+
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to re-apply local configurations: {e}", exc_info=True)
             return False
 
 
