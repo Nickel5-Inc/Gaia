@@ -170,21 +170,27 @@ class ComprehensiveDatabaseSetup:
         """
         Main entry point for complete database system setup.
         This method orchestrates the entire setup process.
+        IDEMPOTENT: Safe to run multiple times, detects existing configurations.
         """
         logger.info("🚀 Starting comprehensive database system setup...")
         
         try:
+            # Step 0: Check if system is already properly configured
+            if await self._check_if_already_configured():
+                logger.info("✅ Database system already properly configured!")
+                return True
+            
             # Step 1: Install PostgreSQL if needed
             if not await self._ensure_postgresql_installed():
                 logger.error("❌ Failed to install PostgreSQL")
                 return False
             
-            # Step 2: Detect and fix any corruption
+            # Step 2: Detect and fix any corruption (only if needed)
             if not await self._detect_and_repair_corruption():
                 logger.error("❌ Failed to repair database corruption")
                 return False
             
-            # Step 3: Configure PostgreSQL
+            # Step 3: Configure PostgreSQL (only if needed)
             if not await self._configure_postgresql_system():
                 logger.error("❌ Failed to configure PostgreSQL")
                 return False
@@ -194,18 +200,19 @@ class ComprehensiveDatabaseSetup:
                 logger.error("❌ Failed to start PostgreSQL")
                 return False
             
-            # Step 5: Create database and users
+            # Step 5: Create database and users (only if needed)
             if not await self._setup_database_and_users():
                 logger.error("❌ Failed to setup database and users")
                 return False
             
-            # Step 6: Run Alembic migrations
+            # Step 6: Run Alembic migrations (only if needed)
             if not await self._setup_alembic_schema():
                 logger.error("❌ Failed to setup database schema")
                 return False
             
             # Step 7: Configure backups (optional, non-blocking)
-            await self._setup_backup_system()
+            if not self.test_mode:
+                await self._setup_backup_system()
             
             # Step 8: Final validation
             if not await self._validate_complete_setup():
@@ -217,6 +224,57 @@ class ComprehensiveDatabaseSetup:
             
         except Exception as e:
             logger.error(f"❌ Unexpected error during database setup: {e}", exc_info=True)
+            return False
+
+    async def _check_if_already_configured(self) -> bool:
+        """
+        Check if the database system is already properly configured.
+        Returns True if everything is working and no setup is needed.
+        """
+        logger.info("🔍 Checking if database system is already configured...")
+        
+        try:
+            # Check 1: PostgreSQL service is running
+            service_name = await self._detect_postgresql_service()
+            if not service_name:
+                logger.info("❌ PostgreSQL service not detected")
+                return False
+            
+            cmd = ['sudo', 'systemctl', 'is-active', service_name]
+            success, stdout, stderr = await self._run_command(cmd, timeout=10)
+            if not success or stdout.strip() != 'active':
+                logger.info("❌ PostgreSQL service not running")
+                return False
+            
+            # Check 2: Database connection works
+            if not await self._test_database_connection():
+                logger.info("❌ Database connection test failed")
+                return False
+            
+            # Check 3: Application database exists
+            cmd = [
+                'sudo', '-u', 'postgres', 'psql', '-lqt'
+            ]
+            success, stdout, stderr = await self._run_command(cmd, timeout=10)
+            if not success or self.config.database_name not in stdout:
+                logger.info(f"❌ Application database '{self.config.database_name}' not found")
+                return False
+            
+            # Check 4: Alembic is set up
+            check_alembic_cmd = [
+                'sudo', '-u', 'postgres', 'psql', '-d', self.config.database_name, '-c',
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'alembic_version');"
+            ]
+            success, stdout, stderr = await self._run_command(check_alembic_cmd, timeout=10)
+            if not success or 'true' not in stdout.lower():
+                logger.info("❌ Alembic not configured")
+                return False
+            
+            logger.info("✅ Database system is already properly configured!")
+            return True
+            
+        except Exception as e:
+            logger.info(f"❌ Configuration check failed: {e}")
             return False
 
     async def _ensure_postgresql_installed(self) -> bool:
@@ -729,11 +787,19 @@ class ComprehensiveDatabaseSetup:
             return False
 
     async def _setup_database_and_users(self) -> bool:
-        """Create database and users"""
+        """Create database and users (idempotent)"""
         logger.info("👤 Setting up database and users...")
         
         try:
-            # Set postgres user password
+            # Check if application database already exists
+            cmd = ['sudo', '-u', 'postgres', 'psql', '-lqt']
+            success, stdout, stderr = await self._run_command(cmd, timeout=10)
+            
+            if success and self.config.database_name in stdout:
+                logger.info(f"✅ Database '{self.config.database_name}' already exists")
+                return True
+            
+            # Set postgres user password (idempotent)
             if not await self._set_postgres_password():
                 return False
             
@@ -799,10 +865,28 @@ class ComprehensiveDatabaseSetup:
             return False
 
     async def _setup_alembic_schema(self) -> bool:
-        """Setup database schema using Alembic"""
+        """Setup database schema using Alembic (idempotent)"""
         logger.info("📋 Setting up database schema with Alembic...")
         
         try:
+            # Check if Alembic is already set up
+            check_alembic_cmd = [
+                'sudo', '-u', 'postgres', 'psql', '-d', self.config.database_name, '-c',
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'alembic_version');"
+            ]
+            success, stdout, stderr = await self._run_command(check_alembic_cmd, timeout=10)
+            
+            if success and 'true' in stdout.lower():
+                logger.info("✅ Alembic already configured, running migrations...")
+                # Still run migrations in case there are new ones
+                original_cwd = os.getcwd()
+                os.chdir(project_root)
+                try:
+                    await self._run_alembic_migrations()
+                finally:
+                    os.chdir(original_cwd)
+                return True
+            
             # Ensure we're in the project root directory
             original_cwd = os.getcwd()
             os.chdir(project_root)
@@ -1078,14 +1162,37 @@ class ComprehensiveDatabaseSetup:
             logger.warning(f"Error during emergency PostgreSQL stop: {e}")
 
     async def _emergency_backup_data(self):
-        """Create emergency backup of data directory"""
+        """Create emergency backup of data directory (only if corruption detected)"""
         try:
             data_dir = Path(self.config.data_directory)
-            if data_dir.exists():
-                backup_dir = data_dir.parent / f"emergency_backup_{int(time.time())}"
-                logger.info(f"💾 Creating emergency backup: {backup_dir}")
-                shutil.copytree(data_dir, backup_dir)
-                logger.info("✅ Emergency backup created")
+            if not data_dir.exists():
+                logger.info("📁 No data directory to backup")
+                return
+            
+            # Only create backup if we detect actual corruption
+            required_files = ['PG_VERSION', 'postgresql.conf']
+            has_corruption = False
+            
+            for file in required_files:
+                if not (data_dir / file).exists():
+                    has_corruption = True
+                    break
+            
+            if not has_corruption:
+                logger.info("📁 Data directory appears healthy, skipping emergency backup")
+                return
+            
+            # Check if we already have recent backups (avoid creating too many)
+            existing_backups = list(data_dir.parent.glob("emergency_backup_*"))
+            if len(existing_backups) >= 3:
+                logger.warning(f"⚠️ Already have {len(existing_backups)} emergency backups, skipping new backup")
+                return
+            
+            backup_dir = data_dir.parent / f"emergency_backup_{int(time.time())}"
+            logger.info(f"💾 Creating emergency backup due to corruption: {backup_dir}")
+            shutil.copytree(data_dir, backup_dir)
+            logger.info("✅ Emergency backup created")
+            
         except Exception as e:
             logger.warning(f"Could not create emergency backup: {e}")
 
