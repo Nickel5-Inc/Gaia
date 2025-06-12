@@ -388,45 +388,44 @@ class ComprehensiveDatabaseSetup:
         logger.info("🔍 Checking for database corruption...")
         
         data_dir = Path(self.config.data_directory)
-        
-        # Check if data directory exists and has required files
-        if not data_dir.exists():
-            logger.info("📁 Data directory doesn't exist, will initialize fresh cluster")
+        config_dir = Path(self.config.config_directory)
+
+        # Check 1: Data directory must exist
+        if not data_dir.exists() or not data_dir.is_dir():
+            logger.warning(f"⚠️ Data directory not found at {data_dir}, initializing fresh cluster.")
             return await self._initialize_fresh_cluster()
+
+        # Check 2: Config directory must exist
+        if not config_dir.exists() or not config_dir.is_dir():
+            logger.warning(f"⚠️ Config directory not found at {config_dir}, will repair.")
+            return await self._repair_corrupted_cluster()
+
+        # Check 3: Essential files and directories
+        required_in_data = ['PG_VERSION', 'base', 'global']
+        required_in_config = ['postgresql.conf', 'pg_hba.conf']
         
-        required_files = ['PG_VERSION', 'postgresql.conf']
-        required_dirs = ['base', 'global', 'pg_wal']
-        
-        missing_files = []
-        missing_dirs = []
-        
-        for file in required_files:
-            if not (data_dir / file).exists():
-                missing_files.append(file)
-        
-        for dir_name in required_dirs:
-            if not (data_dir / dir_name).exists():
-                missing_dirs.append(dir_name)
-        
-        if missing_files or missing_dirs:
-            logger.warning(f"⚠️ Corruption detected - missing files: {missing_files}, missing dirs: {missing_dirs}")
+        missing_items = []
+        for item in required_in_data:
+            if not (data_dir / item).exists():
+                missing_items.append(f"data/{item}")
+        for item in required_in_config:
+            if not (config_dir / item).exists():
+                missing_items.append(f"config/{item}")
+
+        if missing_items:
+            logger.warning(f"⚠️ Corruption detected - missing items: {missing_items}")
             return await self._repair_corrupted_cluster()
         
-        # Check for backup_label file (indicates incomplete restore)
-        backup_label = data_dir / 'backup_label'
-        if backup_label.exists():
-            logger.warning("⚠️ Found backup_label file - removing incomplete restore marker")
-            try:
-                backup_label.unlink()
-                logger.info("✅ Removed backup_label file")
-            except Exception as e:
-                logger.error(f"Failed to remove backup_label: {e}")
-                return False
-        
-        # Check pg_control file
+        # Check 4: pg_control file must exist
         pg_control = data_dir / 'global' / 'pg_control'
         if not pg_control.exists():
-            logger.warning("⚠️ Missing pg_control file - cluster is corrupted")
+            logger.warning("⚠️ Missing pg_control file - cluster is severely corrupted")
+            return await self._repair_corrupted_cluster()
+
+        # Check 5: Incomplete backup/restore marker
+        backup_label = data_dir / 'backup_label'
+        if backup_label.exists():
+            logger.warning("⚠️ Found backup_label file - indicates incomplete restore.")
             return await self._repair_corrupted_cluster()
         
         logger.info("✅ No corruption detected")
@@ -437,39 +436,21 @@ class ComprehensiveDatabaseSetup:
         logger.info("🆕 Initializing fresh PostgreSQL cluster...")
         
         try:
-            # Ensure data directory exists and has correct permissions
-            data_dir = Path(self.config.data_directory)
-            data_dir.parent.mkdir(parents=True, exist_ok=True)
+            # This is now the single point of truth for creating a new cluster.
+            # It assumes prior cleanup has already occurred.
             
-            # Stop any running PostgreSQL service
-            await self._stop_postgresql_service()
-            
-            # Remove existing data directory if it exists
-            if data_dir.exists():
-                logger.info(f"🗑️ Removing existing data directory: {data_dir}")
-                shutil.rmtree(data_dir)
-            
-            # Create fresh data directory
-            data_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Set ownership to postgres user
-            await self._run_command(['chown', '-R', 'postgres:postgres', str(data_dir.parent)])
-            
-            # Initialize cluster
-            initdb_cmd = [
-                'sudo', '-u', 'postgres',
-                f'/usr/lib/postgresql/{self.config.postgres_version}/bin/initdb',
-                '-D', str(data_dir),
-                '--auth-local=trust',
-                '--auth-host=md5'
+            # Use pg_createcluster which handles everything: initdb, config creation, etc.
+            init_cmd = [
+                'sudo', 'pg_createcluster', self.config.postgres_version, 'main',
+                '--start'  # Automatically start the cluster after creation
             ]
             
-            success, stdout, stderr = await self._run_command(initdb_cmd, timeout=120)
+            success, stdout, stderr = await self._run_command(init_cmd, timeout=120)
             if not success:
-                logger.error(f"Failed to initialize cluster: {stderr}")
+                logger.error(f"Failed to create cluster with pg_createcluster: {stderr}")
                 return False
             
-            logger.info("✅ Fresh PostgreSQL cluster initialized")
+            logger.info("✅ Fresh PostgreSQL cluster initialized and started")
             return True
             
         except Exception as e:
@@ -477,22 +458,11 @@ class ComprehensiveDatabaseSetup:
             return False
 
     async def _repair_corrupted_cluster(self) -> bool:
-        """Repair a corrupted PostgreSQL cluster"""
-        logger.info("🔧 Repairing corrupted PostgreSQL cluster...")
+        """Repair a corrupted PostgreSQL cluster by completely recreating it."""
+        logger.warning("🔧 Repairing corrupted PostgreSQL cluster...")
         
-        # Create backup of corrupted data
-        data_dir = Path(self.config.data_directory)
-        backup_dir = data_dir.parent / f"corrupted_backup_{int(time.time())}"
-        
-        try:
-            if data_dir.exists():
-                logger.info(f"💾 Backing up corrupted data to: {backup_dir}")
-                shutil.copytree(data_dir, backup_dir)
-        except Exception as e:
-            logger.warning(f"Could not backup corrupted data: {e}")
-        
-        # Initialize fresh cluster
-        return await self._initialize_fresh_cluster()
+        # The repair strategy is to remove and recreate.
+        return await self._remove_and_recreate_cluster()
 
     async def _configure_postgresql_system(self) -> bool:
         """Configure PostgreSQL system settings"""
@@ -726,72 +696,10 @@ class ComprehensiveDatabaseSetup:
 
     async def _fix_cluster_configuration(self) -> bool:
         """Fix PostgreSQL cluster configuration issues"""
-        try:
-            logger.info("🔧 Fixing PostgreSQL cluster configuration...")
-            
-            # Stop PostgreSQL service
-            await self._stop_postgresql_service()
-            
-            # Check if the data directory exists and has the right structure
-            data_dir = Path(self.config.data_directory)
-            if not data_dir.exists() or not (data_dir / 'PG_VERSION').exists():
-                logger.info("📁 Data directory missing or invalid - initializing fresh cluster")
-                return await self._initialize_fresh_cluster()
-            
-            # Check if the cluster is properly registered
-            cluster_name = f"{self.config.postgres_version}/main"
-            cmd = ['pg_lsclusters']
-            success, stdout, stderr = await self._run_command(cmd, timeout=10)
-            
-            if success and cluster_name in stdout:
-                logger.info(f"✅ Cluster {cluster_name} is registered")
-                
-                # Try to start the specific cluster
-                cmd = ['sudo', 'pg_ctlcluster', self.config.postgres_version, 'main', 'start']
-                success, stdout, stderr = await self._run_command(cmd, timeout=30)
-                
-                if success:
-                    logger.info("✅ Cluster started successfully")
-                    return True
-                else:
-                    logger.warning(f"Failed to start cluster: {stderr}")
-            else:
-                logger.warning(f"Cluster {cluster_name} not properly registered")
-                
-                # If cluster configuration is corrupted, remove it completely and recreate
-                if "Error: cluster configuration already exists" in stderr or "Invalid data directory" in stderr:
-                    logger.warning("🗑️ Cluster configuration corrupted, removing and recreating...")
-                    return await self._remove_and_recreate_cluster()
-                
-                # Try to create/register the cluster
-                cmd = ['sudo', 'pg_createcluster', self.config.postgres_version, 'main', 
-                       '--datadir', self.config.data_directory]
-                success, stdout, stderr = await self._run_command(cmd, timeout=60)
-                
-                if success:
-                    logger.info("✅ Cluster created/registered successfully")
-                    
-                    # Start the cluster
-                    cmd = ['sudo', 'pg_ctlcluster', self.config.postgres_version, 'main', 'start']
-                    success, stdout, stderr = await self._run_command(cmd, timeout=30)
-                    
-                    if success:
-                        logger.info("✅ New cluster started successfully")
-                        return True
-                    else:
-                        logger.error(f"Failed to start new cluster: {stderr}")
-                else:
-                    logger.error(f"Failed to create cluster: {stderr}")
-                    # If creation failed, try the aggressive cleanup
-                    if "already exists" in stderr:
-                        logger.warning("🗑️ Cluster configuration exists but corrupted, removing and recreating...")
-                        return await self._remove_and_recreate_cluster()
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error fixing cluster configuration: {e}", exc_info=True)
-            return False
+        logger.info("🔧 Fixing PostgreSQL cluster configuration...")
+        
+        # Always use the aggressive approach for simplicity and robustness
+        return await self._remove_and_recreate_cluster()
 
     async def _remove_and_recreate_cluster(self) -> bool:
         """Aggressively remove corrupted cluster configuration and recreate"""
@@ -805,38 +713,19 @@ class ComprehensiveDatabaseSetup:
             config_dir = Path(self.config.config_directory)
             if config_dir.exists():
                 logger.info(f"🗑️ Removing config directory: {config_dir}")
-                shutil.rmtree(config_dir, ignore_errors=True)
-            
+                await self._run_command(['sudo', 'rm', '-rf', str(config_dir)])
+
             # Remove data directory
             data_dir = Path(self.config.data_directory)
             if data_dir.exists():
                 logger.info(f"🗑️ Removing data directory: {data_dir}")
-                shutil.rmtree(data_dir, ignore_errors=True)
+                await self._run_command(['sudo', 'rm', '-rf', str(data_dir)])
             
             # Wait a moment for filesystem operations to complete
             await asyncio.sleep(2)
             
-            # Create fresh cluster
-            logger.info("🆕 Creating fresh cluster...")
-            cmd = ['sudo', 'pg_createcluster', self.config.postgres_version, 'main']
-            success, stdout, stderr = await self._run_command(cmd, timeout=60)
-            
-            if not success:
-                logger.error(f"Failed to create fresh cluster: {stderr}")
-                return False
-            
-            logger.info("✅ Fresh cluster created successfully")
-            
-            # Start the cluster
-            cmd = ['sudo', 'pg_ctlcluster', self.config.postgres_version, 'main', 'start']
-            success, stdout, stderr = await self._run_command(cmd, timeout=30)
-            
-            if success:
-                logger.info("✅ Fresh cluster started successfully")
-                return True
-            else:
-                logger.error(f"Failed to start fresh cluster: {stderr}")
-                return False
+            # Initialize a completely fresh cluster
+            return await self._initialize_fresh_cluster()
                 
         except Exception as e:
             logger.error(f"Error removing and recreating cluster: {e}", exc_info=True)
@@ -1163,39 +1052,10 @@ class ComprehensiveDatabaseSetup:
         """Emergency repair function for critical database issues"""
         logger.warning("🚨 Starting emergency database repair...")
         
-        try:
-            # Stop all PostgreSQL processes
-            await self._emergency_stop_postgresql()
-            
-            # Backup current state
-            await self._emergency_backup_data()
-            
-            # Initialize fresh cluster
-            if not await self._initialize_fresh_cluster():
-                logger.error("❌ Emergency repair failed - could not initialize fresh cluster")
-                return False
-            
-            # Restart PostgreSQL
-            if not await self._ensure_postgresql_running():
-                logger.error("❌ Emergency repair failed - could not start PostgreSQL")
-                return False
-            
-            # Recreate database and users
-            if not await self._setup_database_and_users():
-                logger.error("❌ Emergency repair failed - could not setup database and users")
-                return False
-            
-            # Run schema migrations
-            if not await self._setup_alembic_schema():
-                logger.error("❌ Emergency repair failed - could not setup schema")
-                return False
-            
-            logger.info("✅ Emergency repair completed successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"💥 Emergency repair failed: {e}", exc_info=True)
-            return False
+        # The main setup flow is now robust enough to handle this.
+        # Calling it again will trigger the necessary repair steps.
+        logger.info("🚨 Re-running main setup process for emergency repair...")
+        return await self.setup_complete_database_system()
 
     async def _emergency_stop_postgresql(self):
         """Emergency stop of all PostgreSQL processes"""
@@ -1216,41 +1076,6 @@ class ComprehensiveDatabaseSetup:
                     
         except Exception as e:
             logger.warning(f"Error during emergency PostgreSQL stop: {e}")
-
-    async def _emergency_backup_data(self):
-        """Create emergency backup of data directory (only if corruption detected)"""
-        try:
-            data_dir = Path(self.config.data_directory)
-            if not data_dir.exists():
-                logger.info("📁 No data directory to backup")
-                return
-            
-            # Only create backup if we detect actual corruption
-            required_files = ['PG_VERSION', 'postgresql.conf']
-            has_corruption = False
-            
-            for file in required_files:
-                if not (data_dir / file).exists():
-                    has_corruption = True
-                    break
-            
-            if not has_corruption:
-                logger.info("📁 Data directory appears healthy, skipping emergency backup")
-                return
-            
-            # Check if we already have recent backups (avoid creating too many)
-            existing_backups = list(data_dir.parent.glob("emergency_backup_*"))
-            if len(existing_backups) >= 3:
-                logger.warning(f"⚠️ Already have {len(existing_backups)} emergency backups, skipping new backup")
-                return
-            
-            backup_dir = data_dir.parent / f"emergency_backup_{int(time.time())}"
-            logger.info(f"💾 Creating emergency backup due to corruption: {backup_dir}")
-            shutil.copytree(data_dir, backup_dir)
-            logger.info("✅ Emergency backup created")
-            
-        except Exception as e:
-            logger.warning(f"Could not create emergency backup: {e}")
 
     def get_status(self) -> Dict[str, Any]:
         """Get current status of the database system"""
