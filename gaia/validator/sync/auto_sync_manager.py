@@ -2518,40 +2518,22 @@ pg1-user={self.config['pguser']}
             if not await self._reapply_local_configuration_post_restore():
                 logger.error("❌ Failed to re-apply local configurations. The database may not be accessible.")
                 
-            # Step 6: Start PostgreSQL and verify it's working
-            logger.info("📋 Step 6: Starting PostgreSQL and verifying...")
-            await self._ensure_postgresql_running()
-            
-            # Step 7: Verify PostgreSQL is actually working by running a test query
-            logger.info("📋 Step 7: Testing database connectivity...")
-            try:
-                test_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT 1;']
-                test_process = await asyncio.create_subprocess_exec(
-                    *test_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                test_stdout, test_stderr = await test_process.communicate()
-                
-                if test_process.returncode != 0:
-                    logger.error(f"❌ Database connectivity test failed: {test_stderr.decode()}")
-                    # Restore from safety backup
-                    if backup_path and backup_path.exists():
-                        logger.info("🔄 Restoring from safety backup due to connectivity failure...")
-                        await asyncio.create_subprocess_exec('systemctl', 'stop', postgres_service)
-                        await asyncio.sleep(2)
-                        if data_path.exists():
-                            shutil.rmtree(data_path)
-                        shutil.copytree(backup_path, data_path)
-                        await self._ensure_postgresql_running()
-                        return False
+            # Step 6: Restart PostgreSQL to load the newly applied configuration
+            logger.info("📋 Step 6: Restarting PostgreSQL to load new configuration...")
+            service_name = self.system_info.get('postgresql_service', 'postgresql')
+            if not await self._restart_postgresql_service(service_name):
+                logger.error("❌ Failed to restart PostgreSQL after re-applying local configuration.")
+                # Attempt an emergency restart as a fallback
+                if not await self._emergency_postgresql_restart():
+                    logger.critical("💥 Emergency restart also failed. The database is in an inconsistent state.")
                     return False
-                else:
-                    logger.info("✅ Database connectivity test passed")
-            except Exception as test_error:
-                logger.error(f"❌ Error during connectivity test: {test_error}")
+
+            # Step 7: Test connectivity
+            logger.info("📋 Step 7: Testing database connectivity...")
+            if not await self._test_database_connection():
+                logger.error("❌ Failed to test database connectivity after restore.")
                 return False
-            
+
             # Step 8: Clean up safety backup on success
             if backup_path and backup_path.exists():
                 try:
@@ -4122,6 +4104,28 @@ localhost:5433:*:postgres:postgres
             return True
         except Exception as e:
             logger.error(f"❌ Failed to re-apply local configurations: {e}", exc_info=True)
+            return False
+
+    async def _test_database_connection(self):
+        """Test database connectivity after re-applying local configurations."""
+        try:
+            logger.info("🔍 Testing database connectivity...")
+            test_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT 1;']
+            test_process = await asyncio.create_subprocess_exec(
+                *test_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            test_stdout, test_stderr = await test_process.communicate()
+            
+            if test_process.returncode != 0:
+                logger.error(f"❌ Database connectivity test failed: {test_stderr.decode()}")
+                return False
+            
+            logger.info("✅ Database connectivity verified")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error testing database connectivity: {e}")
             return False
 
 
