@@ -168,63 +168,52 @@ class ComprehensiveDatabaseSetup:
 
     async def setup_complete_database_system(self) -> bool:
         """
-        Main entry point for complete database system setup.
-        This method orchestrates the entire setup process.
-        IDEMPOTENT: Safe to run multiple times, detects existing configurations.
+        Main orchestration method for complete database setup.
+        This is designed to be idempotent and self-healing.
         """
         logger.info("🚀 Starting comprehensive database system setup...")
         
-        try:
-            # Step 0: Check if system is already properly configured
-            if await self._check_if_already_configured():
-                logger.info("✅ Database system already properly configured!")
-                return True
-            
-            # Step 1: Install PostgreSQL if needed
-            if not await self._ensure_postgresql_installed():
-                logger.error("❌ Failed to install PostgreSQL")
-                return False
-            
-            # Step 2: Detect and fix any corruption (only if needed)
-            if not await self._detect_and_repair_corruption():
-                logger.error("❌ Failed to repair database corruption")
-                return False
-            
-            # Step 3: Configure PostgreSQL (only if needed)
-            if not await self._configure_postgresql_system():
-                logger.error("❌ Failed to configure PostgreSQL")
-                return False
-            
-            # Step 4: Ensure PostgreSQL is running
-            if not await self._ensure_postgresql_running():
-                logger.error("❌ Failed to start PostgreSQL")
-                return False
-            
-            # Step 5: Create database and users (only if needed)
-            if not await self._setup_database_and_users():
-                logger.error("❌ Failed to setup database and users")
-                return False
-            
-            # Step 6: Run Alembic migrations (only if needed)
-            if not await self._setup_alembic_schema():
-                logger.error("❌ Failed to setup database schema")
-                return False
-            
-            # Step 7: Configure backups (optional, non-blocking)
-            if not self.test_mode:
-                await self._setup_backup_system()
-            
-            # Step 8: Final validation
-            if not await self._validate_complete_setup():
-                logger.error("❌ Final validation failed")
-                return False
-            
-            logger.info("✅ Comprehensive database system setup completed successfully!")
+        # Check if the system is already perfectly configured. If so, we're done.
+        if await self._check_if_already_configured():
+            logger.info("✅ Database system already configured and running.")
             return True
-            
-        except Exception as e:
-            logger.error(f"❌ Unexpected error during database setup: {e}", exc_info=True)
+
+        # Ensure the necessary PostgreSQL packages are installed on the system.
+        if not await self._ensure_postgresql_installed():
+            logger.error("❌ Failed to install PostgreSQL packages. Cannot proceed.")
             return False
+
+        # Ensure the PostgreSQL service is running. This is the key step that will
+        # trigger a full repair if the service is broken or misconfigured.
+        if not await self._ensure_postgresql_running():
+            logger.error("❌ Failed to start or repair the PostgreSQL service. Cannot proceed.")
+            return False
+            
+        # At this point, a running cluster is guaranteed. Now, apply our specific configs.
+        if not await self._configure_postgresql_system():
+             logger.error("❌ Failed to apply PostgreSQL custom configurations.")
+             return False
+        
+        # A restart is required to apply the new configurations.
+        if not await self._restart_postgresql_service():
+            logger.error("❌ Failed to restart PostgreSQL after configuration. The service might be unstable.")
+            # Attempt to proceed, but the connection test will likely fail.
+        
+        # With the service running and configured, set up the database, users, and schema.
+        if not await self._setup_database_and_users():
+            logger.error("❌ Failed to setup database and users.")
+            return False
+        if not await self._setup_alembic_schema():
+            logger.error("❌ Failed to setup Alembic schema.")
+            return False
+            
+        # Run a final validation to ensure everything is perfect.
+        if not await self._validate_complete_setup():
+            logger.error("❌ Final validation of the complete setup failed.")
+            return False
+            
+        logger.info("✅ Comprehensive database system setup completed successfully!")
+        return True
 
     async def _check_if_already_configured(self) -> bool:
         """
@@ -599,43 +588,63 @@ class ComprehensiveDatabaseSetup:
             return False
 
     async def _ensure_postgresql_running(self) -> bool:
-        """Ensure PostgreSQL service is running"""
-        logger.info("🔄 Ensuring PostgreSQL is running...")
+        """Ensures the PostgreSQL service is running, repairing it if necessary."""
+        logger.info("🔄 Ensuring PostgreSQL service is running...")
         
-        # Detect service name
         service_name = await self._detect_postgresql_service()
         if not service_name:
-            logger.error("Could not detect PostgreSQL service name")
+            logger.error("Could not detect PostgreSQL service name, cannot proceed.")
+            return False
+
+        # First, check if the service is active.
+        is_active, _, _ = await self._run_command(['sudo', 'systemctl', 'is-active', service_name])
+        if is_active:
+            logger.info(f"✅ PostgreSQL service '{service_name}' is already active.")
+            return True
+
+        # If the service is not active, try starting it.
+        logger.info(f"Service '{service_name}' is not running. Attempting to start...")
+        start_success, _, start_stderr = await self._run_command(['sudo', 'systemctl', 'start', service_name])
+        
+        if start_success:
+            await asyncio.sleep(2) # Give it a moment to initialize.
+            logger.info(f"✅ Service '{service_name}' started successfully.")
+            return True
+        
+        # If starting failed, the unit is likely broken. This is a corruption symptom.
+        logger.warning(f"Failed to start PostgreSQL service: {start_stderr}")
+        logger.error("🚨 Service start failed, indicating a corrupt or misconfigured cluster. Attempting aggressive repair...")
+        
+        repaired = await self._remove_and_recreate_cluster()
+        if repaired:
+            logger.info("✅ Aggressive repair successful. PostgreSQL should now be running.")
+            return True
+        else:
+            logger.error("💥 Aggressive repair FAILED. The database system is in a bad state.")
+            return False
+
+    async def _restart_postgresql_service(self) -> bool:
+        """Restarts the PostgreSQL service."""
+        logger.info("🔄 Restarting PostgreSQL service to apply configurations...")
+        service_name = await self._detect_postgresql_service()
+        if not service_name:
+            logger.error("Could not detect PostgreSQL service name for restart.")
             return False
         
-        try:
-            # Start the service
-            success, stdout, stderr = await self._run_command(['systemctl', 'start', service_name])
-            if not success:
-                logger.error(f"Failed to start PostgreSQL service: {stderr}")
-                return False
-            
-            # Enable the service
-            await self._run_command(['systemctl', 'enable', service_name])
-            
-            # Wait for service to be ready
-            for attempt in range(30):  # Wait up to 30 seconds
-                success, stdout, stderr = await self._run_command(['systemctl', 'is-active', service_name])
-                if success and stdout.strip() == 'active':
-                    logger.info("✅ PostgreSQL service is running")
-                    
-                    # Test database connection
-                    if await self._test_database_connection():
-                        return True
-                    
-                await asyncio.sleep(1)
-            
-            logger.error("PostgreSQL service started but connection test failed")
+        success, _, stderr = await self._run_command(['sudo', 'systemctl', 'restart', service_name])
+        if not success:
+            logger.error(f"Failed to restart PostgreSQL: {stderr}")
             return False
-            
-        except Exception as e:
-            logger.error(f"Error starting PostgreSQL: {e}", exc_info=True)
+        
+        await asyncio.sleep(2) # Wait for restart
+        
+        is_active, _, _ = await self._run_command(['sudo', 'systemctl', 'is-active', service_name])
+        if not is_active:
+            logger.error("Service failed to become active after restart.")
             return False
+
+        logger.info("✅ Service restarted successfully.")
+        return True
 
     async def _detect_postgresql_service(self) -> Optional[str]:
         """Detect the correct PostgreSQL service name"""
