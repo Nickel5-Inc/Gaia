@@ -632,18 +632,100 @@ class ComprehensiveDatabaseSetup:
     async def _test_database_connection(self) -> bool:
         """Test database connection"""
         try:
+            # First try with cluster specification
+            cmd = ['sudo', '-u', 'postgres', 'psql', '--cluster', f'{self.config.postgres_version}/main', '-c', 'SELECT version();']
+            success, stdout, stderr = await self._run_command(cmd, timeout=10)
+            
+            if success and 'PostgreSQL' in stdout:
+                logger.info("✅ Database connection test successful (with cluster)")
+                return True
+            
+            # If that fails, try without cluster specification
             cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT version();']
             success, stdout, stderr = await self._run_command(cmd, timeout=10)
             
             if success and 'PostgreSQL' in stdout:
-                logger.info("✅ Database connection test successful")
+                logger.info("✅ Database connection test successful (without cluster)")
                 return True
-            else:
-                logger.error(f"Database connection test failed: {stderr}")
-                return False
+            
+            # If both fail, try to fix the cluster configuration
+            logger.warning(f"Database connection failed: {stderr}")
+            logger.info("🔧 Attempting to fix cluster configuration...")
+            
+            if await self._fix_cluster_configuration():
+                # Try connection again after fix
+                cmd = ['sudo', '-u', 'postgres', 'psql', '--cluster', f'{self.config.postgres_version}/main', '-c', 'SELECT version();']
+                success, stdout, stderr = await self._run_command(cmd, timeout=10)
+                
+                if success and 'PostgreSQL' in stdout:
+                    logger.info("✅ Database connection test successful (after cluster fix)")
+                    return True
+            
+            logger.error(f"Database connection test failed: {stderr}")
+            return False
                 
         except Exception as e:
             logger.error(f"Error testing database connection: {e}")
+            return False
+
+    async def _fix_cluster_configuration(self) -> bool:
+        """Fix PostgreSQL cluster configuration issues"""
+        try:
+            logger.info("🔧 Fixing PostgreSQL cluster configuration...")
+            
+            # Stop PostgreSQL service
+            await self._stop_postgresql_service()
+            
+            # Check if the data directory exists and has the right structure
+            data_dir = Path(self.config.data_directory)
+            if not data_dir.exists() or not (data_dir / 'PG_VERSION').exists():
+                logger.info("📁 Data directory missing or invalid - initializing fresh cluster")
+                return await self._initialize_fresh_cluster()
+            
+            # Check if the cluster is properly registered
+            cluster_name = f"{self.config.postgres_version}/main"
+            cmd = ['pg_lsclusters']
+            success, stdout, stderr = await self._run_command(cmd, timeout=10)
+            
+            if success and cluster_name in stdout:
+                logger.info(f"✅ Cluster {cluster_name} is registered")
+                
+                # Try to start the specific cluster
+                cmd = ['sudo', 'pg_ctlcluster', self.config.postgres_version, 'main', 'start']
+                success, stdout, stderr = await self._run_command(cmd, timeout=30)
+                
+                if success:
+                    logger.info("✅ Cluster started successfully")
+                    return True
+                else:
+                    logger.warning(f"Failed to start cluster: {stderr}")
+            else:
+                logger.warning(f"Cluster {cluster_name} not properly registered")
+                
+                # Try to create/register the cluster
+                cmd = ['sudo', 'pg_createcluster', self.config.postgres_version, 'main', 
+                       '--datadir', self.config.data_directory]
+                success, stdout, stderr = await self._run_command(cmd, timeout=60)
+                
+                if success:
+                    logger.info("✅ Cluster created/registered successfully")
+                    
+                    # Start the cluster
+                    cmd = ['sudo', 'pg_ctlcluster', self.config.postgres_version, 'main', 'start']
+                    success, stdout, stderr = await self._run_command(cmd, timeout=30)
+                    
+                    if success:
+                        logger.info("✅ New cluster started successfully")
+                        return True
+                    else:
+                        logger.error(f"Failed to start new cluster: {stderr}")
+                else:
+                    logger.error(f"Failed to create cluster: {stderr}")
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error fixing cluster configuration: {e}", exc_info=True)
             return False
 
     async def _setup_database_and_users(self) -> bool:
