@@ -779,21 +779,41 @@ class AutoSyncManager:
             logger.info(f"🔍 PostgreSQL version: {self.system_info.get('postgresql_version', 'unknown')}")
             logger.info(f"🔍 PostgreSQL service: {self.system_info.get('postgresql_service', 'postgresql')}")
             
+            # For replica nodes, we can skip most configuration since we'll be restoring from backup
+            if not self.is_primary:
+                logger.info("🔄 REPLICA MODE: Minimal PostgreSQL configuration (will be overwritten by restore)")
+                
+                # First, check if archiver is failing and fix it
+                await self._fix_failing_archiver()
+                
+                # Just ensure basic connectivity and skip complex configuration
+                postgres_user = self.system_info.get('postgresql_user', 'postgres')
+                return await self._verify_postgresql_configuration(postgres_user)
+            
+            # Check and fix failing archiver first (can cause hangs)
+            await self._fix_failing_archiver()
+            
             # Detect PostgreSQL configuration file location dynamically
             logger.info("🔍 Detecting PostgreSQL configuration file location...")
             postgres_user = self.system_info.get('postgresql_user', 'postgres')
             
             config_cmd = ['sudo', '-u', postgres_user, 'psql', '-t', '-c', 'SHOW config_file;']
             try:
+                # Add timeout to prevent hanging
                 process = await asyncio.create_subprocess_exec(
                     *config_cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
-                stdout, stderr = await process.communicate()
+                
+                # Wait with timeout
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), 
+                    timeout=30  # 30 second timeout
+                )
                 
                 if process.returncode != 0:
-                    logger.error(f"Failed to detect config file location: {stderr.decode()}")
+                    logger.warning(f"Failed to detect config file location: {stderr.decode()}")
                     logger.info("💡 Trying fallback config detection...")
                     postgres_conf = await self._fallback_config_detection()
                 else:
@@ -801,6 +821,9 @@ class AutoSyncManager:
                     postgres_conf = Path(postgres_conf_path)
                     logger.info(f"📋 PostgreSQL config file: {postgres_conf}")
                     
+            except asyncio.TimeoutError:
+                logger.warning("Config detection timed out after 30 seconds, using fallback...")
+                postgres_conf = await self._fallback_config_detection()
             except Exception as e:
                 logger.warning(f"Config detection failed: {e}, trying fallback...")
                 postgres_conf = await self._fallback_config_detection()
@@ -1011,14 +1034,17 @@ class AutoSyncManager:
             try:
                 await asyncio.sleep(2)  # Wait for PostgreSQL to fully start
                 
-                # Check archive_mode setting
+                # Check archive_mode setting with timeout
                 check_cmd = ['sudo', '-u', postgres_user, 'psql', '-t', '-c', 'SHOW archive_mode;']
                 process = await asyncio.create_subprocess_exec(
                     *check_cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
-                stdout, stderr = await process.communicate()
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), 
+                    timeout=15  # 15 second timeout
+                )
                 
                 if process.returncode == 0:
                     archive_mode = stdout.decode().strip()
@@ -1027,14 +1053,17 @@ class AutoSyncManager:
                     if archive_mode == 'on':
                         logger.info("✅ archive_mode is properly enabled")
                         
-                        # Also verify archive_command
+                        # Also verify archive_command with timeout
                         check_cmd = ['sudo', '-u', postgres_user, 'psql', '-t', '-c', 'SHOW archive_command;']
                         process = await asyncio.create_subprocess_exec(
                             *check_cmd,
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE
                         )
-                        stdout, stderr = await process.communicate()
+                        stdout, stderr = await asyncio.wait_for(
+                            process.communicate(), 
+                            timeout=15  # 15 second timeout
+                        )
                         
                         if process.returncode == 0:
                             current_archive_cmd = stdout.decode().strip()
@@ -1054,6 +1083,8 @@ class AutoSyncManager:
                 else:
                     logger.warning(f"⚠️ Failed to check archive_mode (attempt {attempt + 1}/{max_retries}): {stderr.decode()}")
                     
+            except asyncio.TimeoutError:
+                logger.warning(f"⚠️ Timeout checking archive_mode (attempt {attempt + 1}/{max_retries})")
             except Exception as e:
                 logger.warning(f"⚠️ Error checking archive_mode (attempt {attempt + 1}/{max_retries}): {e}")
                 
@@ -2678,6 +2709,380 @@ pg1-user={self.config['pguser']}
         except Exception as e:
             logger.debug(f"PostgreSQL conflict detection failed: {e}")
 
+    async def _fix_failing_archiver(self):
+        """Detect and fix failing PostgreSQL archiver that can cause hangs."""
+        try:
+            logger.info("🔍 Checking for failing PostgreSQL archiver...")
+            
+            # Check PostgreSQL process status for failing archiver
+            ps_cmd = ['ps', 'aux']
+            process = await asyncio.create_subprocess_exec(
+                *ps_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+            
+            if process.returncode == 0:
+                ps_output = stdout.decode()
+                if 'archiver failed' in ps_output:
+                    logger.warning("⚠️ Detected failing PostgreSQL archiver - this can cause hangs")
+                    logger.info("🔧 Temporarily disabling archive_mode to fix archiver...")
+                    
+                    # Disable archiving temporarily
+                    disable_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 
+                                 "ALTER SYSTEM SET archive_mode = 'off';"]
+                    
+                    process = await asyncio.create_subprocess_exec(
+                        *disable_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+                    
+                    if process.returncode == 0:
+                        logger.info("✅ Disabled archive_mode")
+                        
+                        # Reload PostgreSQL configuration
+                        await self._reload_postgresql_config()
+                        
+                        # Wait for archiver to stop failing
+                        await asyncio.sleep(3)
+                        logger.info("✅ Fixed failing archiver - PostgreSQL should respond normally now")
+                    else:
+                        logger.warning(f"⚠️ Failed to disable archive_mode: {stderr.decode()}")
+                else:
+                    logger.debug("✅ No failing archiver detected")
+            else:
+                logger.warning(f"⚠️ Could not check for failing archiver: {stderr.decode()}")
+                
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ Timeout checking for failing archiver")
+        except Exception as e:
+            logger.warning(f"⚠️ Error checking for failing archiver: {e}")
+
+    async def _detect_and_fix_postgresql_corruption(self) -> bool:
+        """Detect and automatically fix PostgreSQL data directory corruption."""
+        try:
+            logger.info("🔍 Checking for PostgreSQL data directory corruption...")
+            
+            # Get data directory path
+            data_path = self.system_info.get('pgdata', '/var/lib/postgresql/14/main')
+            data_dir = Path(data_path)
+            
+            if not data_dir.exists():
+                logger.warning(f"⚠️ PostgreSQL data directory does not exist: {data_dir}")
+                return await self._initialize_fresh_postgresql_cluster()
+            
+            # Check for essential PostgreSQL files
+            essential_files = [
+                'postgresql.conf',
+                'pg_hba.conf', 
+                'PG_VERSION',
+                'global/pg_control'
+            ]
+            
+            missing_files = []
+            for file_path in essential_files:
+                full_path = data_dir / file_path
+                if not full_path.exists():
+                    missing_files.append(file_path)
+            
+            if missing_files:
+                logger.warning(f"⚠️ PostgreSQL data directory is corrupted - missing files: {missing_files}")
+                logger.info("🔧 Attempting automatic corruption repair...")
+                
+                # Stop PostgreSQL if running
+                await self._stop_postgresql_service()
+                
+                # Backup corrupted directory
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                backup_dir = Path(f"{data_path}.corrupted.{timestamp}")
+                
+                try:
+                    if data_dir.exists():
+                        shutil.move(str(data_dir), str(backup_dir))
+                        logger.info(f"📦 Moved corrupted data to: {backup_dir}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not backup corrupted data: {e}")
+                    # Clear the directory instead
+                    try:
+                        shutil.rmtree(data_dir)
+                        logger.info(f"🗑️ Cleared corrupted data directory: {data_dir}")
+                    except Exception as e2:
+                        logger.error(f"❌ Could not clear corrupted directory: {e2}")
+                        return False
+                
+                # Initialize fresh PostgreSQL cluster
+                return await self._initialize_fresh_postgresql_cluster()
+            else:
+                logger.debug("✅ PostgreSQL data directory appears intact")
+                return False  # No corruption detected
+                
+        except Exception as e:
+            logger.error(f"❌ Error during corruption detection: {e}")
+            return False
+
+    async def _initialize_fresh_postgresql_cluster(self) -> bool:
+        """Initialize a fresh PostgreSQL cluster."""
+        try:
+            logger.info("🔧 Initializing fresh PostgreSQL cluster...")
+            
+            data_path = self.system_info.get('pgdata', '/var/lib/postgresql/14/main')
+            postgres_version = self.system_info.get('postgresql_version', '14')
+            postgres_user = self.system_info.get('postgresql_user', 'postgres')
+            
+            # Ensure data directory exists and has correct ownership
+            data_dir = Path(data_path)
+            data_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Set ownership to postgres user
+            chown_cmd = ['sudo', 'chown', '-R', f'{postgres_user}:{postgres_user}', str(data_dir)]
+            process = await asyncio.create_subprocess_exec(
+                *chown_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.communicate()
+            
+            # Initialize the cluster
+            initdb_cmd = [
+                'sudo', '-u', postgres_user,
+                f'/usr/lib/postgresql/{postgres_version}/bin/initdb',
+                '-D', str(data_dir)
+            ]
+            
+            logger.info(f"🔧 Running initdb: {' '.join(initdb_cmd)}")
+            process = await asyncio.create_subprocess_exec(
+                *initdb_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                logger.info("✅ PostgreSQL cluster initialized successfully")
+                
+                # Set up basic authentication
+                await self._setup_fresh_cluster_auth()
+                
+                # Start PostgreSQL to set up password
+                await self._ensure_postgresql_running()
+                
+                # Set up postgres user password
+                await self._setup_postgres_password()
+                
+                return True
+            else:
+                logger.error(f"❌ Failed to initialize PostgreSQL cluster: {stderr.decode()}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Error initializing fresh PostgreSQL cluster: {e}")
+            return False
+
+    async def _setup_fresh_cluster_auth(self):
+        """Set up authentication for a fresh PostgreSQL cluster."""
+        try:
+            logger.info("🔧 Setting up authentication for fresh cluster...")
+            
+            data_path = self.system_info.get('pgdata', '/var/lib/postgresql/14/main')
+            
+            # Check if config files are in data directory or separate config directory
+            config_locations = [
+                Path(data_path),  # Data directory
+                Path('/etc/postgresql/14/main'),  # Debian/Ubuntu config directory
+                Path('/etc/postgresql/15/main'),
+                Path('/etc/postgresql/16/main'),
+            ]
+            
+            hba_conf_path = None
+            for config_dir in config_locations:
+                potential_hba = config_dir / 'pg_hba.conf'
+                if potential_hba.exists():
+                    hba_conf_path = potential_hba
+                    break
+            
+            if not hba_conf_path:
+                # Create in data directory as fallback
+                hba_conf_path = Path(data_path) / 'pg_hba.conf'
+            
+            if hba_conf_path.exists():
+                # Temporarily set to trust authentication for setup
+                with open(hba_conf_path, 'r') as f:
+                    content = f.read()
+                
+                # Replace md5 with trust for local connections
+                content = content.replace('local   all             postgres                                peer', 
+                                        'local   all             postgres                                trust')
+                content = content.replace('local   all             all                                     peer',
+                                        'local   all             all                                     trust')
+                
+                with open(hba_conf_path, 'w') as f:
+                    f.write(content)
+                
+                logger.info(f"✅ Updated pg_hba.conf for initial setup: {hba_conf_path}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Error setting up fresh cluster auth: {e}")
+
+    async def _setup_postgres_password(self):
+        """Set up postgres user password after fresh cluster initialization."""
+        try:
+            logger.info("🔧 Setting up postgres user password...")
+            
+            postgres_user = self.system_info.get('postgresql_user', 'postgres')
+            
+            # Set postgres user password
+            password_cmd = [
+                'sudo', '-u', postgres_user, 'psql', '-c',
+                "ALTER USER postgres PASSWORD 'postgres';"
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *password_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+            
+            if process.returncode == 0:
+                logger.info("✅ Set postgres user password")
+                
+                # Now update pg_hba.conf to use md5 authentication
+                await self._update_hba_to_md5()
+                
+                # Reload PostgreSQL configuration
+                await self._reload_postgresql_config()
+                
+            else:
+                logger.warning(f"⚠️ Failed to set postgres password: {stderr.decode()}")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Error setting up postgres password: {e}")
+
+    async def _update_hba_to_md5(self):
+        """Update pg_hba.conf to use md5 authentication."""
+        try:
+            data_path = self.system_info.get('pgdata', '/var/lib/postgresql/14/main')
+            
+            # Check if config files are in data directory or separate config directory
+            config_locations = [
+                Path('/etc/postgresql/14/main'),  # Debian/Ubuntu config directory (preferred)
+                Path('/etc/postgresql/15/main'),
+                Path('/etc/postgresql/16/main'),
+                Path(data_path),  # Data directory (fallback)
+            ]
+            
+            hba_conf_path = None
+            for config_dir in config_locations:
+                potential_hba = config_dir / 'pg_hba.conf'
+                if potential_hba.exists():
+                    hba_conf_path = potential_hba
+                    break
+            
+            if hba_conf_path and hba_conf_path.exists():
+                with open(hba_conf_path, 'r') as f:
+                    content = f.read()
+                
+                # Replace trust with md5 for local connections
+                content = content.replace('local   all             postgres                                trust', 
+                                        'local   all             postgres                                md5')
+                content = content.replace('local   all             all                                     trust',
+                                        'local   all             all                                     md5')
+                
+                with open(hba_conf_path, 'w') as f:
+                    f.write(content)
+                
+                logger.info(f"✅ Updated pg_hba.conf to use md5 authentication: {hba_conf_path}")
+            else:
+                logger.warning("⚠️ Could not find pg_hba.conf to update authentication")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Error updating pg_hba.conf to md5: {e}")
+
+    async def _stop_postgresql_service(self):
+        """Stop PostgreSQL service using detected service name."""
+        try:
+            service_candidates = [
+                f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",
+                self.system_info.get('postgresql_service', 'postgresql'),
+                f"postgresql-{self.system_info.get('postgresql_version', '14')}",
+                "postgresql",
+            ]
+            
+            for service_name in service_candidates:
+                try:
+                    stop_cmd = ['sudo', 'systemctl', 'stop', service_name]
+                    process = await asyncio.create_subprocess_exec(
+                        *stop_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+                    
+                    if process.returncode == 0:
+                        logger.info(f"✅ Stopped PostgreSQL service: {service_name}")
+                        return
+                    else:
+                        logger.debug(f"❌ Failed to stop via {service_name}: {stderr.decode().strip()}")
+                except Exception as e:
+                    logger.debug(f"❌ Exception stopping via {service_name}: {e}")
+                    continue
+            
+            logger.warning("⚠️ Could not stop PostgreSQL via any known service name")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Error stopping PostgreSQL service: {e}")
+
+    async def _reload_postgresql_config(self):
+        """Reload PostgreSQL configuration."""
+        try:
+            # Try different service names
+            service_candidates = [
+                f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",
+                self.system_info.get('postgresql_service', 'postgresql'),
+                f"postgresql-{self.system_info.get('postgresql_version', '14')}",
+                "postgresql",
+            ]
+            
+            for service_name in service_candidates:
+                try:
+                    reload_cmd = ['sudo', 'systemctl', 'reload', service_name]
+                    process = await asyncio.create_subprocess_exec(
+                        *reload_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+                    
+                    if process.returncode == 0:
+                        logger.info(f"✅ Reloaded PostgreSQL config via service: {service_name}")
+                        return
+                    else:
+                        logger.debug(f"❌ Failed to reload via {service_name}: {stderr.decode().strip()}")
+                except Exception as e:
+                    logger.debug(f"❌ Exception reloading via {service_name}: {e}")
+                    continue
+            
+            # Fallback: try pg_reload_conf()
+            logger.info("🔄 Trying pg_reload_conf() as fallback...")
+            reload_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT pg_reload_conf();']
+            process = await asyncio.create_subprocess_exec(
+                *reload_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+            
+            if process.returncode == 0:
+                logger.info("✅ Reloaded PostgreSQL config via pg_reload_conf()")
+            else:
+                logger.warning(f"⚠️ Failed to reload config: {stderr.decode()}")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Error reloading PostgreSQL config: {e}")
+
     async def _ensure_postgresql_running(self):
         """Ensure PostgreSQL is running, attempting to start it if not."""
         try:
@@ -3138,8 +3543,34 @@ pg1-user={self.config['pguser']}
                         continue
                 
                 if not active_service:
-                    logger.error("❌ Failed to start PostgreSQL - sync operations unsafe")
-                    return False
+                    logger.warning("⚠️ PostgreSQL still not running - checking for corruption...")
+                    
+                    # Check if data directory is corrupted and attempt auto-repair
+                    if await self._detect_and_fix_postgresql_corruption():
+                        logger.info("🔧 Attempted PostgreSQL corruption repair - retrying service start...")
+                        await self._ensure_postgresql_running()
+                        
+                        # Final re-check after corruption repair
+                        for service_name in service_candidates:
+                            try:
+                                status_cmd = ['systemctl', 'is-active', service_name]
+                                status_process = await asyncio.create_subprocess_exec(
+                                    *status_cmd,
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.PIPE
+                                )
+                                status_stdout, _ = await status_process.communicate()
+                                
+                                if status_stdout.decode().strip() == 'active':
+                                    logger.info(f"✅ PostgreSQL started after corruption repair via service: {service_name}")
+                                    active_service = service_name
+                                    break
+                            except Exception:
+                                continue
+                    
+                    if not active_service:
+                        logger.error("❌ Failed to start PostgreSQL even after corruption repair - sync operations unsafe")
+                        return False
             
             logger.info("✅ PostgreSQL service is running")
             
