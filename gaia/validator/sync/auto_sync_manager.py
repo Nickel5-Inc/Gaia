@@ -3447,8 +3447,44 @@ localhost:5433:*:postgres:postgres
             except Exception as e:
                 logger.warning(f"Could not run pgbackrest start command: {e}")
 
-            # Run a check to see if we have a mismatch, and fix it first.
-            await self._recreate_stanza_if_needed()
+            # First, check if the stanza already exists and is working
+            logger.info("🔍 Checking existing stanza status...")
+            stanza_needs_recreation = False
+            
+            try:
+                info_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', f'--stanza={self.config["stanza_name"]}', 'info']
+                process = await asyncio.create_subprocess_exec(
+                    *info_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                
+                if process.returncode == 0:
+                    logger.info("✅ Existing stanza found and accessible")
+                    # Check if we have backups
+                    backup_info = await self._analyze_existing_backups()
+                    if backup_info.get("backup_count", 0) > 0:
+                        logger.info(f"✅ Found {backup_info['backup_count']} existing backups - preserving existing setup")
+                        # Just ensure WAL archiving is working
+                        await self._setup_wal_archiving()
+                        return True
+                    else:
+                        logger.info("📋 Stanza exists but no backups found - will initialize backups without recreating stanza")
+                        stanza_needs_recreation = False
+                else:
+                    logger.warning(f"⚠️ Stanza check failed: {stderr.decode()}")
+                    logger.info("🔄 Will recreate stanza due to issues")
+                    stanza_needs_recreation = True
+                    
+            except Exception as e:
+                logger.warning(f"Error checking existing stanza: {e}")
+                logger.info("🔄 Will recreate stanza due to check failure")
+                stanza_needs_recreation = True
+
+            # Only recreate if there are actual issues
+            if stanza_needs_recreation:
+                await self._recreate_stanza_if_needed()
             
             # This will create the stanza if it doesn't exist or is broken
             await self._setup_wal_archiving()
