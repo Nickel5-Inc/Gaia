@@ -3375,7 +3375,7 @@ localhost:5433:*:postgres:postgres
                 expected_command = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
                 
                 # Get current archive_command from PostgreSQL
-                check_cmd = ['sudo', '-u', self.config['postgres_user'], 'psql', '-t', '-c', 'SHOW archive_command;']
+                check_cmd = ['sudo', '-u', self.config['pguser'], 'psql', '-t', '-c', 'SHOW archive_command;']
                 returncode, stdout, stderr = await self._run_postgres_command_with_logging(
                     check_cmd, timeout=10, description="Archive command check"
                 )
@@ -3417,7 +3417,7 @@ localhost:5433:*:postgres:postgres
         is a primary or a replica.
         """
         # For a primary node, we assume we are setting up backups for the first time or managing them.
-        if not self.is_replica:
+        if self.is_primary:
             logger.info("🏗️ Setting up PRIMARY stanza and backups...")
 
             # Run a check to see if we have a mismatch, and fix it first.
