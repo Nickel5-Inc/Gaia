@@ -3433,6 +3433,20 @@ localhost:5433:*:postgres:postgres
         if self.is_primary:
             logger.info("🏗️ Setting up PRIMARY stanza and backups...")
 
+            # Start the stanza to clear any prior stop files
+            try:
+                logger.info("Ensuring stanza is started to clear any previous stop files...")
+                start_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 'start', f'--stanza={self.config["stanza_name"]}']
+                process = await asyncio.create_subprocess_exec(
+                    *start_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+                logger.info("✅ Stanza start command completed")
+            except Exception as e:
+                logger.warning(f"Could not run pgbackrest start command: {e}")
+
             # Run a check to see if we have a mismatch, and fix it first.
             await self._recreate_stanza_if_needed()
             
@@ -3506,16 +3520,27 @@ localhost:5433:*:postgres:postgres
             )
             stdout, stderr = await process.communicate()
             
-            if process.returncode == 0:
-                logger.info("✅ Stanza recreated successfully")
+            if process.returncode != 0:
+                logger.error(f"Failed to recreate stanza: {stderr.decode()}")
             else:
-                logger.warning(f"Stanza recreation had issues: {stderr.decode()}")
+                logger.info("✅ Stanza recreated successfully")
                 
+                # IMPORTANT: Start the stanza again to allow operations
+                logger.info("Starting stanza after recreation...")
+                start_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 'start', f'--stanza={self.config["stanza_name"]}']
+                start_process = await asyncio.create_subprocess_exec(
+                    *start_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await start_process.communicate()
+                logger.info("✅ Stanza started after recreation")
+
         except Exception as e:
-            logger.warning(f"Stanza recreation failed: {e}")
+            logger.warning(f"Stanza recreation had issues: {e}")
 
     async def fix_archive_command(self) -> bool:
-        """Fix the PostgreSQL archive command to use the correct network-aware stanza name."""
+        """Fixes the archive command in postgresql.conf."""
         try:
             logger.info("🔧 Fixing PostgreSQL archive command for network-aware stanza...")
             
