@@ -2351,231 +2351,101 @@ pg1-user={self.config['pguser']}
 
     async def restore_from_backup(self, target_time: Optional[str] = None) -> bool:
         """
-        Restore database from backup (replica nodes).
-        Enhanced with corruption prevention and rollback capabilities.
-        
+        Restores the database from the latest pgBackRest backup.
+        Uses --delta for efficiency, and includes a fallback to a full restore on failure.
+
         Args:
-            target_time: Optional point-in-time recovery target
+            target_time: Optional timestamp for point-in-time recovery.
+
+        Returns:
+            True if the restore was successful, False otherwise.
         """
-        postgres_service = self.system_info.get('postgresql_service', 'postgresql')
+        logger.info("🚀 Starting database restore from backup...")
+        postgres_user = self.system_info.get('postgresql_user', 'postgres')
         data_path = Path(self.config['pgdata'])
-        backup_path = None
+        stanza_name = self.config['pgbackrest_stanza_name']
+
+        # Step 1 & 2: Stop PostgreSQL
+        logger.info("📋 Step 1 & 2: Stopping PostgreSQL service before restore...")
+        await self._stop_postgresql_service()
+
+        # Step 3, 4, 5: Attempt an efficient delta restore
+        logger.info("📋 Step 3-5: Attempting efficient delta restore...")
         
+        delta_restore_cmd = [
+            "sudo", "-u", postgres_user,
+            "pgbackrest", f"--stanza={stanza_name}",
+            "--delta", "--force", "restore"
+        ]
+        if target_time:
+            delta_restore_cmd.extend(["--type=time", f"--target={target_time}"])
+        logger.info(f"   - Running delta restore command: {' '.join(delta_restore_cmd)}")
+        
+        success = False
         try:
-            logger.info("🔄 Starting database restore with corruption prevention...")
-            
-            # Step 1: Verify PostgreSQL is currently running and create a safety backup
-            logger.info("📋 Step 1: Creating safety backup of current state...")
-            try:
-                # Check if PostgreSQL is running
-                status_cmd = ['systemctl', 'is-active', postgres_service]
-                status_process = await asyncio.create_subprocess_exec(
-                    *status_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                status_stdout, _ = await status_process.communicate()
-                
-                if status_stdout.decode().strip() == 'active':
-                    # Create a safety backup of the current data directory
-                    backup_path = data_path.parent / f"{data_path.name}_safety_backup_{int(time.time())}"
-                    logger.info(f"📦 Creating safety backup at: {backup_path}")
-                    shutil.copytree(data_path, backup_path)
-                    logger.info("✅ Safety backup created successfully")
-                else:
-                    logger.warning("⚠️ PostgreSQL not running - skipping safety backup")
-            except Exception as backup_error:
-                logger.warning(f"⚠️ Could not create safety backup: {backup_error}")
-                # Continue anyway, but note the risk
-            
-            # Step 2: Stop PostgreSQL with proper service detection
-            logger.info("📋 Step 2: Stopping PostgreSQL...")
-            stop_cmd = ['systemctl', 'stop', postgres_service]
-            stop_process = await asyncio.create_subprocess_exec(
-                *stop_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            success, _, stderr = await self._run_postgres_command_with_logging(
+                delta_restore_cmd, timeout=7200, description="pgBackRest delta restore"
             )
-            await stop_process.communicate()
+        except asyncio.TimeoutError:
+            logger.error("❌ Restore process timed out after 2 hours and was killed.")
+            success = False
+
+        if not success:
+            logger.error("❌ Delta restore failed. This may indicate a corrupted local directory.")
+            logger.info("🔥 Attempting a full, clean restore as a fallback...")
             
-            # Wait for PostgreSQL to fully stop
-            await asyncio.sleep(3)
-            
-            # Step 3: Clear data directory with better error handling
-            logger.info("📋 Step 3: Clearing data directory...")
-            if data_path.exists():
-                try:
+            try:
+                await self._stop_postgresql_service() # Ensure it's stopped before wipe
+                if data_path.exists():
                     shutil.rmtree(data_path)
-                    logger.info(f"✅ Removed existing data directory: {data_path}")
-                except Exception as e:
-                    logger.error(f"❌ Error removing data directory: {e}")
-                    # This is a critical failure - restore from backup if available
-                    if backup_path and backup_path.exists():
-                        logger.info("🔄 Restoring from safety backup due to removal failure...")
-                        shutil.copytree(backup_path, data_path)
-                        await self._ensure_postgresql_running()
-                        return False
-                    raise
-            
-            # Step 4: Create new data directory with proper permissions
-            logger.info("📋 Step 4: Creating new data directory...")
-            try:
                 data_path.mkdir(parents=True, exist_ok=True)
-                logger.info(f"✅ Created data directory: {data_path}")
-                
-                # Try to set ownership, but don't fail if it doesn't work
-                try:
-                    shutil.chown(data_path, user='postgres', group='postgres')
-                    logger.info("✅ Set postgres ownership on data directory")
-                except Exception as chown_error:
-                    logger.warning(f"⚠️ Could not set postgres ownership: {chown_error}")
-                    # Continue anyway - pgbackrest restore might handle this
-                    
-            except Exception as mkdir_error:
-                logger.error(f"❌ Failed to create data directory: {mkdir_error}")
-                # Restore from backup if available
-                if backup_path and backup_path.exists():
-                    logger.info("🔄 Restoring from safety backup due to directory creation failure...")
-                    shutil.copytree(backup_path, data_path)
-                    await self._ensure_postgresql_running()
+                pg_uid = self.system_info.get('postgresql_uid')
+                pg_gid = self.system_info.get('postgresql_gid')
+                if pg_uid is not None and pg_gid is not None:
+                    os.chown(data_path, pg_uid, pg_gid)
+                os.chmod(data_path, 0o700)
+                logger.info(f"   - Successfully wiped and recreated data directory: {data_path}")
+            except Exception as e:
+                logger.critical(f"💥 Failed to wipe directory for full restore fallback: {e}. Manual intervention required.")
                 return False
+
+            full_restore_cmd = ["sudo", "-u", postgres_user, "pgbackrest", f"--stanza={stanza_name}", "restore"]
+            logger.info(f"   - Running full restore command: {' '.join(full_restore_cmd)}")
             
-            # Step 5: Run pgBackRest restore
-            logger.info("📋 Step 5: Running pgBackRest restore...")
-            restore_cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
-                          f'--stanza={self.config["stanza_name"]}', 'restore']
-            
-            if target_time:
-                restore_cmd.extend([f'--target-time={target_time}'])
-            
-            logger.info(f"🔄 Running restore command: {' '.join(restore_cmd)}")
-            
-            # Create process with signal protection
-            process = await asyncio.create_subprocess_exec(
-                *restore_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                preexec_fn=None  # Don't inherit signal handlers
+            full_success, _, full_stderr = await self._run_postgres_command_with_logging(
+                full_restore_cmd, timeout=7200, description="Full pgBackRest restore"
             )
-            
-            logger.info(f"🔄 Restore process started with PID: {process.pid}")
-            
-            # Wait for restore with timeout but handle interruption gracefully
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), 
-                    timeout=7200  # 2 hours timeout
-                )
-            except asyncio.CancelledError:
-                logger.warning("⚠️ Restore process was cancelled - attempting graceful cleanup")
-                try:
-                    # Try to terminate gracefully first
-                    process.terminate()
-                    await asyncio.wait_for(process.wait(), timeout=30)
-                    logger.info("✅ Restore process terminated gracefully")
-                except asyncio.TimeoutError:
-                    logger.warning("⚠️ Graceful termination timed out - force killing restore process")
-                    process.kill()
-                    await process.wait()
-                    logger.info("✅ Restore process force killed")
-                
-                # Re-raise the cancellation
-                raise
-                
-            except asyncio.TimeoutError:
-                logger.error("❌ Restore process timed out after 2 hours")
-                try:
-                    process.terminate()
-                    await asyncio.wait_for(process.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
-                # Set stderr to indicate timeout
-                stderr = b"Restore process timed out after 2 hours"
-            
-            if process.returncode != 0:
-                logger.error(f"❌ pgBackRest restore failed: {stderr.decode()}")
-                if stdout:
-                    logger.error(f"Restore stdout: {stdout.decode()}")
-                
-                # Critical failure - restore from safety backup
-                if backup_path and backup_path.exists():
-                    logger.info("🔄 Restoring from safety backup due to pgBackRest failure...")
-                    if data_path.exists():
-                        shutil.rmtree(data_path)
-                    shutil.copytree(backup_path, data_path)
-                    await self._ensure_postgresql_running()
-                    return False
-                else:
-                    logger.error("❌ No safety backup available - system may be in corrupted state!")
-                    return False
-            else:
-                logger.info("✅ pgBackRest restore completed successfully")
-                if stdout:
-                    logger.debug(f"Restore output: {stdout.decode()}")
 
-            logger.info("📋 Step 5a: Re-applying local configurations post-restore...")
-            if not await self._reapply_local_configuration_post_restore():
-                logger.error("❌ Failed to re-apply local configurations. The database may not be accessible.")
-                
-            # Step 6: Restart PostgreSQL to load the newly applied configuration
-            logger.info("📋 Step 6: Restarting PostgreSQL to load new configuration...")
-            service_name = self.system_info.get('postgresql_service', 'postgresql')
-            if not await self._restart_postgresql_service(service_name):
-                logger.error("❌ Failed to restart PostgreSQL after re-applying local configuration.")
-                # Attempt an emergency restart as a fallback
-                if not await self._emergency_postgresql_restart():
-                    logger.critical("💥 Emergency restart also failed. The database is in an inconsistent state.")
-                    return False
-
-            # Step 7: Test connectivity
-            logger.info("📋 Step 7: Testing database connectivity...")
-            if not await self._test_database_connection():
-                logger.error("❌ Failed to test database connectivity after restore.")
+            if not full_success:
+                logger.critical("💥 FALLBACK RESTORE FAILED. The database is in an inconsistent state and requires manual intervention.")
+                if full_stderr:
+                    try: logger.error(f"   - Stderr: {full_stderr.decode()}")
+                    except: logger.error(f"   - Stderr: {full_stderr}")
                 return False
 
-            # Step 8: Clean up safety backup on success
-            if backup_path and backup_path.exists():
-                try:
-                    shutil.rmtree(backup_path)
-                    logger.info("🧹 Cleaned up safety backup after successful restore")
-                except Exception as cleanup_error:
-                    logger.warning(f"⚠️ Could not clean up safety backup: {cleanup_error}")
-            
-            logger.info("✅ Database restore completed successfully with all verifications passed")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Critical error during database restore: {e}")
-            
-            # Emergency recovery - restore from safety backup if available
-            if backup_path and backup_path.exists():
-                try:
-                    logger.info("🚨 EMERGENCY RECOVERY: Restoring from safety backup...")
-                    # Stop PostgreSQL if running
-                    try:
-                        await asyncio.create_subprocess_exec('systemctl', 'stop', postgres_service)
-                        await asyncio.sleep(2)
-                    except:
-                        pass
-                    
-                    # Remove corrupted data and restore backup
-                    if data_path.exists():
-                        shutil.rmtree(data_path)
-                    shutil.copytree(backup_path, data_path)
-                    
-                    # Try to start PostgreSQL
-                    await self._ensure_postgresql_running()
-                    logger.info("✅ Emergency recovery completed - system restored to previous state")
-                    
-                except Exception as recovery_error:
-                    logger.error(f"❌ CRITICAL: Emergency recovery failed: {recovery_error}")
-                    logger.error("❌ SYSTEM MAY BE IN CORRUPTED STATE - MANUAL INTERVENTION REQUIRED")
-            else:
-                logger.error("❌ CRITICAL: No safety backup available for emergency recovery")
-                logger.error("❌ SYSTEM MAY BE IN CORRUPTED STATE - MANUAL INTERVENTION REQUIRED")
-            
+        # If we are here, either the initial delta or the fallback full restore succeeded.
+        logger.info("✅ Restore process finished successfully.")
+        
+        logger.info("📋 Step 5a: Re-applying local configurations post-restore...")
+        if not await self._reapply_local_configuration_post_restore():
+            logger.error("❌ Failed to re-apply local configurations. The database may not be accessible.")
             return False
+            
+        logger.info("📋 Step 6: Restarting PostgreSQL to load new configuration and initiate WAL replay...")
+        service_name = self.system_info.get('postgresql_service', 'postgresql')
+        if not await self._restart_postgresql_service(service_name):
+            logger.error("❌ Failed to restart PostgreSQL after re-applying local configuration.")
+            if not await self._emergency_postgresql_restart():
+                logger.critical("💥 Emergency restart also failed. The database is in an inconsistent state.")
+                return False
+
+        logger.info("📋 Step 7: Testing database connectivity...")
+        if not await self._test_database_connection():
+            logger.error("❌ Failed to test database connectivity after restore.")
+            return False
+
+        logger.info("🎉 Restore from backup process completed successfully!")
+        return True
 
     async def _attempt_recovery(self):
         """Attempt to recover from backup system issues."""
@@ -3492,126 +3362,101 @@ localhost:5433:*:postgres:postgres
             logger.error(f"❌ Error ensuring PostgreSQL is running: {e}")
 
     async def _ensure_correct_archive_command(self) -> bool:
-        """Ensure PostgreSQL archive command uses the correct network-aware stanza name with retry."""
+        """
+        Ensures the archive_command in PostgreSQL is correctly set to use the
+        network-aware stanza name. This is a critical check after any potential
+        database restore or configuration change.
+        """
         max_retries = 3
-        
         for attempt in range(max_retries):
+            logger.info(f"🔧 Ensuring correct archive command (attempt {attempt + 1}/{max_retries})...")
             try:
-                logger.info(f"🔧 Ensuring correct archive command (attempt {attempt + 1}/{max_retries})...")
+                # Expected command uses the dynamically configured stanza name
+                expected_command = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
                 
-                # Get current archive command
-                check_cmd = ['sudo', '-u', 'postgres', 'psql', '-t', '-c', 'SHOW archive_command;']
-                process = await asyncio.create_subprocess_exec(
-                    *check_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                # Get current archive_command from PostgreSQL
+                check_cmd = ['sudo', '-u', self.config['postgres_user'], 'psql', '-t', '-c', 'SHOW archive_command;']
+                returncode, stdout, stderr = await self._run_postgres_command_with_logging(
+                    check_cmd, timeout=10, description="Archive command check"
                 )
-                stdout, stderr = await process.communicate()
-                
-                if process.returncode != 0:
-                    logger.warning(f"Failed to check archive command: {stderr.decode()}")
+
+                if returncode != 0:
+                    logger.warning(f"Could not check archive command: {stderr}")
+                    await asyncio.sleep(5)
                     continue
+
+                current_command = stdout.strip()
+                logger.info(f"📋 Current: {current_command}")
+                logger.info(f"📋 Expected: {expected_command}")
                 
-                current_archive_cmd = stdout.decode().strip()
-                expected_archive_cmd = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
-                
-                logger.info(f"📋 Current: {current_archive_cmd}")
-                logger.info(f"📋 Expected: {expected_archive_cmd}")
-                
-                if expected_archive_cmd in current_archive_cmd:
+                if current_command == expected_command:
                     logger.info("✅ Archive command is correct")
                     return True
-                
-                # Update the archive command
-                logger.info("🔄 Updating archive command...")
-                update_cmd = [
-                    'sudo', '-u', 'postgres', 'psql', '-c',
-                    f"ALTER SYSTEM SET archive_command TO '{expected_archive_cmd}';"
-                ]
-                
-                process = await asyncio.create_subprocess_exec(
-                    *update_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await process.communicate()
-                
-                if process.returncode != 0:
-                    logger.warning(f"Failed to update archive command: {stderr.decode()}")
-                    continue
-                
-                # Reload PostgreSQL configuration
-                logger.info("🔄 Reloading PostgreSQL configuration...")
-                reload_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT pg_reload_conf();']
-                
-                process = await asyncio.create_subprocess_exec(
-                    *reload_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await process.communicate()
-                
-                if process.returncode != 0:
-                    logger.warning(f"Failed to reload config: {stderr.decode()}")
-                    continue
-                
-                # Verify the change
-                await asyncio.sleep(2)  # Give PostgreSQL time to reload
-                process = await asyncio.create_subprocess_exec(
-                    *check_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await process.communicate()
-                
-                new_archive_cmd = stdout.decode().strip()
-                logger.info(f"✅ Archive command updated to: {new_archive_cmd}")
-                return True
-                
+                else:
+                    logger.warning("❌ Archive command mismatch detected. Attempting to fix...")
+                    fix_success = await self.fix_archive_command()
+                    if fix_success:
+                        logger.info("✅ Archive command fixed successfully.")
+                        # Re-verify after fixing
+                        continue
+                    else:
+                        logger.error("❌ Failed to fix archive command.")
+                        return False
+            
             except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} to fix archive command failed: {e}")
+                logger.error(f"Error ensuring correct archive command: {e}")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(5)  # Wait before retry
+                    await asyncio.sleep(5)
         
-        logger.error("❌ Failed to fix archive command after all attempts")
+        logger.error("❌ Failed to ensure correct archive command after multiple retries.")
         return False
 
     async def _intelligent_stanza_setup(self) -> bool:
-        """Intelligently handle stanza setup for both primary and replica modes."""
-        try:
-            if self.is_primary:
-                logger.info("🏗️ Setting up PRIMARY stanza and backups...")
-                
-                # Test and fix WAL archiving first
-                if not await self._setup_wal_archiving():
-                    logger.warning("WAL archiving setup had issues - attempting recovery...")
-                    # Try to fix by recreating stanza
-                    await self._recreate_stanza_if_needed()
-                
-                # Initialize or verify pgBackRest
-                if not await self._initialize_pgbackrest():
-                    logger.error("Failed to initialize pgBackRest")
+        """
+        Sets up the pgBackRest stanza intelligently based on whether this node
+        is a primary or a replica.
+        """
+        # For a primary node, we assume we are setting up backups for the first time or managing them.
+        if not self.is_replica:
+            logger.info("🏗️ Setting up PRIMARY stanza and backups...")
+
+            # Run a check to see if we have a mismatch, and fix it first.
+            await self._recreate_stanza_if_needed()
+            
+            # This will create the stanza if it doesn't exist or is broken
+            await self._setup_wal_archiving()
+            
+            # This initializes and checks backups
+            if not await self._initialize_pgbackrest():
+                logger.warning("Initial pgBackRest initialization failed. This may be handled by auto-repair.")
+
+            # Verify backups after setup
+            backup_info = await self._analyze_existing_backups()
+            if not backup_info.get("backups"):
+                logger.info("No existing backups found. Creating first full backup.")
+                if not await self._trigger_backup("full"):
+                    logger.error("Failed to create initial full backup.")
                     return False
-                    
-                logger.info("✅ Primary setup completed")
-                return True
-                
             else:
-                logger.info("🔄 Setting up REPLICA configuration...")
-                
-                # Replica setup
-                if not await self._setup_replica():
-                    logger.warning("Replica setup had issues - will continue with basic monitoring")
-                
-                logger.info("✅ Replica setup completed")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Stanza setup failed: {e}")
-            return False
+                logger.info("Existing backups found. Stanza setup appears successful.")
+
+            return True
+
+        # For a replica, we ensure it can connect to the repository but don't create backups.
+        else:
+            logger.info("🏗️ Configuring REPLICA for restore...")
+            if not await self._initialize_pgbackrest():
+                logger.error("Failed to initialize pgBackRest on replica")
+                return False
+            
+            logger.info("✅ Replica setup completed")
+            return True
 
     async def _recreate_stanza_if_needed(self):
-        """Recreate stanza if there are persistent issues."""
+        """
+        Detects if the stanza needs to be recreated (e.g., after a DB re-initialization)
+        and performs the recreation safely by stopping the service first.
+        """
         try:
             logger.info("🔄 Attempting to recreate stanza for clean setup...")
             
