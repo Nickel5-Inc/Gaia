@@ -1235,6 +1235,18 @@ class AutoSyncManager:
         try:
             logger.info("Setting up WAL archiving...")
             
+            # Clean up potential stale lock files before running checks
+            lock_dir = Path('/tmp/pgbackrest')
+            if lock_dir.exists():
+                logger.info(f"Checking for stale lock files in {lock_dir}...")
+                stanza_name = self.config["stanza_name"]
+                for lock_file in lock_dir.glob(f'{stanza_name}*.lock'):
+                    logger.warning(f"Removing potentially stale lock file: {lock_file}")
+                    try:
+                        lock_file.unlink()
+                    except Exception as e:
+                        logger.error(f"Failed to remove lock file {lock_file}: {e}")
+
             # Ensure postgres user can access pgBackRest config
             config_file = '/etc/pgbackrest/pgbackrest.conf'
             if os.path.exists(config_file):
@@ -1247,7 +1259,8 @@ class AutoSyncManager:
             test_cmd = [
                 'sudo', '-u', 'postgres', 'pgbackrest',
                 f'--stanza={self.config["stanza_name"]}',
-                'check'
+                'check',
+                '--archive-timeout=300'  # 5-minute timeout for WAL push check
             ]
             
             process = await asyncio.create_subprocess_exec(
