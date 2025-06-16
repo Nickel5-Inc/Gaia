@@ -293,8 +293,8 @@ class ComprehensiveDatabaseSetup:
     async def _install_postgresql_debian(self) -> bool:
         """Install PostgreSQL on Debian/Ubuntu systems"""
         commands = [
-            ['apt', 'update'],
-            ['apt', 'install', '-y', f'postgresql-{self.config.postgres_version}', 
+            ['sudo', 'apt', 'update'],
+            ['sudo', 'apt', 'install', '-y', f'postgresql-{self.config.postgres_version}', 
              f'postgresql-client-{self.config.postgres_version}', 'postgresql-contrib']
         ]
         
@@ -314,7 +314,7 @@ class ComprehensiveDatabaseSetup:
         pkg_manager = 'dnf' if shutil.which('dnf') else 'yum'
         
         commands = [
-            [pkg_manager, 'install', '-y', f'postgresql{self.config.postgres_version}-server', 
+            ['sudo', pkg_manager, 'install', '-y', f'postgresql{self.config.postgres_version}-server', 
              f'postgresql{self.config.postgres_version}', f'postgresql{self.config.postgres_version}-contrib']
         ]
         
@@ -335,7 +335,7 @@ class ComprehensiveDatabaseSetup:
     async def _install_postgresql_arch(self) -> bool:
         """Install PostgreSQL on Arch Linux"""
         commands = [
-            ['pacman', '-Sy', '--noconfirm', 'postgresql']
+            ['sudo', 'pacman', '-Sy', '--noconfirm', 'postgresql']
         ]
         
         for cmd in commands:
@@ -354,10 +354,10 @@ class ComprehensiveDatabaseSetup:
         
         # Try common package managers
         package_managers = [
-            (['apt', 'update'], ['apt', 'install', '-y', 'postgresql', 'postgresql-contrib']),
-            (['yum', 'install', '-y', 'postgresql-server', 'postgresql']),
-            (['dnf', 'install', '-y', 'postgresql-server', 'postgresql']),
-            (['pacman', '-Sy', '--noconfirm', 'postgresql'])
+            (['sudo', 'apt', 'update'], ['sudo', 'apt', 'install', '-y', 'postgresql', 'postgresql-contrib']),
+            (['sudo', 'yum', 'install', '-y', 'postgresql-server', 'postgresql']),
+            (['sudo', 'dnf', 'install', '-y', 'postgresql-server', 'postgresql']),
+            (['sudo', 'pacman', '-Sy', '--noconfirm', 'postgresql'])
         ]
         
         for update_cmd, install_cmd in package_managers:
@@ -472,7 +472,7 @@ class ComprehensiveDatabaseSetup:
                 return False
             
             # Set proper ownership
-            await self._run_command(['chown', '-R', 'postgres:postgres', str(config_dir)])
+            await self._run_command(['sudo', 'chown', '-R', 'postgres:postgres', str(config_dir)])
             
             logger.info("✅ PostgreSQL system configured")
             return True
