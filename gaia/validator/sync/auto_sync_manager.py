@@ -2544,7 +2544,16 @@ pg1-user={self.config['pguser']}
             if not full_success:
                 logger.critical("💥 FALLBACK RESTORE FAILED. The database is in an inconsistent state and requires manual intervention.")
                 if full_stderr:
-                    try: logger.error(f"   - Stderr: {full_stderr.decode()}")
+                    try: 
+                        stderr_str = full_stderr.decode()
+                        logger.error(f"   - Stderr: {stderr_str}")
+                        
+                        # Check for specific permission issues
+                        if "Permission denied" in stderr_str and "postmaster.pid" in stderr_str:
+                            logger.error("🔍 DIAGNOSIS: Permission denied on postmaster.pid - this indicates ownership issues")
+                            logger.error("💡 SOLUTION: The PostgreSQL data directory needs to be owned by 'postgres' user")
+                            logger.error("🔧 MANUAL FIX: sudo chown -R postgres:postgres /var/lib/postgresql/")
+                        
                     except: logger.error(f"   - Stderr: {full_stderr}")
                 return False
             else:
