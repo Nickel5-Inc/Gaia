@@ -42,7 +42,7 @@ import glob
 from collections import defaultdict
 import torch
 from gaia.tasks.defined_tasks.soilmoisture.utils.inference_class import SoilMoistureInferencePreprocessor
-from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import get_smap_data
+from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import get_smap_data, get_smap_data_multi_region
 
 logger = get_logger(__name__)
 
@@ -146,7 +146,12 @@ class SoilMoistureTask(Task):
             self.db_manager = validator.db_manager
         self.validator = validator
 
-        await self.ensure_retry_columns_exist()
+        # Run startup retry check for any pending tasks from previous sessions
+        logger.info("🚀 Checking for pending tasks on startup...")
+        try:
+            await self._startup_retry_check()
+        except Exception as e:
+            logger.error(f"Error during startup retry check: {e}")
         
         while True:
             try:
@@ -802,17 +807,19 @@ class SoilMoistureTask(Task):
                     )) as predictions
                 FROM soil_moisture_regions r
                 JOIN soil_moisture_predictions p ON p.region_id = r.id
-                WHERE p.status = 'sent_to_miner'
+                WHERE p.status IN ('sent_to_miner', 'retry_scheduled')
                 AND (
-                    -- Normal case: Past scoring delay and no retry
+                    -- Normal case: Past scoring delay and no retry scheduled
                     (
-                        r.target_time <= :scoring_time 
+                        p.status = 'sent_to_miner'
+                        AND r.target_time <= :scoring_time 
                         AND p.next_retry_time IS NULL
                     )
                     OR 
                     -- Retry case: Has retry time and it's in the past
                     (
-                        p.next_retry_time IS NOT NULL 
+                        p.status IN ('sent_to_miner', 'retry_scheduled')
+                        AND p.next_retry_time IS NOT NULL 
                         AND p.next_retry_time <= :current_time
                         AND p.retry_count < 5
                     )
@@ -936,9 +943,35 @@ class SoilMoistureTask(Task):
                             "bounds": task["sentinel_bounds"],
                             "crs": task["sentinel_crs"]
                         })
-                    smap_data_result = await get_smap_data(target_time, regions_for_smap)
+                    smap_data_result = await get_smap_data_multi_region(target_time, regions_for_smap)
                     
                     if smap_data_result is None or not isinstance(smap_data_result, dict):
+                        logger.error(f"Failed to download or process SMAP data for {target_time}")
+                        # Update retry information for failed tasks
+                        for task in tasks_in_time_window:
+                            for prediction in task["predictions"]:
+                                update_query = """
+                                    UPDATE soil_moisture_predictions
+                                    SET retry_count = COALESCE(retry_count, 0) + 1,
+                                        next_retry_time = :next_retry_time,
+                                        last_error = :error_message
+                                    WHERE region_id = :region_id
+                                    AND miner_uid = :miner_uid
+                                """
+                                params = {
+                                    "region_id": task["id"],
+                                    "miner_uid": prediction["miner_id"],
+                                    "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=1),
+                                    "error_message": "Failed to download SMAP data"
+                                }
+                                await self.db_manager.execute(update_query, params)
+                        continue
+                    
+                    # Extract file path and processed data
+                    temp_path = smap_data_result.get("file_path")
+                    smap_processed_data = smap_data_result.get("data", {})
+                    
+                    if not temp_path or not os.path.exists(temp_path):
                         logger.error(f"Failed to download or process SMAP data for {target_time}")
                         # Update retry information for failed tasks
                         for task in tasks_in_time_window:
@@ -1367,35 +1400,7 @@ class SoilMoistureTask(Task):
             logger.error(f"Failed to cleanup predictions: {str(e)}")
             logger.error(traceback.format_exc())
 
-    async def ensure_retry_columns_exist(self):
-        """Ensure retry-related columns exist in soil_moisture_predictions table."""
-        try:
-            # Check if columns exist
-            check_query = """
-                SELECT EXISTS (
-                    SELECT 1 
-                    FROM information_schema.columns 
-                    WHERE table_name = 'soil_moisture_predictions' 
-                    AND column_name = 'retry_count'
-                )
-            """
-            result = await self.db_manager.fetch_one(check_query)
-            columns_exist = result["exists"] if result else False
-            
-            if not columns_exist:
-                logger.info("Adding retry columns to soil_moisture_predictions table")
-                alter_query = """
-                    ALTER TABLE soil_moisture_predictions 
-                    ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0,
-                    ADD COLUMN IF NOT EXISTS next_retry_time TIMESTAMP WITH TIME ZONE,
-                    ADD COLUMN IF NOT EXISTS last_retry_at TIMESTAMP WITH TIME ZONE
-                """
-                await self.db_manager.execute(alter_query)
-                logger.info("Successfully added retry columns")
-            
-        except Exception as e:
-            logger.error(f"Error ensuring retry columns exist: {e}")
-            logger.error(traceback.format_exc())
+
 
     async def cleanup_resources(self):
         """Clean up any resources used by the task during recovery."""
@@ -1434,4 +1439,87 @@ class SoilMoistureTask(Task):
             logger.error(f"Error during soil task cleanup: {e}")
             logger.error(traceback.format_exc())
             raise
+
+    async def _startup_retry_check(self):
+        """Check for pending tasks that can be retried immediately after startup."""
+        try:
+            current_time = datetime.now(timezone.utc)
+            
+            # Check for tasks that are eligible for immediate retry
+            eligible_query = """
+                SELECT 
+                    r.*,
+                    json_agg(json_build_object(
+                        'miner_id', p.miner_uid,
+                        'miner_hotkey', p.miner_hotkey,
+                        'retry_count', p.retry_count,
+                        'next_retry_time', p.next_retry_time,
+                        'surface_sm', p.surface_sm,
+                        'rootzone_sm', p.rootzone_sm,
+                        'uncertainty_surface', p.uncertainty_surface,
+                        'uncertainty_rootzone', p.uncertainty_rootzone
+                    )) as predictions
+                FROM soil_moisture_regions r
+                JOIN soil_moisture_predictions p ON p.region_id = r.id
+                WHERE p.status IN ('sent_to_miner', 'retry_scheduled')
+                AND (
+                    -- Tasks with scheduled retry time that has passed
+                    (
+                        p.status IN ('sent_to_miner', 'retry_scheduled')
+                        AND p.next_retry_time IS NOT NULL 
+                        AND p.next_retry_time <= :current_time
+                        AND p.retry_count < 5
+                    )
+                    OR
+                    -- Tasks that have been pending for over 4 hours (likely from previous session) 
+                    (
+                        p.status = 'sent_to_miner'
+                        AND p.next_retry_time IS NULL
+                        AND r.target_time <= :startup_cutoff_time
+                        AND (p.retry_count IS NULL OR p.retry_count < 5)
+                    )
+                )
+                GROUP BY r.id, r.target_time, r.sentinel_bounds, r.sentinel_crs, r.status
+                ORDER BY r.target_time ASC
+                LIMIT 20
+            """
+            
+            # Look for tasks older than 4 hours for immediate retry
+            startup_cutoff_time = current_time - timedelta(hours=4)
+            
+            params = {
+                "current_time": current_time,
+                "startup_cutoff_time": startup_cutoff_time
+            }
+            
+            eligible_tasks = await self.db_manager.fetch_all(eligible_query, params)
+            
+            if not eligible_tasks:
+                logger.info("✅ No pending tasks found for startup retry")
+                return
+            
+            logger.info(f"🔄 Found {len(eligible_tasks)} tasks eligible for startup retry")
+            
+            # Count different types
+            scheduled_retries = 0
+            old_pending = 0
+            
+            for task in eligible_tasks:
+                for pred in task["predictions"]:
+                    if pred.get("next_retry_time"):
+                        scheduled_retries += 1
+                    else:
+                        old_pending += 1
+            
+            logger.info(f"   - {scheduled_retries} scheduled retries ready")
+            logger.info(f"   - {old_pending} old pending tasks from previous session")
+            
+            # Attempt to score these tasks immediately
+            if eligible_tasks:
+                logger.info("🚀 Starting startup retry scoring...")
+                await self.validator_score()
+                
+        except Exception as e:
+            logger.error(f"Error in startup retry check: {e}")
+            logger.error(traceback.format_exc())
 

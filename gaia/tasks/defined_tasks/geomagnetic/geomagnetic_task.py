@@ -2041,3 +2041,5 @@ class GeomagneticTask(Task):
         except Exception as e:
             logger.warning(f"Error checking if task {task['id']} should be retried: {e}")
             return True  # Default to allowing retry if we can't determine
+
+

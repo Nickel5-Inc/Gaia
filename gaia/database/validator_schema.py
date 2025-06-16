@@ -85,7 +85,8 @@ soil_moisture_predictions_table = sa.Table('soil_moisture_predictions', validato
     sa.Column('status', sa.Text, nullable=False, server_default=sa.text("'sent_to_miner'")),
     sa.Column('retry_count', sa.Integer, server_default=sa.text('0'), nullable=True),
     sa.Column('next_retry_time', postgresql.TIMESTAMP(timezone=True), nullable=True),
-    sa.Column('last_error', sa.Text, nullable=True)
+    sa.Column('last_retry_attempt', postgresql.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column('retry_error_message', sa.Text, nullable=True)
 )
 sa.Index('idx_smp_region_id', soil_moisture_predictions_table.c.region_id)
 sa.Index('idx_smp_miner_uid', soil_moisture_predictions_table.c.miner_uid)
@@ -235,7 +236,11 @@ geomagnetic_predictions_table = sa.Table('geomagnetic_predictions', validator_me
     sa.Column('miner_hotkey', sa.Text, nullable=False),
     sa.Column('predicted_value', sa.Float, nullable=False),
     sa.Column('query_time', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
-    sa.Column('status', sa.Text, nullable=False, server_default=sa.text("'pending'"))
+    sa.Column('status', sa.Text, nullable=False, server_default=sa.text("'pending'")),
+    sa.Column('retry_count', sa.Integer, server_default=sa.text('0'), nullable=True),
+    sa.Column('next_retry_time', postgresql.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column('last_retry_attempt', postgresql.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column('retry_error_message', sa.Text, nullable=True)
 )
 sa.Index('idx_gp_miner_uid', geomagnetic_predictions_table.c.miner_uid)
 sa.Index('idx_gp_miner_hotkey', geomagnetic_predictions_table.c.miner_hotkey)

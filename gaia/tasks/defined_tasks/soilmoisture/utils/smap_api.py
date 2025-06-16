@@ -322,17 +322,21 @@ async def get_smap_data_multi_region(datetime_obj, regions):
                 print(f"Original bounds: {bounds}")
                 print(f"EASE2 bounds: {ease2_bounds}")
 
-        return results
+        # Return both the processed data and the file path for scoring
+        return {
+            "data": results,
+            "file_path": str(temp_filepath)
+        }
 
     except Exception as e:
         print(f"Error getting SMAP data: {str(e)}")
-        return None
-    finally:
+        # Clean up on error only
         if 'temp_filepath' in locals() and temp_filepath.exists():
             try:
                 temp_filepath.unlink()
             except Exception as e:
                 print(f"Error cleaning up temp file: {str(e)}")
+        return None
 
 
 def get_valid_smap_time(datetime_obj):
@@ -362,47 +366,80 @@ def get_valid_smap_time(datetime_obj):
 
 
 def _process_smap_for_sentinel_sync(filepath, sentinel_bounds_tuple, sentinel_crs_str):
-    """Synchronous helper to process SMAP data for sentinel bounds."""
+    """Synchronous helper to process SMAP data for sentinel bounds using proven EASE-Grid approach."""
     with xr.open_dataset(filepath, group="Geophysical_Data") as ds:
-        smap_surface_sm = ds["sm_surface"]
-        smap_rootzone_sm = ds["sm_rootzone"]
-        
-        smap_lat = ds.coords["lat"].values
-        smap_lon = ds.coords["lon"].values
+        # Use the proven approach from get_smap_data_multi_region
+        surface_data = ds["sm_surface"].values
+        rootzone_data = ds["sm_rootzone"].values
 
-        # Assuming sentinel_bounds_tuple is (left, bottom, right, top)
-        # And SMAP data is typically global, so we find the nearest indices
-        # This simplistic approach might need refinement based on actual SMAP grid structure
-        # For EASE-Grid 2.0, direct indexing or more sophisticated reprojection is better.
-        
-        # Placeholder: This needs to be replaced with proper reprojection and extraction
-        # For now, let's assume we extract a small, fixed region for demonstration
-        # In a real scenario, use pyproj and xarray.sel with reprojected coordinates
-        target_lat_slice = slice(sentinel_bounds_tuple[3] - 0.5, sentinel_bounds_tuple[1] + 0.5) # top, bottom
-        target_lon_slice = slice(sentinel_bounds_tuple[0] - 0.5, sentinel_bounds_tuple[2] + 0.5) # left, right
+        # EASE-Grid 2.0 parameters (from working code)
+        ease2_crs = CRS.from_epsg(6933)
+        smap_y_size, smap_x_size = surface_data.shape
+        smap_y_range = (-7314540.11, 7314540.11)
+        smap_x_range = (-17367530.45, 17367530.45)
 
-        try:
-            # Attempt to select based on assuming WGS84-like coordinates for SMAP for simplicity here
-            # This is likely incorrect for actual SMAP EASE-Grid data which is not in degrees lat/lon globally in a simple way.
-            surface_sm = smap_surface_sm.sel(lat=target_lat_slice, lon=target_lon_slice).values
-            rootzone_sm = smap_rootzone_sm.sel(lat=target_lat_slice, lon=target_lon_slice).values
-        except Exception as e:
-            print(f"Warning: Could not select SMAP data by lat/lon directly ({e}), returning full arrays for now. Need proper reprojection.")
-            # Fallback or more robust extraction needed here. For now, returning a slice.
-            # This part needs to be robustly implemented based on SMAP grid and sentinel projection.
-            # Using a fixed slice for now as a placeholder if direct sel fails.
-            surface_sm = smap_surface_sm.isel(lat=slice(100, 200), lon=slice(100,200)).values
-            rootzone_sm = smap_rootzone_sm.isel(lat=slice(100, 200), lon=slice(100,200)).values
+        # sentinel_bounds_tuple should be (left, bottom, right, top)
+        bounds = sentinel_bounds_tuple
+        crs = sentinel_crs_str
 
-        # Ensure NaNs where fill value was
-        surface_sm[surface_sm == smap_surface_sm._FillValue] = np.nan
-        rootzone_sm[rootzone_sm == smap_rootzone_sm._FillValue] = np.nan
+        # Transform bounds to WGS84 if needed
+        if crs != "EPSG:4326":
+            to_wgs84 = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+            left, bottom = to_wgs84.transform(bounds[0], bounds[1])
+            right, top = to_wgs84.transform(bounds[2], bounds[3])
+        else:
+            left, bottom, right, top = bounds
+
+        # Transform to EASE-Grid 2.0
+        to_ease2 = Transformer.from_crs("EPSG:4326", ease2_crs, always_xy=True)
+        ease2_bounds = to_ease2.transform_bounds(left, bottom, right, top)
+        ease2_left, ease2_bottom, ease2_right, ease2_top = ease2_bounds
+
+        # Calculate array indices
+        y_idx_start = int(
+            (smap_y_range[1] - ease2_top)
+            * smap_y_size
+            / (smap_y_range[1] - smap_y_range[0])
+        )
+        y_idx_end = int(
+            (smap_y_range[1] - ease2_bottom)
+            * smap_y_size
+            / (smap_y_range[1] - smap_y_range[0])
+        )
+        x_idx_start = int(
+            (ease2_left - smap_x_range[0])
+            * smap_x_size
+            / (smap_x_range[1] - smap_x_range[0])
+        )
+        x_idx_end = int(
+            (ease2_right - smap_x_range[0])
+            * smap_x_size
+            / (smap_x_range[1] - smap_x_range[0])
+        )
+
+        # Clamp indices to valid range
+        y_idx_start = max(0, min(y_idx_start, smap_y_size))
+        y_idx_end = max(0, min(y_idx_end, smap_y_size))
+        x_idx_start = max(0, min(x_idx_start, smap_x_size))
+        x_idx_end = max(0, min(x_idx_end, smap_x_size))
+
+        # Extract region of interest
+        surface_roi = surface_data[y_idx_start:y_idx_end, x_idx_start:x_idx_end]
+        rootzone_roi = rootzone_data[y_idx_start:y_idx_end, x_idx_start:x_idx_end]
+
+        # Handle fill values
+        surface_roi = surface_roi.astype(float)
+        rootzone_roi = rootzone_roi.astype(float)
         
-        # Resize to a common shape, e.g., 11x11 as often used in the project
-        # This might not be the correct place for resizing if original resolution is important for metrics
-        target_shape = (11, 11) # Example shape
-        surface_resampled = resize(surface_sm, target_shape, preserve_range=True, anti_aliasing=True)
-        rootzone_resampled = resize(rootzone_sm, target_shape, preserve_range=True, anti_aliasing=True)
+        # Set fill values to NaN using the dataset's fill value
+        fill_value = ds["sm_surface"]._FillValue
+        surface_roi[surface_roi == fill_value] = np.nan
+        rootzone_roi[rootzone_roi == fill_value] = np.nan
+
+        # Resize to target shape for consistency
+        target_shape = (11, 11)
+        surface_resampled = resize(surface_roi, target_shape, preserve_range=True, anti_aliasing=True)
+        rootzone_resampled = resize(rootzone_roi, target_shape, preserve_range=True, anti_aliasing=True)
 
         return {"surface_sm": surface_resampled, "rootzone_sm": rootzone_resampled}
 

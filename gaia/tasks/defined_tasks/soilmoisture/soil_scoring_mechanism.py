@@ -191,7 +191,7 @@ class SoilScoringMechanism(ScoringMechanism):
             )
             
             if pred_info and pred_info.get("status") == "retry_scheduled":
-                current_time = datetime.datetime.now(timezone.utc)
+                current_time = datetime.now(timezone.utc)
                 if current_time < pred_info["next_retry_time"]:
                     logger.info(f"Skipping scoring for timestamp {predictions['target_time']} - in retry wait period until {pred_info['next_retry_time']}")
                     return None

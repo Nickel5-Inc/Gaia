@@ -486,8 +486,17 @@ class ComprehensiveDatabaseSetup:
         config_dir = Path(self.config.config_directory)
         conf_d_dir = config_dir / 'conf.d'
         
-        # Ensure the conf.d directory exists
-        conf_d_dir.mkdir(parents=True, exist_ok=True)
+        # Ensure the conf.d directory exists using sudo
+        try:
+            conf_d_dir.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            # If we can't create it directly, use sudo
+            success, _, stderr = await self._run_command([
+                'sudo', 'mkdir', '-p', str(conf_d_dir)
+            ])
+            if not success:
+                logger.error(f"Failed to create conf.d directory: {stderr}")
+                return False
         
         custom_config_file = conf_d_dir / '99-gaia-custom.conf'
         
@@ -538,12 +547,24 @@ class ComprehensiveDatabaseSetup:
             for key, value in config_settings.items():
                 config_lines.append(f"{key} = {value}")
             
-            # Write our custom settings to a file in conf.d
-            with open(custom_config_file, 'w') as f:
-                f.write('\n'.join(config_lines))
+            # Write our custom settings to a file in conf.d using sudo
+            config_content = '\n'.join(config_lines)
             
-            logger.info(f"✅ Custom PostgreSQL configuration written to: {custom_config_file}")
-            return True
+            # Use sudo tee to write to the system directory
+            process = await asyncio.create_subprocess_exec(
+                'sudo', 'tee', str(custom_config_file),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate(input=config_content.encode())
+            
+            if process.returncode == 0:
+                logger.info(f"✅ Custom PostgreSQL configuration written to: {custom_config_file}")
+                return True
+            else:
+                logger.error(f"Failed to write config file: {stderr.decode()}")
+                return False
             
         except Exception as e:
             logger.error(f"Error configuring postgresql.conf via conf.d: {e}", exc_info=True)
@@ -580,11 +601,24 @@ class ComprehensiveDatabaseSetup:
         ]
         
         try:
-            with open(hba_file, 'w') as f:
-                f.write('\n'.join(hba_rules))
+            # Write pg_hba.conf using sudo
+            hba_content = '\n'.join(hba_rules)
             
-            logger.info(f"✅ pg_hba.conf configured: {hba_file}")
-            return True
+            # Use sudo tee to write to the system directory
+            process = await asyncio.create_subprocess_exec(
+                'sudo', 'tee', str(hba_file),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate(input=hba_content.encode())
+            
+            if process.returncode == 0:
+                logger.info(f"✅ pg_hba.conf configured: {hba_file}")
+                return True
+            else:
+                logger.error(f"Failed to write pg_hba.conf: {stderr.decode()}")
+                return False
             
         except Exception as e:
             logger.error(f"Error configuring pg_hba.conf: {e}", exc_info=True)
@@ -1000,7 +1034,7 @@ class ComprehensiveDatabaseSetup:
             return True  # If we can't detect it, assume it's not running
         
         try:
-            success, stdout, stderr = await self._run_command(['systemctl', 'stop', service_name])
+            success, stdout, stderr = await self._run_command(['sudo', 'systemctl', 'stop', service_name])
             if success:
                 logger.info(f"✅ Stopped PostgreSQL service: {service_name}")
             return success
@@ -1070,7 +1104,7 @@ class ComprehensiveDatabaseSetup:
             # Try graceful stop first
             service_name = await self._detect_postgresql_service()
             if service_name:
-                await self._run_command(['systemctl', 'stop', service_name], timeout=30)
+                await self._run_command(['sudo', 'systemctl', 'stop', service_name], timeout=30)
             
             # Kill any remaining postgres processes
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
