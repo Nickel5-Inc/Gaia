@@ -1716,7 +1716,8 @@ pg1-user={self.config['pguser']}
                         logger.warning("💡 To resolve: Check PostgreSQL status and pgBackRest configuration.")
                         # Continue with scheduling even if initial sync failed - the replica sync scheduler will retry
                     else:
-                        logger.info("✅ Initial replica sync successful. Continuing with normal operation.")
+                        logger.info("✅ Initial replica sync successful. Database is now synchronized.")
+                        logger.info("🎉 Continuing with normal operation.")
                 else:
                     logger.info("⏭️ REPLICA STARTUP: Skipping initial sync as per configuration (REPLICA_STARTUP_SYNC is not 'true').")
 
@@ -2454,9 +2455,12 @@ pg1-user={self.config['pguser']}
         success = False
         stderr = ""
         try:
-            success, _, stderr = await self._run_postgres_command_with_logging(
+            return_code, _, stderr = await self._run_postgres_command_with_logging(
                 delta_restore_cmd, timeout=7200, description="pgBackRest delta restore"
             )
+            
+            # Convert return code to boolean (0 = success, non-zero = failure)
+            success = (return_code == 0)
             
             # Even if the command returns success, check for corruption indicators in stderr
             if success and stderr and ("FileMissingError" in stderr or "unable to open missing file" in stderr):
@@ -2467,17 +2471,34 @@ pg1-user={self.config['pguser']}
             logger.error("❌ Restore process timed out after 2 hours and was killed.")
             success = False
 
+        # If the command succeeded, check if it's just permission warnings (which are normal)
+        if success:
+            has_permission_warnings = stderr and ("unknown user 'root'" in stderr or "unknown group 'root'" in stderr)
+            if has_permission_warnings:
+                logger.warning("⚠️ Delta restore completed successfully with permission warnings (normal when running as root)")
+                logger.info("🔧 Will fix ownership after restore completes")
+            else:
+                logger.info("✅ Delta restore completed successfully")
+        
+        # Check if the failure is due to actual corruption vs. just warnings
         if not success:
-            if "FileMissingError" in stderr or "unable to open missing file" in stderr:
+            # Check for actual corruption indicators
+            has_corruption = "FileMissingError" in stderr or "unable to open missing file" in stderr
+            has_permission_warnings = "unknown user 'root'" in stderr or "unknown group 'root'" in stderr
+            
+            if has_corruption:
                 logger.error("❌ Delta restore failed due to missing files in backup - backup appears corrupted.")
                 logger.warning("⚠️ This indicates the backup in R2 storage is incomplete or corrupted.")
                 logger.info("🔍 Checking for alternative backups...")
                 
                 # Try to get backup info to see if there are other backups available
                 info_cmd = ['sudo', '-u', postgres_user, 'pgbackrest', f'--stanza={stanza_name}', 'info']
-                info_success, info_stdout, info_stderr = await self._run_postgres_command_with_logging(
+                info_return_code, info_stdout, info_stderr = await self._run_postgres_command_with_logging(
                     info_cmd, timeout=60, description="pgBackRest backup info"
                 )
+                
+                # Convert return code to boolean (0 = success, non-zero = failure)
+                info_success = (info_return_code == 0)
                 
                 if info_success and info_stdout:
                     logger.info(f"📊 Available backups:\n{info_stdout}")
@@ -2499,9 +2520,12 @@ pg1-user={self.config['pguser']}
                                 '--delta', '--force', 'restore'
                             ]
                             
-                            older_success, _, older_stderr = await self._run_postgres_command_with_logging(
+                            older_return_code, _, older_stderr = await self._run_postgres_command_with_logging(
                                 older_restore_cmd, timeout=7200, description="pgBackRest older backup restore"
                             )
+                            
+                            # Convert return code to boolean (0 = success, non-zero = failure)
+                            older_success = (older_return_code == 0)
                             
                             if older_success and not ("FileMissingError" in older_stderr or "unable to open missing file" in older_stderr):
                                 logger.warning("⚠️ Successfully restored from older backup due to corruption in latest backup")
@@ -2513,11 +2537,17 @@ pg1-user={self.config['pguser']}
                 
                 if not success:
                     logger.error("❌ All available backups appear corrupted. Attempting full clean restore as last resort...")
+            elif has_permission_warnings and not has_corruption:
+                # If it's just permission warnings but no actual corruption, treat as success
+                logger.warning("⚠️ Delta restore completed with permission warnings (this is normal when running as root)")
+                logger.info("🔧 Will fix ownership after restore completes")
+                success = True
             else:
                 logger.error("❌ Delta restore failed. This may indicate a corrupted local directory.")
             
-            if not success:
-                logger.info("🔥 Attempting a full, clean restore as a fallback...")
+        # Only attempt full restore if delta restore actually failed
+        if not success:
+            logger.info("🔥 Attempting a full, clean restore as a fallback...")
             
             try:
                 await self._stop_postgresql_service() # Ensure it's stopped before wipe
@@ -2537,9 +2567,12 @@ pg1-user={self.config['pguser']}
             full_restore_cmd = ["sudo", "-u", postgres_user, "pgbackrest", f"--stanza={stanza_name}", "restore"]
             logger.info(f"   - Running full restore command: {' '.join(full_restore_cmd)}")
             
-            full_success, _, full_stderr = await self._run_postgres_command_with_logging(
+            full_return_code, _, full_stderr = await self._run_postgres_command_with_logging(
                 full_restore_cmd, timeout=7200, description="Full pgBackRest restore"
             )
+            
+            # Convert return code to boolean (0 = success, non-zero = failure)
+            full_success = (full_return_code == 0)
 
             if not full_success:
                 logger.critical("💥 FALLBACK RESTORE FAILED. The database is in an inconsistent state and requires manual intervention.")
@@ -2557,10 +2590,13 @@ pg1-user={self.config['pguser']}
                     except: logger.error(f"   - Stderr: {full_stderr}")
                 return False
             else:
+                # Full restore succeeded, update success flag
+                success = True
+                logger.info("✅ Full restore completed successfully")
                 # Immediately fix ownership after successful restore
                 logger.info("🔧 Fixing data directory ownership after restore...")
                 await self._fix_postgresql_ownership()
-            
+        
         # If we are here, either the initial delta or the fallback full restore succeeded.
         # But let's double-check that we actually succeeded
         if not success:
@@ -2638,6 +2674,7 @@ pg1-user={self.config['pguser']}
             return False
 
         logger.info("🎉 Restore from backup process completed successfully!")
+        logger.info("✅ Database is now synchronized and ready for use")
         return True
 
     async def _attempt_recovery(self):
