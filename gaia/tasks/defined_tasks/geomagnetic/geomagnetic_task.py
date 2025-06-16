@@ -1087,11 +1087,14 @@ class GeomagneticTask(Task):
                 "status": "completed",
             }
 
-            # WRITE operation - use execute for inserting score
+            # WRITE operation - use execute for upserting score (handles duplicates)
             await self.db_manager.execute(
                 """
                 INSERT INTO score_table (task_name, task_id, score, status)
                 VALUES (:task_name, :task_id, :score, :status)
+                ON CONFLICT (task_name, task_id) DO UPDATE SET
+                    score = EXCLUDED.score,
+                    status = EXCLUDED.status
                 """,
                 score_row
             )
@@ -1261,6 +1264,9 @@ class GeomagneticTask(Task):
                         """
                         INSERT INTO score_table (task_name, task_id, score, status)
                         VALUES (:task_name, :task_id, :score, :status)
+                        ON CONFLICT (task_name, task_id) DO UPDATE SET
+                            score = EXCLUDED.score,
+                            status = EXCLUDED.status
                         """,
                         score_row
                     )
