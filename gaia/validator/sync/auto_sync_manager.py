@@ -2231,7 +2231,7 @@ pg1-user={self.config['pguser']}
             return False
 
     async def _trigger_check(self) -> bool:
-        """Run pgBackRest check with detailed logging."""
+        """Run pgBackRest check with detailed logging and intelligent error handling."""
         try:
             logger.debug("🔍 Running pgBackRest check...")
             cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
@@ -2250,8 +2250,22 @@ pg1-user={self.config['pguser']}
                     logger.debug(f"Check output: {stdout.decode()}")
                 return True
             else:
-                logger.warning(f"❌ pgBackRest check failed with return code {process.returncode}")
                 error_msg = stderr.decode() if stderr else ""
+                
+                # Handle WAL archiving timeout (error code 82) more gracefully
+                if process.returncode == 82 and "was not archived before the" in error_msg and "timeout" in error_msg:
+                    logger.warning(f"⚠️ WAL archiving timeout detected (this is often temporary)")
+                    logger.info("🔍 Checking if WAL archiving is generally working...")
+                    
+                    # Check if archive command is working by looking at recent archive activity
+                    if await self._check_recent_archive_activity():
+                        logger.info("✅ Recent WAL archive activity detected - treating timeout as temporary issue")
+                        return True  # Treat as success since archiving is generally working
+                    else:
+                        logger.warning("❌ No recent WAL archive activity - this may indicate a real problem")
+                        return False
+                
+                logger.warning(f"❌ pgBackRest check failed with return code {process.returncode}")
                 if stderr:
                     logger.warning(f"Check error: {error_msg}")
                 if stdout:
@@ -2267,6 +2281,85 @@ pg1-user={self.config['pguser']}
             
         except Exception as e:
             logger.error(f"Error running check: {e}")
+            return False
+
+    async def _check_recent_archive_activity(self) -> bool:
+        """Check if there has been recent WAL archive activity by examining PostgreSQL logs."""
+        try:
+            # Look for recent archive-push success messages in PostgreSQL logs
+            log_paths = [
+                "/var/lib/postgresql/14/main/log",
+                "/var/log/postgresql"
+            ]
+            
+            recent_activity_found = False
+            current_time = datetime.now()
+            
+            for log_dir in log_paths:
+                if not os.path.exists(log_dir):
+                    continue
+                    
+                try:
+                    # Find recent log files (last 2 hours)
+                    log_files = []
+                    for file_path in Path(log_dir).glob("*.log"):
+                        if file_path.is_file():
+                            file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+                            if (current_time - file_mtime).total_seconds() < 7200:  # 2 hours
+                                log_files.append(file_path)
+                    
+                    # Check the most recent log files for archive activity
+                    for log_file in sorted(log_files, key=lambda x: x.stat().st_mtime, reverse=True)[:3]:
+                        try:
+                            with open(log_file, 'r') as f:
+                                # Read last 100 lines to check for recent activity
+                                lines = f.readlines()[-100:]
+                                for line in lines:
+                                    if ("archive-push command end: completed successfully" in line or
+                                        "pushed WAL file" in line):
+                                        # Parse timestamp to ensure it's recent (last 30 minutes)
+                                        if self._is_log_line_recent(line, minutes=30):
+                                            recent_activity_found = True
+                                            logger.debug(f"Found recent archive activity: {line.strip()}")
+                                            break
+                                            
+                                if recent_activity_found:
+                                    break
+                        except Exception as e:
+                            logger.debug(f"Error reading log file {log_file}: {e}")
+                            continue
+                            
+                    if recent_activity_found:
+                        break
+                        
+                except Exception as e:
+                    logger.debug(f"Error checking log directory {log_dir}: {e}")
+                    continue
+            
+            return recent_activity_found
+            
+        except Exception as e:
+            logger.warning(f"Error checking recent archive activity: {e}")
+            return False
+
+    def _is_log_line_recent(self, log_line: str, minutes: int = 30) -> bool:
+        """Check if a log line timestamp is within the specified minutes."""
+        try:
+            # Extract timestamp from log line (format: YYYY-MM-DD HH:MM:SS.mmm)
+            import re
+            timestamp_match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', log_line)
+            if not timestamp_match:
+                return False
+                
+            timestamp_str = timestamp_match.group(1)
+            log_time = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+            current_time = datetime.now()
+            
+            time_diff = (current_time - log_time).total_seconds()
+            return time_diff <= (minutes * 60)
+            
+        except Exception as e:
+            logger.debug(f"Error parsing log timestamp: {e}")
             return False
 
     async def _handle_stanza_mismatch_after_sync(self) -> bool:
