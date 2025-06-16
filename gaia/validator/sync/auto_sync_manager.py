@@ -357,55 +357,44 @@ class AutoSyncManager:
         
         logger.info("🔧 Loading AutoSyncManager configuration...")
         
-        # Debug environment variables
-        env_vars = {
-            'PGBACKREST_STANZA_NAME': os.getenv('PGBACKREST_STANZA_NAME'),
-            'SUBTENSOR_NETWORK': os.getenv('SUBTENSOR_NETWORK'),
-            'IS_SOURCE_VALIDATOR_FOR_DB_SYNC': os.getenv('IS_SOURCE_VALIDATOR_FOR_DB_SYNC'),
-            'REPLICA_STARTUP_SYNC': os.getenv('REPLICA_STARTUP_SYNC'),
-            'PGBACKREST_R2_BUCKET': os.getenv('PGBACKREST_R2_BUCKET'),
-            'PGBACKREST_R2_ENDPOINT': os.getenv('PGBACKREST_R2_ENDPOINT'),
-            'PGBACKREST_R2_ACCESS_KEY_ID': os.getenv('PGBACKREST_R2_ACCESS_KEY_ID'),
-            'PGBACKREST_R2_SECRET_ACCESS_KEY': '***' if os.getenv('PGBACKREST_R2_SECRET_ACCESS_KEY') else None,
-            'PGBACKREST_PGDATA': os.getenv('PGBACKREST_PGDATA'),
-            'PGBACKREST_PGPORT': os.getenv('PGBACKREST_PGPORT'),
-            'PGBACKREST_PGUSER': os.getenv('PGBACKREST_PGUSER'),
-        }
+        # Enhanced stanza naming with network awareness - fully automatic
+        network_suffix = os.getenv('SUBTENSOR_NETWORK', '').lower()
         
-        logger.info("📋 Environment variables:")
-        for key, value in env_vars.items():
-            if value:
-                logger.info(f"   ✅ {key}: {value}")
-            else:
-                logger.info(f"   ❌ {key}: Not set")
+        # Log only the essential configuration status
+        logger.info("📋 Essential configuration status:")
+        logger.info(f"   🌐 Network detected: {network_suffix or 'unknown'}")
+        logger.info(f"   🏠 Node mode: {'PRIMARY' if os.getenv('IS_SOURCE_VALIDATOR_FOR_DB_SYNC', 'False').lower() == 'true' else 'REPLICA'}")
+        logger.info(f"   ☁️  R2 storage: {'✅ Configured' if os.getenv('PGBACKREST_R2_BUCKET') else '❌ Missing'}")
         
         try:
             pgdata_path = self._find_pgdata_path()
-            logger.info(f"✅ PostgreSQL data directory: {pgdata_path}")
+            logger.info(f"   🗄️ PostgreSQL: ✅ Detected at {pgdata_path}")
         except Exception as e:
             logger.error(f"❌ Failed to find PostgreSQL data directory: {e}")
             # Don't raise immediately - let's see what other config we can gather
             pgdata_path = "/var/lib/postgresql/14/main"  # Default fallback
-            logger.warning(f"⚠️ Using fallback PostgreSQL data directory: {pgdata_path}")
+            logger.warning(f"   🗄️ PostgreSQL: ⚠️ Using fallback directory: {pgdata_path}")
 
         r2_region_raw = os.getenv('PGBACKREST_R2_REGION', 'auto')
         r2_region = r2_region_raw.split('#')[0].strip()
-
-        # Enhanced stanza naming with network awareness
-        base_stanza_name = os.getenv('PGBACKREST_STANZA_NAME', 'gaia')
-        network_suffix = os.getenv('SUBTENSOR_NETWORK', '').lower()
         
-        # Auto-append network to stanza name if not already present and network is detected
-        if network_suffix and network_suffix in ['test', 'finney'] and network_suffix not in base_stanza_name.lower():
-            stanza_name = f"{base_stanza_name}-{network_suffix}"
-            logger.info(f"🌐 Network-aware stanza: {stanza_name} (detected network: {network_suffix})")
+        # Auto-detect stanza name based on network and node type
+        if network_suffix and network_suffix in ['test', 'finney']:
+            stanza_name = f"gaia-{network_suffix}"
+            logger.info(f"🌐 Auto-detected network-aware stanza: {stanza_name} (network: {network_suffix})")
         else:
-            stanza_name = base_stanza_name
-            if network_suffix:
-                logger.info(f"🌐 Using explicit stanza: {stanza_name} (network: {network_suffix})")
+            stanza_name = "gaia"
+            logger.info(f"🌐 Using default stanza: {stanza_name} (network: {network_suffix or 'unknown'})")
+        
+        # Override only if explicitly set (for advanced users)
+        if os.getenv('PGBACKREST_STANZA_NAME'):
+            explicit_stanza = os.getenv('PGBACKREST_STANZA_NAME')
+            logger.info(f"🔧 Using explicit stanza override: {explicit_stanza} (was auto-detected as: {stanza_name})")
+            stanza_name = explicit_stanza
 
         config = {
             'stanza_name': stanza_name,
+            'pgbackrest_stanza_name': stanza_name,  # Add alias for backward compatibility
             'r2_bucket': os.getenv('PGBACKREST_R2_BUCKET'),
             'r2_endpoint': os.getenv('PGBACKREST_R2_ENDPOINT'),
             'r2_access_key': os.getenv('PGBACKREST_R2_ACCESS_KEY_ID'),
@@ -414,7 +403,9 @@ class AutoSyncManager:
             'pgdata': pgdata_path,
             'pgport': int(os.getenv('PGBACKREST_PGPORT', '5432')),
             'pguser': os.getenv('PGBACKREST_PGUSER', 'postgres'),
-            'pgpassword': os.getenv('PGBACKREST_PGPASSWORD'),  # Optional password
+            'postgres_user': os.getenv('PGBACKREST_PGUSER', 'postgres'),  # Add alias for backward compatibility
+            'pgpassword': os.getenv('PGBACKREST_PGPASSWORD', os.getenv('DB_PASSWORD', 'postgres')),  # Optional password with fallback
+            'postgres_password': os.getenv('PGBACKREST_PGPASSWORD', os.getenv('DB_PASSWORD', 'postgres')),  # Add alias for backward compatibility
             'is_primary': os.getenv('IS_SOURCE_VALIDATOR_FOR_DB_SYNC', 'False').lower() == 'true',
             'replica_discovery_endpoint': os.getenv('REPLICA_DISCOVERY_ENDPOINT'),  # For primary to announce itself
             'primary_discovery_endpoint': os.getenv('PRIMARY_DISCOVERY_ENDPOINT'),  # For replica to find primary
@@ -439,6 +430,13 @@ class AutoSyncManager:
             raise ValueError(f"Missing required R2 configuration: {missing_vars}")
         
         logger.info("✅ Configuration loaded successfully")
+        
+        # Log final auto-detected configuration
+        logger.info("🎯 Final configuration:")
+        logger.info(f"   📋 Stanza name: {config['stanza_name']} (auto-detected)")
+        logger.info(f"   🏠 Mode: {'PRIMARY' if config['is_primary'] else 'REPLICA'}")
+        logger.info(f"   🔐 Authentication: {'✅ Ready' if config['postgres_password'] else '⚠️ Using default'}")
+        logger.info(f"   🚀 Auto-sync on startup: {'✅ Enabled' if config['replica_startup_sync'] else '❌ Disabled'}")
 
         # Add derived paths for configuration, essential for post-restore config
         pg_version = self.system_info.get('postgresql_version')
@@ -1632,16 +1630,14 @@ pg1-user={self.config['pguser']}
             logger.info("🔄 AutoSyncManager scheduling is already running, skipping duplicate start")
             return
         
-        print("\n" + "🔥" * 80)
-        print("🔥 AUTO SYNC MANAGER SCHEDULING STARTED 🔥")
-        print("🔥" * 80)
+        print("\n🔥 AUTO SYNC MANAGER SCHEDULING STARTED 🔥")
         
         # Note: Database setup is now handled by the comprehensive database setup system
         # We can proceed directly to scheduling since the database should be ready
         logger.info("✅ Database setup handled by comprehensive system - starting scheduling")
         
         if self.is_primary:
-            logger.info("🔥" * 10 + " BACKUP SCHEDULING ACTIVE " + "🔥" * 10)
+            logger.info("🔥 BACKUP SCHEDULING ACTIVE 🔥")
             if self.test_mode:
                 logger.info("⚡ TEST MODE ACTIVE: Differential backups every 15 minutes, health checks every 5 minutes ⚡")
                 print("⚡ TEST MODE: FAST BACKUP SCHEDULE ENABLED FOR TESTING ⚡")
@@ -1678,9 +1674,7 @@ pg1-user={self.config['pguser']}
                 else:
                     logger.info("⏭️ REPLICA STARTUP: Skipping initial sync as per configuration (REPLICA_STARTUP_SYNC is not 'true').")
 
-            logger.info("🔥" * 30)
             logger.info("🔥 AUTO SYNC MANAGER SCHEDULING STARTED 🔥")
-            logger.info("🔥" * 30)
             
             # Only create replica sync task if not already running
             if not self.backup_task or self.backup_task.done():
@@ -1690,7 +1684,7 @@ pg1-user={self.config['pguser']}
         # Only create health check task if not already running
         if not self.health_check_task or self.health_check_task.done():
             self.health_check_task = asyncio.create_task(self._health_monitor())
-        print("🔥" * 80 + "\n")
+        print("🔥 SCHEDULING COMPLETE 🔥\n")
 
     # Note: Pre-validator sync status checking is no longer needed
     # Database setup is now handled by the comprehensive database setup system
@@ -1701,11 +1695,9 @@ pg1-user={self.config['pguser']}
         last_diff_backup = datetime.now()
         last_check = datetime.now()
         
-        print("\n" + "⏰" * 60)
-        print("⏰ BACKUP SCHEDULER MAIN LOOP STARTED ⏰")
+        print("\n⏰ BACKUP SCHEDULER MAIN LOOP STARTED ⏰")
         print(f"⏰ STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ⏰")
-        print("⏰" * 60)
-        logger.info("⏰" * 15 + " BACKUP SCHEDULER LOOP ACTIVE " + "⏰" * 15)
+        logger.info("⏰ BACKUP SCHEDULER LOOP ACTIVE ⏰")
         logger.info(f"⏰ SCHEDULER START TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         while not self._shutdown_event.is_set():
@@ -1726,10 +1718,8 @@ pg1-user={self.config['pguser']}
                     # Test mode: keep existing interval-based logic
                     hours_since_diff = (now - last_diff_backup).total_seconds() / 3600
                     if hours_since_diff >= self.backup_schedule['diff_backup_interval']:
-                        print("\n" + "🚨" * 50)
-                        print("🚨 DIFFERENTIAL BACKUP TRIGGERED (TEST MODE) 🚨")
+                        print("\n🚨 DIFFERENTIAL BACKUP TRIGGERED (TEST MODE) 🚨")
                         print(f"🚨 {hours_since_diff:.1f} HOURS SINCE LAST BACKUP 🚨")
-                        print("🚨" * 50)
                         logger.info(f"🚨 TEST MODE BACKUP TRIGGER: {hours_since_diff:.1f} hours since last diff backup (threshold: {self.backup_schedule['diff_backup_interval']}) - triggering backup... 🚨")
                         if await self._trigger_backup('diff'):
                             last_diff_backup = now
@@ -1756,10 +1746,8 @@ pg1-user={self.config['pguser']}
                         last_backup_hour = last_diff_backup.hour if last_diff_backup.date() == now.date() else -1
                         
                         if current_hour != last_backup_hour:
-                            print("\n" + "🚨" * 50)
-                            print("🚨 DIFFERENTIAL BACKUP TRIGGERED (SCHEDULED) 🚨")
+                            print("\n🚨 DIFFERENTIAL BACKUP TRIGGERED (SCHEDULED) 🚨")
                             print(f"🚨 HOURLY BACKUP AT {current_hour:02d}:{target_minute:02d} 🚨")
-                            print("🚨" * 50)
                             logger.info(f"🚨 SCHEDULED BACKUP TRIGGER: Hourly backup at {current_hour:02d}:{target_minute:02d} - triggering backup... 🚨")
                             if await self._trigger_backup('diff'):
                                 last_diff_backup = now
@@ -1796,11 +1784,9 @@ pg1-user={self.config['pguser']}
 
     async def _health_monitor(self):
         """Monitor backup system health."""
-        print("\n" + "💚" * 60)
-        print("💚 HEALTH MONITOR MAIN LOOP STARTED 💚")
+        print("\n💚 HEALTH MONITOR MAIN LOOP STARTED 💚")
         print(f"💚 CHECKING EVERY {self.backup_schedule['health_check_interval']} SECONDS 💚")
-        print("💚" * 60)
-        logger.info("💚" * 15 + " HEALTH MONITOR LOOP ACTIVE " + "💚" * 15)
+        logger.info("💚 HEALTH MONITOR LOOP ACTIVE 💚")
         logger.info(f"💚 HEALTH CHECK INTERVAL: {self.backup_schedule['health_check_interval']} seconds")
         
         while not self._shutdown_event.is_set():

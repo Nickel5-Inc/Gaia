@@ -3195,21 +3195,26 @@ class GaiaValidator:
 
     async def manage_earthdata_token(self):
         """Periodically checks and refreshes the Earthdata token."""
+        logger.info("🌍 Earthdata token management task started - running initial check immediately...")
+        
         while not self._shutdown_event.is_set():
             try:
-                logger.info("Running Earthdata token check...")
+                logger.info("🔍 Running Earthdata token check...")
                 token = await ensure_valid_earthdata_token()
                 if token:
-                    logger.info(f"Earthdata token check successful. Current token (first 10 chars): {token[:10]}...")
+                    logger.info(f"✅ Earthdata token check successful. Current token (first 10 chars): {token[:10]}...")
                 else:
-                    logger.warning("Earthdata token check failed or no token available.")
+                    logger.warning("⚠️ Earthdata token check failed or no token available.")
 
+                logger.info("⏰ Earthdata token check complete. Sleeping for 24 hours until next check...")
                 await asyncio.sleep(86400) # Check daily
 
             except asyncio.CancelledError:
-                logger.info("Earthdata token management task cancelled.")
+                logger.info("🛑 Earthdata token management task cancelled.")
+                break
             except Exception as e:
-                logger.error(f"Error in Earthdata token management task: {e}", exc_info=True)
+                logger.error(f"❌ Error in Earthdata token management task: {e}", exc_info=True)
+                logger.info("🔄 Retrying Earthdata token check in 1 hour due to error...")
                 await asyncio.sleep(3600) # Retry in an hour if there was an error
 
     async def _initialize_db_sync_components(self):
