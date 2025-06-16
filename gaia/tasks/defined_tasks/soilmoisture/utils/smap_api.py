@@ -190,7 +190,45 @@ def process_smap_data(filepath, bbox, target_shape=(220, 220)):
         return {"surface_sm": surface_resampled, "rootzone_sm": rootzone_resampled}
 
 
-async def get_smap_data(datetime_obj, regions):
+async def get_smap_data(datetime_obj, bbox, crs="EPSG:4326"):
+    """
+    Get SMAP soil moisture data for a bounding box.
+    
+    Args:
+        datetime_obj: Datetime object for the data
+        bbox: Bounding box tuple (left, bottom, right, top)
+        crs: Coordinate reference system (default: "EPSG:4326")
+    
+    Returns:
+        dict: SMAP data with surface_sm and rootzone_sm
+    """
+    try:
+        smap_url = construct_smap_url(datetime_obj)
+        cache_dir = Path("smap_cache")
+        cache_dir.mkdir(exist_ok=True)
+        temp_filename = f"temp_smap_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.h5"
+        temp_filepath = cache_dir / temp_filename
+        
+        if not await download_smap_data(smap_url, str(temp_filepath)):
+            return None
+
+        # Process the data using the existing function
+        result = process_smap_data(str(temp_filepath), bbox)
+        
+        return result
+
+    except Exception as e:
+        print(f"Error getting SMAP data: {str(e)}")
+        return None
+    finally:
+        if 'temp_filepath' in locals() and temp_filepath.exists():
+            try:
+                temp_filepath.unlink()
+            except Exception as e:
+                print(f"Error cleaning up temp file: {str(e)}")
+
+
+async def get_smap_data_multi_region(datetime_obj, regions):
     """
     Get SMAP soil moisture data for multiple regions.
 
@@ -399,31 +437,27 @@ async def test_smap_download():
     print(f"Date: {test_datetime}")
     print(f"Bounds: {test_bounds}")
     print(f"CRS: {test_crs}")
-    test_regions = [{"bounds": test_bounds, "crs": test_crs}]
-    smap_data = await get_smap_data(test_datetime, test_regions)
+    smap_data = await get_smap_data(test_datetime, test_bounds, test_crs)
 
     if smap_data:
-        # Get the first region's data
-        region_data = smap_data["region_0"]
-        
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        im1 = ax1.imshow(region_data["surface_sm"])
+        im1 = ax1.imshow(smap_data["surface_sm"])
         ax1.set_title("Surface Soil Moisture")
         plt.colorbar(im1, ax=ax1)
-        im2 = ax2.imshow(region_data["rootzone_sm"])
+        im2 = ax2.imshow(smap_data["rootzone_sm"])
         ax2.set_title("Root Zone Soil Moisture")
         plt.colorbar(im2, ax=ax2)
         plt.tight_layout()
         plt.show()
 
         print("\nData shapes:")
-        print(f"Surface data shape: {region_data['surface_sm'].shape}")
+        print(f"Surface data shape: {smap_data['surface_sm'].shape}")
         print("\nData ranges:")
         print(
-            f"Surface data range: {np.nanmin(region_data['surface_sm']):.3f} to {np.nanmax(region_data['surface_sm']):.3f}"
+            f"Surface data range: {np.nanmin(smap_data['surface_sm']):.3f} to {np.nanmax(smap_data['surface_sm']):.3f}"
         )
         print(
-            f"Rootzone data range: {np.nanmin(region_data['rootzone_sm']):.3f} to {np.nanmax(region_data['rootzone_sm']):.3f}"
+            f"Rootzone data range: {np.nanmin(smap_data['rootzone_sm']):.3f} to {np.nanmax(smap_data['rootzone_sm']):.3f}"
         )
     else:
         print("Failed to get SMAP data")

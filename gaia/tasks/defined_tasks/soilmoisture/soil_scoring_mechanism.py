@@ -493,3 +493,42 @@ class SoilScoringMechanism(ScoringMechanism):
         except Exception as e:
             logger.error(f"Error preparing soil history record: {str(e)}")
             return None
+
+    async def schedule_retry_for_miner(self, miner_id: str, target_date: datetime, error_message: str):
+        """
+        Schedule a retry for a miner's prediction.
+        
+        Args:
+            miner_id (str): The miner's unique identifier
+            target_date (datetime): The target date for the prediction
+            error_message (str): Error message describing why retry is needed
+        """
+        try:
+            next_retry_time = datetime.now(timezone.utc) + timedelta(hours=1)
+            
+            update_query = """
+                UPDATE soil_moisture_predictions
+                SET retry_count = COALESCE(retry_count, 0) + 1,
+                    next_retry_time = :next_retry_time,
+                    last_error = :error_message,
+                    status = 'retry_scheduled'
+                WHERE miner_uid = :miner_id
+                AND target_time = :target_date
+                AND status = 'sent_to_miner'
+            """
+            
+            params = {
+                "miner_id": miner_id,
+                "target_date": target_date,
+                "next_retry_time": next_retry_time,
+                "error_message": error_message
+            }
+            
+            result = await self.db_manager.execute(update_query, params)
+            logger.info(f"Scheduled retry for miner {miner_id} at {next_retry_time}. Error: {error_message}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error scheduling retry for miner {miner_id}: {str(e)}")
+            logger.error(traceback.format_exc())
+            return None

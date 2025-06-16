@@ -50,3 +50,4 @@ alembic
 gcsfs
 aioboto3
 blosc 
+memray

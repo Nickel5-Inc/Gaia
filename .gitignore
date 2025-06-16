@@ -60,3 +60,6 @@ era5_cache/*
 database_performance_plot.png
 miner_input_batches/*
 validator_memray_output.bin
+weather_sender/*
+tr.py 
+trigger.py
