@@ -2547,12 +2547,20 @@ pg1-user={self.config['pguser']}
                     try: logger.error(f"   - Stderr: {full_stderr.decode()}")
                     except: logger.error(f"   - Stderr: {full_stderr}")
                 return False
+            else:
+                # Immediately fix ownership after successful restore
+                logger.info("🔧 Fixing data directory ownership after restore...")
+                await self._fix_postgresql_ownership()
             
         # If we are here, either the initial delta or the fallback full restore succeeded.
         # But let's double-check that we actually succeeded
         if not success:
             logger.error("❌ All restore attempts failed. Database is in an inconsistent state.")
             return False
+        
+        # Fix ownership after any successful restore
+        logger.info("🔧 Ensuring correct ownership after restore...")
+        await self._fix_postgresql_ownership()
             
         logger.info("✅ Restore process finished successfully.")
             
@@ -4170,6 +4178,71 @@ pg1-user={self.config['pguser']}
             logger.error(f"❌ Failed to re-apply local configurations: {e}", exc_info=True)
             return False
 
+    async def _fix_postgresql_ownership(self):
+        """Fix ownership and permissions of PostgreSQL data directory."""
+        try:
+            data_dir = self.config.get('pgdata_path', '/var/lib/postgresql/14/main')
+            logger.info(f"🔧 Fixing ownership and permissions for: {data_dir}")
+            
+            # Fix ownership to postgres:postgres
+            chown_cmd = ['sudo', 'chown', '-R', 'postgres:postgres', data_dir]
+            process = await asyncio.create_subprocess_exec(
+                *chown_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.warning(f"⚠️ chown command had non-zero exit code: {process.returncode}")
+                if stderr:
+                    logger.warning(f"⚠️ chown stderr: {stderr.decode()}")
+            else:
+                logger.info("✅ Fixed ownership to postgres:postgres")
+            
+            # Fix permissions to 700 for data directory
+            chmod_cmd = ['sudo', 'chmod', '700', data_dir]
+            process = await asyncio.create_subprocess_exec(
+                *chmod_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.warning(f"⚠️ chmod command had non-zero exit code: {process.returncode}")
+                if stderr:
+                    logger.warning(f"⚠️ chmod stderr: {stderr.decode()}")
+            else:
+                logger.info("✅ Fixed permissions to 700")
+                
+            # Also fix ownership of PostgreSQL configuration directories
+            config_dirs = [
+                '/etc/postgresql',
+                '/var/log/postgresql',
+                '/var/lib/postgresql'
+            ]
+            
+            for config_dir in config_dirs:
+                if os.path.exists(config_dir):
+                    chown_config_cmd = ['sudo', 'chown', '-R', 'postgres:postgres', config_dir]
+                    process = await asyncio.create_subprocess_exec(
+                        *chown_config_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await process.wait()
+                    if process.returncode == 0:
+                        logger.debug(f"✅ Fixed ownership for {config_dir}")
+                    else:
+                        logger.debug(f"⚠️ Could not fix ownership for {config_dir} (may not be critical)")
+            
+            logger.info("🎉 PostgreSQL ownership and permissions fixed")
+            
+        except Exception as e:
+            logger.error(f"❌ Error fixing PostgreSQL ownership: {e}")
+            # Don't fail the restore process for ownership issues
+            
     async def _test_database_connection(self):
         """Test database connectivity after re-applying local configurations with comprehensive checks."""
         logger.info("🔍 Testing database connectivity...")
