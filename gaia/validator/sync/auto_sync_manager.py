@@ -2766,6 +2766,13 @@ pg1-user={self.config['pguser']}
             
             return False
 
+        logger.info("📋 Step 8: Promoting database from standby to standalone mode...")
+        if not await self._promote_database_to_standalone():
+            logger.error("❌ Failed to promote database to standalone mode - database will remain read-only")
+            logger.warning("💡 The database is still in recovery mode and cannot accept write operations")
+            logger.warning("💡 You may need to manually promote it: SELECT pg_promote();")
+            return False
+
         logger.info("🎉 Restore from backup process completed successfully!")
         logger.info("✅ Database is now synchronized and ready for use")
         return True
@@ -4542,6 +4549,73 @@ pg1-user={self.config['pguser']}
                 return False
         except Exception as e:
             logger.error(f"Failed to check service status: {e}")
+            return False
+
+    async def _promote_database_to_standalone(self) -> bool:
+        """Promotes the database from standby to standalone mode."""
+        try:
+            logger.info("🔧 Checking if database needs promotion from standby mode...")
+            
+            # First check if database is in recovery mode
+            check_recovery_cmd = ['sudo', '-u', 'postgres', 'psql', '-t', '-c', 'SELECT pg_is_in_recovery();']
+            return_code, stdout, stderr = await self._run_command_async(check_recovery_cmd, "Check recovery status")
+            
+            if return_code != 0:
+                logger.error(f"❌ Failed to check recovery status: {stderr}")
+                return False
+            
+            is_in_recovery = stdout.strip().lower() == 't'
+            logger.info(f"💡 Database recovery status: {'IN RECOVERY (standby)' if is_in_recovery else 'NOT IN RECOVERY (standalone)'}")
+            
+            if not is_in_recovery:
+                logger.info("✅ Database is already in standalone mode - no promotion needed")
+                return True
+            
+            logger.info("🔧 Database is in recovery mode - promoting to standalone...")
+            
+            # Remove standby.signal file if it exists (this is what keeps PostgreSQL in standby mode)
+            data_dir = self.config.get('pgdata_path', '/var/lib/postgresql/14/main')
+            standby_signal_path = f"{data_dir}/standby.signal"
+            
+            remove_signal_cmd = ['sudo', 'rm', '-f', standby_signal_path]
+            return_code, stdout, stderr = await self._run_command_async(remove_signal_cmd, "Remove standby.signal file")
+            
+            if return_code == 0:
+                logger.info("✅ Removed standby.signal file")
+            else:
+                logger.warning(f"⚠️ Could not remove standby.signal file: {stderr}")
+            
+            # Use PostgreSQL's built-in promotion function
+            promote_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT pg_promote();']
+            return_code, stdout, stderr = await self._run_command_async(promote_cmd, "Promote database using pg_promote()")
+            
+            if return_code == 0:
+                logger.info("✅ Database promotion command executed successfully")
+                
+                # Wait a moment for promotion to take effect
+                await asyncio.sleep(5)
+                
+                # Verify promotion was successful
+                verify_cmd = ['sudo', '-u', 'postgres', 'psql', '-t', '-c', 'SELECT pg_is_in_recovery();']
+                return_code, stdout, stderr = await self._run_command_async(verify_cmd, "Verify promotion success")
+                
+                if return_code == 0:
+                    is_still_in_recovery = stdout.strip().lower() == 't'
+                    if not is_still_in_recovery:
+                        logger.info("🎉 Database successfully promoted to standalone mode - now accepting writes!")
+                        return True
+                    else:
+                        logger.error("❌ Database is still in recovery mode after promotion attempt")
+                        return False
+                else:
+                    logger.error(f"❌ Failed to verify promotion status: {stderr}")
+                    return False
+            else:
+                logger.error(f"❌ Failed to promote database: {stderr}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Error promoting database to standalone mode: {e}")
             return False
 
 
