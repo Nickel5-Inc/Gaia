@@ -19,6 +19,7 @@ import traceback
 load_dotenv()
 EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
 EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
+EARTHDATA_API_KEY = os.getenv("EARTHDATA_API_KEY")  # Add support for API key
 BASE_URL = "https://n5eil01u.ecs.nsidc.org/SMAP/SPL4SMGP.007"
 
 
@@ -70,6 +71,7 @@ def construct_smap_url(datetime_obj, test_mode=False):
 async def download_smap_data(url, output_path):
     """
     Download SMAP data with progress bar and caching (now async)
+    Supports both username/password and API token authentication
     """
     cache_dir = Path("smap_cache")
     cache_dir.mkdir(exist_ok=True)
@@ -82,8 +84,24 @@ async def download_smap_data(url, output_path):
             await loop.run_in_executor(None, shutil.copy, str(cache_file), output_path)
         return True
 
+    # Determine authentication method
+    auth_method = None
+    headers = {}
+    
+    if EARTHDATA_API_KEY:
+        # Use API key authentication (preferred)
+        headers["Authorization"] = f"Bearer {EARTHDATA_API_KEY}"
+        print("Using EARTHDATA API key authentication")
+    elif EARTHDATA_USERNAME and EARTHDATA_PASSWORD:
+        # Fall back to basic auth
+        auth_method = (EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
+        print("Using EARTHDATA username/password authentication")
+    else:
+        print("❌ No EARTHDATA credentials found! Set either EARTHDATA_API_KEY or EARTHDATA_USERNAME/EARTHDATA_PASSWORD")
+        return False
+
     try:
-        async with httpx.AsyncClient(auth=(EARTHDATA_USERNAME, EARTHDATA_PASSWORD), follow_redirects=True, timeout=300.0) as client:
+        async with httpx.AsyncClient(auth=auth_method, headers=headers, follow_redirects=True, timeout=300.0) as client:
             # Get content length first for progress bar
             try:
                 head_response = await client.head(url)

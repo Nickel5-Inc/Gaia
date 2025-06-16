@@ -955,6 +955,21 @@ class AutoSyncManager:
             service_name = self.system_info.get('postgresql_service', 'postgresql')
             await self._restart_postgresql_service(service_name)
             
+            # Use ALTER SYSTEM to ensure archive_mode is set correctly (overrides auto.conf)
+            logger.info("🔧 Using ALTER SYSTEM to ensure archive_mode is enabled...")
+            try:
+                alter_cmd = ['sudo', '-u', self.config['pguser'], 'psql', '-c', "ALTER SYSTEM SET archive_mode = 'on';"]
+                return_code, stdout, stderr = await self._run_command_async(alter_cmd, "Set archive_mode via ALTER SYSTEM")
+                if return_code == 0:
+                    logger.info("✅ Successfully set archive_mode = on via ALTER SYSTEM")
+                    # archive_mode requires a full restart, not just reload
+                    logger.info("🔄 Restarting PostgreSQL for archive_mode to take effect...")
+                    await self._restart_postgresql_service(service_name)
+                else:
+                    logger.warning(f"Failed to set archive_mode via ALTER SYSTEM: {stderr}")
+            except Exception as e:
+                logger.warning(f"Error setting archive_mode via ALTER SYSTEM: {e}")
+            
             # Wait for PostgreSQL to be ready and verify archive_mode
             logger.info("🔍 Verifying archive_mode is enabled...")
             return await self._verify_postgresql_configuration(postgres_user)
@@ -1004,52 +1019,61 @@ class AutoSyncManager:
             return None
 
     async def _restart_postgresql_service(self, service_name: str) -> bool:
-        """Restart PostgreSQL service using appropriate method."""
+        """Restart PostgreSQL service using appropriate method with robust service detection."""
         try:
-            logger.info(f"Restarting PostgreSQL service: {service_name}...")
+            logger.info("🔄 Restarting PostgreSQL service...")
             
-            if self.system_info.get('systemd_available', False):
-                # Use systemctl
-                restart_cmd = ['systemctl', 'restart', service_name]
-            else:
-                # Fallback to service command
-                restart_cmd = ['service', service_name, 'restart']
+            # Try multiple service names in order of preference
+            service_candidates = [
+                f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",  # Ubuntu cluster-specific
+                self.system_info.get('postgresql_service', 'postgresql'),              # From system detection
+                service_name,                                                           # Provided service name
+                f"postgresql-{self.system_info.get('postgresql_version', '14')}",      # Version-specific
+                "postgresql",                                                           # Generic
+            ]
             
-            process = await asyncio.create_subprocess_exec(
-                *restart_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_candidates = []
+            for candidate in service_candidates:
+                if candidate and candidate not in seen:
+                    seen.add(candidate)
+                    unique_candidates.append(candidate)
             
-            if process.returncode != 0:
-                logger.error(f"Failed to restart PostgreSQL: {stderr.decode()}")
-                
-                # Try alternative service names
-                alternative_services = self.system_info.get('service_variations', [])
-                for alt_service in alternative_services:
-                    if alt_service != service_name:
-                        logger.info(f"Trying alternative service name: {alt_service}")
-                        try:
-                            alt_cmd = ['systemctl', 'restart', alt_service] if self.system_info.get('systemd_available') else ['service', alt_service, 'restart']
-                            alt_process = await asyncio.create_subprocess_exec(
-                                *alt_cmd,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE
-                            )
-                            alt_stdout, alt_stderr = await alt_process.communicate()
-                            if alt_process.returncode == 0:
-                                logger.info(f"✅ Successfully restarted using: {alt_service}")
-                                # Update the detected service name for future use
-                                self.system_info['postgresql_service'] = alt_service
-                                return True
-                        except Exception as e:
-                            logger.debug(f"Alternative service {alt_service} failed: {e}")
-                            continue
-                return False
-            else:
-                logger.info("✅ PostgreSQL restarted successfully")
-                return True
+            for candidate_service in unique_candidates:
+                try:
+                    logger.info(f"Attempting to restart PostgreSQL service: {candidate_service}")
+                    
+                    if self.system_info.get('systemd_available', True):
+                        # Use systemctl
+                        restart_cmd = ['sudo', 'systemctl', 'restart', candidate_service]
+                    else:
+                        # Fallback to service command
+                        restart_cmd = ['sudo', 'service', candidate_service, 'restart']
+                    
+                    return_code, _, stderr = await self._run_command_async(restart_cmd, f"Restart PostgreSQL service ({candidate_service})")
+                    
+                    if return_code == 0:
+                        logger.info("Waiting for PostgreSQL to initialize after restart...")
+                        await asyncio.sleep(3)
+                        
+                        # Verify the service is actually running
+                        if await self._verify_service_status(candidate_service):
+                            logger.info(f"✅ Successfully restarted PostgreSQL using service: {candidate_service}")
+                            # Update the detected service name for future use
+                            self.system_info['postgresql_service'] = candidate_service
+                            return True
+                        else:
+                            logger.warning(f"Service {candidate_service} restart reported success but service is not active")
+                    else:
+                        logger.debug(f"Failed to restart PostgreSQL service {candidate_service}: {stderr}")
+                        
+                except Exception as e:
+                    logger.debug(f"Exception trying to restart PostgreSQL service {candidate_service}: {e}")
+                    continue
+            
+            logger.error("❌ Failed to restart PostgreSQL service with any known service name")
+            return False
                 
         except Exception as e:
             logger.error(f"Error restarting PostgreSQL: {e}")
@@ -2695,7 +2719,13 @@ pg1-user={self.config['pguser']}
                         # Wait for archiver to stop failing
                         logger.info("⏳ Waiting for archiver to stabilize...")
                         await asyncio.sleep(3)
-                        logger.info("✅ Fixed failing archiver - PostgreSQL should respond normally now")
+                        
+                        # Re-enable archiving with correct settings
+                        logger.info("🔧 Re-enabling archiving with correct configuration...")
+                        if await self._ensure_correct_archive_command():
+                            logger.info("✅ Fixed failing archiver and restored proper archiving configuration")
+                        else:
+                            logger.warning("⚠️ Fixed failing archiver but could not restore archiving configuration")
                     else:
                         logger.warning(f"⚠️ Failed to disable archive_mode: {stderr.decode()}")
                 else:
@@ -3093,44 +3123,95 @@ pg1-user={self.config['pguser']}
             logger.error(f"Failed to set up temporary TRUST auth: {e}", exc_info=True)
 
     async def _emergency_postgresql_restart(self) -> bool:
-        """Stops and starts the PostgreSQL service as a last resort."""
+        """Stops and starts the PostgreSQL service as a last resort using robust service detection."""
         logger.warning("🚨 Attempting emergency restart of PostgreSQL service...")
         try:
+            # Stop the service using our robust method
             await self._stop_postgresql_service()
             logger.info("Waiting a few seconds before starting again...")
             await asyncio.sleep(5)
             
-            start_cmd = ['sudo', 'systemctl', 'start', self.config['service_name']]
-            return_code, _, stderr = await self._run_command_async(start_cmd, "Emergency start PostgreSQL")
+            # Try multiple service names for starting
+            service_candidates = [
+                f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",  # Ubuntu cluster-specific
+                self.system_info.get('postgresql_service', 'postgresql'),              # From system detection
+                f"postgresql-{self.system_info.get('postgresql_version', '14')}",      # Version-specific
+                "postgresql",                                                           # Generic
+            ]
             
-            if return_code == 0:
-                logger.info("✅ Emergency restart appears successful.")
-                await asyncio.sleep(2) # Give it a moment to stabilize
-                return await self._verify_service_status(self.config['service_name'])
-            else:
-                logger.error(f"Failed to start PostgreSQL during emergency restart: {stderr}")
-                return False
+            for service_name in service_candidates:
+                try:
+                    logger.info(f"Attempting emergency start of PostgreSQL service: {service_name}")
+                    start_cmd = ['sudo', 'systemctl', 'start', service_name]
+                    return_code, _, stderr = await self._run_command_async(start_cmd, f"Emergency start PostgreSQL ({service_name})")
+                    
+                    if return_code == 0:
+                        logger.info("Waiting for PostgreSQL to stabilize after emergency restart...")
+                        await asyncio.sleep(3)
+                        
+                        # Verify the service is actually running
+                        if await self._verify_service_status(service_name):
+                            logger.info(f"✅ Emergency restart successful using service: {service_name}")
+                            # Update the detected service name for future use
+                            self.system_info['postgresql_service'] = service_name
+                            return True
+                        else:
+                            logger.warning(f"Emergency start of {service_name} reported success but service is not active")
+                    else:
+                        logger.debug(f"Failed to emergency start PostgreSQL service {service_name}: {stderr}")
+                        
+                except Exception as e:
+                    logger.debug(f"Exception during emergency start of PostgreSQL service {service_name}: {e}")
+                    continue
+            
+            logger.error("❌ Failed to emergency start PostgreSQL service with any known service name")
+            return False
+            
         except Exception as e:
             logger.error(f"Exception during emergency PostgreSQL restart: {e}", exc_info=True)
             return False
 
     async def _stop_postgresql_service(self):
-        """Stops the PostgreSQL service."""
-        logger.info(f"🛑 Stopping PostgreSQL service: {self.config['service_name']}...")
+        """Stops the PostgreSQL service using robust service detection."""
+        logger.info("🛑 Stopping PostgreSQL service...")
+        
+        # Try multiple service names in order of preference
+        service_candidates = [
+            f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",  # Ubuntu cluster-specific
+            self.system_info.get('postgresql_service', 'postgresql'),              # From system detection
+            f"postgresql-{self.system_info.get('postgresql_version', '14')}",      # Version-specific
+            "postgresql",                                                           # Generic
+        ]
+        
+        # First, check which service is actually running
+        running_service = None
+        for service_name in service_candidates:
+            if await self._verify_service_status(service_name):
+                running_service = service_name
+                break
+        
+        if not running_service:
+            logger.info("✅ PostgreSQL service is already stopped (or not found).")
+            return
+        
         try:
+            logger.info(f"Stopping PostgreSQL service: {running_service}")
             # Use a timeout to prevent hanging
-            stop_cmd = ['sudo', 'systemctl', 'stop', self.config['service_name']]
-            proc = await asyncio.create_subprocess_exec(*stop_cmd)
-            await asyncio.wait_for(proc.wait(), timeout=30.0)
+            stop_cmd = ['sudo', 'systemctl', 'stop', running_service]
+            return_code, _, stderr = await self._run_command_async(stop_cmd, f"Stop PostgreSQL service ({running_service})")
             
-            # Verify it's stopped
-            if not await self._verify_service_status(self.config['service_name'], should_be_active=False):
-                logger.warning("Service did not stop cleanly. It may have already been stopped.")
+            if return_code == 0:
+                # Wait a moment for the service to stop
+                await asyncio.sleep(2)
+                
+                # Verify it's stopped
+                if not await self._verify_service_status(running_service, should_be_active=False):
+                    logger.info("✅ PostgreSQL service stopped successfully.")
+                else:
+                    logger.warning(f"Service {running_service} may not have stopped completely.")
             else:
-                logger.info("✅ PostgreSQL service stopped.")
+                logger.warning(f"Failed to stop PostgreSQL service {running_service}: {stderr}")
 
-        except asyncio.TimeoutError:
-            logger.error("Timeout trying to stop the PostgreSQL service. It might be stuck.")
         except Exception as e:
             logger.error(f"Error stopping PostgreSQL service: {e}", exc_info=True)
 
@@ -3138,26 +3219,72 @@ pg1-user={self.config['pguser']}
         """Reloads the PostgreSQL configuration."""
         logger.info("🔄 Reloading PostgreSQL configuration...")
         try:
-            # Check for systemd
-            if shutil.which("systemctl"):
-                reload_cmd = ['sudo', 'systemctl', 'reload', self.config['service_name']]
-                return_code, _, stderr = await self._run_command_async(reload_cmd, "Reload PostgreSQL config (systemd)")
-                if return_code != 0:
-                    logger.warning(f"Failed to reload config via systemctl: {stderr}. Will try pg_ctl.")
+            # Try multiple service names in order of preference
+            service_candidates = [
+                f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",  # Ubuntu cluster-specific
+                self.system_info.get('postgresql_service', 'postgresql'),              # From system detection
+                f"postgresql-{self.system_info.get('postgresql_version', '14')}",      # Version-specific
+                "postgresql",                                                           # Generic
+            ]
             
-            # Fallback to pg_ctl if systemctl fails or is not present
-            pg_ctl_path = self.config.get("pg_ctl_path")
-            if pg_ctl_path and pg_ctl_path.exists():
-                reload_cmd_pgctl = ['sudo', '-u', self.config['postgres_user'], str(pg_ctl_path), 'reload']
-                return_code_pgctl, _, stderr_pgctl = await self._run_command_async(reload_cmd_pgctl, "Reload PostgreSQL config (pg_ctl)")
-                if return_code_pgctl == 0:
-                    logger.info("✅ Successfully reloaded config using pg_ctl.")
-                    return
-                else:
-                    logger.error(f"Failed to reload config with pg_ctl as well: {stderr_pgctl}")
-            else:
-                logger.error("Could not find pg_ctl to reload configuration.")
+            reload_success = False
+            
+            # Try systemctl reload with different service names
+            if shutil.which("systemctl"):
+                for service_name in service_candidates:
+                    try:
+                        reload_cmd = ['sudo', 'systemctl', 'reload', service_name]
+                        return_code, _, stderr = await self._run_command_async(reload_cmd, f"Reload PostgreSQL config (systemd: {service_name})")
+                        if return_code == 0:
+                            logger.info(f"✅ Successfully reloaded config using systemctl with service: {service_name}")
+                            reload_success = True
+                            break
+                        else:
+                            logger.debug(f"Failed to reload via systemctl with {service_name}: {stderr}")
+                    except Exception as e:
+                        logger.debug(f"Exception trying systemctl reload with {service_name}: {e}")
+                        continue
+            
+            # If systemctl failed, try pg_ctl with proper PGDATA
+            if not reload_success:
+                logger.info("Systemctl reload failed, trying pg_ctl...")
+                pg_version = self.system_info.get('postgresql_version')
+                pgdata_path = self.config.get('pgdata', self.system_info.get('pgdata'))
                 
+                if pg_version and pgdata_path:
+                    from pathlib import Path
+                    pg_ctl_path = Path(f"/usr/lib/postgresql/{pg_version}/bin/pg_ctl")
+                    if pg_ctl_path.exists():
+                        # Use pg_ctl with explicit PGDATA
+                        reload_cmd_pgctl = ['sudo', '-u', self.config['pguser'], str(pg_ctl_path), 'reload', '-D', pgdata_path]
+                        return_code_pgctl, _, stderr_pgctl = await self._run_command_async(reload_cmd_pgctl, "Reload PostgreSQL config (pg_ctl)")
+                        if return_code_pgctl == 0:
+                            logger.info("✅ Successfully reloaded config using pg_ctl with explicit PGDATA.")
+                            reload_success = True
+                        else:
+                            logger.warning(f"Failed to reload config with pg_ctl: {stderr_pgctl}")
+                    else:
+                        logger.warning(f"Could not find pg_ctl at {pg_ctl_path}")
+                else:
+                    logger.warning(f"Missing PostgreSQL version ({pg_version}) or PGDATA path ({pgdata_path}) for pg_ctl reload")
+            
+            # Final fallback: try SQL-based reload
+            if not reload_success:
+                logger.info("Trying SQL-based configuration reload...")
+                try:
+                    sql_reload_cmd = ['sudo', '-u', self.config['pguser'], 'psql', '-c', 'SELECT pg_reload_conf();']
+                    return_code_sql, _, stderr_sql = await self._run_command_async(sql_reload_cmd, "Reload PostgreSQL config (SQL)")
+                    if return_code_sql == 0:
+                        logger.info("✅ Successfully reloaded config using SQL pg_reload_conf().")
+                        reload_success = True
+                    else:
+                        logger.warning(f"Failed to reload config via SQL: {stderr_sql}")
+                except Exception as e:
+                    logger.warning(f"Exception during SQL reload: {e}")
+            
+            if not reload_success:
+                logger.error("❌ All PostgreSQL configuration reload methods failed")
+            
         except Exception as e:
             logger.error(f"Exception while reloading PostgreSQL configuration: {e}", exc_info=True)
 
@@ -3165,71 +3292,136 @@ pg1-user={self.config['pguser']}
         """Ensures the PostgreSQL service is running, starting it if necessary."""
         logger.info("Ensuring PostgreSQL service is running...")
         
-        is_running = await self._verify_service_status(self.config['service_name'])
+        # Try multiple service names in order of preference
+        service_candidates = [
+            f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",  # Ubuntu cluster-specific
+            self.system_info.get('postgresql_service', 'postgresql'),              # From system detection
+            f"postgresql-{self.system_info.get('postgresql_version', '14')}",      # Version-specific
+            "postgresql",                                                           # Generic
+        ]
         
-        if is_running:
-            logger.info("✅ PostgreSQL service is already running.")
-            return
+        # First, check if any service is already running
+        for service_name in service_candidates:
+            is_running = await self._verify_service_status(service_name)
+            if is_running:
+                logger.info(f"✅ PostgreSQL service is already running via: {service_name}")
+                return
 
-        logger.info(f"PostgreSQL service '{self.config['service_name']}' is not running. Attempting to start...")
-        try:
-            start_cmd = ['sudo', 'systemctl', 'start', self.config['service_name']]
-            return_code, _, stderr = await self._run_command_async(start_cmd, "Start PostgreSQL service")
+        # If none are running, try to start them in order
+        logger.info("PostgreSQL service is not running. Attempting to start...")
+        for service_name in service_candidates:
+            try:
+                logger.info(f"Trying to start PostgreSQL service: {service_name}")
+                start_cmd = ['sudo', 'systemctl', 'start', service_name]
+                return_code, _, stderr = await self._run_command_async(start_cmd, f"Start PostgreSQL service ({service_name})")
 
-            if return_code == 0:
-                logger.info("Waiting a moment for service to initialize...")
-                await asyncio.sleep(5)
-                
-                # Final check
-                if await self._verify_service_status(self.config['service_name']):
-                    logger.info("✅ Successfully started PostgreSQL service.")
-                else:
-                    logger.error("Service reported start but is not active. Check logs for details.")
+                if return_code == 0:
+                    logger.info("Waiting a moment for service to initialize...")
+                    await asyncio.sleep(5)
                     
-            else:
-                logger.error(f"Failed to start PostgreSQL service. Error: {stderr}")
+                    # Final check
+                    if await self._verify_service_status(service_name):
+                        logger.info(f"✅ Successfully started PostgreSQL service: {service_name}")
+                        return
+                    else:
+                        logger.warning(f"Service {service_name} reported start but is not active.")
+                        
+                else:
+                    logger.debug(f"Failed to start PostgreSQL service {service_name}: {stderr}")
 
-        except Exception as e:
-            logger.error(f"An exception occurred while trying to start PostgreSQL: {e}", exc_info=True)
+            except Exception as e:
+                logger.debug(f"Exception trying to start PostgreSQL service {service_name}: {e}")
+                continue
+        
+        logger.error("❌ Failed to start PostgreSQL service with any known service name")
+        logger.error("💡 You may need to manually start PostgreSQL or check the service configuration")
 
     async def _ensure_correct_archive_command(self) -> bool:
-        """Validates and sets the archive_command in postgresql.conf."""
-        logger.info("Verifying and setting the archive command...")
+        """Validates and sets both archive_mode and archive_command in postgresql.conf."""
+        logger.info("Verifying and setting archive_mode and archive_command...")
         
         expected_command = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
         
         try:
-            # We must run this as the postgres user
-            get_cmd = ['sudo', '-u', self.config['postgres_user'], 'psql', '-t', '-c', "SHOW archive_command;"]
+            # First check archive_mode
+            get_mode_cmd = ['sudo', '-u', self.config['pguser'], 'psql', '-t', '-c', "SHOW archive_mode;"]
+            return_code_mode, current_mode, stderr_mode = await self._run_command_async(get_mode_cmd, "Get current archive_mode")
+
+            if return_code_mode != 0:
+                logger.error(f"Failed to get current archive_mode: {stderr_mode}")
+                logger.warning("Could not verify current archive mode, attempting to set it anyway.")
+                current_mode = "unknown"
+            else:
+                current_mode = current_mode.strip()
+                logger.info(f"🔍 Current archive_mode: {current_mode}")
+
+            # Check archive_command
+            get_cmd = ['sudo', '-u', self.config['pguser'], 'psql', '-t', '-c', "SHOW archive_command;"]
             return_code, current_command, stderr = await self._run_command_async(get_cmd, "Get current archive_command")
 
             if return_code != 0:
                 logger.error(f"Failed to get current archive_command: {stderr}")
-                # This is critical, so we attempt to set it blindly
                 logger.warning("Could not verify current archive command, attempting to set it anyway.")
-            
-            logger.info(f"🔍 Current: {current_command}")
-            logger.info(f"📋 Expected: {expected_command}")
+                current_command = "unknown"
+            else:
+                current_command = current_command.strip()
+                logger.info(f"🔍 Current archive_command: {current_command}")
+                logger.info(f"📋 Expected archive_command: {expected_command}")
 
-            if current_command == expected_command:
-                logger.info("✅ Archive command is correct")
+            # Check if both settings are correct
+            archive_mode_correct = (current_mode == 'on')
+            archive_command_correct = (current_command == expected_command)
+
+            if archive_mode_correct and archive_command_correct:
+                logger.info("✅ Both archive_mode and archive_command are correct")
                 return True
 
-            logger.info("Archive command is incorrect or unset. Setting it now...")
-            set_cmd = [
-                'sudo', '-u', self.config['postgres_user'], 'psql', '-c',
-                f"ALTER SYSTEM SET archive_command = '{expected_command}';"
-            ]
-            return_code_set, _, stderr_set = await self._run_command_async(set_cmd, "Set archive_command")
+            # Set archive_mode if needed
+            if not archive_mode_correct:
+                logger.info(f"Setting archive_mode from '{current_mode}' to 'on'...")
+                set_mode_cmd = [
+                    'sudo', '-u', self.config['pguser'], 'psql', '-c',
+                    "ALTER SYSTEM SET archive_mode = 'on';"
+                ]
+                return_code_mode_set, _, stderr_mode_set = await self._run_command_async(set_mode_cmd, "Set archive_mode")
 
-            if return_code_set != 0:
-                logger.error(f"Failed to set archive_command: {stderr_set}")
-                return False
+                if return_code_mode_set != 0:
+                    logger.error(f"Failed to set archive_mode: {stderr_mode_set}")
+                    return False
+                else:
+                    logger.info("✅ Successfully set archive_mode = 'on' via ALTER SYSTEM")
 
-            await self._reload_postgresql_config()
+            # Set archive_command if needed
+            if not archive_command_correct:
+                logger.info("Setting archive_command...")
+                set_cmd = [
+                    'sudo', '-u', self.config['pguser'], 'psql', '-c',
+                    f"ALTER SYSTEM SET archive_command = '{expected_command}';"
+                ]
+                return_code_set, _, stderr_set = await self._run_command_async(set_cmd, "Set archive_command")
+
+                if return_code_set != 0:
+                    logger.error(f"Failed to set archive_command: {stderr_set}")
+                    return False
+                else:
+                    logger.info("✅ Successfully set archive_command via ALTER SYSTEM")
+
+            # If archive_mode was changed, we need a full restart (not just reload)
+            if not archive_mode_correct:
+                logger.info("🔄 archive_mode was changed - performing full PostgreSQL restart...")
+                service_name = self.system_info.get('postgresql_service', 'postgresql')
+                if not await self._restart_postgresql_service(service_name):
+                    logger.error("Failed to restart PostgreSQL after setting archive_mode")
+                    return False
+                logger.info("✅ PostgreSQL restarted successfully for archive_mode change")
+            else:
+                # Only archive_command changed, reload is sufficient
+                logger.info("🔄 Reloading PostgreSQL configuration...")
+                await self._reload_postgresql_config()
+
             return True
         except Exception as e:
-            logger.error(f"An error occurred while ensuring correct archive command: {e}", exc_info=True)
+            logger.error(f"An error occurred while ensuring correct archive settings: {e}", exc_info=True)
             return False
 
     async def _intelligent_stanza_setup(self) -> bool:
@@ -3246,7 +3438,7 @@ pg1-user={self.config['pguser']}
         # Start the stanza to clear any prior stop files, which is safe to run even if not needed.
         try:
             logger.info("Ensuring stanza is started to clear any previous stop files...")
-            start_cmd = ['sudo', '-u', self.config['postgres_user'], 'pgbackrest', 'start', f'--stanza={self.config["stanza_name"]}']
+            start_cmd = ['sudo', '-u', self.config['pguser'], 'pgbackrest', 'start', f'--stanza={self.config["stanza_name"]}']
             await self._run_command_async(start_cmd, "Start pgBackRest stanza")
             logger.info("✅ Stanza start command completed")
         except Exception as e:
@@ -3256,7 +3448,7 @@ pg1-user={self.config['pguser']}
         logger.info("🔍 Checking existing stanza status...")
         stanza_is_healthy = False
         try:
-            info_cmd = ['sudo', '-u', self.config['postgres_user'], 'pgbackrest', f'--stanza={self.config["stanza_name"]}', 'info', '--output=json']
+            info_cmd = ['sudo', '-u', self.config['pguser'], 'pgbackrest', f'--stanza={self.config["stanza_name"]}', 'info', '--output=json']
             return_code, stdout, stderr = await self._run_command_async(info_cmd, "Get pgBackRest info")
 
             if return_code == 0 and stdout:
@@ -3284,6 +3476,12 @@ pg1-user={self.config['pguser']}
         # Set up WAL archiving settings in PostgreSQL.
         if not await self._setup_wal_archiving():
             logger.error("Failed to set up WAL archiving. Stanza setup cannot proceed.")
+            return False
+
+        # Ensure archive_mode and archive_command are properly configured
+        logger.info("🔧 Ensuring archive_mode and archive_command are properly configured...")
+        if not await self._ensure_correct_archive_command():
+            logger.error("Failed to configure archive_mode and archive_command. Stanza setup cannot proceed.")
             return False
 
         # Initialize pgBackRest. This function is responsible for checking for
@@ -3357,81 +3555,15 @@ pg1-user={self.config['pguser']}
             logger.warning(f"Stanza recreation had issues: {e}")
 
     async def fix_archive_command(self) -> bool:
-        """Fixes the archive command in postgresql.conf."""
+        """Fixes both archive_mode and archive_command in postgresql.conf."""
         try:
-            logger.info("🔧 Fixing PostgreSQL archive command for network-aware stanza...")
+            logger.info("🔧 Fixing PostgreSQL archive_mode and archive_command for network-aware stanza...")
             
-            # Get current archive command
-            check_cmd = ['sudo', '-u', 'postgres', 'psql', '-t', '-c', 'SHOW archive_command;']
-            process = await asyncio.create_subprocess_exec(
-                *check_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                logger.error(f"Failed to check current archive command: {stderr.decode()}")
-                return False
-            
-            current_archive_cmd = stdout.decode().strip()
-            expected_archive_cmd = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
-            
-            logger.info(f"📋 Current archive command: {current_archive_cmd}")
-            logger.info(f"📋 Expected archive command: {expected_archive_cmd}")
-            
-            if expected_archive_cmd in current_archive_cmd:
-                logger.info("✅ Archive command is already correct")
-                return True
-            
-            # Update the archive command
-            logger.info("🔄 Updating archive command...")
-            update_cmd = [
-                'sudo', '-u', 'postgres', 'psql', '-c',
-                f"ALTER SYSTEM SET archive_command TO '{expected_archive_cmd}';"
-            ]
-            
-            process = await asyncio.create_subprocess_exec(
-                *update_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                logger.error(f"Failed to update archive command: {stderr.decode()}")
-                return False
-            
-            # Reload PostgreSQL configuration
-            logger.info("🔄 Reloading PostgreSQL configuration...")
-            reload_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT pg_reload_conf();']
-            
-            process = await asyncio.create_subprocess_exec(
-                *reload_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                logger.error(f"Failed to reload PostgreSQL config: {stderr.decode()}")
-                return False
-            
-            # Verify the change
-            process = await asyncio.create_subprocess_exec(
-                *check_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            new_archive_cmd = stdout.decode().strip()
-            logger.info(f"✅ Archive command updated to: {new_archive_cmd}")
-            
-            return True
+            # Use the enhanced method that handles both archive_mode and archive_command
+            return await self._ensure_correct_archive_command()
             
         except Exception as e:
-            logger.error(f"Failed to fix archive command: {e}")
+            logger.error(f"Failed to fix archive settings: {e}")
             return False
 
     async def prepare_for_network_transition(self, force_clean: bool = False) -> bool:
