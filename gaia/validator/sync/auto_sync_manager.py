@@ -37,6 +37,7 @@ from pathlib import Path
 from fiber.logging_utils import get_logger
 import time
 import re
+import aiofiles
 
 logger = get_logger(__name__)
 
@@ -1246,7 +1247,7 @@ class AutoSyncManager:
                         lock_file.unlink()
                     except Exception as e:
                         logger.error(f"Failed to remove lock file {lock_file}: {e}")
-
+            
             # Ensure postgres user can access pgBackRest config
             config_file = '/etc/pgbackrest/pgbackrest.conf'
             if os.path.exists(config_file):
@@ -2366,7 +2367,7 @@ pg1-user={self.config['pguser']}
         """
         Restores the database from the latest pgBackRest backup.
         Uses --delta for efficiency, and includes a fallback to a full restore on failure.
-
+        
         Args:
             target_time: Optional timestamp for point-in-time recovery.
 
@@ -2435,10 +2436,10 @@ pg1-user={self.config['pguser']}
                     try: logger.error(f"   - Stderr: {full_stderr.decode()}")
                     except: logger.error(f"   - Stderr: {full_stderr}")
                 return False
-
+            
         # If we are here, either the initial delta or the fallback full restore succeeded.
         logger.info("✅ Restore process finished successfully.")
-        
+            
         logger.info("📋 Step 5a: Re-applying local configurations post-restore...")
         if not await self._reapply_local_configuration_post_restore():
             logger.error("❌ Failed to re-apply local configurations. The database may not be accessible.")
@@ -3022,498 +3023,278 @@ pg1-user={self.config['pguser']}
             raise
 
     async def _setup_early_authentication(self, postgres_user: str):
-        """Set up PostgreSQL authentication early to prevent hanging commands."""
-        try:
-            logger.info("🔐 Setting up early PostgreSQL authentication...")
-            
-            # Check if we can connect without authentication first
-            logger.info("🔍 Testing current PostgreSQL authentication...")
-            test_cmd = ['sudo', '-u', postgres_user, 'psql', '-c', 'SELECT 1;']
-            
-            try:
-                returncode, stdout_text, stderr_text = await self._run_postgres_command_with_logging(
-                    test_cmd, timeout=5, description="Authentication test"
-                )
-                
-                if returncode == 0:
-                    logger.info("✅ PostgreSQL authentication already working")
-                    return
-                else:
-                    logger.warning("⚠️ PostgreSQL authentication test failed - setting up authentication")
-                    
-            except asyncio.TimeoutError:
-                logger.warning("⚠️ PostgreSQL authentication test timed out - likely password prompt")
-                logger.info("🔧 Setting up authentication to prevent password prompts...")
-            
-            # Set up .pgpass file for password-less authentication
-            await self._create_pgpass_file(postgres_user)
-            
-            # Also try to set pg_hba.conf to trust for local connections temporarily
-            await self._setup_temporary_trust_auth()
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Error setting up early authentication: {e}")
+        """
+        Sets up a .pgpass file for the current user to allow passwordless access
+        to the database as the postgres user during setup.
+        """
+        if self.config['postgres_password']:
+            logger.info(f"🔑 Setting up early authentication for user '{self.current_user}'...")
+            await self._create_pgpass_file(self.current_user)
+        else:
+            logger.info("🔑 No postgres password set, assuming TRUST authentication is sufficient for setup.")
 
-    async def _create_pgpass_file(self, postgres_user: str):
-        """Create .pgpass file for password-less PostgreSQL access."""
+    async def _create_pgpass_file(self, for_user: str):
+        """
+        Creates a .pgpass file for a given user to connect to the local database.
+        """
         try:
-            logger.info("📝 Creating .pgpass file for password-less access...")
-            
-            # Determine postgres home directory
-            postgres_home_candidates = [
-                '/var/lib/postgresql',
-                f'/home/{postgres_user}',
-                '/root'  # Fallback for root access
-            ]
-            
-            postgres_home = None
-            for home_dir in postgres_home_candidates:
-                if os.path.exists(home_dir):
-                    postgres_home = home_dir
-                    break
-            
-            if not postgres_home:
-                logger.warning("⚠️ Could not find postgres home directory")
+            pgpass_path = Path.home() / '.pgpass'
+            if for_user != self.current_user:
+                logger.warning(f"Cannot create .pgpass for another user '{for_user}'. Skipping.")
                 return
+
+            logger.info(f"Creating .pgpass file at {pgpass_path} for user {for_user}")
             
-            pgpass_file = os.path.join(postgres_home, '.pgpass')
-            logger.info(f"📝 Creating .pgpass at: {pgpass_file}")
+            # Format: hostname:port:database:username:password
+            pgpass_content = f"localhost:5432:*:{self.config['postgres_user']}:{self.config['postgres_password']}\n"
             
-            # Create .pgpass content with common configurations
-            pgpass_content = f"""# Auto-generated by AutoSyncManager
-localhost:5432:*:postgres:postgres
-127.0.0.1:5432:*:postgres:postgres
-*:5432:*:postgres:postgres
-localhost:5433:*:postgres:postgres
-127.0.0.1:5433:*:postgres:postgres
-*:5433:*:postgres:postgres
-"""
+            async with aiofiles.open(pgpass_path, 'w') as f:
+                await f.write(pgpass_content)
             
-            # Write .pgpass file
-            with open(pgpass_file, 'w') as f:
-                f.write(pgpass_content)
-            
-            # Set correct permissions
-            os.chmod(pgpass_file, 0o600)
-            
-            # Try to set ownership to postgres user
-            try:
-                shutil.chown(pgpass_file, user=postgres_user, group=postgres_user)
-                logger.info(f"✅ Created .pgpass file with postgres ownership: {pgpass_file}")
-            except Exception as chown_error:
-                logger.warning(f"⚠️ Could not set postgres ownership on .pgpass: {chown_error}")
-                logger.info(f"✅ Created .pgpass file (root ownership): {pgpass_file}")
-            
+            await asyncio.to_thread(os.chmod, pgpass_path, 0o600)
+            logger.info(f"✅ Successfully created and secured .pgpass file.")
+
         except Exception as e:
-            logger.warning(f"⚠️ Error creating .pgpass file: {e}")
+            logger.error(f"Failed to create .pgpass file for user '{for_user}': {e}", exc_info=True)
 
     async def _setup_temporary_trust_auth(self):
-        """Temporarily set pg_hba.conf to trust authentication for setup."""
+        """
+        Temporarily configures pg_hba.conf to allow TRUST authentication for the postgres user.
+        This is a fallback for when a password isn't working or set.
+        """
+        if not self.config['hba_file_path'] or not self.config['hba_file_path'].exists():
+            logger.error("HBA file path not configured or file does not exist. Cannot set up trust auth.")
+            return
+
+        logger.info("🔐 Setting up temporary TRUST authentication for setup...")
+        
         try:
-            logger.info("🔧 Setting up temporary trust authentication...")
+            async with aiofiles.open(self.config['hba_file_path'], 'r') as f:
+                original_hba_content = await f.read()
+
+            self.original_hba_config = original_hba_content
             
-            # Find pg_hba.conf file
-            hba_locations = [
-                '/etc/postgresql/14/main/pg_hba.conf',
-                '/etc/postgresql/15/main/pg_hba.conf',
-                '/etc/postgresql/16/main/pg_hba.conf',
-                '/var/lib/postgresql/14/main/pg_hba.conf',
-                '/var/lib/postgresql/15/main/pg_hba.conf',
-                '/var/lib/postgresql/16/main/pg_hba.conf',
-            ]
-            
-            hba_conf_path = None
-            for hba_path in hba_locations:
-                if os.path.exists(hba_path):
-                    hba_conf_path = Path(hba_path)
-                    break
-            
-            if not hba_conf_path:
-                logger.warning("⚠️ Could not find pg_hba.conf file")
+            # Check if trust auth is already present for the postgres user
+            if f"local   all             {self.config['postgres_user']}                                     trust" in original_hba_content:
+                logger.info("✅ Temporary TRUST auth already exists for postgres user.")
                 return
-            
-            logger.info(f"📝 Found pg_hba.conf at: {hba_conf_path}")
-            
-            # Backup original file
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            backup_path = f"{hba_conf_path}.backup.{timestamp}"
-            shutil.copy2(hba_conf_path, backup_path)
-            logger.info(f"📦 Backed up pg_hba.conf to: {backup_path}")
-            
-            # Read current content
-            with open(hba_conf_path, 'r') as f:
-                content = f.read()
-            
-            # Replace authentication methods with trust for local connections
-            lines = content.split('\n')
-            updated_lines = []
-            
-            for line in lines:
-                if line.strip().startswith('local') and 'postgres' in line:
-                    # Replace peer/md5 with trust for postgres user
-                    if 'peer' in line or 'md5' in line:
-                        updated_line = line.replace('peer', 'trust').replace('md5', 'trust')
-                        updated_lines.append(updated_line)
-                        logger.info(f"🔄 Updated: {line.strip()} → {updated_line.strip()}")
-                    else:
-                        updated_lines.append(line)
-                else:
-                    updated_lines.append(line)
-            
-            # Write updated content
-            with open(hba_conf_path, 'w') as f:
-                f.write('\n'.join(updated_lines))
-            
-            logger.info("✅ Updated pg_hba.conf for temporary trust authentication")
-            
-            # Reload PostgreSQL configuration
+
+            # Prepend the TRUST rule to the file
+            trust_rule = f"local   all             {self.config['postgres_user']}                                     trust\n"
+            new_hba_content = trust_rule + original_hba_content
+
+            async with aiofiles.open(self.config['hba_file_path'], 'w') as f:
+                await f.write(new_hba_content)
+
+            logger.info("✅ Added temporary TRUST auth rule to pg_hba.conf.")
             await self._reload_postgresql_config()
-            
+
         except Exception as e:
-            logger.warning(f"⚠️ Error setting up temporary trust auth: {e}")
+            logger.error(f"Failed to set up temporary TRUST auth: {e}", exc_info=True)
 
     async def _emergency_postgresql_restart(self) -> bool:
-        """Emergency PostgreSQL restart to fix hanging issues."""
+        """Stops and starts the PostgreSQL service as a last resort."""
+        logger.warning("🚨 Attempting emergency restart of PostgreSQL service...")
         try:
-            logger.warning("🚨 Performing emergency PostgreSQL restart...")
-            
-            # First, try to stop PostgreSQL gracefully
-            logger.info("🛑 Attempting graceful PostgreSQL stop...")
             await self._stop_postgresql_service()
+            logger.info("Waiting a few seconds before starting again...")
+            await asyncio.sleep(5)
             
-            # Wait a moment
-            await asyncio.sleep(2)
+            start_cmd = ['sudo', 'systemctl', 'start', self.config['service_name']]
+            return_code, _, stderr = await self._run_command_async(start_cmd, "Emergency start PostgreSQL")
             
-            # Kill any remaining PostgreSQL processes
-            logger.info("🔪 Killing any remaining PostgreSQL processes...")
-            try:
-                killall_cmd = ['sudo', 'killall', '-9', 'postgres']
-                process = await asyncio.create_subprocess_exec(
-                    *killall_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                await asyncio.wait_for(process.communicate(), timeout=10)
-                logger.debug("🔪 Killall postgres completed")
-            except Exception as e:
-                logger.debug(f"🔪 Killall postgres failed (may be normal): {e}")
-            
-            # Wait for processes to die
-            await asyncio.sleep(3)
-            
-            # Start PostgreSQL
-            logger.info("🚀 Starting PostgreSQL after emergency cleanup...")
-            if await self._ensure_postgresql_running():
-                logger.info("✅ Emergency restart successful")
-                return True
+            if return_code == 0:
+                logger.info("✅ Emergency restart appears successful.")
+                await asyncio.sleep(2) # Give it a moment to stabilize
+                return await self._verify_service_status(self.config['service_name'])
             else:
-                logger.error("❌ Emergency restart failed")
+                logger.error(f"Failed to start PostgreSQL during emergency restart: {stderr}")
                 return False
-                
         except Exception as e:
-            logger.error(f"❌ Emergency restart error: {e}")
+            logger.error(f"Exception during emergency PostgreSQL restart: {e}", exc_info=True)
             return False
 
     async def _stop_postgresql_service(self):
-        """Stop PostgreSQL service using detected service name."""
+        """Stops the PostgreSQL service."""
+        logger.info(f"🛑 Stopping PostgreSQL service: {self.config['service_name']}...")
         try:
-            service_candidates = [
-                f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",
-                self.system_info.get('postgresql_service', 'postgresql'),
-                f"postgresql-{self.system_info.get('postgresql_version', '14')}",
-                "postgresql",
-            ]
+            # Use a timeout to prevent hanging
+            stop_cmd = ['sudo', 'systemctl', 'stop', self.config['service_name']]
+            proc = await asyncio.create_subprocess_exec(*stop_cmd)
+            await asyncio.wait_for(proc.wait(), timeout=30.0)
             
-            for service_name in service_candidates:
-                try:
-                    stop_cmd = ['sudo', 'systemctl', 'stop', service_name]
-                    process = await asyncio.create_subprocess_exec(
-                        *stop_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
-                    
-                    if process.returncode == 0:
-                        logger.info(f"✅ Stopped PostgreSQL service: {service_name}")
-                        return
-                    else:
-                        logger.debug(f"❌ Failed to stop via {service_name}: {stderr.decode().strip()}")
-                except Exception as e:
-                    logger.debug(f"❌ Exception stopping via {service_name}: {e}")
-                    continue
-            
-            logger.warning("⚠️ Could not stop PostgreSQL via any known service name")
-            
+            # Verify it's stopped
+            if not await self._verify_service_status(self.config['service_name'], should_be_active=False):
+                logger.warning("Service did not stop cleanly. It may have already been stopped.")
+            else:
+                logger.info("✅ PostgreSQL service stopped.")
+
+        except asyncio.TimeoutError:
+            logger.error("Timeout trying to stop the PostgreSQL service. It might be stuck.")
         except Exception as e:
-            logger.warning(f"⚠️ Error stopping PostgreSQL service: {e}")
+            logger.error(f"Error stopping PostgreSQL service: {e}", exc_info=True)
 
     async def _reload_postgresql_config(self):
-        """Reload PostgreSQL configuration."""
+        """Reloads the PostgreSQL configuration."""
+        logger.info("🔄 Reloading PostgreSQL configuration...")
         try:
-            # Try different service names
-            service_candidates = [
-                f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",
-                self.system_info.get('postgresql_service', 'postgresql'),
-                f"postgresql-{self.system_info.get('postgresql_version', '14')}",
-                "postgresql",
-            ]
+            # Check for systemd
+            if shutil.which("systemctl"):
+                reload_cmd = ['sudo', 'systemctl', 'reload', self.config['service_name']]
+                return_code, _, stderr = await self._run_command_async(reload_cmd, "Reload PostgreSQL config (systemd)")
+                if return_code != 0:
+                    logger.warning(f"Failed to reload config via systemctl: {stderr}. Will try pg_ctl.")
             
-            for service_name in service_candidates:
-                try:
-                    reload_cmd = ['sudo', 'systemctl', 'reload', service_name]
-                    process = await asyncio.create_subprocess_exec(
-                        *reload_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
-                    
-                    if process.returncode == 0:
-                        logger.info(f"✅ Reloaded PostgreSQL config via service: {service_name}")
-                        return
-                    else:
-                        logger.debug(f"❌ Failed to reload via {service_name}: {stderr.decode().strip()}")
-                except Exception as e:
-                    logger.debug(f"❌ Exception reloading via {service_name}: {e}")
-                    continue
-            
-            # Fallback: try pg_reload_conf()
-            logger.info("🔄 Trying pg_reload_conf() as fallback...")
-            reload_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT pg_reload_conf();']
-            process = await asyncio.create_subprocess_exec(
-                *reload_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
-            
-            if process.returncode == 0:
-                logger.info("✅ Reloaded PostgreSQL config via pg_reload_conf()")
+            # Fallback to pg_ctl if systemctl fails or is not present
+            pg_ctl_path = self.config.get("pg_ctl_path")
+            if pg_ctl_path and pg_ctl_path.exists():
+                reload_cmd_pgctl = ['sudo', '-u', self.config['postgres_user'], str(pg_ctl_path), 'reload']
+                return_code_pgctl, _, stderr_pgctl = await self._run_command_async(reload_cmd_pgctl, "Reload PostgreSQL config (pg_ctl)")
+                if return_code_pgctl == 0:
+                    logger.info("✅ Successfully reloaded config using pg_ctl.")
+                    return
+                else:
+                    logger.error(f"Failed to reload config with pg_ctl as well: {stderr_pgctl}")
             else:
-                logger.warning(f"⚠️ Failed to reload config: {stderr.decode()}")
+                logger.error("Could not find pg_ctl to reload configuration.")
                 
         except Exception as e:
-            logger.warning(f"⚠️ Error reloading PostgreSQL config: {e}")
+            logger.error(f"Exception while reloading PostgreSQL configuration: {e}", exc_info=True)
 
     async def _ensure_postgresql_running(self):
-        """Ensure PostgreSQL is running, attempting to start it if not."""
+        """Ensures the PostgreSQL service is running, starting it if necessary."""
+        logger.info("Ensuring PostgreSQL service is running...")
+        
+        is_running = await self._verify_service_status(self.config['service_name'])
+        
+        if is_running:
+            logger.info("✅ PostgreSQL service is already running.")
+            return
+
+        logger.info(f"PostgreSQL service '{self.config['service_name']}' is not running. Attempting to start...")
         try:
-            # Try different possible service names in order of preference
-            service_candidates = [
-                f"postgresql@{self.system_info.get('postgresql_version', '14')}-main",  # Ubuntu cluster-specific
-                self.system_info.get('postgresql_service', 'postgresql'),              # From system detection
-                f"postgresql-{self.system_info.get('postgresql_version', '14')}",      # Version-specific
-                "postgresql",                                                           # Generic
-            ]
-            
-            active_service = None
-            
-            # First, check if any service is already running
-            for service_name in service_candidates:
-                try:
-                    status_cmd = ['systemctl', 'is-active', service_name]
-                    status_process = await asyncio.create_subprocess_exec(
-                        *status_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    status_stdout, _ = await status_process.communicate()
-                    
-                    if status_stdout.decode().strip() == 'active':
-                        logger.info(f"✅ PostgreSQL is already running via service: {service_name}")
-                        active_service = service_name
-                        break
-                except Exception:
-                    continue
-            
-            if active_service:
-                return
-            
-            # No service is running, try to start one
-            logger.info("🔄 PostgreSQL not running, attempting to start...")
-            
-            for service_name in service_candidates:
-                try:
-                    logger.info(f"🔍 Trying to start service: {service_name}")
-                    start_cmd = ['sudo', 'systemctl', 'start', service_name]
-                    start_process = await asyncio.create_subprocess_exec(
-                        *start_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    start_stdout, start_stderr = await start_process.communicate()
-                    
-                    if start_process.returncode == 0:
-                        logger.info(f"✅ Successfully started PostgreSQL via service: {service_name}")
-                        # Wait a moment for it to be ready
-                        await asyncio.sleep(3)
-                        
-                        # Verify it's actually running
-                        status_process = await asyncio.create_subprocess_exec(
-                            'systemctl', 'is-active', service_name,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE
-                        )
-                        status_stdout, _ = await status_process.communicate()
-                        
-                        if status_stdout.decode().strip() == 'active':
-                            logger.info(f"✅ Confirmed PostgreSQL is running via: {service_name}")
-                            return
-                        else:
-                            logger.warning(f"⚠️ Service {service_name} started but not showing as active")
-                    else:
-                        logger.debug(f"❌ Failed to start {service_name}: {start_stderr.decode().strip()}")
-                        
-                except Exception as e:
-                    logger.debug(f"❌ Exception trying to start {service_name}: {e}")
-                    continue
-            
-            logger.error("❌ Failed to start PostgreSQL with any known service name")
+            start_cmd = ['sudo', 'systemctl', 'start', self.config['service_name']]
+            return_code, _, stderr = await self._run_command_async(start_cmd, "Start PostgreSQL service")
+
+            if return_code == 0:
+                logger.info("Waiting a moment for service to initialize...")
+                await asyncio.sleep(5)
                 
+                # Final check
+                if await self._verify_service_status(self.config['service_name']):
+                    logger.info("✅ Successfully started PostgreSQL service.")
+                else:
+                    logger.error("Service reported start but is not active. Check logs for details.")
+                    
+            else:
+                logger.error(f"Failed to start PostgreSQL service. Error: {stderr}")
+
         except Exception as e:
-            logger.error(f"❌ Error ensuring PostgreSQL is running: {e}")
+            logger.error(f"An exception occurred while trying to start PostgreSQL: {e}", exc_info=True)
 
     async def _ensure_correct_archive_command(self) -> bool:
-        """
-        Ensures the archive_command in PostgreSQL is correctly set to use the
-        network-aware stanza name. This is a critical check after any potential
-        database restore or configuration change.
-        """
-        max_retries = 3
-        for attempt in range(max_retries):
-            logger.info(f"🔧 Ensuring correct archive command (attempt {attempt + 1}/{max_retries})...")
-            try:
-                # Expected command uses the dynamically configured stanza name
-                expected_command = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
-                
-                # Get current archive_command from PostgreSQL
-                check_cmd = ['sudo', '-u', self.config['pguser'], 'psql', '-t', '-c', 'SHOW archive_command;']
-                returncode, stdout, stderr = await self._run_postgres_command_with_logging(
-                    check_cmd, timeout=10, description="Archive command check"
-                )
-
-                if returncode != 0:
-                    logger.warning(f"Could not check archive command: {stderr}")
-                    await asyncio.sleep(5)
-                    continue
-
-                current_command = stdout.strip()
-                logger.info(f"📋 Current: {current_command}")
-                logger.info(f"📋 Expected: {expected_command}")
-                
-                if current_command == expected_command:
-                    logger.info("✅ Archive command is correct")
-                    return True
-                else:
-                    logger.warning("❌ Archive command mismatch detected. Attempting to fix...")
-                    fix_success = await self.fix_archive_command()
-                    if fix_success:
-                        logger.info("✅ Archive command fixed successfully.")
-                        # Re-verify after fixing
-                        continue
-                    else:
-                        logger.error("❌ Failed to fix archive command.")
-                        return False
-            
-            except Exception as e:
-                logger.error(f"Error ensuring correct archive command: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(5)
+        """Validates and sets the archive_command in postgresql.conf."""
+        logger.info("Verifying and setting the archive command...")
         
-        logger.error("❌ Failed to ensure correct archive command after multiple retries.")
-        return False
+        expected_command = f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
+        
+        try:
+            # We must run this as the postgres user
+            get_cmd = ['sudo', '-u', self.config['postgres_user'], 'psql', '-t', '-c', "SHOW archive_command;"]
+            return_code, current_command, stderr = await self._run_command_async(get_cmd, "Get current archive_command")
+
+            if return_code != 0:
+                logger.error(f"Failed to get current archive_command: {stderr}")
+                # This is critical, so we attempt to set it blindly
+                logger.warning("Could not verify current archive command, attempting to set it anyway.")
+            
+            logger.info(f"🔍 Current: {current_command}")
+            logger.info(f"📋 Expected: {expected_command}")
+
+            if current_command == expected_command:
+                logger.info("✅ Archive command is correct")
+                return True
+
+            logger.info("Archive command is incorrect or unset. Setting it now...")
+            set_cmd = [
+                'sudo', '-u', self.config['postgres_user'], 'psql', '-c',
+                f"ALTER SYSTEM SET archive_command = '{expected_command}';"
+            ]
+            return_code_set, _, stderr_set = await self._run_command_async(set_cmd, "Set archive_command")
+
+            if return_code_set != 0:
+                logger.error(f"Failed to set archive_command: {stderr_set}")
+                return False
+
+            await self._reload_postgresql_config()
+            return True
+        except Exception as e:
+            logger.error(f"An error occurred while ensuring correct archive command: {e}", exc_info=True)
+            return False
 
     async def _intelligent_stanza_setup(self) -> bool:
         """
-        Sets up the pgBackRest stanza intelligently based on whether this node
-        is a primary or a replica.
+        Sets up the pgBackRest stanza intelligently. It ensures a valid stanza exists
+        and then relies on _initialize_pgbackrest to handle all backup-related decisions.
         """
-        # For a primary node, we assume we are setting up backups for the first time or managing them.
-        if self.is_primary:
-            logger.info("🏗️ Setting up PRIMARY stanza and backups...")
+        if not self.is_primary:
+            logger.info("🏗️ Node is a replica. Skipping primary stanza setup.")
+            return True
 
-            # Start the stanza to clear any prior stop files
-            try:
-                logger.info("Ensuring stanza is started to clear any previous stop files...")
-                start_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 'start', f'--stanza={self.config["stanza_name"]}']
-                process = await asyncio.create_subprocess_exec(
-                    *start_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                await process.communicate()
-                logger.info("✅ Stanza start command completed")
-            except Exception as e:
-                logger.warning(f"Could not run pgbackrest start command: {e}")
+        logger.info("🏗️ Setting up PRIMARY stanza and backups...")
 
-            # First, check if the stanza already exists and is working
-            logger.info("🔍 Checking existing stanza status...")
-            stanza_needs_recreation = False
-            
-            try:
-                info_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', f'--stanza={self.config["stanza_name"]}', 'info']
-                process = await asyncio.create_subprocess_exec(
-                    *info_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await process.communicate()
-                
-                if process.returncode == 0:
+        # Start the stanza to clear any prior stop files, which is safe to run even if not needed.
+        try:
+            logger.info("Ensuring stanza is started to clear any previous stop files...")
+            start_cmd = ['sudo', '-u', self.config['postgres_user'], 'pgbackrest', 'start', f'--stanza={self.config["stanza_name"]}']
+            await self._run_command_async(start_cmd, "Start pgBackRest stanza")
+            logger.info("✅ Stanza start command completed")
+        except Exception as e:
+            logger.warning(f"Could not run pgbackrest start command, which may be acceptable: {e}")
+
+        # A single, reliable check to see if the stanza is functional.
+        logger.info("🔍 Checking existing stanza status...")
+        stanza_is_healthy = False
+        try:
+            info_cmd = ['sudo', '-u', self.config['postgres_user'], 'pgbackrest', f'--stanza={self.config["stanza_name"]}', 'info', '--output=json']
+            return_code, stdout, stderr = await self._run_command_async(info_cmd, "Get pgBackRest info")
+
+            if return_code == 0 and stdout:
+                info_json = json.loads(stdout)
+                # A healthy stanza has a 'db' list with at least one entry and a good status code.
+                if info_json and info_json[0]['status']['code'] == 0:
+                    stanza_is_healthy = True
                     logger.info("✅ Existing stanza found and accessible")
-                    # Check if we have backups
-                    backup_info = await self._analyze_existing_backups()
-                    if backup_info.get("backup_count", 0) > 0:
-                        logger.info(f"✅ Found {backup_info['backup_count']} existing backups - preserving existing setup")
-                        # Just ensure WAL archiving is working
-                        await self._setup_wal_archiving()
-                        return True
-                    else:
-                        logger.info("📋 Stanza exists but no backups found - will initialize backups without recreating stanza")
-                        stanza_needs_recreation = False
                 else:
-                    logger.warning(f"⚠️ Stanza check failed: {stderr.decode()}")
-                    logger.info("🔄 Will recreate stanza due to issues")
-                    stanza_needs_recreation = True
-                    
-            except Exception as e:
-                logger.warning(f"Error checking existing stanza: {e}")
-                logger.info("🔄 Will recreate stanza due to check failure")
-                stanza_needs_recreation = True
-
-            # Only recreate if there are actual issues
-            if stanza_needs_recreation:
-                await self._recreate_stanza_if_needed()
-            
-            # This will create the stanza if it doesn't exist or is broken
-            await self._setup_wal_archiving()
-            
-            # This initializes and checks backups
-            if not await self._initialize_pgbackrest():
-                logger.warning("Initial pgBackRest initialization failed. This may be handled by auto-repair.")
-
-            # Verify backups after setup
-            backup_info = await self._analyze_existing_backups()
-            if not backup_info.get("backups"):
-                logger.info("No existing backups found. Creating first full backup.")
-                if not await self._trigger_backup("full"):
-                    logger.error("Failed to create initial full backup.")
-                    return False
+                    message = "Unknown error"
+                    if info_json and info_json[0]['status']['message']:
+                        message = info_json[0]['status']['message']
+                    logger.warning(f"Stanza 'info' command reported an error: {message}")
             else:
-                logger.info("Existing backups found. Stanza setup appears successful.")
+                logger.warning(f"Stanza check via 'info' command failed. Stderr: {stderr}")
 
-            return True
+        except (json.JSONDecodeError, IndexError, Exception) as e:
+            logger.warning(f"Error parsing stanza info or running command: {e}")
 
-        # For a replica, we ensure it can connect to the repository but don't create backups.
-        else:
-            logger.info("🏗️ Configuring REPLICA for restore...")
-            if not await self._initialize_pgbackrest():
-                logger.error("Failed to initialize pgBackRest on replica")
-                return False
-            
-            logger.info("✅ Replica setup completed")
-            return True
+        # If the stanza is not healthy, recreate it.
+        if not stanza_is_healthy:
+            logger.info("🔄 Stanza is not healthy or does not exist. Attempting to recreate.")
+            await self._recreate_stanza_if_needed()
+
+        # Set up WAL archiving settings in PostgreSQL.
+        if not await self._setup_wal_archiving():
+            logger.error("Failed to set up WAL archiving. Stanza setup cannot proceed.")
+            return False
+
+        # Initialize pgBackRest. This function is responsible for checking for
+        # existing backups and creating an initial one ONLY if necessary.
+        logger.info("⚙️ Finalizing setup and verifying backups with pgBackRest initialization...")
+        if not await self._initialize_pgbackrest():
+            logger.error("Failed to initialize pgBackRest and ensure backups are configured.")
+            return False
+
+        logger.info("✅ Stanza setup completed successfully.")
+        return True
 
     async def _recreate_stanza_if_needed(self):
         """
@@ -3571,7 +3352,7 @@ localhost:5433:*:postgres:postgres
                 )
                 await start_process.communicate()
                 logger.info("✅ Stanza started after recreation")
-
+                
         except Exception as e:
             logger.warning(f"Stanza recreation had issues: {e}")
 
@@ -4045,6 +3826,49 @@ localhost:5433:*:postgres:postgres
             return True
         except Exception as e:
             logger.error(f"❌ Error testing database connectivity: {e}")
+            return False
+
+    async def _run_command_async(self, cmd: list, description: str) -> tuple[int, str, str]:
+        """Runs a command asynchronously and returns its exit code, stdout, and stderr."""
+        try:
+            logger.debug(f"Running command: {description} -> {' '.join(cmd)}")
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd='/tmp'  # Run in a neutral directory
+            )
+            stdout, stderr = await process.communicate()
+            stdout_str = stdout.decode().strip()
+            stderr_str = stderr.decode().strip()
+            
+            if process.returncode != 0:
+                logger.debug(f"Command '{description}' failed with code {process.returncode}. Stderr: {stderr_str}")
+            else:
+                logger.debug(f"Command '{description}' succeeded.")
+                
+            return process.returncode, stdout_str, stderr_str
+        except Exception as e:
+            logger.error(f"Failed to execute command '{description}': {e}", exc_info=True)
+            return -1, "", str(e)
+
+    async def _verify_service_status(self, service_name: str, should_be_active: bool = True) -> bool:
+        """Checks if the PostgreSQL service is running."""
+        try:
+            status_cmd = ['systemctl', 'is-active', service_name]
+            status_process = await asyncio.create_subprocess_exec(
+                *status_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            status_stdout, _ = await status_process.communicate()
+            
+            if status_stdout.decode().strip() == ('active' if should_be_active else 'inactive'):
+                return True
+            else:
+                return False
+        except Exception as e:
+            logger.error(f"Failed to check service status: {e}")
             return False
 
 

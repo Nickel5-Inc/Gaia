@@ -489,7 +489,7 @@ class ComprehensiveDatabaseSetup:
         conf_d_dir.mkdir(parents=True, exist_ok=True)
         
         custom_config_file = conf_d_dir / '99-gaia-custom.conf'
-
+        
         # These are the settings we want to enforce.
         # We no longer need to specify data_directory, hba_file, etc.
         # as we are not overwriting the main config file.
@@ -823,7 +823,7 @@ class ComprehensiveDatabaseSetup:
     async def _setup_alembic_schema(self) -> bool:
         """Setup the database schema by running alembic migrations."""
         logger.info("📋 Setting up database schema with Alembic...")
-
+        
         if await self._run_alembic_migrations():
             logger.info("✅ Database schema setup completed")
             return True
@@ -845,7 +845,7 @@ class ComprehensiveDatabaseSetup:
             '-x', f'db_url={db_url}',
             'upgrade', 'head'
         ]
-        
+            
         success, stdout, stderr = await self._run_command(cmd, timeout=120, cwd=project_root_dir)
         
         if success:
@@ -879,7 +879,7 @@ class ComprehensiveDatabaseSetup:
             if not success or stdout.strip() != 'active':
                 logger.error(f"❌ PostgreSQL service not running: {stderr}")
                 return False
-
+            
             # Check 2: Database connection works
             if not await self._test_database_connection(max_fix_attempts=0): # No more fixes at this stage
                 logger.error("❌ Database connection test failed")
@@ -919,7 +919,7 @@ class ComprehensiveDatabaseSetup:
         except Exception as e:
             logger.error(f"❌ Validation failed with error: {e}", exc_info=True)
             return False
-            
+
     async def _stop_postgresql_service(self) -> bool:
         """Stop PostgreSQL service"""
         service_name = await self._detect_postgresql_service()
@@ -945,7 +945,7 @@ class ComprehensiveDatabaseSetup:
         if 'sudo' in cmd and '-u' in cmd and 'postgres' in cmd and cwd is None:
             effective_cwd = '/tmp'
             logger.debug(f"🔧 Overriding cwd to '{effective_cwd}' for postgres user command")
-
+        
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
