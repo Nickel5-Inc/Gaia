@@ -103,16 +103,16 @@ class AutoSyncManager:
         print("=" * 80)
         print("🚀 AUTO SYNC MANAGER STARTING UP 🚀")
         print("=" * 80)
-        logger.info("🚀" * 10 + " AUTO SYNC MANAGER INITIALIZATION " + "🚀" * 10)
-        logger.info(f"🏠 MODE: {'PRIMARY DATABASE' if self.is_primary else 'REPLICA DATABASE'}")
-        logger.info(f"🧪 TEST MODE: {'ENABLED (Fast scheduling)' if self.test_mode else 'DISABLED (Production scheduling)'}")
-        logger.info(f"📋 BACKUP SCHEDULE: {self.backup_schedule}")
+        logger.info("🚀 AUTO SYNC MANAGER INITIALIZATION")
+        logger.info(f"MODE: {'PRIMARY DATABASE' if self.is_primary else 'REPLICA DATABASE'}")
+        logger.info(f"TEST MODE: {'ENABLED (Fast scheduling)' if self.test_mode else 'DISABLED (Production scheduling)'}")
+        logger.info(f"BACKUP SCHEDULE: {self.backup_schedule}")
         logger.info("=" * 80)
 
     def _detect_system_configuration(self) -> Dict:
         """Detect system configuration for adaptive setup."""
         try:
-            logger.info("🔍 Detecting system configuration...")
+            logger.info("Detecting system configuration...")
             
             system_info = {
                 'os_type': 'unknown',
@@ -145,7 +145,7 @@ class AutoSyncManager:
                 except FileNotFoundError:
                     pass
                     
-                logger.info(f"🐧 OS: {system_info['os_type']} {system_info['os_version']}")
+                logger.info(f"OS: {system_info['os_type']} {system_info['os_version']}")
                 
             except Exception as e:
                 logger.debug(f"OS detection failed: {e}")
@@ -164,7 +164,7 @@ class AutoSyncManager:
                     result = subprocess.run(['which', cmd], capture_output=True, text=True, timeout=5)
                     if result.returncode == 0:
                         system_info['package_manager'] = name
-                        logger.info(f"📦 Package manager: {name}")
+                        logger.info(f"Package manager: {name}")
                         break
                 except Exception:
                     continue
@@ -173,7 +173,7 @@ class AutoSyncManager:
             try:
                 result = subprocess.run(['systemctl', '--version'], capture_output=True, text=True, timeout=5)
                 system_info['systemd_available'] = result.returncode == 0
-                logger.info(f"⚙️ Systemd: {'Available' if system_info['systemd_available'] else 'Not available'}")
+                logger.info(f"Systemd: {'Available' if system_info['systemd_available'] else 'Not available'}")
             except Exception:
                 pass
             
@@ -467,12 +467,12 @@ class AutoSyncManager:
         """
         try:
             logger.info("🚀 Starting intelligent database sync setup...")
-            logger.info(f"🌐 Network: {self.config.get('network', 'unknown')}")
-            logger.info(f"📋 Target stanza: {self.config['stanza_name']}")
-            logger.info(f"🏠 Mode: {'PRIMARY' if self.is_primary else 'REPLICA'}")
+            logger.info(f"Network: {self.config.get('network', 'unknown')}")
+            logger.info(f"Target stanza: {self.config['stanza_name']}")
+            logger.info(f"Mode: {'PRIMARY' if self.is_primary else 'REPLICA'}")
             
             # 1. Install dependencies with timeout
-            logger.info("📦 Step 1: Installing dependencies...")
+            logger.info("Step 1: Installing dependencies...")
             try:
                 install_success = await asyncio.wait_for(self._install_dependencies(), timeout=300)  # 5 minute timeout
                 if not install_success:
@@ -484,7 +484,7 @@ class AutoSyncManager:
                 return False
             
             # 2. Auto-detect and repair any existing configuration issues with timeout
-            logger.info("🔍 Step 2: Detecting and repairing existing configuration...")
+            logger.info("Step 2: Detecting and repairing existing configuration...")
             try:
                 await asyncio.wait_for(self._auto_repair_configuration(), timeout=60)  # 1 minute timeout
                 logger.info("✅ Step 2 completed successfully")
@@ -492,7 +492,7 @@ class AutoSyncManager:
                 logger.warning("⚠️ Step 2 timed out after 1 minute - continuing anyway")
             
             # 3. Configure PostgreSQL (smart update, not just append) with timeout
-            logger.info("⚙️ Step 3: Configuring PostgreSQL...")
+            logger.info("Step 3: Configuring PostgreSQL...")
             try:
                 config_success = await asyncio.wait_for(self._configure_postgresql(), timeout=120)  # 2 minute timeout
                 if not config_success:
@@ -504,7 +504,7 @@ class AutoSyncManager:
                 return False
             
             # 4. Setup PostgreSQL authentication with timeout
-            logger.info("🔐 Step 4: Setting up PostgreSQL authentication...")
+            logger.info("Step 4: Setting up PostgreSQL authentication...")
             try:
                 auth_success = await asyncio.wait_for(self._setup_postgres_auth(), timeout=60)  # 1 minute timeout
                 if not auth_success:
@@ -516,7 +516,7 @@ class AutoSyncManager:
                 return False
             
             # 5. Configure pgBackRest with timeout
-            logger.info("🔧 Step 5: Configuring pgBackRest...")
+            logger.info("Step 5: Configuring pgBackRest...")
             try:
                 pgbackrest_success = await asyncio.wait_for(self._configure_pgbackrest(), timeout=60)  # 1 minute timeout
                 if not pgbackrest_success:
@@ -528,7 +528,7 @@ class AutoSyncManager:
                 return False
             
             # 6. Ensure archive command is correct (with retry logic) with timeout
-            logger.info("📝 Step 6: Ensuring correct archive command...")
+            logger.info("Step 6: Ensuring correct archive command...")
             try:
                 archive_success = await asyncio.wait_for(self._ensure_correct_archive_command(), timeout=60)  # 1 minute timeout
                 if not archive_success:
@@ -539,7 +539,7 @@ class AutoSyncManager:
                 logger.warning("⚠️ Step 6 timed out after 1 minute - archive command may need manual attention")
             
             # 7. Handle stanza setup intelligently with timeout
-            logger.info("📊 Step 7: Setting up backup stanza...")
+            logger.info("Step 7: Setting up backup stanza...")
             try:
                 stanza_success = await asyncio.wait_for(self._intelligent_stanza_setup(), timeout=600)  # 10 minute timeout
                 if not stanza_success:
@@ -551,7 +551,7 @@ class AutoSyncManager:
                 return False
             
             # 8. Start application-controlled scheduling
-            logger.info("⏰ Step 8: Starting automated scheduling...")
+            logger.info("Step 8: Starting automated scheduling...")
             try:
                 # Add timeout to this step
                 await asyncio.wait_for(
@@ -569,18 +569,18 @@ class AutoSyncManager:
             
         except Exception as e:
             logger.error(f"❌ Database sync setup failed: {e}", exc_info=True)
-            logger.error("🔧 Will attempt fallback configuration...")
+            logger.error("Will attempt fallback configuration...")
             return False
 
     async def _install_dependencies(self) -> bool:
         """Install pgBackRest and required dependencies adaptively based on system detection."""
         try:
-            logger.info("📦 Installing pgBackRest and dependencies...")
-            logger.info(f"🔍 System: {self.system_info.get('os_type', 'unknown')} with {self.system_info.get('package_manager', 'unknown')} package manager")
+            logger.info("Installing pgBackRest and dependencies...")
+            logger.info(f"System: {self.system_info.get('os_type', 'unknown')} with {self.system_info.get('package_manager', 'unknown')} package manager")
             
             # Check if already installed
             try:
-                logger.info("🔍 Checking if pgBackRest is already installed...")
+                logger.info("Checking if pgBackRest is already installed...")
                 result = await asyncio.wait_for(
                     asyncio.create_subprocess_exec(
                         'pgbackrest', 'version',
@@ -595,9 +595,9 @@ class AutoSyncManager:
                     logger.info(f"✅ pgBackRest already installed: {version_info}")
                     return True
                 else:
-                    logger.info("❌ pgBackRest not found, will install...")
+                    logger.info("pgBackRest not found, will install...")
             except (FileNotFoundError, asyncio.TimeoutError):
-                logger.info("❌ pgBackRest not found, will install...")
+                logger.info("pgBackRest not found, will install...")
             
             # Adaptive installation based on package manager
             package_manager = self.system_info.get('package_manager', 'unknown')
@@ -620,7 +620,7 @@ class AutoSyncManager:
     async def _install_dependencies_apt(self) -> bool:
         """Install dependencies using apt (Debian/Ubuntu)."""
         try:
-            logger.info("📦 Installing using apt (Debian/Ubuntu)...")
+            logger.info("Installing using apt (Debian/Ubuntu)...")
             
             commands = [
                 (['apt-get', 'update'], 120, "Updating package lists"),
@@ -628,7 +628,7 @@ class AutoSyncManager:
             ]
             
             for cmd, timeout, description in commands:
-                logger.info(f"🔄 {description}: {' '.join(cmd)}")
+                logger.info(f"{description}: {' '.join(cmd)}")
                 try:
                     process = await asyncio.wait_for(
                         asyncio.create_subprocess_exec(
@@ -660,7 +660,7 @@ class AutoSyncManager:
         """Install dependencies using yum/dnf (RHEL/CentOS/Fedora)."""
         try:
             package_cmd = self.system_info.get('package_manager', 'yum')
-            logger.info(f"📦 Installing using {package_cmd} (RHEL/CentOS/Fedora)...")
+            logger.info(f"Installing using {package_cmd} (RHEL/CentOS/Fedora)...")
             
             commands = [
                 ([package_cmd, 'install', '-y', 'epel-release'], 120, "Installing EPEL repository"),
@@ -669,7 +669,7 @@ class AutoSyncManager:
             ]
             
             for cmd, timeout, description in commands:
-                logger.info(f"🔄 {description}: {' '.join(cmd)}")
+                logger.info(f"{description}: {' '.join(cmd)}")
                 try:
                     process = await asyncio.wait_for(
                         asyncio.create_subprocess_exec(
@@ -707,7 +707,7 @@ class AutoSyncManager:
     async def _install_dependencies_arch(self) -> bool:
         """Install dependencies using pacman (Arch Linux)."""
         try:
-            logger.info("📦 Installing using pacman (Arch Linux)...")
+            logger.info("Installing using pacman (Arch Linux)...")
             
             commands = [
                 (['pacman', '-Sy'], 120, "Updating package database"),
@@ -715,7 +715,7 @@ class AutoSyncManager:
             ]
             
             for cmd, timeout, description in commands:
-                logger.info(f"🔄 {description}: {' '.join(cmd)}")
+                logger.info(f"{description}: {' '.join(cmd)}")
                 try:
                     process = await asyncio.wait_for(
                         asyncio.create_subprocess_exec(
@@ -761,7 +761,7 @@ class AutoSyncManager:
                 pass
             
             logger.error("❌ All installation methods failed")
-            logger.error("💡 Please install pgBackRest manually:")
+            logger.error("Please install pgBackRest manually:")
             logger.error("   - Debian/Ubuntu: apt-get install pgbackrest")
             logger.error("   - RHEL/CentOS: yum install pgbackrest")
             logger.error("   - Fedora: dnf install pgbackrest")
@@ -801,15 +801,15 @@ class AutoSyncManager:
         """Configure PostgreSQL for pgBackRest using detected system configuration."""
         try:
             logger.info("Configuring PostgreSQL...")
-            logger.info(f"🔍 PostgreSQL version: {self.system_info.get('postgresql_version', 'unknown')}")
-            logger.info(f"🔍 PostgreSQL service: {self.system_info.get('postgresql_service', 'postgresql')}")
+            logger.info(f"PostgreSQL version: {self.system_info.get('postgresql_version', 'unknown')}")
+            logger.info(f"PostgreSQL service: {self.system_info.get('postgresql_service', 'postgresql')}")
             
             # For replica nodes, we can skip most configuration since we'll be restoring from backup
             if not self.is_primary:
-                logger.info("🔄 REPLICA MODE: Minimal PostgreSQL configuration (will be overwritten by restore)")
+                logger.info("REPLICA MODE: Minimal PostgreSQL configuration (will be overwritten by restore)")
                 
                 # CRITICAL: Set up authentication FIRST before any PostgreSQL commands
-                logger.info("🔐 Setting up PostgreSQL authentication for replica...")
+                logger.info("Setting up PostgreSQL authentication for replica...")
                 postgres_user = self.system_info.get('postgresql_user', 'postgres')
                 await self._setup_early_authentication(postgres_user)
                 
@@ -822,7 +822,7 @@ class AutoSyncManager:
             await self._fix_failing_archiver()
             
             # Detect PostgreSQL configuration file location dynamically
-            logger.info("🔍 Detecting PostgreSQL configuration file location...")
+            logger.info("Detecting PostgreSQL configuration file location...")
             postgres_user = self.system_info.get('postgresql_user', 'postgres')
             
             config_cmd = ['sudo', '-u', postgres_user, 'psql', '-t', '-c', 'SHOW config_file;']
@@ -842,12 +842,12 @@ class AutoSyncManager:
                 
                 if process.returncode != 0:
                     logger.warning(f"Failed to detect config file location: {stderr.decode()}")
-                    logger.info("💡 Trying fallback config detection...")
+                    logger.info("Trying fallback config detection...")
                     postgres_conf = await self._fallback_config_detection()
                 else:
                     postgres_conf_path = stdout.decode().strip()
                     postgres_conf = Path(postgres_conf_path)
-                    logger.info(f"📋 PostgreSQL config file: {postgres_conf}")
+                    logger.info(f"PostgreSQL config file: {postgres_conf}")
                     
             except asyncio.TimeoutError:
                 logger.warning("Config detection timed out after 30 seconds, using fallback...")
@@ -1653,7 +1653,7 @@ pg1-user={self.config['pguser']}
             if not self.backup_task or self.backup_task.done():
                 self.backup_task = asyncio.create_task(self._backup_scheduler())
         else:
-            logger.info("🔄 REPLICA MODE: Automated download scheduling active 🔄")
+            logger.info("REPLICA MODE: Automated download scheduling active")
             if self.test_mode:
                 logger.info("⚡ TEST MODE REPLICA: Downloads every 30 minutes with 5-minute backup buffer ⚡")
                 print("⚡ TEST MODE REPLICA: FAST DOWNLOAD SCHEDULE FOR TESTING ⚡")
@@ -1844,8 +1844,8 @@ pg1-user={self.config['pguser']}
         print("🔄 REPLICA SYNC SCHEDULER MAIN LOOP STARTED 🔄")
         print(f"🔄 STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 🔄")
         print("🔄" * 60)
-        logger.info("🔄" * 15 + " REPLICA SYNC SCHEDULER LOOP ACTIVE " + "🔄" * 15)
-        logger.info(f"🔄 SYNC SCHEDULER START TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info("REPLICA SYNC SCHEDULER LOOP ACTIVE")
+        logger.info(f"SYNC SCHEDULER START TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         while not self._shutdown_event.is_set():
             try:

@@ -588,83 +588,698 @@ gaia/models/custom_models/
 - **Soil moisture output**: 11x11 arrays for surface/rootzone (0-1 range)
 - **Geomagnetic output**: Next-hour DST prediction with UTC timestamp
 
-### Inference Service Setup (Docker)
+---
 
-For HTTP inference service deployment:
+## Weather Inference Service Setup
 
-#### Configuration (`config/settings.yaml`)
+The Weather Inference Service provides remote GPU-based inference for weather forecasting. This section covers complete setup from Docker building to cloud deployment.
+
+### Overview
+
+The inference service is a FastAPI-based application that:
+- Receives weather data from miners via HTTP API
+- Runs Aurora model inference on GPU hardware
+- Uploads results to R2 storage for miner access
+- Supports both RunPod serverless and dedicated deployments
+
+### Architecture
+
+```
+Miner → HTTP Request → Inference Service → Aurora Model → R2 Upload → Response
+```
+
+**Key Components:**
+- **FastAPI Server**: Handles HTTP requests and authentication
+- **Aurora Model**: Microsoft's weather prediction model
+- **R2 Storage**: Cloudflare R2 for forecast data storage
+- **Docker Container**: Portable deployment environment
+
+---
+
+### Prerequisites
+
+#### Required Accounts & Services
+
+1. **Cloudflare R2 Storage**
+   ```bash
+   # Create R2 bucket for forecast storage
+   # Get R2 credentials: Account ID, Access Key, Secret Key
+   ```
+
+2. **GPU Infrastructure** (Choose one):
+   - **RunPod**: Serverless GPU platform (recommended)
+   - **Vast.ai**: GPU rental marketplace
+   - **AWS/GCP/Azure**: Cloud GPU instances
+   - **Local GPU**: NVIDIA GPU with 24GB+ VRAM
+
+3. **Docker Environment**
+   ```bash
+   # Install Docker and Docker Compose
+   sudo apt update
+   sudo apt install docker.io docker-compose
+   sudo usermod -aG docker $USER
+   ```
+
+#### Hardware Requirements
+
+**Minimum GPU Requirements:**
+- **VRAM**: 24GB+ (RTX 3090, RTX 4090, A5000, A6000, H100)
+- **CUDA**: 11.8+ or 12.x
+- **Memory**: 32GB+ system RAM
+- **Storage**: 50GB+ for model and temporary files
+
+---
+
+### Step 1: Configure the Inference Service
+
+#### 1.1 Configuration Files
+
+Navigate to the inference service directory:
+```bash
+cd gaia/miner/inference_service
+```
+
+#### 1.2 Edit Settings (`config/settings.yaml`)
+
 ```yaml
 model:
-  model_repo: "microsoft/aurora"  # or "/app/local_models/custom_aurora"
+  # Aurora model configuration
+  model_repo: "/app/models/aurora_local"  # Local path in container
   checkpoint: "aurora-0.25-pretrained.ckpt"
   device: "auto"
   inference_steps: 40
   forecast_step_hours: 6
+  resolution: "0.25"
 
 api:
-  host: "0.0.0.0"
   port: 8000
+  host: "0.0.0.0"
 
 logging:
   level: "INFO"
 ```
 
-#### Build & Run
+#### 1.3 Environment Variables
+
+Create `.env` file for local testing:
 ```bash
-# Navigate to inference service directory
-cd gaia/miner/inference_service/
+# API Authentication
+INFERENCE_SERVICE_API_KEY=your_secure_api_key_here
 
-# Build Docker image
-docker build -t weather-inference-service .
+# R2 Storage Configuration
+R2_BUCKET=your-weather-forecasts-bucket
+R2_ENDPOINT_URL=https://your-account-id.r2.cloudflarestorage.com
+R2_ACCESS_KEY=your_r2_access_key
+R2_SECRET_ACCESS_KEY=your_r2_secret_key
 
-# Run with GPU support
-docker run --gpus all -p 8000:8000 weather-inference-service
-
-# Run with custom config
-docker run -p 8000:8000 \
-  -v /path/to/custom_settings.yaml:/app/config/settings.yaml \
-  weather-inference-service
-```
-
-#### API Endpoints
-- **Health Check**: `GET /health`
-- **Inference**: `POST /run_inference`
-  - Input: `{"serialized_aurora_batch": "base64_encoded_data"}`
-  - Output: Forecast data with job ID and status
-
-#### Environment Variables
-```bash
-INFERENCE_CONFIG_PATH=config/settings.yaml
+# Logging
 LOG_LEVEL=INFO
-INFERENCE_SERVICE_API_KEY=<your-api-key>
 
-# R2 Configuration (for R2 operations)
-WORKER_R2_BUCKET_NAME=<bucket-name>
-WORKER_R2_ENDPOINT_URL=<r2-endpoint>
-WORKER_R2_ACCESS_KEY_ID=<access-key>
-WORKER_R2_SECRET_ACCESS_KEY=<secret-key>
+# Optional: Custom model paths
+# CUSTOM_MODEL_PATH=/app/local_models/custom_aurora
 ```
 
 ---
 
-## Database Migration (Miners)
+### Step 2: Build Docker Image
 
-### Miner Database Migration
+#### 2.1 Standard Build
+
 ```bash
-# Check current schema version
-DB_CONNECTION_TYPE=socket alembic -c alembic_miner.ini current
+cd gaia/miner/inference_service
 
-# Upgrade to latest schema
-DB_CONNECTION_TYPE=socket alembic -c alembic_miner.ini upgrade head
+# Build the Docker image
+docker build -t weather-inference-service:latest .
 
-# View migration history
-DB_CONNECTION_TYPE=socket alembic -c alembic_miner.ini history
+# Verify build success
+docker images | grep weather-inference-service
 ```
 
-**Core miner table**: `weather_miner_jobs` with complete column set
+#### 2.2 Build with Custom Aurora Model
 
-**Migration Features**:
-- Handles divergent database states gracefully
-- Adds missing columns with appropriate defaults
-- Preserves existing data while ensuring schema compliance
-- Removes forbidden validator-specific tables 
+If you have a custom Aurora model:
+
+```bash
+# 1. Create local model directory
+mkdir -p local_models/custom_aurora
+
+# 2. Copy your model files
+cp /path/to/your/custom_model.ckpt local_models/custom_aurora/
+cp /path/to/your/config.json local_models/custom_aurora/
+
+# 3. Uncomment the COPY line in Dockerfile
+sed -i 's/# COPY \.\/local_models/COPY \.\/local_models/' Dockerfile
+
+# 4. Update settings.yaml to point to custom model
+sed -i 's|model_repo: "/app/models/aurora_local"|model_repo: "/app/local_models/custom_aurora"|' config/settings.yaml
+
+# 5. Build with custom model
+docker build -t weather-inference-service:custom .
+```
+
+#### 2.3 Build Arguments
+
+Customize the build process:
+```bash
+# Use different Aurora model version
+docker build \
+  --build-arg AURORA_MODEL_REPO="microsoft/aurora" \
+  --build-arg AURORA_CHECKPOINT_NAME="aurora-0.25-pretrained.ckpt" \
+  -t weather-inference-service:latest .
+
+# Build for specific CUDA version
+docker build \
+  --build-arg CUDA_VERSION="11.8" \
+  -t weather-inference-service:cuda118 .
+```
+
+---
+
+### Step 3: Local Testing
+
+#### 3.1 Run Locally with GPU
+
+```bash
+# Run with GPU support
+docker run --gpus all \
+  -p 8000:8000 \
+  --env-file .env \
+  weather-inference-service:latest
+
+# Run with specific GPU
+docker run --gpus '"device=0"' \
+  -p 8000:8000 \
+  --env-file .env \
+  weather-inference-service:latest
+```
+
+#### 3.2 Test Health Endpoint
+
+```bash
+# Check service health
+curl http://localhost:8000/health
+
+# Expected response:
+{
+  "status": "ok",
+  "model_status": "loaded"
+}
+```
+
+#### 3.3 Test Inference Endpoint
+
+```bash
+# Test with sample data (requires valid API key)
+curl -X POST http://localhost:8000/run_inference \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your_secure_api_key_here" \
+  -d '{
+    "input": {
+      "action": "run_inference_from_r2",
+      "input_r2_object_key": "test/sample_input.pkl",
+      "job_run_uuid": "test-job-123"
+    }
+  }'
+```
+
+---
+
+### Step 4: RunPod Deployment
+
+#### 4.1 Push to Container Registry
+
+**Option A: Docker Hub**
+```bash
+# Tag and push to Docker Hub
+docker tag weather-inference-service:latest yourusername/weather-inference:latest
+docker push yourusername/weather-inference:latest
+```
+
+**Option B: GitHub Container Registry**
+```bash
+# Login to GitHub Container Registry
+echo $GITHUB_TOKEN | docker login ghcr.io -u yourusername --password-stdin
+
+# Tag and push
+docker tag weather-inference-service:latest ghcr.io/yourusername/weather-inference:latest
+docker push ghcr.io/yourusername/weather-inference:latest
+```
+
+#### 4.2 RunPod Serverless Setup
+
+1. **Create RunPod Account**
+   - Sign up at [runpod.io](https://runpod.io)
+   - Add payment method and credits
+
+2. **Create Network Volume (Required)**
+   ```bash
+   # Navigate to Storage → Network Volumes → Create Volume
+   
+   # Configuration:
+   Name: weather-data-volume
+   Size: 50GB (minimum required for input/output files)
+   Region: [same as your endpoint region]
+   ```
+
+3. **Create Serverless Endpoint**
+   ```bash
+   # Navigate to Serverless → Endpoints → Create Endpoint
+   
+   # Configuration:
+   Name: weather-inference-service
+   Container Image: yourusername/weather-inference:latest
+   Container Registry Credentials: [if private registry]
+   Network Volume: weather-data-volume → /workspace/data
+   ```
+
+4. **Configure Environment Variables**
+   ```bash
+   # In RunPod Endpoint Settings → Environment Variables:
+   INFERENCE_SERVICE_API_KEY=your_secure_api_key_here
+   R2_BUCKET=your-weather-forecasts-bucket
+   R2_ENDPOINT_URL=https://your-account-id.r2.cloudflarestorage.com
+   R2_ACCESS_KEY=your_r2_access_key
+   R2_SECRET_ACCESS_KEY=your_r2_secret_key
+   LOG_LEVEL=INFO
+   ```
+
+5. **GPU Configuration**
+   ```bash
+   # Recommended GPU types:
+   - RTX 3090 (24GB VRAM) - Cost effective
+   - RTX 4090 (24GB VRAM) - Faster inference
+   - A5000 (24GB VRAM) - Professional grade
+   - H100 (80GB VRAM) - Highest performance
+   
+   # Container Configuration:
+   Container Disk: 50GB
+   Network Volume: 50GB (REQUIRED - for input/output file storage)
+   ```
+
+6. **Deploy and Test**
+   ```bash
+   # Deploy the endpoint
+   # Copy the endpoint URL (e.g., https://api.runpod.ai/v2/your-endpoint-id)
+   
+   # Test deployment
+   curl https://api.runpod.ai/v2/your-endpoint-id/health
+   ```
+
+#### 4.3 RunPod Pod (Dedicated Instance)
+
+For consistent availability, use a dedicated pod:
+
+```bash
+# Create Pod Configuration:
+Template: Custom
+Container Image: yourusername/weather-inference:latest
+GPU: RTX 3090/4090 (24GB VRAM minimum)
+Container Disk: 50GB
+Volume Disk: 100GB
+Ports: 8000 (HTTP)
+
+# Environment Variables: [same as serverless]
+
+# Startup Command:
+python -u -m app.main
+```
+
+---
+
+### Step 5: Miner Configuration
+
+#### 5.1 Update Miner Environment
+
+```bash
+# In your miner .env file:
+WEATHER_MINER_ENABLED=True
+WEATHER_INFERENCE_TYPE=http_service
+
+# RunPod Serverless Endpoint
+WEATHER_INFERENCE_SERVICE_URL="https://api.runpod.ai/v2/your-endpoint-id/run"
+
+# OR RunPod Pod (dedicated instance)
+WEATHER_INFERENCE_SERVICE_URL="https://your-pod-id-8000.proxy.runpod.net/run_inference"
+
+# API Key (must match inference service)
+INFERENCE_SERVICE_API_KEY=your_secure_api_key_here
+
+# R2 Configuration (for miner)
+R2_ENDPOINT_URL=https://your-account-id.r2.cloudflarestorage.com
+R2_BUCKET=your-weather-forecasts-bucket
+R2_ACCESS_KEY=your_r2_access_key
+R2_SECRET_ACCESS_KEY=your_r2_secret_key
+```
+
+#### 5.2 Test Miner Integration
+
+```bash
+# Restart miner
+cd gaia/miner
+python miner.py
+
+# Check logs for successful connection
+tail -f logs/miner.log | grep -i "weather\|inference\|runpod"
+
+# Expected log messages:
+# "Weather task ENABLED for this miner"
+# "RunPod API Key loaded from INFERENCE_SERVICE_API_KEY"
+# "HTTP Inference Service URL is present"
+```
+
+---
+
+### Step 6: Monitoring & Maintenance
+
+#### 6.1 Health Monitoring
+
+**Automated Health Checks:**
+```bash
+#!/bin/bash
+# health_check.sh
+ENDPOINT_URL="https://api.runpod.ai/v2/your-endpoint-id"
+API_KEY="your_secure_api_key_here"
+
+response=$(curl -s -w "%{http_code}" -o /tmp/health_response.json \
+  -H "X-API-Key: $API_KEY" \
+  "$ENDPOINT_URL/health")
+
+if [ "$response" = "200" ]; then
+  echo "✅ Inference service healthy"
+else
+  echo "❌ Inference service unhealthy (HTTP $response)"
+  cat /tmp/health_response.json
+fi
+```
+
+**RunPod Monitoring:**
+```bash
+# Monitor RunPod usage and costs
+# Check endpoint logs in RunPod dashboard
+# Set up billing alerts
+```
+
+#### 6.2 Log Analysis
+
+**Common Log Patterns:**
+```bash
+# Successful inference
+"Successfully processed inference request"
+"Uploaded forecast to R2"
+
+# Authentication issues
+"Invalid API key"
+"Authentication failed"
+
+# Model issues
+"Model loading failed"
+"CUDA out of memory"
+
+# R2 issues
+"R2 upload failed"
+"R2 connection timeout"
+```
+
+#### 6.3 Performance Optimization
+
+**GPU Optimization:**
+```yaml
+# In settings.yaml
+model:
+  device: "cuda"  # Force CUDA instead of auto
+  batch_size: 1   # Adjust based on VRAM
+  precision: "fp16"  # Use half precision if supported
+```
+
+**R2 Optimization:**
+```yaml
+# Concurrent upload limits
+r2:
+  max_concurrent_uploads: 10
+  upload_timeout_seconds: 300
+  retry_attempts: 3
+```
+
+---
+
+### Step 7: Troubleshooting
+
+#### 7.1 Common Issues
+
+**Docker Build Failures:**
+```bash
+# Issue: CUDA compatibility
+# Solution: Use NVIDIA base image
+FROM nvidia/cuda:11.8-runtime-ubuntu20.04
+
+# Issue: Model download timeout
+# Solution: Increase timeout or pre-download
+RUN timeout 1800 python -c "from huggingface_hub import snapshot_download; ..."
+```
+
+**RunPod Deployment Issues:**
+```bash
+# Issue: Container won't start
+# Check: Environment variables are set correctly
+# Check: Container image is accessible
+# Check: GPU requirements are met
+# Check: Network volume is attached (required for serverless)
+
+# Issue: Network volume not accessible
+# Solution: Ensure 50GB network volume is created and attached
+# Check: Volume mount path is /workspace/data
+# Check: Volume is in same region as endpoint
+
+# Issue: Out of memory
+# Solution: Use larger GPU or optimize model
+# Check: nvidia-smi output in container logs
+```
+
+**API Connection Issues:**
+```bash
+# Issue: Authentication failed
+# Check: API key matches between miner and service
+# Check: API key environment variable name
+
+# Issue: Connection timeout
+# Check: RunPod endpoint URL is correct
+# Check: Network connectivity from miner
+```
+
+**R2 Storage Issues:**
+```bash
+# Issue: R2 upload failed
+# Check: R2 credentials and permissions
+# Check: Bucket exists and is accessible
+# Test: Manual R2 connection with AWS CLI
+
+# Test R2 connection:
+aws s3 ls s3://your-bucket --endpoint-url=https://your-account-id.r2.cloudflarestorage.com
+```
+
+#### 7.2 Debug Commands
+
+**Container Debugging:**
+```bash
+# Run container interactively
+docker run -it --gpus all --entrypoint /bin/bash weather-inference-service:latest
+
+# Check GPU availability
+nvidia-smi
+
+# Test model loading
+python -c "import torch; print(torch.cuda.is_available())"
+
+# Check environment variables
+env | grep -E "R2_|INFERENCE_"
+```
+
+**Network Testing:**
+```bash
+# Test endpoint connectivity
+curl -v https://api.runpod.ai/v2/your-endpoint-id/health
+
+# Test with authentication
+curl -H "X-API-Key: your-key" https://api.runpod.ai/v2/your-endpoint-id/health
+
+# Check DNS resolution
+nslookup api.runpod.ai
+```
+
+#### 7.3 Performance Monitoring
+
+**GPU Monitoring:**
+```bash
+# Monitor GPU usage during inference
+watch -n 1 nvidia-smi
+
+# Check memory usage
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+```
+
+**Cost Monitoring:**
+```bash
+# RunPod cost tracking
+# Monitor usage in RunPod dashboard
+# Set up billing alerts
+# Track inference requests per hour
+```
+
+---
+
+### Step 8: Advanced Configuration
+
+#### 8.1 Custom Aurora Models
+
+**Preparing Custom Models:**
+```bash
+# 1. Train or fine-tune Aurora model
+# 2. Save checkpoint in compatible format
+# 3. Create model configuration
+
+# Directory structure:
+local_models/custom_aurora/
+├── custom_model.ckpt
+├── config.json
+└── metadata.json
+```
+
+**Docker Integration:**
+```dockerfile
+# Add to Dockerfile
+COPY ./local_models/custom_aurora /app/local_models/custom_aurora
+
+# Update settings.yaml
+model:
+  model_repo: "/app/local_models/custom_aurora"
+  checkpoint: "custom_model.ckpt"
+```
+
+#### 8.2 Multi-GPU Setup
+
+**For Multiple GPUs:**
+```yaml
+# settings.yaml
+model:
+  device: "cuda:0"  # Specify GPU
+  multi_gpu: true
+  gpu_ids: [0, 1]   # Use multiple GPUs
+```
+
+**Docker Configuration:**
+```bash
+# Run with multiple GPUs
+docker run --gpus '"device=0,1"' \
+  -p 8000:8000 \
+  weather-inference-service:latest
+```
+
+#### 8.3 Scaling & Load Balancing
+
+**Multiple Endpoints:**
+```bash
+# Deploy multiple RunPod endpoints
+# Use load balancer or round-robin in miner
+WEATHER_INFERENCE_SERVICE_URL="https://api.runpod.ai/v2/endpoint-1/run,https://api.runpod.ai/v2/endpoint-2/run"
+```
+
+**Auto-scaling:**
+```bash
+# Configure RunPod auto-scaling
+# Set min/max workers
+# Configure scale-up/down policies
+```
+
+---
+
+### Step 9: Security Best Practices
+
+#### 9.1 API Key Management
+
+```bash
+# Generate secure API keys
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# Rotate keys regularly
+# Use different keys for different environments
+# Store keys securely (not in code)
+```
+
+#### 9.2 Network Security
+
+```bash
+# Restrict access to inference service
+# Use VPN or private networks when possible
+# Monitor access logs
+# Implement rate limiting
+```
+
+#### 9.3 Container Security
+
+```bash
+# Use minimal base images
+# Scan for vulnerabilities
+docker scan weather-inference-service:latest
+
+# Run as non-root user
+USER 1000:1000
+
+# Limit container capabilities
+--cap-drop=ALL --cap-add=SYS_NICE
+```
+
+---
+
+### Step 10: Cost Optimization
+
+#### 10.1 RunPod Cost Management
+
+**Serverless vs Dedicated:**
+```bash
+# Serverless: Pay per inference
+# - Good for: Variable workload
+# - Cost: $0.50-2.00 per hour of GPU time
+
+# Dedicated Pod: Fixed hourly rate
+# - Good for: Consistent workload
+# - Cost: $0.30-1.50 per hour continuous
+```
+
+**GPU Selection:**
+```bash
+# Cost-effective options:
+RTX 3090: ~$0.30/hour (24GB VRAM)
+RTX 4090: ~$0.50/hour (24GB VRAM, faster)
+A5000: ~$0.70/hour (24GB VRAM, professional)
+
+# High-performance options:
+A6000: ~$1.00/hour (48GB VRAM)
+H100: ~$2.00/hour (80GB VRAM, fastest)
+```
+
+#### 10.2 Storage Optimization
+
+**R2 Storage Costs:**
+```bash
+# Storage: $0.015/GB/month
+# Requests: $0.36/million requests
+# Egress: Free (major advantage over S3)
+
+# Optimization strategies:
+# - Compress forecast data
+# - Implement data lifecycle policies
+# - Clean up old forecasts automatically
+```
+
+#### 10.3 Monitoring & Alerts
+
+```bash
+# Set up cost alerts
+# Monitor inference frequency
+# Track storage usage
+# Optimize based on usage patterns
+```
+
+---
+
+This comprehensive guide covers everything needed to set up a production-ready weather inference service, from initial Docker build to advanced scaling and optimization strategies. 

@@ -345,6 +345,21 @@ class GaiaValidator:
         # Add lock for miner table operations
         self.miner_table_lock = asyncio.Lock()
 
+        # Memory monitoring configuration
+        self.memory_monitor_enabled = os.getenv('VALIDATOR_MEMORY_MONITORING_ENABLED', 'true').lower() in ['true', '1', 'yes']
+        self.pm2_restart_enabled = os.getenv('VALIDATOR_PM2_RESTART_ENABLED', 'true').lower() in ['true', '1', 'yes']
+        
+        # Memory thresholds in MB - higher defaults for validators (24GB = 24576MB)
+        self.memory_warning_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_WARNING_THRESHOLD_MB', '16000'))  # 16GB
+        self.memory_emergency_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB', '20000'))  # 20GB  
+        self.memory_critical_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB', '24000'))  # 24GB
+        
+        # Memory monitoring state
+        self.last_memory_log_time = 0
+        self.memory_log_interval = 300  # Log memory status every 5 minutes
+        self.last_emergency_gc_time = 0
+        self.emergency_gc_cooldown = 60  # Minimum 60 seconds between emergency GC attempts
+
         self.basemodel_evaluator = BaseModelEvaluator(
             db_manager=self.database_manager,
             test_mode=self.args.test if hasattr(self.args, 'test') else False
@@ -1298,6 +1313,25 @@ class GaiaValidator:
         if not self.watchdog_running:
             self.watchdog_running = True
             logger.info("Started watchdog")
+            
+            # Log memory monitoring configuration
+            if self.memory_monitor_enabled:
+                try:
+                    import psutil
+                    system_memory = psutil.virtual_memory()
+                    logger.info(f"🔍 Validator memory monitoring enabled:")
+                    logger.info(f"  System memory: {system_memory.total / (1024**3):.1f} GB total, {system_memory.available / (1024**3):.1f} GB available")
+                    logger.info(f"  Memory thresholds: Warning={self.memory_warning_threshold_mb}MB, Emergency={self.memory_emergency_threshold_mb}MB, Critical={self.memory_critical_threshold_mb}MB")
+                    logger.info(f"  PM2 restart enabled: {self.pm2_restart_enabled}")
+                    if self.pm2_restart_enabled:
+                        pm2_id = os.getenv('pm2_id', 'not detected')
+                        logger.info(f"  PM2 instance ID: {pm2_id}")
+                except ImportError:
+                    logger.warning("psutil not available - memory monitoring will be disabled")
+                    self.memory_monitor_enabled = False
+            else:
+                logger.info("Validator memory monitoring disabled by configuration")
+            
             asyncio.create_task(self._watchdog_loop())
 
     async def _watchdog_loop(self):
@@ -1330,6 +1364,18 @@ class GaiaValidator:
         """Perform a single watchdog check iteration."""
         try:
             current_time = time.time()
+            
+            # Memory monitoring check (first priority)
+            if self.memory_monitor_enabled:
+                try:
+                    await asyncio.wait_for(
+                        self._check_memory_usage(current_time),
+                        timeout=5  # 5 second timeout for memory check
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Memory usage check timed out")
+                except Exception as e:
+                    logger.error(f"Error checking memory usage: {e}")
             
             # Update resource usage for all active tasks
             try:
@@ -1368,6 +1414,149 @@ class GaiaValidator:
         except Exception as e:
             logger.error(f"Error in watchdog check: {e}")
             logger.error(traceback.format_exc())
+
+    async def _check_memory_usage(self, current_time):
+        """Check overall validator memory usage and trigger restart if needed."""
+        try:
+            import psutil
+            import gc
+            
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / (1024 * 1024)
+            
+            system_memory = psutil.virtual_memory()
+            system_percent = system_memory.percent
+            
+            # Regular memory status logging
+            if current_time - self.last_memory_log_time > self.memory_log_interval:
+                logger.info(f"🔍 Validator memory status: {memory_mb:.1f} MB RSS ({system_percent:.1f}% system memory)")
+                self.last_memory_log_time = current_time
+            
+            # Check if we're in a critical operation that shouldn't be interrupted
+            critical_operations_active = self._check_critical_operations_active()
+            
+            # Memory threshold checks
+            if memory_mb > self.memory_critical_threshold_mb:
+                logger.error(f"💀 CRITICAL MEMORY: {memory_mb:.1f} MB - OOM imminent! (threshold: {self.memory_critical_threshold_mb} MB)")
+                
+                if critical_operations_active:
+                    logger.warning(f"⚠️  Critical operations active: {critical_operations_active}. Delaying restart until operations complete.")
+                    # Try emergency GC but don't restart yet
+                    if current_time - self.last_emergency_gc_time > self.emergency_gc_cooldown:
+                        logger.error("Attempting emergency garbage collection while critical operations are active...")
+                        collected = gc.collect()
+                        logger.error(f"Emergency GC freed {collected} objects")
+                        self.last_emergency_gc_time = current_time
+                else:
+                    logger.error("Attempting emergency garbage collection before potential restart...")
+                    try:
+                        collected = gc.collect()
+                        logger.error(f"Emergency GC freed {collected} objects")
+                        await asyncio.sleep(2)  # Brief pause after emergency GC
+                        
+                        # Check memory again after GC
+                        post_gc_memory = process.memory_info().rss / (1024 * 1024)
+                        if post_gc_memory > (self.memory_critical_threshold_mb * 0.9):  # Still >90% of critical
+                            if self.pm2_restart_enabled:
+                                logger.error(f"🔄 TRIGGERING PM2 RESTART: Memory still critical after GC ({post_gc_memory:.1f} MB)")
+                                await self._trigger_pm2_restart("Critical memory pressure after GC")
+                                return  # Exit the monitoring
+                            else:
+                                logger.error(f"💀 MEMORY CRITICAL BUT PM2 RESTART DISABLED: {post_gc_memory:.1f} MB - system may be killed by OOM")
+                        else:
+                            logger.info(f"✅ Memory reduced to {post_gc_memory:.1f} MB after GC - continuing")
+                    except Exception as gc_err:
+                        logger.error(f"Emergency GC failed: {gc_err}")
+                        if self.pm2_restart_enabled and not critical_operations_active:
+                            await self._trigger_pm2_restart("Emergency GC failed and memory critical")
+                            return
+                        else:
+                            logger.error("💀 GC FAILED AND RESTART CONDITIONS NOT MET - system may crash")
+                            
+            elif memory_mb > self.memory_emergency_threshold_mb:
+                logger.warning(f"🚨 EMERGENCY MEMORY PRESSURE: {memory_mb:.1f} MB - OOM risk HIGH! (threshold: {self.memory_emergency_threshold_mb} MB)")
+                # Try light GC at emergency level
+                if current_time - self.last_emergency_gc_time > self.emergency_gc_cooldown:
+                    collected = gc.collect()
+                    logger.warning(f"Emergency light GC collected {collected} objects")
+                    self.last_emergency_gc_time = current_time
+                    
+            elif memory_mb > self.memory_warning_threshold_mb:
+                # Only log warning once per interval to avoid spam
+                if current_time - self.last_memory_log_time > (self.memory_log_interval / 2):  # Half interval for warnings
+                    logger.warning(f"🟡 HIGH MEMORY: Validator process using {memory_mb:.1f} MB ({system_percent:.1f}% of system) (threshold: {self.memory_warning_threshold_mb} MB)")
+                    
+        except ImportError:
+            if self.memory_monitor_enabled:
+                logger.warning("psutil not available - memory monitoring disabled")
+                self.memory_monitor_enabled = False
+        except Exception as e:
+            logger.error(f"Error in memory monitoring: {e}", exc_info=True)
+
+    def _check_critical_operations_active(self):
+        """Check if any critical operations are currently active that shouldn't be interrupted."""
+        critical_ops = []
+        
+        for task_name, health in self.task_health.items():
+            if health['status'] in ['processing'] and health.get('current_operation'):
+                # Define critical operations that shouldn't be interrupted
+                critical_operation_patterns = [
+                    'weight_setting',  # Never interrupt weight setting
+                    'miner_query',     # Don't interrupt while querying miners
+                    'scoring',         # Don't interrupt scoring calculations
+                    'db_sync',         # Don't interrupt database sync
+                    'data_fetch',      # Don't interrupt data fetching
+                ]
+                
+                current_op = health.get('current_operation', '')
+                if any(pattern in current_op for pattern in critical_operation_patterns):
+                    critical_ops.append(f"{task_name}:{current_op}")
+        
+        return critical_ops
+
+    async def _trigger_pm2_restart(self, reason: str):
+        """Trigger a controlled PM2 restart for the validator."""
+        if not self.pm2_restart_enabled:
+            logger.error(f"🚨 PM2 restart disabled - would restart for: {reason}")
+            return
+            
+        logger.error(f"🔄 TRIGGERING CONTROLLED PM2 RESTART: {reason}")
+        
+        try:
+            # Try graceful shutdown first
+            logger.info("Attempting graceful shutdown before restart...")
+            
+            # Stop any ongoing tasks
+            try:
+                await self.cleanup_resources()
+                logger.info("Validator cleanup completed")
+            except Exception as e:
+                logger.warning(f"Error during validator cleanup: {e}")
+            
+            # Force garbage collection one more time
+            import gc
+            collected = gc.collect()
+            logger.info(f"Final GC before restart collected {collected} objects")
+            
+            # Check if we're running under PM2
+            pm2_instance_id = os.getenv('pm2_id')
+            if pm2_instance_id:
+                logger.info(f"Running under PM2 instance {pm2_instance_id} - triggering restart...")
+                # Use pm2 restart command
+                import subprocess
+                subprocess.Popen(['pm2', 'restart', pm2_instance_id])
+            else:
+                logger.warning("Not running under PM2 - triggering system exit")
+                # If not under pm2, exit gracefully
+                import sys
+                sys.exit(1)
+                
+        except Exception as e:
+            logger.error(f"Error during controlled restart: {e}")
+            # Last resort - force exit
+            import sys
+            sys.exit(1)
 
     async def _check_resource_usage(self, current_time):
         """Check resource usage for active tasks."""

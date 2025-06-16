@@ -1,5 +1,6 @@
 aiohttp
 asyncpg
+alembic
 boto3
 botocore
 cryptography
