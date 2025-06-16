@@ -383,7 +383,7 @@ async def get_smap_data_for_sentinel_bounds(filepath, sentinel_bounds_tuple, sen
         return None
 
 
-def test_smap_download():
+async def test_smap_download():
     """
     Test SMAP download with sample bounds
     """
@@ -399,27 +399,31 @@ def test_smap_download():
     print(f"Date: {test_datetime}")
     print(f"Bounds: {test_bounds}")
     print(f"CRS: {test_crs}")
-    smap_data = get_smap_data(test_datetime, test_bounds, test_crs)
+    test_regions = [{"bounds": test_bounds, "crs": test_crs}]
+    smap_data = await get_smap_data(test_datetime, test_regions)
 
     if smap_data:
+        # Get the first region's data
+        region_data = smap_data["region_0"]
+        
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        im1 = ax1.imshow(smap_data["surface_sm"])
+        im1 = ax1.imshow(region_data["surface_sm"])
         ax1.set_title("Surface Soil Moisture")
         plt.colorbar(im1, ax=ax1)
-        im2 = ax2.imshow(smap_data["rootzone_sm"])
+        im2 = ax2.imshow(region_data["rootzone_sm"])
         ax2.set_title("Root Zone Soil Moisture")
         plt.colorbar(im2, ax=ax2)
         plt.tight_layout()
         plt.show()
 
         print("\nData shapes:")
-        print(f"Surface data shape: {smap_data['surface_sm'].shape}")
+        print(f"Surface data shape: {region_data['surface_sm'].shape}")
         print("\nData ranges:")
         print(
-            f"Surface data range: {np.nanmin(smap_data['surface_sm']):.3f} to {np.nanmax(smap_data['surface_sm']):.3f}"
+            f"Surface data range: {np.nanmin(region_data['surface_sm']):.3f} to {np.nanmax(region_data['surface_sm']):.3f}"
         )
         print(
-            f"Rootzone data range: {np.nanmin(smap_data['rootzone_sm']):.3f} to {np.nanmax(smap_data['rootzone_sm']):.3f}"
+            f"Rootzone data range: {np.nanmin(region_data['rootzone_sm']):.3f} to {np.nanmax(region_data['rootzone_sm']):.3f}"
         )
     else:
         print("Failed to get SMAP data")

@@ -929,7 +929,14 @@ class SoilMoistureTask(Task):
                 temp_path = None
                 try:
                     logger.info(f"Processing tasks for target_time: {target_time}")
-                    smap_data_result = await get_smap_data(target_time, tasks_in_time_window)
+                    # Transform tasks into the format expected by get_smap_data
+                    regions_for_smap = []
+                    for task in tasks_in_time_window:
+                        regions_for_smap.append({
+                            "bounds": task["sentinel_bounds"],
+                            "crs": task["sentinel_crs"]
+                        })
+                    smap_data_result = await get_smap_data(target_time, regions_for_smap)
                     
                     if smap_data_result is None or not isinstance(smap_data_result, dict):
                         logger.error(f"Failed to download or process SMAP data for {target_time}")
