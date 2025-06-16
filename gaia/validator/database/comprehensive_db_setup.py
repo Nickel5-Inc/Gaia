@@ -605,18 +605,76 @@ class ComprehensiveDatabaseSetup:
             logger.info(f"✅ PostgreSQL service '{service_name}' is already active.")
             return True
 
-        # If the service is not active, try starting it.
-        logger.info(f"Service '{service_name}' is not running. Attempting to start...")
-        start_success, _, start_stderr = await self._run_command(['sudo', 'systemctl', 'start', service_name])
+        # Check the service status for more detailed diagnostics
+        logger.info(f"Service '{service_name}' is not running. Checking status...")
+        status_success, status_stdout, status_stderr = await self._run_command(['sudo', 'systemctl', 'status', service_name])
+        
+        # Log the status for debugging
+        if status_stdout:
+            logger.info(f"📊 Service status: {status_stdout}")
+        if status_stderr:
+            logger.warning(f"📊 Service status stderr: {status_stderr}")
+
+        # Try starting the service
+        logger.info(f"Attempting to start service '{service_name}'...")
+        start_success, start_stdout, start_stderr = await self._run_command(['sudo', 'systemctl', 'start', service_name])
         
         if start_success:
-            await asyncio.sleep(2) # Give it a moment to initialize.
-            logger.info(f"✅ Service '{service_name}' started successfully.")
-            return True
+            await asyncio.sleep(3) # Give it a moment to initialize
+            
+            # Verify it's actually running
+            is_active_after_start, _, _ = await self._run_command(['sudo', 'systemctl', 'is-active', service_name])
+            if is_active_after_start:
+                logger.info(f"✅ Service '{service_name}' started successfully.")
+                return True
+            else:
+                logger.warning(f"Service '{service_name}' start command succeeded but service is not active.")
         
-        # If starting failed, the unit is likely broken. This is a corruption symptom.
+        # If starting failed, diagnose the issue before jumping to aggressive repair
         logger.warning(f"Failed to start PostgreSQL service: {start_stderr}")
-        logger.error("🚨 Service start failed, indicating a corrupt or misconfigured cluster. Attempting aggressive repair...")
+        
+        # Check if it's a configuration issue vs corruption
+        logger.info("🔍 Diagnosing PostgreSQL startup failure...")
+        
+        # Check if data directory exists and has correct permissions
+        data_dir = Path(self.config.data_directory)
+        if not data_dir.exists():
+            logger.warning(f"PostgreSQL data directory does not exist: {data_dir}")
+            logger.info("🔧 This appears to be a missing cluster, not corruption. Initializing fresh cluster...")
+            return await self._initialize_fresh_cluster()
+        
+        # Check if postgresql.conf exists
+        config_file = Path(self.config.config_directory) / "postgresql.conf"
+        if not config_file.exists():
+            logger.warning(f"PostgreSQL config file does not exist: {config_file}")
+            logger.info("🔧 This appears to be a missing configuration, not corruption. Initializing fresh cluster...")
+            return await self._initialize_fresh_cluster()
+        
+        # Check PostgreSQL logs for more specific error information
+        log_success, log_output, _ = await self._run_command(['sudo', 'journalctl', '-u', service_name, '--no-pager', '-n', '20'])
+        if log_success and log_output:
+            logger.info(f"📋 Recent PostgreSQL logs:\n{log_output}")
+            
+            # Look for specific error patterns that indicate corruption vs configuration issues
+            if any(pattern in log_output.lower() for pattern in ['permission denied', 'could not open file', 'no such file']):
+                logger.warning("🔍 Detected permission or missing file issues - attempting ownership fix...")
+                
+                # Try fixing ownership first
+                chown_success, _, _ = await self._run_command(['sudo', 'chown', '-R', 'postgres:postgres', str(data_dir)])
+                chmod_success, _, _ = await self._run_command(['sudo', 'chmod', '-R', '700', str(data_dir)])
+                
+                if chown_success and chmod_success:
+                    logger.info("🔧 Fixed data directory ownership. Retrying service start...")
+                    retry_success, _, _ = await self._run_command(['sudo', 'systemctl', 'start', service_name])
+                    if retry_success:
+                        await asyncio.sleep(3)
+                        is_active_retry, _, _ = await self._run_command(['sudo', 'systemctl', 'is-active', service_name])
+                        if is_active_retry:
+                            logger.info("✅ Service started successfully after ownership fix.")
+                            return True
+        
+        # Only resort to aggressive repair if other methods failed
+        logger.error("🚨 Service start failed after diagnostics and simple fixes. Attempting aggressive repair as last resort...")
         
         repaired = await self._remove_and_recreate_cluster()
         if repaired:
@@ -659,10 +717,24 @@ class ComprehensiveDatabaseSetup:
         
         for service in service_candidates:
             try:
+                # First check if the service unit file exists (more comprehensive than list-units)
+                success, stdout, stderr = await self._run_command(['systemctl', 'cat', f'{service}.service'])
+                if success:
+                    logger.info(f"Detected PostgreSQL service: {service}")
+                    return service
+                
+                # Fallback: check if it appears in list-units (for running services)
                 success, stdout, stderr = await self._run_command(['systemctl', 'list-units', '--type=service', f'{service}.service'])
                 if success and service in stdout:
                     logger.info(f"Detected PostgreSQL service: {service}")
                     return service
+                    
+                # Also check list-unit-files for installed but not loaded services
+                success, stdout, stderr = await self._run_command(['systemctl', 'list-unit-files', f'{service}.service'])
+                if success and service in stdout:
+                    logger.info(f"Detected PostgreSQL service: {service}")
+                    return service
+                    
             except Exception:
                 continue
         

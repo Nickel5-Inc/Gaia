@@ -4369,10 +4369,11 @@ pg1-user={self.config['pguser']}
             if test_process.returncode == 0:
                 logger.info("✅ Basic database connectivity test passed.")
                 
-                # Additional test: check if we can connect to the gaia database
+                # Additional test: check if we can connect to the configured database
                 try:
-                    logger.info("🔍 Testing Gaia database connection...")
-                    gaia_cmd = ['sudo', '-u', 'postgres', 'psql', '-d', 'gaia', '-c', 'SELECT COUNT(*) FROM information_schema.tables;']
+                    db_name = self.config.get('database_name', 'validator_db')
+                    logger.info(f"🔍 Testing {db_name} database connection...")
+                    gaia_cmd = ['sudo', '-u', 'postgres', 'psql', '-d', db_name, '-c', 'SELECT COUNT(*) FROM information_schema.tables;']
                     gaia_process = await asyncio.wait_for(
                         asyncio.create_subprocess_exec(
                             *gaia_cmd,
@@ -4384,15 +4385,15 @@ pg1-user={self.config['pguser']}
                     gaia_stdout, gaia_stderr = await gaia_process.communicate()
                     
                     if gaia_process.returncode == 0:
-                        logger.info("✅ Gaia database connectivity test passed.")
+                        logger.info(f"✅ {db_name} database connectivity test passed.")
                     else:
-                        logger.warning(f"⚠️ Gaia database test failed: {gaia_stderr.decode()}")
+                        logger.warning(f"⚠️ {db_name} database test failed: {gaia_stderr.decode()}")
                         # Don't fail the overall test for this, as the database might still be recovering
                         
                 except asyncio.TimeoutError:
-                    logger.warning("⚠️ Gaia database connectivity test timed out")
+                    logger.warning(f"⚠️ {db_name} database connectivity test timed out")
                 except Exception as e:
-                    logger.warning(f"⚠️ Gaia database connectivity test error: {e}")
+                    logger.warning(f"⚠️ {db_name} database connectivity test error: {e}")
                 
                 logger.info("✅ Database connectivity verified")
                 return True
