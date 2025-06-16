@@ -1711,9 +1711,10 @@ pg1-user={self.config['pguser']}
                     logger.info("🚀 REPLICA STARTUP: Initial sync requested. Attempting to restore from latest backup...")
                     restore_success = await self.restore_from_backup()
                     if not restore_success:
-                        logger.critical("💥 Initial replica sync FAILED. The validator cannot start with a stale database. Please resolve the issue and restart.")
-                        # Prevent further scheduling since startup sync failed
-                        return
+                        logger.error("❌ Initial replica sync FAILED. The validator will continue with existing database.")
+                        logger.warning("⚠️ WARNING: Database may be stale. Replica sync will retry automatically.")
+                        logger.warning("💡 To resolve: Check PostgreSQL status and pgBackRest configuration.")
+                        # Continue with scheduling even if initial sync failed - the replica sync scheduler will retry
                     else:
                         logger.info("✅ Initial replica sync successful. Continuing with normal operation.")
                 else:
@@ -2451,17 +2452,72 @@ pg1-user={self.config['pguser']}
         logger.info(f"   - Running delta restore command: {' '.join(delta_restore_cmd)}")
         
         success = False
+        stderr = ""
         try:
             success, _, stderr = await self._run_postgres_command_with_logging(
                 delta_restore_cmd, timeout=7200, description="pgBackRest delta restore"
             )
+            
+            # Even if the command returns success, check for corruption indicators in stderr
+            if success and stderr and ("FileMissingError" in stderr or "unable to open missing file" in stderr):
+                logger.error("❌ Restore reported success but detected missing files in backup - treating as failure")
+                success = False
+                
         except asyncio.TimeoutError:
             logger.error("❌ Restore process timed out after 2 hours and was killed.")
             success = False
 
         if not success:
-            logger.error("❌ Delta restore failed. This may indicate a corrupted local directory.")
-            logger.info("🔥 Attempting a full, clean restore as a fallback...")
+            if "FileMissingError" in stderr or "unable to open missing file" in stderr:
+                logger.error("❌ Delta restore failed due to missing files in backup - backup appears corrupted.")
+                logger.warning("⚠️ This indicates the backup in R2 storage is incomplete or corrupted.")
+                logger.info("🔍 Checking for alternative backups...")
+                
+                # Try to get backup info to see if there are other backups available
+                info_cmd = ['sudo', '-u', postgres_user, 'pgbackrest', f'--stanza={stanza_name}', 'info']
+                info_success, info_stdout, info_stderr = await self._run_postgres_command_with_logging(
+                    info_cmd, timeout=60, description="pgBackRest backup info"
+                )
+                
+                if info_success and info_stdout:
+                    logger.info(f"📊 Available backups:\n{info_stdout}")
+                    
+                    # Try to restore from an older backup first
+                    import re
+                    backup_lines = [line for line in info_stdout.split('\n') if 'full backup:' in line or 'diff backup:' in line]
+                    if len(backup_lines) > 1:
+                        # Extract backup set from second line (older backup)
+                        backup_match = re.search(r'(\d{8}-\d{6}F(?:_\d{8}-\d{6}[DI])?)', backup_lines[1])
+                        if backup_match:
+                            older_backup = backup_match.group(1)
+                            logger.info(f"🎯 Attempting restore from older backup: {older_backup}")
+                            
+                            older_restore_cmd = [
+                                'sudo', '-u', postgres_user, 'pgbackrest',
+                                f'--stanza={stanza_name}',
+                                f'--set={older_backup}',
+                                '--delta', '--force', 'restore'
+                            ]
+                            
+                            older_success, _, older_stderr = await self._run_postgres_command_with_logging(
+                                older_restore_cmd, timeout=7200, description="pgBackRest older backup restore"
+                            )
+                            
+                            if older_success and not ("FileMissingError" in older_stderr or "unable to open missing file" in older_stderr):
+                                logger.warning("⚠️ Successfully restored from older backup due to corruption in latest backup")
+                                logger.warning("💡 Consider investigating backup integrity on primary node")
+                                # Skip the full restore fallback since we succeeded with older backup
+                                success = True
+                            else:
+                                logger.error(f"❌ Older backup restore also failed: {older_stderr}")
+                
+                if not success:
+                    logger.error("❌ All available backups appear corrupted. Attempting full clean restore as last resort...")
+            else:
+                logger.error("❌ Delta restore failed. This may indicate a corrupted local directory.")
+            
+            if not success:
+                logger.info("🔥 Attempting a full, clean restore as a fallback...")
             
             try:
                 await self._stop_postgresql_service() # Ensure it's stopped before wipe
@@ -2493,6 +2549,11 @@ pg1-user={self.config['pguser']}
                 return False
             
         # If we are here, either the initial delta or the fallback full restore succeeded.
+        # But let's double-check that we actually succeeded
+        if not success:
+            logger.error("❌ All restore attempts failed. Database is in an inconsistent state.")
+            return False
+            
         logger.info("✅ Restore process finished successfully.")
             
         logger.info("📋 Step 5a: Re-applying local configurations post-restore...")
@@ -2511,6 +2572,52 @@ pg1-user={self.config['pguser']}
         logger.info("📋 Step 7: Testing database connectivity...")
         if not await self._test_database_connection():
             logger.error("❌ Failed to test database connectivity after restore.")
+            
+            # Try additional recovery steps
+            logger.info("🔧 Attempting additional recovery steps...")
+            
+            # Check if PostgreSQL data directory has correct permissions
+            try:
+                data_dir = self.config.get('pgdata_path', '/var/lib/postgresql/14/main')
+                logger.info(f"🔍 Checking permissions on data directory: {data_dir}")
+                
+                # Fix ownership
+                chown_cmd = ['sudo', 'chown', '-R', 'postgres:postgres', data_dir]
+                process = await asyncio.create_subprocess_exec(*chown_cmd)
+                await process.wait()
+                
+                # Fix permissions
+                chmod_cmd = ['sudo', 'chmod', '-R', '700', data_dir]
+                process = await asyncio.create_subprocess_exec(*chmod_cmd)
+                await process.wait()
+                
+                logger.info("✅ Fixed data directory permissions")
+                
+                # Try one more restart
+                logger.info("🔄 Attempting final PostgreSQL restart after permission fix...")
+                if await self._restart_postgresql_service('postgresql'):
+                    logger.info("⏳ Waiting 10 seconds for PostgreSQL to fully initialize...")
+                    await asyncio.sleep(10)
+                    
+                    # Final connectivity test
+                    if await self._test_database_connection():
+                        logger.info("🎉 Database connectivity restored after permission fix!")
+                        return True
+                    else:
+                        logger.error("❌ Database still not accessible after permission fix")
+                else:
+                    logger.error("❌ Final PostgreSQL restart failed")
+                    
+            except Exception as e:
+                logger.error(f"❌ Error during additional recovery steps: {e}")
+            
+            logger.critical("💥 All recovery attempts failed. Manual intervention required.")
+            logger.critical("💡 Possible solutions:")
+            logger.critical("   1. Check PostgreSQL logs: sudo journalctl -u postgresql -f")
+            logger.critical("   2. Verify data directory permissions: ls -la /var/lib/postgresql/")
+            logger.critical("   3. Check if PostgreSQL is running: systemctl status postgresql")
+            logger.critical("   4. Try manual restart: sudo systemctl restart postgresql")
+            
             return False
 
         logger.info("🎉 Restore from backup process completed successfully!")
@@ -4064,23 +4171,119 @@ pg1-user={self.config['pguser']}
             return False
 
     async def _test_database_connection(self):
-        """Test database connectivity after re-applying local configurations."""
+        """Test database connectivity after re-applying local configurations with comprehensive checks."""
+        logger.info("🔍 Testing database connectivity...")
+        
+        # First, wait for PostgreSQL socket to be available
+        socket_path = "/var/run/postgresql/.s.PGSQL.5432"
+        max_wait_time = 60  # seconds
+        wait_interval = 2   # seconds
+        
+        logger.info(f"⏳ Waiting for PostgreSQL socket {socket_path} to be available...")
+        for attempt in range(max_wait_time // wait_interval):
+            if os.path.exists(socket_path):
+                logger.info(f"✅ PostgreSQL socket found after {attempt * wait_interval} seconds")
+                break
+            await asyncio.sleep(wait_interval)
+        else:
+            logger.error(f"❌ PostgreSQL socket {socket_path} not found after {max_wait_time} seconds")
+            
+            # Check if PostgreSQL processes are running
+            try:
+                ps_result = await asyncio.create_subprocess_shell(
+                    'ps aux | grep postgres | grep -v grep',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                ps_stdout, _ = await ps_result.communicate()
+                logger.info(f"PostgreSQL processes:\n{ps_stdout.decode()}")
+            except Exception as e:
+                logger.warning(f"Failed to check PostgreSQL processes: {e}")
+            
+            # Check PostgreSQL service status
+            try:
+                status_result = await asyncio.create_subprocess_exec(
+                    'systemctl', 'status', 'postgresql',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                status_stdout, status_stderr = await status_result.communicate()
+                logger.info(f"PostgreSQL service status:\n{status_stdout.decode()}")
+                if status_stderr:
+                    logger.warning(f"PostgreSQL service status stderr:\n{status_stderr.decode()}")
+            except Exception as e:
+                logger.warning(f"Failed to check PostgreSQL service status: {e}")
+            
+            # Try to restart PostgreSQL one more time
+            logger.info("🔄 Attempting final PostgreSQL restart...")
+            restart_success = await self._restart_postgresql_service('postgresql')
+            if not restart_success:
+                logger.error("❌ Final PostgreSQL restart failed")
+                return False
+            
+            # Wait a bit more for the socket after restart
+            logger.info("⏳ Waiting for socket after restart...")
+            for attempt in range(15):  # 30 seconds max
+                if os.path.exists(socket_path):
+                    logger.info(f"✅ PostgreSQL socket found after restart in {attempt * 2} seconds")
+                    break
+                await asyncio.sleep(2)
+            else:
+                logger.error("❌ PostgreSQL socket still not available after restart")
+                return False
+        
+        # Now test the actual database connection
         try:
-            logger.info("🔍 Testing database connectivity...")
+            logger.info("🔍 Testing basic database connection...")
+            # Test basic connection with timeout
             test_cmd = ['sudo', '-u', 'postgres', 'psql', '-c', 'SELECT 1;']
-            test_process = await asyncio.create_subprocess_exec(
-                *test_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            test_process = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *test_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                ),
+                timeout=30.0
             )
             test_stdout, test_stderr = await test_process.communicate()
             
-            if test_process.returncode != 0:
+            if test_process.returncode == 0:
+                logger.info("✅ Basic database connectivity test passed.")
+                
+                # Additional test: check if we can connect to the gaia database
+                try:
+                    logger.info("🔍 Testing Gaia database connection...")
+                    gaia_cmd = ['sudo', '-u', 'postgres', 'psql', '-d', 'gaia', '-c', 'SELECT COUNT(*) FROM information_schema.tables;']
+                    gaia_process = await asyncio.wait_for(
+                        asyncio.create_subprocess_exec(
+                            *gaia_cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        ),
+                        timeout=30.0
+                    )
+                    gaia_stdout, gaia_stderr = await gaia_process.communicate()
+                    
+                    if gaia_process.returncode == 0:
+                        logger.info("✅ Gaia database connectivity test passed.")
+                    else:
+                        logger.warning(f"⚠️ Gaia database test failed: {gaia_stderr.decode()}")
+                        # Don't fail the overall test for this, as the database might still be recovering
+                        
+                except asyncio.TimeoutError:
+                    logger.warning("⚠️ Gaia database connectivity test timed out")
+                except Exception as e:
+                    logger.warning(f"⚠️ Gaia database connectivity test error: {e}")
+                
+                logger.info("✅ Database connectivity verified")
+                return True
+            else:
                 logger.error(f"❌ Database connectivity test failed: {test_stderr.decode()}")
                 return False
-            
-            logger.info("✅ Database connectivity verified")
-            return True
+                
+        except asyncio.TimeoutError:
+            logger.error("❌ Database connectivity test timed out after 30 seconds")
+            return False
         except Exception as e:
             logger.error(f"❌ Error testing database connectivity: {e}")
             return False
