@@ -59,6 +59,10 @@ class AutoSyncManager:
         """
         self.test_mode = test_mode
         
+        # Get current system user
+        import getpass
+        self.current_user = getpass.getuser()
+        
         # Perform system detection first
         self.system_info = self._detect_system_configuration()
         logger.info(f"🔍 System Detection Results: {self.system_info}")
