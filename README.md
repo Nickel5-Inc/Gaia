@@ -148,6 +148,113 @@ fiber-post-ip --netuid <NETUID> --external_ip <YOUR_IP> --external_port <YOUR_PO
 - Further instructions are linked below, but ensure that you start the miner with the `--port` argument pointing to the FORWARDING/INTERNAL port configured in the proxy server script above.
 
 
+## Database Synchronization (Validators)
+
+**🚀 NEW: Automated Database Sync System**
+
+Gaia now includes a streamlined database synchronization system that eliminates manual pgBackRest configuration and provides application-controlled backup scheduling. This system automatically sets up and manages database backups to Cloudflare R2 storage.
+
+### Key Benefits
+
+✅ **One-command setup** - No more manual pgbackrest configuration  
+✅ **Application-controlled scheduling** - No cron jobs needed, easily configurable  
+✅ **Automated recovery** - Self-healing backup system  
+✅ **Simplified replica setup** - No manual IP coordination required  
+✅ **Real-time monitoring** - Health checks and status reporting  
+
+### Quick Setup
+
+#### 1. Configure Environment Variables
+
+Add these to your `.env` file:
+
+```bash
+# Required for R2 backup storage
+PGBACKREST_R2_BUCKET=your-backup-bucket-name
+PGBACKREST_R2_ENDPOINT=https://your-account-id.r2.cloudflarestorage.com
+PGBACKREST_R2_ACCESS_KEY_ID=your-r2-access-key
+PGBACKREST_R2_SECRET_ACCESS_KEY=your-r2-secret-key
+
+# Optional - defaults shown
+PGBACKREST_STANZA_NAME=gaia
+PGBACKREST_R2_REGION=auto
+PGBACKREST_PGDATA=/var/lib/postgresql/data
+PGBACKREST_PGPORT=5432
+PGBACKREST_PGUSER=postgres
+
+# Set to True for primary node, False for replica
+IS_SOURCE_VALIDATOR_FOR_DB_SYNC=True
+```
+
+#### 2. Run Automated Setup
+
+**Primary Node (creates backups):**
+```bash
+sudo python gaia/validator/sync/setup_auto_sync.py --primary
+```
+
+**Replica Node (restores from backups):**
+```bash
+sudo python gaia/validator/sync/setup_auto_sync.py --replica
+```
+
+**Test Mode (faster setup, shorter retention):**
+```bash
+sudo python gaia/validator/sync/setup_auto_sync.py --primary --test
+```
+
+#### 3. The System is Ready!
+
+- **Primary nodes** automatically create backups (full daily at 2 AM, differential every 4 hours)
+- **Replica nodes** can restore with a simple command
+- **All scheduling happens in the application** - no cron jobs to manage
+- **Health monitoring** runs continuously with automatic recovery
+
+### Advanced Operations
+
+**Check backup status:**
+```python
+from gaia.validator.sync.auto_sync_manager import *
+import asyncio
+asyncio.run(check_status())
+```
+
+**Restore from latest backup (replicas):**
+```python
+from gaia.validator.sync.auto_sync_manager import *
+import asyncio
+asyncio.run(restore_latest())
+```
+
+**Change backup schedule dynamically:**
+```python
+# No need to edit cron - just update in the application
+manager.update_schedule({
+    'full_backup_time': '03:00',
+    'diff_backup_interval': 6  # Every 6 hours instead of 4
+})
+```
+
+### Migration from Legacy System
+
+If you're currently using the manual pgBackRest setup, the new system will:
+- ✅ Detect existing configuration and work alongside it
+- ✅ Gradually replace cron-based scheduling with application control
+- ✅ Provide the same functionality with better monitoring and error handling
+
+The legacy scripts in `gaia/validator/sync/pgbackrest/` remain available but are no longer recommended for new installations.
+
+### Troubleshooting
+
+1. **Setup fails:** Check environment variables and ensure running as root
+2. **Backup failures:** The system includes automatic recovery and will retry failed operations
+3. **Connection issues:** Verify R2 credentials and network connectivity
+4. **Status monitoring:** All operations are logged and monitored automatically
+
+For detailed logs, check `/var/log/pgbackrest/` and the validator application logs.
+
+---
+
 ### Follow the Setup Guides for [Miner](docs/MINER.md) or [Validator](docs/VALIDATOR.md)
 #### Custom Miner Models: [HERE](gaia/models/custom_models/CUSTOMMODELS.md)
 

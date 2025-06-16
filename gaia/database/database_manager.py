@@ -16,6 +16,7 @@ except ImportError:
 import traceback
 from datetime import datetime, timezone # Added import
 import os # Ensure os is imported
+import concurrent.futures
 
 logger = get_logger(__name__)
 
@@ -78,6 +79,10 @@ class BaseDatabaseManager(ABC):
     STATUS_COMPLETED = 'completed'
     STATUS_ERROR = 'error'
     STATUS_TIMEOUT = 'timeout'
+
+    # Thread pool for heavy database operations
+    _db_thread_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    DB_THREAD_POOL_MAX_WORKERS = 4  # Limited to prevent overwhelming DB
 
     # Note: Log level 5 is used for TRACE-level session debugging (more verbose than DEBUG level 10)
     # This reduces console noise while still allowing detailed session tracking when needed
@@ -174,6 +179,38 @@ class BaseDatabaseManager(ABC):
             self._engine_initialized = False
             self.initialized = True
             self.db_loop = None
+            
+            # Initialize thread pool for heavy DB operations
+            self._init_thread_pool()
+
+    def _init_thread_pool(self):
+        """Initialize thread pool for heavy database operations."""
+        if BaseDatabaseManager._db_thread_pool is None:
+            BaseDatabaseManager._db_thread_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.DB_THREAD_POOL_MAX_WORKERS,
+                thread_name_prefix="db_worker"
+            )
+            logger.info(f"Initialized database thread pool with {self.DB_THREAD_POOL_MAX_WORKERS} workers")
+
+    @classmethod
+    def _cleanup_thread_pool(cls):
+        """Cleanup thread pool on shutdown."""
+        if cls._db_thread_pool:
+            cls._db_thread_pool.shutdown(wait=True)
+            cls._db_thread_pool = None
+            logger.info("Database thread pool shutdown completed")
+
+    async def run_in_thread_pool(self, func, *args, **kwargs):
+        """Run a function in the database thread pool to avoid blocking the async loop."""
+        loop = asyncio.get_event_loop()
+        if self._db_thread_pool is None:
+            self._init_thread_pool()
+        
+        try:
+            return await loop.run_in_executor(self._db_thread_pool, func, *args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in thread pool execution: {e}")
+            raise
 
     def get_session_stats(self) -> Dict[str, Any]:
         """Returns a dictionary of current session statistics."""
@@ -681,19 +718,109 @@ class BaseDatabaseManager(ABC):
                 # No longer need session.begin() here, self.session() handles it.
                 result = await session.execute(text(query), params or {})
                 rows = result.all()
+                
+                # Enhanced handling and cleanup for large result sets
                 if len(rows) > 1000:
                     logger.warning(
                         f"Large result set ({op_name}): {len(rows)} rows\n"
-                        f"Query: {query}"
+                        f"Query: {query[:200]}..."
                     )
+                    
+                    # Force garbage collection for very large result sets
+                    if len(rows) > 5000:
+                        import gc
+                        collected = gc.collect()
+                        logger.warning(f"Very large result set detected ({len(rows)} rows), forced GC collected {collected} objects")
+                
+                # Convert to dict format
+                converted_rows = [dict(row._mapping) for row in rows]
+                
+                # Clear SQLAlchemy result objects to free memory immediately
+                del rows
+                del result
+                
                 duration = time.time() - start_time
                 if duration > self.DEFAULT_QUERY_TIMEOUT / 2: 
                     logger.warning(f"Slow query detected ({op_name}): {duration:.2f}s\nQuery: {query}")
-                return [dict(row._mapping) for row in rows]
+                    
+                return converted_rows
             except SQLAlchemyError as e:
                 logger.error(f"Database error in fetch_all ({op_name}): {str(e)}\nQuery: {query}")
                 # The main session context manager will handle rollback.
                 raise DatabaseError(f"Error executing query ({op_name}): {str(e)}")
+
+    @with_timeout(DEFAULT_QUERY_TIMEOUT)
+    async def fetch_all_threaded(
+        self, 
+        query: str, 
+        params: Optional[Dict] = None,
+        timeout: Optional[float] = None
+    ) -> List[Dict]:
+        """
+        Fetch all rows using thread pool for heavy operations.
+        Use this for large result sets to avoid blocking the async loop.
+        """
+        start_time = time.time()
+        op_name = f"fetch_all_threaded:{query[:100]}"
+        
+        # Prepare the synchronous function to run in thread
+        def sync_fetch_and_process():
+            import asyncio
+            import time as time_sync
+            from sqlalchemy import text as text_sync
+            
+            # Create a new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                return loop.run_until_complete(self._sync_fetch_helper(query, params, op_name))
+            finally:
+                loop.close()
+        
+        try:
+            # Run the heavy database operation in thread pool
+            result = await self.run_in_thread_pool(sync_fetch_and_process)
+            
+            duration = time.time() - start_time
+            if duration > self.DEFAULT_QUERY_TIMEOUT / 2:
+                logger.warning(f"Slow threaded query detected ({op_name}): {duration:.2f}s\nQuery: {query}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in threaded fetch_all ({op_name}): {str(e)}\nQuery: {query}")
+            raise DatabaseError(f"Error executing threaded query ({op_name}): {str(e)}")
+
+    async def _sync_fetch_helper(self, query: str, params: Optional[Dict], op_name: str) -> List[Dict]:
+        """Helper method for threaded fetch operations."""
+        async with self.session(operation_name=op_name) as session:
+            try:
+                result = await session.execute(text(query), params or {})
+                rows = result.all()
+                
+                # Process rows in the thread to avoid main loop blocking
+                converted_rows = [dict(row._mapping) for row in rows]
+                
+                # Memory cleanup in thread
+                del rows
+                del result
+                
+                # Log large result sets
+                if len(converted_rows) > 1000:
+                    logger.info(f"Large threaded result set ({op_name}): {len(converted_rows)} rows")
+                    
+                    # Force garbage collection for very large result sets
+                    if len(converted_rows) > 5000:
+                        import gc
+                        collected = gc.collect()
+                        logger.info(f"Threaded query GC: collected {collected} objects for {len(converted_rows)} rows")
+                
+                return converted_rows
+                
+            except SQLAlchemyError as e:
+                logger.error(f"Database error in threaded fetch_all ({op_name}): {str(e)}")
+                raise DatabaseError(f"Error executing threaded query ({op_name}): {str(e)}")
 
     @with_timeout(DEFAULT_TRANSACTION_TIMEOUT) # Default timeout for execute
     async def execute(
@@ -907,6 +1034,9 @@ class BaseDatabaseManager(ABC):
 
             if self._engine:
                 await self._engine.dispose()
+            
+            # Cleanup thread pool
+            self._cleanup_thread_pool()
                 
         except Exception as e:
             logger.error(f"Error during database cleanup: {e}")

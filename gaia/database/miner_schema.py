@@ -40,6 +40,7 @@ class WeatherMinerJobs(MinerBase):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=True) 
     gfs_t_minus_6_time_utc = Column(DateTime(timezone=True), nullable=False)
     input_data_hash = Column(Text, nullable=True)
+    input_batch_pickle_path = Column(Text, nullable=True) # Path to the pickled aurora.Batch input
 
     def __repr__(self):
         return f"<WeatherMinerJobs(id='{self.id}', status='{self.status}')>"

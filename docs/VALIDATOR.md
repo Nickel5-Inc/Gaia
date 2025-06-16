@@ -66,42 +66,24 @@ EARTHDATA_USERNAME=<YOUR_EARTHDATA_USERNAME>
 EARTHDATA_PASSWORD=<YOUR_EARTHDATA_PASSWORD>
 EARTHDATA_API_KEY=<YOUR_EARTHDATA_API_KEY>  # This refers to your Earthdata login credentials used by the application.
 
-# --- Database Synchronization System (Optional, highly recommended for multi-validator setups) ---
-# Set this to "true" ONLY if this validator is the designated source for DB backups. (You're not)
-# For replica validators that will restore from Azure, keep this as "False" or omit.
-# IS_SOURCE_VALIDATOR_FOR_DB_SYNC=False # Example for a replica
+# --- Database Synchronization System (Optional, highly recommended) ---
+# Enable database synchronization (uses pgBackRest + R2)
+DB_SYNC_ENABLED=true
 
-# Interval in hours for backup (on source) or restore check (on replicas)
-DB_SYNC_INTERVAL_HOURS=1
+# Set to "true" ONLY if this validator is the PRIMARY/SOURCE (typically one per network)
+# For replica validators, set to "false" or omit
+IS_SOURCE_VALIDATOR_FOR_DB_SYNC=false
 
-# --- Azure Authentication for DB Sync (Choose ONE method and fill details) ---
-# The database user (DB_USER/DB_PASS above) will be used for pg_dump/pg_restore.
+# --- R2 Storage Configuration (required for DB sync) ---
+# Cloudflare R2 bucket and credentials
+PGBACKREST_R2_BUCKET=your-r2-bucket-name
+PGBACKREST_R2_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
+PGBACKREST_R2_ACCESS_KEY_ID=your-r2-access-key
+PGBACKREST_R2_SECRET_ACCESS_KEY=your-r2-secret-key
 
-# Method 1: SAS Token (Recommended)
-# The Blob service endpoint for your storage account.
-AZURE_STORAGE_ACCOUNT_URL="https://devbettensorstore.blob.core.windows.net"
-# The SAS token string (including the leading '?' if it has one).
-# Ensure this token grants Read/List for replicas; Read/Write/List/Delete for the source,
-# to the specified AZURE_BLOB_CONTAINER_NAME_DB_SYNC.
-# If you need an access token, please reach out to the dev team with a signed message proving ownership of a validator key with minimum 10K alpha stake
-AZURE_STORAGE_SAS_TOKEN=<YOUR_AZURE_STORAGE_SAS_TOKEN>
-
-# Method 2: Connection String (Simpler, but generally less secure than SAS Token)
-# If using SAS Token (Method 1), leave this commented out or blank.
-# AZURE_STORAGE_CONNECTION_STRING=<YOUR_AZURE_STORAGE_CONNECTION_STRING>
-
-# Name of the Azure Blob container for storing database dumps.
-AZURE_BLOB_CONTAINER_NAME_DB_SYNC=data/gaia
-
-# --- Local Directories for DB Sync Operations ---
-# Local temporary directory on the SOURCE validator for pg_dump before Azure upload.
-DB_SYNC_BACKUP_DIR=/tmp/db_backups_gaia
-# Local temporary directory on REPLICA validators for downloading dumps before pg_restore.
-DB_SYNC_RESTORE_DIR=/tmp/db_restores_gaia
-
-# --- Backup Retention (for Source Validator) ---
-# Number of recent backups to keep in Azure. Older ones are pruned by the source.
-DB_SYNC_MAX_AZURE_BACKUPS=5
+# --- pgBackRest Configuration (optional - defaults provided) ---
+PGBACKREST_STANZA_NAME=gaia
+PGBACKREST_R2_REGION=auto
 ```
 
 #### Run the validator
@@ -113,87 +95,128 @@ pm2 start --name validator --instances 1 python -- gaia/validator/validator.py
 
 ## **Database Synchronization System (Optional, highly recommended)**
 
-This system allows for near real-time replication of the validator database from a designated source validator to other replica validators using Azure Blob Storage as a central staging point. This is useful for maintaining consistent state across multiple validator instances or for quickly bringing new validators online with current data.
+This system allows for near real-time replication of the validator database from a designated source validator to other replica validators using pgBackRest with Cloudflare R2 storage. This provides efficient incremental backups and point-in-time recovery capabilities.
 
 ### Overview
 
-1.  **Source Validator**: One validator is designated as the "source of truth". It periodically performs a `pg_dump` of its database. The source validator is run by Nickel5.
-2.  **Azure Blob Storage**: The database dump from the source validator is compressed and uploaded to a configured Azure Blob Storage container.
-3.  **Replica Validators**: Other validators (replicas) periodically check Azure Blob Storage for new database dumps.
-4.  **Restore**: If a new dump is found, replica validators download it and use `pg_restore` to replace their local database with the contents of the dump.
+1.  **Source Validator**: One validator is designated as the "source of truth". It runs automated pgBackRest backups to R2 storage.
+2.  **pgBackRest + R2**: Modern backup solution with incremental backups, compression, and encryption.
+3.  **Replica Validators**: Other validators can restore from R2 backups for rapid synchronization.
+4.  **AutoSyncManager**: Streamlined management with automated setup and progress tracking.
 
-This process aims to keep replica databases synchronized with the source, typically within an hour (configurable) of the last successful backup.
+This process provides efficient database synchronization with incremental backups and minimal storage overhead.
 
 ### Configuration (Environment Variables)
 
-To enable and configure the database synchronization system, set the following environment variables on your validator nodes:
+**Core DB Sync Settings:**
+```bash
+# Enable/disable database synchronization
+DB_SYNC_ENABLED=true
 
-*   `DB_SYNC_ENABLED`: (boolean string: "true" or "false")
-    *   Master switch to enable or disable the entire database synchronization feature.
-    *   Set to `"false"` to completely turn off DB sync (both backup and restore operations).
-    *   Defaults to `"true"` if not set, meaning the sync system will attempt to run if other relevant DB sync variables are configured.
-    *   Example: `DB_SYNC_ENABLED=false`
+# Set the validator role (only ONE primary validator should be true)
+IS_SOURCE_VALIDATOR_FOR_DB_SYNC=true  # For primary/source validator
+IS_SOURCE_VALIDATOR_FOR_DB_SYNC=false # For replica validators
+```
 
-*   `IS_SOURCE_VALIDATOR_FOR_DB_SYNC`: (boolean string: "true" or "false")
-    *   **Only relevant if `DB_SYNC_ENABLED` is `"true"` (or not set).**
-    *   Set to `"true"` ONLY if this validator is the designated source for DB backups (typically the main Nickel5 validator).
+**pgBackRest + R2 Configuration:**
+```bash
+# R2 Storage Settings (required)
+PGBACKREST_R2_BUCKET=your-r2-bucket-name
+PGBACKREST_R2_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
+PGBACKREST_R2_ACCESS_KEY_ID=your-r2-access-key
+PGBACKREST_R2_SECRET_ACCESS_KEY=your-r2-secret-key
+PGBACKREST_R2_REGION=auto
 
-*   `DB_SYNC_INTERVAL_HOURS`: (integer)
-    *   Defines how often the backup (on source) or restore check (on replicas) process runs.
-    *   Example: `1` for hourly synchronization.
-    *   Defaults to `1` if not set or set to a non-positive value.
-    *   We recommend keeping this value set to 1 for the most up-to-date data.
+# pgBackRest Settings (optional - defaults provided)
+PGBACKREST_STANZA_NAME=gaia
+PGBACKREST_PGDATA=/var/lib/postgresql/data
+PGBACKREST_PGPORT=5432
+PGBACKREST_PGUSER=postgres
+```
 
-*   **Azure Authentication (provide one of the following methods):**
-    *   **Method 1: SAS Token (Recommended)**
-        *   `AZURE_STORAGE_ACCOUNT_URL`: (string)
-            *   The Blob service endpoint for your storage account.
-            *   Example: `https://<youraccountname>.blob.core.windows.net`
-        *   `AZURE_STORAGE_SAS_TOKEN`: (string)
-            *   The SAS token string (including the leading `?` if applicable, or just the token part).
-            *   This token should grant necessary permissions (Read, List for replicas; Read, Write, List, Delete for source) to the specified `AZURE_BLOB_CONTAINER_NAME_DB_SYNC`.
-    *   **Method 2: Connection String (Simpler, but generally less secure than SAS Token)**
-        *   `AZURE_STORAGE_CONNECTION_STRING`: (string)
-            *   The full connection string for your Azure Blob Storage account.
+### Setup Instructions
 
-*   `AZURE_BLOB_CONTAINER_NAME_DB_SYNC`: (string)
-    *   Name of the Azure Blob container to use for storing database dumps.
-    *   Example: `validator-db-sync`
-    *   Defaults to `validator-db-sync` if not set.
-*   `DB_NAME`: (string)
-    *   The name of the PostgreSQL database to be backed up and restored.
-    *   Should match the main database used by the validator (e.g., `validator_db`).
-    *   Defaults to `validator_db` if `DB_NAME` is not set.
-*   `DB_USER`: (string)
-    *   PostgreSQL username for connecting to the database for dump/restore operations.
-    *   This user needs permissions to perform `pg_dump` and, on replicas, to drop/create the database and terminate connections.
-    *   Example: `postgres`
-    *   Defaults to `postgres` if `DB_USER` is not set.
-*   `DB_HOST`: (string)
-    *   Hostname or IP address of the PostgreSQL server.
-    *   Example: `localhost`
-    *   Defaults to `localhost` if `DB_HOST` is not set.
-*   `DB_PORT`: (integer)
-    *   Port number of the PostgreSQL server.
-    *   Example: `5432`
-    *   Defaults to `5432` if `DB_PORT` is not set.
-*   `DB_PASS`: (string)
-    *   Password for the `DB_USER` to connect to PostgreSQL. The default config password is `postgres`.
-    *   This is passed to `pg_dump` and `pg_restore` via the `PGPASSWORD` environment variable for the subprocess.
-*   `DB_SYNC_BACKUP_DIR`: (path string)
-    *   Local temporary directory on the **source validator** where `pg_dump` will create the database dump file before uploading to Azure.
-    *   Example: `/tmp/db_backups_gaia`
-    *   Defaults to `/tmp/db_backups_gaia`.
-*   `DB_SYNC_RESTORE_DIR`: (path string)
-    *   Local temporary directory on **replica validators** where new database dumps will be downloaded from Azure before being restored.
-    *   Example: `/tmp/db_restores_gaia`
-    *   Defaults to `/tmp/db_restores_gaia`.
-*   `DB_SYNC_MAX_AZURE_BACKUPS`: (integer)
-    *   The number of recent database backups to retain in Azure Blob Storage. Older backups beyond this count will be automatically pruned by the source validator after a successful backup.
-    *   Example: `5` (keeps the last 5 backups).
-    *   Defaults to `5`.
+**Option 1: Automated Setup (Recommended)**
+```bash
+# For primary validator (source)
+python gaia/validator/sync/setup_auto_sync.py --primary
+
+# For replica validator
+python gaia/validator/sync/setup_auto_sync.py --replica
+```
+
+**Option 2: Manual Setup**
+```bash
+# Primary validator
+sudo bash gaia/validator/sync/pgbackrest/setup-primary.sh
+
+# Replica validator  
+sudo bash gaia/validator/sync/pgbackrest/setup-replica.sh
+```
 
 ### Required Dependencies
 
-*   **Python Package**: `azure-storage-blob` (install via `pip install azure-storage-blob`)
-*   **Command-Line Tools**: `pg_dump`, `
+*   **pgBackRest**: Modern PostgreSQL backup solution
+*   **R2 Access**: Cloudflare R2 storage account and bucket
+
+### Monitoring and Management
+
+**Check backup status:**
+```bash
+sudo -u postgres pgbackrest --stanza=gaia info
+```
+
+**Manual operations:**
+```bash
+# Force backup (primary)
+sudo -u postgres pgbackrest --stanza=gaia backup
+
+# Manual restore (replicas)
+sudo systemctl stop postgresql
+sudo -u postgres pgbackrest --stanza=gaia restore
+sudo systemctl start postgresql
+```
+
+**Progress tracking** is available through the AutoSyncManager with real-time backup progress monitoring.
+
+---
+
+## Database Migration
+
+The system uses separate Alembic configurations for miner and validator databases:
+
+### Validator Database Migration
+```bash
+# Check current schema version
+DB_CONNECTION_TYPE=socket alembic -c alembic_validator.ini current
+
+# Upgrade to latest schema
+DB_CONNECTION_TYPE=socket alembic -c alembic_validator.ini upgrade head
+
+# View migration history
+DB_CONNECTION_TYPE=socket alembic -c alembic_validator.ini history
+```
+
+**Core validator tables**: `node_table`, `score_table`, `weather_forecast_runs`, `weather_miner_responses`
+
+**Migration Safety**: All migrations preserve existing data and validate required tables exist.
+
+---
+
+## Custom Models (Advanced)
+
+Validators can benefit from miners using custom models for better performance:
+
+### Encouraging Custom Models
+- Miners with custom models typically provide better predictions
+- Custom models can be task-specific (geomagnetic, soil moisture, weather)
+- Improved accuracy leads to better rewards for miners
+
+### Model Requirements
+- **Soil Moisture**: Must output 11x11 arrays for surface/rootzone moisture (0-1 range)
+- **Geomagnetic**: Must predict next-hour DST index with UTC timestamp
+- **Weather**: Must generate 40-step forecasts in Zarr format
+
+Custom model files must follow naming conventions and implement specific methods (`run_inference()`).
+
+---

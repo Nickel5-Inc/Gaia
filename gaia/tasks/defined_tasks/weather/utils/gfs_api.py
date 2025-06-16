@@ -279,7 +279,7 @@ def process_opendap_dataset(ds: xr.Dataset) -> xr.Dataset:
     if 'lat' in new_ds.coords:
         if new_ds.lat.values[0] < new_ds.lat.values[-1]:
             logger.info("Reversing latitude coordinate to be decreasing (90 to -90).")
-            new_ds = new_ds.reindex(lat=new_ds.lat[::-1])
+            new_ds = new_ds.reindex(lat=new_ds.lat.values[::-1].copy())
 
     if 'lon' in new_ds.coords:
         if new_ds.lon.values.min() < -1.0:
@@ -324,7 +324,8 @@ async def fetch_gfs_analysis_data(
     cache_dir: Path = Path("./gfs_analysis_cache"),
     target_surface_vars: Optional[List[str]] = None,
     target_atmos_vars: Optional[List[str]] = None,
-    target_pressure_levels_hpa: Optional[List[int]] = None
+    target_pressure_levels_hpa: Optional[List[int]] = None,
+    progress_callback: Optional[callable] = None
 ) -> Optional[xr.Dataset]:
     """
     Fetches GFS ANALYSIS data (T+0h) asynchronously for multiple specific times.
@@ -337,6 +338,7 @@ async def fetch_gfs_analysis_data(
         target_surface_vars: Optional list of surface variable names to fetch.
         target_atmos_vars: Optional list of atmospheric variable names to fetch.
         target_pressure_levels_hpa: Optional list of pressure levels (in hPa) for atmospheric variables.
+        progress_callback: Optional callback function for progress updates.
 
     Returns:
         xr.Dataset: Combined dataset of processed analysis variables for target times, or None.
@@ -344,6 +346,15 @@ async def fetch_gfs_analysis_data(
     if not target_times:
         logger.warning("fetch_gfs_analysis_data called with no target_times.")
         return None
+
+    # Emit initial progress
+    if progress_callback:
+        await progress_callback({
+            "operation": "gfs_download",
+            "stage": "initializing",
+            "progress": 0.0,
+            "message": f"Starting GFS analysis fetch for {len(target_times)} time(s)"
+        })
 
     valid_target_times = []
     for t in target_times:
@@ -365,11 +376,31 @@ async def fetch_gfs_analysis_data(
 
     if cache_filename.exists():
         try:
+            if progress_callback:
+                await progress_callback({
+                    "operation": "gfs_download",
+                    "stage": "loading_cache",
+                    "progress": 0.5,
+                    "message": f"Loading cached GFS analysis from {cache_filename.name}"
+                })
+            
             logger.info(f"Loading cached GFS analysis data from: {cache_filename}")
             ds_cached = xr.open_dataset(cache_filename)
             target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
             if all(t_np_ns in ds_cached.time.values for t_np_ns in target_times_np_ns):
                 logger.info("GFS Analysis cache hit is valid.")
+                
+                if progress_callback:
+                    file_size = cache_filename.stat().st_size if cache_filename.exists() else 0
+                    await progress_callback({
+                        "operation": "gfs_download",
+                        "stage": "completed",
+                        "progress": 1.0,
+                        "message": f"Successfully loaded from cache ({file_size} bytes)",
+                        "bytes_downloaded": file_size,
+                        "bytes_total": file_size
+                    })
+                
                 return ds_cached
             else:
                 logger.warning("Cached GFS analysis file missing requested times. Re-fetching.")
@@ -382,29 +413,129 @@ async def fetch_gfs_analysis_data(
                 except OSError: pass
 
     logger.info(f"GFS Analysis cache miss for times: {time_strings[0]}...{time_strings[-1]}. Fetching from NOMADS.")
+    
+    if progress_callback:
+        await progress_callback({
+            "operation": "gfs_download",
+            "stage": "downloading",
+            "progress": 0.1,
+            "message": f"Fetching GFS analysis data from NOMADS for {len(target_times)} times"
+        })
 
     def _sync_fetch_and_process_analysis():
         analysis_slices = []
+        progress_info = {"processed_files": 0, "total_files": len(target_times)}
+        
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=xr.SerializationWarning)
             
-            for target_time in target_times:
-                full_ds = None
+            total_steps = len(target_times)
+            for idx, target_time in enumerate(target_times):
+                processed_one_successfully_for_target = False
                 try:
+                    # Update progress info (to be reported back to async context)
+                    step_progress = 0.1 + (0.7 * (idx / total_steps))  # 10% to 80% for downloading
+                    progress_info.update({
+                        "current_step": idx + 1,
+                        "step_progress": step_progress,
+                        "current_time": target_time.strftime('%Y-%m-%d %H:%M'),
+                        "files_completed": idx
+                    })
+                    
                     base_url = _get_gfs_cycle_url(target_time)
                     if not base_url:
                         logger.error(f"Could not get URL for GFS cycle {target_time}. Skipping.")
                         continue
                         
-                    logger.info(f"Opening GFS cycle {target_time} from {base_url} for analysis (T+0h)...")
-                    full_ds = xr.open_dataset(base_url, decode_times=True, chunks={})
-
-                    analysis_select_time_np = np.datetime64(target_time.replace(tzinfo=None))
-
-                    analysis_slice = full_ds.sel(time=analysis_select_time_np, method='nearest')
+                    logger.info(f"Opening GFS cycle {target_time.strftime('%Y-%m-%d %H:%M:%S')} from {base_url} for analysis (T+0h)...")
+                    full_ds = xr.open_dataset(base_url, decode_times=False, chunks={})
+                    logger.info(f"Successfully opened GFS dataset with decode_times=False. Raw time variable attributes: {full_ds.time.attrs}")
+                    logger.info(f"Raw time variable sample values: {full_ds.time.values[:5] if len(full_ds.time.values) > 5 else full_ds.time.values}")
                     
-                    if abs(analysis_slice.time.values - analysis_select_time_np) > np.timedelta64(1, 'h'):
-                        logger.error(f"Nearest time found ({analysis_slice.time.values}) is too far from requested analysis time {target_time} for cycle {target_time}. Skipping.")
+                    time_coordinate_decoded_successfully = False
+                    try:
+                        # Attempt to decode the time coordinate using cftime
+                        decoded_time_values_np_array = xr.coding.times.decode_cf_datetime(
+                            full_ds.time, 
+                            units=full_ds.time.attrs.get('units'), 
+                            calendar=full_ds.time.attrs.get('calendar', 'standard'), 
+                            use_cftime=True
+                        )
+                        # Log the sample of the numpy array directly
+                        logger.info(f"Manually decoded time with cftime (sample numpy array): {decoded_time_values_np_array[:5] if len(decoded_time_values_np_array) > 5 else decoded_time_values_np_array}")
+                        # Replace the time coordinate in full_ds
+                        full_ds = full_ds.assign_coords(time=decoded_time_values_np_array)
+                        time_coordinate_decoded_successfully = True
+                        logger.info(f"Time coordinate in full_ds updated. Sample from full_ds.time.values: {full_ds.time.values[:5] if len(full_ds.time.values) > 5 else full_ds.time.values}")
+                    except Exception as e_manual_decode:
+                        logger.error(f"Failed to manually decode time with cftime: {e_manual_decode}", exc_info=True)
+                        logger.warning("Proceeding with original undecoded (numerical) time coordinate for selection.")
+
+                    analysis_target_dt_np = np.datetime64(target_time.replace(tzinfo=None))
+                    analysis_slice = None # Initialize to ensure it's defined for logging in case of error
+                    time_difference = np.timedelta64(24*3600, 's') # Default to a large diff
+
+                    if time_coordinate_decoded_successfully:
+                        # full_ds.time is now datetime-like (cftime or datetime64)
+                        analysis_slice = full_ds.sel(time=analysis_target_dt_np, method='nearest')
+                        # analysis_slice.time.values is a scalar cftime.DatetimeGregorian (or similar cftime object)
+                        # Convert cftime object to standard Python datetime, then to np.datetime64
+                        cftime_obj = analysis_slice.time.values.item()
+                        
+                        # Construct standard Python datetime from cftime object components
+                        # Keep it naive, as np.datetime64 is naive and analysis_target_dt_np is also naive.
+                        py_dt = datetime(
+                            year=int(cftime_obj.year), month=int(cftime_obj.month), day=int(cftime_obj.day),
+                            hour=int(cftime_obj.hour), minute=int(cftime_obj.minute), second=int(cftime_obj.second),
+                            microsecond=int(cftime_obj.microsecond)
+                        )
+                        
+                        # Convert the Python datetime to an ISO 8601 string, then to np.datetime64
+                        # This path is often more robust.
+                        iso_str = py_dt.isoformat()
+                        selected_time_from_slice_dt = np.datetime64(iso_str)
+                        
+                        time_difference = abs(selected_time_from_slice_dt - analysis_target_dt_np)
+                    else:
+                        # full_ds.time is numerical (e.g., float64 'days since ...')
+                        # Convert analysis_target_dt_np to this numerical domain for selection
+                        try:
+                            time_units = full_ds.time.attrs.get('units')
+                            time_calendar = full_ds.time.attrs.get('calendar', 'standard')
+                            if not time_units:
+                                logger.error(f"Time units attribute missing from undecoded time coordinate for target {target_time}. Cannot select accurately.")
+                                continue # Skip this target_time
+
+                            numerical_target_for_sel = xr.coding.times.encode_cf_datetime(
+                                np.array([analysis_target_dt_np]), 
+                                units=time_units, 
+                                calendar=time_calendar
+                            )[0] 
+
+                            analysis_slice = full_ds.sel(time=numerical_target_for_sel, method='nearest')
+                            selected_numerical_time_from_slice = analysis_slice.time.values 
+                            numerical_diff = abs(selected_numerical_time_from_slice - numerical_target_for_sel)
+
+                            # Convert numerical_diff (in time_units) back to a np.timedelta64
+                            # Decode [0, numerical_diff] in the original units to get two datetime objects, then subtract
+                            time_axis_for_diff_conversion = xr.coding.times.decode_cf_datetime(
+                                np.array([0, numerical_diff]), 
+                                units=time_units, 
+                                calendar=time_calendar, 
+                                use_cftime=True 
+                            )
+                            time_difference = np.abs(np.datetime64(time_axis_for_diff_conversion[1]) - np.datetime64(time_axis_for_diff_conversion[0]))
+                            
+                        except Exception as e_numerical_sel:
+                            logger.error(f"Error during numerical time selection for target {target_time}: {e_numerical_sel}", exc_info=True)
+                            continue 
+                    
+                    actual_selected_time_for_log = "N/A"
+                    if analysis_slice is not None and hasattr(analysis_slice, 'time') and hasattr(analysis_slice.time, 'values'):
+                        actual_selected_time_for_log = analysis_slice.time.values
+
+                    if time_difference > np.timedelta64(1, 'h'):
+                        logger.error(f"Nearest time found ({actual_selected_time_for_log}) is too far ({time_difference}) from requested analysis time {target_time}. Skipping.")
                         continue
 
                     current_surface_vars = target_surface_vars if target_surface_vars is not None else GFS_SURFACE_VARS
@@ -419,29 +550,27 @@ async def fetch_gfs_analysis_data(
                          
                     loaded_slice = analysis_slice[vars_to_load_final].load()
                     loaded_slice = loaded_slice.expand_dims(dim='time', axis=0)
-                    target_time_utc_naive = target_time.replace(tzinfo=None)
-                    loaded_slice['time'] = [np.datetime64(target_time_utc_naive, 'ns')]
+                    target_time_naive = target_time.replace(tzinfo=None)
+                    loaded_slice['time'] = [np.datetime64(target_time_naive, 'ns')]
                     
                     logger.info(f"Loaded analysis slice for original target {target_time}")
                     analysis_slices.append(loaded_slice)
 
+                    processed_one_successfully_for_target = True
+
                 except Exception as e:
                     logger.error(f"Failed to fetch/process analysis for original target {target_time}: {e}", exc_info=True)
-                finally:
-                    if full_ds:
-                        try: full_ds.close()
-                        except: pass
 
         if not analysis_slices:
             logger.error("Failed to fetch any valid GFS analysis slices.")
-            return None
+            return None, progress_info
 
         try:
             logger.info(f"Combining {len(analysis_slices)} analysis slices...")
             combined_ds = xr.concat(analysis_slices, dim='time')
         except Exception as e_concat:
              logger.error(f"Failed to combine analysis slices: {e_concat}")
-             return None
+             return None, progress_info
              
         logger.debug("Starting analysis dataset processing...")
         
@@ -516,7 +645,7 @@ async def fetch_gfs_analysis_data(
 
         if 'lat' in processed_ds.coords and len(processed_ds.lat) > 1 and processed_ds.lat.values[0] < processed_ds.lat.values[-1]:
             logger.info("Reversing latitude coordinate.")
-            processed_ds = processed_ds.reindex(lat=processed_ds.lat[::-1])
+            processed_ds = processed_ds.reindex(lat=processed_ds.lat.values[::-1].copy())
 
         if 'lon' in processed_ds.coords and processed_ds.lon.values.min() < 0:
             logger.info("Adjusting longitude coordinate to [0, 360).")
@@ -531,18 +660,68 @@ async def fetch_gfs_analysis_data(
             logger.info(f"Saving processed GFS analysis data to cache: {cache_filename}")
             cache_dir.mkdir(parents=True, exist_ok=True)
             processed_ds.to_netcdf(cache_filename)
+                
         except Exception as e_cache:
             logger.error(f"Failed to save GFS analysis to cache {cache_filename}: {e_cache}")
             if isinstance(e_cache, PermissionError):
                  logger.error(f"** PERMISSION DENIED saving to {cache_dir}. Please check directory permissions. **")
-            
-        return processed_ds
+        
+        # Update final progress info
+        progress_info.update({
+            "processed_files": len(analysis_slices),
+            "completed": True,
+            "step_progress": 0.8  # Processing complete, ready for caching
+        })
+        
+        return processed_ds, progress_info
 
     try:
-        result_dataset = await asyncio.to_thread(_sync_fetch_and_process_analysis)
+        result_dataset, final_progress_info = await asyncio.to_thread(_sync_fetch_and_process_analysis)
+        
+        # Emit progress updates based on what happened in the sync function
+        if progress_callback and final_progress_info:
+            if final_progress_info.get("completed"):
+                # Emit intermediate progress for files processed
+                if final_progress_info.get("processed_files", 0) > 0:
+                    await progress_callback({
+                        "operation": "gfs_download",
+                        "stage": "processing",
+                        "progress": final_progress_info.get("step_progress", 0.8),
+                        "message": f"Processed {final_progress_info['processed_files']}/{final_progress_info['total_files']} GFS analysis time steps",
+                        "files_completed": final_progress_info["processed_files"],
+                        "files_total": final_progress_info["total_files"]
+                    })
+                
+                # Final completion progress
+                if result_dataset is not None:
+                    file_size = cache_filename.stat().st_size if cache_filename.exists() else 0
+                    await progress_callback({
+                        "operation": "gfs_download",
+                        "stage": "completed",
+                        "progress": 1.0,
+                        "message": f"GFS analysis data successfully processed and cached ({file_size} bytes)",
+                        "bytes_downloaded": file_size,
+                        "bytes_total": file_size
+                    })
+            else:
+                # Processing failed partway through
+                await progress_callback({
+                    "operation": "gfs_download",
+                    "stage": "error",
+                    "progress": final_progress_info.get("step_progress", 0.0),
+                    "message": f"Processing failed after {final_progress_info.get('files_completed', 0)}/{final_progress_info['total_files']} files"
+                })
+        
         return result_dataset
     except Exception as e:
         logger.error(f"Async fetch GFS analysis data failed: {e}")
+        if progress_callback:
+            await progress_callback({
+                "operation": "gfs_download",
+                "stage": "error",
+                "progress": 0.0,
+                "message": f"GFS fetch failed: {str(e)}"
+            })
         return None
 
 async def _test_fetch_analysis():

@@ -147,15 +147,35 @@ async def evaluate_miner_forecast_day1(
                 logger.warning(f"Could not select GFS data for lead {effective_lead_h}h (valid time {valid_time_dt}): {e_sel}. Skipping lead.")
                 continue
             
-            if valid_time_dt.tzinfo is None or valid_time_dt.tzinfo.utcoffset(valid_time_dt) is None:
-                valid_time_dt_aware = valid_time_dt.replace(tzinfo=timezone.utc)
-            else:
-                valid_time_dt_aware = valid_time_dt.astimezone(timezone.utc)
-            
+            valid_time_dt_aware = pd.Timestamp(valid_time_dt).tz_localize('UTC') if pd.Timestamp(valid_time_dt).tzinfo is None else pd.Timestamp(valid_time_dt).tz_convert('UTC')
             valid_time_np_ns = np.datetime64(valid_time_dt_aware.replace(tzinfo=None), 'ns')
 
             selection_label_for_miner = valid_time_np_ns
-            if np.issubdtype(miner_forecast_ds.time.dtype, np.integer):
+            
+            # Handle timezone-aware datetime dtypes properly
+            time_dtype_str = str(miner_forecast_ds.time.dtype)
+            is_integer_time = False
+            is_timezone_aware = False
+            try:
+                # Try the normal numpy check first, but handle timezone-aware dtypes
+                if 'datetime64' in time_dtype_str and 'UTC' in time_dtype_str:
+                    # This is a timezone-aware datetime, not an integer
+                    is_integer_time = False
+                    is_timezone_aware = True
+                    logger.debug(f"[Day1Score] Detected timezone-aware datetime dtype: {time_dtype_str}")
+                    
+                    # For timezone-aware coordinates, use pandas Timestamp directly
+                    # Don't convert to numpy datetime64 as it loses timezone information
+                    selection_label_for_miner = valid_time_dt_aware
+                    logger.debug(f"[Day1Score] Using pandas Timestamp for timezone-aware selection: {selection_label_for_miner} (type: {type(selection_label_for_miner)})")
+                else:
+                    is_integer_time = np.issubdtype(miner_forecast_ds.time.dtype, np.integer)
+            except TypeError as e:
+                # Handle the "Cannot interpret 'datetime64[ns, UTC]' as a data type" error
+                logger.debug(f"[Day1Score] Cannot check issubdtype for {time_dtype_str}: {e}. Assuming non-integer time.")
+                is_integer_time = False
+            
+            if is_integer_time:
                 logger.warning(f"[Day1Score] Miner forecast time coordinate is integer type ({miner_forecast_ds.time.dtype}). Attempting to cast selection label.")
                 try:
                     selection_label_for_miner = valid_time_np_ns.astype(np.int64)
@@ -178,11 +198,22 @@ async def evaluate_miner_forecast_day1(
             time_diff_too_large = False
             miner_time_value_from_sel = miner_forecast_lead.time.item()
 
-            if not np.issubdtype(miner_forecast_ds.time.dtype, np.integer):
+            # Use the same safe dtype checking as above
+            if not is_integer_time:
                 try:
                     miner_time_dt64 = np.datetime64(miner_time_value_from_sel, 'ns')
-                    if abs(miner_time_dt64 - selection_label_for_miner) > np.timedelta64(1, 'h'):
-                        time_diff_too_large = True
+                    
+                    # Handle timezone-aware vs naive datetime comparison
+                    if is_timezone_aware:
+                        # For timezone-aware data, convert both to naive UTC for comparison
+                        target_naive = selection_label_for_miner.tz_convert('UTC').tz_localize(None)
+                        target_dt64 = np.datetime64(target_naive, 'ns')
+                        if abs(miner_time_dt64 - target_dt64) > np.timedelta64(1, 'h'):
+                            time_diff_too_large = True
+                    else:
+                        # For timezone-naive data, use original logic
+                        if abs(miner_time_dt64 - selection_label_for_miner) > np.timedelta64(1, 'h'):
+                            time_diff_too_large = True
                 except Exception as e_conv_dt64:
                     logger.warning(f"[Day1Score] Could not convert/compare miner time {miner_time_value_from_sel} with {selection_label_for_miner}: {e_conv_dt64}. Assuming time difference is too large.")
                     time_diff_too_large = True
@@ -212,19 +243,94 @@ async def evaluate_miner_forecast_day1(
                     truth_var_da_unaligned = gfs_analysis_lead[var_name]
                     ref_var_da_unaligned = gfs_reference_lead[var_name]
 
-                    if var_level:
-                        miner_var_da_selected = miner_var_da_unaligned.sel(pressure_level=var_level, method="nearest")
-                        truth_var_da_selected = truth_var_da_unaligned.sel(pressure_level=var_level, method="nearest")
-                        ref_var_da_selected = ref_var_da_unaligned.sel(pressure_level=var_level, method="nearest")
+                    # Add detailed diagnostics for potential unit mismatches
+                    logger.info(f"[Day1Score] RAW DATA DIAGNOSTICS for {var_key} at {valid_time_dt}:")
+                    
+                    # Log data ranges before any processing
+                    miner_min, miner_max, miner_mean = float(miner_var_da_unaligned.min()), float(miner_var_da_unaligned.max()), float(miner_var_da_unaligned.mean())
+                    truth_min, truth_max, truth_mean = float(truth_var_da_unaligned.min()), float(truth_var_da_unaligned.max()), float(truth_var_da_unaligned.mean())
+                    ref_min, ref_max, ref_mean = float(ref_var_da_unaligned.min()), float(ref_var_da_unaligned.max()), float(ref_var_da_unaligned.mean())
+                    
+                    logger.info(f"[Day1Score] Miner {var_key}: range=[{miner_min:.1f}, {miner_max:.1f}], mean={miner_mean:.1f}, units={miner_var_da_unaligned.attrs.get('units', 'unknown')}")
+                    logger.info(f"[Day1Score] Truth {var_key}: range=[{truth_min:.1f}, {truth_max:.1f}], mean={truth_mean:.1f}, units={truth_var_da_unaligned.attrs.get('units', 'unknown')}")
+                    logger.info(f"[Day1Score] Ref   {var_key}: range=[{ref_min:.1f}, {ref_max:.1f}], mean={ref_mean:.1f}, units={ref_var_da_unaligned.attrs.get('units', 'unknown')}")
+                    
+                    # Check for potential unit mismatch indicators
+                    if var_name == 'z' and var_level == 500:
+                        # For z500, geopotential should be ~49000-58000 m²/s²
+                        # If it's geopotential height, it would be ~5000-6000 m
+                        miner_ratio = miner_mean / 9.80665  # If miner is geopotential, this ratio should be ~5000-6000
+                        truth_ratio = truth_mean / 9.80665
+                        logger.info(f"[Day1Score] z500 UNIT CHECK - If geopotential (m²/s²): miner_mean/g={miner_ratio:.1f}m, truth_mean/g={truth_ratio:.1f}m")
                         
-                        if abs(truth_var_da_selected.pressure_level.item() - var_level) > 10:
-                             logger.warning(f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected.pressure_level.item()}). Skipping.")
+                        if miner_mean < 10000:  # Much smaller than expected geopotential
+                            logger.warning(f"[Day1Score] POTENTIAL UNIT MISMATCH: Miner z500 mean ({miner_mean:.1f}) suggests geopotential height (m) rather than geopotential (m²/s²)")
+                        elif truth_mean > 40000 and miner_mean > 40000:
+                            logger.info(f"[Day1Score] Unit check OK: Both miner and truth z500 appear to be geopotential (m²/s²)")
+                    
+                    elif var_name == '2t':
+                        # Temperature should be ~200-320 K
+                        if miner_mean < 200 or miner_mean > 350:
+                            logger.warning(f"[Day1Score] POTENTIAL UNIT ISSUE: Miner 2t mean ({miner_mean:.1f}) outside expected range for Kelvin")
+                            
+                    elif var_name == 'msl':
+                        # Mean sea level pressure should be ~90000-110000 Pa
+                        if miner_mean < 50000 or miner_mean > 150000:
+                            logger.warning(f"[Day1Score] POTENTIAL UNIT ISSUE: Miner msl mean ({miner_mean:.1f}) outside expected range for Pa")
+
+                    # AUTOMATIC UNIT CONVERSION: Convert geopotential height to geopotential if needed
+                    if var_name == 'z' and miner_mean < 10000 and truth_mean > 40000:
+                        logger.warning(f"[Day1Score] AUTOMATIC UNIT CONVERSION: Converting miner z from geopotential height (m) to geopotential (m²/s²)")
+                        miner_var_da_unaligned = miner_var_da_unaligned * 9.80665
+                        miner_var_da_unaligned.attrs['units'] = 'm2 s-2'
+                        miner_var_da_unaligned.attrs['long_name'] = 'Geopotential (auto-converted from height)'
+                        logger.info(f"[Day1Score] After conversion: miner z range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}")
+
+                    # Check for temperature unit conversions (Celsius to Kelvin)
+                    elif var_name in ['2t', 't'] and miner_mean < 100 and truth_mean > 200:
+                        logger.warning(f"[Day1Score] AUTOMATIC UNIT CONVERSION: Converting miner {var_name} from Celsius to Kelvin")
+                        miner_var_da_unaligned = miner_var_da_unaligned + 273.15
+                        miner_var_da_unaligned.attrs['units'] = 'K'
+                        miner_var_da_unaligned.attrs['long_name'] = f'{miner_var_da_unaligned.attrs.get("long_name", var_name)} (auto-converted from Celsius)'
+                        logger.info(f"[Day1Score] After conversion: miner {var_name} range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}")
+
+                    # Check for pressure unit conversions (hPa to Pa)
+                    elif var_name == 'msl' and miner_mean < 2000 and truth_mean > 50000:
+                        logger.warning(f"[Day1Score] AUTOMATIC UNIT CONVERSION: Converting miner msl from hPa to Pa")
+                        miner_var_da_unaligned = miner_var_da_unaligned * 100.0
+                        miner_var_da_unaligned.attrs['units'] = 'Pa'
+                        miner_var_da_unaligned.attrs['long_name'] = 'Mean sea level pressure (auto-converted from hPa)'
+                        logger.info(f"[Day1Score] After conversion: miner msl range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}")
+
+                    if var_level:
+                        # Handle different pressure level dimension names for each dataset
+                        def find_pressure_dim(data_array, dataset_name="dataset"):
+                            for dim_name in ['pressure_level', 'plev', 'level']:
+                                if dim_name in data_array.dims:
+                                    return dim_name
+                            logger.warning(f"No pressure level dimension found in {dataset_name} for {var_key} level {var_level}. Available dims: {data_array.dims}")
+                            return None
+                        
+                        miner_pressure_dim = find_pressure_dim(miner_var_da_unaligned, "miner")
+                        truth_pressure_dim = find_pressure_dim(truth_var_da_unaligned, "truth")
+                        ref_pressure_dim = find_pressure_dim(ref_var_da_unaligned, "reference")
+                        
+                        if not all([miner_pressure_dim, truth_pressure_dim, ref_pressure_dim]):
+                            logger.warning(f"Missing pressure dimensions for {var_key} level {var_level}. Skipping.")
+                            continue
+                            
+                        miner_var_da_selected = miner_var_da_unaligned.sel({miner_pressure_dim: var_level}, method="nearest")
+                        truth_var_da_selected = truth_var_da_unaligned.sel({truth_pressure_dim: var_level}, method="nearest")
+                        ref_var_da_selected = ref_var_da_unaligned.sel({ref_pressure_dim: var_level}, method="nearest")
+                        
+                        if abs(truth_var_da_selected[truth_pressure_dim].item() - var_level) > 10:
+                             logger.warning(f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected[truth_pressure_dim].item()}). Skipping.")
                              continue
-                        if abs(miner_var_da_selected.pressure_level.item() - var_level) > 10:
-                             logger.warning(f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected.pressure_level.item()}). Skipping.")
+                        if abs(miner_var_da_selected[miner_pressure_dim].item() - var_level) > 10:
+                             logger.warning(f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected[miner_pressure_dim].item()}). Skipping.")
                              continue
-                        if abs(ref_var_da_selected.pressure_level.item() - var_level) > 10:
-                             logger.warning(f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected.pressure_level.item()}). Skipping.")
+                        if abs(ref_var_da_selected[ref_pressure_dim].item() - var_level) > 10:
+                             logger.warning(f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected[ref_pressure_dim].item()}). Skipping.")
                              continue
                     else:
                         miner_var_da_selected = miner_var_da_unaligned
@@ -319,6 +425,7 @@ async def evaluate_miner_forecast_day1(
                         logger.warning(f"[Day1Score] GFS Clone Suspect: {var_key} at {effective_lead_h}h for {miner_hotkey}. "
                                      f"Distance MSE {clone_distance_mse_val:.4f} < Delta {delta_for_var:.4f}. Penalty: {clone_penalty:.4f}")
                         day1_results["qc_passed_all_vars_leads"] = False
+                        logger.info(f"[Day1Score] QC FAILURE REASON: Clone penalty triggered for {var_key}")
                     day1_results["lead_time_scores"][time_key_for_results][var_key]["clone_penalty_applied"] = clone_penalty
 
                     clim_dayofyear = pd.Timestamp(valid_time_dt).dayofyear
@@ -334,10 +441,18 @@ async def evaluate_miner_forecast_day1(
                     clim_var_da_raw_std = _standardize_spatial_dims(clim_var_da_raw)
 
                     clim_var_to_interpolate = clim_var_da_raw_std
-                    if var_level and 'pressure_level' in clim_var_to_interpolate.dims:
-                        clim_var_to_interpolate = await asyncio.to_thread(clim_var_to_interpolate.sel, pressure_level=var_level, method="nearest")
-                        if abs(clim_var_to_interpolate.pressure_level.item() - var_level) > 10:
-                            logger.warning(f"[Day1Score] Climatology for {var_key} at target level {var_level} was found at {clim_var_to_interpolate.pressure_level.item()}. Using this nearest level data.")
+                    if var_level:
+                        # Handle different pressure level dimension names in climatology data
+                        clim_pressure_dim = None
+                        for dim_name in ['pressure_level', 'plev', 'level']:
+                            if dim_name in clim_var_to_interpolate.dims:
+                                clim_pressure_dim = dim_name
+                                break
+                        
+                        if clim_pressure_dim:
+                            clim_var_to_interpolate = await asyncio.to_thread(clim_var_to_interpolate.sel, **{clim_pressure_dim: var_level}, method="nearest")
+                            if abs(clim_var_to_interpolate[clim_pressure_dim].item() - var_level) > 10:
+                                logger.warning(f"[Day1Score] Climatology for {var_key} at target level {var_level} was found at {clim_var_to_interpolate[clim_pressure_dim].item()}. Using this nearest level data.")
                     
                     clim_var_da_aligned = await asyncio.to_thread(
                         clim_var_to_interpolate.interp_like,
@@ -359,6 +474,9 @@ async def evaluate_miner_forecast_day1(
                        not sanity_results.get("pattern_correlation_passed"):
                         logger.warning(f"[Day1Score] Sanity check failed for {var_key} at {effective_lead_h}h. Skipping metrics.")
                         day1_results["qc_passed_all_vars_leads"] = False
+                        logger.info(f"[Day1Score] QC FAILURE REASON: Sanity check failed for {var_key} - "
+                                   f"Climatology passed: {sanity_results.get('climatology_passed')}, "
+                                   f"Pattern correlation passed: {sanity_results.get('pattern_correlation_passed')}")
                         continue
 
                     # Bias Correction
@@ -387,6 +505,9 @@ async def evaluate_miner_forecast_day1(
                     day1_results["lead_time_scores"][time_key_for_results][var_key]["error"] = str(e_var)
                     day1_results["qc_passed_all_vars_leads"] = False
 
+            # Light cleanup after each time step to prevent excessive accumulation
+            if len(times_to_evaluate) > 2:  # Only if processing multiple time steps
+                gc.collect()
 
         clipped_skill_scores = [max(0.0, s) for s in aggregated_skill_scores if np.isfinite(s)]
         scaled_acc_scores = [(a + 1.0) / 2.0 for a in aggregated_acc_scores if np.isfinite(a)]
@@ -428,12 +549,39 @@ async def evaluate_miner_forecast_day1(
         day1_results["overall_day1_score"] = -np.inf # Penalize on error
         day1_results["qc_passed_all_vars_leads"] = False
     finally:
+        # CRITICAL: Clean up miner-specific objects, but preserve shared datasets
         if miner_forecast_ds:
             try:
                 miner_forecast_ds.close()
+                logger.debug(f"[Day1Score] Closed miner forecast dataset for {miner_hotkey}")
             except Exception:
                 pass
-        gc.collect()
+        
+        # Clean up any remaining intermediate objects created during this miner's evaluation
+        # But do NOT clean the shared datasets (gfs_analysis_data_for_run, gfs_reference_forecast_for_run, era5_climatology)
+        try:
+            miner_specific_objects = [
+                'miner_forecast_ds', 'miner_forecast_lead', 'gfs_analysis_lead', 'gfs_reference_lead'
+            ]
+            
+            for obj_name in miner_specific_objects:
+                if obj_name in locals():
+                    try:
+                        obj = locals()[obj_name]
+                        if hasattr(obj, 'close') and obj_name != 'gfs_analysis_lead' and obj_name != 'gfs_reference_lead':
+                            # Don't close slices of shared datasets, just del the reference
+                            obj.close()
+                        del obj
+                    except Exception:
+                        pass
+            
+            # Single garbage collection pass for this miner
+            collected = gc.collect()
+            if collected > 10:  # Only log if significant cleanup occurred
+                logger.debug(f"[Day1Score] Cleanup for {miner_hotkey}: collected {collected} objects")
+                
+        except Exception as cleanup_err:
+            logger.debug(f"[Day1Score] Error in cleanup for {miner_hotkey}: {cleanup_err}")
 
     logger.info(f"[Day1Score] Completed for {miner_hotkey}. Final score: {day1_results['overall_day1_score']}, QC Passed: {day1_results['qc_passed_all_vars_leads']}")
     return day1_results

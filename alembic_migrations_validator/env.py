@@ -14,17 +14,17 @@ config = context.config
 db_connection_type = os.getenv("DB_CONNECTION_TYPE", "host")
 
 if db_connection_type == "socket":
-    db_name = os.getenv("POSTGRES_DB", "validator_db")
-    db_user = os.getenv("POSTGRES_USER", "postgres")
-    db_password = os.getenv("POSTGRES_PASSWORD", "postgres")
+    db_name = os.getenv("DB_NAME", "validator_db")
+    db_user = os.getenv("DB_USER", "postgres")
+    db_password = os.getenv("DB_PASSWORD", "postgres")
     db_url = f"postgresql+psycopg2://{db_user}:{db_password}@/{db_name}?host=/var/run/postgresql"
     logger.info("Using socket-based DB connection for validator.")
 else:
-    db_host = os.getenv("POSTGRES_HOST", "localhost")
-    db_port = os.getenv("POSTGRES_PORT", "5432")
-    db_user = os.getenv("POSTGRES_USER", "postgres")
-    db_password = os.getenv("POSTGRES_PASSWORD", "postgres")
-    db_name = os.getenv("POSTGRES_DB", "validator_db")
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_port = os.getenv("DB_PORT", "5432")
+    db_user = os.getenv("DB_USER", "postgres")
+    db_password = os.getenv("DB_PASSWORD", "postgres")
+    db_name = os.getenv("DB_NAME", "validator_db")
     db_url = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
     logger.info("Using host-based DB connection for validator.")
 

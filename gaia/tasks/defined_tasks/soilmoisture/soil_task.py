@@ -1,4 +1,5 @@
 from gaia.tasks.base.task import Task
+from gaia.tasks.base.deterministic_job_id import DeterministicJobID
 from datetime import datetime, timedelta, timezone
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
@@ -219,9 +220,28 @@ class SoilMoistureTask(Task):
                                 logger.info(f"Region {region['id']} TIFF header: {combined_data[:4]}")
                                 logger.info(f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}")
                                 
+                                # Track memory usage for large TIFF processing
+                                tiff_size_mb = len(combined_data) / (1024 * 1024)
+                                if tiff_size_mb > 50:
+                                    logger.warning(f"Processing large TIFF for region {region['id']}: {tiff_size_mb:.1f}MB")
+                                
+                                # Log memory before processing
+                                if hasattr(validator, '_log_memory_usage'):
+                                    validator._log_memory_usage(f"soil_before_region_{region['id']}")
+                                
                                 loop = asyncio.get_event_loop()
                                 encoded_data_bytes = await loop.run_in_executor(None, base64.b64encode, combined_data)
                                 encoded_data_ascii = encoded_data_bytes.decode("ascii")
+                                
+                                # Immediately clean up large variables to prevent memory accumulation
+                                del encoded_data_bytes  # Free the intermediate bytes object
+                                original_data_copy = combined_data  # Keep reference for baseline model if needed
+                                del combined_data  # Free the original large TIFF data
+                                
+                                # Log memory after base64 encoding and cleanup
+                                if hasattr(validator, '_log_memory_usage'):
+                                    validator._log_memory_usage(f"soil_after_encoding_{region['id']}")
+                                
                                 logger.info(f"Base64 first 16 chars: {encoded_data_ascii[:16]}")
 
                                 task_data = {
@@ -258,7 +278,10 @@ class SoilMoistureTask(Task):
                                                             logger.error(f"Error cleaning temp file in sync helper: {e_unlink_inner}")
 
                                             loop = asyncio.get_event_loop()
-                                            model_inputs, temp_file_path = await loop.run_in_executor(None, _write_and_preprocess_sync, combined_data)
+                                            model_inputs, temp_file_path = await loop.run_in_executor(None, _write_and_preprocess_sync, original_data_copy)
+                                            
+                                            # Free the original data copy after baseline model processing
+                                            del original_data_copy
                                             
                                             if model_inputs:
                                                 for key, value in model_inputs.items():
@@ -273,6 +296,9 @@ class SoilMoistureTask(Task):
                                         except Exception as e:
                                             logger.error(f"Error preprocessing data for soil moisture baseline model: {str(e)}")
                                             logger.error(traceback.format_exc())
+                                            # Clean up on error
+                                            if 'original_data_copy' in locals():
+                                                del original_data_copy
                                         
                                         if model_inputs:
                                             if isinstance(target_smap_time, datetime):
@@ -282,6 +308,8 @@ class SoilMoistureTask(Task):
                                                     target_smap_time_utc = target_smap_time.replace(tzinfo=timezone.utc)
                                             else:
                                                 target_smap_time_utc = target_smap_time
+                                            # Using timestamp-based deterministic task ID (already deterministic)
+                                            # Could optionally use: DeterministicJobID.generate_task_id("soil_moisture", target_smap_time_utc, region_id)
                                             task_id = str(target_smap_time_utc.timestamp())
                                             baseline_prediction = await validator.basemodel_evaluator.predict_soil_and_store(
                                                 data=model_inputs,
@@ -303,6 +331,13 @@ class SoilMoistureTask(Task):
                                     except Exception as e:
                                         logger.error(f"Error running soil moisture baseline model: {str(e)}")
                                         logger.error(traceback.format_exc())
+                                        # Ensure cleanup on any error
+                                        if 'original_data_copy' in locals():
+                                            del original_data_copy
+                                else:
+                                    # If no baseline model, clean up the original data copy immediately
+                                    if 'original_data_copy' in locals():
+                                        del original_data_copy
 
                                 payload = {"nonce": str(uuid4()), "data": task_data}
 
@@ -311,6 +346,21 @@ class SoilMoistureTask(Task):
                                 responses = await validator.query_miners(
                                     payload=payload, endpoint="/soilmoisture-request"
                                 )
+                                
+                                # Clean up task_data and payload after query to free encoded data
+                                del task_data
+                                del payload
+                                del encoded_data_ascii
+                                
+                                # Force garbage collection after processing large TIFF
+                                if tiff_size_mb > 50:
+                                    import gc
+                                    collected = gc.collect()
+                                    logger.info(f"Cleaned up large TIFF data for region {region['id']} ({tiff_size_mb:.1f}MB), GC collected {collected} objects")
+
+                                # Log memory after cleanup
+                                if hasattr(validator, '_log_memory_usage'):
+                                    validator._log_memory_usage(f"soil_after_cleanup_{region['id']}")
 
                                 if responses:
                                     metadata = {
@@ -415,9 +465,28 @@ class SoilMoistureTask(Task):
                             logger.info(f"Region {region['id']} TIFF header: {combined_data[:4]}")
                             logger.info(f"Region {region['id']} TIFF header hex: {combined_data[:16].hex()}")
                                 
+                            # Track memory usage for large TIFF processing
+                            tiff_size_mb = len(combined_data) / (1024 * 1024)
+                            if tiff_size_mb > 50:
+                                logger.warning(f"Processing large TIFF for region {region['id']}: {tiff_size_mb:.1f}MB")
+                                
+                            # Log memory before processing
+                            if hasattr(validator, '_log_memory_usage'):
+                                validator._log_memory_usage(f"soil_before_region_{region['id']}")
+                                
                             loop = asyncio.get_event_loop()
                             encoded_data_bytes = await loop.run_in_executor(None, base64.b64encode, combined_data)
                             encoded_data_ascii = encoded_data_bytes.decode("ascii")
+                            
+                            # Immediately clean up large variables to prevent memory accumulation
+                            del encoded_data_bytes  # Free the intermediate bytes object
+                            original_data_copy = combined_data  # Keep reference for baseline model if needed
+                            del combined_data  # Free the original large TIFF data
+                            
+                            # Log memory after base64 encoding and cleanup
+                            if hasattr(validator, '_log_memory_usage'):
+                                validator._log_memory_usage(f"soil_after_encoding_{region['id']}")
+                                
                             logger.info(f"Base64 first 16 chars: {encoded_data_ascii[:16]}")
 
                             task_data = {
@@ -860,7 +929,14 @@ class SoilMoistureTask(Task):
                 temp_path = None
                 try:
                     logger.info(f"Processing tasks for target_time: {target_time}")
-                    smap_data_result = await get_smap_data(target_time, tasks_in_time_window)
+                    # Transform tasks into the format expected by get_smap_data
+                    regions_for_smap = []
+                    for task in tasks_in_time_window:
+                        regions_for_smap.append({
+                            "bounds": task["sentinel_bounds"],
+                            "crs": task["sentinel_crs"]
+                        })
+                    smap_data_result = await get_smap_data(target_time, regions_for_smap)
                     
                     if smap_data_result is None or not isinstance(smap_data_result, dict):
                         logger.error(f"Failed to download or process SMAP data for {target_time}")

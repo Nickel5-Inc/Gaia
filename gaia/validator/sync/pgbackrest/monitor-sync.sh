@@ -102,28 +102,22 @@ if command -v pgbackrest &> /dev/null; then
     echo "Backup Information:"
     if sudo -u postgres pgbackrest --stanza="$STANZA_NAME" info 2>/dev/null; then
         echo -e "${GREEN}✓ pgBackRest stanza accessible${NC}"
+        check_status_code=0
+        # Stanza check successful, can proceed with more detailed checks
+        # Check last backup time
+        last_backup=$(sudo -u postgres pgbackrest info --output=json | jq -r ".[] | .backup | .[] | select(.type == \"full\" or .type == \"diff\") | .timestamp.stop" | sort -n | tail -1)
+        if [[ -n "$last_backup" ]]; then
+            last_backup_date=$(date -d @$last_backup)
+            echo "Last full/diff backup completed at: $last_backup_date"
+        else
+            echo -e "${YELLOW}⚠ Could not determine last backup time.${NC}"
+        fi
     else
-        echo -e "${RED}✗ pgBackRest stanza not accessible or Azure connection failed${NC}"
+        echo -e "${RED}✗ pgBackRest stanza not accessible or R2 connection failed${NC}"
+        check_status_code=1
     fi
 else
     echo -e "${RED}✗ pgBackRest is not installed${NC}"
-fi
-
-# Azure Storage Connectivity
-echo ""
-echo -e "${BLUE}Azure Storage Connectivity:${NC}"
-if [[ -n "${AZURE_STORAGE_ACCOUNT:-}" ]] && [[ -n "${AZURE_CONTAINER:-}" ]]; then
-    echo "Storage Account: $AZURE_STORAGE_ACCOUNT"
-    echo "Container: $AZURE_CONTAINER"
-    
-    # Test connectivity with pgbackrest
-    if sudo -u postgres pgbackrest --stanza="$STANZA_NAME" check &>/dev/null; then
-        echo -e "${GREEN}✓ Azure Storage connectivity OK${NC}"
-    else
-        echo -e "${YELLOW}⚠ Azure Storage connectivity check failed${NC}"
-    fi
-else
-    echo -e "${YELLOW}⚠ Azure Storage configuration not found${NC}"
 fi
 
 # Disk Usage
@@ -170,4 +164,14 @@ echo "For detailed monitoring, check:"
 echo "- PostgreSQL logs: journalctl -u postgresql"
 echo "- pgBackRest logs: /var/log/pgbackrest/"
 echo "- Gaia setup logs: /var/log/gaia-pgbackrest/"
-echo "==============================================================================" 
+echo "=============================================================================="
+
+# --- Summary ---
+echo -e "\n${BLUE}--- Sync Status Summary ---${NC}"
+if [[ $check_status_code -eq 0 ]]; then
+    echo -e "${GREEN}✓ DB Sync appears HEALTHY${NC}"
+else
+    echo -e "${RED}✗ DB Sync appears UNHEALTHY${NC}"
+fi
+
+exit $check_status_code 

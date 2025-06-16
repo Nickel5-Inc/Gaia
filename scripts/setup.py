@@ -57,8 +57,8 @@ def setup_postgresql(default_user="postgres", default_password="postgres"):
     """Configure PostgreSQL for the project"""
     try:
         # Allow overriding the default user and password with environment variables
-        postgres_user = os.getenv("POSTGRES_USER", default_user)
-        postgres_password = os.getenv("POSTGRES_PASSWORD", default_password)
+        postgres_user = os.getenv("DB_USER", default_user)
+        postgres_password = os.getenv("DB_PASSWORD", default_password)
 
         conn = psycopg2.connect(
             dbname="postgres", user=postgres_user, password=postgres_password, host="localhost"

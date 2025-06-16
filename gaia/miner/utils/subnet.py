@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional
 import glob
 import urllib.parse
 import base64
+import asyncio
 
 from gaia.tasks.defined_tasks.weather.schemas.weather_inputs import (
     WeatherForecastRequest, WeatherKerchunkRequest, WeatherInputData,
@@ -225,6 +226,14 @@ def factory_router(miner_instance) -> APIRouter:
         
         logger.info(f"Received request for file: {file_path}")
         
+        # Check if we're in R2 proxy mode
+        file_serving_mode = getattr(miner_instance, 'weather_task', None) and miner_instance.weather_task.config.get('file_serving_mode', 'local')
+        
+        if file_serving_mode == 'r2_proxy':
+            # Proxy the request to R2
+            return await proxy_file_from_r2(request, file_path, token)
+        
+        # Original local file serving logic
         if token is None:
             auth_header = request.headers.get("Authorization")
             if auth_header:
@@ -340,6 +349,136 @@ def factory_router(miner_instance) -> APIRouter:
         
         logger.error(f"File or directory not found: {full_path}")
         raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+
+    async def proxy_file_from_r2(request: Request, file_path: str, token: Optional[str] = None):
+        """Proxy file requests to R2 when file_serving_mode is 'r2_proxy'."""
+        logger.info(f"Proxying R2 request for file: {file_path}")
+        
+        # Validate token and extract job_id
+        if not token:
+            # Try to extract token from various sources
+            auth_header = request.headers.get("Authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+            elif "token" in request.query_params:
+                token = request.query_params.get("token")
+            elif "?token=" in file_path:
+                path_parts = file_path.split("?token=", 1)
+                if len(path_parts) == 2:
+                    token = path_parts[1].split("/")[0]
+                    file_path = path_parts[0]
+        
+        if not token:
+            raise HTTPException(status_code=401, detail="Token required for R2 proxy access")
+        
+        try:
+            # Decode JWT to get job information
+            payload = jwt.decode(token, MINER_JWT_SECRET_KEY, algorithms=["HS256"])
+            job_id = payload.get("job_id")
+            
+            if not job_id:
+                raise HTTPException(status_code=403, detail="Token missing job_id claim")
+                
+            # Get the R2 prefix for this job
+            weather_task = miner_instance.weather_task
+            if not weather_task:
+                raise HTTPException(status_code=500, detail="Weather task not available")
+                
+            # Get job details from database to find R2 prefix
+            query = "SELECT target_netcdf_path FROM weather_miner_jobs WHERE id = :job_id"
+            job_data = await weather_task.db_manager.fetch_one(query, {"job_id": job_id})
+            
+            if not job_data or not job_data['target_netcdf_path']:
+                raise HTTPException(status_code=404, detail="Job or R2 path not found")
+                
+            r2_prefix = job_data['target_netcdf_path']
+            
+            # Get R2 client
+            s3_client = await weather_task._get_r2_s3_client()
+            if not s3_client:
+                raise HTTPException(status_code=500, detail="R2 client not available")
+                
+            bucket_name = weather_task.r2_config.get("r2_bucket_name")
+            if not bucket_name:
+                raise HTTPException(status_code=500, detail="R2 bucket not configured")
+            
+            # Handle different file path patterns
+            if file_path.endswith('.zarr/') or file_path.endswith('.zarr'):
+                # List files in the zarr directory
+                zarr_prefix = r2_prefix.rstrip('/') + '/'
+                
+                try:
+                    response = await asyncio.to_thread(
+                        s3_client.list_objects_v2,
+                        Bucket=bucket_name,
+                        Prefix=zarr_prefix
+                    )
+                    
+                    if 'Contents' not in response:
+                        raise HTTPException(status_code=404, detail="No files found")
+                        
+                    files = []
+                    for obj in response['Contents']:
+                        # Extract just the filename from the full key
+                        relative_path = obj['Key'][len(zarr_prefix):]
+                        if relative_path:  # Skip empty paths
+                            files.append(relative_path.split('/')[0])  # Get first part after prefix
+                    
+                    # Remove duplicates and return unique filenames
+                    unique_files = list(set(files))
+                    return JSONResponse(content={"files": unique_files})
+                    
+                except Exception as e:
+                    logger.error(f"Error listing R2 objects: {e}")
+                    raise HTTPException(status_code=500, detail="Error listing files")
+            
+            else:
+                # Request for a specific file - map to R2 object key
+                if file_path.startswith('/'):
+                    file_path = file_path[1:]
+                    
+                # Extract the .nc filename from the path
+                parts = file_path.split('/')
+                if len(parts) >= 2 and parts[1].endswith('.nc'):
+                    nc_filename = parts[1]
+                    r2_object_key = f"{r2_prefix}/{nc_filename}"
+                else:
+                    raise HTTPException(status_code=400, detail="Invalid file path")
+                
+                try:
+                    # Stream the file from R2
+                    response = await asyncio.to_thread(
+                        s3_client.get_object,
+                        Bucket=bucket_name,
+                        Key=r2_object_key
+                    )
+                    
+                    file_content = await asyncio.to_thread(response['Body'].read)
+                    
+                    return Response(
+                        content=file_content,
+                        media_type="application/octet-stream",
+                        headers={
+                            "Content-Disposition": f"attachment; filename={nc_filename}",
+                            "Content-Length": str(len(file_content))
+                        }
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error downloading from R2: {e}")
+                    if "NoSuchKey" in str(e):
+                        raise HTTPException(status_code=404, detail="File not found in R2")
+                    else:
+                        raise HTTPException(status_code=500, detail="Error downloading file")
+                        
+        except jwt.PyJWTError as jwt_error:
+            logger.warning(f"Invalid JWT token: {str(jwt_error)}")
+            raise HTTPException(status_code=401, detail="Invalid token")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error in R2 proxy: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
     async def weather_forecast_require(
         decrypted_payload: WeatherForecastRequest = Depends(

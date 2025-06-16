@@ -9,6 +9,8 @@ import concurrent.futures
 import glob
 import signal
 import sys
+import tracemalloc # Added import
+import memray # Added for programmatic memray tracking
 
 from gaia.database.database_manager import DatabaseTimeout
 try:
@@ -62,6 +64,7 @@ import numpy as np
 from gaia.validator.basemodel_evaluator import BaseModelEvaluator
 from gaia.validator.utils.db_wipe import handle_db_wipe
 from gaia.validator.utils.earthdata_tokens import ensure_valid_earthdata_token
+from gaia.validator.utils.substrate_manager import SubstrateConnectionManager
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 
 # Imports for Alembic check
@@ -71,9 +74,8 @@ from alembic.util import CommandError # Import CommandError
 from sqlalchemy import create_engine, pool
 
 # New imports for DB Sync
-from gaia.validator.sync.azure_blob_utils import get_azure_blob_manager_for_db_sync, AzureBlobManager
-from gaia.validator.sync.backup_manager import get_backup_manager, BackupManager
-from gaia.validator.sync.restore_manager import get_restore_manager, RestoreManager
+# Legacy backup/restore managers removed - using AutoSyncManager only
+from gaia.validator.sync.auto_sync_manager import get_auto_sync_manager
 import random # for staggering db sync tasks
 
 logger = get_logger(__name__)
@@ -175,6 +177,7 @@ class GaiaValidator:
         """
         Initialize the GaiaValidator with provided arguments.
         """
+        print("[STARTUP DEBUG] Starting GaiaValidator.__init__")
         self.args = args
         self.metagraph = None
         self.config = None
@@ -198,6 +201,7 @@ class GaiaValidator:
         self.last_set_weights_block = 0
         self.current_block = 0
         self.nodes = {}
+        self.memray_tracker: Optional[memray.Tracker] = None # For programmatic memray
 
         # Initialize HTTP clients first
         # Client for miner communication with SSL verification disabled
@@ -213,9 +217,9 @@ class GaiaValidator:
             follow_redirects=True,
             verify=False,
             limits=httpx.Limits(
-                max_connections=50,  # Reduced from 100
-                max_keepalive_connections=15,  # Reduced from 20
-                keepalive_expiry=60,  # Increased from 30
+                max_connections=100,  # Restore higher limit for 200+ miners
+                max_keepalive_connections=50,  # Allow more keepalive for efficiency
+                keepalive_expiry=300,  # 5 minutes - good balance for regular queries
             ),
             transport=httpx.AsyncHTTPTransport(
                 retries=2,  # Reduced from 3
@@ -341,6 +345,21 @@ class GaiaValidator:
         # Add lock for miner table operations
         self.miner_table_lock = asyncio.Lock()
 
+        # Memory monitoring configuration
+        self.memory_monitor_enabled = os.getenv('VALIDATOR_MEMORY_MONITORING_ENABLED', 'true').lower() in ['true', '1', 'yes']
+        self.pm2_restart_enabled = os.getenv('VALIDATOR_PM2_RESTART_ENABLED', 'true').lower() in ['true', '1', 'yes']
+        
+        # Memory thresholds in MB - higher defaults for validators (24GB = 24576MB)
+        self.memory_warning_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_WARNING_THRESHOLD_MB', '16000'))  # 16GB
+        self.memory_emergency_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB', '20000'))  # 20GB  
+        self.memory_critical_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB', '24000'))  # 24GB
+        
+        # Memory monitoring state
+        self.last_memory_log_time = 0
+        self.memory_log_interval = 300  # Log memory status every 5 minutes
+        self.last_emergency_gc_time = 0
+        self.emergency_gc_cooldown = 60  # Minimum 60 seconds between emergency GC attempts
+
         self.basemodel_evaluator = BaseModelEvaluator(
             db_manager=self.database_manager,
             test_mode=self.args.test if hasattr(self.args, 'test') else False
@@ -348,15 +367,21 @@ class GaiaValidator:
         logger.info("BaseModelEvaluator initialized")
         
         # DB Sync components
-        self.azure_blob_manager_for_sync: AzureBlobManager | None = None
-        self.backup_manager: BackupManager | None = None
-        self.restore_manager: RestoreManager | None = None
+        self.auto_sync_manager = None  # Streamlined sync system using pgBackRest + R2
         
         self.is_source_validator_for_db_sync = os.getenv("IS_SOURCE_VALIDATOR_FOR_DB_SYNC", "False").lower() == "true"
-        self.db_sync_interval_hours = int(os.getenv("DB_SYNC_INTERVAL_HOURS", "1")) # Default to 1 hour
-        if self.db_sync_interval_hours <= 0 : # Ensure positive interval
-            logger.warning(f"DB_SYNC_INTERVAL_HOURS is {self.db_sync_interval_hours}, defaulting to 1 hour for safety.")
-            self.db_sync_interval_hours = 1
+        
+        # DB Sync interval & mode
+        if self.args.test:
+            self.db_sync_interval_hours = 0.25 # 15 minutes for testing
+            logger.info(f"Test mode enabled: DB sync interval set to {self.db_sync_interval_hours} hours (15 minutes).")
+        else:
+            # Default to 1 hour, allow override by env var for non-test mode
+            self.db_sync_interval_hours = int(os.getenv("DB_SYNC_INTERVAL_HOURS", "1"))
+            if self.db_sync_interval_hours <= 0:
+                logger.warning(f"DB_SYNC_INTERVAL_HOURS ('{os.getenv('DB_SYNC_INTERVAL_HOURS')}') is invalid ({self.db_sync_interval_hours}). Defaulting to 1 hour.")
+                self.db_sync_interval_hours = 1
+            logger.info(f"DB sync interval set to {self.db_sync_interval_hours} hours.")
 
         # For database monitor plotting
         self.db_monitor_history = []
@@ -379,10 +404,17 @@ class GaiaValidator:
              {"weather": 0.80, "geomagnetic": 0.10, "soil": 0.10})
         ]
 
+        self.tracemalloc_snapshot1: Optional[tracemalloc.Snapshot] = None # Initialize for the snapshot taker task
+
+        print("[STARTUP DEBUG] Validating task weight schedule")
         for dt_thresh, weights_dict in self.task_weight_schedule:
             if not math.isclose(sum(weights_dict.values()), 1.0):
                 logger.error(f"Task weights for threshold {dt_thresh.isoformat()} do not sum to 1.0! Sum: {sum(weights_dict.values())}. Fix configuration.")
 
+        # Initialize substrate connection manager (will be set up in setup_neuron)
+        print("[STARTUP DEBUG] Initializing substrate manager")
+        self.substrate_manager: Optional[SubstrateConnectionManager] = None
+        print("[STARTUP DEBUG] GaiaValidator.__init__ completed")
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -438,7 +470,7 @@ class GaiaValidator:
             for task_name in ['soil', 'geomagnetic', 'weather', 'scoring', 'deregistration', 'status_logger', 'db_sync_backup', 'db_sync_restore', 'miner_score_sender', 'earthdata_token', 'db_monitor', 'plot_db_metrics']:
                 try:
                     # Check if task exists in health tracking before updating
-                    if task_name in self.task_health or hasattr(self, f"{task_name}_task") or (task_name.startswith("db_sync") and (self.backup_manager or self.restore_manager)):
+                    if task_name in self.task_health or hasattr(self, f"{task_name}_task") or (task_name.startswith("db_sync") and self.auto_sync_manager):
                         await self.update_task_status(task_name, 'stopping')
                     else:
                         logger.debug(f"Skipping status update for non-existent/inactive task: {task_name}")
@@ -551,10 +583,15 @@ class GaiaValidator:
             
             w.blocks_since_last_update = blocks_since_wrapper
 
+            # Initialize substrate connection manager FIRST
+            self.substrate_manager = SubstrateConnectionManager(
+                subtensor_network=self.subtensor_network,
+                chain_endpoint=self.subtensor_chain_endpoint
+            )
+
             try:
-                self.substrate = get_substrate(
-                    subtensor_network=self.subtensor_network,
-                    subtensor_address=self.subtensor_chain_endpoint)
+                # Use managed connection instead of direct get_substrate()
+                self.substrate = self.substrate_manager.get_connection()
             except Exception as e_sub_init:
                 logger.error(f"CRITICAL: Failed to initialize SubstrateInterface with endpoint {self.subtensor_chain_endpoint}: {e_sub_init}", exc_info=True)
                 return False
@@ -568,6 +605,9 @@ class GaiaValidator:
 
             # Standard Metagraph Sync
             try:
+                # Use direct sync here since _sync_metagraph is async and we're in sync method
+                # But ensure substrate connection is current
+                self.substrate = self.substrate_manager.get_connection()
                 self.metagraph.sync_nodes()  # Sync nodes after initialization
                 logger.info(f"Successfully synced {len(self.metagraph.nodes) if self.metagraph.nodes else '0'} nodes from the network.")
             except Exception as e_meta_sync:
@@ -659,9 +699,17 @@ class GaiaValidator:
                 logger.warning(f"No miners to query for endpoint {endpoint} after filtering. Hotkeys: {hotkeys}")
                 return {}
 
-            # Use the existing miner_client instead of creating a new one
+            # Ensure miner client is available
             if not hasattr(self, 'miner_client') or self.miner_client.is_closed:
                 logger.warning("Miner client not available or closed, creating new one")
+                # Properly close old client if it exists
+                if hasattr(self, 'miner_client') and not self.miner_client.is_closed:
+                    try:
+                        await self.miner_client.aclose()
+                        logger.debug("Closed old miner client before creating new one")
+                    except Exception as e:
+                        logger.debug(f"Error closing old miner client: {e}")
+                
                 # Create SSL context that doesn't verify certificates
                 import ssl
                 ssl_context = ssl.create_default_context()
@@ -673,9 +721,9 @@ class GaiaValidator:
                     follow_redirects=True,
                     verify=False,
                     limits=httpx.Limits(
-                        max_connections=50,  # Reduced from 100
-                        max_keepalive_connections=15,  # Reduced from 20 
-                        keepalive_expiry=60,  # Increased from 30
+                        max_connections=100,  # Restore higher limit for 200+ miners
+                        max_keepalive_connections=50,  # Allow more keepalive for efficiency
+                        keepalive_expiry=300,  # 5 minutes - good balance for regular queries
                     ),
                     transport=httpx.AsyncHTTPTransport(
                         retries=2,  # Reduced from 3
@@ -683,48 +731,46 @@ class GaiaValidator:
                     ),
                 )
 
-            # Reduce concurrency based on number of miners to avoid overwhelming the system
-            max_concurrent = min(5, len(miners_to_query))  # Much more conservative
-            semaphore = asyncio.Semaphore(max_concurrent)
-            logger.info(f"Using concurrency limit of {max_concurrent} for {len(miners_to_query)} miners")
+            # Use chunked processing to reduce database contention and memory spikes
+            chunk_size = 50  # Process miners in chunks of 50
+            chunk_concurrency = 15  # Lower concurrency per chunk to reduce DB pressure
+            chunks = []
+            
+            # Split miners into chunks
+            miners_list = list(miners_to_query.items())
+            for i in range(0, len(miners_list), chunk_size):
+                chunk = dict(miners_list[i:i + chunk_size])
+                chunks.append(chunk)
+            
+            logger.info(f"Processing {len(miners_to_query)} miners in {len(chunks)} chunks of {chunk_size} (concurrency: {chunk_concurrency} per chunk)")
 
-            # Batch retry configuration
-            max_retry_rounds = 2  # Total of 3 attempts (1 initial + 2 retries)
-            retry_delay = 2.0  # Delay between retry rounds
+            # Configuration for immediate retries
+            max_retries_per_miner = 2  # Total of 2 attempts (1 initial + 1 retry)
+            base_timeout = 15.0
             
-            # Track miners for retry
-            miners_remaining = dict(miners_to_query)  # Copy for first attempt
-            
-            for retry_round in range(max_retry_rounds + 1):  # 0 = initial attempt, 1+ = retry rounds
-                if not miners_remaining:
-                    break
-                    
-                round_type = "Initial attempt" if retry_round == 0 else f"Retry round {retry_round}"
-                logger.info(f"{round_type}: Querying {len(miners_remaining)} miners")
+            async def query_single_miner_with_retries(miner_hotkey: str, node, semaphore: asyncio.Semaphore) -> Optional[Dict]:
+                """Query a single miner with immediate retries on failure."""
+                base_url = f"https://{node.ip}:{node.port}"
+                process = psutil.Process() if PSUTIL_AVAILABLE else None
                 
-                async def query_single_miner_no_retry(miner_hotkey: str, node: Any, attempt_num: int) -> Optional[Dict]:
-                    """Query a single miner without internal retries (batch retry handled at higher level)."""
-                    base_url = f"https://{node.ip}:{node.port}"
-                    process = psutil.Process() if PSUTIL_AVAILABLE else None
-                    try:
-                        async with semaphore:  # Control concurrency
-                            logger.debug(f"[{round_type}] Initiating handshake with miner {miner_hotkey} at {base_url}")
+                async with semaphore: # Acquire semaphore before starting attempts for a miner
+                    for attempt in range(max_retries_per_miner):
+                        attempt_timeout = base_timeout + (attempt * 5.0)  # Progressive timeout
+                        
+                        try:
+                            logger.debug(f"Miner {miner_hotkey} attempt {attempt + 1}/{max_retries_per_miner}")
                             
-                            # Perform handshake with a single attempt (no retry at this level)
+                            # Perform handshake
                             handshake_start_time = time.time()
-                            symmetric_key_str, symmetric_key_uuid = None, None
                             try:
-                                # Use a single attempt with longer timeout for retries
-                                current_timeout = 15.0 + (attempt_num * 5.0)  # Increase timeout with retry attempts
-                                
                                 # Get public key
                                 public_key_encryption_key = await asyncio.wait_for(
                                     handshake.get_public_encryption_key(
                                         self.miner_client, 
                                         base_url, 
-                                        timeout=int(current_timeout)
+                                        timeout=int(attempt_timeout)
                                     ),
-                                    timeout=current_timeout
+                                    timeout=attempt_timeout
                                 )
                                 
                                 # Generate symmetric key
@@ -741,55 +787,47 @@ class GaiaValidator:
                                         symmetric_key,
                                         symmetric_key_uuid,
                                         miner_hotkey,
-                                        timeout=int(current_timeout),
+                                        timeout=int(attempt_timeout),
                                     ),
-                                    timeout=current_timeout
+                                    timeout=attempt_timeout
                                 )
                                 
-                                if success:
-                                    symmetric_key_str = base64.b64encode(symmetric_key).decode()
-                                else:
+                                if not success:
                                     raise Exception("Handshake failed: server returned unsuccessful status")
                                     
+                                symmetric_key_str = base64.b64encode(symmetric_key).decode()
+                                    
                             except Exception as hs_err:
-                                logger.debug(f"[{round_type}] Handshake failed for miner {miner_hotkey} at {base_url}: {type(hs_err).__name__} - {hs_err}")
-                                return None
+                                logger.debug(f"Handshake failed for miner {miner_hotkey} attempt {attempt + 1}: {type(hs_err).__name__}")
+                                if attempt < max_retries_per_miner - 1:
+                                    await asyncio.sleep(0.5 * (attempt + 1))  # Brief delay before retry
+                                    continue
+                                return {"hotkey": miner_hotkey, "status": "failed", "reason": "Handshake Error", "details": f"{type(hs_err).__name__}"}
 
                             handshake_duration = time.time() - handshake_start_time
-                            logger.debug(f"[{round_type}] Handshake with {miner_hotkey} completed in {handshake_duration:.2f}s")
+                            logger.debug(f"Handshake with {miner_hotkey} completed in {handshake_duration:.2f}s (attempt {attempt + 1})")
 
-                            if not symmetric_key_str or not symmetric_key_uuid:
-                                logger.debug(f"[{round_type}] Failed handshake with miner {miner_hotkey} (no key/UUID returned)")
-                                return None
-
-                            logger.debug(f"[{round_type}] Handshake successful with miner {miner_hotkey}")
                             if process:
                                 logger.debug(f"Memory after handshake ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
                             
                             fernet = Fernet(symmetric_key_str)
                             
+                            # Make the actual request
                             try:
-                                import pickle
-                                payload_bytes = pickle.dumps(payload)
-                                payload_size_bytes = len(payload_bytes)
-                                logger.debug(f"Preparing to send request to miner {miner_hotkey} at {base_url}{endpoint}. Raw payload size: {payload_size_bytes / (1024*1024):.2f} MB")
-                                del payload_bytes
-                                import gc
-                                gc.collect()
-                            except Exception as size_err:
-                                logger.warning(f"Could not accurately determine payload size for {miner_hotkey}: {size_err}")
-                                payload_size_bytes = -1
-                                                            
-                            resp = None
-                            try:
-                                logger.debug(f"[{round_type}] Calling vali_client.make_non_streamed_post for {miner_hotkey}...")
-                                if process:
-                                    mem_before = process.memory_info().rss / (1024*1024)
-                                    logger.debug(f"Memory BEFORE request call ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
+                                logger.debug(f"Making request to {miner_hotkey} (attempt {attempt + 1})")
                                 request_start_time = time.time()
+                                
+                                # Log payload size for memory tracking
+                                try:
+                                    payload_size_mb = len(str(payload).encode('utf-8')) / (1024 * 1024)
+                                    if payload_size_mb > 50:  # Log large payloads
+                                        logger.info(f"Large payload warning: {miner_hotkey} payload size: {payload_size_mb:.1f}MB")
+                                except Exception:
+                                    pass
+                                
                                 resp = await asyncio.wait_for(
                                     vali_client.make_non_streamed_post(
-                                        httpx_client=self.miner_client,  # Use existing client
+                                        httpx_client=self.miner_client,
                                         server_address=base_url,
                                         fernet=fernet,
                                         keypair=self.keypair,
@@ -799,88 +837,398 @@ class GaiaValidator:
                                         payload=payload,
                                         endpoint=endpoint,
                                     ),
-                                    timeout=240.0  # Increased from 180s for large payloads
+                                    timeout=240.0  # Keep longer timeout for actual request
                                 )
                                 request_duration = time.time() - request_start_time
+                                
+                                # Immediate cleanup of cryptographic objects and large variables
+                                try:
+                                    # Clear Fernet cipher and symmetric key data
+                                    if hasattr(fernet, '__dict__'):
+                                        fernet.__dict__.clear()
+                                    del fernet
+                                    
+                                    # Clear symmetric key variables
+                                    symmetric_key = None
+                                    del symmetric_key_str
+                                    del symmetric_key_uuid
+                                    
+                                    # Clear request response data if it's large
+                                    if resp and hasattr(resp, 'content') and len(resp.content) > 1024*1024:  # > 1MB
+                                        logger.debug(f"Clearing large response content for {miner_hotkey}: {len(resp.content)} bytes")
+                                        
+                                except Exception as cleanup_err:
+                                    logger.debug(f"Non-critical cleanup error for {miner_hotkey}: {cleanup_err}")
+                                
                                 if process:
                                     mem_after = process.memory_info().rss / (1024*1024)
-                                    logger.debug(f"Memory AFTER successful request call ({miner_hotkey}): {mem_after:.2f} MB (Delta: {mem_after - mem_before:.2f} MB)")
-                                if resp:
-                                    logger.info(f"[{round_type}] Successfully called make_non_streamed_post for {miner_hotkey}. Response status: {resp.status_code}. Duration: {request_duration:.2f}s. Response content length: {len(resp.content) if resp.content else 0} bytes.")
+                                    logger.debug(f"Memory after request ({miner_hotkey}): {mem_after:.2f} MB")
+                                
+                                if resp and resp.status_code < 400:
+                                    response_data = {
+                                        "status": "success",
+                                        "text": resp.text,
+                                        "status_code": resp.status_code,
+                                        "hotkey": miner_hotkey,
+                                        "port": node.port,
+                                        "ip": node.ip,
+                                        "duration": request_duration,
+                                        "content_length": len(resp.content) if resp.content else 0,
+                                        "attempts_used": attempt + 1
+                                    }
+                                    logger.info(f"SUCCESS: {miner_hotkey} responded in {request_duration:.2f}s (attempt {attempt + 1})")
+                                    return response_data # Success, return immediately
                                 else:
-                                    logger.warning(f"[{round_type}] Call to make_non_streamed_post for {miner_hotkey} completed without error but response object is None. Duration: {request_duration:.2f}s")
+                                    logger.debug(f"Bad response from {miner_hotkey} attempt {attempt + 1}: status {resp.status_code if resp else 'None'}")
+                                    if attempt < max_retries_per_miner - 1:
+                                        await asyncio.sleep(0.5 * (attempt + 1))
+                                        continue # Go to next attempt for this miner
+                                    return {"hotkey": miner_hotkey, "status": "failed", "reason": "Bad Response", "details": f"Status code {resp.status_code if resp else 'N/A'}"}
 
+                            except asyncio.TimeoutError:
+                                # This is a specific type of request error, so we can categorize it
+                                if attempt < max_retries_per_miner - 1:
+                                    await asyncio.sleep(0.5 * (attempt + 1))
+                                    continue
+                                return {"hotkey": miner_hotkey, "status": "failed", "reason": "Request Timeout", "details": "Timeout during non-streamed POST"}
                             except Exception as request_error:
-                                if process:
-                                    logger.error(f"Memory during request EXCEPTION ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
-                                logger.debug(f"[{round_type}] Error during make_non_streamed_post for {miner_hotkey}: {type(request_error).__name__} - {request_error}")
-                                return None
-                            
-                            if resp is None:
-                                 logger.debug(f"[{round_type}] No response object received from {miner_hotkey} despite no exception, likely due to prior error.")
-                                 return None
-                            elif resp.status_code >= 400:
-                                logger.debug(f"[{round_type}] Miner {miner_hotkey} returned error status {resp.status_code}. Response text: {resp.text[:500]}...")
-                                return None
+                                # Enhanced cleanup on error
+                                try:
+                                    if 'fernet' in locals() and fernet:
+                                        if hasattr(fernet, '__dict__'):
+                                            fernet.__dict__.clear()
+                                        del fernet
+                                    if 'symmetric_key_str' in locals():
+                                        del symmetric_key_str
+                                    if 'symmetric_key_uuid' in locals():
+                                        del symmetric_key_uuid
+                                    if 'symmetric_key' in locals():
+                                        symmetric_key = None
+                                except Exception:
+                                    pass
+                                    
+                                logger.debug(f"Request error for {miner_hotkey} attempt {attempt + 1}: {type(request_error).__name__}")
+                                if attempt < max_retries_per_miner - 1:
+                                    await asyncio.sleep(0.5 * (attempt + 1))
+                                    continue # Go to next attempt for this miner
+                                return {"hotkey": miner_hotkey, "status": "failed", "reason": "Request Error", "details": f"{type(request_error).__name__}"}
+                                
+                        except Exception as outer_error: # Catch errors within the attempt loop but outside handshake/request
+                            logger.debug(f"Outer error for {miner_hotkey} attempt {attempt + 1}: {type(outer_error).__name__} - {outer_error}")
+                            if attempt < max_retries_per_miner - 1:
+                                await asyncio.sleep(0.5 * (attempt + 1))
+                                continue # Go to next attempt for this miner
+                            return {"hotkey": miner_hotkey, "status": "failed", "reason": "Outer Error", "details": f"{type(outer_error).__name__}"}
+                    
+                    # If loop finishes, all attempts for this miner failed (should be caught by returns above but as a fallback)
+                    logger.debug(f"All {max_retries_per_miner} attempts failed for {miner_hotkey} (fallback).")
+                    return {"hotkey": miner_hotkey, "status": "failed", "reason": "All Attempts Failed", "details": "Fell through retry loop"}
+                # Semaphore is automatically released when async with block exits
 
-                            response_data = {
-                                "text": resp.text,
-                                "status_code": resp.status_code,
-                                "hotkey": miner_hotkey,
-                                "port": node.port,
-                                "ip": node.ip,
-                                "content_length": len(resp.content) if resp.content else 0
-                            }
-                            logger.info(f"[{round_type}] Successfully received response from miner {miner_hotkey}")
-                            return response_data
-
-                    except asyncio.TimeoutError:
-                        logger.debug(f"[{round_type}] Timeout querying miner {miner_hotkey} at {base_url}")
-                        return None
-                    except Exception as e:
-                        logger.debug(f"[{round_type}] Failed request to miner {miner_hotkey} at {base_url}: {type(e).__name__} - {str(e)}")
-                        return None
-
-                # Query all remaining miners in parallel for this round
-                tasks = []
-                for hotkey, node in miners_remaining.items():
-                    if node.ip and node.port:  # Only query miners with valid IP/port
-                        tasks.append(query_single_miner_no_retry(hotkey, node, retry_round))
+            # Process miners in chunks to reduce database contention and memory usage
+            logger.info(f"Starting chunked processing of {len(chunks)} chunks...")
+            start_time = time.time()
+            all_results = []
+            
+            # Log memory before launching queries
+            self._log_memory_usage("query_miners_start")
+            
+            # Log total payload memory footprint
+            try:
+                import sys
+                total_payload_size = sys.getsizeof(payload) / (1024 * 1024)
+                estimated_chunk_memory = total_payload_size * chunk_size
+                logger.info(f"Payload memory per chunk: {chunk_size} miners × {total_payload_size:.1f}MB = {estimated_chunk_memory:.1f}MB")
+            except Exception:
+                pass
+            
+            for chunk_idx, chunk_miners in enumerate(chunks):
+                chunk_start_time = time.time()
+                logger.info(f"Processing chunk {chunk_idx + 1}/{len(chunks)} with {len(chunk_miners)} miners...")
+                
+                # Create semaphore for this chunk
+                chunk_semaphore = asyncio.Semaphore(chunk_concurrency)
+                
+                # Create tasks for this chunk only
+                chunk_tasks = []
+                for hotkey, node in chunk_miners.items():
+                    if node.ip and node.port:
+                        task = asyncio.create_task(
+                            query_single_miner_with_retries(hotkey, node, chunk_semaphore),
+                            name=f"query_chunk{chunk_idx}_{hotkey[:8]}"
+                        )
+                        chunk_tasks.append((hotkey, task))
                     else:
                         logger.warning(f"Skipping miner {hotkey} - missing IP or port")
+                        all_results.append({"hotkey": hotkey, "status": "failed", "reason": "Missing IP/Port", "details": "No IP or port available"})
 
-                # Gather responses with timeout
-                miner_responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # Process responses and track failures for next round
-                miners_for_next_round = {}
-                successful_this_round = 0
+                # Process this chunk's responses
+                chunk_results = []
+                completed_count = 0
                 
-                for (hotkey, node), response in zip(miners_remaining.items(), miner_responses):
-                    if response is not None and not isinstance(response, Exception):
-                        responses[response['hotkey']] = response
-                        successful_this_round += 1
-                    else:
-                        # Add to retry list for next round
-                        miners_for_next_round[hotkey] = node
-
-                logger.info(f"{round_type} completed: {successful_this_round} successful, {len(miners_for_next_round)} failed")
+                # Create a mapping for this chunk
+                task_to_hotkey = {task: hotkey for hotkey, task in chunk_tasks}
+                just_tasks = [task for _, task in chunk_tasks]
                 
-                # Update miners_remaining for next round
-                miners_remaining = miners_for_next_round
-                
-                # If we have more rounds and miners to retry, wait before next round
-                if miners_remaining and retry_round < max_retry_rounds:
-                    logger.info(f"Waiting {retry_delay}s before retry round {retry_round + 1} with {len(miners_remaining)} miners")
-                    await asyncio.sleep(retry_delay)
+                if just_tasks:  # Only process if we have tasks
+                    for completed_task in asyncio.as_completed(just_tasks):
+                        completed_count += 1
+                        try:
+                            result = await completed_task
+                            chunk_results.append(result)
+                            all_results.append(result)
+                        except Exception as e:
+                            task_hotkey = task_to_hotkey.get(completed_task, "unknown")
+                            error_result = {"hotkey": task_hotkey, "status": "failed", "reason": "Task Exception", "details": str(e)}
+                            chunk_results.append(error_result)
+                            all_results.append(error_result)
+                            logger.debug(f"Exception processing response in chunk {chunk_idx + 1}: {e}")
 
-            logger.info(f"Batch query completed: Received {len(responses)} total valid responses from miners")
+                chunk_time = time.time() - chunk_start_time
+                chunk_successful = sum(1 for r in chunk_results if r and r.get('status') == 'success')
+                chunk_failed = len(chunk_results) - chunk_successful
+                logger.info(f"Chunk {chunk_idx + 1}/{len(chunks)} completed: {chunk_successful} successful, {chunk_failed} failed in {chunk_time:.2f}s")
+                
+                # Memory cleanup between chunks
+                try:
+                    del chunk_tasks
+                    del task_to_hotkey
+                    del just_tasks
+                    del chunk_results
+                    del chunk_semaphore
+                    
+                    # Force garbage collection between chunks to manage memory
+                    import gc
+                    collected = gc.collect()
+                    if collected > 20:
+                        logger.debug(f"GC collected {collected} objects after chunk {chunk_idx + 1}")
+                except Exception as cleanup_err:
+                    logger.debug(f"Error during chunk cleanup: {cleanup_err}")
+                
+                # Small delay between chunks to allow database recovery
+                if chunk_idx < len(chunks) - 1:  # Don't delay after the last chunk
+                    await asyncio.sleep(0.5)  # 500ms delay between chunks
+
+            total_time = time.time() - start_time
+            
+            # --- Start of Detailed Logging ---
+            successful_results = [r for r in all_results if r and r.get('status') == 'success']
+            failed_results = [r for r in all_results if not r or r.get('status') == 'failed']
+            
+            responses = {res['hotkey']: res for res in successful_results} # Keep original responses dict for return value
+            
+            total_queries = len(all_results)
+            success_count = len(successful_results)
+            failed_count = len(failed_results)
+            success_rate = success_count / total_queries * 100 if total_queries > 0 else 0
+            avg_rate = total_queries / total_time if total_time > 0 else 0
+
+            summary_log = f"\n--- Miner Query Summary (Endpoint: {endpoint}) ---\n"
+            summary_log += "Overall:\n"
+            summary_log += f"  - Total Queries: {total_queries}\n"
+            summary_log += f"  - Successful: {success_count} ({success_rate:.1f}%)\n"
+            summary_log += f"  - Failed: {failed_count} ({100-success_rate:.1f}%)\n"
+            summary_log += f"  - Total Time: {total_time:.2f}s\n"
+            summary_log += f"  - Average Rate: {avg_rate:.1f} queries/sec\n"
+
+            if successful_results:
+                durations = [r['duration'] for r in successful_results]
+                summary_log += "\nTiming (Successful Queries):\n"
+                summary_log += f"  - Min Duration: {np.min(durations):.2f}s\n"
+                summary_log += f"  - Max Duration: {np.max(durations):.2f}s\n"
+                summary_log += f"  - Avg Duration: {np.mean(durations):.2f}s\n"
+                summary_log += f"  - Median Duration: {np.median(durations):.2f}s\n"
+                summary_log += f"  - 95th Percentile: {np.percentile(durations, 95):.2f}s\n"
+
+            if failed_results:
+                summary_log += f"\nFailures ({failed_count} miners):\n"
+                failures_by_reason = defaultdict(list)
+                for failure in failed_results:
+                    reason = failure.get('reason', 'Unknown Reason')
+                    failures_by_reason[reason].append(failure)
+                
+                # Sort reasons by number of failures
+                sorted_reasons = sorted(failures_by_reason.items(), key=lambda item: len(item[1]), reverse=True)
+
+                for reason, fails in sorted_reasons:
+                    summary_log += f"  - {reason} ({len(fails)}):\n"
+                    # Log up to 5 hotkeys for brevity
+                    for fail in fails[:5]:
+                        summary_log += f"    - {fail.get('hotkey', 'N/A')[:12]}... (Details: {fail.get('details', 'N/A')})\n"
+                    if len(fails) > 5:
+                        summary_log += f"    - ... and {len(fails) - 5} more\n"
+            
+            summary_log += "--- End of Summary ---\n"
+            logger.info(summary_log)
+            # --- End of Detailed Logging ---
+            
+            # Aggressive memory cleanup after large payload processing
+            try:
+                # Clear chunk references
+                del chunks
+                del miners_list
+                
+                # Clear payload reference - critical for large payloads
+                if 'payload' in locals():
+                    payload_size_mb = 0
+                    try:
+                        payload_size_mb = len(str(payload).encode('utf-8')) / (1024 * 1024)
+                    except:
+                        pass
+                    del payload
+                    if payload_size_mb > 50:
+                        logger.info(f"Cleared large payload from memory ({payload_size_mb:.1f}MB)")
+                
+                # Force garbage collection for large memory cleanup
+                import gc
+                collected = gc.collect()
+                if collected > 100:  # Log significant cleanup
+                    logger.info(f"Garbage collected {collected} objects after miner queries")
+                
+                # Log memory after cleanup if psutil available
+                if PSUTIL_AVAILABLE:
+                    try:
+                        process = psutil.Process()
+                        mem_after_cleanup = process.memory_info().rss / (1024*1024)
+                        logger.debug(f"Memory after query cleanup: {mem_after_cleanup:.2f}MB")
+                    except:
+                        pass
+                        
+            except Exception as cleanup_error:
+                logger.warning(f"Error during post-query memory cleanup: {cleanup_error}")
+            
+            # Log memory after cleanup to verify effectiveness
+            self._log_memory_usage("query_miners_end")
+            
+            # Clean up connections after query batch completes
+            await self._cleanup_idle_connections()
+            
             return responses
 
         except Exception as e:
             logger.error(f"Error querying miners: {e}")
             logger.error(traceback.format_exc())
             return {}
+
+    async def _cleanup_idle_connections(self):
+        """Clean up idle connections in the HTTP client pool, but only stale ones."""
+        try:
+            if hasattr(self, 'miner_client') and not self.miner_client.is_closed:
+                # Force close idle connections by accessing the transport pool
+                if hasattr(self.miner_client, '_transport') and hasattr(self.miner_client._transport, '_pool'):
+                    pool = self.miner_client._transport._pool
+                    if hasattr(pool, '_connections'):
+                        connections = pool._connections
+                        closed_count = 0
+                        
+                        # Handle both dict and list cases
+                        if hasattr(connections, 'items'):  # Dict-like
+                            connection_items = list(connections.items())
+                            for key, conn in connection_items:
+                                # Only close connections that have been idle for a while
+                                # This preserves recent connections for potential reuse
+                                if (hasattr(conn, 'is_idle') and conn.is_idle() and 
+                                    hasattr(conn, '_idle_time') and 
+                                    getattr(conn, '_idle_time', 0) > 60):  # 60 seconds idle
+                                    try:
+                                        await conn.aclose()
+                                        del connections[key]
+                                        closed_count += 1
+                                        logger.debug(f"Closed stale idle connection to {key}")
+                                    except Exception as e:
+                                        logger.debug(f"Error closing idle connection: {e}")
+                        else:  # List-like
+                            for conn in list(connections):
+                                if (hasattr(conn, 'is_idle') and conn.is_idle() and 
+                                    hasattr(conn, '_idle_time') and 
+                                    getattr(conn, '_idle_time', 0) > 60):  # 60 seconds idle
+                                    try:
+                                        await conn.aclose()
+                                        connections.remove(conn)
+                                        closed_count += 1
+                                        logger.debug(f"Closed stale idle connection")
+                                    except Exception as e:
+                                        logger.debug(f"Error closing idle connection: {e}")
+                    
+                        if closed_count > 0:
+                            logger.info(f"Cleaned up {closed_count} stale idle connections")
+                        else:
+                            logger.debug("No stale connections found to clean up")
+                        
+        except Exception as e:
+            logger.debug(f"Error during connection cleanup: {e}")
+
+    def _log_memory_usage(self, context: str, threshold_mb: float = 100.0):
+        """Enhanced memory logging with detailed breakdown and automatic cleanup."""
+        if not PSUTIL_AVAILABLE:
+            return
+            
+        try:
+            process = psutil.Process()
+            current_memory = process.memory_info().rss / (1024 * 1024)
+            
+            # Calculate memory change
+            if not hasattr(self, '_last_memory'):
+                self._last_memory = current_memory
+                memory_change = 0
+            else:
+                memory_change = current_memory - self._last_memory
+                self._last_memory = current_memory
+            
+            # Enhanced logging for significant changes
+            if abs(memory_change) > threshold_mb or context in ['calc_weights_start', 'calc_weights_after_cleanup']:
+                # Get additional memory details
+                memory_info = process.memory_info()
+                try:
+                    # Try to get memory percentage
+                    memory_percent = process.memory_percent()
+                    
+                    # Get thread and file handle counts
+                    num_threads = process.num_threads()
+                    open_files = len(process.open_files())
+                    
+                    # Check if we have tracemalloc data
+                    tracemalloc_info = ""
+                    if tracemalloc.is_tracing():
+                        try:
+                            current, peak = tracemalloc.get_traced_memory()
+                            tracemalloc_info = f", Traced: {current/(1024*1024):.1f}MB (peak: {peak/(1024*1024):.1f}MB)"
+                        except Exception:
+                            pass
+                    
+                    logger.info(
+                        f"Memory usage [{context}]: {current_memory:.1f}MB "
+                        f"({'+' if memory_change > 0 else ''}{memory_change:.1f}MB), "
+                        f"RSS: {memory_info.rss/(1024*1024):.1f}MB, "
+                        f"VMS: {memory_info.vms/(1024*1024):.1f}MB, "
+                        f"Percent: {memory_percent:.1f}%, "
+                        f"Threads: {num_threads}, "
+                        f"Files: {open_files}"
+                        f"{tracemalloc_info}"
+                    )
+                    
+                    # Trigger comprehensive cleanup for large memory increases (but not during startup)
+                    if (memory_change > 200 and 
+                        hasattr(self, 'substrate_manager') and 
+                        self.substrate_manager is not None and
+                        hasattr(self, 'last_metagraph_sync')):  # Only after validator is fully running
+                        logger.warning(f"Large memory increase detected ({memory_change:.1f}MB), forcing comprehensive cleanup")
+                        memory_freed = self._comprehensive_memory_cleanup(f"emergency_{context}")
+                        
+                        # Check memory again after comprehensive cleanup
+                        new_memory = process.memory_info().rss / (1024 * 1024)
+                        total_savings = current_memory - new_memory
+                        logger.info(f"Emergency comprehensive cleanup freed {memory_freed:.1f}MB (total reduction: {total_savings:.1f}MB)")
+                    elif memory_change > 200:
+                        logger.info(f"Large memory increase detected during startup ({memory_change:.1f}MB) - skipping cleanup until fully initialized")
+                        
+                except Exception as e:
+                    logger.info(f"Memory usage [{context}]: {current_memory:.1f}MB ({'+' if memory_change > 0 else ''}{memory_change:.1f}MB) - detailed info error: {e}")
+            else:
+                logger.debug(f"Memory usage [{context}]: {current_memory:.1f}MB ({'+' if memory_change > 0 else ''}{memory_change:.1f}MB)")
+                
+        except Exception as e:
+            logger.debug(f"Error logging memory usage for {context}: {e}")
 
     async def check_for_updates(self):
         """Check for and apply updates every 5 minutes."""
@@ -965,6 +1313,25 @@ class GaiaValidator:
         if not self.watchdog_running:
             self.watchdog_running = True
             logger.info("Started watchdog")
+            
+            # Log memory monitoring configuration
+            if self.memory_monitor_enabled:
+                try:
+                    import psutil
+                    system_memory = psutil.virtual_memory()
+                    logger.info(f"🔍 Validator memory monitoring enabled:")
+                    logger.info(f"  System memory: {system_memory.total / (1024**3):.1f} GB total, {system_memory.available / (1024**3):.1f} GB available")
+                    logger.info(f"  Memory thresholds: Warning={self.memory_warning_threshold_mb}MB, Emergency={self.memory_emergency_threshold_mb}MB, Critical={self.memory_critical_threshold_mb}MB")
+                    logger.info(f"  PM2 restart enabled: {self.pm2_restart_enabled}")
+                    if self.pm2_restart_enabled:
+                        pm2_id = os.getenv('pm2_id', 'not detected')
+                        logger.info(f"  PM2 instance ID: {pm2_id}")
+                except ImportError:
+                    logger.warning("psutil not available - memory monitoring will be disabled")
+                    self.memory_monitor_enabled = False
+            else:
+                logger.info("Validator memory monitoring disabled by configuration")
+            
             asyncio.create_task(self._watchdog_loop())
 
     async def _watchdog_loop(self):
@@ -997,6 +1364,18 @@ class GaiaValidator:
         """Perform a single watchdog check iteration."""
         try:
             current_time = time.time()
+            
+            # Memory monitoring check (first priority)
+            if self.memory_monitor_enabled:
+                try:
+                    await asyncio.wait_for(
+                        self._check_memory_usage(current_time),
+                        timeout=5  # 5 second timeout for memory check
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Memory usage check timed out")
+                except Exception as e:
+                    logger.error(f"Error checking memory usage: {e}")
             
             # Update resource usage for all active tasks
             try:
@@ -1035,6 +1414,149 @@ class GaiaValidator:
         except Exception as e:
             logger.error(f"Error in watchdog check: {e}")
             logger.error(traceback.format_exc())
+
+    async def _check_memory_usage(self, current_time):
+        """Check overall validator memory usage and trigger restart if needed."""
+        try:
+            import psutil
+            import gc
+            
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / (1024 * 1024)
+            
+            system_memory = psutil.virtual_memory()
+            system_percent = system_memory.percent
+            
+            # Regular memory status logging
+            if current_time - self.last_memory_log_time > self.memory_log_interval:
+                logger.info(f"🔍 Validator memory status: {memory_mb:.1f} MB RSS ({system_percent:.1f}% system memory)")
+                self.last_memory_log_time = current_time
+            
+            # Check if we're in a critical operation that shouldn't be interrupted
+            critical_operations_active = self._check_critical_operations_active()
+            
+            # Memory threshold checks
+            if memory_mb > self.memory_critical_threshold_mb:
+                logger.error(f"💀 CRITICAL MEMORY: {memory_mb:.1f} MB - OOM imminent! (threshold: {self.memory_critical_threshold_mb} MB)")
+                
+                if critical_operations_active:
+                    logger.warning(f"⚠️  Critical operations active: {critical_operations_active}. Delaying restart until operations complete.")
+                    # Try emergency GC but don't restart yet
+                    if current_time - self.last_emergency_gc_time > self.emergency_gc_cooldown:
+                        logger.error("Attempting emergency garbage collection while critical operations are active...")
+                        collected = gc.collect()
+                        logger.error(f"Emergency GC freed {collected} objects")
+                        self.last_emergency_gc_time = current_time
+                else:
+                    logger.error("Attempting emergency garbage collection before potential restart...")
+                    try:
+                        collected = gc.collect()
+                        logger.error(f"Emergency GC freed {collected} objects")
+                        await asyncio.sleep(2)  # Brief pause after emergency GC
+                        
+                        # Check memory again after GC
+                        post_gc_memory = process.memory_info().rss / (1024 * 1024)
+                        if post_gc_memory > (self.memory_critical_threshold_mb * 0.9):  # Still >90% of critical
+                            if self.pm2_restart_enabled:
+                                logger.error(f"🔄 TRIGGERING PM2 RESTART: Memory still critical after GC ({post_gc_memory:.1f} MB)")
+                                await self._trigger_pm2_restart("Critical memory pressure after GC")
+                                return  # Exit the monitoring
+                            else:
+                                logger.error(f"💀 MEMORY CRITICAL BUT PM2 RESTART DISABLED: {post_gc_memory:.1f} MB - system may be killed by OOM")
+                        else:
+                            logger.info(f"✅ Memory reduced to {post_gc_memory:.1f} MB after GC - continuing")
+                    except Exception as gc_err:
+                        logger.error(f"Emergency GC failed: {gc_err}")
+                        if self.pm2_restart_enabled and not critical_operations_active:
+                            await self._trigger_pm2_restart("Emergency GC failed and memory critical")
+                            return
+                        else:
+                            logger.error("💀 GC FAILED AND RESTART CONDITIONS NOT MET - system may crash")
+                            
+            elif memory_mb > self.memory_emergency_threshold_mb:
+                logger.warning(f"🚨 EMERGENCY MEMORY PRESSURE: {memory_mb:.1f} MB - OOM risk HIGH! (threshold: {self.memory_emergency_threshold_mb} MB)")
+                # Try light GC at emergency level
+                if current_time - self.last_emergency_gc_time > self.emergency_gc_cooldown:
+                    collected = gc.collect()
+                    logger.warning(f"Emergency light GC collected {collected} objects")
+                    self.last_emergency_gc_time = current_time
+                    
+            elif memory_mb > self.memory_warning_threshold_mb:
+                # Only log warning once per interval to avoid spam
+                if current_time - self.last_memory_log_time > (self.memory_log_interval / 2):  # Half interval for warnings
+                    logger.warning(f"🟡 HIGH MEMORY: Validator process using {memory_mb:.1f} MB ({system_percent:.1f}% of system) (threshold: {self.memory_warning_threshold_mb} MB)")
+                    
+        except ImportError:
+            if self.memory_monitor_enabled:
+                logger.warning("psutil not available - memory monitoring disabled")
+                self.memory_monitor_enabled = False
+        except Exception as e:
+            logger.error(f"Error in memory monitoring: {e}", exc_info=True)
+
+    def _check_critical_operations_active(self):
+        """Check if any critical operations are currently active that shouldn't be interrupted."""
+        critical_ops = []
+        
+        for task_name, health in self.task_health.items():
+            if health['status'] in ['processing'] and health.get('current_operation'):
+                # Define critical operations that shouldn't be interrupted
+                critical_operation_patterns = [
+                    'weight_setting',  # Never interrupt weight setting
+                    'miner_query',     # Don't interrupt while querying miners
+                    'scoring',         # Don't interrupt scoring calculations
+                    'db_sync',         # Don't interrupt database sync
+                    'data_fetch',      # Don't interrupt data fetching
+                ]
+                
+                current_op = health.get('current_operation', '')
+                if any(pattern in current_op for pattern in critical_operation_patterns):
+                    critical_ops.append(f"{task_name}:{current_op}")
+        
+        return critical_ops
+
+    async def _trigger_pm2_restart(self, reason: str):
+        """Trigger a controlled PM2 restart for the validator."""
+        if not self.pm2_restart_enabled:
+            logger.error(f"🚨 PM2 restart disabled - would restart for: {reason}")
+            return
+            
+        logger.error(f"🔄 TRIGGERING CONTROLLED PM2 RESTART: {reason}")
+        
+        try:
+            # Try graceful shutdown first
+            logger.info("Attempting graceful shutdown before restart...")
+            
+            # Stop any ongoing tasks
+            try:
+                await self.cleanup_resources()
+                logger.info("Validator cleanup completed")
+            except Exception as e:
+                logger.warning(f"Error during validator cleanup: {e}")
+            
+            # Force garbage collection one more time
+            import gc
+            collected = gc.collect()
+            logger.info(f"Final GC before restart collected {collected} objects")
+            
+            # Check if we're running under PM2
+            pm2_instance_id = os.getenv('pm2_id')
+            if pm2_instance_id:
+                logger.info(f"Running under PM2 instance {pm2_instance_id} - triggering restart...")
+                # Use pm2 restart command
+                import subprocess
+                subprocess.Popen(['pm2', 'restart', pm2_instance_id])
+            else:
+                logger.warning("Not running under PM2 - triggering system exit")
+                # If not under pm2, exit gracefully
+                import sys
+                sys.exit(1)
+                
+        except Exception as e:
+            logger.error(f"Error during controlled restart: {e}")
+            # Last resort - force exit
+            import sys
+            sys.exit(1)
 
     async def _check_resource_usage(self, current_time):
         """Check resource usage for active tasks."""
@@ -1097,14 +1619,129 @@ class GaiaValidator:
                         logger.error(traceback.format_exc())
                         health['errors'] += 1
 
+    async def _fetch_nodes_managed(self, netuid):
+        """
+        Fetch nodes using get_nodes_for_netuid but with aggressive connection management.
+        Use cached nodes when possible to avoid any substrate calls.
+        """
+        try:
+            logger.debug(f"Fetching nodes for netuid {netuid} using ultra-aggressive memory management")
+            
+            # First, try to use cached nodes from metagraph if available and recent
+            if (hasattr(self, 'metagraph') and self.metagraph and 
+                hasattr(self.metagraph, 'nodes') and self.metagraph.nodes and
+                hasattr(self, 'last_metagraph_sync') and 
+                time.time() - self.last_metagraph_sync < 300):  # Use cache if less than 5 minutes old
+                
+                logger.info(f"✅ Using cached metagraph nodes ({len(self.metagraph.nodes)} nodes) - NO substrate calls needed")
+                # Convert metagraph nodes dict to list format expected by callers
+                cached_nodes = []
+                for hotkey, node in self.metagraph.nodes.items():
+                    if hasattr(node, 'node_id'):
+                        cached_nodes.append(node)
+                    else:
+                        # Create a simple node object if metagraph node doesn't have the right format
+                        simple_node = type('Node', (), {
+                            'node_id': getattr(node, 'uid', 0),
+                            'hotkey': hotkey,
+                            'ip': getattr(node, 'ip', '0.0.0.0'),
+                            'port': getattr(node, 'port', 0),
+                            'ip_type': getattr(node, 'ip_type', 4),
+                            'protocol': getattr(node, 'protocol', 4),
+                            'placeholder1': 0,
+                            'placeholder2': 0,
+                        })()
+                        cached_nodes.append(simple_node)
+                return cached_nodes
+            
+            # If no cache available, reluctantly make the substrate call
+            logger.warning("No cached nodes available - making substrate call (potential memory leak)")
+            
+            # More aggressive patching - patch multiple possible import locations
+            import fiber.chain.interface as fiber_interface
+            import fiber.chain.fetch_nodes as fetch_nodes_module
+            
+            # Store originals
+            original_get_substrate = fiber_interface.get_substrate
+            original_fetch_get_substrate = getattr(fetch_nodes_module, 'get_substrate', None)
+            
+            def ultra_patched_get_substrate(*args, **kwargs):
+                logger.warning("!!! SUBSTRATE CONNECTION INTERCEPTED - using managed connection instead !!!")
+                return self.substrate
+            
+            # Apply patches everywhere
+            fiber_interface.get_substrate = ultra_patched_get_substrate
+            if original_fetch_get_substrate:
+                fetch_nodes_module.get_substrate = ultra_patched_get_substrate
+            
+            try:
+                # Force substrate manager to use fresh connection
+                self.substrate = self.substrate_manager.get_connection()
+                nodes = get_nodes_for_netuid(self.substrate, netuid)
+                logger.info(f"⚠️ Fetched {len(nodes) if nodes else 0} nodes with substrate call (check for new connections in logs)")
+                return nodes
+            finally:
+                # Always restore originals
+                fiber_interface.get_substrate = original_get_substrate
+                if original_fetch_get_substrate:
+                    fetch_nodes_module.get_substrate = original_fetch_get_substrate
+                
+        except Exception as e:
+            logger.error(f"Error in ultra-aggressive node fetching: {e}")
+            logger.error(traceback.format_exc())
+            # Final fallback
+            logger.error("CRITICAL: All node fetching approaches failed - using direct call")
+            return get_nodes_for_netuid(self.substrate, netuid)
+
     async def _sync_metagraph(self):
-        """Sync the metagraph."""
+        """Sync the metagraph using managed substrate connection with custom implementation to prevent memory leaks."""
         sync_start = time.time()
-        self.metagraph.sync_nodes()
+        # Use managed substrate connection for metagraph operations
+        old_substrate = getattr(self, 'substrate', None)
+        self.substrate = self.substrate_manager.get_connection()
+        
+        # Ensure metagraph uses the managed connection and update substrate reference
+        if hasattr(self, 'metagraph') and self.metagraph:
+            self.metagraph.substrate = self.substrate
+        
+        # CRITICAL FIX: Use our custom node fetching that truly uses managed connections
+        try:
+            if hasattr(self, 'metagraph') and self.metagraph:
+                # Use our ultra-aggressive caching to prevent memory leaks
+                logger.debug("Using ultra-aggressive caching with minimal substrate calls to prevent memory leaks")
+                active_nodes_list = await self._fetch_nodes_managed(self.metagraph.netuid)
+                
+                if active_nodes_list:
+                    # Update metagraph nodes manually instead of calling sync_nodes()
+                    self.metagraph.nodes = {node.hotkey: node for node in active_nodes_list}
+                    logger.info(f"✅ Custom metagraph sync: Updated with {len(self.metagraph.nodes)} nodes using managed connection (NO memory leak)")
+                else:
+                    logger.warning("No nodes returned from custom node fetching")
+                    self.metagraph.nodes = {}
+            else:
+                logger.error("Metagraph not initialized, cannot sync nodes")
+                return
+        except Exception as e:
+            logger.error(f"Error during custom metagraph sync: {e}")
+            logger.error(traceback.format_exc())
+            # Fallback to regular sync_nodes if our custom method fails, but log the issue
+            logger.warning("Falling back to regular metagraph.sync_nodes() - this may create memory leaks")
+            if hasattr(self, 'metagraph') and self.metagraph:
+                self.metagraph.sync_nodes()
+            
         sync_duration = time.time() - sync_start
         self.last_metagraph_sync = time.time()
+        
+        # Enhanced logging
         if sync_duration > 30:  # Log slow syncs
             logger.warning(f"Slow metagraph sync: {sync_duration:.2f}s")
+        
+        # Log substrate connection status
+        connection_changed = old_substrate != self.substrate
+        logger.debug(f"Custom metagraph sync completed in {sync_duration:.2f}s using managed connection (connection changed: {connection_changed})")
+        
+        if connection_changed:
+            logger.info("Substrate connection refreshed during metagraph sync")
 
     async def cleanup_resources(self):
         """Clean up any resources used by the validator during recovery."""
@@ -1135,6 +1772,12 @@ class GaiaValidator:
 
             # Clean up HTTP clients
             if hasattr(self, 'miner_client') and self.miner_client and not self.miner_client.is_closed:
+                # Clean up connections before closing client
+                try:
+                    await self._cleanup_idle_connections()
+                except Exception as e:
+                    logger.debug(f"Error cleaning up connections before client close: {e}")
+                
                 await self.miner_client.aclose()
                 logger.info("Closed miner HTTP client")
             
@@ -1155,6 +1798,22 @@ class GaiaValidator:
                     logger.info("Cleaned up WeatherTask resources")
             except Exception as e:
                 logger.debug(f"Error cleaning up WeatherTask: {e}")
+
+            # Clean up substrate connection manager
+            try:
+                if hasattr(self, 'substrate_manager') and self.substrate_manager:
+                    self.substrate_manager.cleanup()
+                    logger.info("Cleaned up substrate connection manager")
+            except Exception as e:
+                logger.debug(f"Error cleaning up substrate manager: {e}")
+
+            # Clean up AutoSyncManager
+            try:
+                if hasattr(self, 'auto_sync_manager') and self.auto_sync_manager:
+                    await self.auto_sync_manager.shutdown()
+                    logger.info("Cleaned up AutoSyncManager")
+            except Exception as e:
+                logger.debug(f"Error cleaning up AutoSyncManager: {e}")
 
             # Aggressive fsspec/gcsfs cleanup to prevent session errors blocking PM2 restart
             try:
@@ -1225,10 +1884,10 @@ class GaiaValidator:
             elif task_name == "geomagnetic":
                 await self.geomagnetic_task.cleanup_resources()
             elif task_name == "scoring":
-                self.substrate = interface.get_substrate(subtensor_network=self.subtensor_network)
-                self.metagraph.sync_nodes()
+                self.substrate = self.substrate_manager.force_reconnect()
+                await self._sync_metagraph()  # Use managed connection instead of direct sync
             elif task_name == "deregistration":
-                self.metagraph.sync_nodes()
+                await self._sync_metagraph()  # Use managed connection instead of direct sync
                 self.nodes = {}
             
             # Reset task health
@@ -1262,14 +1921,14 @@ class GaiaValidator:
 
             # 1. Fetch Current Metagraph State
             logger.info("Syncing metagraph for stale history check...")
-            self.metagraph.sync_nodes()
+            await self._sync_metagraph()  # Use managed connection instead of direct sync
             
-            # Fetch the list of nodes directly since Metagraph object doesn't store a UID-indexed list
+            # Fetch the list of nodes directly using our managed implementation
             try:
-                active_nodes_list = get_nodes_for_netuid(self.substrate, self.metagraph.netuid)
+                active_nodes_list = await self._fetch_nodes_managed(self.metagraph.netuid)
                 if active_nodes_list is None:
                     active_nodes_list = [] # Ensure it's an iterable if None is returned
-                    logger.warning("get_nodes_for_netuid returned None, proceeding with empty list for stale history check.")
+                    logger.warning("Managed node fetching returned None, proceeding with empty list for stale history check.")
             except Exception as e_fetch_nodes:
                 logger.error(f"Failed to fetch nodes for stale history check: {e_fetch_nodes}", exc_info=True)
                 active_nodes_list = [] # Proceed with empty list to avoid further errors here
@@ -1462,205 +2121,265 @@ class GaiaValidator:
     async def main(self):
         """Main execution loop for the validator."""
 
-        # Suppress gcsfs/aiohttp cleanup warnings that can block PM2 restart
-        def custom_excepthook(exc_type, exc_value, exc_traceback):
-            # Suppress specific gcsfs/aiohttp cleanup errors
-            if (exc_type == RuntimeWarning and 
-                ('coroutine' in str(exc_value) and 'never awaited' in str(exc_value)) or
-                ('Non-thread-safe operation' in str(exc_value))):
-                return  # Silently ignore these warnings
-            # Call the default handler for other exceptions
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        
-        sys.excepthook = custom_excepthook
+        memray_active = False
+        memray_output_file_path = "validator_memray_output.bin" 
 
-        # --- Alembic check removed from here ---
-        #test
-        try:
-            logger.info("Setting up neuron...")
-            if not self.setup_neuron():
-                logger.error("Failed to setup neuron, exiting...")
-                return
-
-            logger.info("Neuron setup complete.")
-
-            logger.info("Checking metagraph initialization...")
-            if self.metagraph is None:
-                logger.error("Metagraph not initialized, exiting...")
-                return
-
-            logger.info("Metagraph initialized.")
-
-            logger.info("Initializing database connection...") 
-            await self.database_manager.initialize_database()
-            logger.info("Database tables initialized.")
-            
-            # Initialize DB Sync Components - AFTER DB init
-            # await self._initialize_db_sync_components()
-
-            #logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
-            await handle_db_wipe(self.database_manager)
-            
-            # Perform startup history cleanup AFTER db init and wipe check
-            await self.cleanup_stale_history_on_startup()
-
-            # Lock storage to prevent any writes
-            self.database_manager._storage_locked = False
-            if self.database_manager._storage_locked:
-                logger.warning("Database storage is locked - no data will be stored until manually unlocked")
-
-            logger.info("Checking HTTP clients...")
-            # Only create clients if they don't exist or are closed
-            if not hasattr(self, 'miner_client') or self.miner_client.is_closed:
-                self.miner_client = httpx.AsyncClient(
-                    timeout=30.0, follow_redirects=True, verify=False
-                )
-                logger.info("Created new miner client")
-            if not hasattr(self, 'api_client') or self.api_client.is_closed:
-                self.api_client = httpx.AsyncClient(
-                    timeout=30.0,
-                    follow_redirects=True,
-                    limits=httpx.Limits(
-                        max_connections=100,
-                        max_keepalive_connections=20,
-                        keepalive_expiry=30,
-                    ),
-                    transport=httpx.AsyncHTTPTransport(retries=3),
-                )
-                logger.info("Created new API client")
-            logger.info("HTTP clients ready.")
-
-            logger.info("Starting watchdog...")
-            await self.start_watchdog()
-            logger.info("Watchdog started.")
-            
-            logger.info("Initializing baseline models...")
-            await self.basemodel_evaluator.initialize_models()
-            logger.info("Baseline models initialization complete")
-            
-            # Start auto-updater as independent task (not in main loop to avoid self-cancellation)
-            logger.info("Starting independent auto-updater task...")
-            auto_updater_task = asyncio.create_task(self.check_for_updates())
-            logger.info("Auto-updater task started independently")
-            
-            tasks = [
-                lambda: self.geomagnetic_task.validator_execute(self),
-                lambda: self.soil_task.validator_execute(self),
-                lambda: self.weather_task.validator_execute(self),
-                lambda: self.status_logger(),
-                lambda: self.main_scoring(),
-                lambda: self.handle_miner_deregistration_loop(),
-                # The MinerScoreSender task will be added conditionally below
-                lambda: self.manage_earthdata_token(),
-                lambda: self.monitor_client_health(),  # Added HTTP client monitoring
-                #lambda: self.database_monitor(),
-                #lambda: self.plot_database_metrics_periodically() # Added plotting task
-            ]
-
-            # Add DB Sync tasks conditionally
-            # if self.is_source_validator_for_db_sync and self.backup_manager:
-            #     logger.info(f"Adding DB Sync Backup task (interval: {self.db_sync_interval_hours}h).")
-            #     # Using insert to make it one of the earlier tasks, but order might not be critical.
-            #     tasks.insert(0, lambda: self.backup_manager.start_periodic_backups(self.db_sync_interval_hours))
-            # elif not self.is_source_validator_for_db_sync and self.restore_manager:
-            #     logger.info(f"Adding DB Sync Restore task (interval: {self.db_sync_interval_hours}h).")
-            #     tasks.insert(0, lambda: self.restore_manager.start_periodic_restores(self.db_sync_interval_hours))
-            # else:
-            #     logger.info("DB Sync is not active for this node (either source or replica manager failed to init, not configured, or Azure manager failed).")
-
-            
-            # Conditionally add miner_score_sender task
-            score_sender_on_str = os.getenv("SCORE_SENDER_ON", "False")
-            if score_sender_on_str.lower() == "true":
-                logger.info("SCORE_SENDER_ON is True, enabling MinerScoreSender task.")
-                tasks.insert(5, lambda: self.miner_score_sender.run_async())
-
-            active_service_tasks = []  # Define here for access in except CancelledError
-            shutdown_waiter = None # Define here for access in except CancelledError
+        if os.getenv("ENABLE_MEMRAY_TRACKING", "false").lower() == "true":
             try:
-                logger.info(f"Creating {len(tasks)} main service tasks...")
-                active_service_tasks = [asyncio.create_task(t()) for t in tasks]
-                logger.info(f"All {len(active_service_tasks)} main service tasks created.")
+                # memray is already imported at the top
+                logger.info(f"Programmatic Memray tracking enabled. Output will be saved to: {memray_output_file_path}")
+                self.memray_tracker = memray.Tracker(
+                    destination=memray.FileDestination(path=memray_output_file_path, overwrite=True),
+                    native_traces=True 
+                )
+                memray_active = True
+            except ImportError: # Should not happen if import is at top, but good for safety
+                logger.warning("Memray library seemed to be missing despite top-level import. Programmatic Memray tracking is disabled.")
+            except Exception as e:
+                logger.error(f"Failed to initialize Memray tracker: {e}")
+                self.memray_tracker = None # Ensure it's None if init fails
+        
+        async def run_validator_logic():
+            # Suppress gcsfs/aiohttp cleanup warnings that can block PM2 restart
+            def custom_excepthook(exc_type, exc_value, exc_traceback):
+                # Suppress specific gcsfs/aiohttp cleanup errors
+                if (exc_type == RuntimeWarning and 
+                    ('coroutine' in str(exc_value) and 'never awaited' in str(exc_value)) or
+                    ('Non-thread-safe operation' in str(exc_value))):
+                    return  # Silently ignore these warnings
+                # Call the default handler for other exceptions
+                sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            
+            sys.excepthook = custom_excepthook
 
-                shutdown_waiter = asyncio.create_task(self._shutdown_event.wait())
+            # --- Alembic check removed from here ---
+            #test
+            try:
+                logger.info("Setting up neuron...")
+                if not self.setup_neuron():
+                    logger.error("Failed to setup neuron, exiting...")
+                    return
+
+                logger.info("Neuron setup complete.")
+
+                logger.info("Checking metagraph initialization...")
+                if self.metagraph is None:
+                    logger.error("Metagraph not initialized, exiting...")
+                    return
+
+                logger.info("Metagraph initialized.")
+
+                logger.info("Initializing database connection...") 
+                await self.database_manager.initialize_database()
+                logger.info("Database tables initialized.")
                 
-                # Tasks to monitor are all service tasks plus the shutdown_waiter
-                all_tasks_being_monitored = active_service_tasks + [shutdown_waiter]
+                # Initialize DB Sync Components - AFTER DB init
+                await self._initialize_db_sync_components()
 
-                while not self._shutdown_event.is_set():
-                    # Filter out already completed tasks from the list we pass to asyncio.wait
-                    current_wait_list = [t for t in all_tasks_being_monitored if not t.done()]
-                    
-                    if not current_wait_list: 
-                        # This means all tasks (services + shutdown_waiter) are done.
-                        logger.info("All monitored tasks have completed.")
-                        if not self._shutdown_event.is_set():
-                             logger.warning("All tasks completed but shutdown event was not explicitly set. Setting it now to ensure proper cleanup.")
-                             self._shutdown_event.set() # Ensure shutdown is triggered
-                        break # Exit the while loop
+                #logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
+                await handle_db_wipe(self.database_manager)
+                
+                # Perform startup history cleanup AFTER db init and wipe check
+                await self.cleanup_stale_history_on_startup()
 
-                    done, pending = await asyncio.wait(
-                        current_wait_list,
-                        return_when=asyncio.FIRST_COMPLETED
+                # Lock storage to prevent any writes
+                self.database_manager._storage_locked = False
+                if self.database_manager._storage_locked:
+                    logger.warning("Database storage is locked - no data will be stored until manually unlocked")
+
+                logger.info("Checking HTTP clients...")
+                # Only create clients if they don't exist or are closed
+                if not hasattr(self, 'miner_client') or self.miner_client.is_closed:
+                    self.miner_client = httpx.AsyncClient(
+                        timeout=30.0, follow_redirects=True, verify=False
                     )
+                    logger.info("Created new miner client")
+                if not hasattr(self, 'api_client') or self.api_client.is_closed:
+                    self.api_client = httpx.AsyncClient(
+                        timeout=30.0,
+                        follow_redirects=True,
+                        limits=httpx.Limits(
+                            max_connections=100,
+                            max_keepalive_connections=20,
+                            keepalive_expiry=30,
+                        ),
+                        transport=httpx.AsyncHTTPTransport(retries=3),
+                    )
+                    logger.info("Created new API client")
+                logger.info("HTTP clients ready.")
+
+                logger.info("Starting watchdog...")
+                await self.start_watchdog()
+                logger.info("Watchdog started.")
+
+                if not memray_active: # Start tracemalloc only if memray is not active
+                    logger.info("Starting tracemalloc for memory analysis...")
+                    tracemalloc.start(25) # Start tracemalloc, 25 frames for traceback
+                
+                logger.info("Initializing baseline models...")
+                await self.basemodel_evaluator.initialize_models()
+                logger.info("Baseline models initialization complete")
+                
+                # Start auto-updater as independent task (not in main loop to avoid self-cancellation)
+                logger.info("Starting independent auto-updater task...")
+                auto_updater_task = asyncio.create_task(self.check_for_updates())
+                logger.info("Auto-updater task started independently")
+                
+                tasks_lambdas = [ # Renamed to avoid conflict if tasks variable is used elsewhere
+                    lambda: self.geomagnetic_task.validator_execute(self),
+                    lambda: self.soil_task.validator_execute(self),
+                    lambda: self.weather_task.validator_execute(self),
+                    lambda: self.status_logger(),
+                    lambda: self.main_scoring(),
+                    lambda: self.handle_miner_deregistration_loop(),
+                    # The MinerScoreSender task will be added conditionally below
+                    lambda: self.manage_earthdata_token(),
+                    lambda: self.monitor_client_health(),  # Added HTTP client monitoring
+                    #lambda: self.database_monitor(),
+                    lambda: self.periodic_substrate_cleanup(),  # Added substrate cleanup task
+                    lambda: self.aggressive_memory_cleanup(),  # Added aggressive memory cleanup task
+                    #lambda: self.plot_database_metrics_periodically() # Added plotting task
+                ]
+                if not memray_active: # Add tracemalloc snapshot taker only if memray is not active
+                    tasks_lambdas.append(lambda: self.memory_snapshot_taker())
+
+
+                # Add DB Sync tasks conditionally
+                if self.auto_sync_manager:
+                    logger.info(f"AutoSyncManager is active - Starting setup and scheduling...")
+                    logger.info(f"DB Sync Configuration: Primary={self.is_source_validator_for_db_sync}")
                     
-                    # If shutdown_event is set (e.g. by signal handler) or shutdown_waiter completed, break the loop.
-                    if self._shutdown_event.is_set() or shutdown_waiter.done():
-                        logger.info("Shutdown signaled or shutdown_waiter completed. Breaking main monitoring loop.")
-                        break 
-
-                    # If we are here, one of the active_service_tasks completed. Log it.
-                    for task in done:
-                        if task in active_service_tasks: # Check if it's one of our main service tasks
+                    # Setup AutoSyncManager (includes system configuration AND scheduling)
+                    try:
+                        logger.info("🚀 Setting up AutoSyncManager (includes system config and scheduling)...")
+                        setup_success = await self.auto_sync_manager.setup()
+                        if setup_success:
+                            logger.info("✅ AutoSyncManager setup and scheduling completed successfully!")
+                        else:
+                            logger.warning("⚠️ AutoSyncManager setup failed - attempting fallback scheduling for basic monitoring...")
+                            # If setup failed, try just starting scheduling for monitoring
                             try:
-                                result = task.result() # Access result to raise exception if task failed
-                                logger.warning(f"Main service task {task.get_name()} completed unexpectedly with result: {result}. It will not be automatically restarted by this loop.")
-                            except asyncio.CancelledError:
-                                logger.info(f"Main service task {task.get_name()} was cancelled.")
-                            except Exception as e:
-                                logger.error(f"Main service task {task.get_name()} failed with exception: {e}", exc_info=True)
-                
-                # --- After the while loop (either by break or _shutdown_event being set before loop start) ---
-                logger.info("Main monitoring loop finished. Initiating cancellation of any remaining active tasks for shutdown.")
-                
-                # Cancel all original service tasks if not already done
-                for task_to_cancel in active_service_tasks:
-                    if not task_to_cancel.done():
-                        logger.info(f"Cancelling service task: {task_to_cancel.get_name()}")
-                        task_to_cancel.cancel()
-                
-                # Cancel shutdown_waiter if not done
-                # (e.g., if loop broke because all service tasks finished before shutdown_event was set)
-                if shutdown_waiter and not shutdown_waiter.done():
-                    logger.info("Cancelling shutdown_waiter task.")
-                    shutdown_waiter.cancel()
-                
-                # Await all of them to ensure they are properly cleaned up
-                await asyncio.gather(*(active_service_tasks + ([shutdown_waiter] if shutdown_waiter else [])), return_exceptions=True)
-                logger.info("All main service tasks and the shutdown waiter have been processed (awaited/cancelled).")
-                
-            except asyncio.CancelledError:
-                logger.info("Main task execution block was cancelled. Ensuring child tasks are also cancelled.")
-                # This block handles if validator.main() itself is cancelled from outside.
-                tasks_to_ensure_cancelled = []
-                if 'active_service_tasks' in locals(): # Check if list was initialized
-                    tasks_to_ensure_cancelled.extend(active_service_tasks)
-                if 'shutdown_waiter' in locals() and shutdown_waiter: # Check if waiter was initialized
-                    tasks_to_ensure_cancelled.append(shutdown_waiter)
-                
-                for task_to_cancel in tasks_to_ensure_cancelled:
-                    if task_to_cancel and not task_to_cancel.done():
-                        logger.info(f"Cancelling task due to main cancellation: {task_to_cancel.get_name()}")
-                        task_to_cancel.cancel()
-                await asyncio.gather(*tasks_to_ensure_cancelled, return_exceptions=True)
-                logger.info("Child tasks cancellation process completed due to main cancellation.")
+                                await self.auto_sync_manager.start_scheduling()
+                                logger.info("✅ AutoSyncManager fallback scheduling started successfully!")
+                            except Exception as fallback_e:
+                                logger.error(f"❌ AutoSyncManager fallback scheduling also failed: {fallback_e}")
+                                self.auto_sync_manager = None
+                    except Exception as e:
+                        logger.error(f"❌ AutoSyncManager setup failed with exception: {e}")
+                        logger.info("🔄 Attempting fallback scheduling for basic monitoring...")
+                        # If setup completely failed, try just starting scheduling
+                        try:
+                            await self.auto_sync_manager.start_scheduling()
+                            logger.info("✅ AutoSyncManager fallback scheduling started successfully!")
+                        except Exception as fallback_e:
+                            logger.error(f"❌ AutoSyncManager fallback scheduling also failed: {fallback_e}")
+                            logger.error("🚫 AutoSyncManager will be completely disabled")
+                            self.auto_sync_manager = None
+                else:
+                    logger.info("AutoSyncManager is not active for this node (initialization failed or not configured).")
 
-        except Exception as e:
-            logger.error(f"Error in main: {e}")
-            logger.error(traceback.format_exc())
-        finally:
-            if not self._cleanup_done:
-                await self._initiate_shutdown()
+                
+                # Conditionally add miner_score_sender task
+                score_sender_on_str = os.getenv("SCORE_SENDER_ON", "False")
+                if score_sender_on_str.lower() == "true":
+                    logger.info("SCORE_SENDER_ON is True, enabling MinerScoreSender task.")
+                    tasks_lambdas.insert(5, lambda: self.miner_score_sender.run_async())
+
+                active_service_tasks = []  # Define here for access in except CancelledError
+                shutdown_waiter = None # Define here for access in except CancelledError
+                try:
+                    logger.info(f"Creating {len(tasks_lambdas)} main service tasks...")
+                    active_service_tasks = [asyncio.create_task(t()) for t in tasks_lambdas]
+                    logger.info(f"All {len(active_service_tasks)} main service tasks created.")
+
+                    shutdown_waiter = asyncio.create_task(self._shutdown_event.wait())
+                    
+                    # Tasks to monitor are all service tasks plus the shutdown_waiter
+                    all_tasks_being_monitored = active_service_tasks + [shutdown_waiter]
+
+                    while not self._shutdown_event.is_set():
+                        # Filter out already completed tasks from the list we pass to asyncio.wait
+                        current_wait_list = [t for t in all_tasks_being_monitored if not t.done()]
+                        
+                        if not current_wait_list: 
+                            # This means all tasks (services + shutdown_waiter) are done.
+                            logger.info("All monitored tasks have completed.")
+                            if not self._shutdown_event.is_set():
+                                 logger.warning("All tasks completed but shutdown event was not explicitly set. Setting it now to ensure proper cleanup.")
+                                 self._shutdown_event.set() # Ensure shutdown is triggered
+                            break # Exit the while loop
+
+                        done, pending = await asyncio.wait(
+                            current_wait_list,
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+                        
+                        # If shutdown_event is set (e.g. by signal handler) or shutdown_waiter completed, break the loop.
+                        if self._shutdown_event.is_set() or shutdown_waiter.done():
+                            logger.info("Shutdown signaled or shutdown_waiter completed. Breaking main monitoring loop.")
+                            break 
+
+                        # If we are here, one of the active_service_tasks completed. Log it.
+                        for task in done:
+                            if task in active_service_tasks: # Check if it's one of our main service tasks
+                                try:
+                                    result = task.result() # Access result to raise exception if task failed
+                                    logger.warning(f"Main service task {task.get_name()} completed unexpectedly with result: {result}. It will not be automatically restarted by this loop.")
+                                except asyncio.CancelledError:
+                                    logger.info(f"Main service task {task.get_name()} was cancelled.")
+                                except Exception as e:
+                                    logger.error(f"Main service task {task.get_name()} failed with exception: {e}", exc_info=True)
+                    
+                    # --- After the while loop (either by break or _shutdown_event being set before loop start) ---
+                    logger.info("Main monitoring loop finished. Initiating cancellation of any remaining active tasks for shutdown.")
+                    
+                    # Cancel all original service tasks if not already done
+                    for task_to_cancel in active_service_tasks:
+                        if not task_to_cancel.done():
+                            logger.info(f"Cancelling service task: {task_to_cancel.get_name()}")
+                            task_to_cancel.cancel()
+                    
+                    # Cancel shutdown_waiter if not done
+                    # (e.g., if loop broke because all service tasks finished before shutdown_event was set)
+                    if shutdown_waiter and not shutdown_waiter.done():
+                        logger.info("Cancelling shutdown_waiter task.")
+                        shutdown_waiter.cancel()
+                    
+                    # Await all of them to ensure they are properly cleaned up
+                    await asyncio.gather(*(active_service_tasks + ([shutdown_waiter] if shutdown_waiter else [])), return_exceptions=True)
+                    logger.info("All main service tasks and the shutdown waiter have been processed (awaited/cancelled).")
+                    
+                except asyncio.CancelledError:
+                    logger.info("Main task execution block was cancelled. Ensuring child tasks are also cancelled.")
+                    # This block handles if validator.main() itself is cancelled from outside.
+                    tasks_to_ensure_cancelled = []
+                    if 'active_service_tasks' in locals(): # Check if list was initialized
+                        tasks_to_ensure_cancelled.extend(active_service_tasks)
+                    if 'shutdown_waiter' in locals() and shutdown_waiter: # Check if waiter was initialized
+                        tasks_to_ensure_cancelled.append(shutdown_waiter)
+                    
+                    for task_to_cancel in tasks_to_ensure_cancelled:
+                        if task_to_cancel and not task_to_cancel.done():
+                            logger.info(f"Cancelling task due to main cancellation: {task_to_cancel.get_name()}")
+                            task_to_cancel.cancel()
+                    await asyncio.gather(*tasks_to_ensure_cancelled, return_exceptions=True)
+                    logger.info("Child tasks cancellation process completed due to main cancellation.")
+
+            except Exception as e:
+                logger.error(f"Error in main: {e}")
+                logger.error(traceback.format_exc())
+            finally:
+                if not self._cleanup_done:
+                    await self._initiate_shutdown()
+
+        if memray_active and self.memray_tracker:
+            with self.memray_tracker: # This starts the tracking
+                logger.info("Memray tracker is active and wrapping validator logic.")
+                await run_validator_logic()
+            logger.info(f"Memray tracking finished. Output file '{memray_output_file_path}' should be written.")
+        else:
+            logger.info("Memray tracking is not active. Running validator logic directly.")
+            await run_validator_logic()
 
     async def main_scoring(self):
         """Run scoring every subnet tempo blocks."""
@@ -1669,6 +2388,7 @@ class GaiaValidator:
             wallet_name=self.wallet_name,
             hotkey_name=self.hotkey_name,
             network=self.subtensor_network,
+            substrate_manager=self.substrate_manager,
         )
 
         while True:
@@ -1786,7 +2506,7 @@ class GaiaValidator:
                 logger.error("Weight setting operation timed out - restarting cycle")
                 await self.update_task_status('scoring', 'error')
                 try:
-                    self.substrate = await interface.async_get_substrate(subtensor_network=self.subtensor_network)
+                    self.substrate = self.substrate_manager.force_reconnect()
                 except Exception as e:
                     logger.error(f"Failed to reconnect to substrate: {e}")
                 await asyncio.sleep(12)
@@ -1819,14 +2539,25 @@ class GaiaValidator:
                 except Exception as block_error:
 
                     try:
-                        self.substrate = get_substrate(
-                            subtensor_network=self.subtensor_network,
-                            subtensor_address=self.subtensor_chain_endpoint
-                        )
+                        self.substrate = self.substrate_manager.get_connection()
                     except Exception as e:
                         logger.error(f"Failed to reconnect to substrate: {e}")
 
                 active_nodes = len(self.metagraph.nodes) if self.metagraph else 0
+
+                # Get substrate connection manager stats
+                substrate_stats = ""
+                if hasattr(self, 'substrate_manager') and self.substrate_manager:
+                    try:
+                        stats = self.substrate_manager.get_stats()
+                        substrate_stats = (
+                            f"Substrate Connections: {stats['connection_count']}, "
+                            f"Queries: {stats['query_count']}, "
+                            f"Age: {stats['connection_age']:.1f}s, "
+                            f"Cleanup: {stats['time_since_cleanup']:.1f}s ago"
+                        )
+                    except Exception as e:
+                        substrate_stats = f"Substrate Stats Error: {e}"
 
                 logger.info(
                     f"\n"
@@ -1834,7 +2565,8 @@ class GaiaValidator:
                     f"Time (UTC): {formatted_time} | \n"
                     f"Block: {self.current_block} | \n"
                     f"Nodes: {active_nodes}/256 | \n"
-                    f"Weights Set: {blocks_since_weights} blocks ago"
+                    f"Weights Set: {blocks_since_weights} blocks ago\n"
+                    f"{substrate_stats}"
                 )
 
             except Exception as e:
@@ -1856,7 +2588,7 @@ class GaiaValidator:
                     continue # Wait for metagraph to be initialized
                 
                 logger.info("Syncing metagraph for miner state update...")
-                self.metagraph.sync_nodes()
+                await self._sync_metagraph()  # Use managed connection instead of direct sync
                 if not self.metagraph.nodes:
                     logger.warning("Metagraph empty after sync, skipping miner state update.")
                     await asyncio.sleep(600)  # Sleep before retrying
@@ -1865,12 +2597,12 @@ class GaiaValidator:
                 async with self.miner_table_lock:
                     logger.info("Performing miner hotkey change check and info update...")
                     
-                    # Get current UIDs and hotkeys from the chain's metagraph
+                    # Get current UIDs and hotkeys from the chain's metagraph using managed fetching
                     try:
-                        active_nodes_list = get_nodes_for_netuid(self.substrate, self.metagraph.netuid)
+                        active_nodes_list = await self._fetch_nodes_managed(self.metagraph.netuid)
                         if active_nodes_list is None:
                             active_nodes_list = [] # Ensure it's an iterable
-                            logger.warning("get_nodes_for_netuid returned None in handle_miner_deregistration_loop.")
+                            logger.warning("Managed node fetching returned None in handle_miner_deregistration_loop.")
                     except Exception as e_fetch_nodes_dereg:
                         logger.error(f"Failed to fetch nodes in handle_miner_deregistration_loop: {e_fetch_nodes_dereg}", exc_info=True)
                         active_nodes_list = []
@@ -2068,176 +2800,245 @@ class GaiaValidator:
     def _perform_weight_calculations_sync(self, weather_results, geomagnetic_results, soil_results, now, validator_nodes_by_uid_list):
         """
         Synchronous helper to perform CPU-bound weight calculations.
+        Memory-optimized version with explicit cleanup.
         """
         logger.info("Synchronous weight calculation: Processing fetched scores...")
-        # Initialize score arrays
-        weather_scores = np.full(256, np.nan)
-        geomagnetic_scores = np.full(256, np.nan)
-        soil_scores = np.full(256, np.nan)
-
-        # Count raw scores per UID
-        weather_counts = [0] * 256
-        geo_counts = [0] * 256
-        soil_counts = [0] * 256
         
-        if weather_results:
-            for result in weather_results:
-                # Ensure 'score' key exists and is a list of appropriate length
-                scores = result.get('score', [np.nan]*256)
-                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+        try:
+            # Initialize score arrays
+            weather_scores = np.full(256, np.nan)
+            geomagnetic_scores = np.full(256, np.nan)
+            soil_scores = np.full(256, np.nan)
+
+            # Count raw scores per UID - use numpy for better memory efficiency
+            weather_counts = np.zeros(256, dtype=int)
+            geo_counts = np.zeros(256, dtype=int)
+            soil_counts = np.zeros(256, dtype=int)
+        
+            if weather_results:
+                for result in weather_results:
+                    # Ensure 'score' key exists and is a list of appropriate length
+                    scores = result.get('score', [np.nan]*256)
+                    if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                    for uid in range(256):
+                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                            weather_counts[uid] += 1
+            
+            if geomagnetic_results:
+                for result in geomagnetic_results:
+                    scores = result.get('score', [np.nan]*256)
+                    if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                    for uid in range(256):
+                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                            geo_counts[uid] += 1
+
+            if soil_results:
+                for result in soil_results:
+                    scores = result.get('score', [np.nan]*256)
+                    if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                    for uid in range(256):
+                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                            soil_counts[uid] += 1
+
+            if geomagnetic_results:
+                # Process geomagnetic scores with memory-efficient approach
+                zero_scores_count = 0
                 for uid in range(256):
-                    if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
-                        weather_counts[uid] += 1
-        
-        if geomagnetic_results:
-            for result in geomagnetic_results:
-                scores = result.get('score', [np.nan]*256)
+                    uid_scores = []
+                    uid_weights = []
+                    
+                    # Collect scores for this UID across all results
+                    for result in geomagnetic_results:
+                        age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                        decay = np.exp(-age_days * np.log(2))
+                        scores = result.get('score', [np.nan]*256)
+                        if not isinstance(scores, list) or len(scores) != 256: 
+                            scores = [np.nan]*256 # Defensive
+                        
+                        score_val = scores[uid]
+                        if isinstance(score_val, str) or np.isnan(score_val): 
+                            score_val = 0.0
+                        if score_val == 0.0: 
+                            zero_scores_count += 1
+                        
+                        uid_scores.append(score_val)
+                        uid_weights.append(decay)
+                        geo_counts[uid] += (score_val != 0.0)
+                    
+                    # Calculate weighted average for this UID
+                    if uid_scores:
+                        s_arr = np.array(uid_scores)
+                        w_arr = np.array(uid_weights)
+                        non_zero_mask = s_arr != 0.0
+                        
+                        if np.any(non_zero_mask):
+                            masked_s = s_arr[non_zero_mask]
+                            masked_w = w_arr[non_zero_mask]
+                            weight_sum = np.sum(masked_w)
+                            if weight_sum > 0:
+                                geomagnetic_scores[uid] = np.sum(masked_s * masked_w) / weight_sum
+                            else:
+                                geomagnetic_scores[uid] = 0.0
+                        else:
+                            geomagnetic_scores[uid] = 0.0
+                    
+                    # Clean up temporary arrays immediately
+                    del uid_scores, uid_weights
+                
+                logger.info(f"Processed {len(geomagnetic_results)} geomagnetic records with {zero_scores_count} zero scores")
+
+            if weather_results:
+                latest_result = weather_results[0]
+                scores = latest_result.get('score', [np.nan]*256)
                 if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                score_age_days = (now - latest_result['created_at']).total_seconds() / (24 * 3600)
+                logger.info(f"Using latest weather score from {latest_result['created_at']} ({score_age_days:.1f} days ago)")
                 for uid in range(256):
-                    if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
-                        geo_counts[uid] += 1
+                    if isinstance(scores[uid], str) or np.isnan(scores[uid]): weather_scores[uid] = 0.0
+                    else: weather_scores[uid] = scores[uid]; weather_counts[uid] += (scores[uid] != 0.0)
+                logger.info(f"Weather scores: {sum(1 for s in weather_scores if s == 0.0)} UIDs have zero score")
 
-        if soil_results:
-            for result in soil_results:
-                scores = result.get('score', [np.nan]*256)
-                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+            if soil_results:
+                # Process soil scores with memory-efficient approach
+                zero_soil_scores = 0
                 for uid in range(256):
-                    if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
-                        soil_counts[uid] += 1
+                    uid_scores = []
+                    uid_weights = []
+                    
+                    # Collect scores for this UID across all results
+                    for result in soil_results:
+                        age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                        decay = np.exp(-age_days * np.log(2))
+                        scores = result.get('score', [np.nan]*256)
+                        if not isinstance(scores, list) or len(scores) != 256: 
+                            scores = [np.nan]*256 # Defensive
+                        
+                        score_val = scores[uid]
+                        if isinstance(score_val, str) or np.isnan(score_val): 
+                            score_val = 0.0
+                        if score_val == 0.0: 
+                            zero_soil_scores += 1
+                        
+                        uid_scores.append(score_val)
+                        uid_weights.append(decay)
+                        soil_counts[uid] += (score_val != 0.0)
+                    
+                    # Calculate weighted average for this UID
+                    if uid_scores:
+                        s_arr = np.array(uid_scores)
+                        w_arr = np.array(uid_weights)
+                        non_zero_mask = s_arr != 0.0
+                        
+                        if np.any(non_zero_mask):
+                            masked_s = s_arr[non_zero_mask]
+                            masked_w = w_arr[non_zero_mask]
+                            weight_sum = np.sum(masked_w)
+                            if weight_sum > 0:
+                                soil_scores[uid] = np.sum(masked_s * masked_w) / weight_sum
+                            else:
+                                soil_scores[uid] = 0.0
+                        else:
+                            soil_scores[uid] = 0.0
+                    
+                    # Clean up temporary arrays immediately
+                    del uid_scores, uid_weights
+                
+                logger.info(f"Processed {len(soil_results)} soil records with {zero_soil_scores} zero scores")
 
-        if geomagnetic_results:
-            geo_scores_by_uid = [[] for _ in range(256)]
-            zero_scores_count = 0
-            for result in geomagnetic_results:
-                age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                decay = np.exp(-age_days * np.log(2))
-                scores = result.get('score', [np.nan]*256)
-                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
-                for uid in range(256):
-                    if isinstance(scores[uid], str) or np.isnan(scores[uid]): scores[uid] = 0.0
-                    geo_scores_by_uid[uid].append((scores[uid], decay))
-                    if scores[uid] == 0.0: zero_scores_count += 1
-            logger.info(f"Loaded {len(geomagnetic_results)} geomagnetic score records with {zero_scores_count} zero scores")
-            zeros_after = 0
-            for uid in range(256):
-                if geo_scores_by_uid[uid]:
-                    s_vals, d_weights = zip(*geo_scores_by_uid[uid])
-                    s_arr, w_arr = np.array(s_vals), np.array(d_weights)
-                    zero_mask, total_count = (s_arr == 0.0), len(s_arr)
-                    if np.all(zero_mask): geomagnetic_scores[uid], zeros_after = 0.0, zeros_after + 1; logger.debug(f"UID {uid}: All {total_count} geo scores zeroed"); continue
-                    masked_s, masked_w = s_arr[~zero_mask], w_arr[~zero_mask]
-                    if np.any(zero_mask): logger.debug(f"UID {uid}: Masked {np.sum(zero_mask)}/{total_count} zero geo scores")
-                    weight_sum = np.sum(masked_w)
-                    if weight_sum > 0: geomagnetic_scores[uid] = np.sum(masked_s * masked_w) / weight_sum; zeros_after += (geomagnetic_scores[uid] == 0.0)
-                    else: geomagnetic_scores[uid], zeros_after = 0.0, zeros_after + 1
-            logger.info(f"Geomagnetic masked array processing: {zeros_after} UIDs have zero final score")
+            logger.info("Aggregate scores calculated. Proceeding to weight normalization...")
+            def sigmoid(x, k=20, x0=0.93): return 1 / (1 + math.exp(-k * (x - x0)))
+            weights_final = np.zeros(256)
+            for idx in range(256):
+                w_s, g_s, sm_s = weather_scores[idx], geomagnetic_scores[idx], soil_scores[idx]
+                if np.isnan(w_s) or w_s==0: w_s=np.nan
+                if np.isnan(g_s) or g_s==0: g_s=np.nan
+                if np.isnan(sm_s) or sm_s==0: sm_s=np.nan
+                node_obj, hk_chain = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None, "N/A"
+                if node_obj: hk_chain = node_obj.get('hotkey', 'N/A')
+                if np.isnan(w_s) and np.isnan(g_s) and np.isnan(sm_s): weights_final[idx] = 0.0
+                else:
+                    wc, gc, sc, total_w_avail = 0.0,0.0,0.0,0.0
+                    if not np.isnan(w_s): wc,total_w_avail = 0.70*w_s, total_w_avail+0.70
+                    if not np.isnan(g_s): gc,total_w_avail = 0.15*sigmoid(g_s), total_w_avail+0.15
+                    if not np.isnan(sm_s): sc,total_w_avail = 0.15*sm_s, total_w_avail+0.15
+                    weights_final[idx] = (wc+gc+sc)/total_w_avail if total_w_avail>0 else 0.0
+                # Reduce logging to prevent memory pressure - only log every 32nd UID or non-zero weights
+                if idx % 32 == 0 or weights_final[idx] > 0.0:
+                    logger.debug(f"UID {idx} (HK: {hk_chain}): Wea={w_s if not np.isnan(w_s) else '-'} ({weather_counts[idx]} scores), Geo={g_s if not np.isnan(g_s) else '-'} ({geo_counts[idx]} scores), Soil={sm_s if not np.isnan(sm_s) else '-'} ({soil_counts[idx]} scores), AggW={weights_final[idx]:.4f}")
+            logger.info(f"Weights before normalization: Min={np.min(weights_final):.4f}, Max={np.max(weights_final):.4f}, Mean={np.mean(weights_final):.4f}")
+            
+            non_zero_mask = weights_final != 0.0
+            if not np.any(non_zero_mask): logger.warning("No non-zero weights to normalize!"); return None
+            
+            nz_weights = weights_final[non_zero_mask]
+            max_w_val = np.max(nz_weights)
+            if max_w_val == 0: logger.warning("Max weight is 0, cannot normalize."); return None
+            
+            norm_weights = np.copy(weights_final); norm_weights[non_zero_mask] /= max_w_val
+            positives = norm_weights[norm_weights > 0]
+            if not positives.any(): logger.warning("No positive weights after initial normalization!"); return None
+            
+            M = np.percentile(positives, 80); logger.info(f"Using 80th percentile ({M:.8f}) as curve midpoint")
+            b,Q,v,k,a,slope = 70,8,0.3,0.98,0.0,0.01
+            transformed_w = np.zeros_like(weights_final)
+            nz_indices = np.where(weights_final > 0.0)[0]
+            if not nz_indices.any(): logger.warning("No positive weight indices for transformation!"); return None
 
-        if weather_results:
-            latest_result = weather_results[0]
-            scores = latest_result.get('score', [np.nan]*256)
-            if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
-            score_age_days = (now - latest_result['created_at']).total_seconds() / (24 * 3600)
-            logger.info(f"Using latest weather score from {latest_result['created_at']} ({score_age_days:.1f} days ago)")
-            for uid in range(256):
-                if isinstance(scores[uid], str) or np.isnan(scores[uid]): weather_scores[uid] = 0.0
-                else: weather_scores[uid] = scores[uid]; weather_counts[uid] += (scores[uid] != 0.0)
-            logger.info(f"Weather scores: {sum(1 for s in weather_scores if s == 0.0)} UIDs have zero score")
+            for idx in nz_indices:
+                sig_p = a+(k-a)/np.power(1+Q*np.exp(-b*(norm_weights[idx]-M)),1/v)
+                transformed_w[idx] = sig_p + slope*norm_weights[idx]
+            
+            trans_nz = transformed_w[transformed_w > 0]
+            if trans_nz.any(): logger.info(f"Transformed weights: Min={np.min(trans_nz):.4f}, Max={np.max(trans_nz):.4f}, Mean={np.mean(trans_nz):.4f}")
+            else: logger.warning("No positive weights after sigmoid transformation!"); # Continue to rank-based if needed or return None
 
-        if soil_results:
-            soil_scores_by_uid = [[] for _ in range(256)]
-            for result in soil_results:
-                age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                decay = np.exp(-age_days * np.log(2))
-                scores = result.get('score', [np.nan]*256)
-                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
-                for uid in range(256):
-                    if isinstance(scores[uid], str) or np.isnan(scores[uid]): scores[uid] = 0.0
-                    soil_scores_by_uid[uid].append((scores[uid], decay))
-            zero_soil_scores = sum(s == 0.0 for res in soil_results for s_list in [res.get('score')] if isinstance(s_list, list) for s in s_list if isinstance(s, (int, float)))
-            logger.info(f"Loaded {len(soil_results)} soil records with {zero_soil_scores}/{len(soil_results)*256} zero scores")
-            zeros_after = 0
-            for uid in range(256):
-                if soil_scores_by_uid[uid]:
-                    s_vals, d_weights = zip(*soil_scores_by_uid[uid])
-                    s_arr, w_arr = np.array(s_vals), np.array(d_weights)
-                    zero_mask, total_count = (s_arr == 0.0), len(s_arr)
-                    if np.all(zero_mask): soil_scores[uid], zeros_after = 0.0, zeros_after + 1; logger.debug(f"UID {uid}: All {total_count} soil scores zeroed"); continue
-                    masked_s, masked_w = s_arr[~zero_mask], w_arr[~zero_mask]
-                    if np.any(zero_mask): logger.debug(f"UID {uid}: Masked {np.sum(zero_mask)}/{total_count} zero soil scores")
-                    weight_sum = np.sum(masked_w)
-                    if weight_sum > 0: soil_scores[uid] = np.sum(masked_s * masked_w) / weight_sum; zeros_after += (soil_scores[uid] == 0.0)
-                    else: soil_scores[uid], zeros_after = 0.0, zeros_after + 1
-            logger.info(f"Soil task: {zeros_after} UIDs have zero final score after masked array processing")
-
-        logger.info("Aggregate scores calculated. Proceeding to weight normalization...")
-        def sigmoid(x, k=20, x0=0.93): return 1 / (1 + math.exp(-k * (x - x0)))
-        weights_final = np.zeros(256)
-        for idx in range(256):
-            w_s, g_s, sm_s = weather_scores[idx], geomagnetic_scores[idx], soil_scores[idx]
-            if np.isnan(w_s) or w_s==0: w_s=np.nan
-            if np.isnan(g_s) or g_s==0: g_s=np.nan
-            if np.isnan(sm_s) or sm_s==0: sm_s=np.nan
-            node_obj, hk_chain = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None, "N/A"
-            if node_obj: hk_chain = node_obj.hotkey
-            if np.isnan(w_s) and np.isnan(g_s) and np.isnan(sm_s): weights_final[idx] = 0.0
-            else:
-                wc, gc, sc, total_w_avail = 0.0,0.0,0.0,0.0
-                if not np.isnan(w_s): wc,total_w_avail = 0.70*w_s, total_w_avail+0.70
-                if not np.isnan(g_s): gc,total_w_avail = 0.15*sigmoid(g_s), total_w_avail+0.15
-                if not np.isnan(sm_s): sc,total_w_avail = 0.15*sm_s, total_w_avail+0.15
-                weights_final[idx] = (wc+gc+sc)/total_w_avail if total_w_avail>0 else 0.0
-            logger.info(f"UID {idx} (HK: {hk_chain}): Wea={w_s if not np.isnan(w_s) else '-'} ({weather_counts[idx]} scores), Geo={g_s if not np.isnan(g_s) else '-'} ({geo_counts[idx]} scores), Soil={sm_s if not np.isnan(sm_s) else '-'} ({soil_counts[idx]} scores), AggW={weights_final[idx]:.4f}")
-        logger.info(f"Weights before normalization: Min={np.min(weights_final):.4f}, Max={np.max(weights_final):.4f}, Mean={np.mean(weights_final):.4f}")
+            if len(trans_nz) > 1 and np.std(trans_nz) < 0.01:
+                logger.warning(f"Transformed weights too uniform (std={np.std(trans_nz):.4f}), switching to rank-based.")
+                sorted_indices = np.argsort(-weights_final); transformed_w = np.zeros_like(weights_final)
+                pos_count = np.sum(weights_final > 0)
+                for i,idx_val in enumerate(sorted_indices[:pos_count]): transformed_w[idx_val] = 1.0/((i+1)**1.2)
+                rank_nz = transformed_w[transformed_w > 0]
+                if rank_nz.any(): logger.info(f"Rank-based: Min={np.min(rank_nz):.4f}, Max={np.max(rank_nz):.4f}, Mean={np.mean(rank_nz):.4f}")
+            
+            final_sum = np.sum(transformed_w); final_weights_list = None
+            if final_sum > 0:
+                transformed_w /= final_sum
+                final_nz_vals = transformed_w[transformed_w > 0]
+                if final_nz_vals.any():
+                    logger.info(f"Final Norm Weights: Count={len(final_nz_vals)}, Min={np.min(final_nz_vals):.4f}, Max={np.max(final_nz_vals):.4f}, Std={np.std(final_nz_vals):.4f}")
+                    if len(np.unique(final_nz_vals)) < len(final_nz_vals)/2 : logger.warning(f"Low unique weights! {len(np.unique(final_nz_vals))}/{len(final_nz_vals)}")
+                    if final_nz_vals.max() > 0.90: logger.warning(f"Max weight {final_nz_vals.max():.4f} is very high!")
+                final_weights_list = transformed_w.tolist()
+                logger.info("Final normalized weights calculated.")
+            else: 
+                logger.warning("Sum of weights is zero, cannot normalize! Returning None.")
+                final_weights_list = None
+            
+            # Clean up all intermediate arrays to prevent memory leaks
+            try:
+                del weather_scores, geomagnetic_scores, soil_scores
+                del weather_counts, geo_counts, soil_counts
+                del weights_final, transformed_w
+                if 'nz_weights' in locals(): del nz_weights
+                if 'norm_weights' in locals(): del norm_weights
+                if 'positives' in locals(): del positives
+                if 'trans_nz' in locals(): del trans_nz
+                if 'sorted_indices' in locals(): del sorted_indices
+            except Exception as cleanup_e:
+                logger.warning(f"Error during sync weight calculation cleanup: {cleanup_e}")
+            
+            return final_weights_list
         
-        non_zero_mask = weights_final != 0.0
-        if not np.any(non_zero_mask): logger.warning("No non-zero weights to normalize!"); return None
-        
-        nz_weights = weights_final[non_zero_mask]
-        max_w_val = np.max(nz_weights)
-        if max_w_val == 0: logger.warning("Max weight is 0, cannot normalize."); return None
-        
-        norm_weights = np.copy(weights_final); norm_weights[non_zero_mask] /= max_w_val
-        positives = norm_weights[norm_weights > 0]
-        if not positives.any(): logger.warning("No positive weights after initial normalization!"); return None
-        
-        M = np.percentile(positives, 80); logger.info(f"Using 80th percentile ({M:.8f}) as curve midpoint")
-        b,Q,v,k,a,slope = 70,8,0.3,0.98,0.0,0.01
-        transformed_w = np.zeros_like(weights_final)
-        nz_indices = np.where(weights_final > 0.0)[0]
-        if not nz_indices.any(): logger.warning("No positive weight indices for transformation!"); return None
-
-        for idx in nz_indices:
-            sig_p = a+(k-a)/np.power(1+Q*np.exp(-b*(norm_weights[idx]-M)),1/v)
-            transformed_w[idx] = sig_p + slope*norm_weights[idx]
-        
-        trans_nz = transformed_w[transformed_w > 0]
-        if trans_nz.any(): logger.info(f"Transformed weights: Min={np.min(trans_nz):.4f}, Max={np.max(trans_nz):.4f}, Mean={np.mean(trans_nz):.4f}")
-        else: logger.warning("No positive weights after sigmoid transformation!"); # Continue to rank-based if needed or return None
-
-        if len(trans_nz) > 1 and np.std(trans_nz) < 0.01:
-            logger.warning(f"Transformed weights too uniform (std={np.std(trans_nz):.4f}), switching to rank-based.")
-            sorted_indices = np.argsort(-weights_final); transformed_w = np.zeros_like(weights_final)
-            pos_count = np.sum(weights_final > 0)
-            for i,idx_val in enumerate(sorted_indices[:pos_count]): transformed_w[idx_val] = 1.0/((i+1)**1.2)
-            rank_nz = transformed_w[transformed_w > 0]
-            if rank_nz.any(): logger.info(f"Rank-based: Min={np.min(rank_nz):.4f}, Max={np.max(rank_nz):.4f}, Mean={np.mean(rank_nz):.4f}")
-        
-        final_sum = np.sum(transformed_w); final_weights_list = None
-        if final_sum > 0:
-            transformed_w /= final_sum
-            final_nz_vals = transformed_w[transformed_w > 0]
-            if final_nz_vals.any():
-                logger.info(f"Final Norm Weights: Count={len(final_nz_vals)}, Min={np.min(final_nz_vals):.4f}, Max={np.max(final_nz_vals):.4f}, Std={np.std(final_nz_vals):.4f}")
-                if len(np.unique(final_nz_vals)) < len(final_nz_vals)/2 : logger.warning(f"Low unique weights! {len(np.unique(final_nz_vals))}/{len(final_nz_vals)}")
-                if final_nz_vals.max() > 0.90: logger.warning(f"Max weight {final_nz_vals.max():.4f} is very high!")
-            final_weights_list = transformed_w.tolist()
-            logger.info("Final normalized weights calculated.")
-        else: logger.warning("Sum of weights is zero, cannot normalize! Returning None.")
-        return final_weights_list
+        except Exception as calc_error:
+            logger.error(f"Error in sync weight calculation: {calc_error}")
+            return None
 
     async def _calc_task_weights(self):
         """Calculate weights based on recent task scores. Async part fetches data."""
         try:
+            # Log memory before large database operations
+            self._log_memory_usage("calc_weights_start")
+            
             now = datetime.now(timezone.utc)
             one_day_ago = now - timedelta(days=1)
             
@@ -2249,45 +3050,138 @@ class GaiaValidator:
             weather_query = """
             SELECT score, created_at 
             FROM score_table 
-            WHERE task_name = :task_name ORDER BY created_at DESC LIMIT 1
+            WHERE task_name = 'weather' AND created_at >= :start_time ORDER BY created_at DESC LIMIT 50
             """
-            
-            weather_results = await self.database_manager.fetch_all(weather_query, {"task_name": "weather"})
-            logger.info(f"Fetched {len(weather_results)} weather score rows")
-            geomagnetic_results = await self.database_manager.fetch_all(query, {"task_name": "geomagnetic", "start_time": one_day_ago})
-            logger.info(f"Fetched {len(geomagnetic_results)} geomagnetic score rows")
-            soil_results = await self.database_manager.fetch_all(query, {"task_name": "soil_moisture", "start_time": one_day_ago})
-            logger.info(f"Fetched {len(soil_results)} soil moisture score rows")
-            
-            if not weather_results and not geomagnetic_results and not soil_results:
-                logger.info("No scores found in DB - returning zero weights (no scores to base weights on)")
-                # Return zero weights array instead of equal weights
-                weights_arr = np.zeros(256)
-                logger.info("Initialized zero weights for all nodes (no scoring data available)")
-                return weights_arr.tolist()
+            geomagnetic_query = """
+            SELECT score, created_at 
+            FROM score_table 
+            WHERE task_name = 'geomagnetic' AND created_at >= :start_time ORDER BY created_at DESC LIMIT 50
+            """
+            soil_query = """
+            SELECT score, created_at 
+            FROM score_table 
+            WHERE task_name LIKE 'soil_moisture_region_%' AND created_at >= :start_time ORDER BY created_at DESC LIMIT 200
+            """
 
-            active_nodes_list_sync = []
+            # Query node table for validator nodes with chunking to manage memory
+            validator_nodes_query = """
+            SELECT uid, hotkey, ip, port, incentive 
+            FROM node_table 
+            WHERE uid IS NOT NULL 
+            ORDER BY uid
+            """
+
+            params = {"start_time": one_day_ago}
+            
+            # Fetch all data concurrently using regular async approach
             try:
-                # Ensure this is a synchronous call if get_nodes_for_netuid can be blocking.
-                # For now, assuming it's relatively quick or primarily I/O bound with Substrate.
-                active_nodes_list_from_chain = get_nodes_for_netuid(self.substrate, self.metagraph.netuid)
-                if active_nodes_list_from_chain is None: active_nodes_list_from_chain = []
-                active_nodes_list_sync = active_nodes_list_from_chain # Use this list for the sync method
-            except Exception as e_fetch_nodes:
-                logger.error(f"Failed to fetch nodes for weight calc: {e_fetch_nodes}", exc_info=True)
-                # active_nodes_list_sync remains empty, sync function should handle this
-            
-            validator_nodes_by_uid_list_sync = [None] * 256
-            for node in active_nodes_list_sync:
-                if node.node_id < 256:
-                    validator_nodes_by_uid_list_sync[node.node_id] = node
-            
-            return await asyncio.to_thread(
-                self._perform_weight_calculations_sync,
-                weather_results, geomagnetic_results, soil_results, now, validator_nodes_by_uid_list_sync
-            )
+                self._log_memory_usage("calc_weights_before_db_fetch")
+                weather_results, geomagnetic_results, soil_results, validator_nodes_list = await asyncio.gather(
+                    self.database_manager.fetch_all(weather_query, params),
+                    self.database_manager.fetch_all(geomagnetic_query, params),
+                    self.database_manager.fetch_all(soil_query, params),
+                    self.database_manager.fetch_all(validator_nodes_query),
+                    return_exceptions=True
+                )
+                self._log_memory_usage("calc_weights_after_db_fetch")
+                
+                # Log individual dataset sizes
+                if weather_results and not isinstance(weather_results, Exception):
+                    logger.info(f"Weather dataset: {len(weather_results)} records")
+                if geomagnetic_results and not isinstance(geomagnetic_results, Exception):
+                    logger.info(f"Geomagnetic dataset: {len(geomagnetic_results)} records")
+                if soil_results and not isinstance(soil_results, Exception):
+                    logger.info(f"Soil dataset: {len(soil_results)} records")
+                    # Check soil record size (they contain large score arrays)
+                    if soil_results:
+                        sample_soil = soil_results[0]
+                        if 'score' in sample_soil and isinstance(sample_soil['score'], list):
+                            logger.info(f"Soil score array size per record: {len(sample_soil['score'])} elements")
+                if validator_nodes_list and not isinstance(validator_nodes_list, Exception):
+                    logger.info(f"Validator nodes dataset: {len(validator_nodes_list)} records")
+                
+                # Check for exceptions in results
+                for i, result in enumerate([weather_results, geomagnetic_results, soil_results, validator_nodes_list]):
+                    if isinstance(result, Exception):
+                        task_names = ['weather', 'geomagnetic', 'soil', 'validator_nodes']
+                        logger.error(f"Error fetching {task_names[i]} data: {result}")
+                        return None
+                
+                # Log memory after database queries
+                self._log_memory_usage("calc_weights_after_db_queries")
+
+                # Defensive fallbacks for failed queries
+                if not weather_results:
+                    weather_results = []
+                if not geomagnetic_results:
+                    geomagnetic_results = []
+                if not soil_results:
+                    soil_results = []
+                if not validator_nodes_list:
+                    logger.error("Failed to fetch validator nodes - cannot calculate weights")
+                    return None
+
+                logger.info(f"Fetched scores: Weather={len(weather_results)}, Geo={len(geomagnetic_results)}, Soil={len(soil_results)}")
+                
+                # Convert to list for the sync calculation
+                self._log_memory_usage("calc_weights_before_node_conversion")
+                validator_nodes_by_uid_list = [None] * 256
+                for node_dict in validator_nodes_list:
+                    uid = node_dict.get('uid')
+                    if uid is not None and 0 <= uid < 256:
+                        validator_nodes_by_uid_list[uid] = node_dict
+                self._log_memory_usage("calc_weights_after_node_conversion")
+
+                # Perform CPU-bound weight calculation in thread pool to avoid blocking
+                self._log_memory_usage("calc_weights_before_sync_calc")
+                loop = asyncio.get_event_loop()
+                final_weights_list = await loop.run_in_executor(
+                    None,
+                    self._perform_weight_calculations_sync,
+                    weather_results,
+                    geomagnetic_results,
+                    soil_results,
+                    now,
+                    validator_nodes_by_uid_list
+                )
+                self._log_memory_usage("calc_weights_after_sync_calc")
+
+                # Aggressive memory cleanup after weight calculation
+                try:
+                    # Clear all large data structures
+                    del weather_results
+                    del geomagnetic_results
+                    del soil_results
+                    del validator_nodes_list
+                    del validator_nodes_by_uid_list
+                    
+                    # Force comprehensive cleanup for weight calculation (if fully initialized)
+                    if (hasattr(self, 'substrate_manager') and 
+                        self.substrate_manager is not None and
+                        hasattr(self, 'last_metagraph_sync')):
+                        memory_freed = self._comprehensive_memory_cleanup("weight_calculation")
+                    else:
+                        # Fallback to basic cleanup during startup
+                        import gc
+                        collected = gc.collect()
+                        logger.info(f"Basic GC cleanup during startup: collected {collected} objects")
+                        memory_freed = 0
+                    
+                    # Log memory after cleanup
+                    self._log_memory_usage("calc_weights_after_cleanup")
+                    
+                except Exception as cleanup_err:
+                    logger.warning(f"Error during weight calculation cleanup: {cleanup_err}")
+
+                return final_weights_list
+
+            except Exception as query_error:
+                logger.error(f"Error during database queries for weight calculation: {query_error}")
+                return None
+
         except Exception as e:
-            logger.error(f"Error in _calc_task_weights (async part): {e}", exc_info=True)
+            logger.error(f"Error calculating task weights: {e}")
+            logger.error(traceback.format_exc())
             return None
 
     async def update_last_weights_block(self):
@@ -2301,21 +3195,26 @@ class GaiaValidator:
 
     async def manage_earthdata_token(self):
         """Periodically checks and refreshes the Earthdata token."""
+        logger.info("🌍 Earthdata token management task started - running initial check immediately...")
+        
         while not self._shutdown_event.is_set():
             try:
-                logger.info("Running Earthdata token check...")
+                logger.info("🔍 Running Earthdata token check...")
                 token = await ensure_valid_earthdata_token()
                 if token:
-                    logger.info(f"Earthdata token check successful. Current token (first 10 chars): {token[:10]}...")
+                    logger.info(f"✅ Earthdata token check successful. Current token (first 10 chars): {token[:10]}...")
                 else:
-                    logger.warning("Earthdata token check failed or no token available.")
+                    logger.warning("⚠️ Earthdata token check failed or no token available.")
 
+                logger.info("⏰ Earthdata token check complete. Sleeping for 24 hours until next check...")
                 await asyncio.sleep(86400) # Check daily
 
             except asyncio.CancelledError:
-                logger.info("Earthdata token management task cancelled.")
+                logger.info("🛑 Earthdata token management task cancelled.")
+                break
             except Exception as e:
-                logger.error(f"Error in Earthdata token management task: {e}", exc_info=True)
+                logger.error(f"❌ Error in Earthdata token management task: {e}", exc_info=True)
+                logger.info("🔄 Retrying Earthdata token check in 1 hour due to error...")
                 await asyncio.sleep(3600) # Retry in an hour if there was an error
 
     async def _initialize_db_sync_components(self):
@@ -2324,101 +3223,79 @@ class GaiaValidator:
         db_sync_enabled_str = os.getenv("DB_SYNC_ENABLED", "True") # Default to True if not set
         if db_sync_enabled_str.lower() != "true":
             logger.info("DB_SYNC_ENABLED is not 'true'. Database synchronization feature will be disabled.")
-            self.azure_blob_manager_for_sync = None
-            self.backup_manager = None
-            self.restore_manager = None
+            self.auto_sync_manager = None
             return
 
-        self.azure_blob_manager_for_sync = await get_azure_blob_manager_for_db_sync()
-        if not self.azure_blob_manager_for_sync:
-            logger.error("Failed to initialize AzureBlobManager for DB Sync. DB Sync will be disabled.")
-            return
-
-        if self.is_source_validator_for_db_sync:
-            logger.info("This node is configured as the SOURCE for DB Sync.")
-            self.backup_manager = await get_backup_manager(self.azure_blob_manager_for_sync)
-            if not self.backup_manager:
-                logger.error("Failed to initialize BackupManager. DB Sync (source) will be disabled.")
-        else:
-            logger.info("This node is configured as a REPLICA for DB Sync.")
-            self.restore_manager = await get_restore_manager(self.azure_blob_manager_for_sync)
-            if not self.restore_manager:
-                logger.error("Failed to initialize RestoreManager. DB Sync (replica) will be disabled.")
-        logger.info("DB Sync components initialization attempt finished.")
+        # Initialize AutoSyncManager (streamlined sync system using pgBackRest + R2)
+        try:
+            logger.info("Initializing AutoSyncManager (streamlined sync system)...")
+            self.auto_sync_manager = await get_auto_sync_manager(test_mode=self.args.test)
+            if self.auto_sync_manager:
+                logger.info("✅ AutoSyncManager initialized successfully")
+                logger.info("🔧 AutoSyncManager provides automated setup and application-controlled scheduling")
+                logger.info("📝 To set up database sync, run: python gaia/validator/sync/setup_auto_sync.py --primary (or --replica)")
+                return
+            else:
+                logger.warning("AutoSyncManager failed to initialize - check environment variables")
+        except Exception as e:
+            logger.warning(f"AutoSyncManager initialization failed: {e}")
+            logger.info("💡 To enable DB sync, configure PGBACKREST_R2_* environment variables")
+            logger.info("   - PGBACKREST_R2_BUCKET")
+            logger.info("   - PGBACKREST_R2_ENDPOINT") 
+            logger.info("   - PGBACKREST_R2_ACCESS_KEY_ID")
+            logger.info("   - PGBACKREST_R2_SECRET_ACCESS_KEY")
+        
+        logger.info("DB Sync initialization completed (not active).")
 
     async def database_monitor(self):
-        """Periodically query and log database statistics."""
+        """Periodically query and log database statistics from a consistent snapshot."""
         logger.info("Starting database monitor task...")
         while not self._shutdown_event.is_set():
             await asyncio.sleep(60) # Check every 60 seconds
 
             current_timestamp_iso = datetime.now(timezone.utc).isoformat()
             collected_stats = {
-                "timestamp": current_timestamp_iso, # Add timestamp at the start
+                "timestamp": current_timestamp_iso,
                 "connection_summary": "[Query Failed or No Data]",
-                "null_state_connection_details": "[Query Failed or No Data for NULL state details]",
-                "idle_in_transaction_details": "[Query Failed or No Data]",
+                "null_state_connection_details": [],
+                "idle_in_transaction_details": [],
                 "lock_details": "[Query Failed or No Data]",
-                "active_query_wait_events": "[Query Failed or No Data]",
-                "session_manager_stats": "[Query Failed or No Data]", # New key for our session stats
+                "active_query_wait_events": [],
+                "session_manager_stats": "[Query Failed or No Data]",
                 "error": None
             }
 
             try:
-                # Fetch general operation/session stats from DatabaseManager
+                # 1. Fetch all pg_stat_activity data at once for a consistent snapshot
+                activity_snapshot = []
+                activity_query = "SELECT pid, usename, application_name, client_addr, backend_start, state, backend_type, query, state_change, query_start, wait_event_type, wait_event FROM pg_stat_activity;"
                 try:
-                    # session_manager_specific_stats = self.database_manager.get_session_stats()
-                    # Corrected call for all stats including session stats:
-                    all_db_manager_stats = self.database_manager.get_session_stats() # Renamed for clarity
-                    collected_stats["session_manager_stats"] = all_db_manager_stats
+                    activity_snapshot = await self.database_manager.fetch_all(activity_query, timeout=45.0)
+                except DatabaseTimeout:
+                    collected_stats["error"] = "Timeout fetching pg_stat_activity snapshot."
+                    logger.warning(f"[DB Monitor] {collected_stats['error']}")
+                except Exception as e:
+                    collected_stats["error"] = f"Error fetching pg_stat_activity snapshot: {type(e).__name__}"
+                    logger.warning(f"[DB Monitor] {collected_stats['error']} - {e}")
 
+                if collected_stats["error"]:
+                    await self._log_and_store_db_stats(collected_stats)
+                    continue
+
+                # 2. Process the snapshot in memory
+                summary, null_state_details, idle_in_transaction_details, active_query_details = self._process_activity_snapshot(activity_snapshot)
+                
+                collected_stats["connection_summary"] = summary
+                collected_stats["null_state_connection_details"] = null_state_details
+                collected_stats["idle_in_transaction_details"] = idle_in_transaction_details
+                collected_stats["active_query_wait_events"] = active_query_details
+
+                # 3. Fetch other stats
+                try:
+                    collected_stats["session_manager_stats"] = self.database_manager.get_session_stats()
                 except Exception as e:
                     collected_stats["session_manager_stats"] = f"[Error fetching session manager stats: {type(e).__name__}]"
-                    logger.warning(f"[DB Monitor] Error fetching session manager stats: {e}")
 
-                # Query overall connection summary
-                conn_summary_query = "SELECT state, count(*) FROM pg_stat_activity GROUP BY state;"
-                try:
-                    collected_stats["connection_summary"] = await self.database_manager.fetch_all(conn_summary_query, timeout=45.0)
-                except DatabaseTimeout:
-                    collected_stats["connection_summary"] = "[Query Timed Out]"
-                    logger.warning("[DB Monitor] Timeout fetching connection summary.")
-                except Exception as e:
-                    collected_stats["connection_summary"] = f"[Query Error: {type(e).__name__}]"
-                    logger.warning(f"[DB Monitor] Error fetching connection summary: {e}")
-
-                # Query details for NULL state connections
-                null_state_query = """
-                SELECT pid, usename, application_name, client_addr, backend_start, state, backend_type, query
-                FROM pg_stat_activity 
-                WHERE state IS NULL;
-                """
-                try:
-                    collected_stats["null_state_connection_details"] = await self.database_manager.fetch_all(null_state_query, timeout=45.0)
-                except DatabaseTimeout:
-                    collected_stats["null_state_connection_details"] = "[Query Timed Out for NULL state details]"
-                    logger.warning("[DB Monitor] Timeout fetching NULL state connection details.")
-                except Exception as e:
-                    collected_stats["null_state_connection_details"] = f"[Query Error for NULL state details: {type(e).__name__}]"
-                    logger.warning(f"[DB Monitor] Error fetching NULL state connection details: {e}")
-                
-                # Query details for 'idle in transaction' connections
-                idle_in_transaction_query = """
-                SELECT pid, usename, application_name, client_addr, backend_start, state_change, query_start, query 
-                FROM pg_stat_activity 
-                WHERE state = 'idle in transaction' 
-                ORDER BY state_change ASC;
-                """
-                try:
-                    collected_stats["idle_in_transaction_details"] = await self.database_manager.fetch_all(idle_in_transaction_query, timeout=45.0)
-                except DatabaseTimeout:
-                    collected_stats["idle_in_transaction_details"] = "[Query Timed Out]"
-                    logger.warning("[DB Monitor] Timeout fetching idle in transaction details.")
-                except Exception as e:
-                    collected_stats["idle_in_transaction_details"] = f"[Query Error: {type(e).__name__}]"
-                    logger.warning(f"[DB Monitor] Error fetching idle in transaction details: {e}")
-
-                # Query for lock contention
                 lock_details_query = """
                 SELECT
                     activity.pid,
@@ -2439,82 +3316,86 @@ class GaiaValidator:
                     collected_stats["lock_details"] = await self.database_manager.fetch_all(lock_details_query, timeout=45.0)
                 except DatabaseTimeout:
                     collected_stats["lock_details"] = "[Query Timed Out]"
-                    logger.warning("[DB Monitor] Timeout fetching lock details.")
                 except Exception as e:
                     collected_stats["lock_details"] = f"[Query Error: {type(e).__name__}]"
-                    logger.warning(f"[DB Monitor] Error fetching lock details: {e}")
-
-                # Query for top active queries by wait events (excluding background workers and idle)
-                active_query_wait_events_query = """
-                SELECT 
-                    pid, 
-                    usename, 
-                    application_name,
-                    query, 
-                    wait_event_type, 
-                    wait_event,
-                    age(now(), query_start) as query_age,
-                    state
-                FROM pg_stat_activity 
-                WHERE state = 'active'
-                  AND backend_type = 'client backend'
-                  AND pid != pg_backend_pid()
-                ORDER BY query_start ASC;
-                """
-                try:
-                    collected_stats["active_query_wait_events"] = await self.database_manager.fetch_all(active_query_wait_events_query, timeout=45.0)
-                except DatabaseTimeout:
-                    collected_stats["active_query_wait_events"] = "[Query Timed Out]"
-                    logger.warning("[DB Monitor] Timeout fetching active query wait events.")
-                except Exception as e:
-                    collected_stats["active_query_wait_events"] = f"[Query Error: {type(e).__name__}]"
-                    logger.warning(f"[DB Monitor] Error fetching active query wait events: {e}")
 
             except Exception as e_outer:
                 collected_stats["error"] = f"Outer error in database_monitor: {str(e_outer)}"
-                logger.error(f"[DB Monitor] Outer error: {e_outer}")
-                logger.error(traceback.format_exc())
-            
-            # Store collected stats
-            async with self.db_monitor_history_lock:
-                self.db_monitor_history.append(collected_stats)
-                if len(self.db_monitor_history) > self.DB_MONITOR_HISTORY_MAX_SIZE:
-                    self.db_monitor_history.pop(0) # Remove the oldest entry
+                logger.error(f"[DB Monitor] Outer error: {e_outer}", exc_info=True)
 
-            # Log all collected stats
-            log_output = "[DB Monitor] Stats:\n"
-            for key, value in collected_stats.items():
-                if key == "error" and value is None: 
-                    continue
-                try:
-                    # Pretty print if it's a list of dicts (likely query results)
-                    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
-                        log_output += f"  {key.replace('_', ' ').title()}:\n"
-                        if not value: # Empty list
-                             log_output += "  []\n"
-                        else:
-                            for item_dict in value:
-                                log_output += "  {\n"
-                                for k_item, v_item in item_dict.items():
-                                    if isinstance(v_item, datetime):
-                                        v_item_str = v_item.isoformat()
-                                    else:
-                                        v_item_str = str(v_item)
-                                    log_output += f"    {k_item}: {v_item_str}\n"
-                                log_output += "  }\n"
-                            if len(value) > 1 : log_output += "  ...\n" # Indicate if more items not shown in detail for brevity if needed
-                        if isinstance(value, list) and len(value) > 0 and not all(isinstance(item, dict) for item in value): # list of non-dicts
-                             log_output += f"  {json.dumps(value, indent=2, default=str)}\n"
-                    elif isinstance(value, str) and (value.startswith("[Query Timed Out") or value.startswith("[Query Error") or value.startswith("[Query Failed")):
-                        log_output += f"  {key.replace('_', ' ').title()}: {value}\n"
-
-                    else: # For simple values or non-list-of-dict structures
-                        log_output += f"  {key.replace('_', ' ').title()}: {json.dumps(value, indent=2, default=str)}\n"
-                except Exception as e_log:
-                    log_output += f"  Error formatting log for {key}: {e_log}\n"
-            
-            logger.info(log_output)
+            await self._log_and_store_db_stats(collected_stats)
             gc.collect()
+
+    def _process_activity_snapshot(self, activity_snapshot):
+        summary = {}
+        null_state_details = []
+        idle_in_transaction_details = []
+        active_query_details = []
+        
+        # Note: To perfectly exclude the monitor's own query, another query for its pid would be needed.
+        # This implementation omits that for simplicity, so the monitor's query may appear in active queries.
+        
+        for row_proxy in activity_snapshot:
+            row = dict(row_proxy)
+            state = row.get('state')
+            summary[state] = summary.get(state, 0) + 1
+
+            if state is None:
+                null_state_details.append(row)
+            elif state == 'idle in transaction':
+                idle_in_transaction_details.append(row)
+            elif state == 'active' and row.get('backend_type') == 'client backend':
+                if row.get('query_start'):
+                    row['query_age'] = datetime.now(timezone.utc) - row.get('query_start')
+                else:
+                    row['query_age'] = timedelta(0)
+                active_query_details.append(row)
+
+        idle_in_transaction_details.sort(key=lambda r: r.get('state_change') or datetime.min.replace(tzinfo=timezone.utc))
+        active_query_details.sort(key=lambda r: r.get('query_start') or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        
+        summary_list = [{"state": s if s is not None else "null", "count": c} for s, c in summary.items()]
+        
+        return summary_list, null_state_details, idle_in_transaction_details, active_query_details
+
+    async def _log_and_store_db_stats(self, collected_stats: dict):
+        """Helper to store stats in history and log them."""
+        async with self.db_monitor_history_lock:
+            self.db_monitor_history.append(collected_stats)
+            if len(self.db_monitor_history) > self.DB_MONITOR_HISTORY_MAX_SIZE:
+                self.db_monitor_history.pop(0)
+
+        log_output = "[DB Monitor] Stats:\n"
+        for key, value in collected_stats.items():
+            if key == "error" and value is None:
+                continue
+            try:
+                title = key.replace('_', ' ').title()
+                if isinstance(value, list):
+                    log_output += f"  {title}:\n"
+                    if not value:
+                        log_output += "  []\n"
+                    else:
+                        # Show up to 5 entries before truncating for brevity
+                        for i, item in enumerate(value[:5]):
+                            item_dict = dict(item)
+                            log_output += "  {\n"
+                            for k, v in item_dict.items():
+                                v_str = str(v)
+                                if isinstance(v, datetime):
+                                    v_str = v.isoformat()
+                                elif isinstance(v, timedelta):
+                                    v_str = str(v)
+                                log_output += f"    {k}: {v_str}\n"
+                            log_output += "  }\n"
+                        if len(value) > 5:
+                            log_output += f"  ... and {len(value) - 5} more ...\n"
+                else:
+                    log_output += f"  {title}: {json.dumps(value, indent=2, default=str)}\n"
+            except Exception as e_log:
+                log_output += f"  Error formatting log for {key}: {e_log}\n"
+        
+        logger.info(log_output)
 
     def _generate_and_save_plot_sync(self, history_copy):
         """Synchronous helper to generate and save database metrics plots."""
@@ -2663,30 +3544,362 @@ class GaiaValidator:
                             connections = pool._connections
                             total_connections = len(connections)
                             
+                            # Count different connection states
+                            keepalive_connections = 0
+                            idle_connections = 0
+                            active_connections = 0
+                            unique_hosts = set()
+                            
                             # Handle both list and dict cases for _connections
                             if hasattr(connections, 'values'):  # It's a dict-like object
-                                keepalive_connections = sum(1 for conn in connections.values() 
-                                                          if hasattr(conn, '_keepalive_expiry') and conn._keepalive_expiry)
+                                connection_items = connections.values()
                             else:  # It's a list-like object
-                                keepalive_connections = sum(1 for conn in connections 
-                                                          if hasattr(conn, '_keepalive_expiry') and conn._keepalive_expiry)
+                                connection_items = connections
+                            
+                            for conn in connection_items:
+                                # Count keepalive connections
+                                if hasattr(conn, '_keepalive_expiry') and conn._keepalive_expiry:
+                                    keepalive_connections += 1
+                                
+                                # Count idle connections
+                                if hasattr(conn, 'is_idle') and callable(conn.is_idle):
+                                    try:
+                                        if conn.is_idle():
+                                            idle_connections += 1
+                                        else:
+                                            active_connections += 1
+                                    except Exception:
+                                        pass
+                                
+                                # Track unique hosts
+                                if hasattr(conn, '_origin') and conn._origin:
+                                    unique_hosts.add(str(conn._origin))
+                                elif hasattr(conn, '_socket') and hasattr(conn._socket, 'getpeername'):
+                                    try:
+                                        peer = conn._socket.getpeername()
+                                        unique_hosts.add(f"{peer[0]}:{peer[1]}")
+                                    except Exception:
+                                        pass
                             
                             # Get pool limit - check multiple possible locations
                             pool_limit = "unknown"
-                            if hasattr(self.miner_client, '_limits') and hasattr(self.miner_client._limits, 'max_connections'):
-                                pool_limit = self.miner_client._limits.max_connections
-                            elif hasattr(pool, '_max_connections'):
-                                pool_limit = pool._max_connections
-                            elif hasattr(pool, 'max_connections'):
-                                pool_limit = pool.max_connections
+                            keepalive_limit = "unknown"
+                            if hasattr(self.miner_client, '_limits'):
+                                if hasattr(self.miner_client._limits, 'max_connections'):
+                                    pool_limit = self.miner_client._limits.max_connections
+                                if hasattr(self.miner_client._limits, 'max_keepalive_connections'):
+                                    keepalive_limit = self.miner_client._limits.max_keepalive_connections
                             
-                            logger.debug(f"HTTP Client Pool Health - Total: {total_connections}, "
-                                       f"Keepalive: {keepalive_connections}, "
-                                       f"Pool limit: {pool_limit}")
+                            # Log detailed information - use INFO level when high connection counts detected
+                            log_level = logger.info if total_connections > 75 else logger.debug
+                            log_level(f"HTTP Client Pool Health - "
+                                    f"Total: {total_connections}/{pool_limit}, "
+                                    f"Keepalive: {keepalive_connections}/{keepalive_limit}, "
+                                    f"Idle: {idle_connections}, Active: {active_connections}, "
+                                    f"Unique hosts: {len(unique_hosts)}")
+                            
+                            # If we have excessive connections, log the unique hosts
+                            if total_connections > 80 and unique_hosts:
+                                logger.info(f"Connection pool has {total_connections} connections to {len(unique_hosts)} unique hosts")
+                                if len(unique_hosts) <= 15:  # Only log if manageable number
+                                    logger.debug(f"Connected hosts: {list(unique_hosts)[:15]}")
+                            
+                            # Only trigger cleanup if we have excessive idle connections (not just any idle)
+                            if idle_connections > 30:
+                                logger.info(f"High idle connection count ({idle_connections}), triggering cleanup")
+                                try:
+                                    await self._cleanup_idle_connections()
+                                except Exception as e:
+                                    logger.warning(f"Error during automatic connection cleanup: {e}")
+                            
                 await asyncio.sleep(300)  # Check every 5 minutes
             except Exception as e:
                 logger.debug(f"Error monitoring client health: {e}")
                 await asyncio.sleep(300)
+
+    async def memory_snapshot_taker(self):
+        """Periodically takes memory snapshots and logs differences."""
+        logger.info("Starting memory snapshot taker task...")
+        
+        snapshot_interval_seconds = 300 # 5 minutes
+        logger.info(f"Memory snapshots will be taken every {snapshot_interval_seconds} seconds.")
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(snapshot_interval_seconds)
+                if self._shutdown_event.is_set():
+                    break
+
+                logger.info("--- Taking Tracemalloc Snapshot ---")
+                current_snapshot = tracemalloc.take_snapshot()
+                
+                logger.info("Top 10 current memory allocations (by line number):")
+                for stat in current_snapshot.statistics('lineno')[:10]:
+                    logger.info(f"  {stat}")
+                    # Uncomment for full traceback of top allocations if needed
+                    # logger.info(f"    Traceback for allocation at {stat.traceback[0]}:")
+                    # for line in stat.traceback.format():
+                    #    logger.info(f"      {line}")
+
+                if self.tracemalloc_snapshot1:
+                    logger.info("Comparing to previous snapshot...")
+                    top_stats = current_snapshot.compare_to(self.tracemalloc_snapshot1, 'lineno')
+                    logger.info("Top 10 memory differences since last snapshot:")
+                    for stat in top_stats[:10]:
+                        logger.info(f"  {stat}")
+                        # Uncomment for full traceback of significant differences
+                        # logger.info(f"    Traceback for diff at {stat.traceback[0]}:")
+                        # for line in stat.traceback.format():
+                        #    logger.info(f"      {line}")
+                
+                self.tracemalloc_snapshot1 = current_snapshot
+                logger.info("--- Tracemalloc Snapshot Processed ---")
+
+            except asyncio.CancelledError:
+                logger.info("Memory snapshot taker task cancelled.")
+                break
+            except Exception as e:
+                logger.error(f"Error in memory_snapshot_taker: {e}", exc_info=True)
+                await asyncio.sleep(60) # Wait a bit before retrying if an error occurs
+
+    async def periodic_substrate_cleanup(self):
+        """Periodically force substrate connection cleanup to prevent memory leaks."""
+        while True:
+            try:
+                await asyncio.sleep(300)  # Run every 5 minutes (more frequent cleanup)
+                
+                if hasattr(self, 'substrate_manager') and self.substrate_manager:
+                    try:
+                        stats_before = self.substrate_manager.get_stats()
+                        logger.debug(f"Substrate cleanup - Before: queries={stats_before['query_count']}, age={stats_before['connection_age']:.1f}s")
+                        
+                        # Force cleanup if query count is high or connection is old  
+                        if stats_before['query_count'] > 150 or stats_before['connection_age'] > 400:  # 6.7 minutes
+                            logger.info("Forcing substrate connection refresh due to high usage/age")
+                            self.substrate = self.substrate_manager.force_reconnect()
+                            
+                        # Always force garbage collection
+                        self.substrate_manager._force_garbage_collection()
+                        
+                        stats_after = self.substrate_manager.get_stats()
+                        logger.debug(f"Substrate cleanup - After: queries={stats_after['query_count']}, age={stats_after['connection_age']:.1f}s")
+                        
+                    except Exception as e:
+                        logger.debug(f"Error during periodic substrate cleanup: {e}")
+                
+            except asyncio.CancelledError:
+                logger.info("Periodic substrate cleanup task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in periodic substrate cleanup: {e}")
+                await asyncio.sleep(60)  # Shorter retry on error
+
+    async def aggressive_memory_cleanup(self):
+        """Aggressive memory cleanup to prevent memory leaks."""
+        while True:
+            try:
+                await asyncio.sleep(120)  # Run every 2 minutes
+                
+                # Get memory before cleanup
+                if PSUTIL_AVAILABLE:
+                    process = psutil.Process()
+                    memory_before = process.memory_info().rss / (1024 * 1024)
+                    
+                    # Perform garbage collection
+                    import gc
+                    collected = gc.collect()
+                    
+                    # Clear any module-level caches if available
+                    try:
+                        # Clear httpx connection pools more aggressively
+                        if hasattr(self, 'miner_client') and self.miner_client and not self.miner_client.is_closed:
+                            # Force close idle connections
+                            await self._cleanup_idle_connections()
+                        
+                        # Clear any fsspec caches
+                        try:
+                            import fsspec
+                            if hasattr(fsspec, 'config') and hasattr(fsspec.config, 'conf'):
+                                fsspec.config.conf.clear()
+                            if hasattr(fsspec, 'filesystem') and hasattr(fsspec.filesystem, '_cache'):
+                                fsspec.filesystem._cache.clear()
+                        except ImportError:
+                            pass
+                        
+                        # Clear any xarray caches
+                        try:
+                            import xarray as xr
+                            if hasattr(xr, 'backends') and hasattr(xr.backends, 'list_engines'):
+                                # Force cleanup of any xarray backend caches
+                                pass
+                        except ImportError:
+                            pass
+                            
+                    except Exception as cache_clear_error:
+                        logger.debug(f"Error clearing caches: {cache_clear_error}")
+                    
+                    # Get memory after cleanup
+                    memory_after = process.memory_info().rss / (1024 * 1024)
+                    memory_freed = memory_before - memory_after
+                    
+                    # Use comprehensive cleanup instead of just GC for better results (if fully initialized)
+                    if (hasattr(self, 'substrate_manager') and 
+                        self.substrate_manager is not None and
+                        hasattr(self, 'last_metagraph_sync')):
+                        comp_memory_freed = self._comprehensive_memory_cleanup("periodic_aggressive")
+                    else:
+                        comp_memory_freed = 0  # Skip during startup
+                    
+                    if collected > 50 or comp_memory_freed > 10:
+                        logger.info(f"Memory cleanup: GC collected {collected} objects, comprehensive freed {comp_memory_freed:.1f}MB")
+                    else:
+                        logger.debug(f"Memory cleanup: GC collected {collected} objects, comprehensive freed {comp_memory_freed:.1f}MB")
+                        
+            except asyncio.CancelledError:
+                logger.info("Aggressive memory cleanup task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in aggressive memory cleanup: {e}")
+                await asyncio.sleep(30)  # Shorter retry on error
+
+    def _comprehensive_memory_cleanup(self, context: str = "general"):
+        """
+        Comprehensive memory cleanup that goes beyond standard garbage collection.
+        Targets C extension memory, file handles, module caches, and other persistent references.
+        Made more conservative to avoid interfering with running tasks.
+        """
+        
+        # Skip cleanup during early startup to prevent initialization issues
+        if not hasattr(self, 'substrate_manager') or self.substrate_manager is None:
+            logger.debug(f"Skipping comprehensive cleanup for {context} - validator not fully initialized")
+            return 0
+            
+        logger.info(f"Starting comprehensive memory cleanup for context: {context}")
+        try:
+            initial_memory = self._get_memory_usage()
+        except Exception:
+            # Fallback if memory monitoring isn't available yet
+            initial_memory = 0
+        
+        try:
+            # 1. Clear exception tracebacks (major memory holder)
+            import sys
+            sys.last_traceback = None
+            sys.last_type = None 
+            sys.last_value = None
+            
+            # 2. Clear module-level caches that accumulate over time (more conservative)
+            try:
+                # Only clear specific known-safe cache attributes
+                for module_name in list(sys.modules.keys()):
+                    if any(pattern in module_name.lower() for pattern in 
+                           ['substrate', 'scalecodec', 'scale_info', 'metadata']):
+                        module = sys.modules.get(module_name)
+                        if hasattr(module, '__dict__'):
+                            # Only clear known safe cache attributes, avoid _registry which might be critical
+                            for attr_name in list(module.__dict__.keys()):
+                                if attr_name in ['_cache', '__pycache__', '_instance_cache']:
+                                    try:
+                                        cache_obj = getattr(module, attr_name)
+                                        if hasattr(cache_obj, 'clear') and isinstance(cache_obj, dict):
+                                            cache_obj.clear()
+                                    except Exception:
+                                        pass
+            except Exception as e:
+                logger.debug(f"Error clearing module caches: {e}")
+            
+            # 3. Clear numpy/xarray memory more aggressively
+            try:
+                import numpy as np
+                # Force numpy to release cached memory
+                if hasattr(np, '_get_ndarray_cache'):
+                    np._get_ndarray_cache().clear()
+                    
+                # Clear any xarray caches
+                try:
+                    import xarray as xr
+                    if hasattr(xr.backends, 'plugins') and hasattr(xr.backends.plugins, 'clear'):
+                        xr.backends.plugins.clear()
+                except ImportError:
+                    pass
+            except Exception as e:
+                logger.debug(f"Error clearing numpy/xarray caches: {e}")
+            
+            # 4. Clear HTTP client caches (only if they exist)
+            try:
+                if hasattr(self, 'miner_http_client') and getattr(self, 'miner_http_client', None):
+                    # Clear any response caches
+                    if hasattr(self.miner_http_client, '_transport'):
+                        transport = self.miner_http_client._transport
+                        if hasattr(transport, '_pool'):
+                            transport._pool.clear()
+                            
+                if hasattr(self, 'validator_http_client') and getattr(self, 'validator_http_client', None):
+                    if hasattr(self.validator_http_client, '_transport'):
+                        transport = self.validator_http_client._transport
+                        if hasattr(transport, '_pool'):
+                            transport._pool.clear()
+            except Exception as e:
+                logger.debug(f"Error clearing HTTP client caches: {e}")
+            
+            # 5. Clear database connection pool caches (only if fully initialized)
+            try:
+                if hasattr(self, 'database_manager') and getattr(self, 'database_manager', None):
+                    # Force database manager to clear any cached connections/results
+                    if hasattr(self.database_manager, 'pool') and getattr(self.database_manager, 'pool', None):
+                        # Clear any cached query results or metadata
+                        pool = self.database_manager.pool
+                        if hasattr(pool, '_queue') and hasattr(pool._queue, 'empty'):
+                            # Clear connection pool queue
+                            try:
+                                while not pool._queue.empty():
+                                    conn = pool._queue.get_nowait()
+                                    if hasattr(conn, 'invalidate'):
+                                        conn.invalidate()
+                            except:
+                                pass  # Queue might be empty or connection pool not ready
+            except Exception as e:
+                logger.debug(f"Error clearing database caches: {e}")
+            
+            # 6. REMOVED: Asyncio task references cleanup - too dangerous while tasks are running
+            # This was likely causing the task cancellations
+            
+            # 7. Force multiple garbage collection passes with different strategies
+            import gc
+            collected_total = 0
+            
+            # First pass: standard collection
+            collected = gc.collect()
+            collected_total += collected
+            
+            # Second pass: collect generation 0 (youngest objects)
+            collected = gc.collect(0)
+            collected_total += collected
+            
+            # Third pass: collect all generations
+            for generation in range(3):
+                collected = gc.collect(generation)
+                collected_total += collected
+            
+            # 8. REMOVED: Aggressive object cleanup - too dangerous while tasks are running
+            # The gc.get_objects() iteration could close objects still in use by active tasks
+            
+            try:
+                final_memory = self._get_memory_usage()
+                memory_freed = initial_memory - final_memory
+            except Exception:
+                # Fallback if memory monitoring fails
+                final_memory = 0
+                memory_freed = 0
+            
+            logger.info(f"Comprehensive cleanup for {context}: "
+                       f"freed {memory_freed:.1f}MB, collected {collected_total} objects")
+            
+            return memory_freed
+            
+        except Exception as e:
+            logger.error(f"Error during comprehensive memory cleanup: {e}")
+            return 0
 
 
 if __name__ == "__main__":
@@ -2709,96 +3922,119 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # --- Alembic check code for Validator ---
-    # No need to set DB_TARGET since we have separate configurations now
-    logger.info(f"[Startup] Using validator-specific Alembic configuration")
+    # --- Database Setup Note ---
+    # Database installation, configuration, and Alembic migrations are now handled
+    # by the comprehensive database setup system below
+    logger.info("Starting comprehensive database setup and validator application...")
+    # --- End Database Setup Note ---
 
-    try:
-        print("[Startup] Checking database schema version using Alembic...")
-        # Construct path relative to this script file to find alembic_validator.ini at project root
-        # Assumes validator.py is in project_root/gaia/validator/validator.py
-        current_script_dir_val = os.path.dirname(os.path.abspath(__file__))
-        project_root_val = os.path.abspath(os.path.join(current_script_dir_val, "..", ".."))
-        alembic_ini_path_val = os.path.join(project_root_val, "alembic_validator.ini")
-
-        if not os.path.exists(alembic_ini_path_val):
-            print(f"[Startup] ERROR: alembic_validator.ini not found at expected path: {alembic_ini_path_val}")
-            sys.exit("Alembic validator configuration not found.")
-
-        alembic_cfg_val = Config(alembic_ini_path_val)
-        print(f"[Startup] Validator: Using Alembic configuration from: {alembic_ini_path_val}")
-
-        # Diagnostic block for validator
+    # --- Comprehensive Database Setup ---
+    async def run_comprehensive_database_setup():
         try:
-            from alembic.script import ScriptDirectory
-            script_dir_instance_val = ScriptDirectory.from_config(alembic_cfg_val)
-            print(f"[Startup] Validator DIAGNOSTIC: ScriptDirectory main path: {script_dir_instance_val.dir}")
-            print(f"[Startup] Validator DIAGNOSTIC: ScriptDirectory version_locations: {script_dir_instance_val.version_locations}")
-        except Exception as e_diag_val:
-            print(f"[Startup] Validator DIAGNOSTIC: Error: {e_diag_val}")
+            logger.info("🚀 Starting comprehensive database setup and validation...")
+            print("\n" + "🔧" * 80)
+            print("🔧 COMPREHENSIVE DATABASE SETUP STARTING 🔧")
+            print("🔧" * 80)
+            
+            # Import the comprehensive database setup
+            from gaia.validator.database.comprehensive_db_setup import setup_comprehensive_database, DatabaseConfig
+            
+            # Create database configuration from environment variables
+            db_config = DatabaseConfig(
+                database_name=os.getenv("DB_NAME", "gaia_validator"),
+                postgres_version=os.getenv("POSTGRES_VERSION", "14"),
+                postgres_password=os.getenv("DB_PASSWORD", "postgres"),
+                postgres_user=os.getenv("DB_USER", "postgres"),
+                port=int(os.getenv("DB_PORT", "5432")),
+                data_directory=os.getenv("POSTGRES_DATA_DIR", "/var/lib/postgresql/14/main"),
+                config_directory=os.getenv("POSTGRES_CONFIG_DIR", "/etc/postgresql/14/main")
+            )
+            
+            logger.info(f"Database configuration: {db_config.database_name} on port {db_config.port}")
+            
+            # Run comprehensive database setup
+            setup_success = await setup_comprehensive_database(
+                test_mode=args.test,
+                config=db_config
+            )
+            
+            if not setup_success:
+                logger.error("❌ Comprehensive database setup failed - validator cannot start safely")
+                print("❌ DATABASE SETUP FAILED - EXITING ❌")
+                sys.exit(1)
+            
+            logger.info("✅ Comprehensive database setup completed successfully")
+            print("✅ DATABASE SETUP COMPLETED - STARTING VALIDATOR ✅")
+            print("🔧" * 80 + "\n")
+            
+        except Exception as e:
+            logger.error(f"❌ Critical error in comprehensive database setup: {e}", exc_info=True)
+            print(f"❌ CRITICAL DATABASE ERROR: {e} ❌")
+            sys.exit(1)
+    
+    # Run the comprehensive database setup
+    asyncio.run(run_comprehensive_database_setup())
+    # --- End Comprehensive Database Setup ---
 
-        alembic_auto_upgrade_val = os.getenv("ALEMBIC_AUTO_UPGRADE", "True").lower() in ["true", "1", "yes"]
-        if alembic_auto_upgrade_val:
-            print(f"[Startup] Validator: ALEMBIC_AUTO_UPGRADE is True. Attempting to upgrade to head...")
-            
-            # Construct database URL for Alembic check
-            db_host = os.getenv("DB_HOST", "localhost")
-            db_port = os.getenv("DB_PORT", "5432")
-            db_name = os.getenv("DB_NAME", "validator_db")
-            db_user = os.getenv("DB_USER", "postgres")
-            db_password = os.getenv("DB_PASSWORD", "postgres")
-            db_url = f"postgresql+asyncpg://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-            
-            # Safety check: Verify no data-destructive migrations are pending
-            try:
-                from alembic.script import ScriptDirectory
-                from alembic.runtime.migration import MigrationContext
-                
-                script_dir = ScriptDirectory.from_config(alembic_cfg_val)
-                
-                # Check current revision
-                with create_engine(db_url, poolclass=pool.NullPool).connect() as conn:
-                    context = MigrationContext.configure(conn)
-                    current_rev = context.get_current_revision()
-                    
-                print(f"[Startup] Current database revision: {current_rev}")
-                print(f"[Startup] Target revision: head")
-                
-                # Get pending migrations
-                if current_rev:
-                    pending_revisions = script_dir.get_revisions(current_rev, "head")
-                    if pending_revisions:
-                        print(f"[Startup] Found {len(pending_revisions)} pending migration(s)")
-                        for rev in pending_revisions:
-                            print(f"[Startup] Pending: {rev.revision} - {rev.doc}")
-                    else:
-                        print("[Startup] No pending migrations - database is up to date")
-                        
-            except Exception as e:
-                print(f"[Startup] Warning: Could not check migration status: {e}")
-            
-            command.upgrade(alembic_cfg_val, "head")
-            print("[Startup] Validator: Database schema is up-to-date (or upgrade attempted).")
+    # --- Ensure requirements are up to date on every restart ---
+    try:
+        import subprocess
+        import sys
+        
+        logger.info("Ensuring Python requirements are up to date...")
+        print("[STARTUP DEBUG] Installing/updating requirements from requirements.txt...")
+        
+        # Construct path to requirements.txt relative to this script
+        current_script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(current_script_dir, "..", ".."))
+        requirements_path = os.path.join(project_root, "requirements.txt")
+        
+        if not os.path.exists(requirements_path):
+            logger.warning(f"requirements.txt not found at {requirements_path}, skipping pip install")
+            print(f"[STARTUP DEBUG] Warning: requirements.txt not found at {requirements_path}")
         else:
-            print("[Startup] Validator: ALEMBIC_AUTO_UPGRADE is False. Skipping auto schema upgrade.")
+            # Run pip install with timeout to prevent hanging
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", requirements_path],
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 minute timeout
+                cwd=project_root
+            )
+            
+            if result.returncode == 0:
+                logger.info("Successfully updated Python requirements")
+                print("[STARTUP DEBUG] Python requirements updated successfully")
+                if result.stdout:
+                    logger.debug(f"Pip install output: {result.stdout}")
+            else:
+                logger.warning(f"Pip install returned non-zero exit code {result.returncode}")
+                print(f"[STARTUP DEBUG] Warning: pip install failed with exit code {result.returncode}")
+                if result.stderr:
+                    logger.warning(f"Pip install stderr: {result.stderr}")
+                    print(f"[STARTUP DEBUG] Pip error output: {result.stderr}")
+                    
+    except subprocess.TimeoutExpired:
+        logger.warning("Pip install timed out after 5 minutes, continuing with startup")
+        print("[STARTUP DEBUG] Warning: pip install timed out, continuing with startup")
+    except Exception as e:
+        logger.warning(f"Error during pip install: {e}, continuing with startup")
+        print(f"[STARTUP DEBUG] Warning: Error during pip install: {e}")
+    # --- End requirements update ---
 
-    except CommandError as e_val:
-         print(f"[Startup] Validator: ERROR: Alembic command failed: {e_val}")
-    except Exception as e_val_outer: # Catch other potential errors like path issues
-        print(f"[Startup] Validator: ERROR during Alembic setup: {e_val_outer}", exc_info=True)
-
-    logger.info("Validator Alembic check complete. Starting main validator application...")
-    # --- End Alembic check code for Validator ---
-
+    print("[STARTUP DEBUG] Creating GaiaValidator instance")
     validator = GaiaValidator(args)
     try:
+        print("[STARTUP DEBUG] Starting validator.main()")
         asyncio.run(validator.main())
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received, shutting down...")
+        print("[STARTUP DEBUG] Keyboard interrupt received")
     except Exception as e:
         logger.critical(f"Unhandled exception in main loop: {e}", exc_info=True)
+        print(f"[STARTUP DEBUG] Unhandled exception: {e}")
     finally:
-
+        print("[STARTUP DEBUG] Entering finally block")
         if hasattr(validator, '_cleanup_done') and not validator._cleanup_done:
              try:
                  loop = asyncio.get_event_loop()
@@ -2808,3 +4044,5 @@ if __name__ == "__main__":
                  loop.run_until_complete(validator._initiate_shutdown())
              except Exception as cleanup_e:
                  logger.error(f"Error during final cleanup: {cleanup_e}")
+                 print(f"[STARTUP DEBUG] Error during final cleanup: {cleanup_e}")
+        print("[STARTUP DEBUG] Startup sequence completed")

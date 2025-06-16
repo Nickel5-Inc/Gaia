@@ -30,6 +30,7 @@ import ipaddress
 from typing import Optional
 import warnings
 from contextlib import asynccontextmanager # Add this import
+import time
 
 # Imports for Alembic check
 from alembic.config import Config # Add Alembic import
@@ -94,6 +95,11 @@ class Miner:
         self.weather_inference_service_url: Optional[str] = None # Added for inference service URL
         self.weather_task = None # Will be initialized in lifespan
         self.weather_runpod_api_key = None
+        
+        # Memory monitoring for the entire miner process
+        self.memory_monitor_task = None
+        self.memory_monitor_enabled = os.getenv('MINER_MEMORY_MONITORING_ENABLED', 'true').lower() in ['true', '1', 'yes']
+        self.pm2_restart_enabled = os.getenv('MINER_PM2_RESTART_ENABLED', 'true').lower() in ['true', '1', 'yes']
 
         # Load environment variables
         load_dotenv(".env")
@@ -152,17 +158,64 @@ class Miner:
             node_type="miner"
         )
         
+        # --- Initialize WeatherTask in __init__ ---
+        self.weather_inference_service_url = None # Will be determined here
+        self.weather_runpod_api_key = None      # Will be determined here
+        self.weather_task = None                # Initialize to None
+
         weather_enabled_env_val = os.getenv("WEATHER_MINER_ENABLED", "false")
         weather_enabled = weather_enabled_env_val.lower() in ["true", "1", "yes"]
         
+        # Corrected logging for WEATHER_MINER_ENABLED
+        weather_enabled_env_val_for_log = os.getenv("WEATHER_MINER_ENABLED")
+        logger.info(f"DEBUG_WEATHER_ENABLED in __init__: Value from os.getenv: '{weather_enabled_env_val_for_log}', Evaluated to: {weather_enabled}")
+
+        
         self.weather_inference_service_url = os.getenv("WEATHER_INFERENCE_SERVICE_URL")
-        runpod_api_key_from_env = os.getenv("CREDENTIAL")
+        runpod_api_key_from_env = os.getenv("INFERENCE_SERVICE_API_KEY")
         if runpod_api_key_from_env:
             self.weather_runpod_api_key = runpod_api_key_from_env
-            logger.info(f"RunPod API Key loaded from CREDENTIAL env var in __init__.")
+            logger.info("RunPod API Key loaded from INFERENCE_SERVICE_API_KEY env var in __init__.")
+        else:
+            runpod_api_key_from_env = os.getenv("WEATHER_RUNPOD_API_KEY")
+            if runpod_api_key_from_env:
+                self.weather_runpod_api_key = runpod_api_key_from_env
+                logger.info("RunPod API Key loaded from WEATHER_RUNPOD_API_KEY env var in __init__.")
+            else:
+                logger.info("No RunPod API Key found (checked INFERENCE_SERVICE_API_KEY, WEATHER_RUNPOD_API_KEY) in __init__.")
 
         if weather_enabled:
-            logger.info("Weather task ENABLED by WEATHER_MINER_ENABLED. Initializing in __init__.")
+            logger.info("Weather task IS ENABLED based on WEATHER_MINER_ENABLED in __init__.")
+            
+            weather_inference_type = os.getenv("WEATHER_INFERENCE_TYPE", "local_model").lower()
+            service_url_env = os.getenv("WEATHER_INFERENCE_SERVICE_URL")
+
+            if weather_inference_type == "http_service":
+                if not service_url_env:
+                    logger.error("WEATHER_INFERENCE_TYPE is 'http_service' but WEATHER_INFERENCE_SERVICE_URL is not set. Weather task cannot use inference service.")
+                    # self.weather_task remains None
+                else:
+                    self.weather_inference_service_url = service_url_env
+                    logger.info(f"HTTP inference service configured in __init__. URL: {self.weather_inference_service_url}")
+                    
+                    runpod_api_key_from_env = os.getenv("INFERENCE_SERVICE_API_KEY")
+                    if runpod_api_key_from_env:
+                        self.weather_runpod_api_key = runpod_api_key_from_env
+                        logger.info("RunPod API Key loaded from INFERENCE_SERVICE_API_KEY env var in __init__.")
+                    else:
+                        runpod_api_key_from_env = os.getenv("WEATHER_RUNPOD_API_KEY")
+                        if runpod_api_key_from_env:
+                            self.weather_runpod_api_key = runpod_api_key_from_env
+                            logger.info("RunPod API Key loaded from WEATHER_RUNPOD_API_KEY env var in __init__.")
+                        else:
+                            logger.info("No RunPod API Key found (checked INFERENCE_SERVICE_API_KEY, WEATHER_RUNPOD_API_KEY) in __init__.")
+            
+            elif weather_inference_type == "local_model":
+                logger.info(f"Weather inference type is '{weather_inference_type}' in __init__. WeatherTask will use internal model logic.")
+            else:
+                logger.warning(f"Unhandled WEATHER_INFERENCE_TYPE: '{weather_inference_type}' in __init__.")
+
+            # Now, instantiate WeatherTask if it's still considered viable
             weather_task_args = {
                 "db_manager": self.database_manager,
                 "node_type": "miner",
@@ -171,11 +224,35 @@ class Miner:
             if self.weather_runpod_api_key:
                 weather_task_args["runpod_api_key"] = self.weather_runpod_api_key
             
-            self.weather_task = WeatherTask(**weather_task_args)
-            logger.info("WeatherTask basic initialization completed in __init__.")
+            # Load R2 configuration from environment variables
+            r2_config = {}
+            r2_endpoint_url = os.getenv("R2_ENDPOINT_URL")
+            r2_access_key_id = os.getenv("R2_ACCESS_KEY")
+            r2_secret_access_key = os.getenv("R2_SECRET_ACCESS_KEY")
+            r2_bucket_name = os.getenv("R2_BUCKET")
+            
+            if all([r2_endpoint_url, r2_access_key_id, r2_secret_access_key, r2_bucket_name]):
+                r2_config = {
+                    "r2_endpoint_url": r2_endpoint_url,
+                    "r2_access_key_id": r2_access_key_id,
+                    "r2_secret_access_key": r2_secret_access_key,
+                    "r2_bucket_name": r2_bucket_name
+                }
+                weather_task_args["r2_config"] = r2_config
+                self.logger.info("Loaded complete R2 configuration from environment variables during startup.")
+            else:
+                self.logger.warning("Incomplete R2 configuration found during startup. WeatherTask will proceed without R2 upload capabilities.")
+            
+            try:
+                self.weather_task = WeatherTask(**weather_task_args)
+                logger.info("WeatherTask INSTANTIATED in Miner.__init__.")
+            except Exception as e_wt_init:
+                logger.error(f"Failed to instantiate WeatherTask in Miner.__init__: {e_wt_init}", exc_info=True)
+                self.weather_task = None # Ensure it's None on failure
         else:
-            logger.info("Weather task DISABLED by WEATHER_MINER_ENABLED. self.weather_task remains None.")
-            self.weather_task = None
+            logger.info("Weather task IS DISABLED based on WEATHER_MINER_ENABLED in __init__. self.weather_task is None.")
+            self.weather_task = None # Explicitly None
+        # --- End WeatherTask Initialization in __init__ ---
     
 
     def setup_neuron(self) -> bool:
@@ -194,19 +271,22 @@ class Miner:
             config.chain_endpoint = self.subtensor_chain_endpoint
             self.config = config
             
-            if self.weather_task is not None:
+            if self.weather_task is not None: # Check if weather_task was initialized
                 if hasattr(self.weather_task, 'config') and self.weather_task.config is not None:
                     self.weather_task.config['netuid'] = self.netuid
                     self.weather_task.config['chain_endpoint'] = self.subtensor_chain_endpoint
                     if 'miner_public_base_url' not in self.weather_task.config:
-                         self.weather_task.config['miner_public_base_url'] = None
+                         self.weather_task.config['miner_public_base_url'] = None # Will be set by self-check if possible
+                    self.weather_task.keypair = self.keypair
+                    logger.info("Miner.setup_neuron: Applied neuron config to existing WeatherTask.")
                 else:
                     self.weather_task.config = {
                         'netuid': self.netuid,
                         'chain_endpoint': self.subtensor_chain_endpoint,
-                        'miner_public_base_url': None
+                        'miner_public_base_url': None # Will be set by self-check if possible
                     }
-                self.weather_task.keypair = self.keypair
+                    self.weather_task.keypair = self.keypair
+                    logger.info("Miner.setup_neuron: WeatherTask is None, skipping neuron config for it.")
 
             self.logger.debug(
                 f"""
@@ -267,7 +347,7 @@ class Miner:
                                 self.weather_task.config['miner_public_base_url'] = self.my_public_base_url
                                 self.logger.info(f"MINER_SELF_CHECK: Updated WeatherTask config with miner_public_base_url: {self.my_public_base_url}")
                             else:
-                                self.logger.warning("MINER_SELF_CHECK: WeatherTask.config not found or is None, cannot set miner_public_base_url.")
+                                self.logger.info("MINER_SELF_CHECK: WeatherTask is None or WeatherTask.config is None, cannot set miner_public_base_url for it.") # Modified log
 
                     except ValueError as e_ip_conv:
                         self.logger.error(f"MINER_SELF_CHECK: Could not convert/validate IP '{ip_to_convert}' to standard string: {e_ip_conv}. Public URL not set.")
@@ -300,6 +380,10 @@ class Miner:
                 self.logger.info(f"Miner public base URL for Kerchunk determined as: {self.my_public_base_url}")
             else:
                 self.logger.warning("Miner public base URL could not be determined. Kerchunk JSONs may use relative paths.")
+
+            # Start memory monitoring in a background thread
+            self.logger.info("🔍 Starting miner memory monitoring in background...")
+            self._start_memory_monitoring_thread()
 
             self.logger.info("Starting miner server...")
             
@@ -345,6 +429,8 @@ class Miner:
                     self.logger.error(f"Failed to initialize database during startup: {e_db}", exc_info=True)
                     # Depending on severity, you might want to sys.exit(1) here
                 
+
+                
                 # Weather Inference Service Setup
                 weather_enabled_env_val = os.getenv("WEATHER_MINER_ENABLED", "false") 
                 self.logger.info(f"DEBUG_WEATHER_ENABLED: Value of WEATHER_MINER_ENABLED from os.getenv: '{weather_enabled_env_val}'")
@@ -361,7 +447,11 @@ class Miner:
                         }
                         if self.weather_runpod_api_key:
                             weather_task_args["runpod_api_key"] = self.weather_runpod_api_key
-                        self.weather_task = WeatherTask(**weather_task_args)
+                        try:
+                            self.weather_task = WeatherTask(**weather_task_args)
+                        except Exception as e:
+                            self.logger.error(f"Failed to instantiate WeatherTask: {e}", exc_info=True)
+                            self.weather_task = None
 
                     if self.weather_task:
                         weather_inference_type = os.getenv("WEATHER_INFERENCE_TYPE", "local_model").lower()
@@ -401,6 +491,13 @@ class Miner:
                                 }
                             self.weather_task.keypair = self.keypair
                             self.logger.info("WeatherTask re-configured with neuron details during startup.")
+                            
+                            # Start background workers for the WeatherTask
+                            try:
+                                await self.weather_task.start_background_workers()
+                                self.logger.info("Started WeatherTask background workers for re-initialized WeatherTask.")
+                            except Exception as worker_err:
+                                self.logger.error(f"Failed to start WeatherTask background workers for re-initialized task: {worker_err}", exc_info=True)
                         else:
                             self.logger.warning("Miner self.config not found during startup, WeatherTask config might be incomplete.")
                     else:
@@ -410,10 +507,45 @@ class Miner:
 
                 yield
                 self.logger.info("Application shutting down...")
+                # Stop memory monitoring on shutdown
+                await self.stop_memory_monitoring()
             
             
 
             app.body_limit = MAX_REQUEST_SIZE
+
+            # Add rate limiting middleware to prevent request spam
+            from collections import defaultdict
+            import time
+            
+            # Simple in-memory rate limiter
+            request_counts = defaultdict(list)
+            
+            @app.middleware("http")
+            async def rate_limit_middleware(request, call_next):
+                client_ip = request.client.host
+                current_time = time.time()
+                
+                # Clean old requests (older than 1 minute)
+                request_counts[client_ip] = [
+                    req_time for req_time in request_counts[client_ip] 
+                    if current_time - req_time < 60
+                ]
+                
+                # Check rate limit (max 100 requests per minute per IP)
+                max_requests_per_minute = int(os.getenv('MINER_RATE_LIMIT_PER_MINUTE', '100'))
+                if len(request_counts[client_ip]) >= max_requests_per_minute:
+                    self.logger.warning(f"Rate limit exceeded for IP {client_ip}: {len(request_counts[client_ip])} requests in last minute")
+                    return JSONResponse(
+                        status_code=429,
+                        content={"detail": "Rate limit exceeded"}
+                    )
+                
+                # Record this request
+                request_counts[client_ip].append(current_time)
+                
+                response = await call_next(request)
+                return response
 
             app.include_router(factory_router(self))
 
@@ -486,6 +618,307 @@ class Miner:
             self.logger.error(f"Error starting miner: {e}")
             self.logger.error(traceback.format_exc())
             raise e
+
+    def _start_memory_monitoring_thread(self):
+        """Start memory monitoring in a separate thread to avoid event loop issues."""
+        if not self.memory_monitor_enabled:
+            self.logger.info("Miner memory monitoring disabled by configuration")
+            return
+            
+        try:
+            import threading
+            import psutil
+            system_memory = psutil.virtual_memory()
+            self.logger.info(f"System memory: {system_memory.total / (1024**3):.1f} GB total, {system_memory.available / (1024**3):.1f} GB available")
+            
+            # Start monitoring in a daemon thread
+            monitor_thread = threading.Thread(target=self._memory_monitor_sync_loop, daemon=True)
+            monitor_thread.start()
+            self.logger.info("✅ Miner memory monitoring started in background thread")
+        except ImportError:
+            self.logger.warning("psutil not available - memory monitoring disabled")
+            self.memory_monitor_enabled = False
+        except Exception as e:
+            self.logger.error(f"Failed to start miner memory monitoring: {e}")
+
+    def _memory_monitor_sync_loop(self):
+        """Synchronous memory monitoring loop that runs in a separate thread."""
+        try:
+            import psutil
+            import time
+            import gc
+            process = psutil.Process()
+            last_log_time = 0
+            
+            # Configurable thresholds with defaults tuned for miner systems
+            warning_threshold_mb = int(os.getenv('MINER_MEMORY_WARNING_THRESHOLD_MB', '8000'))  # 8GB
+            emergency_threshold_mb = int(os.getenv('MINER_MEMORY_EMERGENCY_THRESHOLD_MB', '12000'))  # 12GB
+            critical_threshold_mb = int(os.getenv('MINER_MEMORY_CRITICAL_THRESHOLD_MB', '14000'))  # 14GB
+            
+            self.logger.info(f"Memory monitoring thresholds: Warning={warning_threshold_mb}MB, Emergency={emergency_threshold_mb}MB, Critical={critical_threshold_mb}MB")
+            self.logger.info(f"PM2 restart enabled: {self.pm2_restart_enabled}")
+            if self.pm2_restart_enabled:
+                pm2_id = os.getenv('pm2_id', 'not detected')
+                self.logger.info(f"PM2 instance ID: {pm2_id}")
+            
+            while True:
+                try:
+                    memory_info = process.memory_info()
+                    memory_mb = memory_info.rss / (1024 * 1024)
+                    
+                    system_memory = psutil.virtual_memory()
+                    system_percent = system_memory.percent
+                    
+                    current_time = time.time()
+                    
+                    # Emergency circuit breakers with pm2 restart capability
+                    if memory_mb > critical_threshold_mb:
+                        self.logger.error(f"💀 CRITICAL MEMORY: {memory_mb:.1f} MB - OOM imminent! (threshold: {critical_threshold_mb} MB)")
+                        self.logger.error("Attempting emergency garbage collection to prevent OOM kill...")
+                        try:
+                            collected = gc.collect()
+                            self.logger.error(f"Emergency GC freed {collected} objects")
+                            time.sleep(2)  # Brief pause after emergency GC
+                            
+                            # Check memory again after GC
+                            post_gc_memory = process.memory_info().rss / (1024 * 1024)
+                            if post_gc_memory > (critical_threshold_mb * 0.9):  # Still >90% of critical
+                                if self.pm2_restart_enabled:
+                                    self.logger.error(f"🔄 TRIGGERING PM2 RESTART: Memory still critical after GC ({post_gc_memory:.1f} MB)")
+                                    self._trigger_pm2_restart_sync("Critical memory pressure after GC")
+                                    return  # Exit the monitoring loop
+                                else:
+                                    self.logger.error(f"💀 MEMORY CRITICAL BUT PM2 RESTART DISABLED: {post_gc_memory:.1f} MB - system may be killed by OOM")
+                            else:
+                                self.logger.info(f"✅ Memory reduced to {post_gc_memory:.1f} MB after GC - continuing")
+                        except Exception as gc_err:
+                            self.logger.error(f"Emergency GC failed: {gc_err}")
+                            # If GC fails, definitely restart (if enabled)
+                            if self.pm2_restart_enabled:
+                                self._trigger_pm2_restart_sync("Emergency GC failed and memory critical")
+                                return
+                            else:
+                                self.logger.error("💀 GC FAILED AND PM2 RESTART DISABLED - system may crash")
+                    elif memory_mb > emergency_threshold_mb:
+                        self.logger.error(f"🚨 EMERGENCY MEMORY PRESSURE: {memory_mb:.1f} MB - OOM risk HIGH! (threshold: {emergency_threshold_mb} MB)")
+                        self.logger.warning("Consider reducing batch sizes or restarting miner to prevent OOM")
+                        # Light GC at emergency level
+                        try:
+                            collected = gc.collect()
+                            if collected > 0:
+                                self.logger.info(f"Emergency light GC collected {collected} objects")
+                        except Exception:
+                            pass
+                    elif memory_mb > warning_threshold_mb:
+                        self.logger.warning(f"🟡 HIGH MEMORY: Miner process using {memory_mb:.1f} MB ({system_percent:.1f}% of system) (threshold: {warning_threshold_mb} MB)")
+                        
+                    # Regular status logging every 5 minutes
+                    if current_time - last_log_time >= 300:  # 5 minutes
+                        self.logger.info(f"Miner memory status: {memory_mb:.1f} MB RSS ({system_percent:.1f}% system memory)")
+                        last_log_time = current_time
+                        
+                except Exception as e:
+                    self.logger.warning(f"Memory monitoring error: {e}")
+                    
+                time.sleep(10)  # Check every 10 seconds
+                
+        except Exception as e:
+            self.logger.error(f"Miner memory monitoring thread error: {e}", exc_info=True)
+
+    def _trigger_pm2_restart_sync(self, reason: str):
+        """Synchronous version of PM2 restart trigger for use in threads."""
+        self.logger.error(f"🔄 TRIGGERING CONTROLLED PM2 RESTART: {reason}")
+        
+        try:
+            # Try graceful shutdown first
+            self.logger.info("Attempting graceful shutdown before restart...")
+            
+            # Force garbage collection one more time
+            import gc
+            collected = gc.collect()
+            self.logger.info(f"Final GC before restart collected {collected} objects")
+            
+            # Check if we're running under pm2
+            pm2_instance_id = os.getenv('pm2_id')
+            if pm2_instance_id:
+                self.logger.info(f"Running under PM2 instance {pm2_instance_id} - triggering restart...")
+                # Use pm2 restart command
+                import subprocess
+                subprocess.Popen(['pm2', 'restart', pm2_instance_id])
+            else:
+                self.logger.warning("Not running under PM2 - triggering system exit")
+                # If not under pm2, exit gracefully
+                import sys
+                sys.exit(1)
+                
+        except Exception as e:
+            self.logger.error(f"Error during controlled restart: {e}")
+            # Last resort - force exit
+            import sys
+            sys.exit(1)
+
+    async def start_memory_monitoring(self):
+        """Start background memory monitoring for the entire miner process."""
+        if not self.memory_monitor_enabled:
+            self.logger.info("Miner memory monitoring disabled by configuration")
+            return
+            
+        self.logger.info("🔍 Starting memory monitoring for miner process...")
+        try:
+            import psutil
+            system_memory = psutil.virtual_memory()
+            self.logger.info(f"System memory: {system_memory.total / (1024**3):.1f} GB total, {system_memory.available / (1024**3):.1f} GB available")
+            
+            self.memory_monitor_task = asyncio.create_task(self._memory_monitor_loop())
+            self.logger.info("✅ Miner memory monitoring started")
+        except ImportError:
+            self.logger.warning("psutil not available - memory monitoring disabled")
+            self.memory_monitor_enabled = False
+        except Exception as e:
+            self.logger.error(f"Failed to start miner memory monitoring: {e}")
+
+    async def _memory_monitor_loop(self):
+        """Background memory monitoring loop for the miner process."""
+        try:
+            import psutil
+            process = psutil.Process()
+            last_log_time = 0
+            
+            # Configurable thresholds with defaults tuned for miner systems
+            warning_threshold_mb = int(os.getenv('MINER_MEMORY_WARNING_THRESHOLD_MB', '8000'))  # 8GB
+            emergency_threshold_mb = int(os.getenv('MINER_MEMORY_EMERGENCY_THRESHOLD_MB', '12000'))  # 12GB
+            critical_threshold_mb = int(os.getenv('MINER_MEMORY_CRITICAL_THRESHOLD_MB', '14000'))  # 14GB
+            
+            self.logger.info(f"Memory monitoring thresholds: Warning={warning_threshold_mb}MB, Emergency={emergency_threshold_mb}MB, Critical={critical_threshold_mb}MB")
+            self.logger.info(f"PM2 restart enabled: {self.pm2_restart_enabled}")
+            if self.pm2_restart_enabled:
+                pm2_id = os.getenv('pm2_id', 'not detected')
+                self.logger.info(f"PM2 instance ID: {pm2_id}")
+            
+            while True:
+                try:
+                    memory_info = process.memory_info()
+                    memory_mb = memory_info.rss / (1024 * 1024)
+                    
+                    system_memory = psutil.virtual_memory()
+                    system_percent = system_memory.percent
+                    
+                    current_time = time.time()
+                    
+                    # Emergency circuit breakers with pm2 restart capability
+                    if memory_mb > critical_threshold_mb:
+                        self.logger.error(f"💀 CRITICAL MEMORY: {memory_mb:.1f} MB - OOM imminent! (threshold: {critical_threshold_mb} MB)")
+                        self.logger.error("Attempting emergency garbage collection to prevent OOM kill...")
+                        try:
+                            import gc
+                            collected = gc.collect()
+                            self.logger.error(f"Emergency GC freed {collected} objects")
+                            await asyncio.sleep(2)  # Brief pause after emergency GC
+                            
+                            # Check memory again after GC
+                            post_gc_memory = process.memory_info().rss / (1024 * 1024)
+                            if post_gc_memory > (critical_threshold_mb * 0.9):  # Still >90% of critical
+                                if self.pm2_restart_enabled:
+                                    self.logger.error(f"🔄 TRIGGERING PM2 RESTART: Memory still critical after GC ({post_gc_memory:.1f} MB)")
+                                    await self._trigger_pm2_restart("Critical memory pressure after GC")
+                                    return  # Exit the monitoring loop
+                                else:
+                                    self.logger.error(f"💀 MEMORY CRITICAL BUT PM2 RESTART DISABLED: {post_gc_memory:.1f} MB - system may be killed by OOM")
+                            else:
+                                self.logger.info(f"✅ Memory reduced to {post_gc_memory:.1f} MB after GC - continuing")
+                        except Exception as gc_err:
+                            self.logger.error(f"Emergency GC failed: {gc_err}")
+                            # If GC fails, definitely restart (if enabled)
+                            if self.pm2_restart_enabled:
+                                await self._trigger_pm2_restart("Emergency GC failed and memory critical")
+                                return
+                            else:
+                                self.logger.error("💀 GC FAILED AND PM2 RESTART DISABLED - system may crash")
+                    elif memory_mb > emergency_threshold_mb:
+                        self.logger.error(f"🚨 EMERGENCY MEMORY PRESSURE: {memory_mb:.1f} MB - OOM risk HIGH! (threshold: {emergency_threshold_mb} MB)")
+                        self.logger.warning("Consider reducing batch sizes or restarting miner to prevent OOM")
+                        # Light GC at emergency level
+                        try:
+                            import gc
+                            collected = gc.collect()
+                            if collected > 0:
+                                self.logger.info(f"Emergency light GC collected {collected} objects")
+                        except Exception:
+                            pass
+                    elif memory_mb > warning_threshold_mb:
+                        self.logger.warning(f"🟡 HIGH MEMORY: Miner process using {memory_mb:.1f} MB ({system_percent:.1f}% of system) (threshold: {warning_threshold_mb} MB)")
+                        
+                    # Regular status logging every 5 minutes
+                    if current_time - last_log_time >= 300:  # 5 minutes
+                        self.logger.info(f"Miner memory status: {memory_mb:.1f} MB RSS ({system_percent:.1f}% system memory)")
+                        last_log_time = current_time
+                        
+                except Exception as e:
+                    self.logger.warning(f"Memory monitoring error: {e}")
+                    
+                await asyncio.sleep(10)  # Check every 10 seconds
+                
+        except asyncio.CancelledError:
+            self.logger.info("Miner memory monitoring stopped")
+        except Exception as e:
+            self.logger.error(f"Miner memory monitoring loop error: {e}", exc_info=True)
+
+    async def _trigger_pm2_restart(self, reason: str):
+        """Trigger a controlled pm2 restart instead of letting OOM killer take over."""
+        if not self.pm2_restart_enabled:
+            self.logger.error(f"🚨 PM2 restart disabled - would restart for: {reason}")
+            return
+            
+        self.logger.error(f"🔄 TRIGGERING CONTROLLED PM2 RESTART: {reason}")
+        
+        try:
+            # Try graceful shutdown first
+            self.logger.info("Attempting graceful shutdown before restart...")
+            
+            # Stop any ongoing weather tasks
+            if hasattr(self, 'weather_task') and self.weather_task:
+                try:
+                    await self.weather_task.cleanup_resources()
+                    self.logger.info("Weather task cleanup completed")
+                except Exception as e:
+                    self.logger.warning(f"Error during weather task cleanup: {e}")
+            
+            # Force garbage collection one more time
+            import gc
+            collected = gc.collect()
+            self.logger.info(f"Final GC before restart collected {collected} objects")
+            
+            # Check if we're running under pm2
+            pm2_instance_id = os.getenv('pm2_id')
+            if pm2_instance_id:
+                self.logger.info(f"Running under PM2 instance {pm2_instance_id} - triggering restart...")
+                # Use pm2 restart command
+                import subprocess
+                subprocess.Popen(['pm2', 'restart', pm2_instance_id])
+            else:
+                self.logger.warning("Not running under PM2 - triggering system exit")
+                # If not under pm2, exit gracefully
+                import sys
+                sys.exit(1)
+                
+        except Exception as e:
+            self.logger.error(f"Error during controlled restart: {e}")
+            # Last resort - force exit
+            import sys
+            sys.exit(1)
+
+    async def stop_memory_monitoring(self):
+        """Stop memory monitoring gracefully."""
+        if self.memory_monitor_task and not self.memory_monitor_task.done():
+            self.logger.info("Stopping miner memory monitoring...")
+            self.memory_monitor_task.cancel()
+            try:
+                await self.memory_monitor_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                self.logger.warning(f"Error stopping memory monitor: {e}")
+            self.logger.info("Miner memory monitoring stopped")
 
 
 if __name__ == "__main__":

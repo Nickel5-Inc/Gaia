@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field, validator, ConfigDict, root_validator, mo
 from gaia.tasks.base.components.outputs import Outputs
 from gaia.tasks.base.decorators import handle_validation_error
 from fiber.logging_utils import get_logger
+from enum import Enum
+
 logger = get_logger(__name__)
 
 """
@@ -20,6 +22,34 @@ PRESSURE_LEVELS = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 10
 GRID_DIMENSIONS = (721, 1440) # 721x1440 grid (lat x lon)
 LAT_RANGE = (90.0, -90.0)  # Latitudes must be decreasing from 90 to -90
 LON_RANGE = (0.0, 360.0)  # Longitudes must be 0 to 360 (not including 360)
+
+class WeatherTaskStatus(str, Enum):
+    """Standardized status values for Weather Task responses"""
+    # Initiate Fetch Response Statuses
+    FETCH_ACCEPTED = "fetch_accepted"
+    FETCH_REJECTED = "fetch_rejected"
+    
+    # Input Status Response Statuses  
+    FETCH_QUEUED = "fetch_queued"
+    FETCHING_GFS = "fetching_gfs"
+    HASHING_INPUT = "hashing_input"
+    INPUT_HASHED_AWAITING_VALIDATION = "input_hashed_awaiting_validation"
+    FETCH_ERROR = "fetch_error"
+    
+    # Inference Response Statuses
+    INFERENCE_STARTED = "inference_started"
+    INFERENCE_FAILED = "inference_failed"
+    
+    # Kerchunk/Data Response Statuses
+    COMPLETED = "completed"
+    PROCESSING = "processing"
+    NOT_FOUND = "not_found"
+    ERROR = "error"
+    
+    # General Error Statuses
+    PARSE_ERROR = "parse_error"
+    VALIDATOR_POLL_ERROR = "validator_poll_error" 
+    VALIDATOR_POLL_FAILED = "validator_poll_failed"
 
 class Variable(BaseModel):
     """Base class for variable validation."""
@@ -552,3 +582,23 @@ class WeatherStartInferenceResponse(BaseModel):
      """ Response model for /weather-start-inference """
      status: str = Field(..., description="Status indicator, e.g., 'inference_started', 'error'")
      message: Optional[str] = Field(None, description="Optional message.")
+
+class WeatherProgressUpdate(BaseModel):
+    """Progress update for weather task operations"""
+    operation: str  # e.g., "gfs_download", "era5_download", "inference", "verification"
+    stage: str      # e.g., "downloading", "processing", "caching", "completed"
+    progress: float # 0.0 to 1.0
+    message: str
+    estimated_time_remaining: Optional[int] = None  # seconds
+    bytes_downloaded: Optional[int] = None
+    bytes_total: Optional[int] = None
+    files_completed: Optional[int] = None
+    files_total: Optional[int] = None
+
+class WeatherFileLocation(BaseModel):
+    """Information about where weather files are stored"""
+    file_type: str  # e.g., "gfs_cache", "era5_cache", "forecast", "input_batch"
+    local_path: str
+    size_bytes: Optional[int] = None
+    created_time: Optional[datetime] = None
+    description: str

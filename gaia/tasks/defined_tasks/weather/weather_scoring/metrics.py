@@ -89,6 +89,16 @@ async def calculate_mse_skill_score(
         
         skill_score = 1.0 - (mse_forecast_scalar / mse_reference_scalar)
         logger.info(f"MSE Skill Score: 1.0 - ({mse_forecast_scalar.item():.4f} / {mse_reference_scalar.item():.4f}) = {skill_score.item():.4f}")
+        
+        # Add diagnostic logging to understand negative skill scores
+        if skill_score < -1.0:
+            logger.warning(f"Very negative skill score detected: {skill_score.item():.4f}. "
+                          f"Forecast MSE ({mse_forecast_scalar.item():.4f}) is much higher than reference MSE ({mse_reference_scalar.item():.4f}). "
+                          f"This suggests potential data alignment or processing issues.")
+        elif skill_score < 0:
+            logger.info(f"Negative skill score: {skill_score.item():.4f}. "
+                       f"Forecast is performing worse than reference (forecast MSE: {mse_forecast_scalar.item():.4f}, reference MSE: {mse_reference_scalar.item():.4f})")
+        
         return float(skill_score.item())
     except Exception as e:
         logger.error(f"Error in calculate_mse_skill_score: {e}", exc_info=True)

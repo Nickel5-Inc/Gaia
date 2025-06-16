@@ -17,13 +17,14 @@ logger = get_logger(__name__)
 warnings.filterwarnings('ignore', message='numpy.core.numeric is deprecated', category=DeprecationWarning)
 
 
-def download_static_pickle(download_dir: str = '.', resolution: str = '0.25') -> str:
+def download_static_pickle(download_dir: str = '.', resolution: str = '0.25', force_download: bool = False) -> str:
     """
     Download the static variables pickle file from HuggingFace if not already present.
     
     Args:
         download_dir: Directory to download the file (default: current directory)
         resolution: Resolution of the Aurora model ('0.25' or '0.1')
+        force_download: If True, will re-download the file even if it exists.
         
     Returns:
         str: Path to the static pickle file
@@ -40,6 +41,14 @@ def download_static_pickle(download_dir: str = '.', resolution: str = '0.25') ->
     
     pickle_file = os.path.join(download_dir, f'aurora-{resolution}-static.pickle')
     
+    if os.path.exists(pickle_file) and force_download:
+        logger.info(f"Forcing re-download of static pickle file. Deleting {pickle_file}.")
+        try:
+            os.remove(pickle_file)
+        except OSError as e:
+            logger.error(f"Error deleting existing static file {pickle_file}: {e}")
+            # Decide if we should proceed or fail. For now, we'll proceed to try downloading.
+
     if not os.path.exists(pickle_file):
         logger.info(f"Downloading Aurora static variables pickle for {resolution}° resolution")
         url = static_urls[resolution]
@@ -202,7 +211,8 @@ def create_aurora_batch_from_gfs(
     static_pickle_path: Optional[str] = None,
     resolution: str = '0.25',
     download_dir: str = '.',
-    history_steps: int = 2
+    history_steps: int = 2,
+    force_download_static: bool = False
 ) -> Batch:
     """
     Create an Aurora Batch object from GFS data and static variables.
@@ -213,6 +223,7 @@ def create_aurora_batch_from_gfs(
         resolution: Resolution of the Aurora model ('0.25' or '0.1')
         download_dir: Directory to download static variables if needed
         history_steps: Number of time steps to include for history dimension
+        force_download_static: If True, forces re-download of the static data file.
         
     Returns:
         Batch: An Aurora Batch object ready for input to the model
@@ -224,7 +235,7 @@ def create_aurora_batch_from_gfs(
         raise
     
     if static_pickle_path is None:
-        static_pickle_path = download_static_pickle(download_dir, resolution)
+        static_pickle_path = download_static_pickle(download_dir, resolution, force_download=force_download_static)
     
     static_data = load_static_variables(static_pickle_path)
     

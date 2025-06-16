@@ -28,6 +28,9 @@ def track_operation(operation_type: str):
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         async def wrapper(self: 'ValidatorDatabaseManager', *args, **kwargs) -> T:
+            if self.system_running_event:
+                await self.system_running_event.wait()
+
             query_text_for_log = "N/A"
             if args:
                 if isinstance(args[0], str):
@@ -145,6 +148,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         port: int = 5432,
         user: str = "postgres",
         password: str = "postgres",
+        system_running_event: Optional[asyncio.Event] = None
     ) -> None:
         """Initialize the validator database manager."""
         if not hasattr(self, '_initialized') or not self._initialized:
@@ -172,6 +176,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             self.VALIDATOR_TRANSACTION_TIMEOUT = 300  # 5 minutes
             
             self.node_table = node_table
+            self.system_running_event = system_running_event
             self._initialized = True
 
     async def get_operation_stats(self) -> Dict[str, Any]:
@@ -187,6 +192,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
     async def _initialize_engine(self) -> None:
         """Initialize database engine and session factory. Assumes DB exists."""
+        if self.system_running_event:
+            await self.system_running_event.wait()
         try:
             if not self.db_url:
                 logger.error("Database URL not set during engine initialization.")
@@ -244,6 +251,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
     async def initialize_database(self):
         """Placeholder for any non-schema initialization needed at startup."""
+        if self.system_running_event:
+            await self.system_running_event.wait()
         # This method previously called the DDL creation methods.
         # Now, it assumes the schema exists (created by Alembic).
         # If there are other non-schema setup tasks (e.g., populating

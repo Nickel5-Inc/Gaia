@@ -2,6 +2,7 @@ import asyncio
 import traceback
 import logging
 from typing import Any, Dict, Optional, List
+from pathlib import Path
 
 import torch
 
@@ -11,18 +12,21 @@ import torch
 _AURORA_AVAILABLE = False
 AuroraModelType: Any
 BatchType: Any
+RolloutFuncType: Any
 
 try:
-    from aurora import Aurora as AuroraActual, Batch as BatchActual
+    from aurora import Aurora as AuroraActual, Batch as BatchActual, rollout as RolloutActual
     AuroraModelType = AuroraActual
     BatchType = BatchActual
+    RolloutFuncType = RolloutActual
     _AURORA_AVAILABLE = True
-    logging.info("Successfully imported Aurora and Batch from aurora SDK for type hinting.")
+    logging.info("Successfully imported Aurora, Batch, and rollout from aurora SDK for type hinting.")
 except ImportError:
     AuroraModelType = Any
     BatchType = Any
+    RolloutFuncType = Any
     logging.warning(
-        "Aurora SDK (aurora.py) not found. Using 'Any' for Aurora and Batch types. "
+        "Aurora SDK (aurora.py) not found. Using 'Any' for Aurora, Batch, and rollout types. "
         "Full model loading and type checking for these objects will be bypassed. "
         "Ensure the SDK is available in the environment for full functionality."
     )
@@ -47,12 +51,10 @@ class InferenceModel:
         Loads the Aurora model onto the appropriate device (CPU or GPU)
         based on the provided configuration and system availability.
         """
-        model_repo = self.model_config.get('model_repo', "microsoft/aurora")
-        checkpoint = self.model_config.get('checkpoint', "aurora-0.25-pretrained.ckpt")
-        # use_lora = self.model_config.get('use_lora', False) # Not currently used for pretrained Aurora
+        model_repo_path_or_name = self.model_config.get('model_repo', "microsoft/aurora")
+        checkpoint_filename = self.model_config.get('checkpoint', "aurora-0.25-pretrained.ckpt")
         use_lora = False
 
-        # Determine device from config, defaulting to cuda if available, else cpu
         config_device_str = self.model_config.get('device', 'auto').lower()
         if config_device_str == "cuda":
             if torch.cuda.is_available():
@@ -65,36 +67,62 @@ class InferenceModel:
         else: # 'auto' or invalid value
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        logger.info(f"Initializing InferenceModel. Attempting to use device: {self.device}")
+        logger.info(f"Attempting to load model. Device: {self.device}, Repo/Path: '{model_repo_path_or_name}', Checkpoint file: '{checkpoint_filename}'")
 
         if not _AURORA_AVAILABLE:
-            logger.error(
-                "Aurora SDK is not available. Cannot load the Aurora model. "
-                "Inference functionality will be disabled."
-            )
+            logger.error("Aurora SDK is not available. Cannot load model.")
             self.model = None
             return
 
         try:
-            logger.info(f"Creating Aurora model instance (use_lora={use_lora})...")
-            # Ensure AuroraModelType is the actual class if available
-            self.model = AuroraModelType(use_lora=use_lora) # type: ignore
-            logger.info(f"Loading checkpoint '{checkpoint}' from repository '{model_repo}'...")
-            # The Aurora model internally handles downloading from HuggingFace Hub
-            # or loading from a local path if model_repo is a local directory path.
-            self.model.load_checkpoint(model_repo, checkpoint) # type: ignore
-            self.model.eval() # type: ignore # Set to evaluation mode
-            self.model = self.model.to(self.device) # type: ignore # Move model to the selected device
-            logger.info(f"Aurora model '{checkpoint}' loaded successfully from '{model_repo}' and moved to {self.device}.")
+            potential_local_path = Path(model_repo_path_or_name)
+            
+            # First, instantiate a base model. The specific architecture will be
+            # configured by the checkpoint loading method.
+            self.model = AuroraModelType(use_lora=use_lora)
+            
+            # Scenario 1: Loading from a local directory
+            if potential_local_path.is_dir():
+                logger.info(f"Local path detected: '{potential_local_path}'. Loading model using 'load_checkpoint_local'.")
+                
+                # Construct the full path to the checkpoint file.
+                full_checkpoint_path = potential_local_path / checkpoint_filename
+                if not full_checkpoint_path.exists():
+                    raise FileNotFoundError(f"Local checkpoint file not found at expected path: {full_checkpoint_path}")
+
+                # Use the dedicated method for loading from a local directory, passing the full file path.
+                self.model.load_checkpoint_local(str(full_checkpoint_path)) # type: ignore
+                logger.info("Local checkpoint loaded successfully.")
+
+            # Scenario 2: Loading from Hugging Face Hub
+            else:
+                logger.info(f"Hugging Face repo ID detected: '{model_repo_path_or_name}'. Loading model from Hub.")
+                self.model.load_checkpoint(model_repo_path_or_name, checkpoint_filename) # type: ignore
+                logger.info("Checkpoint loaded successfully from Hub.")
+
+            # Common finalization steps for both scenarios
+            logger.info("Setting model to evaluation mode (model.eval())...")
+            self.model.eval()
+
+            logger.info(f"Moving model to device '{self.device}' (model.to(device))...")
+            self.model = self.model.to(self.device)
+            logger.info("Model moved to device.")
+
+            logger.info(f"Aurora model based on '{model_repo_path_or_name}' loaded, moved to {self.device}, and set to eval mode.")
 
         except FileNotFoundError as fnf_error:
-            logger.error(f"Checkpoint file not found for model {model_repo}/{checkpoint}. Error: {fnf_error}", exc_info=True)
-            logger.error("Please ensure the model_repo and checkpoint are correct in settings.yaml, ")
-            logger.error("or that the checkpoint exists at the specified path if model_repo is a local directory (and copied into the container).")
-            self.model = None # Ensure model is None if loading fails
+            logger.error(f"CRITICAL (FileNotFoundError): {fnf_error}", exc_info=True)
+            self.model = None
+        except RuntimeError as e_rt:
+            logger.error(f"CRITICAL (RuntimeError) during model loading/setup for '{model_repo_path_or_name}/{checkpoint_filename}': {e_rt}", exc_info=True)
+            if "size mismatch" in str(e_rt).lower():
+                logger.error("RuntimeError (size mismatch): This often means the defined model architecture doesn't match the checkpoint's layers/weights, or the checkpoint is corrupt/incomplete.")
+            if self.model is not None:
+                 logger.error(f"Partial model structure (if any): {self.model}")
+            self.model = None
         except Exception as e:
-            logger.error(f"Failed to load Aurora model: {e}", exc_info=True)
-            self.model = None # Ensure model is None if loading fails
+            logger.error(f"CRITICAL (General Exception) failed to load Aurora model '{model_repo_path_or_name}/{checkpoint_filename}': {e}", exc_info=True)
+            self.model = None
 
     async def run_inference(self, input_batch: BatchType, steps: int) -> Optional[List[BatchType]]:
         """
@@ -125,8 +153,8 @@ class InferenceModel:
             """Synchronous part of the inference to be run in a thread."""
             results: List[BatchType] = []
             with torch.inference_mode(): # Essential for performance and correct behavior
-                # torch.rollout is assumed to be available if Aurora is
-                for step_index, pred_batch_device in enumerate(torch.rollout(self.model, batch_on_device, steps=steps)):
+                # The 'rollout' function is part of the aurora library, not torch.
+                for step_index, pred_batch_device in enumerate(RolloutFuncType(self.model, batch_on_device, steps=steps)):
                     logger.debug(f"Prediction for step {step_index+1} (T+{(step_index + 1) * self.model_config.get('forecast_step_hours', 6)}h)")
                     # Move predictions to CPU before storing/returning to avoid GPU memory accumulation
                     # and to make them accessible for CPU-based serialization later.

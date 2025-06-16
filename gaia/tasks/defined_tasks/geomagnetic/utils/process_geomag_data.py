@@ -108,10 +108,13 @@ async def get_latest_geomag_data(include_historical=False):
             timestamp = latest_data_point["timestamp"]
             dst_value = float(latest_data_point["Dst"])
         else:
-            return "N/A", "N/A", None
+            # Return consistent format based on include_historical flag
+            if include_historical:
+                return "N/A", "N/A", None
+            else:
+                return "N/A", "N/A"
 
         # If historical data is requested, filter the DataFrame for the current month
-        historical_data = None
         if include_historical:
             now = datetime.now(timezone.utc)
             start_of_month = now.replace(
@@ -119,8 +122,13 @@ async def get_latest_geomag_data(include_historical=False):
             )
             historical_data = cleaned_df[cleaned_df["timestamp"] >= start_of_month]
             return timestamp, dst_value, historical_data
-        return timestamp, dst_value
+        else:
+            return timestamp, dst_value
     except Exception as e:
         logger.error(f"Error fetching geomagnetic data: {e}")
         logger.error(f"{traceback.format_exc()}")
-        return "N/A", "N/A", None
+        # Return consistent format based on include_historical flag
+        if include_historical:
+            return "N/A", "N/A", None
+        else:
+            return "N/A", "N/A"

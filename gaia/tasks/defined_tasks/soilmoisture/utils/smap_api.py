@@ -19,6 +19,7 @@ import traceback
 load_dotenv()
 EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
 EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
+EARTHDATA_API_KEY = os.getenv("EARTHDATA_API_KEY")  # Add support for API key
 BASE_URL = "https://n5eil01u.ecs.nsidc.org/SMAP/SPL4SMGP.007"
 
 
@@ -70,6 +71,7 @@ def construct_smap_url(datetime_obj, test_mode=False):
 async def download_smap_data(url, output_path):
     """
     Download SMAP data with progress bar and caching (now async)
+    Supports both username/password and API token authentication
     """
     cache_dir = Path("smap_cache")
     cache_dir.mkdir(exist_ok=True)
@@ -82,8 +84,24 @@ async def download_smap_data(url, output_path):
             await loop.run_in_executor(None, shutil.copy, str(cache_file), output_path)
         return True
 
+    # Determine authentication method
+    auth_method = None
+    headers = {}
+    
+    if EARTHDATA_API_KEY:
+        # Use API key authentication (preferred)
+        headers["Authorization"] = f"Bearer {EARTHDATA_API_KEY}"
+        print("Using EARTHDATA API key authentication")
+    elif EARTHDATA_USERNAME and EARTHDATA_PASSWORD:
+        # Fall back to basic auth
+        auth_method = (EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
+        print("Using EARTHDATA username/password authentication")
+    else:
+        print("❌ No EARTHDATA credentials found! Set either EARTHDATA_API_KEY or EARTHDATA_USERNAME/EARTHDATA_PASSWORD")
+        return False
+
     try:
-        async with httpx.AsyncClient(auth=(EARTHDATA_USERNAME, EARTHDATA_PASSWORD), follow_redirects=True, timeout=300.0) as client:
+        async with httpx.AsyncClient(auth=auth_method, headers=headers, follow_redirects=True, timeout=300.0) as client:
             # Get content length first for progress bar
             try:
                 head_response = await client.head(url)
@@ -365,7 +383,7 @@ async def get_smap_data_for_sentinel_bounds(filepath, sentinel_bounds_tuple, sen
         return None
 
 
-def test_smap_download():
+async def test_smap_download():
     """
     Test SMAP download with sample bounds
     """
@@ -381,27 +399,31 @@ def test_smap_download():
     print(f"Date: {test_datetime}")
     print(f"Bounds: {test_bounds}")
     print(f"CRS: {test_crs}")
-    smap_data = get_smap_data(test_datetime, test_bounds, test_crs)
+    test_regions = [{"bounds": test_bounds, "crs": test_crs}]
+    smap_data = await get_smap_data(test_datetime, test_regions)
 
     if smap_data:
+        # Get the first region's data
+        region_data = smap_data["region_0"]
+        
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        im1 = ax1.imshow(smap_data["surface_sm"])
+        im1 = ax1.imshow(region_data["surface_sm"])
         ax1.set_title("Surface Soil Moisture")
         plt.colorbar(im1, ax=ax1)
-        im2 = ax2.imshow(smap_data["rootzone_sm"])
+        im2 = ax2.imshow(region_data["rootzone_sm"])
         ax2.set_title("Root Zone Soil Moisture")
         plt.colorbar(im2, ax=ax2)
         plt.tight_layout()
         plt.show()
 
         print("\nData shapes:")
-        print(f"Surface data shape: {smap_data['surface_sm'].shape}")
+        print(f"Surface data shape: {region_data['surface_sm'].shape}")
         print("\nData ranges:")
         print(
-            f"Surface data range: {np.nanmin(smap_data['surface_sm']):.3f} to {np.nanmax(smap_data['surface_sm']):.3f}"
+            f"Surface data range: {np.nanmin(region_data['surface_sm']):.3f} to {np.nanmax(region_data['surface_sm']):.3f}"
         )
         print(
-            f"Rootzone data range: {np.nanmin(smap_data['rootzone_sm']):.3f} to {np.nanmax(smap_data['rootzone_sm']):.3f}"
+            f"Rootzone data range: {np.nanmin(region_data['rootzone_sm']):.3f} to {np.nanmax(region_data['rootzone_sm']):.3f}"
         )
     else:
         print("Failed to get SMAP data")

@@ -787,18 +787,32 @@ def _get_canonical_bytes(ds_t0: xr.Dataset, ds_t_minus_6: xr.Dataset) -> Optiona
 async def compute_input_data_hash(
     t0_run_time: datetime,
     t_minus_6_run_time: datetime,
-    cache_dir: Path
+    cache_dir: Path,
+    ds_t0_override: Optional[xr.Dataset] = None,
+    ds_t_minus_6_override: Optional[xr.Dataset] = None
 ) -> Optional[str]:
     """
     Computes a canonical hash for GFS input data (T0 and T-6).
+    If ds_t0_override or ds_t_minus_6_override are provided, they are used directly.
     Ensures that the potentially CPU-bound part (_get_canonical_bytes) is run in a thread.
     """
     logger.info(f"Computing input data hash for T0={t0_run_time}, T-6={t_minus_6_run_time}")
     ds_t0 = None
     ds_t_minus_6 = None
     try:
-        ds_t0 = await fetch_gfs_analysis_data([t0_run_time], cache_dir=cache_dir)
-        ds_t_minus_6 = await fetch_gfs_analysis_data([t_minus_6_run_time], cache_dir=cache_dir)
+        if ds_t0_override is not None:
+            logger.info("Using provided ds_t0_override for hash computation.")
+            ds_t0 = ds_t0_override
+        else:
+            logger.info(f"Fetching GFS T0 data ({t0_run_time}) for hash computation.")
+            ds_t0 = await fetch_gfs_analysis_data([t0_run_time], cache_dir=cache_dir)
+
+        if ds_t_minus_6_override is not None:
+            logger.info("Using provided ds_t_minus_6_override for hash computation.")
+            ds_t_minus_6 = ds_t_minus_6_override
+        else:
+            logger.info(f"Fetching GFS T-6 data ({t_minus_6_run_time}) for hash computation.")
+            ds_t_minus_6 = await fetch_gfs_analysis_data([t_minus_6_run_time], cache_dir=cache_dir)
 
         if ds_t0 is None or ds_t_minus_6 is None:
             logger.error("Failed to fetch GFS data for hash computation.")
@@ -821,12 +835,13 @@ async def compute_input_data_hash(
         logger.error(f"Error in compute_input_data_hash: {e}", exc_info=True)
         return None
     finally:
-        if ds_t0 is not None and hasattr(ds_t0, 'close'):
+        # Close datasets only if they were fetched by this function, not if overridden
+        if ds_t0_override is None and ds_t0 is not None and hasattr(ds_t0, 'close'):
             try:
                 ds_t0.close()
             except Exception:
                 pass
-        if ds_t_minus_6 is not None and hasattr(ds_t_minus_6, 'close'):
+        if ds_t_minus_6_override is None and ds_t_minus_6 is not None and hasattr(ds_t_minus_6, 'close'):
             try:
                 ds_t_minus_6.close()
             except Exception:

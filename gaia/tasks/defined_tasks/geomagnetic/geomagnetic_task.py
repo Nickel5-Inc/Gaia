@@ -3,6 +3,7 @@ from typing import Any, Dict, Optional, Union, List
 import uuid
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from gaia.tasks.base.task import Task
+from gaia.tasks.base.deterministic_job_id import DeterministicJobID
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_metadata import (
     GeomagneticMetadata,
 )
@@ -86,6 +87,15 @@ class GeomagneticTask(Task):
     validator: Any = Field(
         default=None, 
         description="Reference to the validator instance"
+    )
+    # New fields for improved retry logic
+    pending_retry_worker_running: bool = Field(
+        default=False,
+        description="Whether the pending retry worker is running"
+    )
+    pending_retry_worker_task: Optional[Any] = Field(
+        default=None,
+        description="Reference to the pending retry worker task"
     )
 
 
@@ -199,60 +209,73 @@ class GeomagneticTask(Task):
             - Query miners for new predictions
             - Score predictions collected during hour N-1
         - Runs in a continuous loop.
+        - Starts a background worker for intelligent retry of pending tasks.
         """
         self.validator = validator
         
-        while True:
-            try:
-                await validator.update_task_status('geomagnetic', 'active')
-                
-                # Step 1: Align to the top of the next hour (or wait 5 min in test mode)
-                current_time = datetime.datetime.now(datetime.timezone.utc)
-                if not self.test_mode:
-                    next_hour = current_time.replace(
-                        minute=0, second=0, microsecond=0
-                    ) + datetime.timedelta(hours=1)
-                    sleep_duration = (next_hour - current_time).total_seconds()
+        # Start the background worker for intelligent retry of pending tasks
+        await self._start_pending_retry_worker(validator)
+        
+        try:
+            while True:
+                try:
+                    await validator.update_task_status('geomagnetic', 'active')
+                    
+                    # Step 1: Align to the top of the next hour (or wait 5 min in test mode)
+                    current_time = datetime.datetime.now(datetime.timezone.utc)
+                    if not self.test_mode:
+                        next_hour = current_time.replace(
+                            minute=0, second=0, microsecond=0
+                        ) + datetime.timedelta(hours=1)
+                        sleep_duration = (next_hour - current_time).total_seconds()
 
-                    logger.info(
-                        f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
+                        logger.info(
+                            f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
+                        )
+                        await validator.update_task_status('geomagnetic', 'idle')
+                        await asyncio.sleep(sleep_duration)
+                    else:
+                        next_hour = current_time
+                        logger.info("Test mode: Running immediately, will sleep for 5 minutes after completion")
+
+                    logger.info("Starting GeomagneticTask execution...")
+
+                    # Step 2: Fetch Latest Geomagnetic Data
+                    await validator.update_task_status('geomagnetic', 'processing', 'data_fetch')
+                    timestamp, dst_value, historical_data = await self._fetch_geomag_data()
+
+                    # Step 3: Query Miners for predictions
+                    await validator.update_task_status('geomagnetic', 'processing', 'miner_query')
+                    await self._query_miners(
+                        validator, timestamp, dst_value, historical_data, next_hour
                     )
+                    logger.info(f"Collected predictions at hour {next_hour}")
+
+                    # Step 4: Score predictions from previous hour
+                    previous_hour = next_hour - datetime.timedelta(hours=1)
+                    await validator.update_task_status('geomagnetic', 'processing', 'scoring')
+                    await self._process_scores(validator, previous_hour)
+                    
                     await validator.update_task_status('geomagnetic', 'idle')
-                    await asyncio.sleep(sleep_duration)
-                else:
-                    next_hour = current_time
-                    logger.info("Test mode: Running immediately, will sleep for 5 minutes after completion")
 
-                logger.info("Starting GeomagneticTask execution...")
+                    # In test mode, sleep for 5 minutes before next iteration
+                    if self.test_mode:
+                        logger.info("Test mode: Sleeping for 5 minutes before next execution")
+                        await asyncio.sleep(300)
+                    else:
+                        # Every 6 hours, run a more comprehensive cleanup of old pending tasks
+                        if next_hour.hour % 6 == 0:
+                            logger.info("Running comprehensive cleanup of old pending tasks")
+                            await self._comprehensive_pending_cleanup(validator)
 
-                # Step 2: Fetch Latest Geomagnetic Data
-                await validator.update_task_status('geomagnetic', 'processing', 'data_fetch')
-                timestamp, dst_value, historical_data = await self._fetch_geomag_data()
-
-                # Step 3: Query Miners for predictions
-                await validator.update_task_status('geomagnetic', 'processing', 'miner_query')
-                await self._query_miners(
-                    validator, timestamp, dst_value, historical_data, next_hour
-                )
-                logger.info(f"Collected predictions at hour {next_hour}")
-
-                # Step 4: Score predictions from previous hour
-                previous_hour = next_hour - datetime.timedelta(hours=1)
-                await validator.update_task_status('geomagnetic', 'processing', 'scoring')
-                await self._process_scores(validator, previous_hour)
-                
-                await validator.update_task_status('geomagnetic', 'idle')
-
-                # In test mode, sleep for 5 minutes before next iteration
-                if self.test_mode:
-                    logger.info("Test mode: Sleeping for 5 minutes before next execution")
-                    await asyncio.sleep(300)
-
-            except Exception as e:
-                logger.error(f"Unexpected error in validator_execute loop: {e}")
-                logger.error(traceback.format_exc())
-                await validator.update_task_status('geomagnetic', 'error')
-                await asyncio.sleep(3600)
+                except Exception as e:
+                    logger.error(f"Unexpected error in validator_execute loop: {e}")
+                    logger.error(traceback.format_exc())
+                    await validator.update_task_status('geomagnetic', 'error')
+                    await asyncio.sleep(3600)
+        finally:
+            # Clean up the background worker when exiting
+            await self._stop_pending_retry_worker()
 
     async def _fetch_geomag_data(self):
         """Fetch latest geomagnetic data."""
@@ -360,13 +383,17 @@ class GeomagneticTask(Task):
             all_processed = all(task.get("status") == "scored" for task in tasks)
             if all_processed:
                 logger.info(f"All tasks already scored for hour {query_hour.isoformat()}")
-                # Return empty list since we don't need to score anything
                 return [], current_time
 
-            # Get ground truth data
-            ground_truth_value = await self.fetch_ground_truth()
+            # Check if ground truth is likely available before attempting to fetch
+            if not await self._check_ground_truth_availability(query_hour):
+                logger.info(f"Ground truth not yet available for hour {query_hour.isoformat()}, tasks will remain pending")
+                return [], current_time
+
+            # Get ground truth data with improved retry logic
+            ground_truth_value = await self._fetch_ground_truth_for_time(query_hour, max_attempts=3)
             if ground_truth_value is None:
-                logger.warning("Could not fetch ground truth value, skipping scoring")
+                logger.warning(f"Could not fetch ground truth value after retries, tasks will remain pending for hour {query_hour.isoformat()}")
                 return [], current_time
 
             logger.info(f"Ground truth value: {ground_truth_value}")
@@ -459,6 +486,9 @@ class GeomagneticTask(Task):
                 await self.build_score_row(query_hour, scored_tasks)
             else:
                 logger.info("No tasks were scored, skipping score row creation")
+
+            # Try to retry older pending tasks now that we have ground truth
+            await self._retry_pending_tasks(validator, current_time)
 
             return scored_tasks, current_time
 
@@ -560,31 +590,8 @@ class GeomagneticTask(Task):
         Returns:
             int: The real-time DST value, or None if fetching fails.
         """
-        try:
-            # Get the current UTC time
-            current_time = datetime.datetime.now(datetime.timezone.utc)
-            
-            if self.test_mode:
-                logger.info(f"TEST MODE: Fetching ground truth for current UTC hour: {current_time.hour}")
-            else:
-                logger.info(f"Fetching ground truth for UTC hour: {current_time.hour}")
-
-            # Fetch the most recent geomagnetic data
-            timestamp, dst_value = await get_latest_geomag_data(
-                include_historical=False
-            )
-
-            if timestamp == "N/A" or dst_value == "N/A":
-                logger.warning("No ground truth data available for the current hour.")
-                return None
-
-            logger.info(f"Ground truth value for hour {current_time.hour}: {dst_value}")
-            return dst_value
-
-        except Exception as e:
-            logger.error(f"Error fetching ground truth: {e}")
-            logger.error(f"{traceback.format_exc()}")
-            return None
+        # Use the retry version for consistency
+        return await self._fetch_ground_truth_with_retry()
 
     async def move_task_to_history(
         self, task: dict, ground_truth_value: float, score: float, score_time: datetime
@@ -808,6 +815,8 @@ class GeomagneticTask(Task):
         """
         try:
             # Prepare parameters
+            # NOTE: Using random UUID for prediction record ID (database primary key)
+            # Task IDs elsewhere use deterministic timestamp-based IDs
             params = {
                 "id": str(uuid.uuid4()),
                 "miner_uid": miner_uid,
@@ -1078,11 +1087,14 @@ class GeomagneticTask(Task):
                 "status": "completed",
             }
 
-            # WRITE operation - use execute for inserting score
+            # WRITE operation - use execute for upserting score (handles duplicates)
             await self.db_manager.execute(
                 """
                 INSERT INTO score_table (task_name, task_id, score, status)
                 VALUES (:task_name, :task_id, :score, :status)
+                ON CONFLICT (task_name, task_id) DO UPDATE SET
+                    score = EXCLUDED.score,
+                    status = EXCLUDED.status
                 """,
                 score_row
             )
@@ -1158,6 +1170,7 @@ class GeomagneticTask(Task):
                 AND query_time <= :current_time
                 AND miner_uid = ANY(:uids)
                 ORDER BY query_time ASC
+                LIMIT 10000
                 """,
                 {
                     "history_window": history_window,
@@ -1170,6 +1183,10 @@ class GeomagneticTask(Task):
                 logger.warning(f"No historical data found for UIDs {uids} in window {history_window} to {current_time}")
                 return
 
+            # Log if we fetched a large dataset
+            if len(history_results) > 1000:
+                logger.warning(f"Large geomagnetic history dataset: {len(history_results)} records for UIDs {uids}")
+
             # Get current miner mappings
             miner_mappings = await self.db_manager.fetch_all(
                 """
@@ -1180,15 +1197,43 @@ class GeomagneticTask(Task):
             )
             hotkey_to_uid: Dict[str, int] = {row["hotkey"]: row["uid"] for row in miner_mappings}
 
-            # Group records by hour
+            # Group records by hour with memory-efficient processing
             hourly_records: Dict[datetime.datetime, List[Dict[str, Any]]] = {}
-            for record in history_results:
-                hour_key = record["query_time"].replace(
-                    minute=0, second=0, microsecond=0
-                )
-                if hour_key not in hourly_records:
-                    hourly_records[hour_key] = []
-                hourly_records[hour_key].append(record)
+            processed_count = 0
+            
+            try:
+                for record in history_results:
+                    hour_key = record["query_time"].replace(
+                        minute=0, second=0, microsecond=0
+                    )
+                    if hour_key not in hourly_records:
+                        hourly_records[hour_key] = []
+                    hourly_records[hour_key].append(record)
+                    processed_count += 1
+                    
+                    # Yield control periodically for large datasets
+                    if processed_count % 1000 == 0:
+                        await asyncio.sleep(0)
+
+                # Clear the large results list to free memory
+                del history_results
+                del miner_mappings
+                
+                # Force garbage collection for large datasets
+                if processed_count > 1000:
+                    import gc
+                    collected = gc.collect()
+                    logger.info(f"Geomagnetic history processing: GC collected {collected} objects after processing {processed_count} records")
+
+            except Exception as processing_error:
+                logger.error(f"Error processing historical records: {processing_error}")
+                # Clean up on error
+                try:
+                    del history_results
+                    del miner_mappings
+                except:
+                    pass
+                raise
 
             # Process each hour
             for hour, records in hourly_records.items():
@@ -1219,6 +1264,9 @@ class GeomagneticTask(Task):
                         """
                         INSERT INTO score_table (task_name, task_id, score, status)
                         VALUES (:task_name, :task_id, :score, :status)
+                        ON CONFLICT (task_name, task_id) DO UPDATE SET
+                            score = EXCLUDED.score,
+                            status = EXCLUDED.status
                         """,
                         score_row
                     )
@@ -1242,6 +1290,9 @@ class GeomagneticTask(Task):
     async def cleanup_resources(self):
         """Clean up any resources used by the task during recovery."""
         try:
+            # Stop the background retry worker
+            await self._stop_pending_retry_worker()
+            
             await self.db_manager.execute(
                 """
                 UPDATE geomagnetic_predictions 
@@ -1265,4 +1316,728 @@ class GeomagneticTask(Task):
             logger.error(f"Error during geomagnetic task cleanup: {e}")
             logger.error(traceback.format_exc())
             raise
-            raise
+
+    async def _fetch_ground_truth_with_retry(self):
+        """
+        Fetches the ground truth DST value for the current UTC hour with retry logic.
+
+        Returns:
+            int: The real-time DST value, or None if fetching fails after retries.
+        """
+        try:
+            # Get the current UTC time
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            
+            if self.test_mode:
+                logger.info(f"TEST MODE: Fetching ground truth for current UTC hour: {current_time.hour}")
+            else:
+                logger.info(f"Fetching ground truth for UTC hour: {current_time.hour}")
+
+            # Fetch the most recent geomagnetic data with retry logic
+            for attempt in range(1, 4):
+                try:
+                    result = await get_latest_geomag_data(include_historical=False)
+                    
+                    # Handle the result based on expected format (should be 2 values)
+                    if len(result) == 2:
+                        timestamp, dst_value = result
+                    else:
+                        logger.error(f"Unexpected number of values returned from get_latest_geomag_data: {len(result)} (expected 2)")
+                        logger.error(f"Result: {result}")
+                        continue
+                    
+                    if timestamp == "N/A" or dst_value == "N/A":
+                        logger.warning("No ground truth data available for the current hour.")
+                        continue
+
+                    logger.info(f"Ground truth value for hour {current_time.hour}: {dst_value}")
+                    return dst_value
+
+                except Exception as e:
+                    logger.error(f"Error fetching ground truth, attempt {attempt}: {e}")
+                    logger.error(f"{traceback.format_exc()}")
+                    await asyncio.sleep(attempt * 10)  # Wait between attempts
+
+            logger.warning("All ground truth fetching attempts failed. No ground truth value returned.")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error fetching ground truth: {e}")
+            logger.error(f"{traceback.format_exc()}")
+            return None
+
+    async def _retry_pending_tasks(self, validator, current_time):
+        """
+        Retries scoring for older pending tasks from the last 24 hours.
+        Groups tasks by hour and attempts to score them properly.
+
+        Args:
+            validator: Validator instance
+            current_time: Current datetime
+        """
+        try:
+            # Look for pending tasks from the last 24 hours
+            start_time = current_time - datetime.timedelta(hours=24)
+            
+            logger.info(f"Checking for pending tasks from {start_time} to {current_time}")
+            
+            # Get all pending tasks from the last 24 hours
+            pending_tasks_query = await self.db_manager.fetch_all(
+                """
+                SELECT 
+                    id,
+                    miner_uid,
+                    miner_hotkey,
+                    predicted_value,
+                    query_time
+                FROM geomagnetic_predictions
+                WHERE query_time >= :start_time 
+                AND query_time < :end_time 
+                AND status = 'pending'
+                ORDER BY query_time ASC
+                """,
+                {
+                    "start_time": start_time,
+                    "end_time": current_time
+                }
+            )
+
+            if not pending_tasks_query:
+                logger.debug("No pending tasks found for retry in the last 24 hours")
+                return
+
+            logger.info(f"Found {len(pending_tasks_query)} pending tasks to retry")
+
+            # Convert to task format and group by hour
+            hourly_pending_tasks = {}
+            for row in pending_tasks_query:
+                task = {
+                    "id": row["id"],
+                    "miner_uid": row["miner_uid"],
+                    "miner_hotkey": row["miner_hotkey"],
+                    "predicted_values": row["predicted_value"],
+                    "query_time": row["query_time"],
+                    "timestamp": row["query_time"],
+                }
+                
+                # Group by hour
+                hour_key = row["query_time"].replace(minute=0, second=0, microsecond=0)
+                if hour_key not in hourly_pending_tasks:
+                    hourly_pending_tasks[hour_key] = []
+                hourly_pending_tasks[hour_key].append(task)
+
+            # Process each hour's pending tasks
+            scored_any_tasks = False
+            for hour_key, tasks in hourly_pending_tasks.items():
+                try:
+                    logger.info(f"Attempting to score {len(tasks)} pending tasks from hour {hour_key}")
+                    
+                    # Try to get ground truth for this time period
+                    ground_truth_value = await self._fetch_ground_truth_with_retry()
+                    if ground_truth_value is None:
+                        logger.warning(f"Could not fetch ground truth for pending tasks from hour {hour_key}, will retry later")
+                        continue
+
+                    logger.info(f"Successfully got ground truth value {ground_truth_value} for pending tasks from hour {hour_key}")
+
+                    # Score all tasks for this hour
+                    scored_tasks = []
+                    for task in tasks:
+                        try:
+                            # Check if this task should be retried
+                            if not await self._should_retry_task(task):
+                                logger.debug(f"Skipping task {task['id']} - retry conditions not met")
+                                continue
+                            
+                            # Update retry count
+                            await self._update_retry_count(task["id"])
+                            
+                            # Validate task is still in metagraph if validator is available
+                            if validator and hasattr(validator, 'metagraph') and validator.metagraph is not None:
+                                if task["miner_hotkey"] not in validator.metagraph.nodes:
+                                    logger.warning(f"Miner {task['miner_hotkey']} no longer in metagraph, skipping task {task['id']}")
+                                    continue
+
+                            # Use validator's basemodel_evaluator to get the baseline score for comparison
+                            baseline_score = None
+                            if validator and hasattr(validator, 'basemodel_evaluator'):
+                                try:
+                                    task_timestamp = task.get("timestamp", task.get("query_time"))
+                                    if task_timestamp:
+                                        if isinstance(task_timestamp, datetime.datetime):
+                                            if task_timestamp.tzinfo is not None:
+                                                task_timestamp_utc = task_timestamp.astimezone(datetime.timezone.utc)
+                                            else:
+                                                task_timestamp_utc = task_timestamp.replace(tzinfo=datetime.timezone.utc)
+                                                
+                                            task_id = str(task_timestamp_utc.timestamp())
+                                        else:
+                                            task_id = str(task_timestamp)
+                                        
+                                        validator.basemodel_evaluator.test_mode = self.test_mode
+                                        baseline_score = await validator.basemodel_evaluator.score_geo_baseline(
+                                            task_id=task_id,
+                                            ground_truth=ground_truth_value
+                                        )
+                                        if baseline_score is not None:
+                                            logger.info(f"Retrieved baseline score for retry task_id {task_id}: {baseline_score:.4f}")
+                                except Exception as e:
+                                    logger.warning(f"Error retrieving baseline score for retry task: {e}")
+
+                            # Calculate score
+                            score = self.scoring_mechanism.calculate_score(
+                                task["predicted_values"], ground_truth_value
+                            )
+
+                            # Apply baseline comparison if available
+                            if baseline_score is not None:
+                                base_epsilon = 0.005
+                                theoretical_max = 0.99
+                                
+                                if baseline_score > theoretical_max - 0.10:
+                                    epsilon = 0.002
+                                else:
+                                    epsilon = base_epsilon
+                                
+                                if score <= baseline_score + epsilon:
+                                    logger.info(f"Retry task score zeroed - insufficient improvement: {score:.4f} vs baseline {baseline_score:.4f}")
+                                    score = 0
+                                else:
+                                    logger.info(f"Retry task score valid - exceeds baseline by {score - baseline_score:.4f}")
+
+                            # Move task to history
+                            await self.move_task_to_history(
+                                task, ground_truth_value, score, current_time
+                            )
+
+                            # Add score to task for building score row
+                            task["score"] = score
+                            scored_tasks.append(task)
+                            logger.info(f"Successfully retried and scored task {task['id']} with score {score}")
+
+                        except Exception as e:
+                            logger.error(f"Error processing retry task {task['id']}: {e}")
+                            continue
+
+                    # Build score row for this hour if we scored any tasks
+                    if scored_tasks:
+                        await self.build_score_row(hour_key, scored_tasks)
+                        logger.info(f"Built score row for {len(scored_tasks)} retried tasks from hour {hour_key}")
+                        scored_any_tasks = True
+
+                except Exception as e:
+                    logger.error(f"Error processing pending tasks for hour {hour_key}: {e}")
+                    logger.error(traceback.format_exc())
+                    continue
+
+            if scored_any_tasks:
+                logger.info("Successfully scored some pending tasks from previous hours")
+            else:
+                logger.info("No pending tasks could be scored in this retry attempt")
+
+        except Exception as e:
+            logger.error(f"Error in _retry_pending_tasks: {e}")
+            logger.error(traceback.format_exc())
+
+    async def _comprehensive_pending_cleanup(self, validator):
+        """
+        Performs a more comprehensive cleanup of old pending tasks.
+
+        Args:
+            validator: Validator instance
+        """
+        try:
+            # Get all pending tasks from the database
+            pending_tasks_query = await self.db_manager.fetch_all(
+                """
+                SELECT 
+                    id,
+                    miner_uid,
+                    miner_hotkey,
+                    predicted_value,
+                    query_time
+                FROM geomagnetic_predictions
+                WHERE status = 'pending'
+                """,
+            )
+
+            if not pending_tasks_query:
+                logger.info("No pending tasks found for comprehensive cleanup")
+                return
+
+            logger.info(f"Found {len(pending_tasks_query)} pending tasks to cleanup")
+
+            # Process each pending task
+            for row in pending_tasks_query:
+                task = {
+                    "id": row["id"],
+                    "miner_uid": row["miner_uid"],
+                    "miner_hotkey": row["miner_hotkey"],
+                    "predicted_values": row["predicted_value"],
+                    "query_time": row["query_time"],
+                    "timestamp": row["query_time"],
+                }
+                
+                try:
+                    # Validate task is still in metagraph if validator is available
+                    if validator and hasattr(validator, 'metagraph') and validator.metagraph is not None:
+                        if task["miner_hotkey"] not in validator.metagraph.nodes:
+                            logger.warning(f"Miner {task['miner_hotkey']} no longer in metagraph, skipping task {task['id']}")
+                            continue
+
+                    # Use validator's basemodel_evaluator to get the baseline score for comparison
+                    baseline_score = None
+                    if validator and hasattr(validator, 'basemodel_evaluator'):
+                        try:
+                            task_timestamp = task.get("timestamp", task.get("query_time"))
+                            if task_timestamp:
+                                if isinstance(task_timestamp, datetime.datetime):
+                                    if task_timestamp.tzinfo is not None:
+                                        task_timestamp_utc = task_timestamp.astimezone(datetime.timezone.utc)
+                                    else:
+                                        task_timestamp_utc = task_timestamp.replace(tzinfo=datetime.timezone.utc)
+                                        
+                                    task_id = str(task_timestamp_utc.timestamp())
+                                else:
+                                    task_id = str(task_timestamp)
+                                
+                                validator.basemodel_evaluator.test_mode = self.test_mode
+                                baseline_score = await validator.basemodel_evaluator.score_geo_baseline(
+                                    task_id=task_id,
+                                    ground_truth=task["predicted_values"]
+                                )
+                                if baseline_score is not None:
+                                    logger.info(f"Retrieved baseline score for cleanup task_id {task_id}: {baseline_score:.4f}")
+                        except Exception as e:
+                            logger.warning(f"Error retrieving baseline score for cleanup task: {e}")
+
+                    # Calculate score
+                    score = self.scoring_mechanism.calculate_score(
+                        task["predicted_values"], task["predicted_values"]
+                    )
+
+                    # Move task to history
+                    await self.move_task_to_history(
+                        task, task["predicted_values"], score, datetime.datetime.now(datetime.timezone.utc)
+                    )
+
+                except Exception as e:
+                    logger.error(f"Error processing cleanup task {task['id']}: {e}")
+                    continue
+
+            logger.info("Completed comprehensive cleanup of old pending tasks")
+
+        except Exception as e:
+            logger.error(f"Error in _comprehensive_pending_cleanup: {e}")
+            logger.error(traceback.format_exc())
+
+    async def _check_ground_truth_availability(self, target_time: datetime.datetime) -> bool:
+        """
+        Lightweight check to see if ground truth data is available for a specific time.
+        This avoids doing a full download if data isn't ready yet.
+        
+        Args:
+            target_time: The datetime to check ground truth availability for
+            
+        Returns:
+            bool: True if ground truth data appears to be available, False otherwise
+        """
+        try:
+            # In test mode, assume ground truth is always available
+            if self.test_mode:
+                logger.debug(f"TEST MODE: Assuming ground truth is available for {target_time}")
+                return True
+            
+            # For geomagnetic data, we typically need to wait at least 1-2 hours after the target time
+            # for the data to be processed and made available
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            time_since_target = current_time - target_time
+            
+            # If less than 1 hour has passed, data is likely not available yet
+            if time_since_target.total_seconds() < 3600:  # 1 hour
+                logger.debug(f"Ground truth likely not available yet for {target_time} (only {time_since_target.total_seconds()/60:.1f} minutes have passed)")
+                return False
+            
+            # If more than 48 hours have passed, we should definitely have data by now
+            if time_since_target.total_seconds() > 172800:  # 48 hours
+                logger.debug(f"Ground truth should definitely be available for {target_time} (data is {time_since_target.total_seconds()/3600:.1f} hours old)")
+                return True
+            
+            # For times between 1-48 hours ago, do a quick check
+            # We'll try a single attempt to fetch data without retries
+            try:
+                result = await get_latest_geomag_data(include_historical=False)
+                
+                if len(result) == 2:
+                    timestamp, dst_value = result
+                    if timestamp != "N/A" and dst_value != "N/A":
+                        # Check if the returned data is reasonably recent
+                        if isinstance(timestamp, datetime.datetime):
+                            data_age = current_time - timestamp
+                            if data_age.total_seconds() < 7200:  # Data is less than 2 hours old
+                                logger.debug(f"Recent ground truth data found (age: {data_age.total_seconds()/60:.1f} minutes)")
+                                return True
+                        else:
+                            # If timestamp format is different, assume data is available
+                            logger.debug(f"Ground truth data found with timestamp: {timestamp}")
+                            return True
+                
+                logger.debug(f"Ground truth check returned N/A values for {target_time}")
+                return False
+                
+            except Exception as e:
+                logger.debug(f"Error during ground truth availability check for {target_time}: {e}")
+                # If we can't check, assume it might be available (err on the side of trying)
+                return time_since_target.total_seconds() > 7200  # 2 hours
+                
+        except Exception as e:
+            logger.error(f"Error in _check_ground_truth_availability: {e}")
+            # Default to trying if we can't determine availability
+            return True
+
+    async def _fetch_ground_truth_for_time(self, target_time: datetime.datetime, max_attempts: int = 3):
+        """
+        Fetches ground truth data for a specific time period with retry logic.
+        
+        Args:
+            target_time: The datetime to fetch ground truth for
+            max_attempts: Maximum number of retry attempts
+            
+        Returns:
+            float: The ground truth DST value, or None if fetching fails
+        """
+        try:
+            logger.info(f"Fetching ground truth for time: {target_time}")
+
+            # Fetch the most recent geomagnetic data with retry logic
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    result = await get_latest_geomag_data(include_historical=False)
+                    
+                    # Handle the result based on expected format (should be 2 values)
+                    if len(result) == 2:
+                        timestamp, dst_value = result
+                    else:
+                        logger.warning(f"Unexpected number of values returned from get_latest_geomag_data: {len(result)} (expected 2)")
+                        logger.warning(f"Result: {result}")
+                        continue
+                    
+                    if timestamp == "N/A" or dst_value == "N/A":
+                        logger.warning(f"No ground truth data available for {target_time} (attempt {attempt}/{max_attempts})")
+                        if attempt < max_attempts:
+                            await asyncio.sleep(attempt * 5)  # Shorter wait between attempts
+                        continue
+
+                    logger.info(f"Ground truth value for {target_time}: {dst_value}")
+                    return dst_value
+
+                except Exception as e:
+                    logger.warning(f"Error fetching ground truth for {target_time}, attempt {attempt}/{max_attempts}: {e}")
+                    if attempt < max_attempts:
+                        await asyncio.sleep(attempt * 5)  # Shorter wait between attempts
+
+            logger.warning(f"All ground truth fetching attempts failed for {target_time}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error fetching ground truth for {target_time}: {e}")
+            logger.error(f"{traceback.format_exc()}")
+            return None
+
+    async def _start_pending_retry_worker(self, validator):
+        """
+        Starts a background worker that checks for pending tasks every 10 minutes
+        and attempts to score them if ground truth becomes available.
+        """
+        if self.pending_retry_worker_running:
+            logger.info("Pending retry worker is already running")
+            return
+        
+        self.pending_retry_worker_running = True
+        self.pending_retry_worker_task = asyncio.create_task(self._pending_retry_worker_loop(validator))
+        logger.info("Started pending retry worker (checks every 10 minutes)")
+
+    async def _stop_pending_retry_worker(self):
+        """Stops the background pending retry worker."""
+        if not self.pending_retry_worker_running:
+            return
+        
+        self.pending_retry_worker_running = False
+        if self.pending_retry_worker_task:
+            self.pending_retry_worker_task.cancel()
+            try:
+                await self.pending_retry_worker_task
+            except asyncio.CancelledError:
+                pass
+            self.pending_retry_worker_task = None
+        logger.info("Stopped pending retry worker")
+
+    async def _pending_retry_worker_loop(self, validator):
+        """
+        Background worker loop that checks for pending tasks every 10 minutes
+        and attempts to score them if ground truth becomes available.
+        """
+        retry_interval = 600 if not self.test_mode else 60  # 10 minutes in production, 1 minute in test mode
+        
+        while self.pending_retry_worker_running:
+            try:
+                await asyncio.sleep(retry_interval)
+                
+                if not self.pending_retry_worker_running:
+                    break
+                
+                logger.info("Pending retry worker: Checking for tasks that can now be scored...")
+                await self._intelligent_retry_pending_tasks(validator)
+                
+            except asyncio.CancelledError:
+                logger.info("Pending retry worker cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in pending retry worker: {e}")
+                logger.error(traceback.format_exc())
+                # Continue running even if there's an error
+                await asyncio.sleep(60)  # Wait 1 minute before retrying
+
+    async def _intelligent_retry_pending_tasks(self, validator):
+        """
+        Intelligently retry pending tasks by first checking if ground truth is available
+        before attempting to fetch it. Groups tasks by hour and processes efficiently.
+        """
+        try:
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            
+            # Look for pending tasks from the last 72 hours (extended window)
+            start_time = current_time - datetime.timedelta(hours=72)
+            
+            logger.debug(f"Checking for pending tasks from {start_time} to {current_time}")
+            
+            # Get all pending tasks, grouped by hour
+            pending_tasks_query = await self.db_manager.fetch_all(
+                """
+                SELECT 
+                    id,
+                    miner_uid,
+                    miner_hotkey,
+                    predicted_value,
+                    query_time,
+                    DATE_TRUNC('hour', query_time) as hour_bucket
+                FROM geomagnetic_predictions
+                WHERE query_time >= :start_time 
+                AND query_time < :end_time 
+                AND status = 'pending'
+                ORDER BY query_time ASC
+                """,
+                {
+                    "start_time": start_time,
+                    "end_time": current_time
+                }
+            )
+
+            if not pending_tasks_query:
+                logger.debug("No pending tasks found for intelligent retry")
+                return
+
+            logger.info(f"Found {len(pending_tasks_query)} pending tasks to check for retry")
+
+            # Group tasks by hour
+            hourly_pending_tasks = {}
+            for row in pending_tasks_query:
+                hour_key = row["hour_bucket"]
+                if hour_key not in hourly_pending_tasks:
+                    hourly_pending_tasks[hour_key] = []
+                
+                task = {
+                    "id": row["id"],
+                    "miner_uid": row["miner_uid"],
+                    "miner_hotkey": row["miner_hotkey"],
+                    "predicted_values": row["predicted_value"],
+                    "query_time": row["query_time"],
+                    "timestamp": row["query_time"],
+                }
+                hourly_pending_tasks[hour_key].append(task)
+
+            # Process each hour's pending tasks
+            scored_any_tasks = False
+            for hour_key, tasks in hourly_pending_tasks.items():
+                try:
+                    # First, check if ground truth is likely available for this hour
+                    if not await self._check_ground_truth_availability(hour_key):
+                        logger.debug(f"Ground truth not yet available for hour {hour_key}, skipping {len(tasks)} tasks")
+                        continue
+                    
+                    logger.info(f"Ground truth appears available for hour {hour_key}, attempting to score {len(tasks)} tasks")
+                    
+                    # Try to fetch ground truth for this time period
+                    ground_truth_value = await self._fetch_ground_truth_for_time(hour_key, max_attempts=2)
+                    if ground_truth_value is None:
+                        logger.warning(f"Could not fetch ground truth for hour {hour_key} despite availability check")
+                        continue
+
+                    logger.info(f"Successfully got ground truth value {ground_truth_value} for hour {hour_key}")
+
+                    # Score all tasks for this hour
+                    scored_tasks = []
+                    for task in tasks:
+                        try:
+                            # Validate task is still in metagraph if validator is available
+                            if validator and hasattr(validator, 'metagraph') and validator.metagraph is not None:
+                                if task["miner_hotkey"] not in validator.metagraph.nodes:
+                                    logger.warning(f"Miner {task['miner_hotkey']} no longer in metagraph, skipping task {task['id']}")
+                                    continue
+
+                            # Get baseline score for comparison
+                            baseline_score = None
+                            if validator and hasattr(validator, 'basemodel_evaluator'):
+                                try:
+                                    task_timestamp = task.get("timestamp", task.get("query_time"))
+                                    if task_timestamp:
+                                        if isinstance(task_timestamp, datetime.datetime):
+                                            if task_timestamp.tzinfo is not None:
+                                                task_timestamp_utc = task_timestamp.astimezone(datetime.timezone.utc)
+                                            else:
+                                                task_timestamp_utc = task_timestamp.replace(tzinfo=datetime.timezone.utc)
+                                                
+                                            task_id = str(task_timestamp_utc.timestamp())
+                                        else:
+                                            task_id = str(task_timestamp)
+                                        
+                                        validator.basemodel_evaluator.test_mode = self.test_mode
+                                        baseline_score = await validator.basemodel_evaluator.score_geo_baseline(
+                                            task_id=task_id,
+                                            ground_truth=ground_truth_value
+                                        )
+                                        if baseline_score is not None:
+                                            logger.debug(f"Retrieved baseline score for intelligent retry task_id {task_id}: {baseline_score:.4f}")
+                                except Exception as e:
+                                    logger.debug(f"Error retrieving baseline score for intelligent retry task: {e}")
+
+                            # Calculate score
+                            score = self.scoring_mechanism.calculate_score(
+                                task["predicted_values"], ground_truth_value
+                            )
+
+                            # Apply baseline comparison if available
+                            if baseline_score is not None:
+                                base_epsilon = 0.005
+                                theoretical_max = 0.99
+                                
+                                if baseline_score > theoretical_max - 0.10:
+                                    epsilon = 0.002
+                                else:
+                                    epsilon = base_epsilon
+                                
+                                if score <= baseline_score + epsilon:
+                                    logger.debug(f"Intelligent retry task score zeroed - insufficient improvement: {score:.4f} vs baseline {baseline_score:.4f}")
+                                    score = 0
+                                else:
+                                    logger.debug(f"Intelligent retry task score valid - exceeds baseline by {score - baseline_score:.4f}")
+
+                            # Move task to history
+                            await self.move_task_to_history(
+                                task, ground_truth_value, score, current_time
+                            )
+
+                            # Add score to task for building score row
+                            task["score"] = score
+                            scored_tasks.append(task)
+                            logger.info(f"Intelligent retry: Successfully scored task {task['id']} with score {score}")
+
+                        except Exception as e:
+                            logger.error(f"Error processing intelligent retry task {task['id']}: {e}")
+                            continue
+
+                    # Build score row for this hour if we scored any tasks
+                    if scored_tasks:
+                        await self.build_score_row(hour_key, scored_tasks)
+                        logger.info(f"Built score row for {len(scored_tasks)} intelligently retried tasks from hour {hour_key}")
+                        scored_any_tasks = True
+
+                except Exception as e:
+                    logger.error(f"Error processing intelligent retry for hour {hour_key}: {e}")
+                    logger.error(traceback.format_exc())
+                    continue
+
+            if scored_any_tasks:
+                logger.info("Intelligent retry: Successfully scored some pending tasks")
+            else:
+                logger.debug("Intelligent retry: No pending tasks could be scored in this attempt")
+
+        except Exception as e:
+            logger.error(f"Error in _intelligent_retry_pending_tasks: {e}")
+            logger.error(traceback.format_exc())
+
+    async def _update_retry_count(self, task_id: int):
+        """
+        Updates the retry count for a task to track how many times we've attempted to score it.
+        This helps prevent infinite retries of problematic tasks.
+        """
+        try:
+            await self.db_manager.execute(
+                """
+                UPDATE geomagnetic_predictions 
+                SET retry_count = COALESCE(retry_count, 0) + 1,
+                    last_retry_attempt = NOW()
+                WHERE id = :task_id
+                """,
+                {"task_id": task_id}
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update retry count for task {task_id}: {e}")
+
+    async def _should_retry_task(self, task: dict, max_retries: int = 10) -> bool:
+        """
+        Determines if a task should be retried based on its age and retry count.
+        
+        Args:
+            task: Task dictionary containing task information
+            max_retries: Maximum number of retry attempts allowed
+            
+        Returns:
+            bool: True if the task should be retried, False otherwise
+        """
+        try:
+            # Get current retry count from database
+            result = await self.db_manager.fetch_one(
+                "SELECT COALESCE(retry_count, 0) as retry_count, last_retry_attempt FROM geomagnetic_predictions WHERE id = :task_id",
+                {"task_id": task["id"]}
+            )
+            
+            if not result:
+                return True  # If we can't find the task, allow retry
+            
+            retry_count = result["retry_count"] or 0
+            last_retry = result["last_retry_attempt"]
+            
+            # Don't retry if we've exceeded max attempts
+            if retry_count >= max_retries:
+                logger.debug(f"Task {task['id']} has exceeded max retries ({retry_count}/{max_retries})")
+                return False
+            
+            # Don't retry if we just attempted recently (within last 30 minutes)
+            if last_retry:
+                current_time = datetime.datetime.now(datetime.timezone.utc)
+                if isinstance(last_retry, datetime.datetime):
+                    if last_retry.tzinfo is None:
+                        last_retry = last_retry.replace(tzinfo=datetime.timezone.utc)
+                    time_since_retry = current_time - last_retry
+                    if time_since_retry.total_seconds() < 1800:  # 30 minutes
+                        logger.debug(f"Task {task['id']} was retried recently ({time_since_retry.total_seconds()/60:.1f} minutes ago)")
+                        return False
+            
+            # Check task age - don't retry tasks older than 7 days
+            task_time = task.get("query_time") or task.get("timestamp")
+            if task_time:
+                if isinstance(task_time, datetime.datetime):
+                    if task_time.tzinfo is None:
+                        task_time = task_time.replace(tzinfo=datetime.timezone.utc)
+                    current_time = datetime.datetime.now(datetime.timezone.utc)
+                    task_age = current_time - task_time
+                    if task_age.total_seconds() > 604800:  # 7 days
+                        logger.debug(f"Task {task['id']} is too old ({task_age.total_seconds()/86400:.1f} days)")
+                        return False
+            
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Error checking if task {task['id']} should be retried: {e}")
+            return True  # Default to allowing retry if we can't determine

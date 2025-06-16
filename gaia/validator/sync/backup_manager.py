@@ -1,358 +1,206 @@
 # gaia/validator/sync/backup_manager.py
 import asyncio
 import os
-import datetime
-import random
-import time
-import subprocess # For running pg_dump
+import subprocess # For running pgBackRest
 from fiber.logging_utils import get_logger
-from gaia.validator.sync.azure_blob_utils import AzureBlobManager # Direct import
-# Assuming ValidatorDatabaseManager might be needed for DB config, though pg_dump uses env vars or pgpass
-# from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager 
+from datetime import datetime, timezone # Keep for logging or potential future use
+from typing import Optional
 
 logger = get_logger(__name__)
 
-# Configuration - consider moving to a shared config module or direct env var usage in methods
-DB_NAME_DEFAULT = "validator_db"
-DB_USER_DEFAULT = "postgres"
-DB_HOST_DEFAULT = "localhost"
-DB_PORT_DEFAULT = "5432"
-# DB_PASS_DEFAULT should not be hardcoded; expect from env.
-BACKUP_DIR_DEFAULT = "/tmp/db_backups_gaia" # Local temporary storage for dumps
-BACKUP_PREFIX_DEFAULT = "validator_db_backup_"
-MANIFEST_FILENAME_DEFAULT = "latest_backup_manifest.txt"
-MAX_AZURE_BACKUPS_DEFAULT = 5 # Keep last 5 backups
-PG_DUMP_TIMEOUT_SECONDS = 1800 # Timeout for pg_dump command (30 minutes)
-TARGET_BACKUP_MINUTE = 30 # Target minute of the hour to start backups (e.g., HH:30)
+# pgBackRest related constants (stanza is primary)
+PGBACKREST_STANZA_DEFAULT = "gaia" # Default stanza name
 
 class BackupManager:
-    def __init__(self, azure_manager: AzureBlobManager, 
-                 db_name: str, db_user: str, db_host: str, db_port: str, db_password: str | None,
-                 local_backup_dir: str, backup_prefix: str, 
-                 manifest_filename: str, max_azure_backups: int):
-        self.azure_manager = azure_manager
-        self.db_name = db_name
-        self.db_user = db_user
-        self.db_host = db_host
-        self.db_port = db_port
-        self.db_password = db_password # Can be None
-        self.local_backup_dir = local_backup_dir
-        self.backup_prefix = backup_prefix
-        self.manifest_filename = manifest_filename
-        self.max_azure_backups = max_azure_backups
-        os.makedirs(self.local_backup_dir, exist_ok=True)
+    def __init__(self, test_mode: bool = False): # Removed storage_manager
+        """
+        Manages ad-hoc pgBackRest operations.
+        Scheduling of regular backups is handled by cron (see setup-primary.sh).
 
-    async def _run_pg_dump(self, backup_file_path: str) -> bool:
-        cmd = [
-            "pg_dump",
-            "-U", self.db_user,
-            "-h", self.db_host,
-            "-p", self.db_port,
-            "-d", self.db_name,
-            "-Fc", # Custom format, compressed
-            "-f", backup_file_path
-        ]
-        logger.info(f"Running pg_dump: {' '.join(cmd)} (Password presence: {'yes' if self.db_password else 'no'})")
+        Args:
+            test_mode: If True, may use test-friendly options for commands.
+        """
+        # self.storage_manager = storage_manager # Removed, manifest not handled here
+        self.test_mode = test_mode
+        self.pgbackrest_stanza = os.getenv("PGBACKREST_STANZA", PGBACKREST_STANZA_DEFAULT)
         
-        # Prepare environment for the subprocess
-        sub_env = os.environ.copy()
-        if self.db_password:
-            sub_env["PGPASSWORD"] = self.db_password
-        else:
-            # If no password, ensure PGPASSWORD is not set from a higher environment,
-            # to allow other auth methods like .pgpass or peer authentication to work.
-            if "PGPASSWORD" in sub_env:
-                del sub_env["PGPASSWORD"]
+        logger.info(f"BackupManager initialized. Stanza: {self.pgbackrest_stanza}, Test_mode: {self.test_mode}. "
+                    f"Regular backup scheduling is handled by system cron via setup-primary.sh.")
 
+    async def _trigger_pgbackrest_command(self, command_args: list[str], operation_name: str) -> bool:
+        """
+        Triggers a pgBackRest command.
+        
+        Args:
+            command_args: List of arguments for the pgbackrest command.
+            operation_name: Name of the operation for logging.
+        
+        Returns:
+            True if successful, False otherwise.
+        """
+        # Ensure stanza is part of the command if not already included by caller
+        if not any(arg.startswith("--stanza=") or arg == self.pgbackrest_stanza for arg in command_args):
+             # Add stanza if it's a common command like 'backup', 'info', 'check', 'archive-push'
+            if operation_name not in ["Stanza Create"]: # Stanza Create takes stanza as a positional arg
+                 # Check if the command itself is the stanza name (e.g. for stanza-create)
+                is_stanza_command = False
+                if len(command_args) > 0 and command_args[0] == self.pgbackrest_stanza:
+                    is_stanza_command = True
+
+                if not is_stanza_command and not any(arg.startswith(f"--stanza={self.pgbackrest_stanza}") for arg in command_args):
+                     # Prepend --stanza only if it's not there. Some commands might have it later.
+                     # A more robust way would be to have specific methods define their args fully.
+                     # For now, this is a basic check.
+                     if command_args[0] != 'stanza-create': # stanza-create uses positional stanza
+                        command_args = [f"--stanza={self.pgbackrest_stanza}"] + command_args
+
+
+        full_command = ["pgbackrest"] + command_args
+        logger.info(f"Executing pgBackRest {operation_name}: {' '.join(full_command)}")
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                env=sub_env, # Pass the modified environment
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            process = await asyncio.to_thread(
+                subprocess.run,
+                full_command,
+                capture_output=True,
+                text=True,
+                check=False 
             )
-            
-            logger.info(f"Waiting for pg_dump (PID: {process.pid}) to complete (timeout: {PG_DUMP_TIMEOUT_SECONDS}s)...")
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), 
-                    timeout=PG_DUMP_TIMEOUT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"pg_dump timed out after {PG_DUMP_TIMEOUT_SECONDS} seconds.")
-                try:
-                    process.kill() # Ensure the process is killed
-                    await process.wait() # Wait for the process to terminate
-                except Exception as e_kill:
-                    logger.error(f"Error trying to kill timed-out pg_dump process: {e_kill}")
-                return False # pg_dump failed due to timeout
-            
             if process.returncode == 0:
-                logger.info(f"pg_dump completed successfully for {backup_file_path}.")
-                if stderr:
-                    logger.warning(f"pg_dump stderr (though successful): {stderr.decode().strip()}")
+                logger.info(f"pgBackRest {operation_name} successful. Output:\n{process.stdout}")
                 return True
             else:
-                logger.error(f"pg_dump failed with return code {process.returncode}.")
-                logger.error(f"pg_dump stdout: {stdout.decode().strip()}")
-                logger.error(f"pg_dump stderr: {stderr.decode().strip()}")
+                logger.error(f"pgBackRest {operation_name} failed with code {process.returncode}. Error:\n{process.stderr}\nStdout:\n{process.stdout}")
                 return False
         except FileNotFoundError:
-            logger.error("pg_dump command not found. Ensure PostgreSQL client tools are installed and in PATH.")
+            logger.error(f"pgBackRest command not found. Ensure it's installed and in PATH.")
             return False
         except Exception as e:
-            logger.error(f"An exception occurred while running pg_dump: {e}")
+            logger.error(f"Error during pgBackRest {operation_name}: {e}", exc_info=True)
             return False
 
-    async def _update_latest_backup_manifest(self, latest_dump_blob_name: str) -> bool:
-        logger.info(f"Updating manifest file '{self.manifest_filename}' with new backup: {latest_dump_blob_name}")
-        return await self.azure_manager.upload_blob_content(latest_dump_blob_name, self.manifest_filename)
-
-    async def _prune_old_backups_azure(self) -> None:
-        logger.info("Pruning old backups from Azure Blob Storage...")
-        try:
-            # Assuming dumps are stored with a prefix or in a specific virtual folder for listing
-            blob_list = await self.azure_manager.list_blobs(prefix=f"dumps/{self.backup_prefix}")
-            
-            # Filter and sort backups by timestamp in filename (descending, newest first)
-            # Example filename: dumps/validator_db_backup_20230101_120000.dump
-            backups = []
-            for blob_name in blob_list:
-                try:
-                    filename_part = blob_name.split('/')[-1] # Get filename from full blob path
-                    if filename_part.startswith(self.backup_prefix) and filename_part.endswith(".dump"):
-                        # Extract timestamp string: validator_db_backup_YYYYMMDD_HHMMSS.dump
-                        ts_str = filename_part[len(self.backup_prefix):-len(".dump")]
-                        dt_obj = datetime.datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
-                        backups.append((dt_obj, blob_name))
-                except ValueError as e:
-                    logger.warning(f"Could not parse timestamp from blob name '{blob_name}': {e}")
-            
-            backups.sort(key=lambda item: item[0], reverse=True) # Sort by datetime object, newest first
-            
-            if len(backups) > self.max_azure_backups:
-                backups_to_delete = backups[self.max_azure_backups:]
-                logger.info(f"Found {len(backups_to_delete)} old backups to delete from Azure.")
-                for _, blob_name_to_delete in backups_to_delete:
-                    logger.info(f"Deleting old Azure backup: {blob_name_to_delete}")
-                    await self.azure_manager.delete_blob(blob_name_to_delete)
-            else:
-                logger.info("No old Azure backups to prune based on current count and max limit.")
-        except Exception as e:
-            logger.error(f"Error during Azure backup pruning: {e}", exc_info=True)
-    
-    def _os_remove_sync(self, file_path: str):
-        """Synchronous wrapper for os.remove."""
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            return True
-        return False
-
-    async def _prune_local_backup(self, local_file_path: str) -> None:
-        try:
-            loop = asyncio.get_event_loop()
-            removed = await loop.run_in_executor(None, self._os_remove_sync, local_file_path)
-            if removed:
-                logger.info(f"Successfully pruned local backup: {local_file_path}")
-            elif os.path.exists(local_file_path): # Check again in case of race or if remove failed silently
-                logger.warning(f"Local backup file still exists after prune attempt: {local_file_path}")
-            else:
-                logger.info(f"Local backup file did not exist or was already pruned: {local_file_path}")
-        except Exception as e:
-            logger.error(f"Error pruning local backup {local_file_path}: {e}")
-
-    async def perform_backup_cycle(self) -> bool:
-        timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        local_dump_filename = f"{self.backup_prefix}{timestamp_str}.dump"
-        local_dump_full_path = os.path.join(self.local_backup_dir, local_dump_filename)
-        azure_blob_name = f"dumps/{local_dump_filename}" # Store in a 'dumps' folder in Azure
-
-        logger.info(f"Starting database backup cycle. Target: {local_dump_full_path}, Azure Blob: {azure_blob_name}")
-
-        # 1. Run pg_dump
-        logger.info("Step 1: Running pg_dump...")
-        if not await self._run_pg_dump(local_dump_full_path):
-            logger.error("pg_dump failed. Aborting backup cycle.")
-            await self._prune_local_backup(local_dump_full_path) # Clean up failed dump
+    async def trigger_backup(self, backup_type: str = "full") -> bool:
+        """
+        Triggers an ad-hoc pgBackRest backup.
+        Args:
+            backup_type: Type of backup ("full", "diff", "incr").
+        """
+        if backup_type not in ["full", "diff", "incr"]:
+            logger.error(f"Invalid backup type: {backup_type}. Must be 'full', 'diff', or 'incr'.")
             return False
-        logger.info("Step 1: pg_dump successful.")
-
-        # 2. Upload to Azure
-        logger.info(f"Step 2: Uploading '{local_dump_full_path}' to Azure as '{azure_blob_name}'...")
-        if not await self.azure_manager.upload_blob(local_dump_full_path, azure_blob_name):
-            logger.error("Azure upload failed. Aborting backup cycle.")
-            await self._prune_local_backup(local_dump_full_path) # Clean up local dump if upload fails
-            return False
-        logger.info("Step 2: Azure upload successful.")
-
-        # 3. Update manifest
-        logger.info("Step 3: Updating latest backup manifest...")
-        if not await self._update_latest_backup_manifest(azure_blob_name):
-            logger.warning("Failed to update latest backup manifest. Continuing, but replicas might not find this backup immediately.")
-            # Not returning False here as the backup itself is successful and uploaded.
-        else:
-            logger.info("Step 3: Manifest update successful.")
-
-        # 4. Prune old Azure backups
-        logger.info("Step 4: Pruning old Azure backups...")
-        await self._prune_old_backups_azure()
-        logger.info("Step 4: Azure pruning finished.")
-
-        # 5. Prune local dump file
-        logger.info(f"Step 5: Pruning local dump file '{local_dump_full_path}'...")
-        await self._prune_local_backup(local_dump_full_path)
-        logger.info("Step 5: Local pruning finished.")
+            
+        args = [f"--stanza={self.pgbackrest_stanza}", "backup", f"--type={backup_type}"]
+        if self.test_mode:
+            # Example: Shorter archive timeout, no compression for faster test "backup"
+            # These settings might vary depending on actual pgBackRest version and desired test behavior
+            args.extend(["--archive-timeout=30s", "--compress-level=0"]) 
+            logger.info(f"[Test Mode] Ad-hoc pgBackRest Backup ({backup_type}) with test options.")
         
-        logger.info(f"Database backup cycle completed successfully for {azure_blob_name}.")
-        return True
+        return await self._trigger_pgbackrest_command(args, f"Ad-hoc Backup ({backup_type})")
 
-    async def start_periodic_backups(self, interval_hours: int):
-        if interval_hours <= 0:
-            logger.warning("DB Sync Backup interval is not positive. Periodic backups will not run.")
-            return
+    async def trigger_archive_push(self) -> bool:
+        """
+        Triggers an ad-hoc pgBackRest archive-push command.
+        This is generally not needed if archive_command in postgresql.conf is set correctly,
+        but can be useful for flushing any pending WAL segments if archive_async is enabled.
+        """
+        args = [f"--stanza={self.pgbackrest_stanza}", "archive-push"]
+        return await self._trigger_pgbackrest_command(args, "Ad-hoc Archive Push")
 
-        logger.info(f"Starting periodic database backups, aiming for {TARGET_BACKUP_MINUTE} minutes past the hour, every {interval_hours} hour(s).")
+    async def check_stanza_config(self) -> bool:
+        """
+        Runs `pgbackrest check --stanza=xxx`
+        """
+        args = [f"--stanza={self.pgbackrest_stanza}", "check"]
+        return await self._trigger_pgbackrest_command(args, "Stanza Check")
+
+    async def get_info(self) -> bool: # Returns bool for consistency, output is logged
+        """
+        Runs `pgbackrest info --stanza=xxx`
+        """
+        args = [f"--stanza={self.pgbackrest_stanza}", "info"]
+        return await self._trigger_pgbackrest_command(args, "Info")
         
-        while True:
-            now = datetime.datetime.now(datetime.timezone.utc)
-            
-            # Calculate the next target start time
-            next_run_hour = now.hour
-            if now.minute >= TARGET_BACKUP_MINUTE:
-                # If current minute is past the target, schedule for the next interval_hours block
-                # This logic needs to be careful if interval_hours is not 1
-                # For simplicity with interval_hours, let's assume we just advance to next scheduled slot based on current hour.
-                # More robust: consider the last run time if we stored it.
-                # Current simple approach: if it's 10:45 and interval is 1h, next is 11:30.
-                # If it's 10:15 and interval is 1h, next is 10:30.
-                # If interval_hours > 1, this needs to be smarter about which hour is next.
-                # For now, let's just align to the *next* HH:TARGET_BACKUP_MINUTE that also respects the interval.
-                
-                # Simpler approach: Calculate time to next HH:MM, then if that time is too soon for the interval, add interval.
-                # This will drift if perform_backup_cycle takes significant time.
-                
-                # Revised approach for better alignment with interval:
-                # Calculate how many 'interval_hours' blocks have passed since midnight UTC for the current day for the target minute.
-                # Example: interval_hours = 3. Runs at 00:30, 03:30, 06:30, etc.
-                # If current time is 05:00, target is 06:30.
-                # If current time is 02:50, target is 03:30.
-                # If current time is 03:35, target is 06:30.
-
-                # Determine the 'current' or 'next' valid slot based on interval_hours and TARGET_BACKUP_MINUTE
-                current_hour_block = now.hour // interval_hours 
-                next_potential_hour = current_hour_block * interval_hours
-                
-                target_datetime_this_block = now.replace(hour=next_potential_hour, minute=TARGET_BACKUP_MINUTE, second=0, microsecond=0)
-                
-                if now >= target_datetime_this_block:
-                    # We are past the target time for the current block, or right at it.
-                    # Move to the next interval block.
-                    next_run_base_hour = (current_hour_block + 1) * interval_hours
-                    # Handle day overflow if next_run_base_hour >= 24
-                    days_to_add = next_run_base_hour // 24
-                    final_target_hour = next_run_base_hour % 24
-                    target_run_time = now.replace(hour=final_target_hour, minute=TARGET_BACKUP_MINUTE, second=0, microsecond=0) + datetime.timedelta(days=days_to_add)
-                else:
-                    # The target time in the current block is still in the future.
-                    target_run_time = target_datetime_this_block
-            else: # now.minute < TARGET_BACKUP_MINUTE
-                # Target minute is in the future for the current hour (or a past hour if interval > 1, handled by block logic above)
-                current_hour_block = now.hour // interval_hours
-                target_base_hour_this_block = current_hour_block * interval_hours 
-                # Ensure we are targeting a valud hour slot based on interval
-                target_run_time = now.replace(hour=target_base_hour_this_block, minute=TARGET_BACKUP_MINUTE, second=0, microsecond=0)
-                if target_run_time < now : # If this calculated time is in the past (e.g. now is 05:00, interval 3, target_base_hour is 03:00)
-                    # Move to the next interval block.
-                    next_run_base_hour = (current_hour_block + 1) * interval_hours
-                    days_to_add = next_run_base_hour // 24
-                    final_target_hour = next_run_base_hour % 24
-                    target_run_time = now.replace(hour=final_target_hour, minute=TARGET_BACKUP_MINUTE, second=0, microsecond=0) + datetime.timedelta(days=days_to_add)
+    async def create_stanza_if_needed(self) -> bool:
+        """
+        Attempts to create the stanza. Idempotent if stanza already exists.
+        This is typically done by setup-primary.sh but can be called ad-hoc.
+        Note: requires pgBackRest to be configured to communicate with R2.
+        """
+        # Stanza create does not take --stanza=, it's a positional argument
+        args = ["stanza-create", self.pgbackrest_stanza]
+        # Check if we need to pass repo type etc, or if global config is enough
+        # The setup-primary.sh does `sudo -u postgres pgbackrest --stanza="$STANZA_NAME" stanza-create`
+        # which relies on the global config in /etc/pgbackrest/pgbackrest.conf for repo details.
+        # So, this should be fine.
+        return await self._trigger_pgbackrest_command(args, "Stanza Create")
 
 
-            wait_seconds = (target_run_time - now).total_seconds()
-            if wait_seconds < 0 : # Should ideally not happen with the logic above, but as a safeguard
-                logger.warning(f"Calculated wait time is negative ({wait_seconds}s). Scheduling for next interval. This might indicate a logic issue in scheduling.")
-                wait_seconds = interval_hours * 3600 # Fallback to simple interval sleep
-            
-            logger.info(f"Next backup cycle scheduled for {target_run_time.strftime('%Y-%m-%d %H:%M:%S %Z')}. Waiting for {wait_seconds / 3600:.2f} hours.")
-            await asyncio.sleep(wait_seconds)
-
-            try:
-                await self.perform_backup_cycle()
-            except Exception as e:
-                logger.error(f"Critical error during periodic backup cycle: {e}", exc_info=True)
+    # Removed start_periodic_backups and related scheduling methods as cron handles this.
+    # Removed pg_dump related methods and constants.
+    # Removed manifest related logic.
 
     async def close(self):
-        # The azure_manager is passed in, so its lifecycle is managed externally (e.g., by GaiaValidator)
-        logger.info("BackupManager closed. (Azure client lifecycle managed externally)")
+        # No external resources like storage_manager to close for this version.
+        logger.info("BackupManager closed.")
 
-async def get_backup_manager(azure_manager: AzureBlobManager) -> BackupManager | None:
-    if not azure_manager:
-        logger.error("AzureBlobManager instance is required to create BackupManager.")
-        return None
-
-    db_name = os.getenv("DB_NAME", DB_NAME_DEFAULT) # Using DB_NAME from env
-    db_user = os.getenv("DB_USER", DB_USER_DEFAULT) # Using DB_USER from env
-    db_host = os.getenv("DB_HOST", DB_HOST_DEFAULT) # Using DB_HOST from env
-    db_port = os.getenv("DB_PORT", DB_PORT_DEFAULT) # Using DB_PORT from env
-    db_password = os.getenv("DB_PASS") # Using DB_PASS from env (can be None)
+async def get_backup_manager(test_mode: bool = False) -> Optional[BackupManager]: # Removed storage_manager argument
+    """
+    Factory function to create a BackupManager instance.
+    """
+    if not os.getenv("PGBACKREST_STANZA"):
+        logger.warning(f"PGBACKREST_STANZA environment variable not set. Using default: {PGBACKREST_STANZA_DEFAULT}. "\
+                       "BackupManager might not function correctly if this doesn't match the actual stanza.")
     
-    local_backup_dir = os.getenv("DB_SYNC_BACKUP_DIR", BACKUP_DIR_DEFAULT)
-    backup_prefix = os.getenv("DB_SYNC_BACKUP_PREFIX", BACKUP_PREFIX_DEFAULT)
-    manifest_filename = os.getenv("DB_SYNC_MANIFEST_FILENAME", MANIFEST_FILENAME_DEFAULT)
-    max_azure_backups = int(os.getenv("DB_SYNC_MAX_AZURE_BACKUPS", MAX_AZURE_BACKUPS_DEFAULT))
+    # Could add a check to see if pgbackrest CLI is available
+    try:
+        process = await asyncio.to_thread(
+            subprocess.run,
+            ["pgbackrest", "version"], # Simple command to check availability
+            capture_output=True, text=True, check=False
+        )
+        if process.returncode != 0:
+            logger.error(f"pgBackRest command-line tool may not be available or configured. Error: {process.stderr}")
+            # return None # Decide if this should be a fatal error for the manager
+    except FileNotFoundError:
+        logger.error(f"pgBackRest command-line tool not found in PATH. BackupManager will likely fail.")
+        # return None # Decide if this should be a fatal error for the manager
+        
+    logger.info(f"Creating BackupManager. Test mode: {test_mode}")
+    return BackupManager(test_mode=test_mode)
 
-    return BackupManager(
-        azure_manager=azure_manager,
-        db_name=db_name,
-        db_user=db_user,
-        db_host=db_host,
-        db_port=db_port,
-        db_password=db_password,
-        local_backup_dir=local_backup_dir,
-        backup_prefix=backup_prefix,
-        manifest_filename=manifest_filename,
-        max_azure_backups=max_azure_backups
-    )
 
-
-# Example Usage (for testing)
-async def _example_main_backup():
-    from gaia.validator.sync.azure_blob_utils import get_azure_blob_manager_for_db_sync # Relative import for example
-    logger.info("Testing BackupManager...")
+# Example Usage (for testing ad-hoc commands)
+async def _example_main_backup_adhoc():
+    logger.info("Testing BackupManager (Ad-hoc Commands)...")
     
-    # Ensure AZURE_STORAGE_CONNECTION_STRING is set for AzureBlobManager
-    if not os.getenv("AZURE_STORAGE_CONNECTION_STRING"):
-        logger.error("Please set AZURE_STORAGE_CONNECTION_STRING environment variable to test BackupManager.")
-        return
+    # This example assumes pgBackRest is configured and the stanza exists (e.g., via setup-primary.sh)
+    # It also assumes the necessary PGBACKREST_STANZA env var is set or default is used.
 
-    # It's also assumed that PostgreSQL is running and accessible for pg_dump
-    # and that pg_dump is in the system PATH. Adjust DB_USER and DB_NAME if needed via env vars.
-
-    azure_manager_instance = await get_azure_blob_manager_for_db_sync()
-    if not azure_manager_instance:
-        logger.error("Failed to initialize AzureBlobManager for BackupManager test.")
-        return
-
-    backup_manager_instance = await get_backup_manager(azure_manager_instance)
+    backup_manager_instance = await get_backup_manager(test_mode=True)
     if not backup_manager_instance:
-        logger.error("Failed to initialize BackupManager.")
-        await azure_manager_instance.close()
+        logger.error("Failed to initialize BackupManager for ad-hoc test.")
         return
     
     try:
-        logger.info("Performing a single backup cycle for testing...")
-        success = await backup_manager_instance.perform_backup_cycle()
-        if success:
-            logger.info("SUCCESS: Test backup cycle completed.")
-        else:
-            logger.error("FAILURE: Test backup cycle did not complete successfully.")
+        logger.info("Attempting to get pgBackRest info...")
+        await backup_manager_instance.get_info()
+        
+        logger.info("\nAttempting to run pgBackRest check...")
+        await backup_manager_instance.check_stanza_config()
+
+        # Example: Trigger an ad-hoc backup (ensure this is safe in your test environment)
+        # logger.info("\nAttempting to trigger an ad-hoc FULL backup (test mode)...")
+        # success = await backup_manager_instance.trigger_backup(backup_type="full")
+        # if success:
+        #     logger.info("SUCCESS: Ad-hoc full backup command completed.")
+        # else:
+        #     logger.error("FAILURE: Ad-hoc full backup command did not complete successfully.")
+
     except Exception as e:
-        logger.error(f"Error during BackupManager test: {e}", exc_info=True)
+        logger.error(f"Error during BackupManager ad-hoc test: {e}", exc_info=True)
     finally:
         await backup_manager_instance.close()
-        await azure_manager_instance.close()
 
 if __name__ == "__main__":
     # To run: python -m gaia.validator.sync.backup_manager
-    asyncio.run(_example_main_backup()) 
+    asyncio.run(_example_main_backup_adhoc()) 

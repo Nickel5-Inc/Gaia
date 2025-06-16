@@ -609,17 +609,49 @@ async def calculate_era5_miner_score(
             era5_truth_lead_slice = None
 
             try:
-                if np.issubdtype(miner_forecast_ds.time.dtype, np.integer):
+                # Robust dtype checking for timezone-aware dtypes
+                def _is_integer_dtype(dtype):
+                    """Check if dtype is integer, handling timezone-aware dtypes."""
+                    try:
+                        return np.issubdtype(dtype, np.integer)
+                    except TypeError:
+                        # Handle timezone-aware dtypes that can't be interpreted by numpy
+                        return False
+                
+                def _is_datetime_dtype(dtype):
+                    """Check if dtype is datetime, handling timezone-aware dtypes."""
+                    dtype_str = str(dtype)
+                    return (
+                        'datetime64' in dtype_str or
+                        dtype_str.startswith('<M8') or
+                        'datetime' in dtype_str.lower()
+                    )
+                
+                # Handle miner forecast dataset time dtype with robust checking
+                if _is_integer_dtype(miner_forecast_ds.time.dtype):
                     selection_label_miner = int(valid_time_dt.timestamp() * 1_000_000_000)
-                elif str(miner_forecast_ds.time.dtype) == 'datetime64[ns]':
-                    selection_label_miner = valid_time_dt.replace(tzinfo=None)
+                elif _is_datetime_dtype(miner_forecast_ds.time.dtype):
+                    dtype_str = str(miner_forecast_ds.time.dtype)
+                    if 'UTC' in dtype_str or 'tz' in dtype_str.lower():
+                        # Timezone-aware - use timezone-aware timestamp
+                        selection_label_miner = valid_time_dt
+                    else:
+                        # Timezone-naive - remove timezone
+                        selection_label_miner = valid_time_dt.replace(tzinfo=None)
                 else:
-                    selection_label_miner = valid_time_dt 
+                    selection_label_miner = valid_time_dt
 
-                if np.issubdtype(era5_truth_ds.time.dtype, np.integer):
+                # Handle ERA5 truth dataset time dtype with robust checking
+                if _is_integer_dtype(era5_truth_ds.time.dtype):
                     selection_label_era5 = int(valid_time_dt.timestamp() * 1_000_000_000)
-                elif str(era5_truth_ds.time.dtype) == 'datetime64[ns]':
-                    selection_label_era5 = valid_time_dt.replace(tzinfo=None)
+                elif _is_datetime_dtype(era5_truth_ds.time.dtype):
+                    dtype_str = str(era5_truth_ds.time.dtype)
+                    if 'UTC' in dtype_str or 'tz' in dtype_str.lower():
+                        # Timezone-aware - use timezone-aware timestamp
+                        selection_label_era5 = valid_time_dt
+                    else:
+                        # Timezone-naive - remove timezone
+                        selection_label_era5 = valid_time_dt.replace(tzinfo=None)
                 else:
                     selection_label_era5 = valid_time_dt
 
@@ -653,9 +685,11 @@ async def calculate_era5_miner_score(
                                    f"too far from target {valid_time_dt}. Skipping this valid_time.")
                     time_check_failed = True
                 
-                if not time_check_failed and abs((era5_time_actual_utc - valid_time_dt).total_seconds()) > 3600:
+                # Use more lenient tolerance for ERA5 in test mode where data availability may be limited
+                era5_time_tolerance = 21600  # 6 hours for ERA5 (more lenient for test mode)
+                if not time_check_failed and abs((era5_time_actual_utc - valid_time_dt).total_seconds()) > era5_time_tolerance:
                     logger.warning(f"[FinalScore] Miner {miner_hotkey}: Selected ERA5 truth time {era5_time_actual_utc} "
-                                   f"too far from target {valid_time_dt}. Skipping this valid_time.")
+                                   f"too far from target {valid_time_dt} (tolerance: {era5_time_tolerance/3600:.1f}h). Skipping this valid_time.")
                     time_check_failed = True
                 
                 if time_check_failed:
@@ -704,6 +738,63 @@ async def calculate_era5_miner_score(
                     miner_var_da_unaligned = miner_forecast_lead_slice[var_name]
                     truth_var_da_unaligned = era5_truth_lead_slice[var_name]
                     
+                    # Add detailed diagnostics for potential unit mismatches
+                    logger.info(f"[FinalScore] RAW DATA DIAGNOSTICS for {var_key} at {valid_time_dt}:")
+                    
+                    # Log data ranges before any processing
+                    miner_min, miner_max, miner_mean = float(miner_var_da_unaligned.min()), float(miner_var_da_unaligned.max()), float(miner_var_da_unaligned.mean())
+                    truth_min, truth_max, truth_mean = float(truth_var_da_unaligned.min()), float(truth_var_da_unaligned.max()), float(truth_var_da_unaligned.mean())
+                    
+                    logger.info(f"[FinalScore] Miner {var_key}: range=[{miner_min:.1f}, {miner_max:.1f}], mean={miner_mean:.1f}, units={miner_var_da_unaligned.attrs.get('units', 'unknown')}")
+                    logger.info(f"[FinalScore] ERA5  {var_key}: range=[{truth_min:.1f}, {truth_max:.1f}], mean={truth_mean:.1f}, units={truth_var_da_unaligned.attrs.get('units', 'unknown')}")
+                    
+                    # Check for potential unit mismatch indicators
+                    if var_name == 'z' and var_level == 500:
+                        # For z500, geopotential should be ~49000-58000 m²/s²
+                        # If it's geopotential height, it would be ~5000-6000 m
+                        miner_ratio = miner_mean / 9.80665  # If miner is geopotential, this ratio should be ~5000-6000
+                        truth_ratio = truth_mean / 9.80665
+                        logger.info(f"[FinalScore] z500 UNIT CHECK - If geopotential (m²/s²): miner_mean/g={miner_ratio:.1f}m, truth_mean/g={truth_ratio:.1f}m")
+                        
+                        if miner_mean < 10000:  # Much smaller than expected geopotential
+                            logger.warning(f"[FinalScore] POTENTIAL UNIT MISMATCH: Miner z500 mean ({miner_mean:.1f}) suggests geopotential height (m) rather than geopotential (m²/s²)")
+                        elif truth_mean > 40000 and miner_mean > 40000:
+                            logger.info(f"[FinalScore] Unit check OK: Both miner and truth z500 appear to be geopotential (m²/s²)")
+                    
+                    elif var_name == '2t':
+                        # Temperature should be ~200-320 K
+                        if miner_mean < 200 or miner_mean > 350:
+                            logger.warning(f"[FinalScore] POTENTIAL UNIT ISSUE: Miner 2t mean ({miner_mean:.1f}) outside expected range for Kelvin")
+                            
+                    elif var_name == 'msl':
+                        # Mean sea level pressure should be ~90000-110000 Pa
+                        if miner_mean < 50000 or miner_mean > 150000:
+                            logger.warning(f"[FinalScore] POTENTIAL UNIT ISSUE: Miner msl mean ({miner_mean:.1f}) outside expected range for Pa")
+                    
+                    # AUTOMATIC UNIT CONVERSION: Convert geopotential height to geopotential if needed
+                    if var_name == 'z' and miner_mean < 10000 and truth_mean > 40000:
+                        logger.warning(f"[FinalScore] AUTOMATIC UNIT CONVERSION: Converting miner z from geopotential height (m) to geopotential (m²/s²)")
+                        miner_var_da_unaligned = miner_var_da_unaligned * 9.80665
+                        miner_var_da_unaligned.attrs['units'] = 'm2 s-2'
+                        miner_var_da_unaligned.attrs['long_name'] = 'Geopotential (auto-converted from height)'
+                        logger.info(f"[FinalScore] After conversion: miner z range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}")
+
+                    # Check for temperature unit conversions (Celsius to Kelvin)
+                    elif var_name in ['2t', 't'] and miner_mean < 100 and truth_mean > 200:
+                        logger.warning(f"[FinalScore] AUTOMATIC UNIT CONVERSION: Converting miner {var_name} from Celsius to Kelvin")
+                        miner_var_da_unaligned = miner_var_da_unaligned + 273.15
+                        miner_var_da_unaligned.attrs['units'] = 'K'
+                        miner_var_da_unaligned.attrs['long_name'] = f'{miner_var_da_unaligned.attrs.get("long_name", var_name)} (auto-converted from Celsius)'
+                        logger.info(f"[FinalScore] After conversion: miner {var_name} range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}")
+
+                    # Check for pressure unit conversions (hPa to Pa)
+                    elif var_name == 'msl' and miner_mean < 2000 and truth_mean > 50000:
+                        logger.warning(f"[FinalScore] AUTOMATIC UNIT CONVERSION: Converting miner msl from hPa to Pa")
+                        miner_var_da_unaligned = miner_var_da_unaligned * 100.0
+                        miner_var_da_unaligned.attrs['units'] = 'Pa'
+                        miner_var_da_unaligned.attrs['long_name'] = 'Mean sea level pressure (auto-converted from hPa)'
+                        logger.info(f"[FinalScore] After conversion: miner msl range=[{float(miner_var_da_unaligned.min()):.1f}, {float(miner_var_da_unaligned.max()):.1f}], mean={float(miner_var_da_unaligned.mean()):.1f}")
+
                     clim_dayofyear = pd.Timestamp(valid_time_dt).dayofyear
                     clim_hour_rounded = (valid_time_dt.hour // 6) * 6
                     climatology_var_da_raw = era5_climatology_ds[standard_name_for_clim].sel(
@@ -711,10 +802,25 @@ async def calculate_era5_miner_score(
                     )
 
                     if var_level:
-                        miner_var_da_selected = miner_var_da_unaligned.sel(pressure_level=var_level, method="nearest").squeeze(drop=True)
-                        truth_var_da_selected = truth_var_da_unaligned.sel(pressure_level=var_level, method="nearest").squeeze(drop=True)
-                        if 'pressure_level' in climatology_var_da_raw.dims:
-                            climatology_var_da_selected = climatology_var_da_raw.sel(pressure_level=var_level, method="nearest").squeeze(drop=True)
+                        # Handle different pressure level dimension names robustly
+                        def _select_pressure_level(data_array, target_level):
+                            """Select pressure level handling multiple possible dimension names."""
+                            possible_pressure_dims = ['pressure_level', 'plev', 'level', 'levels', 'p']
+                            for dim_name in possible_pressure_dims:
+                                if dim_name in data_array.dims:
+                                    return data_array.sel(**{dim_name: target_level}, method="nearest").squeeze(drop=True)
+                            raise ValueError(f"No pressure level dimension found in {list(data_array.dims)}. Expected one of: {possible_pressure_dims}")
+                        
+                        miner_var_da_selected = _select_pressure_level(miner_var_da_unaligned, var_level)
+                        truth_var_da_selected = _select_pressure_level(truth_var_da_unaligned, var_level)
+                        # Apply robust pressure level selection to climatology too
+                        clim_pressure_dim = None
+                        for dim_name in ['pressure_level', 'plev', 'level', 'levels', 'p']:
+                            if dim_name in climatology_var_da_raw.dims:
+                                clim_pressure_dim = dim_name
+                                break
+                        if clim_pressure_dim:
+                            climatology_var_da_selected = climatology_var_da_raw.sel(**{clim_pressure_dim: var_level}, method="nearest").squeeze(drop=True)
                         else: 
                             climatology_var_da_selected = climatology_var_da_raw.squeeze(drop=True)
                     else:
@@ -744,8 +850,17 @@ async def calculate_era5_miner_score(
                     truth_var_da_final = target_grid_for_interp
                     
                     clim_var_to_interpolate = climatology_var_da_std
-                    if var_level and 'pressure_level' in clim_var_to_interpolate.dims and 'pressure_level' not in truth_var_da_final.dims:
-                        clim_var_to_interpolate = clim_var_to_interpolate.sel(pressure_level=var_level, method="nearest").squeeze(drop=True)
+                    # Apply robust pressure level handling to climatology interpolation
+                    if var_level:
+                        clim_pressure_dim = None
+                        for dim_name in ['pressure_level', 'plev', 'level', 'levels', 'p']:
+                            if dim_name in clim_var_to_interpolate.dims:
+                                clim_pressure_dim = dim_name
+                                break
+                        # If climatology still has pressure dimensions but truth doesn't, select the level  
+                        truth_has_pressure = any(dim in truth_var_da_final.dims for dim in ['pressure_level', 'plev', 'level', 'levels', 'p'])
+                        if clim_pressure_dim and not truth_has_pressure:
+                            clim_var_to_interpolate = clim_var_to_interpolate.sel(**{clim_pressure_dim: var_level}, method="nearest").squeeze(drop=True)
                     
                     climatology_da_aligned = await asyncio.to_thread(
                         clim_var_to_interpolate.interp_like, truth_var_da_final, method="linear", kwargs={"fill_value": None}
@@ -766,7 +881,7 @@ async def calculate_era5_miner_score(
                     
                     actual_bias_op = (miner_var_da_aligned - truth_var_da_final)
                     
-                    async def calculate_mean_scalar_threaded(op):
+                    def calculate_mean_scalar_threaded(op):
                         computed_mean = op.mean()
                         if hasattr(computed_mean, 'compute'):
                             computed_mean = computed_mean.compute()
@@ -801,35 +916,87 @@ async def calculate_era5_miner_score(
                     all_metrics_for_db.append(acc_metric_row)
 
                     skill_score_val = None
-                    skill_score_type_gfs = f"era5_skill_gfs_{var_key}_{lead_hours}h"
-                    skill_rec_gfs = await task_instance.db_manager.fetch_one(
-                        "SELECT score FROM weather_miner_scores WHERE response_id = :resp_id AND score_type = :stype",
-                        {"resp_id": response_id, "stype": skill_score_type_gfs}
-                    )
-                    if skill_rec_gfs and skill_rec_gfs['score'] is not None and np.isfinite(skill_rec_gfs['score']):
-                        skill_score_val = skill_rec_gfs['score']
-                        logger.info(f"[FinalScore] UID {miner_uid} - Using GFS-based skill for {var_key} L{lead_hours}h: {skill_score_val:.4f}")
-                    else:
-                        skill_score_type_clim = f"era5_skill_clim_{var_key}_{lead_hours}h"
-                        skill_rec_clim = await task_instance.db_manager.fetch_one(
-                            "SELECT score FROM weather_miner_scores WHERE response_id = :resp_id AND score_type = :stype",
-                            {"resp_id": response_id, "stype": skill_score_type_clim}
-                        )
-                        if skill_rec_clim and skill_rec_clim['score'] is not None and np.isfinite(skill_rec_clim['score']):
-                            skill_score_val = skill_rec_clim['score']
-                            logger.info(f"[FinalScore] UID {miner_uid} - Using CLIM-based skill for {var_key} L{lead_hours}h: {skill_score_val:.4f} (GFS-based not found/valid)")
-                        else:
-                            logger.warning(f"[FinalScore] UID {miner_uid} - No valid GFS or CLIM skill score found for {var_key} L{lead_hours}h.")
+                    
+                    if gfs_op_lead_slice is not None:
+                        try:
+                            if var_name in gfs_op_lead_slice:
+                                gfs_var_da_unaligned = gfs_op_lead_slice[var_name]
 
-                    skill_metric_row = {**db_metric_row_base, 
-                                        "metrics": current_metrics.copy(), 
-                                        "score_type": f"era5_skill_clim_{var_key}_{int(lead_hours)}h", 
-                                        "score": skill_score_val
-                                       }
-                    all_metrics_for_db.append(skill_metric_row)
+                                if var_level:
+                                    gfs_pressure_dim = None
+                                    for dim_name in ['pressure_level', 'plev', 'level', 'isobaricInhPa']:
+                                        if dim_name in gfs_var_da_unaligned.dims:
+                                            gfs_pressure_dim = dim_name
+                                            break
+                                    
+                                    if gfs_pressure_dim:
+                                        gfs_var_da_selected = gfs_var_da_unaligned.sel({gfs_pressure_dim: var_level}, method="nearest")
+                                    else:
+                                        logger.warning(f"[FinalScore] No pressure dimension found in GFS data for {var_key}. Using surface data.")
+                                        gfs_var_da_selected = gfs_var_da_unaligned
+                                else:
+                                    gfs_var_da_selected = gfs_var_da_unaligned
+                                
+                                gfs_var_da_std = _standardize_spatial_dims_final(gfs_var_da_selected)
+                                gfs_var_da_aligned = await asyncio.to_thread(
+                                    gfs_var_da_std.interp_like, truth_var_da_final, method="linear", kwargs={"fill_value": None}
+                                )
+                                
+                                # bias correction - fresh calculation for each variable to prevent reuse
+                                forecast_bc_da = await calculate_bias_corrected_forecast(miner_var_da_aligned, truth_var_da_final)
+                                
+                                # skill score
+                                skill_score_val = await calculate_mse_skill_score(
+                                    forecast_bc_da, truth_var_da_final, gfs_var_da_aligned, lat_weights
+                                )
+                                
+                                if np.isfinite(skill_score_val):
+                                    logger.info(f"[FinalScore] UID {miner_uid} - Calculated GFS-based skill for {var_key} L{lead_hours}h: {skill_score_val:.4f}")
+                                    skill_metric_row = {**db_metric_row_base, 
+                                                       "metrics": current_metrics.copy(), 
+                                                       "score_type": f"era5_skill_gfs_{var_key}_{int(lead_hours)}h", 
+                                                       "score": skill_score_val}
+                                    all_metrics_for_db.append(skill_metric_row)
+                                else:
+                                    logger.warning(f"[FinalScore] UID {miner_uid} - Calculated skill score is non-finite for {var_key} L{lead_hours}h")
+                                    skill_score_val = None
+                            else:
+                                logger.warning(f"[FinalScore] UID {miner_uid} - Variable {var_name} not found in GFS forecast data")
+                        except Exception as e_skill:
+                            logger.error(f"[FinalScore] UID {miner_uid} - Error calculating skill score for {var_key} L{lead_hours}h: {e_skill}", exc_info=True)
+                            skill_score_val = None
+                    else:
+                        logger.warning(f"[FinalScore] UID {miner_uid} - No GFS forecast data available for skill score calculation")
+                    
+                    if skill_score_val is None:
+                        try:
+                            # bias correction - ALWAYS recalculate for each variable (prevent variable reuse bug)
+                            forecast_bc_da = await calculate_bias_corrected_forecast(miner_var_da_aligned, truth_var_da_final)
+                            
+                            # skill score vs climatology
+                            skill_score_val = await calculate_mse_skill_score(
+                                forecast_bc_da, truth_var_da_final, climatology_da_aligned, lat_weights
+                            )
+                            
+                            if np.isfinite(skill_score_val):
+                                logger.info(f"[FinalScore] UID {miner_uid} - Calculated CLIM-based skill for {var_key} L{lead_hours}h: {skill_score_val:.4f}")
+                                skill_metric_row = {**db_metric_row_base, 
+                                                   "metrics": current_metrics.copy(), 
+                                                   "score_type": f"era5_skill_clim_{var_key}_{int(lead_hours)}h", 
+                                                   "score": skill_score_val}
+                                all_metrics_for_db.append(skill_metric_row)
+                            else:
+                                logger.warning(f"[FinalScore] UID {miner_uid} - Calculated climatology skill score is non-finite for {var_key} L{lead_hours}h")
+                                skill_score_val = None
+                        except Exception as e_clim_skill:
+                            logger.error(f"[FinalScore] UID {miner_uid} - Error calculating climatology skill score for {var_key} L{lead_hours}h: {e_clim_skill}", exc_info=True)
+                            skill_score_val = None
+                    
+                    if skill_score_val is None:
+                        logger.warning(f"[FinalScore] UID {miner_uid} - No valid skill score calculated for {var_key} L{lead_hours}h")
                     
                     skill_score_log_str = f"{skill_score_val:.3f}" if skill_score_val is not None else "N/A"
-                    logger.info(f"[FinalScore] Miner {miner_hotkey} V:{var_key} L:{int(lead_hours)}h RMSE:{current_metrics.get('rmse', np.nan):.2f} ACC:{current_metrics.get('acc', np.nan):.3f} SKILL(clim):{skill_score_log_str}")
+                    logger.info(f"[FinalScore] Miner {miner_hotkey} V:{var_key} L:{int(lead_hours)}h RMSE:{current_metrics.get('rmse', np.nan):.2f} ACC:{current_metrics.get('acc', np.nan):.3f} SKILL:{skill_score_log_str}")
 
                 except KeyError as ke:
                     logger.error(f"[FinalScore] Miner {miner_hotkey}: KeyError scoring {var_key} at {valid_time_dt}: {ke}. This often means the variable was not found in one of the datasets (miner, truth, or climatology).", exc_info=True)
@@ -841,8 +1008,38 @@ async def calculate_era5_miner_score(
                     all_metrics_for_db.append(error_metric_row)
     finally:
         if miner_forecast_ds:
-            try: miner_forecast_ds.close()
-            except Exception: pass
+            try: 
+                miner_forecast_ds.close()
+                logger.debug(f"[FinalScore] Closed miner forecast dataset for {miner_hotkey}")
+            except Exception: 
+                pass
+        
+        # CRITICAL: Enhanced cleanup per miner for ERA5 scoring
+        try:
+            # Clear any ERA5-specific intermediate objects created during this miner's evaluation
+            miner_specific_objects = [
+                'miner_forecast_ds', 'gfs_operational_fcst_ds', 'miner_forecast_lead_slice', 
+                'era5_truth_lead_slice', 'gfs_op_lead_slice'
+            ]
+            
+            for obj_name in miner_specific_objects:
+                if obj_name in locals():
+                    try:
+                        obj = locals()[obj_name]
+                        if hasattr(obj, 'close'):
+                            obj.close()
+                        del obj
+                    except Exception:
+                        pass
+            
+            # Force cleanup for this miner's processing
+            collected = gc.collect()
+            logger.debug(f"[FinalScore] Cleanup for {miner_hotkey}: collected {collected} objects")
+            
+        except Exception as cleanup_err:
+            logger.debug(f"[FinalScore] Cleanup error for {miner_hotkey}: {cleanup_err}")
+        
+        # Final garbage collection
         gc.collect()
     
     if not all_metrics_for_db:

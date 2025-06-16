@@ -3,11 +3,11 @@ model:
 
   # --- Aurora Model Configuration --- 
   # For Hugging Face Hub model:
-  model_repo: "microsoft/aurora"
+  # model_repo: "microsoft/aurora"
   checkpoint: "aurora-0.25-pretrained.ckpt"
   
   # OR For a local model (ensure files are copied into the Docker image, e.g., to /app/local_models/my_aurora_model):
-  # model_repo: "/app/local_models/my_aurora_model" # Path to the directory containing the checkpoint and other model files
+  model_repo: "/app/models/aurora_local" # Path to the directory containing the checkpoint and other model files
   # checkpoint: "my_custom_weights.ckpt" # Name of the checkpoint file in the model_repo directory
 
   device: "auto" # "cuda", "cpu", or "auto" to pick best available
@@ -31,7 +31,7 @@ data:
   static_download_dir: "/app/static_data" # Path inside the container for static data if aurora needs it 
 
 security:
-  api_key: fOcuWmBM8UuhMWllLxrkD+C78zBpjZlbSlElv+98C3A=
+  api_key_env_var: "INFERENCE_SERVICE_API_KEY" # Name of the ENV VAR that holds the actual API key
 
 # env: # You can remove this 'env' section if it only contained the API key, or keep it for other env-like configs.
   # INFERENCE_SERVICE_API_KEY: fOcuWmBM8UuhMWllLxrkD+C78zBpjZlbSlElv+98C3A= # <-- Remove or comment out
@@ -40,3 +40,9 @@ security:
 storage:
   network_volume_base_path: "/mnt/runpod_volume/forecast_outputs" # Example mount path for outputs
   # Ensure this '/mnt/runpod_volume' part matches how you configure the mount in RunPod
+
+r2:
+  bucket_env_var: "R2_BUCKET" # Env var holding the bucket name
+  endpoint_url_env_var: "R2_ENDPOINT_URL" # Env var holding the R2 endpoint URL
+  access_key_id_env_var: "R2_ACCESS_KEY" # Env var holding the R2 Access Key ID
+  secret_access_key_env_var: "R2_SECRET_ACCESS_KEY" # Env var holding the R2 Secret Access Key

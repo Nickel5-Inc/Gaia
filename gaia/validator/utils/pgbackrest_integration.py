@@ -30,9 +30,10 @@ class PgBackRestIntegration:
         try:
             # Load configuration from environment variables with PGBACKREST_ prefix
             env_mapping = {
-                'AZURE_STORAGE_ACCOUNT': 'PGBACKREST_AZURE_STORAGE_ACCOUNT',
-                'AZURE_STORAGE_KEY': 'PGBACKREST_AZURE_STORAGE_KEY', 
-                'AZURE_CONTAINER': 'PGBACKREST_AZURE_CONTAINER',
+                'R2_BUCKET': 'PGBACKREST_R2_BUCKET',
+                'R2_ENDPOINT': 'PGBACKREST_R2_ENDPOINT', 
+                'R2_ACCESS_KEY': 'PGBACKREST_R2_ACCESS_KEY_ID',
+                'R2_SECRET_KEY': 'PGBACKREST_R2_SECRET_ACCESS_KEY',
                 'STANZA_NAME': 'PGBACKREST_STANZA_NAME',
                 'PGDATA': 'PGBACKREST_PGDATA',
                 'PGPORT': 'PGBACKREST_PGPORT',
@@ -72,8 +73,8 @@ class PgBackRestIntegration:
             # Check if configuration file exists OR we have environment variables
             config_file_exists = os.path.exists('/etc/pgbackrest/pgbackrest.conf')
             
-            # Check if we have required Azure configuration in environment
-            required_keys = ['AZURE_STORAGE_ACCOUNT', 'AZURE_STORAGE_KEY', 'AZURE_CONTAINER']
+            # Check if we have required R2 configuration in environment
+            required_keys = ['R2_BUCKET', 'R2_ENDPOINT', 'R2_ACCESS_KEY', 'R2_SECRET_KEY']
             env_config_complete = all(key in self.config for key in required_keys)
             
             if not config_file_exists and not env_config_complete:
@@ -165,7 +166,7 @@ class PgBackRestIntegration:
             'available': self.is_available,
             'last_backup': None,
             'backup_count': 0,
-            'azure_connectivity': False,
+            'r2_connectivity': False,
             'wal_archiving': False
         }
         
@@ -183,7 +184,7 @@ class PgBackRestIntegration:
             stdout, stderr = await proc.communicate()
             
             if proc.returncode == 0:
-                status['azure_connectivity'] = True
+                status['r2_connectivity'] = True
                 output = stdout.decode()
                 # Parse backup information (simplified)
                 if 'full backup:' in output.lower():
@@ -270,8 +271,8 @@ class PgBackRestIntegration:
             if lag is not None and lag > 300:  # 5 minutes
                 status['recommendations'].append(f"High replication lag: {lag:.1f} seconds")
         
-        if not status['backup_status'].get('azure_connectivity', False):
-            status['recommendations'].append("Azure Storage connectivity issues detected")
+        if not status['backup_status'].get('r2_connectivity', False):
+            status['recommendations'].append("R2 Storage connectivity issues detected")
         
         if status['node_type'] == 'primary' and not status['backup_status'].get('wal_archiving', False):
             status['recommendations'].append("WAL archiving not working properly")

@@ -1,5 +1,6 @@
 aiohttp
 asyncpg
+alembic
 boto3
 botocore
 cryptography
@@ -47,3 +48,5 @@ pyinstrument
 kerchunk
 alembic
 gcsfs
+aioboto3
+blosc 
