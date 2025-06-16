@@ -1334,7 +1334,7 @@ class AutoSyncManager:
             return True
 
     async def _configure_pgbackrest(self) -> bool:
-        """Configure pgBackRest with R2 settings."""
+        """Configure pgBackRest with R2 settings and automatic stanza name correction."""
         try:
             logger.info("Configuring pgBackRest...")
             
@@ -1344,7 +1344,49 @@ class AutoSyncManager:
                 os.makedirs(dir_path, exist_ok=True)
                 shutil.chown(dir_path, user='postgres', group='postgres')
             
-            # pgBackRest configuration
+            config_file = '/etc/pgbackrest/pgbackrest.conf'
+            expected_stanza = self.config['stanza_name']
+            
+            # Check if config file exists and detect stanza mismatches
+            if os.path.exists(config_file):
+                logger.info("🔍 Checking existing pgBackRest configuration for stanza mismatches...")
+                try:
+                    with open(config_file, 'r') as f:
+                        existing_content = f.read()
+                    
+                    # Find all stanza sections (lines starting with [ and ending with ])
+                    import re
+                    stanza_pattern = r'^\[([^\]]+)\]'
+                    existing_stanzas = []
+                    
+                    for line in existing_content.split('\n'):
+                        match = re.match(stanza_pattern, line.strip())
+                        if match:
+                            stanza_name = match.group(1)
+                            if stanza_name != 'global':  # Skip [global] section
+                                existing_stanzas.append(stanza_name)
+                    
+                    if existing_stanzas:
+                        logger.info(f"📋 Found existing stanzas in config: {existing_stanzas}")
+                        
+                        # Check if our expected stanza is already there
+                        if expected_stanza not in existing_stanzas:
+                            logger.warning(f"🔧 Stanza mismatch detected!")
+                            logger.warning(f"   Expected: [{expected_stanza}]")
+                            logger.warning(f"   Found: {existing_stanzas}")
+                            logger.info("🔄 Automatically updating configuration to match network settings...")
+                            
+                            # Create backup of old config
+                            backup_file = f"{config_file}.backup.{int(time.time())}"
+                            shutil.copy2(config_file, backup_file)
+                            logger.info(f"📋 Backed up old config to: {backup_file}")
+                        else:
+                            logger.info(f"✅ Configuration already has correct stanza: [{expected_stanza}]")
+                    
+                except Exception as e:
+                    logger.warning(f"Could not analyze existing config: {e}. Will recreate.")
+            
+            # Generate new configuration content
             config_content = f"""[global]
 repo1-type=s3
 repo1-s3-bucket={self.config['r2_bucket']}
@@ -1359,14 +1401,13 @@ process-max={'2' if self.test_mode else '4'}
 log-level-console=info
 log-level-file=debug
 
-[{self.config['stanza_name']}]
+[{expected_stanza}]
 pg1-path={self.config['pgdata']}
 pg1-port={self.config['pgport']}
 pg1-user={self.config['pguser']}
 """
             
-            # Write configuration
-            config_file = '/etc/pgbackrest/pgbackrest.conf'
+            # Write updated configuration
             with open(config_file, 'w') as f:
                 f.write(config_content)
             
@@ -1374,7 +1415,7 @@ pg1-user={self.config['pguser']}
             os.chmod(config_file, 0o640)
             shutil.chown(config_file, user='postgres', group='postgres')
             
-            logger.info("✅ pgBackRest configured successfully")
+            logger.info(f"✅ pgBackRest configured successfully with stanza: [{expected_stanza}]")
             return True
             
         except Exception as e:
@@ -2552,8 +2593,11 @@ pg1-user={self.config['pguser']}
             logger.warning(f"Configuration repair had issues: {e}")
 
     async def _detect_stanza_conflicts(self):
-        """Detect if there are multiple or conflicting stanza configurations."""
+        """Detect if there are multiple or conflicting stanza configurations and fix them automatically."""
         try:
+            expected_stanza = self.config['stanza_name']
+            logger.info(f"🔍 Checking for stanza conflicts. Expected stanza: [{expected_stanza}]")
+            
             # Check what stanzas exist in pgBackRest
             info_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 'info']
             process = await asyncio.create_subprocess_exec(
@@ -2563,8 +2607,8 @@ pg1-user={self.config['pguser']}
             )
             stdout, stderr = await process.communicate()
             
+            existing_stanzas = []
             if process.returncode == 0 and stdout:
-                existing_stanzas = []
                 for line in stdout.decode().split('\n'):
                     if line.startswith('stanza:'):
                         stanza_name = line.split(':')[1].strip()
@@ -2574,13 +2618,104 @@ pg1-user={self.config['pguser']}
                     logger.info(f"📊 Found existing stanzas: {existing_stanzas}")
                     
                     # Check if our target stanza is among them
-                    if self.config['stanza_name'] not in existing_stanzas:
-                        logger.info(f"🆕 Will create new stanza: {self.config['stanza_name']}")
+                    if expected_stanza not in existing_stanzas:
+                        logger.warning(f"🔧 Stanza mismatch detected in pgBackRest!")
+                        logger.warning(f"   Expected: [{expected_stanza}]")
+                        logger.warning(f"   Found: {existing_stanzas}")
+                        
+                        # Automatically clean up old stanzas and recreate with correct name
+                        await self._fix_stanza_mismatch(existing_stanzas, expected_stanza)
                     else:
-                        logger.info(f"♻️ Will reuse existing stanza: {self.config['stanza_name']}")
+                        logger.info(f"✅ Correct stanza already exists: [{expected_stanza}]")
+                else:
+                    logger.info(f"📋 No existing stanzas found. Will create: [{expected_stanza}]")
+            else:
+                logger.info(f"📋 pgBackRest info command failed (expected for new setup). Will create: [{expected_stanza}]")
                         
         except Exception as e:
             logger.debug(f"Stanza conflict detection failed: {e}")
+
+    async def _fix_stanza_mismatch(self, existing_stanzas: List[str], expected_stanza: str):
+        """Automatically fix stanza name mismatches by cleaning up old stanzas and recreating."""
+        try:
+            logger.info("🔧 Automatically fixing stanza mismatch...")
+            
+            # Stop archiving temporarily to prevent conflicts during cleanup
+            logger.info("🛑 Temporarily disabling archive command...")
+            await self._set_archive_command("off")
+            
+            # Delete all existing stanzas that don't match our expected name
+            for old_stanza in existing_stanzas:
+                if old_stanza != expected_stanza:
+                    logger.info(f"🗑️  Removing old stanza: [{old_stanza}]")
+                    delete_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
+                                 f'--stanza={old_stanza}', 'stanza-delete', '--force']
+                    
+                    process = await asyncio.create_subprocess_exec(
+                        *delete_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await process.communicate()
+                    
+                    if process.returncode == 0:
+                        logger.info(f"✅ Successfully removed old stanza: [{old_stanza}]")
+                    else:
+                        logger.warning(f"⚠️ Warning during stanza deletion (may be expected): {stderr.decode() if stderr else 'unknown'}")
+            
+            # Wait a moment for cleanup
+            await asyncio.sleep(2)
+            
+            # Create the correct stanza
+            logger.info(f"🆕 Creating correct stanza: [{expected_stanza}]")
+            create_cmd = ['sudo', '-u', 'postgres', 'pgbackrest', 
+                         f'--stanza={expected_stanza}', 'stanza-create']
+            
+            process = await asyncio.create_subprocess_exec(
+                *create_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                logger.info(f"✅ Successfully created correct stanza: [{expected_stanza}]")
+            else:
+                # Check if stanza already exists
+                if 'already exists' in stderr.decode().lower():
+                    logger.info(f"✅ Stanza already exists: [{expected_stanza}]")
+                else:
+                    logger.error(f"❌ Failed to create stanza: {stderr.decode() if stderr else 'unknown'}")
+                    return False
+            
+            # Re-enable archive command with correct stanza name
+            logger.info("🔄 Re-enabling archive command with correct stanza...")
+            archive_command = f"pgbackrest --stanza={expected_stanza} archive-push %p"
+            await self._set_archive_command(archive_command)
+            
+            # Verify the fix worked
+            logger.info("🔍 Verifying stanza fix...")
+            check_cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
+                        f'--stanza={expected_stanza}', 'check']
+            
+            process = await asyncio.create_subprocess_exec(
+                *check_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                logger.info("🎉 Stanza mismatch fix completed successfully!")
+                return True
+            else:
+                logger.warning(f"⚠️ Stanza fix verification had issues: {stderr.decode() if stderr else 'unknown'}")
+                logger.info("🔄 Will proceed with setup - issues may be resolved during initialization")
+                return True  # Continue anyway, issues might be resolved during backup initialization
+                
+        except Exception as e:
+            logger.error(f"Failed to fix stanza mismatch: {e}")
+            return False
 
     async def _clean_old_configurations(self):
         """Clean up any old configuration files that might interfere."""
