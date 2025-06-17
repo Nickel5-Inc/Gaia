@@ -326,7 +326,7 @@ class ComprehensiveDatabaseSetup:
                 return False
         
         # Initialize database cluster for RHEL systems
-        init_cmd = [f'postgresql-{self.config.postgres_version}-setup', 'initdb']
+        init_cmd = ['sudo', f'postgresql-{self.config.postgres_version}-setup', 'initdb']
         await self._run_command(init_cmd, timeout=60)
         
         logger.info("✅ PostgreSQL installed successfully on RHEL/CentOS/Fedora")

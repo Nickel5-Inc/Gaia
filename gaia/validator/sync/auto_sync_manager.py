@@ -1195,13 +1195,20 @@ class AutoSyncManager:
                 pgpass_content += f"127.0.0.1:{self.config['pgport']}:*:{self.config['pguser']}:{self.config['pgpassword']}\n"
                 pgpass_content += f"*:{self.config['pgport']}:*:{self.config['pguser']}:{self.config['pgpassword']}\n"
                 
-                # Write .pgpass file
-                with open(pgpass_file, 'w') as f:
-                    f.write(pgpass_content)
+                # Write .pgpass file using sudo since it's in postgres home directory
+                process = await asyncio.create_subprocess_exec(
+                    'sudo', 'tee', pgpass_file,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate(input=pgpass_content.encode())
                 
                 # Set correct permissions and ownership
-                os.chmod(pgpass_file, 0o600)
-                # Use subprocess for chown since it needs elevated privileges
+                chmod_cmd = ['sudo', 'chmod', '600', pgpass_file]
+                process = await asyncio.create_subprocess_exec(*chmod_cmd)
+                await process.wait()
+                
                 chown_cmd = ['sudo', 'chown', 'postgres:postgres', pgpass_file]
                 process = await asyncio.create_subprocess_exec(*chown_cmd)
                 await process.wait()
@@ -1280,8 +1287,10 @@ class AutoSyncManager:
             # Ensure postgres user can access pgBackRest config
             config_file = '/etc/pgbackrest/pgbackrest.conf'
             if os.path.exists(config_file):
-                # Make sure postgres user can read the config
-                os.chmod(config_file, 0o644)  # More permissive for testing
+                # Make sure postgres user can read the config using sudo
+                chmod_cmd = ['sudo', 'chmod', '644', config_file]
+                process = await asyncio.create_subprocess_exec(*chmod_cmd)
+                await process.wait()
                 logger.info("Updated pgBackRest config permissions for postgres user")
             
             # Test archive command manually
@@ -2660,14 +2669,28 @@ pg1-user={self.config['pguser']}
             
             try:
                 await self._stop_postgresql_service() # Ensure it's stopped before wipe
+                logger.info(f"   - Wiping data directory for clean restore: {data_path}")
+                
+                # Use sudo to remove the directory since it's owned by postgres
                 if data_path.exists():
-                    shutil.rmtree(data_path)
-                data_path.mkdir(parents=True, exist_ok=True)
-                pg_uid = self.system_info.get('postgresql_uid')
-                pg_gid = self.system_info.get('postgresql_gid')
-                if pg_uid is not None and pg_gid is not None:
-                    os.chown(data_path, pg_uid, pg_gid)
-                os.chmod(data_path, 0o700)
+                    rm_cmd = ['sudo', 'rm', '-rf', str(data_path)]
+                    process = await asyncio.create_subprocess_exec(*rm_cmd)
+                    await process.wait()
+                
+                # Create directory with sudo
+                mkdir_cmd = ['sudo', 'mkdir', '-p', str(data_path)]
+                process = await asyncio.create_subprocess_exec(*mkdir_cmd)
+                await process.wait()
+                
+                # Set ownership and permissions with sudo
+                chown_cmd = ['sudo', 'chown', 'postgres:postgres', str(data_path)]
+                process = await asyncio.create_subprocess_exec(*chown_cmd)
+                await process.wait()
+                
+                chmod_cmd = ['sudo', 'chmod', '700', str(data_path)]
+                process = await asyncio.create_subprocess_exec(*chmod_cmd)
+                await process.wait()
+                
                 logger.info(f"   - Successfully wiped and recreated data directory: {data_path}")
             except Exception as e:
                 logger.critical(f"💥 Failed to wipe directory for full restore fallback: {e}. Manual intervention required.")
@@ -3318,8 +3341,14 @@ pg1-user={self.config['pguser']}
                 content = content.replace('local   all             all                                     peer',
                                         'local   all             all                                     trust')
                 
-                with open(hba_conf_path, 'w') as f:
-                    f.write(content)
+                # Write using sudo since it might be in /etc/
+                process = await asyncio.create_subprocess_exec(
+                    'sudo', 'tee', str(hba_conf_path),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate(input=content.encode())
                 
                 logger.info(f"✅ Updated pg_hba.conf for initial setup: {hba_conf_path}")
             
@@ -3391,8 +3420,14 @@ pg1-user={self.config['pguser']}
                 content = content.replace('local   all             all                                     trust',
                                         'local   all             all                                     md5')
                 
-                with open(hba_conf_path, 'w') as f:
-                    f.write(content)
+                # Write using sudo since it might be in /etc/
+                process = await asyncio.create_subprocess_exec(
+                    'sudo', 'tee', str(hba_conf_path),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate(input=content.encode())
                 
                 logger.info(f"✅ Updated pg_hba.conf to use md5 authentication: {hba_conf_path}")
             else:
