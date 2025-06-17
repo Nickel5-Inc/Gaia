@@ -43,6 +43,7 @@ import subprocess
 import boto3 # For R2
 from botocore.exceptions import ClientError as BotoClientError # For R2 error handling, aliased to avoid conflict if other ClientError exists
 from . import weather_http_utils
+from concurrent.futures import ProcessPoolExecutor
 
 # Ensure blosc codec is available for zarr operations
 try:
@@ -276,6 +277,13 @@ class WeatherTask(Task):
         era5_scoring_concurrency = int(os.getenv('WEATHER_VALIDATOR_ERA5_SCORING_CONCURRENCY', '4'))
         self.era5_scoring_semaphore = asyncio.Semaphore(era5_scoring_concurrency)
         logger.info(f"ERA5 scoring concurrency for validator set to: {era5_scoring_concurrency}")
+
+        # Process pool for CPU-bound scoring tasks
+        self.scoring_executor = None
+        if self.node_type == "validator":
+            max_workers = self.config.get('scoring_max_workers', max(1, os.cpu_count() // 2))
+            self.scoring_executor = ProcessPoolExecutor(max_workers=max_workers)
+            logger.info(f"Initialized ProcessPoolExecutor for scoring with max_workers={max_workers}")
 
         # Configure file serving mode for miners
         if self.node_type == "miner":
@@ -2072,64 +2080,25 @@ class WeatherTask(Task):
     ############################################################
 
     async def cleanup_resources(self):
-        """
-        Cleans up old files from the local filesystem.
-        """
-        logger.info("Cleaning up weather task resources...")
+        """Clean up resources like database connections and background workers."""
+        logger.info("WeatherTask: Cleaning up resources...")
+
+        # Shutdown the process pool executor
+        if self.scoring_executor:
+            logger.info("Shutting down scoring ProcessPoolExecutor...")
+            self.scoring_executor.shutdown(wait=True)
+            logger.info("Scoring ProcessPoolExecutor shut down.")
+
+        # Stop all background workers
+        await self.stop_background_workers()
+
+        # Close database connections if the db_manager is responsible for the engine
+        if self.db_manager and hasattr(self.db_manager, 'engine') and self.db_manager.engine:
+            logger.info("Closing database connections...")
+            await self.db_manager.close()
+            logger.info("Database connections closed.")
         
-        # Stop all background workers with proper awaiting
-        logger.info("Stopping all background workers...")
-        try:
-            await self.stop_background_workers()
-        except Exception as e:
-            logger.error(f"Error during background worker cleanup: {e}")
-        
-        # Clean up ERA5 climatology dataset
-        try:
-            if hasattr(self, 'era5_climatology_ds') and self.era5_climatology_ds is not None:
-                logger.info("Closing ERA5 climatology dataset...")
-                self.era5_climatology_ds.close()
-                self.era5_climatology_ds = None
-                logger.info("Closed ERA5 climatology dataset")
-        except Exception as e:
-            logger.warning(f"Error closing ERA5 climatology dataset: {e}")
-
-        # Clean up any HTTP clients
-        try:
-            if hasattr(self, 'validator') and self.validator and hasattr(self.validator, 'miner_client'):
-                logger.info("Closing validator HTTP clients...")
-                if not self.validator.miner_client.is_closed:
-                    await self.validator.miner_client.aclose()
-                logger.info("Closed validator HTTP clients")
-        except Exception as e:
-            logger.warning(f"Error closing HTTP clients: {e}")
-
-        # Clean up fsspec/gcsfs caches and sessions
-        try:
-            logger.info("Clearing fsspec filesystem cache...")
-            # Suppress fsspec warnings during shutdown
-            import logging
-            logging.getLogger('fsspec').setLevel(logging.ERROR)
-            logging.getLogger('gcsfs').setLevel(logging.ERROR)
-            logging.getLogger('aiohttp').setLevel(logging.ERROR)
-            
-            # Clear fsspec registry and cache to prevent session cleanup issues
-            fsspec.config.conf.clear()
-            if hasattr(fsspec.filesystem, '_cache'):
-                fsspec.filesystem._cache.clear()
-            logger.info("Cleared fsspec caches")
-        except Exception as e:
-            logger.warning(f"Error clearing fsspec caches: {e}")
-
-        # Force garbage collection to help with cleanup
-        try:
-            import gc
-            collected = gc.collect()
-            logger.info(f"Garbage collection freed {collected} objects")
-        except Exception as e:
-            logger.warning(f"Error during garbage collection: {e}")
-
-        logger.info("Weather task cleanup completed")
+        logger.info("WeatherTask: Resource cleanup complete.")
 
     async def start_initial_scoring_workers(self, num_workers=1):
         if self.node_type != "validator":
