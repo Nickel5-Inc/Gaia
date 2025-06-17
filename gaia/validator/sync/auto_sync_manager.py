@@ -625,8 +625,8 @@ class AutoSyncManager:
             logger.info("Installing using apt (Debian/Ubuntu)...")
             
             commands = [
-                (['apt-get', 'update'], 120, "Updating package lists"),
-                (['apt-get', 'install', '-y', 'pgbackrest', 'postgresql-client'], 300, "Installing pgBackRest and PostgreSQL client")
+                (['sudo', 'apt-get', 'update'], 120, "Updating package lists"),
+                (['sudo', 'apt-get', 'install', '-y', 'pgbackrest', 'postgresql-client'], 300, "Installing pgBackRest and PostgreSQL client")
             ]
             
             for cmd, timeout, description in commands:
@@ -665,9 +665,9 @@ class AutoSyncManager:
             logger.info(f"Installing using {package_cmd} (RHEL/CentOS/Fedora)...")
             
             commands = [
-                ([package_cmd, 'install', '-y', 'epel-release'], 120, "Installing EPEL repository"),
-                ([package_cmd, 'update', '-y'], 180, "Updating packages"),
-                ([package_cmd, 'install', '-y', 'pgbackrest', 'postgresql'], 300, "Installing pgBackRest and PostgreSQL")
+                (['sudo', package_cmd, 'install', '-y', 'epel-release'], 120, "Installing EPEL repository"),
+                (['sudo', package_cmd, 'update', '-y'], 180, "Updating packages"),
+                (['sudo', package_cmd, 'install', '-y', 'pgbackrest', 'postgresql'], 300, "Installing pgBackRest and PostgreSQL")
             ]
             
             for cmd, timeout, description in commands:
@@ -712,8 +712,8 @@ class AutoSyncManager:
             logger.info("Installing using pacman (Arch Linux)...")
             
             commands = [
-                (['pacman', '-Sy'], 120, "Updating package database"),
-                (['pacman', '-S', '--noconfirm', 'pgbackrest', 'postgresql'], 300, "Installing pgBackRest and PostgreSQL")
+                (['sudo', 'pacman', '-Sy'], 120, "Updating package database"),
+                (['sudo', 'pacman', '-S', '--noconfirm', 'pgbackrest', 'postgresql'], 300, "Installing pgBackRest and PostgreSQL")
             ]
             
             for cmd, timeout, description in commands:
@@ -1201,7 +1201,10 @@ class AutoSyncManager:
                 
                 # Set correct permissions and ownership
                 os.chmod(pgpass_file, 0o600)
-                shutil.chown(pgpass_file, user='postgres', group='postgres')
+                # Use subprocess for chown since it needs elevated privileges
+                chown_cmd = ['sudo', 'chown', 'postgres:postgres', pgpass_file]
+                process = await asyncio.create_subprocess_exec(*chown_cmd)
+                await process.wait()
                 
                 logger.info(f"✅ Created .pgpass file at {pgpass_file}")
                 
@@ -1342,7 +1345,10 @@ class AutoSyncManager:
             dirs = ['/var/log/pgbackrest', '/var/lib/pgbackrest', '/etc/pgbackrest']
             for dir_path in dirs:
                 os.makedirs(dir_path, exist_ok=True)
-                shutil.chown(dir_path, user='postgres', group='postgres')
+                # Use subprocess for chown since it needs elevated privileges
+                chown_cmd = ['sudo', 'chown', 'postgres:postgres', dir_path]
+                process = await asyncio.create_subprocess_exec(*chown_cmd)
+                await process.wait()
             
             config_file = '/etc/pgbackrest/pgbackrest.conf'
             expected_stanza = self.config['stanza_name']
@@ -1407,13 +1413,23 @@ pg1-port={self.config['pgport']}
 pg1-user={self.config['pguser']}
 """
             
-            # Write updated configuration
-            with open(config_file, 'w') as f:
-                f.write(config_content)
+            # Write updated configuration using sudo since it's in /etc/
+            process = await asyncio.create_subprocess_exec(
+                'sudo', 'tee', config_file,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.communicate(input=config_content.encode())
             
-            # Set proper permissions
-            os.chmod(config_file, 0o640)
-            shutil.chown(config_file, user='postgres', group='postgres')
+            # Set proper permissions and ownership
+            chmod_cmd = ['sudo', 'chmod', '640', config_file]
+            process = await asyncio.create_subprocess_exec(*chmod_cmd)
+            await process.wait()
+            
+            chown_cmd = ['sudo', 'chown', 'postgres:postgres', config_file]
+            process = await asyncio.create_subprocess_exec(*chown_cmd)
+            await process.wait()
             
             logger.info(f"✅ pgBackRest configured successfully with stanza: [{expected_stanza}]")
             return True
