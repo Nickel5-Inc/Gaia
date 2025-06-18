@@ -870,7 +870,8 @@ class SoilMoistureTask(Task):
                         "rootzone_structure_score": scores["metrics"].get("rootzone_ssim", 0),
                     }
 
-                    insert_query = """
+                    # Use UPSERT to prevent duplicates in history table
+                    upsert_query = """
                         INSERT INTO soil_moisture_history 
                         (region_id, miner_uid, miner_hotkey, target_time,
                             surface_sm_pred, rootzone_sm_pred,
@@ -883,15 +884,25 @@ class SoilMoistureTask(Task):
                             :surface_sm_truth, :rootzone_sm_truth,
                             :surface_rmse, :rootzone_rmse,
                             :surface_structure_score, :rootzone_structure_score)
+                        ON CONFLICT (region_id, miner_uid, target_time) 
+                        DO UPDATE SET 
+                            surface_sm_pred = EXCLUDED.surface_sm_pred,
+                            rootzone_sm_pred = EXCLUDED.rootzone_sm_pred,
+                            surface_sm_truth = EXCLUDED.surface_sm_truth,
+                            rootzone_sm_truth = EXCLUDED.rootzone_sm_truth,
+                            surface_rmse = EXCLUDED.surface_rmse,
+                            rootzone_rmse = EXCLUDED.rootzone_rmse,
+                            surface_structure_score = EXCLUDED.surface_structure_score,
+                            rootzone_structure_score = EXCLUDED.rootzone_structure_score
                     """
-                    await self.db_manager.execute(insert_query, params)
+                    await self.db_manager.execute(upsert_query, params)
 
                     update_query = """
                         UPDATE soil_moisture_predictions 
                         SET status = 'scored'
                         WHERE region_id = :region_id 
                         AND miner_uid = :miner_uid
-                        AND status = 'sent_to_miner'
+                        AND status IN ('sent_to_miner', 'retry_scheduled')
                     """
                     await self.db_manager.execute(update_query, {
                         "region_id": region["id"],
@@ -997,7 +1008,9 @@ class SoilMoistureTask(Task):
 
                     for task in tasks_in_time_window:
                         try:
-                            scores = {}
+                            scored_predictions = []
+                            task_ground_truth = None
+                            
                             for prediction in task["predictions"]:
                                 pred_data = {
                                     "bounds": task["sentinel_bounds"],
@@ -1110,14 +1123,12 @@ class SoilMoistureTask(Task):
                                         except Exception as e:
                                             logger.error(f"Error retrieving baseline score: {e}")
                                     
-                                    scores = score
-                                    task["score"] = score
-                                    await self.move_task_to_history(
-                                        region=task,
-                                        predictions=task["predictions"],
-                                        ground_truth=score.get("ground_truth"),
-                                        scores=score
-                                    )
+                                    # Store the scored prediction and ground truth
+                                    prediction["score"] = score
+                                    scored_predictions.append(prediction)
+                                    if task_ground_truth is None:
+                                        task_ground_truth = score.get("ground_truth")
+                                        
                                 else:
                                     # Update retry information for failed scoring
                                     update_query = """
@@ -1136,6 +1147,17 @@ class SoilMoistureTask(Task):
                                         "error_message": "Failed to calculate score"
                                     }
                                     await self.db_manager.execute(update_query, params)
+                            
+                            # Move to history ONCE per task, only if we have scored predictions
+                            if scored_predictions:
+                                # Use the first scored prediction's metrics for the task score
+                                task_score = scored_predictions[0]["score"]
+                                await self.move_task_to_history(
+                                    region=task,
+                                    predictions=scored_predictions,  # Only scored predictions
+                                    ground_truth=task_ground_truth,
+                                    scores=task_score
+                                )
 
                         except Exception as e:
                             logger.error(f"Error scoring task {task['id']}: {str(e)}")
@@ -1143,17 +1165,18 @@ class SoilMoistureTask(Task):
 
                     score_rows = await self.build_score_row(target_time, tasks_in_time_window)
                     if score_rows:
-                        # Check if any tasks in this batch are retries
-                        has_retries = any(
-                            any(
-                                prediction.get("retry_count", 0) > 0 
-                                for prediction in task.get("predictions", [])
-                            )
-                            for task in tasks_in_time_window
-                        )
+                        # Check if scores already exist for this timestamp (indicating a retry scenario)
+                        check_existing_query = """
+                            SELECT COUNT(*) as count FROM score_table 
+                            WHERE task_name = 'soil_moisture' 
+                            AND task_id = :task_id
+                        """
+                        task_id = str(datetime.fromisoformat(str(target_time)).timestamp())
+                        existing_result = await self.db_manager.fetch_one(check_existing_query, {"task_id": task_id})
+                        has_existing_scores = existing_result and existing_result.get("count", 0) > 0
                         
-                        if has_retries:
-                            # Use UPSERT for retries to update existing scores
+                        if has_existing_scores:
+                            # Use UPSERT for existing scores (retry scenario)
                             upsert_query = """
                                 INSERT INTO score_table 
                                 (task_name, task_id, score, status)
@@ -1166,7 +1189,7 @@ class SoilMoistureTask(Task):
                             """
                             for score_row in score_rows:
                                 await self.db_manager.execute(upsert_query, score_row)
-                            logger.info(f"Updated global scores for timestamp {target_time} (retry batch)")
+                            logger.info(f"Updated global scores for timestamp {target_time} (existing scores found)")
                         else:
                             # Regular insert for new scores
                             insert_query = """

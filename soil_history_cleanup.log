@@ -1,0 +1,116 @@
+2025-06-18 21:36:51,348 - [32m[1mINFO[0m - BaseDatabaseManager init for node_type 'validator' with connection_type: 'socket', monitoring: True
+2025-06-18 21:36:51,349 - [31m[1mERROR[0m - Socket connection type specified, but host ('localhost') is not a valid socket path. Attempting to use default /var/run/postgresql.
+2025-06-18 21:36:51,349 - [32m[1mINFO[0m - BaseDatabaseManager: Configuring database for Unix domain socket connection. Socket path: '/var/run/postgresql', DB: 'validator_db', User: 'postgres'
+2025-06-18 21:36:51,349 - [32m[1mINFO[0m - Initialized database thread pool with 4 workers
+2025-06-18 21:36:51,349 - INFO - ✅ Database connection established
+2025-06-18 21:36:51,349 - INFO - 🔍 Starting duplicate detection...
+2025-06-18 21:36:51,349 - [32m[1mINFO[0m - Attempting to initialize main database engine for: postgresql+asyncpg://***:***@/validator_db?host=/var/run/postgresql
+2025-06-18 21:36:51,370 - [32m[1mINFO[0m - Successfully initialized database engine for validator node.
+2025-06-18 21:37:07,019 - INFO - 🧹 Starting cleanup with batch size: 10000
+2025-06-18 21:37:07,019 - [32m[1mINFO[0m - [DBTrack 69783] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:07,532 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990582000 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:07,584 - [32m[1mINFO[0m - Session new_140276990582000 (execute_new_session_query_snippet_
+                    WITH dupl): Significant overhead detected. Total: 564.58ms, Yield: 513.25ms, Overhead: 51.33ms
+2025-06-18 21:37:07,584 - INFO -    Batch 1: Deleted 10,000 records (Total: 10,000)
+2025-06-18 21:37:07,685 - [32m[1mINFO[0m - [DBTrack 75748] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:08,034 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990577248 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:08,092 - [32m[1mINFO[0m - Session new_140276990577248 (execute_new_session_query_snippet_
+                    WITH dupl): Significant overhead detected. Total: 407.24ms, Yield: 348.78ms, Overhead: 58.46ms
+2025-06-18 21:37:08,092 - INFO -    Batch 2: Deleted 10,000 records (Total: 20,000)
+2025-06-18 21:37:08,193 - [32m[1mINFO[0m - [DBTrack 59538] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:08,661 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990577200 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:08,735 - [32m[1mINFO[0m - Session new_140276990577200 (execute_new_session_query_snippet_
+                    WITH dupl): Significant overhead detected. Total: 541.57ms, Yield: 467.87ms, Overhead: 73.70ms
+2025-06-18 21:37:08,735 - INFO -    Batch 3: Deleted 10,000 records (Total: 30,000)
+2025-06-18 21:37:08,836 - [32m[1mINFO[0m - [DBTrack 54641] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:09,278 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990580272 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:09,349 - [32m[1mINFO[0m - Session new_140276990580272 (execute_new_session_query_snippet_
+                    WITH dupl): Significant overhead detected. Total: 512.81ms, Yield: 442.52ms, Overhead: 70.29ms
+2025-06-18 21:37:09,349 - INFO -    Batch 4: Deleted 10,000 records (Total: 40,000)
+2025-06-18 21:37:09,450 - [32m[1mINFO[0m - [DBTrack 97102] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:09,852 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990576528 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:09,923 - [32m[1mINFO[0m - Session new_140276990576528 (execute_new_session_query_snippet_
+                    WITH dupl): Significant overhead detected. Total: 472.99ms, Yield: 402.41ms, Overhead: 70.57ms
+2025-06-18 21:37:09,923 - INFO -    Batch 5: Deleted 10,000 records (Total: 50,000)
+2025-06-18 21:37:10,024 - [32m[1mINFO[0m - [DBTrack 99903] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:10,529 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990580608 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:10,596 - [32m[1mINFO[0m - Session new_140276990580608 (execute_new_session_query_snippet_
+                    WITH dupl): Significant overhead detected. Total: 571.86ms, Yield: 504.76ms, Overhead: 67.09ms
+2025-06-18 21:37:10,596 - INFO -    Batch 6: Deleted 10,000 records (Total: 60,000)
+2025-06-18 21:37:10,697 - [32m[1mINFO[0m - [DBTrack 96286] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:11,037 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990577440 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:11,107 - [32m[1mINFO[0m - Session new_140276990577440 (execute_new_session_query_snippet_
+                    WITH dupl): Significant overhead detected. Total: 409.78ms, Yield: 340.16ms, Overhead: 69.62ms
+2025-06-18 21:37:11,107 - INFO -    Batch 7: Deleted 10,000 records (Total: 70,000)
+2025-06-18 21:37:11,207 - [32m[1mINFO[0m - [DBTrack 55738] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:11,537 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990581904 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:11,540 - INFO -    Batch 8: Deleted 10,000 records (Total: 80,000)
+2025-06-18 21:37:11,640 - [32m[1mINFO[0m - [DBTrack 35258] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:11,966 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990582144 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:11,970 - INFO -    Batch 9: Deleted 10,000 records (Total: 90,000)
+2025-06-18 21:37:12,070 - [32m[1mINFO[0m - [DBTrack 33624] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:12,417 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990577392 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:12,467 - INFO -    Batch 10: Deleted 10,000 records (Total: 100,000)
+2025-06-18 21:37:12,567 - [32m[1mINFO[0m - [DBTrack 73766] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:12,838 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990577200 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:12,844 - INFO -    Batch 11: Deleted 10,000 records (Total: 110,000)
+2025-06-18 21:37:12,944 - [32m[1mINFO[0m - [DBTrack 12592] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:13,205 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990580272 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:13,209 - INFO -    Batch 12: Deleted 10,000 records (Total: 120,000)
+2025-06-18 21:37:13,310 - [32m[1mINFO[0m - [DBTrack 98706] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:13,565 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990576528 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:13,567 - INFO -    Batch 13: Deleted 9,214 records (Total: 129,214)
+2025-06-18 21:37:13,667 - [32m[1mINFO[0m - [DBTrack 31307] ENTERING write op: execute, Query:                      WITH duplicates_to_delete AS (                         SELECT h1.id                         FROM soil_moisture_history h1                         WHERE EXISTS (                   ...
+2025-06-18 21:37:13,764 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990580608 for query: 
+                    WITH duplicates_to_delete AS (
+                        SELECT h1.id
+           ...
+2025-06-18 21:37:13,765 - INFO - ✅ No more duplicates found. Cleanup complete!
+2025-06-18 21:37:13,765 - INFO - 🎉 Cleanup complete! Total records deleted: 129,214
+2025-06-18 21:37:13,765 - INFO - 🔒 Adding unique constraint...
+2025-06-18 21:37:13,769 - [32m[1mINFO[0m - [DBTrack 78373] ENTERING write op: execute, Query:                  ALTER TABLE soil_moisture_history                  ADD CONSTRAINT unique_soil_history_per_prediction                  UNIQUE (region_id, miner_uid, target_time)             ...
+2025-06-18 21:37:13,818 - [36m[1mDEBUG[0m - Query executed successfully within session 140276990580224 for query: 
+                ALTER TABLE soil_moisture_history 
+                ADD CONSTRAINT unique_soil_histo...
+2025-06-18 21:37:13,819 - INFO - ✅ Unique constraint added successfully
+2025-06-18 21:37:13,819 - INFO - 🔍 Verifying cleanup...
+2025-06-18 21:37:13,846 - [32m[1mINFO[0m - Database thread pool shutdown completed
