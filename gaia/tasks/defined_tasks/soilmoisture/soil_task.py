@@ -954,14 +954,15 @@ class SoilMoistureTask(Task):
                                     UPDATE soil_moisture_predictions
                                     SET retry_count = COALESCE(retry_count, 0) + 1,
                                         next_retry_time = :next_retry_time,
-                                        last_error = :error_message
+                                        last_error = :error_message,
+                                        status = 'retry_scheduled'
                                     WHERE region_id = :region_id
                                     AND miner_uid = :miner_uid
                                 """
                                 params = {
                                     "region_id": task["id"],
                                     "miner_uid": prediction["miner_id"],
-                                    "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=1),
+                                    "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=2),  # SMAP data availability issue
                                     "error_message": "Failed to download SMAP data"
                                 }
                                 await self.db_manager.execute(update_query, params)
@@ -980,14 +981,15 @@ class SoilMoistureTask(Task):
                                     UPDATE soil_moisture_predictions
                                     SET retry_count = COALESCE(retry_count, 0) + 1,
                                         next_retry_time = :next_retry_time,
-                                        last_error = :error_message
+                                        last_error = :error_message,
+                                        status = 'retry_scheduled'
                                     WHERE region_id = :region_id
                                     AND miner_uid = :miner_uid
                                 """
                                 params = {
                                     "region_id": task["id"],
                                     "miner_uid": prediction["miner_id"],
-                                    "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=1),
+                                    "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=2),  # SMAP data availability issue
                                     "error_message": "Failed to download SMAP data"
                                 }
                                 await self.db_manager.execute(update_query, params)
@@ -1122,14 +1124,15 @@ class SoilMoistureTask(Task):
                                         UPDATE soil_moisture_predictions
                                         SET retry_count = COALESCE(retry_count, 0) + 1,
                                             next_retry_time = :next_retry_time,
-                                            last_error = :error_message
+                                            last_error = :error_message,
+                                            status = 'retry_scheduled'
                                         WHERE region_id = :region_id
                                         AND miner_uid = :miner_uid
                                     """
                                     params = {
                                         "region_id": task["id"],
                                         "miner_uid": prediction["miner_id"],
-                                        "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=1),
+                                        "next_retry_time": datetime.now(timezone.utc) + timedelta(minutes=5),  # Scoring error - quick retry
                                         "error_message": "Failed to calculate score"
                                     }
                                     await self.db_manager.execute(update_query, params)
@@ -1140,16 +1143,41 @@ class SoilMoistureTask(Task):
 
                     score_rows = await self.build_score_row(target_time, tasks_in_time_window)
                     if score_rows:
-                        # Insert scores
-                        insert_query = """
-                            INSERT INTO score_table 
-                            (task_name, task_id, score, status)
-                            VALUES 
-                            (:task_name, :task_id, :score, :status)
-                        """
-                        for score_row in score_rows:
-                            await self.db_manager.execute(insert_query, score_row)
-                        logger.info(f"Stored global scores for timestamp {target_time}")
+                        # Check if any tasks in this batch are retries
+                        has_retries = any(
+                            any(
+                                prediction.get("retry_count", 0) > 0 
+                                for prediction in task.get("predictions", [])
+                            )
+                            for task in tasks_in_time_window
+                        )
+                        
+                        if has_retries:
+                            # Use UPSERT for retries to update existing scores
+                            upsert_query = """
+                                INSERT INTO score_table 
+                                (task_name, task_id, score, status)
+                                VALUES 
+                                (:task_name, :task_id, :score, :status)
+                                ON CONFLICT (task_name, task_id) 
+                                DO UPDATE SET 
+                                    score = EXCLUDED.score,
+                                    status = EXCLUDED.status
+                            """
+                            for score_row in score_rows:
+                                await self.db_manager.execute(upsert_query, score_row)
+                            logger.info(f"Updated global scores for timestamp {target_time} (retry batch)")
+                        else:
+                            # Regular insert for new scores
+                            insert_query = """
+                                INSERT INTO score_table 
+                                (task_name, task_id, score, status)
+                                VALUES 
+                                (:task_name, :task_id, :score, :status)
+                            """
+                            for score_row in score_rows:
+                                await self.db_manager.execute(insert_query, score_row)
+                            logger.info(f"Stored global scores for timestamp {target_time}")
 
                 finally:
                     if temp_path and os.path.exists(temp_path):
@@ -1278,15 +1306,39 @@ class SoilMoistureTask(Task):
             scores = [float("nan")] * 256
             current_datetime = datetime.fromisoformat(str(target_time))
 
-            check_query = """
-                SELECT COUNT(*) as count FROM score_table 
-                WHERE task_name = 'soil_moisture' 
-                AND task_id = :task_id
-            """
-            result = await self.db_manager.fetch_one(check_query, {"task_id": str(current_datetime.timestamp())})
-            if result and result["count"] > 0:
-                logger.warning(f"Score row already exists for target_time {target_time}. Skipping.")
-                return []
+            # Check if we're processing a retry batch - if so, allow overwriting existing scores
+            has_retry_tasks = False
+            if recent_tasks:
+                for task in recent_tasks:
+                    for prediction in task.get("predictions", []):
+                        # Check if any of the tasks have retry information in the database
+                        retry_check_query = """
+                            SELECT retry_count FROM soil_moisture_predictions 
+                            WHERE miner_uid = :miner_id AND target_time = :target_time
+                        """
+                        retry_result = await self.db_manager.fetch_one(retry_check_query, {
+                            "miner_id": prediction.get("miner_id"),
+                            "target_time": target_time
+                        })
+                        if retry_result and retry_result.get("retry_count", 0) > 0:
+                            has_retry_tasks = True
+                            break
+                    if has_retry_tasks:
+                        break
+            
+            # Only skip if scores exist AND this is not a retry batch
+            if not has_retry_tasks:
+                check_query = """
+                    SELECT COUNT(*) as count FROM score_table 
+                    WHERE task_name = 'soil_moisture' 
+                    AND task_id = :task_id
+                """
+                result = await self.db_manager.fetch_one(check_query, {"task_id": str(current_datetime.timestamp())})
+                if result and result["count"] > 0:
+                    logger.warning(f"Score row already exists for target_time {target_time}. Skipping.")
+                    return []
+            else:
+                logger.info(f"Processing retry batch for target_time {target_time}. Will update existing scores.")
 
             if recent_tasks:
                 logger.info(f"Processing {len(recent_tasks)} recent tasks across all regions")
@@ -1441,11 +1493,38 @@ class SoilMoistureTask(Task):
             raise
 
     async def _startup_retry_check(self):
-        """Check for pending tasks that can be retried immediately after startup."""
+        """Comprehensive startup retry check - aggressively find and retry stuck tasks."""
         try:
             current_time = datetime.now(timezone.utc)
             
-            # Check for tasks that are eligible for immediate retry
+            # First, let's check what we have in the database
+            status_query = """
+                SELECT 
+                    p.status,
+                    COUNT(*) as count,
+                    MIN(r.target_time) as earliest_time,
+                    MAX(r.target_time) as latest_time,
+                    COUNT(DISTINCT p.miner_uid) as unique_miners
+                FROM soil_moisture_predictions p
+                JOIN soil_moisture_regions r ON p.region_id = r.id
+                WHERE p.status IN ('sent_to_miner', 'retry_scheduled')
+                GROUP BY p.status
+            """
+            status_summary = await self.db_manager.fetch_all(status_query)
+            
+            total_stuck_tasks = 0
+            for row in status_summary:
+                total_stuck_tasks += row['count']
+                logger.info(f"Found {row['count']} tasks with status '{row['status']}' - "
+                          f"miners: {row['unique_miners']}, time range: {row['earliest_time']} to {row['latest_time']}")
+            
+            if total_stuck_tasks == 0:
+                logger.info("✅ No stuck tasks found in database")
+                return
+            
+            logger.warning(f"🚨 Found {total_stuck_tasks} potentially stuck soil moisture tasks")
+            
+            # Aggressive eligibility criteria for startup
             eligible_query = """
                 SELECT 
                     r.*,
@@ -1454,6 +1533,7 @@ class SoilMoistureTask(Task):
                         'miner_hotkey', p.miner_hotkey,
                         'retry_count', p.retry_count,
                         'next_retry_time', p.next_retry_time,
+                        'last_error', p.last_error,
                         'surface_sm', p.surface_sm,
                         'rootzone_sm', p.rootzone_sm,
                         'uncertainty_surface', p.uncertainty_surface,
@@ -1463,63 +1543,152 @@ class SoilMoistureTask(Task):
                 JOIN soil_moisture_predictions p ON p.region_id = r.id
                 WHERE p.status IN ('sent_to_miner', 'retry_scheduled')
                 AND (
-                    -- Tasks with scheduled retry time that has passed
+                    -- Any scheduled retry that's ready or overdue
                     (
-                        p.status IN ('sent_to_miner', 'retry_scheduled')
+                        p.status = 'retry_scheduled'
                         AND p.next_retry_time IS NOT NULL 
                         AND p.next_retry_time <= :current_time
-                        AND p.retry_count < 5
+                        AND COALESCE(p.retry_count, 0) < 10
                     )
                     OR
-                    -- Tasks that have been pending for over 4 hours (likely from previous session) 
+                    -- Any task that's been sitting for more than 30 minutes
                     (
                         p.status = 'sent_to_miner'
-                        AND p.next_retry_time IS NULL
-                        AND r.target_time <= :startup_cutoff_time
-                        AND (p.retry_count IS NULL OR p.retry_count < 5)
+                        AND r.target_time <= :recent_cutoff_time
+                        AND COALESCE(p.retry_count, 0) < 10
+                    )
+                    OR
+                    -- Processing/scoring errors - immediate retry on startup
+                    (
+                        p.status IN ('sent_to_miner', 'retry_scheduled')
+                        AND p.last_error IS NOT NULL
+                        AND (
+                            p.last_error LIKE '%processing%' OR
+                            p.last_error LIKE '%scoring%' OR
+                            p.last_error LIKE '%calculate%' OR
+                            p.last_error LIKE '%_FillValue%'
+                        )
+                        AND COALESCE(p.retry_count, 0) < 10
                     )
                 )
                 GROUP BY r.id, r.target_time, r.sentinel_bounds, r.sentinel_crs, r.status
                 ORDER BY r.target_time ASC
-                LIMIT 20
+                LIMIT 50
             """
             
-            # Look for tasks older than 4 hours for immediate retry
-            startup_cutoff_time = current_time - timedelta(hours=4)
+            # Look for tasks older than 30 minutes for immediate startup retry
+            recent_cutoff_time = current_time - timedelta(minutes=30)
             
             params = {
                 "current_time": current_time,
-                "startup_cutoff_time": startup_cutoff_time
+                "recent_cutoff_time": recent_cutoff_time
             }
             
             eligible_tasks = await self.db_manager.fetch_all(eligible_query, params)
             
             if not eligible_tasks:
-                logger.info("✅ No pending tasks found for startup retry")
+                logger.info("✅ No tasks eligible for immediate startup retry")
                 return
             
-            logger.info(f"🔄 Found {len(eligible_tasks)} tasks eligible for startup retry")
+            logger.info(f"🔄 Found {len(eligible_tasks)} tasks eligible for immediate startup retry")
             
-            # Count different types
+            # Count different types and reset retry times for immediate processing
             scheduled_retries = 0
             old_pending = 0
+            processing_errors = 0
+            immediate_retry_count = 0
             
             for task in eligible_tasks:
                 for pred in task["predictions"]:
+                    last_error = pred.get("last_error", "") or ""
+                    
                     if pred.get("next_retry_time"):
                         scheduled_retries += 1
                     else:
                         old_pending += 1
-            
+                    
+                    if last_error and any(keyword in last_error.lower() for keyword in ['processing', 'scoring', 'calculate', '_fillvalue']):
+                        processing_errors += 1
+                        # Force immediate retry for processing/scoring errors
+                        immediate_retry_query = """
+                            UPDATE soil_moisture_predictions
+                            SET next_retry_time = :immediate_time,
+                                status = 'retry_scheduled'
+                            WHERE miner_uid = :miner_id 
+                            AND target_time = :target_time
+                        """
+                        await self.db_manager.execute(immediate_retry_query, {
+                            "miner_id": pred["miner_id"],
+                            "target_time": task["target_time"],
+                            "immediate_time": current_time - timedelta(seconds=1)  # Make it ready now
+                        })
+                        immediate_retry_count += 1
+                        
             logger.info(f"   - {scheduled_retries} scheduled retries ready")
             logger.info(f"   - {old_pending} old pending tasks from previous session")
+            logger.info(f"   - {processing_errors} processing/scoring errors")
+            logger.info(f"   - {immediate_retry_count} tasks set for immediate retry")
             
-            # Attempt to score these tasks immediately
+            # Force an immediate scoring attempt
             if eligible_tasks:
-                logger.info("🚀 Starting startup retry scoring...")
-                await self.validator_score()
+                logger.info("🚀 Starting aggressive startup retry scoring...")
+                try:
+                    # Run multiple scoring attempts to clear backlog
+                    for attempt in range(3):
+                        logger.info(f"Startup retry attempt {attempt + 1}/3")
+                        result = await self.validator_score()
+                        if result.get("status") == "no_pending_tasks":
+                            logger.info("✅ All startup retries completed successfully")
+                            break
+                        await asyncio.sleep(10)  # Short delay between attempts
+                except Exception as e:
+                    logger.error(f"Error during startup retry scoring: {e}")
                 
         except Exception as e:
             logger.error(f"Error in startup retry check: {e}")
+            logger.error(traceback.format_exc())
+
+    async def force_immediate_retries(self, error_types=None):
+        """Force immediate retry of stuck tasks, optionally filtered by error type."""
+        try:
+            current_time = datetime.now(timezone.utc)
+            
+            if error_types is None:
+                # Default to processing/scoring errors that should retry immediately
+                error_types = ['processing', 'scoring', 'calculate', '_fillvalue', 'failed to calculate']
+            
+            logger.info(f"🔧 Forcing immediate retries for error types: {error_types}")
+            
+            # Find all tasks with these error types
+            filter_conditions = " OR ".join([f"p.last_error ILIKE '%{error_type}%'" for error_type in error_types])
+            
+            force_retry_query = f"""
+                UPDATE soil_moisture_predictions
+                SET next_retry_time = :immediate_time,
+                    status = 'retry_scheduled'
+                WHERE status IN ('sent_to_miner', 'retry_scheduled')
+                AND last_error IS NOT NULL
+                AND ({filter_conditions})
+                AND COALESCE(retry_count, 0) < 10
+                RETURNING miner_uid, target_time, last_error
+            """
+            
+            updated_tasks = await self.db_manager.fetch_all(force_retry_query, {
+                "immediate_time": current_time - timedelta(seconds=1)  # Make it ready now
+            })
+            
+            if updated_tasks:
+                logger.info(f"✅ Forced immediate retry for {len(updated_tasks)} stuck tasks")
+                for task in updated_tasks:
+                    logger.info(f"   - Miner {task['miner_uid']} at {task['target_time']}: {task['last_error']}")
+                
+                # Trigger scoring immediately
+                logger.info("🚀 Starting forced retry scoring...")
+                await self.validator_score()
+            else:
+                logger.info("ℹ️  No tasks found matching the specified error types")
+                
+        except Exception as e:
+            logger.error(f"Error in force_immediate_retries: {e}")
             logger.error(traceback.format_exc())
 

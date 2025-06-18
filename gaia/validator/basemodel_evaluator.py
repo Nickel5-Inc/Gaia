@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import traceback
 import asyncio
+import tempfile
 from fiber.logging_utils import get_logger
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, Any, List, Tuple, Union
@@ -428,6 +429,142 @@ class BaseModelEvaluator:
             logger.error(f"Error retrieving soil moisture baseline prediction: {e}")
             logger.error(traceback.format_exc())
             return None
+
+    async def _generate_missing_baseline_prediction(self, task_id: str, region_id: str) -> Optional[Dict]:
+        """
+        Generate a baseline prediction from original region data when one is missing.
+        
+        Args:
+            task_id: The task ID for the prediction
+            region_id: The region ID for the prediction
+            
+        Returns:
+            Optional[Dict]: The generated baseline prediction or None if generation fails
+        """
+        if not self.db_manager:
+            logger.warning("No database manager available, cannot generate baseline prediction")
+            return None
+            
+        try:
+            # Get the original region data from the database
+            region_query = """
+                SELECT r.*, r.combined_data, r.target_time, r.sentinel_bounds, r.sentinel_crs
+                FROM soil_moisture_regions r
+                WHERE r.id = :region_id
+            """
+            # Convert region_id to integer for database query
+            try:
+                region_id_int = int(region_id)
+            except (ValueError, TypeError):
+                logger.error(f"Invalid region_id format: {region_id} (type: {type(region_id)})")
+                return None
+            
+            region_result = await self.db_manager.fetch_one(region_query, {"region_id": region_id_int})
+            
+            if not region_result:
+                logger.error(f"No region data found for region_id {region_id}")
+                return None
+            
+            if not region_result.get("combined_data"):
+                logger.error(f"No combined_data found for region_id {region_id}")
+                return None
+            
+            combined_data = region_result["combined_data"]
+            target_time = region_result["target_time"]
+            
+            # Ensure target_time is a datetime object
+            if isinstance(target_time, str):
+                try:
+                    target_time = datetime.fromisoformat(target_time)
+                except ValueError:
+                    try:
+                        target_time = datetime.fromtimestamp(float(target_time), tz=timezone.utc)
+                    except:
+                        logger.error(f"Could not parse target_time: {target_time}")
+                        return None
+            
+            if target_time.tzinfo is None:
+                target_time = target_time.replace(tzinfo=timezone.utc)
+            
+            logger.info(f"Generating baseline prediction for region {region_id}, target_time {target_time}")
+            logger.info(f"Combined data size: {len(combined_data) / (1024 * 1024):.2f} MB")
+            
+            # Import SoilMoistureInferencePreprocessor
+            from gaia.tasks.defined_tasks.soilmoisture.utils.inference_class import SoilMoistureInferencePreprocessor
+            
+            # Process the combined data to generate model inputs
+            model_inputs = None
+            temp_file_path = None
+            
+            try:
+                # Offload file writing and preprocessing to an executor
+                def _write_and_preprocess_sync(data_bytes):
+                    t_file_path = None
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix='.tiff', delete=False) as temp_f:
+                            temp_f.write(data_bytes)
+                            t_file_path = temp_f.name
+                        
+                        s_preprocessor = SoilMoistureInferencePreprocessor()
+                        m_inputs = s_preprocessor.preprocess(t_file_path)
+                        return m_inputs, t_file_path
+                    finally:
+                        # Ensure temp file is cleaned up if preprocess fails before returning path
+                        if t_file_path and (not 'm_inputs' in locals() or m_inputs is None) and os.path.exists(t_file_path):
+                            try:
+                                os.unlink(t_file_path)
+                            except Exception as e_unlink_inner:
+                                logger.error(f"Error cleaning temp file in sync helper: {e_unlink_inner}")
+
+                loop = asyncio.get_event_loop()
+                model_inputs, temp_file_path = await loop.run_in_executor(None, _write_and_preprocess_sync, combined_data)
+                
+                if model_inputs:
+                    # Convert numpy arrays to torch tensors
+                    for key, value in model_inputs.items():
+                        if isinstance(value, np.ndarray):
+                            model_inputs[key] = torch.from_numpy(value).float()
+                
+                    # Add metadata to model inputs
+                    model_inputs["sentinel_bounds"] = region_result["sentinel_bounds"]
+                    model_inputs["sentinel_crs"] = region_result["sentinel_crs"]
+                    model_inputs["target_time"] = target_time
+                    
+                    logger.info(f"Preprocessed data for baseline generation. Keys: {list(model_inputs.keys())}")
+                    
+                    # Generate the baseline prediction
+                    baseline_prediction = await self.predict_soil_and_store(
+                        data=model_inputs,
+                        task_id=task_id,
+                        region_id=region_id
+                    )
+                    
+                    if baseline_prediction:
+                        logger.info(f"Successfully generated and stored baseline prediction for region {region_id}")
+                        return baseline_prediction
+                    else:
+                        logger.error(f"Failed to generate baseline prediction for region {region_id}")
+                        return None
+                else:
+                    logger.error(f"Preprocessing failed for baseline generation, region {region_id}")
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"Error preprocessing data for baseline generation: {str(e)}")
+                logger.error(traceback.format_exc())
+                return None
+            finally:
+                # Clean up temporary file
+                if temp_file_path and os.path.exists(temp_file_path):
+                    try:
+                        os.unlink(temp_file_path)
+                    except Exception as e:
+                        logger.error(f"Error cleaning up temporary file: {str(e)}")
+                        
+        except Exception as e:
+            logger.error(f"Error generating missing baseline prediction: {e}")
+            logger.error(traceback.format_exc())
+            return None
     
     async def cleanup(self):
         """Release resources held by the models."""
@@ -506,7 +643,16 @@ class BaseModelEvaluator:
             baseline_prediction = await self.get_soil_baseline_prediction(task_id, region_id_str)
             if baseline_prediction is None:
                 logger.warning(f"No soil baseline prediction found for task_id {task_id}, region {region_id_str}")
-                return None
+                
+                # Try to generate baseline prediction from original region data
+                logger.info(f"Attempting to generate missing baseline prediction for task_id {task_id}, region {region_id_str}")
+                baseline_prediction = await self._generate_missing_baseline_prediction(task_id, region_id_str)
+                
+                if baseline_prediction is None:
+                    logger.error(f"Failed to generate baseline prediction for task_id {task_id}, region {region_id_str}")
+                    return None
+                else:
+                    logger.info(f"Successfully generated missing baseline prediction for task_id {task_id}, region {region_id_str}")
             
             if "surface_sm" in baseline_prediction and "rootzone_sm" in baseline_prediction:
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

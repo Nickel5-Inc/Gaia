@@ -15,6 +15,7 @@ from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import (
     get_smap_data_for_sentinel_bounds,
 )
 from gaia.tasks.defined_tasks.soilmoisture.utils.evaluation_metrics import calculate_all_metrics
+from skimage.metrics import structural_similarity as ssim
 from pydantic import Field
 from fiber.logging_utils import get_logger
 import os
@@ -190,14 +191,17 @@ class SoilScoringMechanism(ScoringMechanism):
                 }
             )
             
+            # Note: Retry wait period checking is now handled at the task level in get_pending_tasks()
+            # The scoring mechanism should process any task that reaches it, as the task-level logic
+            # has already determined it's ready for processing
             if pred_info and pred_info.get("status") == "retry_scheduled":
-                current_time = datetime.now(timezone.utc)
-                if current_time < pred_info["next_retry_time"]:
-                    logger.info(f"Skipping scoring for timestamp {predictions['target_time']} - in retry wait period until {pred_info['next_retry_time']}")
-                    return None
-
-            if not pred_info or pred_info.get("status") == "sent_to_miner":
+                logger.info(f"Processing retry for timestamp {predictions['target_time']} - retry time has passed")
+            elif pred_info and pred_info.get("status") == "sent_to_miner":
                 logger.info(f"Processing new prediction for timestamp {predictions['target_time']}")
+            else:
+                logger.info(f"Processing prediction for timestamp {predictions['target_time']}")
+
+            # Proceed with scoring - the task-level logic has already validated this task is ready
 
             metrics = await self.compute_smap_score_metrics(
                 bounds=predictions["bounds"],
@@ -345,20 +349,73 @@ class SoilScoringMechanism(ScoringMechanism):
             smap_rootzone = torch.from_numpy(smap_data["rootzone_sm"]).float()
             smap_tensor = torch.stack([smap_surface, smap_rootzone], dim=0).unsqueeze(0)
 
-            # --- Offload metric calculation ---
-            def _calculate_all_metrics_sync(preds, truth):
-                return calculate_all_metrics(preds, truth)
+            # --- Calculate RMSE and SSIM metrics ---
+            def _calculate_soil_metrics_sync(preds, truth):
+                """Calculate RMSE and SSIM metrics for soil moisture predictions."""
+                try:
+                    # Convert PyTorch tensors to numpy arrays if needed
+                    preds_np = preds.detach().cpu().numpy() if hasattr(preds, 'detach') else preds
+                    truth_np = truth.detach().cpu().numpy() if hasattr(truth, 'detach') else truth
+                    
+                    # Ensure we have the right shape: [batch, channels, height, width]
+                    if preds_np.ndim == 4 and truth_np.ndim == 4:
+                        # Extract surface (channel 0) and rootzone (channel 1) predictions
+                        surface_pred = preds_np[0, 0]  # [height, width]
+                        rootzone_pred = preds_np[0, 1]  # [height, width]
+                        surface_truth = truth_np[0, 0]  # [height, width]
+                        rootzone_truth = truth_np[0, 1]  # [height, width]
+                    else:
+                        logger.error(f"Unexpected tensor shapes: preds {preds_np.shape}, truth {truth_np.shape}")
+                        return None
+                    
+                    # Calculate RMSE for surface and rootzone
+                    surface_mse = np.mean((surface_pred - surface_truth) ** 2)
+                    rootzone_mse = np.mean((rootzone_pred - rootzone_truth) ** 2)
+                    surface_rmse = np.sqrt(surface_mse)
+                    rootzone_rmse = np.sqrt(rootzone_mse)
+                    
+                                         # Calculate SSIM (Structural Similarity Index)
+                    
+                    # Normalize data to [0, 1] for SSIM calculation
+                    def normalize_for_ssim(data):
+                        data_min, data_max = data.min(), data.max()
+                        if data_max > data_min:
+                            return (data - data_min) / (data_max - data_min)
+                        else:
+                            return np.zeros_like(data)
+                    
+                    surface_pred_norm = normalize_for_ssim(surface_pred)
+                    surface_truth_norm = normalize_for_ssim(surface_truth)
+                    rootzone_pred_norm = normalize_for_ssim(rootzone_pred)
+                    rootzone_truth_norm = normalize_for_ssim(rootzone_truth)
+                    
+                    # Calculate SSIM with appropriate parameters
+                    surface_ssim = ssim(surface_truth_norm, surface_pred_norm, data_range=1.0)
+                    rootzone_ssim = ssim(rootzone_truth_norm, rootzone_pred_norm, data_range=1.0)
+                    
+                    metrics = {
+                        "surface_rmse": float(surface_rmse),
+                        "rootzone_rmse": float(rootzone_rmse),
+                        "surface_ssim": float(surface_ssim),
+                        "rootzone_ssim": float(rootzone_ssim)
+                    }
+                    
+                    return metrics
+                    
+                except Exception as e:
+                    logger.error(f"Error calculating soil metrics: {e}")
+                    return None
             
-            all_metrics = await loop.run_in_executor(
+            soil_metrics = await loop.run_in_executor(
                 self.executor,
-                _calculate_all_metrics_sync,
-                model_predictions, # CPU tensor
-                smap_tensor        # CPU tensor
+                _calculate_soil_metrics_sync,
+                model_predictions, # CPU tensor -> will be converted to numpy in sync function
+                smap_tensor        # CPU tensor -> will be converted to numpy in sync function
             )
             # --- End offload --
 
-            if not all_metrics:
-                logger.error(f"Failed to compute metrics for miner {miner_id} at {target_date}")
+            if not soil_metrics:
+                logger.error(f"Failed to compute soil metrics for miner {miner_id} at {target_date}")
                 return None
                 
             # Move model_predictions back to original device if needed (e.g. if other parts of class expect it there)
@@ -385,13 +442,13 @@ class SoilScoringMechanism(ScoringMechanism):
                 "bounds": bounds,
                 "crs": str(crs),
                 "smap_file_used": temp_smap_filename,
-                "metrics_computed": all_metrics
+                "metrics_computed": soil_metrics
             }
             metrics_logger.info(json.dumps(extended_log_message))
 
 
             return {
-                "validation_metrics": all_metrics, 
+                "validation_metrics": soil_metrics, 
                 "ground_truth": smap_data
             }
 
@@ -496,7 +553,7 @@ class SoilScoringMechanism(ScoringMechanism):
 
     async def schedule_retry_for_miner(self, miner_id: str, target_date: datetime, error_message: str):
         """
-        Schedule a retry for a miner's prediction.
+        Schedule a retry for a miner's prediction with smart timing based on error type.
         
         Args:
             miner_id (str): The miner's unique identifier
@@ -504,7 +561,25 @@ class SoilScoringMechanism(ScoringMechanism):
             error_message (str): Error message describing why retry is needed
         """
         try:
-            next_retry_time = datetime.now(timezone.utc) + timedelta(hours=1)
+            current_time = datetime.now(timezone.utc)
+            
+            # Smart retry timing based on error type
+            if "SMAP download failed" in error_message or "SMAP file not found" in error_message:
+                # Data availability issue - longer delay to allow SMAP data to become available
+                next_retry_time = current_time + timedelta(hours=2)
+                retry_reason = "SMAP data unavailable"
+            elif "SMAP processing failed" in error_message or "_FillValue" in error_message:
+                # Processing issue - shorter delay, might be a transient error
+                next_retry_time = current_time + timedelta(minutes=15)
+                retry_reason = "SMAP processing error"
+            elif "General error" in error_message or "Failed to calculate score" in error_message:
+                # Scoring/calculation issue - very short delay, likely a transient error  
+                next_retry_time = current_time + timedelta(minutes=5)
+                retry_reason = "calculation/scoring error"
+            else:
+                # Unknown error - medium delay
+                next_retry_time = current_time + timedelta(minutes=30)
+                retry_reason = "unknown error"
             
             update_query = """
                 UPDATE soil_moisture_predictions
@@ -525,7 +600,7 @@ class SoilScoringMechanism(ScoringMechanism):
             }
             
             result = await self.db_manager.execute(update_query, params)
-            logger.info(f"Scheduled retry for miner {miner_id} at {next_retry_time}. Error: {error_message}")
+            logger.info(f"Scheduled retry for miner {miner_id} at {next_retry_time} ({retry_reason}). Error: {error_message}")
             return result
             
         except Exception as e:

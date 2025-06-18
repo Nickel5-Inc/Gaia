@@ -1762,38 +1762,44 @@ pg1-user={self.config['pguser']}
     # Database setup is now handled by the comprehensive database setup system
 
     async def _backup_scheduler(self):
-        """Application-controlled backup scheduling (replaces cron)."""
+        """Resilient backup scheduling with catch-up logic and multiple trigger opportunities."""
         last_full_backup = datetime.now().date()
         last_diff_backup = datetime.now()
         last_check = datetime.now()
         
-        print("\n⏰ BACKUP SCHEDULER MAIN LOOP STARTED ⏰")
+        # Track backup attempts to prevent infinite retries
+        backup_attempts_this_hour = {}
+        
+        print("\n⏰ RESILIENT BACKUP SCHEDULER STARTED ⏰")
         print(f"⏰ STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ⏰")
-        logger.info("⏰ BACKUP SCHEDULER LOOP ACTIVE ⏰")
+        logger.info("⏰ RESILIENT BACKUP SCHEDULER ACTIVE ⏰")
         logger.info(f"⏰ SCHEDULER START TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         while not self._shutdown_event.is_set():
             try:
                 now = datetime.now()
+                current_hour_key = f"{now.date()}_{now.hour}"
                 
                 # Full backup daily at specified time (skip in test mode)
                 if (self.backup_schedule['full_backup_time'] and 
                     now.strftime('%H:%M') == self.backup_schedule['full_backup_time'] and 
                     now.date() > last_full_backup):
                     logger.info("⏰ Scheduled full backup time reached - triggering backup...")
-                    if await self._trigger_backup('full'):
+                    backup_success = await self._trigger_backup_with_timeout('full', timeout_minutes=30)
+                    if backup_success:
                         last_full_backup = now.date()
                         logger.info(f"✅ Full backup completed, next full backup: tomorrow at {self.backup_schedule['full_backup_time']}")
                 
-                # Differential backup scheduling
+                # Differential backup scheduling - resilient approach
                 if self.test_mode:
-                    # Test mode: keep existing interval-based logic
+                    # Test mode: keep existing interval-based logic but with timeout
                     hours_since_diff = (now - last_diff_backup).total_seconds() / 3600
                     if hours_since_diff >= self.backup_schedule['diff_backup_interval']:
                         print("\n🚨 DIFFERENTIAL BACKUP TRIGGERED (TEST MODE) 🚨")
                         print(f"🚨 {hours_since_diff:.1f} HOURS SINCE LAST BACKUP 🚨")
                         logger.info(f"🚨 TEST MODE BACKUP TRIGGER: {hours_since_diff:.1f} hours since last diff backup (threshold: {self.backup_schedule['diff_backup_interval']}) - triggering backup... 🚨")
-                        if await self._trigger_backup('diff'):
+                        backup_success = await self._trigger_backup_with_timeout('diff', timeout_minutes=15)
+                        if backup_success:
                             last_diff_backup = now
                             next_diff_time = now + timedelta(hours=self.backup_schedule['diff_backup_interval'])
                             print("✅ DIFFERENTIAL BACKUP COMPLETED SUCCESSFULLY ✅")
@@ -1805,39 +1811,94 @@ pg1-user={self.config['pguser']}
                             print(f"📊 TEST MODE BACKUP STATUS: Next diff backup in {time_until_next:.1f} hours (last: {last_diff_backup.strftime('%H:%M:%S')})")
                             logger.info(f"📊 Test mode backup scheduler: Next diff backup in {time_until_next:.1f} hours (last: {last_diff_backup.strftime('%H:%M:%S')})")
                 else:
-                    # Production mode: schedule-based logic (every hour at specific minute)
+                    # Production mode: resilient hourly backup with multiple opportunities
+                    hours_since_diff = (now - last_diff_backup).total_seconds() / 3600
+                    
+                    # Primary condition: Time-based trigger (preferred window)
                     target_minute = self.backup_schedule['diff_backup_minute']
                     current_minute = now.minute
                     current_hour = now.hour
                     
-                    # Check if we're at the target minute (allowing a 2-minute window for execution)
-                    if (current_minute >= target_minute and current_minute <= target_minute + 2 and 
-                        now.second < 30):  # Only trigger in first 30 seconds to avoid double triggers
+                    # Check if we haven't done a backup this hour yet
+                    last_backup_hour = last_diff_backup.hour if last_diff_backup.date() == now.date() else -1
+                    need_backup_this_hour = current_hour != last_backup_hour
+                    
+                    # Multiple trigger opportunities for resilience
+                    should_trigger_backup = False
+                    trigger_reason = ""
+                    
+                    if need_backup_this_hour:
+                        # Opportunity 1: Preferred time window (target_minute to target_minute+5)
+                        if (current_minute >= target_minute and current_minute <= target_minute + 5):
+                            should_trigger_backup = True
+                            trigger_reason = f"preferred_window_{current_hour:02d}:{target_minute:02d}-{target_minute+5:02d}"
                         
-                        # Check if we haven't already done a backup this hour
-                        last_backup_hour = last_diff_backup.hour if last_diff_backup.date() == now.date() else -1
+                        # Opportunity 2: Catch-up window (last 10 minutes of hour if backup still missing)
+                        elif current_minute >= 50 and hours_since_diff >= 0.9:  # 54+ minutes since last backup
+                            should_trigger_backup = True
+                            trigger_reason = f"catchup_window_{current_hour:02d}:50-59"
                         
-                        if current_hour != last_backup_hour:
-                            print("\n🚨 DIFFERENTIAL BACKUP TRIGGERED (SCHEDULED) 🚨")
-                            print(f"🚨 HOURLY BACKUP AT {current_hour:02d}:{target_minute:02d} 🚨")
-                            logger.info(f"🚨 SCHEDULED BACKUP TRIGGER: Hourly backup at {current_hour:02d}:{target_minute:02d} - triggering backup... 🚨")
-                            if await self._trigger_backup('diff'):
+                        # Opportunity 3: Emergency catch-up (if >75 minutes since last backup)
+                        elif hours_since_diff >= 1.25:  # 75+ minutes
+                            should_trigger_backup = True
+                            trigger_reason = f"emergency_catchup_{hours_since_diff:.1f}h_overdue"
+                    
+                    # Execute backup if triggered and not already attempted this hour
+                    if should_trigger_backup:
+                        attempts_this_hour = backup_attempts_this_hour.get(current_hour_key, 0)
+                        
+                        if attempts_this_hour < 3:  # Max 3 attempts per hour
+                            print(f"\n🚨 DIFFERENTIAL BACKUP TRIGGERED ({trigger_reason.upper()}) 🚨")
+                            print(f"🚨 ATTEMPT {attempts_this_hour + 1}/3 FOR HOUR {current_hour:02d} 🚨")
+                            logger.info(f"🚨 RESILIENT BACKUP TRIGGER: {trigger_reason} - attempt {attempts_this_hour + 1}/3 🚨")
+                            
+                            backup_attempts_this_hour[current_hour_key] = attempts_this_hour + 1
+                            
+                            backup_success = await self._trigger_backup_with_timeout('diff', timeout_minutes=15)
+                            if backup_success:
                                 last_diff_backup = now
                                 next_hour = (current_hour + 1) % 24
                                 print("✅ DIFFERENTIAL BACKUP COMPLETED SUCCESSFULLY ✅")
-                                logger.info(f"✅ Differential backup completed, next diff backup: {next_hour:02d}:{target_minute:02d}")
-                    else:
-                        # Log status periodically for visibility (every 10 minutes)
-                        if int(now.minute) % 10 == 0 and now.second < 10:
-                            next_hour = current_hour if current_minute < target_minute else (current_hour + 1) % 24
-                            print(f"📊 BACKUP STATUS: Next diff backup at {next_hour:02d}:{target_minute:02d} (last: {last_diff_backup.strftime('%H:%M:%S')})")
-                            logger.info(f"📊 Backup scheduler active: Next diff backup at {next_hour:02d}:{target_minute:02d} (last: {last_diff_backup.strftime('%H:%M:%S')})")
+                                logger.info(f"✅ Resilient backup completed, next backup: {next_hour:02d}:{target_minute:02d}")
+                                
+                                # Clear attempt counter on success
+                                if current_hour_key in backup_attempts_this_hour:
+                                    del backup_attempts_this_hour[current_hour_key]
+                            else:
+                                logger.warning(f"❌ Backup attempt {attempts_this_hour + 1}/3 failed for hour {current_hour}")
+                        else:
+                            if int(now.minute) % 15 == 0 and now.second < 10:  # Log every 15 minutes
+                                logger.error(f"❌ Max backup attempts (3) reached for hour {current_hour}. Will retry next hour.")
+                    
+                    # Cleanup old attempt counters (keep only last 3 hours)
+                    cutoff_time = now - timedelta(hours=3)
+                    keys_to_remove = []
+                    for key in backup_attempts_this_hour.keys():
+                        try:
+                            key_date, key_hour = key.split('_')
+                            key_datetime = datetime.strptime(f"{key_date} {key_hour}", "%Y-%m-%d %H")
+                            if key_datetime < cutoff_time:
+                                keys_to_remove.append(key)
+                        except:
+                            keys_to_remove.append(key)  # Remove malformed keys
+                    
+                    for key in keys_to_remove:
+                        del backup_attempts_this_hour[key]
+                    
+                    # Status logging (every 10 minutes)
+                    if int(now.minute) % 10 == 0 and now.second < 10:
+                        if need_backup_this_hour:
+                            minutes_until_catchup = max(0, 50 - current_minute)
+                            logger.info(f"📊 Backup needed this hour. Next opportunities: {target_minute:02d}min (preferred) or {50}min (catchup in {minutes_until_catchup}min)")
+                        else:
+                            next_hour = (current_hour + 1) % 24
+                            logger.info(f"📊 Backup scheduler: Hour {current_hour} complete. Next backup: {next_hour:02d}:{target_minute:02d}")
                 
                 # Health check every hour
                 minutes_since_check = (now - last_check).total_seconds() / 60
                 if minutes_since_check >= self.backup_schedule['check_interval']:
                     logger.info(f"🔍 {minutes_since_check:.1f} minutes since last check (threshold: {self.backup_schedule['check_interval']}) - running health check...")
-                    check_success = await self._trigger_check()
+                    check_success = await asyncio.wait_for(self._trigger_check(), timeout=300)  # 5 minute timeout
                     last_check = now
                     if check_success:
                         logger.info("✅ Health check passed")
@@ -1850,6 +1911,9 @@ pg1-user={self.config['pguser']}
             except asyncio.CancelledError:
                 logger.info("Backup scheduler cancelled")
                 break
+            except asyncio.TimeoutError:
+                logger.error("⚠️ Backup scheduler operation timed out - continuing with next cycle")
+                await asyncio.sleep(60)
             except Exception as e:
                 logger.error(f"Error in backup scheduler: {e}")
                 await asyncio.sleep(60)
@@ -2056,6 +2120,33 @@ pg1-user={self.config['pguser']}
                 
         except Exception as e:
             logger.error(f"❌ Error in replica sync: {e}")
+            return False
+
+    async def _trigger_backup_with_timeout(self, backup_type: str, timeout_minutes: int = 20) -> bool:
+        """Trigger a backup with timeout protection to prevent blocking the scheduler."""
+        try:
+            logger.info(f"🚀 Starting {backup_type.upper()} backup with {timeout_minutes}min timeout...")
+            timeout_seconds = timeout_minutes * 60
+            
+            # Use asyncio.wait_for to add timeout protection
+            backup_success = await asyncio.wait_for(
+                self._trigger_backup(backup_type),
+                timeout=timeout_seconds
+            )
+            
+            if backup_success:
+                logger.info(f"✅ {backup_type.upper()} backup completed within timeout")
+            else:
+                logger.warning(f"❌ {backup_type.upper()} backup failed (completed but with errors)")
+            
+            return backup_success
+            
+        except asyncio.TimeoutError:
+            logger.error(f"⏰ {backup_type.upper()} backup TIMED OUT after {timeout_minutes} minutes")
+            logger.error("🚨 Backup process may still be running in background - scheduler continues")
+            return False
+        except Exception as e:
+            logger.error(f"Error in timeout-protected backup: {e}")
             return False
 
     async def _trigger_backup(self, backup_type: str) -> bool:
@@ -2871,7 +2962,105 @@ pg1-user={self.config['pguser']}
         print(f"🔄 BACKUP TASK RUNNING: {self.backup_task is not None and not self.backup_task.done()}")
         print(f"💚 HEALTH TASK RUNNING: {self.health_check_task is not None and not self.health_check_task.done()}")
         print(f"⏹️  SHUTDOWN REQUESTED: {self._shutdown_event.is_set()}")
+        
+        # Print resilient backup schedule info for primary nodes
+        if self.is_primary and not self.test_mode:
+            target_minute = self.backup_schedule.get('diff_backup_minute', 24)
+            print(f"\n🛡️  RESILIENT BACKUP FEATURES:")
+            print(f"   • Preferred Window: Every hour at :{target_minute:02d}-{target_minute+5:02d} minutes")
+            print(f"   • Catch-up Window: Every hour at :50-59 minutes (if backup missed)")
+            print(f"   • Emergency Catch-up: Any time if >75 minutes overdue")
+            print(f"   • Max Attempts: 3 per hour")
+            print(f"   • Timeout Protection: 15 minutes per backup attempt")
+            print(f"   • Multiple Opportunities: No more missed backups due to timing!")
+        
         print("🔍" * 80 + "\n")
+
+    async def get_resilient_backup_stats(self) -> Dict:
+        """Get statistics about the resilient backup system performance."""
+        try:
+            current_time = datetime.now()
+            
+            # Get recent backup info
+            info_cmd = ['sudo', '-u', 'postgres', 'pgbackrest',
+                       f'--stanza={self.config["stanza_name"]}', 'info', '--output=json']
+            
+            process = await asyncio.create_subprocess_exec(
+                *info_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            stats = {
+                'current_time': current_time.strftime('%Y-%m-%d %H:%M:%S'),
+                'backup_system_healthy': process.returncode == 0,
+                'last_backup_time': None,
+                'hours_since_last_backup': None,
+                'backup_within_schedule': None,
+                'next_preferred_window': None,
+                'next_catchup_window': None,
+                'resilient_features_active': self.is_primary and not self.test_mode,
+                'scheduler_running': self.backup_task is not None and not self.backup_task.done()
+            }
+            
+            if process.returncode == 0:
+                try:
+                    backup_info = json.loads(stdout.decode())
+                    if backup_info and len(backup_info) > 0:
+                        stanza_info = backup_info[0]
+                        if 'backup' in stanza_info and len(stanza_info['backup']) > 0:
+                            recent_backup = stanza_info['backup'][-1]
+                            backup_timestamp = recent_backup.get('timestamp', {}).get('stop')
+                            
+                            if backup_timestamp and str(backup_timestamp).isdigit():
+                                backup_time = datetime.fromtimestamp(int(backup_timestamp), tz=timezone.utc)
+                                stats['last_backup_time'] = backup_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+                                
+                                hours_since = (current_time.replace(tzinfo=timezone.utc) - backup_time).total_seconds() / 3600
+                                stats['hours_since_last_backup'] = round(hours_since, 2)
+                                stats['backup_within_schedule'] = hours_since <= 1.5  # Within 90 minutes is good
+                except json.JSONDecodeError:
+                    pass
+            
+            # Calculate next backup windows for production mode
+            if self.is_primary and not self.test_mode:
+                target_minute = self.backup_schedule.get('diff_backup_minute', 24)
+                current_minute = current_time.minute
+                current_hour = current_time.hour
+                
+                # Next preferred window
+                if current_minute < target_minute:
+                    next_preferred = current_time.replace(minute=target_minute, second=0, microsecond=0)
+                else:
+                    next_hour = (current_hour + 1) % 24
+                    next_preferred = current_time.replace(hour=next_hour, minute=target_minute, second=0, microsecond=0)
+                    if next_hour == 0:  # Next day
+                        next_preferred += timedelta(days=1)
+                
+                stats['next_preferred_window'] = next_preferred.strftime('%H:%M:%S')
+                
+                # Next catch-up window
+                if current_minute < 50:
+                    next_catchup = current_time.replace(minute=50, second=0, microsecond=0)
+                else:
+                    next_hour = (current_hour + 1) % 24
+                    next_catchup = current_time.replace(hour=next_hour, minute=50, second=0, microsecond=0)
+                    if next_hour == 0:  # Next day
+                        next_catchup += timedelta(days=1)
+                
+                stats['next_catchup_window'] = next_catchup.strftime('%H:%M:%S')
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting resilient backup stats: {e}")
+            return {
+                'error': str(e),
+                'backup_system_healthy': False,
+                'resilient_features_active': self.is_primary and not self.test_mode,
+                'scheduler_running': False
+            }
 
     async def _auto_repair_configuration(self):
         """Automatically detect and repair common configuration issues."""

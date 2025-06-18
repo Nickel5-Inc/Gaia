@@ -182,8 +182,24 @@ def process_smap_data(filepath, bbox, target_shape=(220, 220)):
             .values
         )
 
-        surface_sm[surface_sm == ds["sm_surface"]._FillValue] = np.nan
-        rootzone_sm[rootzone_sm == ds["sm_rootzone"]._FillValue] = np.nan
+        # Handle fill values for surface soil moisture
+        try:
+            surface_fill_value = ds["sm_surface"]._FillValue
+        except AttributeError:
+            surface_fill_value = ds["sm_surface"].attrs.get('_FillValue', 
+                                ds["sm_surface"].attrs.get('fill_value', 
+                                ds["sm_surface"].attrs.get('missing_value', -9999.0)))
+        
+        # Handle fill values for rootzone soil moisture
+        try:
+            rootzone_fill_value = ds["sm_rootzone"]._FillValue
+        except AttributeError:
+            rootzone_fill_value = ds["sm_rootzone"].attrs.get('_FillValue', 
+                                 ds["sm_rootzone"].attrs.get('fill_value', 
+                                 ds["sm_rootzone"].attrs.get('missing_value', -9999.0)))
+        
+        surface_sm[surface_sm == surface_fill_value] = np.nan
+        rootzone_sm[rootzone_sm == rootzone_fill_value] = np.nan
         surface_resampled = resize(surface_sm, target_shape, preserve_range=True)
         rootzone_resampled = resize(rootzone_sm, target_shape, preserve_range=True)
 
@@ -432,9 +448,30 @@ def _process_smap_for_sentinel_sync(filepath, sentinel_bounds_tuple, sentinel_cr
         rootzone_roi = rootzone_roi.astype(float)
         
         # Set fill values to NaN using the dataset's fill value
-        fill_value = ds["sm_surface"]._FillValue
-        surface_roi[surface_roi == fill_value] = np.nan
-        rootzone_roi[rootzone_roi == fill_value] = np.nan
+        # Try multiple ways to access fill value for compatibility
+        fill_value = None
+        try:
+            # Try accessing _FillValue attribute directly (older xarray)
+            fill_value = ds["sm_surface"]._FillValue
+        except AttributeError:
+            # Try accessing from attrs dictionary (newer xarray)
+            fill_value = ds["sm_surface"].attrs.get('_FillValue', None)
+            if fill_value is None:
+                # Try other common fill value attribute names
+                fill_value = ds["sm_surface"].attrs.get('fill_value', None)
+                if fill_value is None:
+                    fill_value = ds["sm_surface"].attrs.get('missing_value', None)
+        
+        # Apply fill value if found, otherwise use a common SMAP fill value
+        if fill_value is not None:
+            surface_roi[surface_roi == fill_value] = np.nan
+            rootzone_roi[rootzone_roi == fill_value] = np.nan
+        else:
+            # Common SMAP fill values as fallback
+            common_fill_values = [-9999.0, -999.0, -99.0]
+            for fv in common_fill_values:
+                surface_roi[surface_roi == fv] = np.nan
+                rootzone_roi[rootzone_roi == fv] = np.nan
 
         # Resize to target shape for consistency
         target_shape = (11, 11)
