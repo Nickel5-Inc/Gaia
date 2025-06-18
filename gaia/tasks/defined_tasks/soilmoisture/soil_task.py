@@ -915,10 +915,11 @@ class SoilMoistureTask(Task):
 
             logger.info(f"Moved {len(predictions)} tasks to history for region {region['id']}")
 
+            # Clean up ALL predictions for this region/target_time (not just one miner)
             await self.cleanup_predictions(
                 bounds=region["sentinel_bounds"],
                 target_time=region["target_time"],
-                miner_uid=miner_id
+                miner_uid=None  # Clean up all miners for this region
             )
 
             return True
@@ -1449,26 +1450,46 @@ class SoilMoistureTask(Task):
     async def cleanup_predictions(self, bounds, target_time=None, miner_uid=None):
         """Clean up predictions after they've been processed and moved to history."""
         try:
-            delete_query = """
-                DELETE FROM soil_moisture_predictions p
-                USING soil_moisture_regions r
-                WHERE p.region_id = r.id 
-                AND r.sentinel_bounds = :bounds
-                AND r.target_time = :target_time
-                AND p.miner_uid = :miner_uid
-                AND p.status = 'scored'
-            """
-            params = {
-                "bounds": bounds,
-                "target_time": target_time,
-                "miner_uid": miner_uid
-            }
-            await self.db_manager.execute(delete_query, params)
+            if miner_uid is not None:
+                # Clean up specific miner's predictions
+                delete_query = """
+                    DELETE FROM soil_moisture_predictions p
+                    USING soil_moisture_regions r
+                    WHERE p.region_id = r.id 
+                    AND r.sentinel_bounds = :bounds
+                    AND r.target_time = :target_time
+                    AND p.miner_uid = :miner_uid
+                    AND p.status = 'scored'
+                """
+                params = {
+                    "bounds": bounds,
+                    "target_time": target_time,
+                    "miner_uid": miner_uid
+                }
+            else:
+                # Clean up ALL scored predictions for this region/target_time
+                delete_query = """
+                    DELETE FROM soil_moisture_predictions p
+                    USING soil_moisture_regions r
+                    WHERE p.region_id = r.id 
+                    AND r.sentinel_bounds = :bounds
+                    AND r.target_time = :target_time
+                    AND p.status = 'scored'
+                """
+                params = {
+                    "bounds": bounds,
+                    "target_time": target_time
+                }
+            
+            result = await self.db_manager.execute(delete_query, params)
+            
+            # Try to get the number of deleted rows
+            rows_deleted = getattr(result, 'rowcount', 0) if result else 0
             
             logger.info(
-                f"Cleaned up predictions for bounds {bounds}"
+                f"Cleaned up {rows_deleted} predictions for bounds {bounds}"
                 f"{f', time {target_time}' if target_time else ''}"
-                f"{f', miner {miner_uid}' if miner_uid else ''}"
+                f"{f', miner {miner_uid}' if miner_uid else ' (all miners)'}"
             )
 
         except Exception as e:
