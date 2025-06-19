@@ -218,20 +218,21 @@ class FiberWeightSetter:
 
             logger.info(f"\nSetting weights for subnet {self.netuid}...")
 
-            # Always refresh substrate connection from manager to ensure it's current
-            if self.substrate_manager:
-                self.substrate = self.substrate_manager.get_connection()
-                logger.debug("Using managed substrate connection for weight setting")
-            else:
-                # This creates an unmanaged connection - should only be used as fallback
-                logger.warning("No substrate manager provided - creating unmanaged connection (potential memory leak)")
-                # Clean up any existing unmanaged connection first
-                if hasattr(self, 'substrate') and self.substrate:
-                    try:
-                        self.substrate.close()
-                    except Exception as e:
-                        logger.debug(f"Error closing old unmanaged connection: {e}")
-                self.substrate = interface.get_substrate(subtensor_network=self.network)
+            # SAFETY MEASURE: Always create a fresh substrate connection for weight setting
+            # This ensures we have the most current blockchain state and aren't affected by
+            # any potential caching or staleness issues in managed connections
+            logger.info("Creating fresh substrate connection for weight setting (bypassing managed connection)")
+            
+            # Clean up any existing connection first
+            if hasattr(self, 'substrate') and self.substrate:
+                try:
+                    self.substrate.close()
+                except Exception as e:
+                    logger.debug(f"Error closing old connection before fresh creation: {e}")
+            
+            # Create completely fresh substrate connection
+            self.substrate = interface.get_substrate(subtensor_network=self.network)
+            logger.info("✅ Fresh substrate connection created for weight setting")
             self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
             logger.info(f"Found {len(self.nodes)} nodes in subnet")
 
@@ -249,7 +250,7 @@ class FiberWeightSetter:
 
             active_validator_uids = await get_active_validator_uids(
                 netuid=self.netuid, 
-                substrate_manager=self.substrate_manager,
+                substrate_manager=None,  # Force fresh connection instead of managed
                 subtensor_network=self.network
             )
             logger.info(f"Found {len(active_validator_uids)} active validators - zeroing their weights")
@@ -290,11 +291,29 @@ class FiberWeightSetter:
             except Exception as e:
                 logger.error(f"Error initiating weight commit: {str(e)}")
                 return False
+            finally:
+                # Clean up the fresh substrate connection to prevent memory leaks
+                if hasattr(self, 'substrate') and self.substrate:
+                    try:
+                        logger.debug("Cleaning up fresh substrate connection after weight setting")
+                        self.substrate.close()
+                        self.substrate = None
+                    except Exception as cleanup_e:
+                        logger.debug(f"Error cleaning up fresh substrate connection: {cleanup_e}")
 
         except Exception as e:
             logger.error(f"Error in weight setting: {str(e)}")
             logger.error(traceback.format_exc())
             return False
+        finally:
+            # Ensure cleanup happens even if outer exception occurs
+            if hasattr(self, 'substrate') and self.substrate:
+                try:
+                    logger.debug("Final cleanup of fresh substrate connection")
+                    self.substrate.close()
+                    self.substrate = None
+                except Exception as cleanup_e:
+                    logger.debug(f"Error in final substrate cleanup: {cleanup_e}")
 
     async def _async_set_node_weights(self, **kwargs):
         """Async wrapper for the synchronous set_node_weights function with timeout"""

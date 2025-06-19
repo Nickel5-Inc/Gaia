@@ -30,6 +30,7 @@ import logging
 import json
 import concurrent.futures
 from pathlib import Path
+import math
 
 logger = get_logger(__name__)
 
@@ -83,21 +84,64 @@ class SoilScoringMechanism(ScoringMechanism):
 
     def compute_final_score(self, metrics: Dict) -> float:
         """Compute final score combining RMSE and SSIM metrics."""
-        surface_rmse = metrics["validation_metrics"].get("surface_rmse", self.beta)
-        rootzone_rmse = metrics["validation_metrics"].get("rootzone_rmse", self.beta)
-        surface_ssim = metrics["validation_metrics"].get("surface_ssim", 0)
-        rootzone_ssim = metrics["validation_metrics"].get("rootzone_ssim", 0)
-        #surface_score = 0.8 * self.sigmoid_rmse(torch.tensor(surface_rmse)) + 0.2 * (
-        #    (surface_ssim + 1) / 2
-        #)
-        #rootzone_score = 0.8 * self.sigmoid_rmse(torch.tensor(rootzone_rmse)) + 0.2 * (
-        #    (rootzone_ssim + 1) / 2
-        #)
-        surface_score = self.sigmoid_rmse(torch.tensor(surface_rmse))
-        rootzone_score = self.sigmoid_rmse(torch.tensor(rootzone_rmse))
-        final_score = 0.6 * surface_score + 0.4 * rootzone_score
-
-        return final_score.item()
+        try:
+            surface_rmse = metrics["validation_metrics"].get("surface_rmse", self.beta)
+            rootzone_rmse = metrics["validation_metrics"].get("rootzone_rmse", self.beta)
+            surface_ssim = metrics["validation_metrics"].get("surface_ssim", 0)
+            rootzone_ssim = metrics["validation_metrics"].get("rootzone_ssim", 0)
+            
+            # Debug logging to identify NaN sources
+            logger.debug(f"Input metrics - Surface RMSE: {surface_rmse}, Rootzone RMSE: {rootzone_rmse}, Surface SSIM: {surface_ssim}, Rootzone SSIM: {rootzone_ssim}")
+            
+            # Validate input values
+            if not isinstance(surface_rmse, (int, float)) or math.isnan(surface_rmse) or math.isinf(surface_rmse):
+                logger.error(f"Invalid surface_rmse value: {surface_rmse}")
+                return float('nan')
+            
+            if not isinstance(rootzone_rmse, (int, float)) or math.isnan(rootzone_rmse) or math.isinf(rootzone_rmse):
+                logger.error(f"Invalid rootzone_rmse value: {rootzone_rmse}")
+                return float('nan')
+                
+            if not isinstance(surface_ssim, (int, float)) or math.isnan(surface_ssim) or math.isinf(surface_ssim):
+                logger.warning(f"Invalid surface_ssim value: {surface_ssim}, setting to 0")
+                surface_ssim = 0
+                
+            if not isinstance(rootzone_ssim, (int, float)) or math.isnan(rootzone_ssim) or math.isinf(rootzone_ssim):
+                logger.warning(f"Invalid rootzone_ssim value: {rootzone_ssim}, setting to 0")
+                rootzone_ssim = 0
+            
+            # Compute scores with validation
+            surface_score_tensor = self.sigmoid_rmse(torch.tensor(surface_rmse, dtype=torch.float32))
+            rootzone_score_tensor = self.sigmoid_rmse(torch.tensor(rootzone_rmse, dtype=torch.float32))
+            
+            # Extract values and validate
+            surface_score = surface_score_tensor.item()
+            rootzone_score = rootzone_score_tensor.item()
+            
+            logger.debug(f"Computed scores - Surface: {surface_score}, Rootzone: {rootzone_score}")
+            
+            if math.isnan(surface_score) or math.isinf(surface_score):
+                logger.error(f"Invalid surface score: {surface_score} from RMSE: {surface_rmse}")
+                return float('nan')
+                
+            if math.isnan(rootzone_score) or math.isinf(rootzone_score):
+                logger.error(f"Invalid rootzone score: {rootzone_score} from RMSE: {rootzone_rmse}")
+                return float('nan')
+            
+            final_score = 0.6 * surface_score + 0.4 * rootzone_score
+            
+            logger.debug(f"Final score calculation: 0.6 * {surface_score} + 0.4 * {rootzone_score} = {final_score}")
+            
+            if math.isnan(final_score) or math.isinf(final_score):
+                logger.error(f"Final score is invalid: {final_score}")
+                return float('nan')
+            
+            return final_score
+            
+        except Exception as e:
+            logger.error(f"Error in compute_final_score: {str(e)}")
+            logger.error(f"Metrics: {metrics}")
+            return float('nan')
 
     async def validate_predictions(self, predictions: Dict) -> bool:
         """check predictions before scoring."""
@@ -357,6 +401,36 @@ class SoilScoringMechanism(ScoringMechanism):
                     preds_np = preds.detach().cpu().numpy() if hasattr(preds, 'detach') else preds
                     truth_np = truth.detach().cpu().numpy() if hasattr(truth, 'detach') else truth
                     
+                    # Check for NaN or inf values in input data
+                    pred_nan_count = np.sum(np.isnan(preds_np))
+                    pred_inf_count = np.sum(np.isinf(preds_np))
+                    truth_nan_count = np.sum(np.isnan(truth_np))
+                    truth_inf_count = np.sum(np.isinf(truth_np))
+                    
+                    if pred_nan_count > 0 or pred_inf_count > 0:
+                        logger.error(f"Predictions contain invalid values: nan_count={pred_nan_count}, inf_count={pred_inf_count}")
+                        return None
+                    
+                    # SMAP ground truth commonly contains NaN values due to:
+                    # - Cloud cover, instrument issues, geographic coverage gaps
+                    # - This is normal and expected behavior
+                    if truth_nan_count > 0:
+                        logger.info(f"SMAP ground truth contains {truth_nan_count} NaN values (normal due to satellite data gaps)")
+                        
+                        # If too many NaN values (>90% of pixels), the region might have insufficient data
+                        total_pixels = truth_np.size
+                        nan_percentage = (truth_nan_count / total_pixels) * 100
+                        
+                        if nan_percentage > 90:
+                            logger.warning(f"SMAP data has {nan_percentage:.1f}% NaN values - insufficient valid data for scoring")
+                            return None
+                        
+                        logger.info(f"SMAP data quality: {nan_percentage:.1f}% NaN values, proceeding with valid pixels only")
+                    
+                    if truth_inf_count > 0:
+                        logger.error(f"Ground truth contains inf values: inf_count={truth_inf_count}")
+                        return None
+                    
                     # Ensure we have the right shape: [batch, channels, height, width]
                     if preds_np.ndim == 4 and truth_np.ndim == 4:
                         # Extract surface (channel 0) and rootzone (channel 1) predictions
@@ -368,30 +442,95 @@ class SoilScoringMechanism(ScoringMechanism):
                         logger.error(f"Unexpected tensor shapes: preds {preds_np.shape}, truth {truth_np.shape}")
                         return None
                     
-                    # Calculate RMSE for surface and rootzone
-                    surface_mse = np.mean((surface_pred - surface_truth) ** 2)
-                    rootzone_mse = np.mean((rootzone_pred - rootzone_truth) ** 2)
-                    surface_rmse = np.sqrt(surface_mse)
-                    rootzone_rmse = np.sqrt(rootzone_mse)
+                    # Calculate metrics using only valid (non-NaN) pixels
+                    def calculate_rmse_with_valid_pixels(pred, truth):
+                        """Calculate RMSE using only pixels where both prediction and truth are valid."""
+                        # Create mask for valid pixels (not NaN in either prediction or truth)
+                        valid_mask = ~(np.isnan(pred) | np.isnan(truth))
+                        
+                        if np.sum(valid_mask) == 0:
+                            logger.warning("No valid pixels found for RMSE calculation")
+                            return np.nan
+                        
+                        # Calculate MSE only on valid pixels
+                        valid_pred = pred[valid_mask]
+                        valid_truth = truth[valid_mask]
+                        mse = np.mean((valid_pred - valid_truth) ** 2)
+                        
+                        if np.isnan(mse) or np.isinf(mse) or mse < 0:
+                            logger.error(f"Invalid MSE calculated: {mse}")
+                            return np.nan
+                        
+                        rmse = np.sqrt(mse)
+                        valid_pixel_count = np.sum(valid_mask)
+                        total_pixels = pred.size
+                        
+                        logger.debug(f"RMSE calculated from {valid_pixel_count}/{total_pixels} valid pixels ({valid_pixel_count/total_pixels*100:.1f}%)")
+                        return rmse
                     
-                                         # Calculate SSIM (Structural Similarity Index)
+                    # Calculate RMSE for surface and rootzone using valid pixels
+                    surface_rmse = calculate_rmse_with_valid_pixels(surface_pred, surface_truth)
+                    rootzone_rmse = calculate_rmse_with_valid_pixels(rootzone_pred, rootzone_truth)
                     
-                    # Normalize data to [0, 1] for SSIM calculation
-                    def normalize_for_ssim(data):
-                        data_min, data_max = data.min(), data.max()
-                        if data_max > data_min:
-                            return (data - data_min) / (data_max - data_min)
-                        else:
-                            return np.zeros_like(data)
+                    # Validate RMSE values
+                    if np.isnan(surface_rmse):
+                        logger.error("Failed to calculate valid surface RMSE")
+                        return None
+                        
+                    if np.isnan(rootzone_rmse):
+                        logger.error("Failed to calculate valid rootzone RMSE")
+                        return None
                     
-                    surface_pred_norm = normalize_for_ssim(surface_pred)
-                    surface_truth_norm = normalize_for_ssim(surface_truth)
-                    rootzone_pred_norm = normalize_for_ssim(rootzone_pred)
-                    rootzone_truth_norm = normalize_for_ssim(rootzone_truth)
+                    # Calculate SSIM (Structural Similarity Index) with valid pixels
+                    def calculate_ssim_with_valid_pixels(pred, truth):
+                        """Calculate SSIM using only valid pixels and proper normalization."""
+                        try:
+                            # Create mask for valid pixels
+                            valid_mask = ~(np.isnan(pred) | np.isnan(truth))
+                            
+                            if np.sum(valid_mask) < 100:  # Need minimum pixels for meaningful SSIM
+                                logger.warning(f"Insufficient valid pixels ({np.sum(valid_mask)}) for SSIM calculation")
+                                return 0.0
+                            
+                            # For SSIM, we need to work with the full arrays but handle NaN values
+                            # Replace NaN values with mean of valid values for SSIM calculation
+                            pred_for_ssim = pred.copy()
+                            truth_for_ssim = truth.copy()
+                            
+                            if np.any(~valid_mask):
+                                pred_mean = np.nanmean(pred_for_ssim)
+                                truth_mean = np.nanmean(truth_for_ssim)
+                                
+                                pred_for_ssim[~valid_mask] = pred_mean
+                                truth_for_ssim[~valid_mask] = truth_mean
+                            
+                            # Normalize data to [0, 1] for SSIM calculation
+                            def normalize_for_ssim(data):
+                                data_min, data_max = np.nanmin(data), np.nanmax(data)
+                                if data_max > data_min and not (np.isnan(data_min) or np.isnan(data_max)):
+                                    return (data - data_min) / (data_max - data_min)
+                                else:
+                                    return np.zeros_like(data)
+                            
+                            pred_norm = normalize_for_ssim(pred_for_ssim)
+                            truth_norm = normalize_for_ssim(truth_for_ssim)
+                            
+                            # Calculate SSIM
+                            ssim_value = ssim(truth_norm, pred_norm, data_range=1.0)
+                            
+                            if np.isnan(ssim_value) or np.isinf(ssim_value):
+                                logger.warning(f"Invalid SSIM calculated: {ssim_value}, setting to 0")
+                                return 0.0
+                            
+                            return float(ssim_value)
+                            
+                        except Exception as e:
+                            logger.warning(f"Error calculating SSIM: {e}, setting to 0")
+                            return 0.0
                     
-                    # Calculate SSIM with appropriate parameters
-                    surface_ssim = ssim(surface_truth_norm, surface_pred_norm, data_range=1.0)
-                    rootzone_ssim = ssim(rootzone_truth_norm, rootzone_pred_norm, data_range=1.0)
+                    # Calculate SSIM for surface and rootzone
+                    surface_ssim = calculate_ssim_with_valid_pixels(surface_pred, surface_truth)
+                    rootzone_ssim = calculate_ssim_with_valid_pixels(rootzone_pred, rootzone_truth)
                     
                     metrics = {
                         "surface_rmse": float(surface_rmse),
@@ -400,10 +539,12 @@ class SoilScoringMechanism(ScoringMechanism):
                         "rootzone_ssim": float(rootzone_ssim)
                     }
                     
+                    logger.debug(f"Calculated metrics with valid pixels: {metrics}")
                     return metrics
                     
                 except Exception as e:
                     logger.error(f"Error calculating soil metrics: {e}")
+                    logger.error(traceback.format_exc())
                     return None
             
             soil_metrics = await loop.run_in_executor(

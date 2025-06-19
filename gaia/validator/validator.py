@@ -173,11 +173,46 @@ async def perform_handshake_with_retry(
 
 
 class GaiaValidator:
+    def _clear_pycache_files(self):
+        """Clear all Python bytecode cache files in the repository to prevent caching issues."""
+        try:
+            import subprocess
+            import os
+            
+            # Get the repository root (where this file is located, go up to find gaia root)
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            
+            print(f"[STARTUP] Clearing Python cache files in {repo_root}...")
+            
+            # Clear .pyc files
+            cmd_pyc = f"find {repo_root} -name '*.pyc' -delete"
+            result_pyc = subprocess.run(cmd_pyc, shell=True, capture_output=True, text=True)
+            
+            # Clear __pycache__ directories  
+            cmd_pycache = f"find {repo_root} -name '__pycache__' -type d -exec rm -rf {{}} + 2>/dev/null || true"
+            result_pycache = subprocess.run(cmd_pycache, shell=True, capture_output=True, text=True)
+            
+            # Clear Python import cache
+            import importlib
+            if hasattr(importlib, 'invalidate_caches'):
+                importlib.invalidate_caches()
+            
+            print("[STARTUP] ✅ Python cache cleanup completed")
+            
+        except Exception as e:
+            print(f"[STARTUP] ⚠️ Warning: Failed to clear Python cache: {e}")
+            # Don't fail startup if cache clearing fails
+            
     def __init__(self, args):
         """
         Initialize the GaiaValidator with provided arguments.
         """
         print("[STARTUP DEBUG] Starting GaiaValidator.__init__")
+        
+        # Clear Python bytecode cache on startup to prevent caching issues
+        if os.getenv('VALIDATOR_CLEAR_PYCACHE_ON_STARTUP', 'true').lower() in ['true', '1', 'yes']:
+            self._clear_pycache_files()
+        
         self.args = args
         self.metagraph = None
         self.config = None
@@ -1619,16 +1654,20 @@ class GaiaValidator:
                         logger.error(traceback.format_exc())
                         health['errors'] += 1
 
-    async def _fetch_nodes_managed(self, netuid):
+    async def _fetch_nodes_managed(self, netuid, force_fresh=False):
         """
         Fetch nodes using get_nodes_for_netuid but with aggressive connection management.
         Use cached nodes when possible to avoid any substrate calls.
+        
+        Args:
+            netuid: Network UID to fetch nodes for
+            force_fresh: If True, bypass cache and force fresh node fetch
         """
         try:
             logger.debug(f"Fetching nodes for netuid {netuid} using ultra-aggressive memory management")
             
-            # First, try to use cached nodes from metagraph if available and recent
-            if (hasattr(self, 'metagraph') and self.metagraph and 
+            # First, try to use cached nodes from metagraph if available and recent (unless force_fresh is True)
+            if (not force_fresh and hasattr(self, 'metagraph') and self.metagraph and 
                 hasattr(self.metagraph, 'nodes') and self.metagraph.nodes and
                 hasattr(self, 'last_metagraph_sync') and 
                 time.time() - self.last_metagraph_sync < 300):  # Use cache if less than 5 minutes old
@@ -1654,8 +1693,11 @@ class GaiaValidator:
                         cached_nodes.append(simple_node)
                 return cached_nodes
             
-            # If no cache available, reluctantly make the substrate call
-            logger.warning("No cached nodes available - making substrate call (potential memory leak)")
+            # If no cache available or force_fresh is True, make the substrate call
+            if force_fresh:
+                logger.info("🔄 FORCE_FRESH: Bypassing node cache for fresh data")
+            else:
+                logger.warning("No cached nodes available - making substrate call (potential memory leak)")
             
             # More aggressive patching - patch multiple possible import locations
             import fiber.chain.interface as fiber_interface
