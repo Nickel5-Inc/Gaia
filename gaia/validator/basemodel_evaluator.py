@@ -340,7 +340,7 @@ class BaseModelEvaluator:
             
             if self.db_manager:
                 success = await self.db_manager.store_baseline_prediction(
-                    task_name="soil_moisture",
+                    task_name="soil_moisture_region_global",
                     task_id=task_id,
                     timestamp=target_time,
                     prediction=prediction_data,
@@ -415,7 +415,7 @@ class BaseModelEvaluator:
             region_id_str = str(region_id)
             
             result = await self.db_manager.get_baseline_prediction(
-                task_name="soil_moisture",
+                task_name="soil_moisture_region_global",
                 task_id=task_id,
                 region_id=region_id_str
             )

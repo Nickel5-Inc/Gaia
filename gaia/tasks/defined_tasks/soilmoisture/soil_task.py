@@ -1169,7 +1169,7 @@ class SoilMoistureTask(Task):
                         # Check if scores already exist for this timestamp (indicating a retry scenario)
                         check_existing_query = """
                             SELECT COUNT(*) as count FROM score_table 
-                            WHERE task_name = 'soil_moisture' 
+                            WHERE task_name = 'soil_moisture_region_global' 
                             AND task_id = :task_id
                         """
                         task_id = str(datetime.fromisoformat(str(target_time)).timestamp())
@@ -1354,7 +1354,7 @@ class SoilMoistureTask(Task):
             if not has_retry_tasks:
                 check_query = """
                     SELECT COUNT(*) as count FROM score_table 
-                    WHERE task_name = 'soil_moisture' 
+                    WHERE task_name = 'soil_moisture_region_global' 
                     AND task_id = :task_id
                 """
                 result = await self.db_manager.fetch_one(check_query, {"task_id": str(current_datetime.timestamp())})
@@ -1428,7 +1428,7 @@ class SoilMoistureTask(Task):
                             logger.warning(f"Unexpected number of regions ({region_count}) for miner {miner_id}. Expected maximum 5.")
 
             score_row = {
-                "task_name": "soil_moisture",
+                "task_name": "soil_moisture_region_global",
                 "task_id": str(current_datetime.timestamp()),
                 "score": scores,
                 "status": "completed"
@@ -1540,6 +1540,14 @@ class SoilMoistureTask(Task):
         """Comprehensive startup retry check - aggressively find and retry stuck tasks."""
         try:
             current_time = datetime.now(timezone.utc)
+            
+            # First, check for and build any missing retroactive score rows
+            logger.info("🔍 Checking for missing soil moisture score rows...")
+            try:
+                await self.build_retroactive_score_rows(days_back=7, force_rebuild=False)
+            except Exception as e:
+                logger.error(f"Error during retroactive score building: {e}")
+                # Continue with regular startup retry check even if retroactive scoring fails
             
             # First, let's check what we have in the database
             status_query = """
@@ -1734,5 +1742,229 @@ class SoilMoistureTask(Task):
                 
         except Exception as e:
             logger.error(f"Error in force_immediate_retries: {e}")
+            logger.error(traceback.format_exc())
+
+    async def build_retroactive_score_rows(self, days_back=7, force_rebuild=False):
+        """
+        Retroactively build score rows from soil_moisture_history table for tasks 
+        that were completed but never had their scores properly aggregated.
+        
+        Args:
+            days_back (int): How many days back to look for missing score rows
+            force_rebuild (bool): Whether to rebuild existing score rows
+        """
+        try:
+            logger.info(f"🔄 Starting retroactive score row building for last {days_back} days...")
+            
+            # Get cutoff time
+            cutoff_time = datetime.now(timezone.utc) - timedelta(days=days_back)
+            
+            # Get miner mappings
+            miner_query = """
+                SELECT uid, hotkey FROM node_table 
+                WHERE hotkey IS NOT NULL
+            """
+            miner_mappings = await self.db_manager.fetch_all(miner_query)
+            hotkey_to_uid = {row["hotkey"]: row["uid"] for row in miner_mappings}
+            logger.info(f"Found {len(hotkey_to_uid)} miner mappings for retroactive scoring")
+            
+            # Find target times that have history entries but no score rows
+            missing_scores_query = """
+                SELECT DISTINCT h.target_time, COUNT(*) as history_count
+                FROM soil_moisture_history h
+                WHERE h.target_time >= :cutoff_time
+                AND NOT EXISTS (
+                    SELECT 1 FROM score_table s 
+                    WHERE s.task_name = 'soil_moisture_region_global' 
+                    AND s.task_id = CAST(EXTRACT(EPOCH FROM h.target_time) AS TEXT)
+                )
+                GROUP BY h.target_time
+                ORDER BY h.target_time DESC
+            """
+            
+            if force_rebuild:
+                # If force rebuild, get all target times regardless of existing score rows
+                missing_scores_query = """
+                    SELECT DISTINCT h.target_time, COUNT(*) as history_count
+                    FROM soil_moisture_history h
+                    WHERE h.target_time >= :cutoff_time
+                    GROUP BY h.target_time
+                    ORDER BY h.target_time DESC
+                """
+            
+            missing_times = await self.db_manager.fetch_all(missing_scores_query, {"cutoff_time": cutoff_time})
+            
+            if not missing_times:
+                logger.info("✅ No missing score rows found in soil moisture history")
+                return
+            
+            logger.info(f"🔍 Found {len(missing_times)} target times with missing score rows:")
+            for time_row in missing_times:
+                logger.info(f"   - {time_row['target_time']}: {time_row['history_count']} history entries")
+            
+            successful_builds = 0
+            failed_builds = 0
+            
+            # Process each missing target time
+            for time_row in missing_times:
+                target_time = time_row['target_time']
+                try:
+                    logger.info(f"📊 Building retroactive score row for {target_time}...")
+                    
+                    # Get all history entries for this target time
+                    history_query = """
+                        SELECT h.*, r.sentinel_bounds, r.sentinel_crs
+                        FROM soil_moisture_history h
+                        JOIN soil_moisture_regions r ON h.region_id = r.id
+                        WHERE h.target_time = :target_time
+                        ORDER BY h.region_id, h.miner_uid
+                    """
+                    
+                    history_entries = await self.db_manager.fetch_all(history_query, {"target_time": target_time})
+                    
+                    if not history_entries:
+                        logger.warning(f"No history entries found for {target_time}")
+                        failed_builds += 1
+                        continue
+                    
+                    # Group by region and calculate aggregate scores per miner
+                    regions_data = defaultdict(lambda: defaultdict(list))
+                    
+                    for entry in history_entries:
+                        region_id = entry['region_id']
+                        miner_uid = entry['miner_uid']
+                        miner_hotkey = entry['miner_hotkey']
+                        
+                        # Calculate composite score from RMSE and SSIM
+                        surface_rmse = entry.get('surface_rmse', 0) or 0
+                        rootzone_rmse = entry.get('rootzone_rmse', 0) or 0
+                        surface_ssim = entry.get('surface_structure_score', 0) or 0
+                        rootzone_ssim = entry.get('rootzone_structure_score', 0) or 0
+                        
+                        # Use similar scoring logic as in the main scoring mechanism
+                        # Average RMSE (lower is better, so invert for scoring)
+                        avg_rmse = (surface_rmse + rootzone_rmse) / 2
+                        rmse_score = max(0, 1 - (avg_rmse / 0.1))  # Normalize assuming max reasonable RMSE of 0.1
+                        
+                        # Average SSIM (higher is better, already 0-1 range)
+                        avg_ssim = (surface_ssim + rootzone_ssim) / 2
+                        ssim_score = max(0, (avg_ssim + 1) / 2)  # Convert from [-1,1] to [0,1]
+                        
+                        # Composite score (weighted combination)
+                        composite_score = (rmse_score * 0.7) + (ssim_score * 0.3)
+                        
+                        regions_data[region_id][miner_uid] = {
+                            'score': composite_score,
+                            'hotkey': miner_hotkey,
+                            'surface_rmse': surface_rmse,
+                            'rootzone_rmse': rootzone_rmse,
+                            'surface_ssim': surface_ssim,
+                            'rootzone_ssim': rootzone_ssim
+                        }
+                    
+                    # Build the score array
+                    scores = [float("nan")] * 256
+                    miner_scores = defaultdict(list)
+                    region_counts = defaultdict(set)
+                    
+                    for region_id, miners in regions_data.items():
+                        for miner_uid, data in miners.items():
+                            # Validate miner is still in current metagraph if available
+                            is_valid_in_metagraph = True  # Default to true for retroactive scoring
+                            if self.validator and hasattr(self.validator, 'metagraph') and self.validator.metagraph is not None:
+                                miner_hotkey = data['hotkey']
+                                if miner_hotkey in self.validator.metagraph.nodes:
+                                    node_in_metagraph = self.validator.metagraph.nodes[miner_hotkey]
+                                    if hasattr(node_in_metagraph, 'node_id') and str(node_in_metagraph.node_id) == str(miner_uid):
+                                        is_valid_in_metagraph = True
+                                    else:
+                                        logger.debug(f"Retroactive: Metagraph UID mismatch for {miner_hotkey}, but including in retroactive scoring")
+                                else:
+                                    logger.debug(f"Retroactive: Miner {miner_hotkey} not in current metagraph, but including in retroactive scoring")
+                            
+                            if is_valid_in_metagraph:
+                                score_value = data['score']
+                                miner_scores[miner_uid].append(score_value)
+                                region_counts[miner_uid].add(region_id)
+                                logger.debug(f"Retroactive: Added score {score_value:.4f} for miner {miner_uid} in region {region_id}")
+                    
+                    # Calculate final scores for each miner
+                    for miner_uid, scores_list in miner_scores.items():
+                        if scores_list:
+                            avg_score = sum(scores_list) / len(scores_list)
+                            region_count = len(region_counts[miner_uid])
+                            try:
+                                scores[int(miner_uid)] = avg_score
+                                logger.debug(f"Retroactive: Final score for miner {miner_uid}: {avg_score:.4f} across {region_count} regions")
+                            except (ValueError, IndexError):
+                                logger.warning(f"Invalid miner UID for scoring: {miner_uid}")
+                                continue
+                    
+                    # Create score row
+                    current_datetime = target_time
+                    score_row = {
+                        "task_name": "soil_moisture_region_global",
+                        "task_id": str(current_datetime.timestamp()),
+                        "score": scores,
+                        "status": "completed"
+                    }
+                    
+                    # Insert or update the score row (always use UPSERT to avoid conflicts)
+                    upsert_query = """
+                        INSERT INTO score_table 
+                        (task_name, task_id, score, status)
+                        VALUES 
+                        (:task_name, :task_id, :score, :status)
+                        ON CONFLICT (task_name, task_id) 
+                        DO UPDATE SET 
+                            score = EXCLUDED.score,
+                            status = EXCLUDED.status
+                    """
+                    await self.db_manager.execute(upsert_query, score_row)
+                    
+                    if force_rebuild:
+                        logger.info(f"✅ Updated retroactive score row for {target_time}")
+                    else:
+                        logger.info(f"✅ Created/updated retroactive score row for {target_time}")
+                    
+                    # Log summary
+                    non_nan_scores = [(i, s) for i, s in enumerate(scores) if not math.isnan(s)]
+                    if non_nan_scores:
+                        logger.info(f"   📈 Built score row with {len(non_nan_scores)} miners, "
+                                  f"scores: {min(s for _, s in non_nan_scores):.4f} - {max(s for _, s in non_nan_scores):.4f}")
+                    
+                    successful_builds += 1
+                    
+                except Exception as e:
+                    logger.error(f"❌ Failed to build retroactive score row for {target_time}: {e}")
+                    logger.error(traceback.format_exc())
+                    failed_builds += 1
+                    continue
+            
+            logger.info(f"🎯 Retroactive score building complete: {successful_builds} successful, {failed_builds} failed")
+            
+            if successful_builds > 0:
+                logger.info("💡 Retroactive scores have been added to the score_table and should be reflected in the next weight calculation")
+            
+        except Exception as e:
+            logger.error(f"Error in build_retroactive_score_rows: {e}")
+            logger.error(traceback.format_exc())
+
+    async def trigger_retroactive_scoring(self, days_back=7, force_rebuild=False):
+        """
+        Public method to trigger retroactive score building.
+        Can be called manually or during startup.
+        
+        Args:
+            days_back (int): How many days back to look for missing score rows
+            force_rebuild (bool): Whether to rebuild existing score rows
+        """
+        try:
+            logger.info("🚀 Triggering retroactive soil moisture score building...")
+            await self.build_retroactive_score_rows(days_back=days_back, force_rebuild=force_rebuild)
+            logger.info("✅ Retroactive soil moisture score building completed")
+            
+        except Exception as e:
+            logger.error(f"Error triggering retroactive scoring: {e}")
             logger.error(traceback.format_exc())
 

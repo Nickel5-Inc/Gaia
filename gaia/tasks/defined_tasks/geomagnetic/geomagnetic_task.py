@@ -1455,7 +1455,16 @@ class GeomagneticTask(Task):
                             # Validate task is still in metagraph if validator is available
                             if validator and hasattr(validator, 'metagraph') and validator.metagraph is not None:
                                 if task["miner_hotkey"] not in validator.metagraph.nodes:
-                                    logger.warning(f"Miner {task['miner_hotkey']} no longer in metagraph, skipping task {task['id']}")
+                                    logger.warning(f"Miner {task['miner_hotkey']} no longer in metagraph, deleting task {task['id']}")
+                                    try:
+                                        # Delete the task from the database since miner is no longer valid
+                                        await self.db_manager.execute(
+                                            "DELETE FROM geomagnetic_predictions WHERE id = :task_id",
+                                            {"task_id": task["id"]}
+                                        )
+                                        logger.info(f"Successfully deleted orphaned task {task['id']} for removed miner {task['miner_hotkey']}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to delete orphaned task {task['id']}: {e}")
                                     continue
 
                             # Use validator's basemodel_evaluator to get the baseline score for comparison
@@ -1582,7 +1591,16 @@ class GeomagneticTask(Task):
                     # Validate task is still in metagraph if validator is available
                     if validator and hasattr(validator, 'metagraph') and validator.metagraph is not None:
                         if task["miner_hotkey"] not in validator.metagraph.nodes:
-                            logger.warning(f"Miner {task['miner_hotkey']} no longer in metagraph, skipping task {task['id']}")
+                            logger.warning(f"Miner {task['miner_hotkey']} no longer in metagraph, deleting task {task['id']}")
+                            try:
+                                # Delete the task from the database since miner is no longer valid
+                                await self.db_manager.execute(
+                                    "DELETE FROM geomagnetic_predictions WHERE id = :task_id",
+                                    {"task_id": task["id"]}
+                                )
+                                logger.info(f"Successfully deleted orphaned task {task['id']} for removed miner {task['miner_hotkey']}")
+                            except Exception as e:
+                                logger.error(f"Failed to delete orphaned task {task['id']}: {e}")
                             continue
 
                     # Use validator's basemodel_evaluator to get the baseline score for comparison
@@ -1882,7 +1900,16 @@ class GeomagneticTask(Task):
                             # Validate task is still in metagraph if validator is available
                             if validator and hasattr(validator, 'metagraph') and validator.metagraph is not None:
                                 if task["miner_hotkey"] not in validator.metagraph.nodes:
-                                    logger.warning(f"Miner {task['miner_hotkey']} no longer in metagraph, skipping task {task['id']}")
+                                    logger.warning(f"Miner {task['miner_hotkey']} no longer in metagraph, deleting task {task['id']}")
+                                    try:
+                                        # Delete the task from the database since miner is no longer valid
+                                        await self.db_manager.execute(
+                                            "DELETE FROM geomagnetic_predictions WHERE id = :task_id",
+                                            {"task_id": task["id"]}
+                                        )
+                                        logger.info(f"Successfully deleted orphaned task {task['id']} for removed miner {task['miner_hotkey']}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to delete orphaned task {task['id']}: {e}")
                                     continue
 
                             # Get baseline score for comparison
