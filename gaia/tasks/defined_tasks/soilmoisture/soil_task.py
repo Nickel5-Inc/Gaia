@@ -252,7 +252,7 @@ class SoilMoistureTask(Task):
                                 task_data = {
                                     "region_id": region["id"],
                                     "combined_data": encoded_data_ascii,
-                                    "sentinel_bounds": region["sentinel_bounds"],
+                                    "sentinel_bounds": json.loads(region["sentinel_bounds"]) if isinstance(region["sentinel_bounds"], str) else region["sentinel_bounds"],
                                     "sentinel_crs": region["sentinel_crs"],
                                     "target_time": target_smap_time.isoformat(),
                                 }
@@ -1450,13 +1450,26 @@ class SoilMoistureTask(Task):
     async def cleanup_predictions(self, bounds, target_time=None, miner_uid=None):
         """Clean up predictions after they've been processed and moved to history."""
         try:
+            try:
+                bounds_list = json.loads(bounds)
+                if (
+                    not isinstance(bounds_list, list)
+                    or len(bounds_list) != 4
+                    or any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in bounds_list)
+                ):
+                    logger.warning(f"🚫 Skipping cleanup — invalid sentinel_bounds: {bounds}")
+                    return
+            except Exception:
+                logger.warning(f"🚫 Cleanup aborted — malformed sentinel_bounds JSON: {bounds}")
+                return
+
             if miner_uid is not None:
                 # Clean up specific miner's predictions
                 delete_query = """
                     DELETE FROM soil_moisture_predictions p
                     USING soil_moisture_regions r
                     WHERE p.region_id = r.id 
-                    AND r.sentinel_bounds = :bounds
+                    AND r.sentinel_bounds = :bounds: :jsonb
                     AND r.target_time = :target_time
                     AND p.miner_uid = :miner_uid
                     AND p.status = 'scored'
@@ -1472,7 +1485,7 @@ class SoilMoistureTask(Task):
                     DELETE FROM soil_moisture_predictions p
                     USING soil_moisture_regions r
                     WHERE p.region_id = r.id 
-                    AND r.sentinel_bounds = :bounds
+                    AND r.sentinel_bounds = :bounds: :jsonb
                     AND r.target_time = :target_time
                     AND p.status = 'scored'
                 """
@@ -1832,6 +1845,22 @@ class SoilMoistureTask(Task):
                     
                     for entry in history_entries:
                         region_id = entry['region_id']
+
+                        # Validate sentinel_bounds
+                        try:
+                            bounds = json.loads(entry['sentinel_bounds'])
+                            if (
+                                    not isinstance(bounds, list)
+                                    or len(bounds) != 4
+                                    or any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in bounds)
+                            ):
+                                logger.warning(
+                                    f"🚫 Skipping region {region_id} due to invalid sentinel_bounds: {entry['sentinel_bounds']}")
+                                continue
+                        except Exception:
+                            logger.warning(f"🚫 Malformed JSON in sentinel_bounds for region {region_id}")
+                            continue
+
                         miner_uid = entry['miner_uid']
                         miner_hotkey = entry['miner_hotkey']
                         
