@@ -48,10 +48,57 @@ async def get_active_validator_uids(netuid, subtensor_network="finney", chain_en
         logger.error(traceback.format_exc())
         return []
     finally:
-        # Clean up substrate connection
+        # MEMORY LEAK FIX: Aggressive substrate cleanup
         if 'substrate' in locals():
             try:
+                # Clear substrate internal caches before closing
+                try:
+                    if hasattr(substrate, '_request_cache'):
+                        substrate._request_cache.clear()
+                    if hasattr(substrate, 'metadata_cache'):
+                        substrate.metadata_cache.clear()
+                    if hasattr(substrate, 'runtime_configuration'):
+                        substrate.runtime_configuration = None
+                    if hasattr(substrate, 'websocket') and substrate.websocket:
+                        substrate.websocket.close()
+                except Exception:
+                    pass
+                    
                 substrate.close()
+                
+                # Clear scalecodec caches after substrate operation
+                try:
+                    import sys
+                    import gc
+                    cleared_count = 0
+                    
+                    for module_name in list(sys.modules.keys()):
+                        if any(pattern in module_name.lower() for pattern in 
+                               ['scalecodec', 'substrate', 'scale_info']):
+                            module = sys.modules.get(module_name)
+                            if hasattr(module, '__dict__'):
+                                for attr_name in list(module.__dict__.keys()):
+                                    if any(cache_pattern in attr_name.lower() for cache_pattern in 
+                                           ['cache', 'registry', '_cached', '_memo']):
+                                        try:
+                                            cache_obj = getattr(module, attr_name)
+                                            if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
+                                                cache_obj.clear()
+                                                cleared_count += 1
+                                            elif isinstance(cache_obj, (dict, list, set)):
+                                                cache_obj.clear()
+                                                cleared_count += 1
+                                        except Exception:
+                                            pass
+                    
+                    # Force GC after clearing caches
+                    collected = gc.collect()
+                    if cleared_count > 0:
+                        logger.debug(f"get_active_validator_uids cleanup: cleared {cleared_count} cache objects, GC collected {collected}")
+                        
+                except Exception:
+                    pass
+                    
             except Exception as cleanup_error:
                 logger.debug(f"Error cleaning up substrate connection: {cleanup_error}")
 
@@ -297,12 +344,63 @@ class FiberWeightSetter:
             logger.error(traceback.format_exc())
             return False
         finally:
-            # Ensure cleanup happens even if outer exception occurs
+            # MEMORY LEAK FIX: Aggressive substrate cleanup with scalecodec cache clearing
             if hasattr(self, 'substrate') and self.substrate:
                 try:
-                    logger.debug("Final cleanup of fresh substrate connection")
+                    logger.debug("Final cleanup of fresh substrate connection with aggressive scalecodec cleanup")
+                    
+                    # Clear substrate internal caches before closing
+                    try:
+                        if hasattr(self.substrate, '_request_cache'):
+                            self.substrate._request_cache.clear()
+                        if hasattr(self.substrate, 'metadata_cache'):
+                            self.substrate.metadata_cache.clear()
+                        if hasattr(self.substrate, 'runtime_configuration'):
+                            self.substrate.runtime_configuration = None
+                        if hasattr(self.substrate, 'websocket') and self.substrate.websocket:
+                            self.substrate.websocket.close()
+                    except Exception as cache_clear_err:
+                        logger.debug(f"Error clearing substrate caches: {cache_clear_err}")
+                    
+                    # Close the connection
                     self.substrate.close()
                     self.substrate = None
+                    
+                    # AGGRESSIVE: Clear scalecodec module-level caches after substrate operations
+                    try:
+                        import sys
+                        scalecodec_modules_cleared = 0
+                        
+                        for module_name in list(sys.modules.keys()):
+                            if any(pattern in module_name.lower() for pattern in 
+                                   ['scalecodec', 'substrate', 'scale_info', 'metadata']):
+                                module = sys.modules.get(module_name)
+                                if hasattr(module, '__dict__'):
+                                    for attr_name in list(module.__dict__.keys()):
+                                        if any(cache_pattern in attr_name.lower() for cache_pattern in 
+                                               ['cache', 'registry', '_cached', '_memo', '_lru', '_store']):
+                                            try:
+                                                cache_obj = getattr(module, attr_name)
+                                                if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
+                                                    cache_obj.clear()
+                                                    scalecodec_modules_cleared += 1
+                                                elif isinstance(cache_obj, (dict, list, set)):
+                                                    cache_obj.clear() 
+                                                    scalecodec_modules_cleared += 1
+                                            except Exception:
+                                                pass
+                        
+                        if scalecodec_modules_cleared > 0:
+                            logger.debug(f"Substrate cleanup: cleared {scalecodec_modules_cleared} scalecodec cache objects")
+                                                
+                        # Force garbage collection after substrate operations
+                        import gc
+                        collected = gc.collect()
+                        logger.debug(f"Substrate cleanup: GC collected {collected} objects")
+                        
+                    except Exception as aggressive_cleanup_err:
+                        logger.debug(f"Error during aggressive substrate cleanup: {aggressive_cleanup_err}")
+                        
                 except Exception as cleanup_e:
                     logger.debug(f"Error in final substrate cleanup: {cleanup_e}")
 

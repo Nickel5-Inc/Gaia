@@ -352,16 +352,23 @@ class SoilMoistureTask(Task):
                                     payload=payload, endpoint="/soilmoisture-request"
                                 )
                                 
-                                # Clean up task_data and payload after query to free encoded data
-                                del task_data
-                                del payload
-                                del encoded_data_ascii
-                                
-                                # Force garbage collection after processing large TIFF
-                                if tiff_size_mb > 50:
-                                    import gc
-                                    collected = gc.collect()
-                                    logger.info(f"Cleaned up large TIFF data for region {region['id']} ({tiff_size_mb:.1f}MB), GC collected {collected} objects")
+                                # IMMEDIATE cleanup after query to free encoded data
+                                try:
+                                    del task_data
+                                    del payload  
+                                    del encoded_data_ascii
+                                    
+                                    # Clean up the original data copy if still in scope
+                                    if 'original_data_copy' in locals():
+                                        del original_data_copy
+                                        
+                                    # Force garbage collection after processing large TIFF
+                                    if tiff_size_mb > 50:
+                                        import gc
+                                        collected = gc.collect()
+                                        logger.info(f"Cleaned up large TIFF data for region {region['id']} ({tiff_size_mb:.1f}MB), GC collected {collected} objects")
+                                except Exception as cleanup_err:
+                                    logger.warning(f"Error during soil task cleanup for region {region['id']}: {cleanup_err}")
 
                                 # Log memory after cleanup
                                 if hasattr(validator, '_log_memory_usage'):
@@ -1426,6 +1433,15 @@ class SoilMoistureTask(Task):
                         
                         if region_count > 5:
                             logger.warning(f"Unexpected number of regions ({region_count}) for miner {miner_id}. Expected maximum 5.")
+                
+                # MEMORY LEAK FIX: Clear intermediate data structures
+                try:
+                    del processed_region_ids, miner_scores, region_counts
+                    import gc
+                    collected = gc.collect()
+                    logger.debug(f"Soil score building cleanup: collected {collected} objects")
+                except Exception as cleanup_err:
+                    logger.debug(f"Error during soil score cleanup: {cleanup_err}")
 
             score_row = {
                 "task_name": "soil_moisture_region_global",

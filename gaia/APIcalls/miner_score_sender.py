@@ -218,36 +218,61 @@ class MinerScoreSender:
                             logger.error(f"Error processing miner {miner['hotkey']} under semaphore: {str(e)}\n{traceback.format_exc()}")
                             return None
 
-                # Gather all processed miner data
-                logger.info(f"Starting to process data for {len(active_miners)} active miners.")
-                miner_data_tasks = [process_miner_with_semaphore(miner) for miner in active_miners]
-                all_miner_payloads = await asyncio.gather(*miner_data_tasks, return_exceptions=True)
-
-                valid_payloads = [p for p in all_miner_payloads if p is not None and not isinstance(p, Exception)]
-                logger.info(f"Successfully processed data for {len(valid_payloads)} miners.")
-
-                # Send data to Gaia API in batches or sequentially
-                # For simplicity, sending one by one with timeout, can be batched if API supports batch endpoints
-                # or with another semaphore if sending concurrently is desired.
+                # Process miners in smaller batches to reduce memory usage
+                batch_size = 50  # Process 50 miners at a time
                 successful_sends = 0
                 failed_sends = 0
-                for i, payload in enumerate(valid_payloads):
+                
+                logger.info(f"Starting to process data for {len(active_miners)} active miners in batches of {batch_size}.")
+                
+                for batch_start in range(0, len(active_miners), batch_size):
+                    batch_end = min(batch_start + batch_size, len(active_miners))
+                    batch_miners = active_miners[batch_start:batch_end]
+                    
+                    logger.info(f"Processing miner batch {batch_start//batch_size + 1}: miners {batch_start+1}-{batch_end}")
+                    
+                    # Process this batch
+                    batch_tasks = [process_miner_with_semaphore(miner) for miner in batch_miners]
+                    batch_payloads = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                    
+                    valid_batch_payloads = [p for p in batch_payloads if p is not None and not isinstance(p, Exception)]
+                    logger.info(f"Batch {batch_start//batch_size + 1}: Successfully processed {len(valid_batch_payloads)} miners.")
+                    
+                    # Send batch data immediately and clean up
+                    for i, payload in enumerate(valid_batch_payloads):
+                        try:
+                            logger.debug(f"Sending data for miner {payload['minerHotKey']} ({i+1}/{len(valid_batch_payloads)})")
+                            await asyncio.wait_for(
+                                gaia_communicator.send_data(data=payload),
+                                timeout=30 # Timeout for individual API call
+                            )
+                            logger.debug(f"Successfully sent data for miner {payload['minerHotKey']}")
+                            successful_sends += 1
+                        except asyncio.TimeoutError:
+                            logger.error(f"Timeout sending API data for miner {payload['minerHotKey']}")
+                            failed_sends += 1
+                        except Exception as e:
+                            logger.error(f"Error sending API data for miner {payload['minerHotKey']}: {str(e)}\n{traceback.format_exc()}")
+                            failed_sends += 1
+                        finally:
+                            await asyncio.sleep(0.2) # Add a small delay to avoid rate limiting
+                    
+                    # IMMEDIATE cleanup of batch data
                     try:
-                        logger.debug(f"Sending data for miner {payload['minerHotKey']} ({i+1}/{len(valid_payloads)})")
-                        await asyncio.wait_for(
-                            gaia_communicator.send_data(data=payload),
-                            timeout=30 # Timeout for individual API call
-                        )
-                        logger.debug(f"Successfully sent data for miner {payload['minerHotKey']}")
-                        successful_sends += 1
-                    except asyncio.TimeoutError:
-                        logger.error(f"Timeout sending API data for miner {payload['minerHotKey']}")
-                        failed_sends += 1
-                    except Exception as e:
-                        logger.error(f"Error sending API data for miner {payload['minerHotKey']}: {str(e)}\n{traceback.format_exc()}")
-                        failed_sends += 1
-                    finally:
-                        await asyncio.sleep(0.2) # Add a small delay to avoid rate limiting
+                        del batch_tasks
+                        del batch_payloads  
+                        del valid_batch_payloads
+                        # Force GC every few batches for large miner sets
+                        if (batch_start // batch_size + 1) % 3 == 0:
+                            import gc
+                            collected = gc.collect()
+                            logger.debug(f"Batch cleanup: GC collected {collected} objects")
+                    except Exception as cleanup_err:
+                        logger.debug(f"Error during batch cleanup: {cleanup_err}")
+                    
+                    # Brief pause between batches
+                    if batch_end < len(active_miners):
+                        await asyncio.sleep(1.0)
                 
                 logger.info(f"Completed sending data to Gaia API. Successful: {successful_sends}, Failed: {failed_sends}")
 

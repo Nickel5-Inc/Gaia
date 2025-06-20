@@ -1215,15 +1215,24 @@ class GeomagneticTask(Task):
                     if processed_count % 1000 == 0:
                         await asyncio.sleep(0)
 
-                # Clear the large results list to free memory
+                # AGGRESSIVE cleanup of large datasets
                 del history_results
                 del miner_mappings
                 
-                # Force garbage collection for large datasets
+                # Force comprehensive cleanup for large datasets  
                 if processed_count > 1000:
                     import gc
                     collected = gc.collect()
                     logger.info(f"Geomagnetic history processing: GC collected {collected} objects after processing {processed_count} records")
+                
+                # Additional cleanup: clear any large intermediate data structures
+                try:
+                    # Clear hourly_records dict to release memory from grouped records
+                    if processed_count > 500:  # Only for moderate+ datasets
+                        logger.info(f"Clearing hourly_records dict with {len(hourly_records)} hour keys")
+                        hourly_records.clear()
+                except Exception as hourly_cleanup_err:
+                    logger.debug(f"Error during hourly records cleanup: {hourly_cleanup_err}")
 
             except Exception as processing_error:
                 logger.error(f"Error processing historical records: {processing_error}")

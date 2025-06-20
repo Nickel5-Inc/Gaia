@@ -235,6 +235,11 @@ class GaiaValidator:
         self.metagraph = None
         self.config = None
         self.database_manager = ValidatorDatabaseManager()
+        
+        # MEMORY LEAK FIX: Task tracking for proper cleanup
+        self._background_tasks = set()  # Track all background tasks
+        self._task_cleanup_lock = asyncio.Lock()
+        
         self.soil_task = SoilMoistureTask(
             db_manager=self.database_manager,
             node_type="validator",
@@ -402,10 +407,10 @@ class GaiaValidator:
         self.memory_monitor_enabled = os.getenv('VALIDATOR_MEMORY_MONITORING_ENABLED', 'true').lower() in ['true', '1', 'yes']
         self.pm2_restart_enabled = os.getenv('VALIDATOR_PM2_RESTART_ENABLED', 'true').lower() in ['true', '1', 'yes']
         
-        # Memory thresholds in MB - conservative defaults for validators (15GB max)
-        self.memory_warning_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_WARNING_THRESHOLD_MB', '10000'))  # 10GB
-        self.memory_emergency_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB', '12000'))  # 12GB  
-        self.memory_critical_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB', '15000'))  # 15GB
+        # AGGRESSIVE MEMORY THRESHOLDS - Lower defaults for more aggressive restart behavior
+        self.memory_warning_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_WARNING_THRESHOLD_MB', '8000'))  # 8GB (reduced from 10GB)
+        self.memory_emergency_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB', '10000'))  # 10GB (reduced from 12GB)  
+        self.memory_critical_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB', '12000'))  # 12GB (reduced from 15GB)
         
         # Memory monitoring state
         self.last_memory_log_time = 0
@@ -715,6 +720,15 @@ class GaiaValidator:
 
             responses = {}
             
+            # Log payload memory footprint early
+            try:
+                import sys
+                payload_size_mb = sys.getsizeof(payload) / (1024 * 1024)
+                if payload_size_mb > 50:  # Log large payloads early
+                    logger.warning(f"Large payload detected: {payload_size_mb:.1f}MB - will reuse same reference for all miners")
+            except Exception:
+                pass
+            
             current_time = time.time()
             if self.metagraph is None or current_time - self.last_metagraph_sync > self.metagraph_sync_interval:
                 logger.info(f"Metagraph not initialized or sync interval ({self.metagraph_sync_interval}s) exceeded. Syncing metagraph before querying miners. Last sync: {current_time - self.last_metagraph_sync if self.metagraph else 'Never'}s ago.")
@@ -870,18 +884,10 @@ class GaiaValidator:
                             
                             fernet = Fernet(symmetric_key_str)
                             
-                            # Make the actual request
+                            # Make the actual request - REUSE THE SAME PAYLOAD REFERENCE
                             try:
                                 logger.debug(f"Making request to {miner_hotkey} (attempt {attempt + 1})")
                                 request_start_time = time.time()
-                                
-                                # Log payload size for memory tracking
-                                try:
-                                    payload_size_mb = len(str(payload).encode('utf-8')) / (1024 * 1024)
-                                    if payload_size_mb > 50:  # Log large payloads
-                                        logger.info(f"Large payload warning: {miner_hotkey} payload size: {payload_size_mb:.1f}MB")
-                                except Exception:
-                                    pass
                                 
                                 resp = await asyncio.wait_for(
                                     vali_client.make_non_streamed_post(
@@ -892,7 +898,7 @@ class GaiaValidator:
                                         symmetric_key_uuid=symmetric_key_uuid,
                                         validator_ss58_address=self.keypair.ss58_address,
                                         miner_ss58_address=miner_hotkey,
-                                        payload=payload,
+                                        payload=payload,  # REUSE SAME PAYLOAD REFERENCE - NO COPYING!
                                         endpoint=endpoint,
                                     ),
                                     timeout=240.0  # Keep longer timeout for actual request
@@ -986,19 +992,10 @@ class GaiaValidator:
             # Process miners in chunks to reduce database contention and memory usage
             logger.info(f"Starting chunked processing of {len(chunks)} chunks...")
             start_time = time.time()
-            all_results = []
+            successful_responses = {}  # Final results only
             
             # Log memory before launching queries
             self._log_memory_usage("query_miners_start")
-            
-            # Log total payload memory footprint
-            try:
-                import sys
-                total_payload_size = sys.getsizeof(payload) / (1024 * 1024)
-                estimated_chunk_memory = total_payload_size * chunk_size
-                logger.info(f"Payload memory per chunk: {chunk_size} miners × {total_payload_size:.1f}MB = {estimated_chunk_memory:.1f}MB")
-            except Exception:
-                pass
             
             for chunk_idx, chunk_miners in enumerate(chunks):
                 chunk_start_time = time.time()
@@ -1018,10 +1015,8 @@ class GaiaValidator:
                         chunk_tasks.append((hotkey, task))
                     else:
                         logger.warning(f"Skipping miner {hotkey} - missing IP or port")
-                        all_results.append({"hotkey": hotkey, "status": "failed", "reason": "Missing IP/Port", "details": "No IP or port available"})
 
                 # Process this chunk's responses
-                chunk_results = []
                 completed_count = 0
                 
                 # Create a mapping for this chunk
@@ -1033,33 +1028,31 @@ class GaiaValidator:
                         completed_count += 1
                         try:
                             result = await completed_task
-                            chunk_results.append(result)
-                            all_results.append(result)
+                            if result and result.get('status') == 'success':
+                                # Only keep successful results in final collection
+                                successful_responses[result['hotkey']] = result
                         except Exception as e:
                             task_hotkey = task_to_hotkey.get(completed_task, "unknown")
-                            error_result = {"hotkey": task_hotkey, "status": "failed", "reason": "Task Exception", "details": str(e)}
-                            chunk_results.append(error_result)
-                            all_results.append(error_result)
                             logger.debug(f"Exception processing response in chunk {chunk_idx + 1}: {e}")
 
                 chunk_time = time.time() - chunk_start_time
-                chunk_successful = sum(1 for r in chunk_results if r and r.get('status') == 'success')
-                chunk_failed = len(chunk_results) - chunk_successful
+                chunk_successful = len([r for r in successful_responses.values() if r.get('hotkey') in chunk_miners])
+                chunk_failed = len(chunk_miners) - chunk_successful
                 logger.info(f"Chunk {chunk_idx + 1}/{len(chunks)} completed: {chunk_successful} successful, {chunk_failed} failed in {chunk_time:.2f}s")
                 
-                # Memory cleanup between chunks
+                # AGGRESSIVE CLEANUP BETWEEN CHUNKS
                 try:
                     del chunk_tasks
                     del task_to_hotkey
                     del just_tasks
-                    del chunk_results
                     del chunk_semaphore
                     
                     # Force garbage collection between chunks to manage memory
-                    import gc
-                    collected = gc.collect()
-                    if collected > 20:
-                        logger.debug(f"GC collected {collected} objects after chunk {chunk_idx + 1}")
+                    if chunk_idx % 3 == 0:  # Every 3 chunks
+                        import gc
+                        collected = gc.collect()
+                        if collected > 20:
+                            logger.debug(f"GC collected {collected} objects after chunk {chunk_idx + 1}")
                 except Exception as cleanup_err:
                     logger.debug(f"Error during chunk cleanup: {cleanup_err}")
                 
@@ -1069,91 +1062,31 @@ class GaiaValidator:
 
             total_time = time.time() - start_time
             
-            # --- Start of Detailed Logging ---
-            successful_results = [r for r in all_results if r and r.get('status') == 'success']
-            failed_results = [r for r in all_results if not r or r.get('status') == 'failed']
-            
-            responses = {res['hotkey']: res for res in successful_results} # Keep original responses dict for return value
-            
-            total_queries = len(all_results)
-            success_count = len(successful_results)
-            failed_count = len(failed_results)
+            # Final summary logging
+            total_queries = sum(len(chunk) for chunk in chunks)
+            success_count = len(successful_responses)
+            failed_count = total_queries - success_count
             success_rate = success_count / total_queries * 100 if total_queries > 0 else 0
             avg_rate = total_queries / total_time if total_time > 0 else 0
 
-            summary_log = f"\n--- Miner Query Summary (Endpoint: {endpoint}) ---\n"
-            summary_log += "Overall:\n"
-            summary_log += f"  - Total Queries: {total_queries}\n"
-            summary_log += f"  - Successful: {success_count} ({success_rate:.1f}%)\n"
-            summary_log += f"  - Failed: {failed_count} ({100-success_rate:.1f}%)\n"
-            summary_log += f"  - Total Time: {total_time:.2f}s\n"
-            summary_log += f"  - Average Rate: {avg_rate:.1f} queries/sec\n"
-
-            if successful_results:
-                durations = [r['duration'] for r in successful_results]
-                summary_log += "\nTiming (Successful Queries):\n"
-                summary_log += f"  - Min Duration: {np.min(durations):.2f}s\n"
-                summary_log += f"  - Max Duration: {np.max(durations):.2f}s\n"
-                summary_log += f"  - Avg Duration: {np.mean(durations):.2f}s\n"
-                summary_log += f"  - Median Duration: {np.median(durations):.2f}s\n"
-                summary_log += f"  - 95th Percentile: {np.percentile(durations, 95):.2f}s\n"
-
-            if failed_results:
-                summary_log += f"\nFailures ({failed_count} miners):\n"
-                failures_by_reason = defaultdict(list)
-                for failure in failed_results:
-                    reason = failure.get('reason', 'Unknown Reason')
-                    failures_by_reason[reason].append(failure)
-                
-                # Sort reasons by number of failures
-                sorted_reasons = sorted(failures_by_reason.items(), key=lambda item: len(item[1]), reverse=True)
-
-                for reason, fails in sorted_reasons:
-                    summary_log += f"  - {reason} ({len(fails)}):\n"
-                    # Log up to 5 hotkeys for brevity
-                    for fail in fails[:5]:
-                        summary_log += f"    - {fail.get('hotkey', 'N/A')[:12]}... (Details: {fail.get('details', 'N/A')})\n"
-                    if len(fails) > 5:
-                        summary_log += f"    - ... and {len(fails) - 5} more\n"
+            logger.info(f"Query Summary - Total: {total_queries}, Success: {success_count} ({success_rate:.1f}%), "
+                       f"Failed: {failed_count}, Time: {total_time:.2f}s, Rate: {avg_rate:.1f} queries/sec")
             
-            summary_log += "--- End of Summary ---\n"
-            logger.info(summary_log)
-            # --- End of Detailed Logging ---
-            
-            # Aggressive memory cleanup after large payload processing
+            # FINAL AGGRESSIVE CLEANUP
             try:
-                # Clear chunk references
+                # Clear all chunk references
                 del chunks
                 del miners_list
+                del miners_to_query  # Clear the large metagraph subset
                 
-                # Clear payload reference - critical for large payloads
-                if 'payload' in locals():
-                    payload_size_mb = 0
-                    try:
-                        payload_size_mb = len(str(payload).encode('utf-8')) / (1024 * 1024)
-                    except:
-                        pass
-                    del payload
-                    if payload_size_mb > 50:
-                        logger.info(f"Cleared large payload from memory ({payload_size_mb:.1f}MB)")
-                
-                # Force garbage collection for large memory cleanup
+                # Force final garbage collection
                 import gc
                 collected = gc.collect()
                 if collected > 100:  # Log significant cleanup
-                    logger.info(f"Garbage collected {collected} objects after miner queries")
-                
-                # Log memory after cleanup if psutil available
-                if PSUTIL_AVAILABLE:
-                    try:
-                        process = psutil.Process()
-                        mem_after_cleanup = process.memory_info().rss / (1024*1024)
-                        logger.debug(f"Memory after query cleanup: {mem_after_cleanup:.2f}MB")
-                    except:
-                        pass
+                    logger.info(f"Final cleanup: GC collected {collected} objects after miner queries")
                         
             except Exception as cleanup_error:
-                logger.warning(f"Error during post-query memory cleanup: {cleanup_error}")
+                logger.warning(f"Error during final query cleanup: {cleanup_error}")
             
             # Log memory after cleanup to verify effectiveness
             self._log_memory_usage("query_miners_end")
@@ -1161,7 +1094,7 @@ class GaiaValidator:
             # Clean up connections after query batch completes
             await self._cleanup_idle_connections()
             
-            return responses
+            return successful_responses
 
         except Exception as e:
             logger.error(f"Error querying miners: {e}")
@@ -1506,56 +1439,107 @@ class GaiaValidator:
             # Check if we're in a critical operation that shouldn't be interrupted
             critical_operations_active = self._check_critical_operations_active()
             
-            # Memory threshold checks
+            # AGGRESSIVE MEMORY MONITORING: Restart quickly when limits exceeded
             if memory_mb > self.memory_critical_threshold_mb:
                 logger.error(f"💀 CRITICAL MEMORY: {memory_mb:.1f} MB - OOM imminent! (threshold: {self.memory_critical_threshold_mb} MB)")
                 
                 if critical_operations_active:
-                    logger.warning(f"⚠️  Critical operations active: {critical_operations_active}. Delaying restart until operations complete.")
-                    # Try emergency GC but don't restart yet
-                    if current_time - self.last_emergency_gc_time > self.emergency_gc_cooldown:
+                    logger.warning(f"⚠️  Critical operations active: {critical_operations_active}. Will wait maximum 30 seconds before forced restart.")
+                    
+                    # Only wait briefly for truly critical operations (weight_setting only)
+                    # Try emergency GC but prepare for forced restart if memory stays critical
+                    if current_time - self.last_emergency_gc_time > 15:  # Reduced cooldown to 15 seconds
                         logger.error("Attempting emergency garbage collection while critical operations are active...")
-                        collected = gc.collect()
-                        logger.error(f"Emergency GC freed {collected} objects")
-                        self.last_emergency_gc_time = current_time
+                        try:
+                            collected = gc.collect()
+                            logger.error(f"Emergency GC freed {collected} objects")
+                            self.last_emergency_gc_time = current_time
+                            
+                            # Check memory immediately after GC
+                            immediate_post_gc_memory = process.memory_info().rss / (1024 * 1024)
+                            if immediate_post_gc_memory > (self.memory_critical_threshold_mb * 0.95):  # Still >95% of critical
+                                logger.error(f"🚨 GC INEFFECTIVE: Memory still {immediate_post_gc_memory:.1f} MB after emergency GC")
+                                if self.pm2_restart_enabled:
+                                    logger.error(f"🔄 FORCED RESTART: Cannot wait for critical operations - OOM imminent!")
+                                    await self._trigger_pm2_restart("Forced restart - GC ineffective and OOM imminent")
+                                    return
+                            
+                        except Exception as gc_err:
+                            logger.error(f"Emergency GC failed during critical operation: {gc_err}")
+                            if self.pm2_restart_enabled:
+                                logger.error(f"🔄 FORCED RESTART: GC failed and OOM imminent!")
+                                await self._trigger_pm2_restart("Forced restart - GC failed during critical operation")
+                                return
                 else:
-                    logger.error("Attempting emergency garbage collection before potential restart...")
+                    # NO critical operations - restart immediately after quick GC attempt
+                    logger.error("NO CRITICAL OPERATIONS - immediate restart after emergency GC...")
                     try:
                         collected = gc.collect()
-                        logger.error(f"Emergency GC freed {collected} objects")
-                        await asyncio.sleep(2)  # Brief pause after emergency GC
+                        logger.error(f"Emergency GC freed {collected} objects before restart")
+                        await asyncio.sleep(1)  # Very brief pause - 1 second only
                         
-                        # Check memory again after GC
+                        # Check memory again after GC - be more aggressive about restart threshold
                         post_gc_memory = process.memory_info().rss / (1024 * 1024)
-                        if post_gc_memory > (self.memory_critical_threshold_mb * 0.9):  # Still >90% of critical
+                        if post_gc_memory > (self.memory_critical_threshold_mb * 0.85):  # Restart if still >85% of critical
                             if self.pm2_restart_enabled:
-                                logger.error(f"🔄 TRIGGERING PM2 RESTART: Memory still critical after GC ({post_gc_memory:.1f} MB)")
-                                await self._trigger_pm2_restart("Critical memory pressure after GC")
+                                logger.error(f"🔄 TRIGGERING IMMEDIATE PM2 RESTART: Memory still high after GC ({post_gc_memory:.1f} MB)")
+                                await self._trigger_pm2_restart("Immediate restart - memory still critical after GC")
                                 return  # Exit the monitoring
                             else:
-                                logger.error(f"💀 MEMORY CRITICAL BUT PM2 RESTART DISABLED: {post_gc_memory:.1f} MB - system may be killed by OOM")
+                                logger.error(f"💀 MEMORY CRITICAL BUT PM2 RESTART DISABLED: {post_gc_memory:.1f} MB - system will likely be killed by OOM")
                         else:
-                            logger.info(f"✅ Memory reduced to {post_gc_memory:.1f} MB after GC - continuing")
+                            logger.info(f"✅ Memory reduced to {post_gc_memory:.1f} MB after GC - continuing with monitoring")
                     except Exception as gc_err:
                         logger.error(f"Emergency GC failed: {gc_err}")
-                        if self.pm2_restart_enabled and not critical_operations_active:
-                            await self._trigger_pm2_restart("Emergency GC failed and memory critical")
+                        if self.pm2_restart_enabled:
+                            logger.error(f"🔄 IMMEDIATE RESTART: GC failed and memory critical")
+                            await self._trigger_pm2_restart("Immediate restart - GC failed and memory critical")
                             return
                         else:
-                            logger.error("💀 GC FAILED AND RESTART CONDITIONS NOT MET - system may crash")
+                            logger.error("💀 GC FAILED AND PM2 RESTART DISABLED - system will likely crash")
                             
             elif memory_mb > self.memory_emergency_threshold_mb:
                 logger.warning(f"🚨 EMERGENCY MEMORY PRESSURE: {memory_mb:.1f} MB - OOM risk HIGH! (threshold: {self.memory_emergency_threshold_mb} MB)")
+                
+                # AGGRESSIVE: If emergency level persists, prepare for restart
+                if not hasattr(self, '_emergency_memory_start_time'):
+                    self._emergency_memory_start_time = current_time
+                    logger.warning(f"🕐 Emergency memory pressure started - will force restart if sustained for 60 seconds")
+                
+                emergency_duration = current_time - self._emergency_memory_start_time
+                
                 # Try light GC at emergency level
-                if current_time - self.last_emergency_gc_time > self.emergency_gc_cooldown:
+                if current_time - self.last_emergency_gc_time > 30:  # More frequent GC at emergency level
                     collected = gc.collect()
                     logger.warning(f"Emergency light GC collected {collected} objects")
                     self.last_emergency_gc_time = current_time
                     
+                    # Check if memory reduced after GC
+                    post_emergency_gc_memory = process.memory_info().rss / (1024 * 1024)
+                    if post_emergency_gc_memory < self.memory_emergency_threshold_mb:
+                        logger.info(f"✅ Emergency GC successful - memory reduced to {post_emergency_gc_memory:.1f} MB")
+                        if hasattr(self, '_emergency_memory_start_time'):
+                            delattr(self, '_emergency_memory_start_time')
+                    elif emergency_duration > 60:  # 60 seconds of emergency pressure
+                        if critical_operations_active:
+                            logger.error(f"🔄 EMERGENCY TIMEOUT: {emergency_duration:.0f}s of emergency memory pressure - forcing restart despite critical operations")
+                        else:
+                            logger.error(f"🔄 EMERGENCY TIMEOUT: {emergency_duration:.0f}s of emergency memory pressure - forcing restart")
+                        
+                        if self.pm2_restart_enabled:
+                            await self._trigger_pm2_restart(f"Emergency memory pressure sustained for {emergency_duration:.0f} seconds")
+                            return
+                        else:
+                            logger.error("💀 EMERGENCY TIMEOUT BUT PM2 RESTART DISABLED - system at high OOM risk")
+                            
             elif memory_mb > self.memory_warning_threshold_mb:
                 # Only log warning once per interval to avoid spam
                 if current_time - self.last_memory_log_time > (self.memory_log_interval / 2):  # Half interval for warnings
                     logger.warning(f"🟡 HIGH MEMORY: Validator process using {memory_mb:.1f} MB ({system_percent:.1f}% of system) (threshold: {self.memory_warning_threshold_mb} MB)")
+            else:
+                # Memory is below all thresholds - reset emergency timer
+                if hasattr(self, '_emergency_memory_start_time'):
+                    delattr(self, '_emergency_memory_start_time')
                     
         except ImportError:
             if self.memory_monitor_enabled:
@@ -1565,18 +1549,20 @@ class GaiaValidator:
             logger.error(f"Error in memory monitoring: {e}", exc_info=True)
 
     def _check_critical_operations_active(self):
-        """Check if any critical operations are currently active that shouldn't be interrupted."""
+        """Check if any critical operations are currently active that shouldn't be interrupted.
+        
+        MEMORY LEAK FIX: Made much more restrictive - only weight_setting is truly critical.
+        All other operations can be safely interrupted and restarted to prevent OOM.
+        """
         critical_ops = []
         
         for task_name, health in self.task_health.items():
             if health['status'] in ['processing'] and health.get('current_operation'):
-                # Define critical operations that shouldn't be interrupted
+                # AGGRESSIVE RESTART: Only weight_setting is truly critical and cannot be interrupted
+                # All other operations (miner_query, scoring, data_fetch, db_sync) can be safely
+                # interrupted and restarted to prevent system death from OOM
                 critical_operation_patterns = [
-                    'weight_setting',  # Never interrupt weight setting
-                    'miner_query',     # Don't interrupt while querying miners
-                    'scoring',         # Don't interrupt scoring calculations
-                    'db_sync',         # Don't interrupt database sync
-                    'data_fetch',      # Don't interrupt data fetching
+                    'weight_setting',  # ONLY weight setting is critical - blockchain integrity
                 ]
                 
                 current_op = health.get('current_operation', '')
@@ -1867,9 +1853,103 @@ class GaiaValidator:
         if connection_changed:
             logger.info("Substrate connection refreshed during metagraph sync")
 
+    def _track_background_task(self, task: asyncio.Task, task_name: str = "unnamed"):
+        """Track a background task for proper cleanup."""
+        self._background_tasks.add(task)
+        task.add_done_callback(lambda t: self._background_tasks.discard(t))
+        logger.debug(f"Tracking background task: {task_name}")
+        
+    def _aggressive_substrate_cleanup(self, context: str = "substrate_cleanup"):
+        """Aggressive cleanup of substrate/scalecodec module caches."""
+        try:
+            import sys
+            import gc
+            
+            substrate_modules_cleared = 0
+            cache_objects_cleared = 0
+            
+            # Target substrate-related modules specifically
+            substrate_patterns = [
+                'substrate', 'scalecodec', 'scale_info', 'metadata', 
+                'substrateinterface', 'scale_codec', 'polkadot'
+            ]
+            
+            for module_name in list(sys.modules.keys()):
+                if any(pattern in module_name.lower() for pattern in substrate_patterns):
+                    module = sys.modules.get(module_name)
+                    if hasattr(module, '__dict__'):
+                        module_cleared = False
+                        
+                        # Clear all cache-like attributes in substrate modules
+                        for attr_name in list(module.__dict__.keys()):
+                            if any(cache_pattern in attr_name.lower() for cache_pattern in 
+                                   ['cache', 'registry', '_cached', '_memo', '_lru', '_store', 
+                                    '_type_registry', '_metadata', '_runtime', '_version']):
+                                try:
+                                    cache_obj = getattr(module, attr_name)
+                                    if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
+                                        cache_obj.clear()
+                                        cache_objects_cleared += 1
+                                        module_cleared = True
+                                    elif isinstance(cache_obj, (dict, list, set)):
+                                        cache_obj.clear()
+                                        cache_objects_cleared += 1
+                                        module_cleared = True
+                                except Exception:
+                                    pass
+                        
+                        if module_cleared:
+                            substrate_modules_cleared += 1
+            
+            # Force garbage collection after substrate cleanup
+            collected = gc.collect()
+            
+            if substrate_modules_cleared > 0:
+                logger.info(f"Substrate cleanup ({context}): cleared {cache_objects_cleared} cache objects "
+                          f"from {substrate_modules_cleared} substrate modules, GC collected {collected}")
+                return cache_objects_cleared
+            else:
+                logger.debug(f"Substrate cleanup ({context}): no substrate caches found to clear")
+                return 0
+                
+        except Exception as e:
+            logger.debug(f"Error during aggressive substrate cleanup: {e}")
+            return 0
+        
+    async def _cleanup_background_tasks(self):
+        """Clean up all tracked background tasks."""
+        async with self._task_cleanup_lock:
+            if not self._background_tasks:
+                return
+                
+            logger.info(f"Cleaning up {len(self._background_tasks)} background tasks...")
+            
+            # Cancel all tasks
+            for task in self._background_tasks:
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for cancellation with timeout
+            if self._background_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*self._background_tasks, return_exceptions=True),
+                        timeout=10.0
+                    )
+                    logger.info("Successfully cancelled all background tasks")
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout cancelling background tasks")
+                except Exception as e:
+                    logger.warning(f"Error cancelling background tasks: {e}")
+                finally:
+                    self._background_tasks.clear()
+
     async def cleanup_resources(self):
         """Clean up any resources used by the validator during recovery."""
         try:
+            # MEMORY LEAK FIX: Clean up background tasks first
+            await self._cleanup_background_tasks()
+            
             # First clean up database resources
             if hasattr(self, 'database_manager'):
                 await self.database_manager.execute(
@@ -2602,6 +2682,15 @@ class GaiaValidator:
                                         await self.update_last_weights_block()
                                         self.last_successful_weight_set = time.time()
                                         logger.info("✅ Successfully set weights")
+                                        
+                                        # MEMORY LEAK FIX: Aggressive substrate cleanup after successful weight setting
+                                        try:
+                                            substrate_cleanup_count = self._aggressive_substrate_cleanup("post_weight_setting")
+                                            if substrate_cleanup_count > 0:
+                                                logger.info(f"Post-weight-setting cleanup: cleared {substrate_cleanup_count} substrate cache objects")
+                                        except Exception as substrate_cleanup_err:
+                                            logger.debug(f"Error during post-weight-setting substrate cleanup: {substrate_cleanup_err}")
+                                        
                                         await self.update_task_status('scoring', 'idle')
                                         
                                         # Clean up any stale operations
@@ -2632,11 +2721,49 @@ class GaiaValidator:
                 logger.error("Weight setting operation timed out - restarting cycle")
                 await self.update_task_status('scoring', 'error')
                 try:
+                    # MEMORY LEAK FIX: Clean up old substrate before creating new one
+                    if hasattr(self, 'substrate') and self.substrate:
+                        try:
+                            self.substrate.close()
+                        except Exception:
+                            pass
+                        
                     self.substrate = interface.get_substrate(
                         subtensor_network=self.subtensor_network,
                         subtensor_address=self.subtensor_chain_endpoint
                     )
                     print("🔄 Force reconnect - created fresh substrate connection")
+                    
+                    # Clear scalecodec caches after reconnection
+                    try:
+                        import sys
+                        import gc
+                        cleared_count = 0
+                        
+                        for module_name in list(sys.modules.keys()):
+                            if 'scalecodec' in module_name.lower() or 'substrate' in module_name.lower():
+                                module = sys.modules.get(module_name)
+                                if hasattr(module, '__dict__'):
+                                    for attr_name in list(module.__dict__.keys()):
+                                        if 'cache' in attr_name.lower() or 'registry' in attr_name.lower():
+                                            try:
+                                                cache_obj = getattr(module, attr_name)
+                                                if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
+                                                    cache_obj.clear()
+                                                    cleared_count += 1
+                                                elif isinstance(cache_obj, (dict, list, set)):
+                                                    cache_obj.clear()
+                                                    cleared_count += 1
+                                            except Exception:
+                                                pass
+                        
+                        if cleared_count > 0:
+                            collected = gc.collect()
+                            logger.debug(f"Substrate reconnect cleanup: cleared {cleared_count} cache objects, GC collected {collected}")
+                            
+                    except Exception:
+                        pass
+                        
                 except Exception as e:
                     logger.error(f"Failed to reconnect to substrate: {e}")
                 await asyncio.sleep(12)
@@ -2669,11 +2796,49 @@ class GaiaValidator:
                 except Exception as block_error:
 
                     try:
+                        # MEMORY LEAK FIX: Clean up old substrate before creating new one
+                        if hasattr(self, 'substrate') and self.substrate:
+                            try:
+                                self.substrate.close()
+                            except Exception:
+                                pass
+                                
                         self.substrate = interface.get_substrate(
                             subtensor_network=self.subtensor_network,
                             subtensor_address=self.subtensor_chain_endpoint
                         )
                         print("🔄 Created fresh connection for status logger")
+                        
+                        # Clear scalecodec caches after status logger reconnection
+                        try:
+                            import sys
+                            import gc
+                            cleared_count = 0
+                            
+                            for module_name in list(sys.modules.keys()):
+                                if 'scalecodec' in module_name.lower() or 'substrate' in module_name.lower():
+                                    module = sys.modules.get(module_name)
+                                    if hasattr(module, '__dict__'):
+                                        for attr_name in list(module.__dict__.keys()):
+                                            if 'cache' in attr_name.lower() or 'registry' in attr_name.lower():
+                                                try:
+                                                    cache_obj = getattr(module, attr_name)
+                                                    if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
+                                                        cache_obj.clear()
+                                                        cleared_count += 1
+                                                    elif isinstance(cache_obj, (dict, list, set)):
+                                                        cache_obj.clear()
+                                                        cleared_count += 1
+                                                except Exception:
+                                                    pass
+                            
+                            if cleared_count > 0:
+                                collected = gc.collect()
+                                logger.debug(f"Status logger substrate cleanup: cleared {cleared_count} cache objects, GC collected {collected}")
+                                
+                        except Exception:
+                            pass
+                            
                     except Exception as e:
                         logger.error(f"Failed to reconnect to substrate: {e}")
 
@@ -2964,51 +3129,61 @@ class GaiaValidator:
                             soil_counts[uid] += 1
 
             if geomagnetic_results:
-                # Process geomagnetic scores with memory-efficient approach
+                # MEMORY LEAK FIX: Process geomagnetic scores with vectorized operations
+                logger.info(f"Processing {len(geomagnetic_results)} geomagnetic records with enhanced memory management")
                 zero_scores_count = 0
-                for uid in range(256):
-                    uid_scores = []
-                    uid_weights = []
+                
+                # Pre-allocate arrays to reduce memory allocations
+                num_results = len(geomagnetic_results)
+                scores_matrix = np.full((256, num_results), np.nan, dtype=np.float32)  # Use float32 to save memory
+                weights_matrix = np.full((256, num_results), 0.0, dtype=np.float32)
+                
+                # Process all results in one pass to build the matrix
+                for result_idx, result in enumerate(geomagnetic_results):
+                    age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                    decay = np.exp(-age_days * np.log(2))
+                    scores = result.get('score', [np.nan]*256)
+                    if not isinstance(scores, list) or len(scores) != 256: 
+                        scores = [np.nan]*256 # Defensive
                     
-                    # Collect scores for this UID across all results
-                    for result in geomagnetic_results:
-                        age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                        decay = np.exp(-age_days * np.log(2))
-                        scores = result.get('score', [np.nan]*256)
-                        if not isinstance(scores, list) or len(scores) != 256: 
-                            scores = [np.nan]*256 # Defensive
-                        
+                    # Process all UIDs for this result
+                    for uid in range(256):
                         score_val = scores[uid]
                         if isinstance(score_val, str) or np.isnan(score_val): 
                             score_val = 0.0
                         if score_val == 0.0: 
                             zero_scores_count += 1
                         
-                        uid_scores.append(score_val)
-                        uid_weights.append(decay)
-                        geo_counts[uid] += (score_val != 0.0)
+                        scores_matrix[uid, result_idx] = score_val
+                        if score_val != 0.0:
+                            weights_matrix[uid, result_idx] = decay
+                            geo_counts[uid] += 1
+                
+                # Vectorized calculation for all UIDs at once
+                for uid in range(256):
+                    uid_scores = scores_matrix[uid, :]
+                    uid_weights = weights_matrix[uid, :]
                     
-                    # Calculate weighted average for this UID
-                    if uid_scores:
-                        s_arr = np.array(uid_scores)
-                        w_arr = np.array(uid_weights)
-                        non_zero_mask = s_arr != 0.0
-                        
-                        if np.any(non_zero_mask):
-                            masked_s = s_arr[non_zero_mask]
-                            masked_w = w_arr[non_zero_mask]
-                            weight_sum = np.sum(masked_w)
-                            if weight_sum > 0:
-                                geomagnetic_scores[uid] = np.sum(masked_s * masked_w) / weight_sum
-                            else:
-                                geomagnetic_scores[uid] = 0.0
+                    # Find non-zero scores
+                    non_zero_mask = uid_scores != 0.0
+                    
+                    if np.any(non_zero_mask):
+                        masked_s = uid_scores[non_zero_mask]
+                        masked_w = uid_weights[non_zero_mask]
+                        weight_sum = np.sum(masked_w)
+                        if weight_sum > 0:
+                            geomagnetic_scores[uid] = np.sum(masked_s * masked_w) / weight_sum
                         else:
                             geomagnetic_scores[uid] = 0.0
-                    
-                    # Clean up temporary arrays immediately
-                    del uid_scores, uid_weights
+                    else:
+                        geomagnetic_scores[uid] = 0.0
                 
-                logger.info(f"Processed {len(geomagnetic_results)} geomagnetic records with {zero_scores_count} zero scores")
+                # IMMEDIATE cleanup of large matrices
+                del scores_matrix, weights_matrix
+                import gc
+                gc.collect()
+                
+                logger.info(f"Processed {len(geomagnetic_results)} geomagnetic records with {zero_scores_count} zero scores (memory-optimized)")
 
             if weather_results:
                 latest_result = weather_results[0]
@@ -3022,51 +3197,61 @@ class GaiaValidator:
                 logger.info(f"Weather scores: {sum(1 for s in weather_scores if s == 0.0)} UIDs have zero score")
 
             if soil_results:
-                # Process soil scores with memory-efficient approach
+                # MEMORY LEAK FIX: Process soil scores with aggressive memory management
+                logger.info(f"Processing {len(soil_results)} soil records with enhanced memory management")
                 zero_soil_scores = 0
-                for uid in range(256):
-                    uid_scores = []
-                    uid_weights = []
+                
+                # Pre-allocate arrays to reduce memory allocations
+                num_results = len(soil_results)
+                scores_matrix = np.full((256, num_results), np.nan, dtype=np.float32)  # Use float32 to save memory
+                weights_matrix = np.full((256, num_results), 0.0, dtype=np.float32)
+                
+                # Process all results in one pass to build the matrix
+                for result_idx, result in enumerate(soil_results):
+                    age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                    decay = np.exp(-age_days * np.log(2))
+                    scores = result.get('score', [np.nan]*256)
+                    if not isinstance(scores, list) or len(scores) != 256: 
+                        scores = [np.nan]*256 # Defensive
                     
-                    # Collect scores for this UID across all results
-                    for result in soil_results:
-                        age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                        decay = np.exp(-age_days * np.log(2))
-                        scores = result.get('score', [np.nan]*256)
-                        if not isinstance(scores, list) or len(scores) != 256: 
-                            scores = [np.nan]*256 # Defensive
-                        
+                    # Process all UIDs for this result
+                    for uid in range(256):
                         score_val = scores[uid]
                         if isinstance(score_val, str) or np.isnan(score_val): 
                             score_val = 0.0
                         if score_val == 0.0: 
                             zero_soil_scores += 1
                         
-                        uid_scores.append(score_val)
-                        uid_weights.append(decay)
-                        soil_counts[uid] += (score_val != 0.0)
+                        scores_matrix[uid, result_idx] = score_val
+                        if score_val != 0.0:
+                            weights_matrix[uid, result_idx] = decay
+                            soil_counts[uid] += 1
+                
+                # Vectorized calculation for all UIDs at once
+                for uid in range(256):
+                    uid_scores = scores_matrix[uid, :]
+                    uid_weights = weights_matrix[uid, :]
                     
-                    # Calculate weighted average for this UID
-                    if uid_scores:
-                        s_arr = np.array(uid_scores)
-                        w_arr = np.array(uid_weights)
-                        non_zero_mask = s_arr != 0.0
-                        
-                        if np.any(non_zero_mask):
-                            masked_s = s_arr[non_zero_mask]
-                            masked_w = w_arr[non_zero_mask]
-                            weight_sum = np.sum(masked_w)
-                            if weight_sum > 0:
-                                soil_scores[uid] = np.sum(masked_s * masked_w) / weight_sum
-                            else:
-                                soil_scores[uid] = 0.0
+                    # Find non-zero scores
+                    non_zero_mask = uid_scores != 0.0
+                    
+                    if np.any(non_zero_mask):
+                        masked_s = uid_scores[non_zero_mask]
+                        masked_w = uid_weights[non_zero_mask]
+                        weight_sum = np.sum(masked_w)
+                        if weight_sum > 0:
+                            soil_scores[uid] = np.sum(masked_s * masked_w) / weight_sum
                         else:
                             soil_scores[uid] = 0.0
-                    
-                    # Clean up temporary arrays immediately
-                    del uid_scores, uid_weights
+                    else:
+                        soil_scores[uid] = 0.0
                 
-                logger.info(f"Processed {len(soil_results)} soil records with {zero_soil_scores} zero scores")
+                # IMMEDIATE cleanup of large matrices
+                del scores_matrix, weights_matrix
+                import gc
+                gc.collect()
+                
+                logger.info(f"Processed {len(soil_results)} soil records with {zero_soil_scores} zero scores (memory-optimized)")
 
             logger.info("Aggregate scores calculated. Proceeding to weight normalization...")
             def sigmoid(x, k=20, x0=0.93): return 1 / (1 + math.exp(-k * (x - x0)))
@@ -3255,6 +3440,25 @@ class GaiaValidator:
                         validator_nodes_by_uid_list[uid] = node_dict
                 self._log_memory_usage("calc_weights_after_node_conversion")
 
+                # IMMEDIATELY clear the original large list to save memory
+                del validator_nodes_list
+                
+                # MEMORY LEAK FIX: Force immediate cleanup of database query results before sync calculation
+                # The database results can be very large (200 soil records × 256 scores = 51,200 values)
+                try:
+                    import gc
+                    # Calculate total memory footprint before cleanup
+                    total_records = len(weather_results) + len(geomagnetic_results) + len(soil_results)
+                    logger.info(f"Processing {total_records} total database records for weight calculation")
+                    
+                    # Force garbage collection before the heavy sync calculation
+                    collected = gc.collect()
+                    logger.debug(f"Pre-sync GC: collected {collected} objects before weight calculation")
+                    
+                    self._log_memory_usage("calc_weights_pre_sync_gc")
+                except Exception as pre_sync_cleanup_err:
+                    logger.debug(f"Error during pre-sync cleanup: {pre_sync_cleanup_err}")
+
                 # Perform CPU-bound weight calculation in thread pool to avoid blocking
                 self._log_memory_usage("calc_weights_before_sync_calc")
                 loop = asyncio.get_event_loop()
@@ -3269,22 +3473,27 @@ class GaiaValidator:
                 )
                 self._log_memory_usage("calc_weights_after_sync_calc")
 
-                # Aggressive memory cleanup after weight calculation
+                # MEMORY CLEANUP after sync calculation (scope-aware)
                 try:
-                    # Clear all large data structures
+                    # Clear all large data structures that exist in this scope
                     del weather_results
-                    del geomagnetic_results
+                    del geomagnetic_results  
                     del soil_results
-                    del validator_nodes_list
                     del validator_nodes_by_uid_list
+                    
+                    # Force immediate garbage collection
+                    import gc
+                    collected = gc.collect()
+                    logger.info(f"Weight calculation cleanup: collected {collected} objects after data deletion")
                     
                     # Force comprehensive cleanup for weight calculation (if fully initialized)
                     if hasattr(self, 'last_metagraph_sync'):
                         memory_freed = self._comprehensive_memory_cleanup("weight_calculation")
+                        logger.info(f"Weight calculation comprehensive cleanup: freed {memory_freed:.1f}MB")
                     else:
-                        # Fallback to basic cleanup during startup
-                        import gc
-                        collected = gc.collect()
+                        # Additional GC during startup
+                        for _ in range(2):  # Multiple GC passes
+                            collected += gc.collect()
                         logger.info(f"Basic GC cleanup during startup: collected {collected} objects")
                         memory_freed = 0
                     
@@ -3815,7 +4024,7 @@ class GaiaValidator:
                 await asyncio.sleep(60)  # Shorter retry on error
 
     async def aggressive_memory_cleanup(self):
-        """Aggressive memory cleanup to prevent memory leaks."""
+        """Enhanced aggressive memory cleanup with pressure monitoring."""
         while True:
             try:
                 await asyncio.sleep(120)  # Run every 2 minutes
@@ -3825,53 +4034,89 @@ class GaiaValidator:
                     process = psutil.Process()
                     memory_before = process.memory_info().rss / (1024 * 1024)
                     
-                    # Perform garbage collection
-                    import gc
-                    collected = gc.collect()
+                    # Determine cleanup intensity based on memory pressure
+                    cleanup_level = "light"
+                    if memory_before > 8000:  # > 8GB
+                        cleanup_level = "aggressive"
+                    elif memory_before > 6000:  # > 6GB
+                        cleanup_level = "moderate"
+                        
+                    # Perform cleanup based on pressure level
+                    collected = 0
+                    comp_memory_freed = 0
                     
-                    # Clear any module-level caches if available
-                    try:
-                        # Clear httpx connection pools more aggressively
-                        if hasattr(self, 'miner_client') and self.miner_client and not self.miner_client.is_closed:
-                            # Force close idle connections
-                            await self._cleanup_idle_connections()
+                    if cleanup_level == "aggressive":
+                        logger.warning(f"HIGH MEMORY PRESSURE: {memory_before:.1f}MB - performing aggressive cleanup")
                         
-                        # Clear any fsspec caches
-                        try:
-                            import fsspec
-                            if hasattr(fsspec, 'config') and hasattr(fsspec.config, 'conf'):
-                                fsspec.config.conf.clear()
-                            if hasattr(fsspec, 'filesystem') and hasattr(fsspec.filesystem, '_cache'):
-                                fsspec.filesystem._cache.clear()
-                        except ImportError:
-                            pass
+                        # Force comprehensive cleanup first
+                        if hasattr(self, 'last_metagraph_sync'):
+                            comp_memory_freed = self._comprehensive_memory_cleanup("pressure_aggressive")
                         
-                        # Clear any xarray caches
+                        # Clean up HTTP connections more aggressively
                         try:
-                            import xarray as xr
-                            if hasattr(xr, 'backends') and hasattr(xr.backends, 'list_engines'):
-                                # Force cleanup of any xarray backend caches
-                                pass
-                        except ImportError:
+                            if hasattr(self, 'miner_client') and self.miner_client and not self.miner_client.is_closed:
+                                await self._cleanup_idle_connections()
+                        except Exception:
                             pass
                             
-                    except Exception as cache_clear_error:
-                        logger.debug(f"Error clearing caches: {cache_clear_error}")
+                        # Force multiple GC passes
+                        import gc
+                        for _ in range(3):
+                            collected += gc.collect()
+                            
+                        # Clean up background tasks that may be accumulating
+                        try:
+                            task_count = len(self._background_tasks)
+                            if task_count > 50:  # Too many background tasks
+                                logger.warning(f"High background task count: {task_count} - cleaning up completed tasks")
+                                completed_tasks = [t for t in self._background_tasks if t.done()]
+                                for task in completed_tasks:
+                                    self._background_tasks.discard(task)
+                                logger.info(f"Removed {len(completed_tasks)} completed background tasks")
+                        except Exception:
+                            pass
+                            
+                    elif cleanup_level == "moderate":
+                        logger.info(f"MODERATE MEMORY PRESSURE: {memory_before:.1f}MB - performing moderate cleanup")
+                        
+                        # Standard comprehensive cleanup
+                        if hasattr(self, 'last_metagraph_sync'):
+                            comp_memory_freed = self._comprehensive_memory_cleanup("pressure_moderate")
+                        
+                        # Standard GC
+                        import gc
+                        collected = gc.collect()
+                        
+                    else:  # light cleanup
+                        # Just basic GC and cache clearing
+                        import gc
+                        collected = gc.collect()
+                        
+                        # Clear basic module caches
+                        try:
+                            if hasattr(self, 'miner_client') and self.miner_client and not self.miner_client.is_closed:
+                                await self._cleanup_idle_connections()
+                        except Exception:
+                            pass
                     
                     # Get memory after cleanup
                     memory_after = process.memory_info().rss / (1024 * 1024)
                     memory_freed = memory_before - memory_after
                     
-                    # Use comprehensive cleanup instead of just GC for better results (if fully initialized)
-                    if hasattr(self, 'last_metagraph_sync'):
-                        comp_memory_freed = self._comprehensive_memory_cleanup("periodic_aggressive")
+                    # Log results based on effectiveness
+                    if cleanup_level == "aggressive" or memory_freed > 50:
+                        logger.info(f"Memory cleanup ({cleanup_level}): {memory_before:.1f}MB → {memory_after:.1f}MB "
+                                  f"(freed {memory_freed:.1f}MB, GC collected {collected} objects)")
+                    elif collected > 50 or comp_memory_freed > 10:
+                        logger.info(f"Memory cleanup ({cleanup_level}): GC collected {collected} objects, "
+                                  f"comprehensive freed {comp_memory_freed:.1f}MB")
                     else:
-                        comp_memory_freed = 0  # Skip during startup
-                    
-                    if collected > 50 or comp_memory_freed > 10:
-                        logger.info(f"Memory cleanup: GC collected {collected} objects, comprehensive freed {comp_memory_freed:.1f}MB")
-                    else:
-                        logger.debug(f"Memory cleanup: GC collected {collected} objects, comprehensive freed {comp_memory_freed:.1f}MB")
+                        logger.debug(f"Memory cleanup ({cleanup_level}): minimal cleanup needed")
+                        
+                    # Emergency action if memory is still very high
+                    if memory_after > 10000:  # > 10GB after cleanup
+                        logger.error(f"🚨 CRITICAL: Memory still very high after cleanup: {memory_after:.1f}MB")
+                        # Could trigger more drastic measures here
                         
             except asyncio.CancelledError:
                 logger.info("Aggressive memory cleanup task cancelled")
@@ -3881,23 +4126,17 @@ class GaiaValidator:
                 await asyncio.sleep(30)  # Shorter retry on error
 
     def _comprehensive_memory_cleanup(self, context: str = "general"):
-        """
-        Comprehensive memory cleanup that goes beyond standard garbage collection.
-        Targets C extension memory, file handles, module caches, and other persistent references.
-        Made more conservative to avoid interfering with running tasks.
-        """
+        """Enhanced comprehensive memory cleanup with aggressive module cache clearing."""
         
-        # Skip cleanup during early startup to prevent initialization issues
-        if not hasattr(self, 'last_metagraph_sync'):
-            logger.debug(f"Skipping comprehensive cleanup for {context} - validator not fully initialized")
+        if not PSUTIL_AVAILABLE:
+            logger.debug("psutil not available for memory cleanup")
             return 0
-            
-        logger.info(f"Starting comprehensive memory cleanup for context: {context}")
+        
         try:
-            initial_memory = self._get_memory_usage()
+            process = psutil.Process()
+            memory_before = process.memory_info().rss / (1024 * 1024)
         except Exception:
-            # Fallback if memory monitoring isn't available yet
-            initial_memory = 0
+            memory_before = 0
         
         try:
             # 1. Clear exception tracebacks (major memory holder)
@@ -3906,56 +4145,125 @@ class GaiaValidator:
             sys.last_type = None 
             sys.last_value = None
             
-            # 2. Clear module-level caches that accumulate over time (more conservative)
+            # 2. AGGRESSIVE MODULE CACHE CLEANUP - This is the major fix
             try:
-                # Only clear specific known-safe cache attributes
+                import sys
+                modules_cleared = 0
+                cache_objects_cleared = 0
+                
+                # Target problematic modules that accumulate caches (substrate/scalecodec are major offenders)
+                target_modules = [
+                    'substrate', 'scalecodec', 'scale_info', 'metadata', 'fiber', 'substrateinterface',
+                    'xarray', 'dask', 'numpy', 'pandas', 'fsspec', 'zarr', 
+                    'netcdf4', 'h5py', 'scipy', 'era5', 'gcsfs', 'cloudpickle',
+                    'numcodecs', 'blosc', 'lz4', 'snappy', 'zstd'
+                ]
+                
                 for module_name in list(sys.modules.keys()):
-                    if any(pattern in module_name.lower() for pattern in 
-                           ['substrate', 'scalecodec', 'scale_info', 'metadata']):
+                    if any(pattern in module_name.lower() for pattern in target_modules):
                         module = sys.modules.get(module_name)
                         if hasattr(module, '__dict__'):
-                            # Only clear known safe cache attributes, avoid _registry which might be critical
+                            module_cleared = False
+                            
+                            # Clear all cache-like attributes
                             for attr_name in list(module.__dict__.keys()):
-                                if attr_name in ['_cache', '__pycache__', '_instance_cache']:
+                                if any(cache_pattern in attr_name.lower() for cache_pattern in 
+                                       ['cache', 'registry', '_cached', '__pycache__', '_instance_cache', 
+                                        '_memo', '_lru', '_registry', '_store', '_buffer']):
                                     try:
                                         cache_obj = getattr(module, attr_name)
-                                        if hasattr(cache_obj, 'clear') and isinstance(cache_obj, dict):
+                                        if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
                                             cache_obj.clear()
+                                            cache_objects_cleared += 1
+                                            module_cleared = True
+                                        elif isinstance(cache_obj, dict):
+                                            cache_obj.clear()
+                                            cache_objects_cleared += 1
+                                            module_cleared = True
+                                        elif isinstance(cache_obj, list):
+                                            cache_obj.clear()
+                                            cache_objects_cleared += 1
+                                            module_cleared = True
+                                        elif isinstance(cache_obj, set):
+                                            cache_obj.clear()
+                                            cache_objects_cleared += 1
+                                            module_cleared = True
                                     except Exception:
                                         pass
+                            
+                            if module_cleared:
+                                modules_cleared += 1
+                
+                if modules_cleared > 0:
+                    logger.info(f"Module cache cleanup: cleared {cache_objects_cleared} cache objects from {modules_cleared} modules")
+                    
             except Exception as e:
-                logger.debug(f"Error clearing module caches: {e}")
+                logger.debug(f"Error during module cache cleanup: {e}")
             
-            # 3. Clear numpy/xarray memory more aggressively
+            # 3. Clear specific library caches that are known problematic
             try:
+                # Clear NumPy caches
                 import numpy as np
-                # Force numpy to release cached memory
                 if hasattr(np, '_get_ndarray_cache'):
                     np._get_ndarray_cache().clear()
-                    
-                # Clear any xarray caches
+                if hasattr(np, 'core') and hasattr(np.core, 'multiarray'):
+                    if hasattr(np.core.multiarray, '_reconstruct'):
+                        # Clear numpy reconstruction cache
+                        pass
+                        
+                # Clear xarray caches
                 try:
                     import xarray as xr
-                    if hasattr(xr.backends, 'plugins') and hasattr(xr.backends.plugins, 'clear'):
-                        xr.backends.plugins.clear()
+                    if hasattr(xr.backends, 'plugins'):
+                        if hasattr(xr.backends.plugins, 'clear'):
+                            xr.backends.plugins.clear()
+                        elif isinstance(xr.backends.plugins, dict):
+                            xr.backends.plugins.clear()
+                    if hasattr(xr, 'core') and hasattr(xr.core, 'formatting'):
+                        if hasattr(xr.core.formatting, '_KNOWN_TYPE_REPRS'):
+                            xr.core.formatting._KNOWN_TYPE_REPRS.clear()
                 except ImportError:
                     pass
+                    
+                # Clear fsspec/gcsfs caches
+                try:
+                    import fsspec
+                    if hasattr(fsspec, 'config') and hasattr(fsspec.config, 'conf'):
+                        fsspec.config.conf.clear()
+                    if hasattr(fsspec, 'filesystem') and hasattr(fsspec.filesystem, '_cache'):
+                        fsspec.filesystem._cache.clear()
+                    if hasattr(fsspec, 'registry') and hasattr(fsspec.registry, 'registry'):
+                        # Don't clear registry as it's needed for functionality
+                        pass
+                except ImportError:
+                    pass
+                    
+                # Clear netCDF4/HDF5 caches
+                try:
+                    import netCDF4
+                    if hasattr(netCDF4, '_default_fillvals'):
+                        netCDF4._default_fillvals.clear()
+                    if hasattr(netCDF4, '_netCDF4'):
+                        # Clear any internal caches
+                        pass
+                except ImportError:
+                    pass
+                    
             except Exception as e:
-                logger.debug(f"Error clearing numpy/xarray caches: {e}")
+                logger.debug(f"Error clearing specific library caches: {e}")
             
             # 4. Clear HTTP client caches (only if they exist)
             try:
-                if hasattr(self, 'miner_http_client') and getattr(self, 'miner_http_client', None):
-                    # Clear any response caches
-                    if hasattr(self.miner_http_client, '_transport'):
-                        transport = self.miner_http_client._transport
-                        if hasattr(transport, '_pool'):
+                if hasattr(self, 'miner_client') and self.miner_client and not self.miner_client.is_closed:
+                    if hasattr(self.miner_client, '_transport'):
+                        transport = self.miner_client._transport
+                        if hasattr(transport, '_pool') and hasattr(transport._pool, 'clear'):
                             transport._pool.clear()
                             
-                if hasattr(self, 'validator_http_client') and getattr(self, 'validator_http_client', None):
-                    if hasattr(self.validator_http_client, '_transport'):
-                        transport = self.validator_http_client._transport
-                        if hasattr(transport, '_pool'):
+                if hasattr(self, 'api_client') and self.api_client and not self.api_client.is_closed:
+                    if hasattr(self.api_client, '_transport'):
+                        transport = self.api_client._transport
+                        if hasattr(transport, '_pool') and hasattr(transport._pool, 'clear'):
                             transport._pool.clear()
             except Exception as e:
                 logger.debug(f"Error clearing HTTP client caches: {e}")
@@ -3964,25 +4272,17 @@ class GaiaValidator:
             try:
                 if hasattr(self, 'database_manager') and getattr(self, 'database_manager', None):
                     # Force database manager to clear any cached connections/results
-                    if hasattr(self.database_manager, 'pool') and getattr(self.database_manager, 'pool', None):
-                        # Clear any cached query results or metadata
-                        pool = self.database_manager.pool
-                        if hasattr(pool, '_queue') and hasattr(pool._queue, 'empty'):
-                            # Clear connection pool queue
-                            try:
-                                while not pool._queue.empty():
-                                    conn = pool._queue.get_nowait()
-                                    if hasattr(conn, 'invalidate'):
-                                        conn.invalidate()
-                            except:
-                                pass  # Queue might be empty or connection pool not ready
+                    if hasattr(self.database_manager, '_engine') and self.database_manager._engine:
+                        engine = self.database_manager._engine
+                        if hasattr(engine, 'pool'):
+                            pool = engine.pool
+                            if hasattr(pool, 'invalidate'):
+                                # Invalidate stale connections but don't clear active ones
+                                pass
             except Exception as e:
                 logger.debug(f"Error clearing database caches: {e}")
             
-            # 6. REMOVED: Asyncio task references cleanup - too dangerous while tasks are running
-            # This was likely causing the task cancellations
-            
-            # 7. Force multiple garbage collection passes with different strategies
+            # 6. Force multiple garbage collection passes with different strategies
             import gc
             collected_total = 0
             
@@ -3999,24 +4299,27 @@ class GaiaValidator:
                 collected = gc.collect(generation)
                 collected_total += collected
             
-            # 8. REMOVED: Aggressive object cleanup - too dangerous while tasks are running
-            # The gc.get_objects() iteration could close objects still in use by active tasks
+            # Clear Python's internal type cache
+            try:
+                if hasattr(sys, '_clear_type_cache'):
+                    sys._clear_type_cache()
+            except Exception:
+                pass
             
             try:
-                final_memory = self._get_memory_usage()
-                memory_freed = initial_memory - final_memory
+                process = psutil.Process()
+                memory_after = process.memory_info().rss / (1024 * 1024)
+                memory_freed = memory_before - memory_after
+                
+                if memory_freed > 10:  # Only log significant memory freeing
+                    logger.info(f"Comprehensive cleanup ({context}): freed {memory_freed:.1f}MB, GC collected {collected_total} objects")
+                
+                return memory_freed
             except Exception:
-                # Fallback if memory monitoring fails
-                final_memory = 0
-                memory_freed = 0
-            
-            logger.info(f"Comprehensive cleanup for {context}: "
-                       f"freed {memory_freed:.1f}MB, collected {collected_total} objects")
-            
-            return memory_freed
-            
+                return 0
+                
         except Exception as e:
-            logger.error(f"Error during comprehensive memory cleanup: {e}")
+            logger.debug(f"Error in comprehensive memory cleanup: {e}")
             return 0
 
 
