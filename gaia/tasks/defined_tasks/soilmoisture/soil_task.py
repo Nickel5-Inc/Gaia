@@ -1835,23 +1835,89 @@ class SoilMoistureTask(Task):
                         miner_uid = entry['miner_uid']
                         miner_hotkey = entry['miner_hotkey']
                         
-                        # Calculate composite score from RMSE and SSIM
+                        # Extract RMSE values from history (SSIM values are stored but not used in final score)
                         surface_rmse = entry.get('surface_rmse', 0) or 0
                         rootzone_rmse = entry.get('rootzone_rmse', 0) or 0
                         surface_ssim = entry.get('surface_structure_score', 0) or 0
                         rootzone_ssim = entry.get('rootzone_structure_score', 0) or 0
                         
-                        # Use similar scoring logic as in the main scoring mechanism
-                        # Average RMSE (lower is better, so invert for scoring)
-                        avg_rmse = (surface_rmse + rootzone_rmse) / 2
-                        rmse_score = max(0, 1 - (avg_rmse / 0.1))  # Normalize assuming max reasonable RMSE of 0.1
+                        # CRITICAL: Apply EXACT same validation as regular scoring flow
+                        # Mirror SoilScoringMechanism.validate_metrics() exactly
                         
-                        # Average SSIM (higher is better, already 0-1 range)
-                        avg_ssim = (surface_ssim + rootzone_ssim) / 2
-                        ssim_score = max(0, (avg_ssim + 1) / 2)  # Convert from [-1,1] to [0,1]
+                        # Validate metrics format and basic requirements
+                        has_surface = surface_rmse is not None and surface_rmse != 0
+                        has_rootzone = rootzone_rmse is not None and rootzone_rmse != 0
                         
-                        # Composite score (weighted combination)
-                        composite_score = (rmse_score * 0.7) + (ssim_score * 0.3)
+                        if not (has_surface or has_rootzone):
+                            logger.warning(f"Retroactive: No valid metrics found for miner {miner_uid}, region {region_id}")
+                            continue
+                        
+                        # Validate surface metrics if present
+                        if has_surface:
+                            if not isinstance(surface_rmse, (int, float)) or math.isnan(surface_rmse) or math.isinf(surface_rmse):
+                                logger.warning(f"Retroactive: Invalid surface_rmse format: {surface_rmse}, skipping entry")
+                                continue
+                            if surface_rmse < 0:
+                                logger.warning(f"Retroactive: Surface RMSE must be positive, got {surface_rmse}, skipping entry")
+                                continue
+                            if surface_ssim is not None and surface_ssim != 0:
+                                if not isinstance(surface_ssim, (int, float)) or math.isnan(surface_ssim) or math.isinf(surface_ssim):
+                                    logger.warning(f"Retroactive: Invalid surface_ssim format: {surface_ssim}, setting to 0")
+                                    surface_ssim = 0
+                                elif not -1 <= surface_ssim <= 1:
+                                    logger.warning(f"Retroactive: Surface SSIM {surface_ssim} outside valid range [-1,1], setting to 0")
+                                    surface_ssim = 0
+                        
+                        # Validate rootzone metrics if present
+                        if has_rootzone:
+                            if not isinstance(rootzone_rmse, (int, float)) or math.isnan(rootzone_rmse) or math.isinf(rootzone_rmse):
+                                logger.warning(f"Retroactive: Invalid rootzone_rmse format: {rootzone_rmse}, skipping entry")
+                                continue
+                            if rootzone_rmse < 0:
+                                logger.warning(f"Retroactive: Rootzone RMSE must be positive, got {rootzone_rmse}, skipping entry")
+                                continue
+                            if rootzone_ssim is not None and rootzone_ssim != 0:
+                                if not isinstance(rootzone_ssim, (int, float)) or math.isnan(rootzone_ssim) or math.isinf(rootzone_ssim):
+                                    logger.warning(f"Retroactive: Invalid rootzone_ssim format: {rootzone_ssim}, setting to 0")
+                                    rootzone_ssim = 0
+                                elif not -1 <= rootzone_ssim <= 1:
+                                    logger.warning(f"Retroactive: Rootzone SSIM {rootzone_ssim} outside valid range [-1,1], setting to 0")
+                                    rootzone_ssim = 0
+                        
+                        # Apply sigmoid transformation exactly as in SoilScoringMechanism
+                        # sigmoid_rmse(rmse) = 1 / (1 + exp(alpha * (rmse - beta)))
+                        # Where alpha=3, beta=0.15 (SoilScoringMechanism defaults)
+                        alpha = 3.0
+                        beta = 0.15
+                        
+                        surface_score = 1.0 / (1.0 + math.exp(alpha * (surface_rmse - beta)))
+                        rootzone_score = 1.0 / (1.0 + math.exp(alpha * (rootzone_rmse - beta)))
+                        
+                        # Validate transformed scores
+                        if math.isnan(surface_score) or math.isinf(surface_score):
+                            logger.warning(f"Retroactive: Invalid surface score after sigmoid: {surface_score}, skipping entry")
+                            continue
+                            
+                        if math.isnan(rootzone_score) or math.isinf(rootzone_score):
+                            logger.warning(f"Retroactive: Invalid rootzone score after sigmoid: {rootzone_score}, skipping entry")
+                            continue
+                        
+                        # Final score calculation exactly as in SoilScoringMechanism.compute_final_score()
+                        composite_score = 0.6 * surface_score + 0.4 * rootzone_score
+                        
+                        # Validate final score exactly as regular flow does
+                        if math.isnan(composite_score) or math.isinf(composite_score):
+                            logger.warning(f"Retroactive: Invalid composite score: {composite_score}, skipping entry")
+                            continue
+                        
+                        if not 0 <= composite_score <= 1:
+                            logger.warning(f"Retroactive: Final score {composite_score} outside valid range [0,1], skipping entry")
+                            continue
+                        
+                        logger.debug(f"Retroactive score calculation for miner {miner_uid}: "
+                                   f"surface_rmse={surface_rmse:.4f}→{surface_score:.4f}, "
+                                   f"rootzone_rmse={rootzone_rmse:.4f}→{rootzone_score:.4f}, "
+                                   f"final={composite_score:.4f}")
                         
                         regions_data[region_id][miner_uid] = {
                             'score': composite_score,
@@ -1869,19 +1935,52 @@ class SoilMoistureTask(Task):
                     
                     for region_id, miners in regions_data.items():
                         for miner_uid, data in miners.items():
-                            # Validate miner is still in current metagraph if available
-                            is_valid_in_metagraph = True  # Default to true for retroactive scoring
+                            # CRITICAL: Validate miner hotkey matches current metagraph
+                            # If hotkey doesn't match, we should DELETE the old prediction, not score it for the new miner
+                            is_valid_in_metagraph = False
+                            should_delete_old_prediction = False
+                            
                             if self.validator and hasattr(self.validator, 'metagraph') and self.validator.metagraph is not None:
                                 miner_hotkey = data['hotkey']
                                 if miner_hotkey in self.validator.metagraph.nodes:
                                     node_in_metagraph = self.validator.metagraph.nodes[miner_hotkey]
                                     if hasattr(node_in_metagraph, 'node_id') and str(node_in_metagraph.node_id) == str(miner_uid):
                                         is_valid_in_metagraph = True
+                                        logger.debug(f"Retroactive: Valid hotkey match for miner {miner_uid} ({miner_hotkey})")
                                     else:
-                                        logger.debug(f"Retroactive: Metagraph UID mismatch for {miner_hotkey}, but including in retroactive scoring")
+                                        metagraph_uid = getattr(node_in_metagraph, 'node_id', 'unknown')
+                                        logger.warning(f"Retroactive: UID mismatch for hotkey {miner_hotkey} - History UID: {miner_uid}, Current UID: {metagraph_uid}. DELETING old prediction.")
+                                        should_delete_old_prediction = True
                                 else:
-                                    logger.debug(f"Retroactive: Miner {miner_hotkey} not in current metagraph, but including in retroactive scoring")
+                                    logger.warning(f"Retroactive: Hotkey {miner_hotkey} not in current metagraph. DELETING old prediction for UID {miner_uid}.")
+                                    should_delete_old_prediction = True
+                            else:
+                                # If no metagraph available, be conservative and skip retroactive scoring
+                                logger.warning(f"Retroactive: No metagraph available for validation. Skipping retroactive scoring for miner {miner_uid}.")
+                                continue
                             
+                            # If hotkey doesn't match current metagraph, delete the old prediction from history
+                            if should_delete_old_prediction:
+                                try:
+                                    delete_query = """
+                                        DELETE FROM soil_moisture_history 
+                                        WHERE target_time = :target_time 
+                                        AND miner_uid = :miner_uid 
+                                        AND miner_hotkey = :miner_hotkey
+                                        AND region_id = :region_id
+                                    """
+                                    await self.db_manager.execute(delete_query, {
+                                        "target_time": target_time,
+                                        "miner_uid": miner_uid,
+                                        "miner_hotkey": miner_hotkey,
+                                        "region_id": region_id
+                                    })
+                                    logger.info(f"Retroactive: Deleted mismatched prediction for UID {miner_uid}, hotkey {miner_hotkey}, region {region_id}")
+                                except Exception as delete_error:
+                                    logger.error(f"Error deleting mismatched prediction: {delete_error}")
+                                continue  # Skip scoring for this miner
+                            
+                            # Only score if hotkey validation passed
                             if is_valid_in_metagraph:
                                 score_value = data['score']
                                 miner_scores[miner_uid].append(score_value)

@@ -17,13 +17,11 @@ from gaia import __spec_version__
 logger = get_logger(__name__)
 
 
-async def get_active_validator_uids(netuid, substrate_manager=None, subtensor_network="finney", chain_endpoint=None, recent_blocks=500):
+async def get_active_validator_uids(netuid, subtensor_network="finney", chain_endpoint=None, recent_blocks=500):
     try:
-        # Use managed connection if available, otherwise create a new one
-        if substrate_manager:
-            substrate = substrate_manager.get_connection()
-        else:
-            substrate = SubstrateInterface(url=chain_endpoint) if chain_endpoint else get_substrate(subtensor_network=subtensor_network)
+        # Always use fresh connections
+        substrate = SubstrateInterface(url=chain_endpoint) if chain_endpoint else get_substrate(subtensor_network=subtensor_network)
+        logger.info("🔄 Using fresh substrate connection for get_active_validator_uids")
         
         loop = asyncio.get_event_loop()
         validator_permits = await loop.run_in_executor(
@@ -50,8 +48,8 @@ async def get_active_validator_uids(netuid, substrate_manager=None, subtensor_ne
         logger.error(traceback.format_exc())
         return []
     finally:
-        # Clean up substrate connection if we created it locally
-        if not substrate_manager and 'substrate' in locals():
+        # Clean up substrate connection
+        if 'substrate' in locals():
             try:
                 substrate.close()
             except Exception as cleanup_error:
@@ -66,19 +64,13 @@ class FiberWeightSetter:
             hotkey_name: str = "default",
             network: str = "finney",
             timeout: int = 30,
-            substrate_manager=None,
     ):
-        """Initialize the weight setter with fiber and optional substrate manager"""
+        """Initialize the weight setter with fiber connections"""
         self.netuid = netuid
         self.network = network
-        self.substrate_manager = substrate_manager
-        # Always prefer substrate manager to prevent memory leaks
-        if self.substrate_manager:
-            self.substrate = self.substrate_manager.get_connection()
-        else:
-            # This should rarely happen in production - log warning
-            logger.warning("Creating unmanaged substrate connection in FiberWeightSetter.__init__ - potential memory leak")
-            self.substrate = interface.get_substrate(subtensor_network=network)
+        # Always use fresh connections
+        logger.info("🔄 FiberWeightSetter using fresh connection")
+        self.substrate = interface.get_substrate(subtensor_network=network)
         self.nodes = None
         self.keypair = chain_utils.load_hotkey_keypair(
             wallet_name=wallet_name, hotkey_name=hotkey_name
@@ -86,8 +78,8 @@ class FiberWeightSetter:
         self.timeout = timeout
 
     def cleanup(self):
-        """Clean up substrate connection if it's unmanaged."""
-        if not self.substrate_manager and hasattr(self, 'substrate') and self.substrate:
+        """Clean up substrate connection."""
+        if hasattr(self, 'substrate') and self.substrate:
             try:
                 logger.debug("Cleaning up unmanaged substrate connection in FiberWeightSetter")
                 self.substrate.close()
@@ -250,7 +242,6 @@ class FiberWeightSetter:
 
             active_validator_uids = await get_active_validator_uids(
                 netuid=self.netuid, 
-                substrate_manager=None,  # Force fresh connection instead of managed
                 subtensor_network=self.network
             )
             logger.info(f"Found {len(active_validator_uids)} active validators - zeroing their weights")

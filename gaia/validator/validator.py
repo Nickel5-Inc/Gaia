@@ -23,6 +23,24 @@ except ImportError:
 
 os.environ["NODE_TYPE"] = "validator"
 import asyncio
+
+# === WEIGHT TRACING INTEGRATION ===
+try:
+    import sys
+    import os
+    # Add the root directory to Python path to find runtime_weight_tracer
+    root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if root_dir not in sys.path:
+        sys.path.insert(0, root_dir)
+    
+    import runtime_weight_tracer
+    print("🔍 [MAIN] Weight tracing available - enabling...")
+    runtime_weight_tracer.enable_weight_tracing()
+    print("✅ [MAIN] Weight tracing enabled successfully")
+except Exception as e:
+    print(f"⚠️ [MAIN] Weight tracing not available: {e}")
+# === END WEIGHT TRACING INTEGRATION ===
+
 import ssl
 import traceback
 import random
@@ -64,7 +82,7 @@ import numpy as np
 from gaia.validator.basemodel_evaluator import BaseModelEvaluator
 from gaia.validator.utils.db_wipe import handle_db_wipe
 from gaia.validator.utils.earthdata_tokens import ensure_valid_earthdata_token
-from gaia.validator.utils.substrate_manager import SubstrateConnectionManager
+# Substrate connection manager completely removed - using fresh connections only
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 
 # Imports for Alembic check
@@ -384,10 +402,10 @@ class GaiaValidator:
         self.memory_monitor_enabled = os.getenv('VALIDATOR_MEMORY_MONITORING_ENABLED', 'true').lower() in ['true', '1', 'yes']
         self.pm2_restart_enabled = os.getenv('VALIDATOR_PM2_RESTART_ENABLED', 'true').lower() in ['true', '1', 'yes']
         
-        # Memory thresholds in MB - higher defaults for validators (24GB = 24576MB)
-        self.memory_warning_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_WARNING_THRESHOLD_MB', '16000'))  # 16GB
-        self.memory_emergency_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB', '20000'))  # 20GB  
-        self.memory_critical_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB', '24000'))  # 24GB
+        # Memory thresholds in MB - conservative defaults for validators (15GB max)
+        self.memory_warning_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_WARNING_THRESHOLD_MB', '10000'))  # 10GB
+        self.memory_emergency_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB', '12000'))  # 12GB  
+        self.memory_critical_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB', '15000'))  # 15GB
         
         # Memory monitoring state
         self.last_memory_log_time = 0
@@ -448,7 +466,7 @@ class GaiaValidator:
 
         # Initialize substrate connection manager (will be set up in setup_neuron)
         print("[STARTUP DEBUG] Initializing substrate manager")
-        self.substrate_manager: Optional[SubstrateConnectionManager] = None
+        
         print("[STARTUP DEBUG] GaiaValidator.__init__ completed")
 
     def _signal_handler(self, signum, frame):
@@ -618,15 +636,16 @@ class GaiaValidator:
             
             w.blocks_since_last_update = blocks_since_wrapper
 
-            # Initialize substrate connection manager FIRST
-            self.substrate_manager = SubstrateConnectionManager(
-                subtensor_network=self.subtensor_network,
-                chain_endpoint=self.subtensor_chain_endpoint
-            )
-
+            # SUBSTRATE MANAGER DISABLED - Using fresh connections
+            # Substrate manager completely removed - using fresh connections only
+            
             try:
-                # Use managed connection instead of direct get_substrate()
-                self.substrate = self.substrate_manager.get_connection()
+                # Use fresh connection directly
+                self.substrate = interface.get_substrate(
+                    subtensor_network=self.subtensor_network,
+                    subtensor_address=self.subtensor_chain_endpoint
+                )
+                print("🔄 Created fresh substrate connection")
             except Exception as e_sub_init:
                 logger.error(f"CRITICAL: Failed to initialize SubstrateInterface with endpoint {self.subtensor_chain_endpoint}: {e_sub_init}", exc_info=True)
                 return False
@@ -641,8 +660,12 @@ class GaiaValidator:
             # Standard Metagraph Sync
             try:
                 # Use direct sync here since _sync_metagraph is async and we're in sync method
-                # But ensure substrate connection is current
-                self.substrate = self.substrate_manager.get_connection()
+                # Create fresh substrate connection
+                self.substrate = interface.get_substrate(
+                    subtensor_network=self.subtensor_network,
+                    subtensor_address=self.subtensor_chain_endpoint
+                )
+                print("🔄 Created fresh connection for metagraph sync")
                 self.metagraph.sync_nodes()  # Sync nodes after initialization
                 logger.info(f"Successfully synced {len(self.metagraph.nodes) if self.metagraph.nodes else '0'} nodes from the network.")
             except Exception as e_meta_sync:
@@ -1244,8 +1267,6 @@ class GaiaValidator:
                     
                     # Trigger comprehensive cleanup for large memory increases (but not during startup)
                     if (memory_change > 200 and 
-                        hasattr(self, 'substrate_manager') and 
-                        self.substrate_manager is not None and
                         hasattr(self, 'last_metagraph_sync')):  # Only after validator is fully running
                         logger.warning(f"Large memory increase detected ({memory_change:.1f}MB), forcing comprehensive cleanup")
                         memory_freed = self._comprehensive_memory_cleanup(f"emergency_{context}")
@@ -1359,8 +1380,22 @@ class GaiaValidator:
                     logger.info(f"  Memory thresholds: Warning={self.memory_warning_threshold_mb}MB, Emergency={self.memory_emergency_threshold_mb}MB, Critical={self.memory_critical_threshold_mb}MB")
                     logger.info(f"  PM2 restart enabled: {self.pm2_restart_enabled}")
                     if self.pm2_restart_enabled:
-                        pm2_id = os.getenv('pm2_id', 'not detected')
+                        # Check multiple possible PM2 environment variables
+                        pm2_id = (os.getenv('pm_id') or 
+                                 os.getenv('NODE_APP_INSTANCE') or 
+                                 os.getenv('PM2_INSTANCE_ID') or 
+                                 'not detected')
                         logger.info(f"  PM2 instance ID: {pm2_id}")
+                        
+                        # Also try to get the process name dynamically
+                        try:
+                            process_name = await self._get_pm2_process_name()
+                            if process_name:
+                                logger.info(f"  PM2 process name: {process_name}")
+                            else:
+                                logger.info(f"  PM2 process name: not detected")
+                        except Exception as e:
+                            logger.debug(f"Error getting PM2 process name during startup: {e}")
                 except ImportError:
                     logger.warning("psutil not available - memory monitoring will be disabled")
                     self.memory_monitor_enabled = False
@@ -1550,6 +1585,44 @@ class GaiaValidator:
         
         return critical_ops
 
+    async def _get_pm2_process_name(self):
+        """Dynamically get PM2 process name using PM2's JSON list"""
+        try:
+            # Get the PM2 process ID from environment variables
+            pm_id = (os.getenv('pm_id') or 
+                    os.getenv('NODE_APP_INSTANCE') or 
+                    os.getenv('PM2_INSTANCE_ID'))
+            
+            if pm_id is None:
+                return None  # Not running under PM2
+            
+            # Use PM2 to get process info
+            import subprocess
+            import json
+            result = await asyncio.to_thread(
+                lambda: subprocess.run(["pm2", "jlist"], capture_output=True, text=True)
+            )
+            
+            if result.returncode != 0:
+                logger.warning(f"Failed to get PM2 process list: {result.stderr}")
+                return None
+                
+            processes = json.loads(result.stdout)
+            
+            # Find the process with matching pm_id
+            for process in processes:
+                if str(process.get("pm_id")) == str(pm_id):
+                    process_name = process.get("name")
+                    logger.info(f"Found PM2 process: {process_name} (ID: {pm_id})")
+                    return process_name
+            
+            logger.warning(f"PM2 process with ID {pm_id} not found in process list")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting PM2 process name: {e}")
+            return None
+
     async def _trigger_pm2_restart(self, reason: str):
         """Trigger a controlled PM2 restart for the validator."""
         if not self.pm2_restart_enabled:
@@ -1574,15 +1647,15 @@ class GaiaValidator:
             collected = gc.collect()
             logger.info(f"Final GC before restart collected {collected} objects")
             
-            # Check if we're running under PM2
-            pm2_instance_id = os.getenv('pm2_id')
-            if pm2_instance_id:
-                logger.info(f"Running under PM2 instance {pm2_instance_id} - triggering restart...")
-                # Use pm2 restart command
+            # Dynamically get PM2 process name
+            process_name = await self._get_pm2_process_name()
+            if process_name:
+                logger.info(f"Running under PM2 process '{process_name}' - triggering restart...")
+                # Use pm2 restart command with process name
                 import subprocess
-                subprocess.Popen(['pm2', 'restart', pm2_instance_id])
+                subprocess.Popen(['pm2', 'restart', process_name, '--update-env'])
             else:
-                logger.warning("Not running under PM2 - triggering system exit")
+                logger.warning("Not running under PM2 or process not found - triggering system exit")
                 # If not under pm2, exit gracefully
                 import sys
                 sys.exit(1)
@@ -1707,18 +1780,23 @@ class GaiaValidator:
             original_get_substrate = fiber_interface.get_substrate
             original_fetch_get_substrate = getattr(fetch_nodes_module, 'get_substrate', None)
             
-            def ultra_patched_get_substrate(*args, **kwargs):
-                logger.warning("!!! SUBSTRATE CONNECTION INTERCEPTED - using managed connection instead !!!")
-                return self.substrate
-            
+                        # ULTRA-PATCHING DISABLED FOR SUBSTRATE MANAGER TESTING
+            # def ultra_patched_get_substrate(*args, **kwargs):
+            #     logger.warning("!!! SUBSTRATE CONNECTION INTERCEPTED - using managed connection instead !!!")
+            #     return self.substrate
+
             # Apply patches everywhere
-            fiber_interface.get_substrate = ultra_patched_get_substrate
-            if original_fetch_get_substrate:
-                fetch_nodes_module.get_substrate = ultra_patched_get_substrate
+            # fiber_interface.get_substrate = ultra_patched_get_substrate
+            # if original_fetch_get_substrate:
+            #     fetch_nodes_module.get_substrate = ultra_patched_get_substrate
             
             try:
-                # Force substrate manager to use fresh connection
-                self.substrate = self.substrate_manager.get_connection()
+                # Create fresh substrate connection
+                self.substrate = interface.get_substrate(
+                    subtensor_network=self.subtensor_network,
+                    subtensor_address=self.subtensor_chain_endpoint
+                )
+                print("🔄 Created fresh connection for node fetching")
                 nodes = get_nodes_for_netuid(self.substrate, netuid)
                 logger.info(f"⚠️ Fetched {len(nodes) if nodes else 0} nodes with substrate call (check for new connections in logs)")
                 return nodes
@@ -1738,15 +1816,19 @@ class GaiaValidator:
     async def _sync_metagraph(self):
         """Sync the metagraph using managed substrate connection with custom implementation to prevent memory leaks."""
         sync_start = time.time()
-        # Use managed substrate connection for metagraph operations
+        # Use fresh substrate connection for metagraph operations  
         old_substrate = getattr(self, 'substrate', None)
-        self.substrate = self.substrate_manager.get_connection()
+        self.substrate = interface.get_substrate(
+            subtensor_network=self.subtensor_network,
+            subtensor_address=self.subtensor_chain_endpoint
+        )
+        print("🔄 Created fresh connection for metagraph sync")
         
-        # Ensure metagraph uses the managed connection and update substrate reference
+        # Ensure metagraph uses the fresh connection and update substrate reference
         if hasattr(self, 'metagraph') and self.metagraph:
             self.metagraph.substrate = self.substrate
         
-        # CRITICAL FIX: Use our custom node fetching that truly uses managed connections
+        # SUBSTRATE MANAGER DISABLED: Use our custom node fetching with fresh connections
         try:
             if hasattr(self, 'metagraph') and self.metagraph:
                 # Use our ultra-aggressive caching to prevent memory leaks
@@ -1756,7 +1838,7 @@ class GaiaValidator:
                 if active_nodes_list:
                     # Update metagraph nodes manually instead of calling sync_nodes()
                     self.metagraph.nodes = {node.hotkey: node for node in active_nodes_list}
-                    logger.info(f"✅ Custom metagraph sync: Updated with {len(self.metagraph.nodes)} nodes using managed connection (NO memory leak)")
+                    logger.info(f"✅ Custom metagraph sync: Updated with {len(self.metagraph.nodes)} nodes using fresh connection (NO memory leak)")
                 else:
                     logger.warning("No nodes returned from custom node fetching")
                     self.metagraph.nodes = {}
@@ -1780,7 +1862,7 @@ class GaiaValidator:
         
         # Log substrate connection status
         connection_changed = old_substrate != self.substrate
-        logger.debug(f"Custom metagraph sync completed in {sync_duration:.2f}s using managed connection (connection changed: {connection_changed})")
+        logger.debug(f"Custom metagraph sync completed in {sync_duration:.2f}s using fresh connection (connection changed: {connection_changed})")
         
         if connection_changed:
             logger.info("Substrate connection refreshed during metagraph sync")
@@ -1841,11 +1923,9 @@ class GaiaValidator:
             except Exception as e:
                 logger.debug(f"Error cleaning up WeatherTask: {e}")
 
-            # Clean up substrate connection manager
+            # Substrate connection manager removed - using fresh connections only
             try:
-                if hasattr(self, 'substrate_manager') and self.substrate_manager:
-                    self.substrate_manager.cleanup()
-                    logger.info("Cleaned up substrate connection manager")
+                logger.info("Substrate connection manager removed - using fresh connections only")
             except Exception as e:
                 logger.debug(f"Error cleaning up substrate manager: {e}")
 
@@ -1926,8 +2006,12 @@ class GaiaValidator:
             elif task_name == "geomagnetic":
                 await self.geomagnetic_task.cleanup_resources()
             elif task_name == "scoring":
-                self.substrate = self.substrate_manager.force_reconnect()
-                await self._sync_metagraph()  # Use managed connection instead of direct sync
+                self.substrate = interface.get_substrate(
+                    subtensor_network=self.subtensor_network,
+                    subtensor_address=self.subtensor_chain_endpoint
+                )
+                print("🔄 Force reconnect - created fresh substrate connection")
+                await self._sync_metagraph()  # Use fresh connection
             elif task_name == "deregistration":
                 await self._sync_metagraph()  # Use managed connection instead of direct sync
                 self.nodes = {}
@@ -1963,7 +2047,7 @@ class GaiaValidator:
 
             # 1. Fetch Current Metagraph State
             logger.info("Syncing metagraph for stale history check...")
-            await self._sync_metagraph()  # Use managed connection instead of direct sync
+            await self._sync_metagraph()  # Use fresh connection instead of direct sync
             
             # Fetch the list of nodes directly using our managed implementation
             try:
@@ -2430,7 +2514,7 @@ class GaiaValidator:
             wallet_name=self.wallet_name,
             hotkey_name=self.hotkey_name,
             network=self.subtensor_network,
-            substrate_manager=self.substrate_manager,
+                                # Substrate manager removed - using fresh connections only
         )
 
         while True:
@@ -2548,7 +2632,11 @@ class GaiaValidator:
                 logger.error("Weight setting operation timed out - restarting cycle")
                 await self.update_task_status('scoring', 'error')
                 try:
-                    self.substrate = self.substrate_manager.force_reconnect()
+                    self.substrate = interface.get_substrate(
+                        subtensor_network=self.subtensor_network,
+                        subtensor_address=self.subtensor_chain_endpoint
+                    )
+                    print("🔄 Force reconnect - created fresh substrate connection")
                 except Exception as e:
                     logger.error(f"Failed to reconnect to substrate: {e}")
                 await asyncio.sleep(12)
@@ -2581,25 +2669,18 @@ class GaiaValidator:
                 except Exception as block_error:
 
                     try:
-                        self.substrate = self.substrate_manager.get_connection()
+                        self.substrate = interface.get_substrate(
+                            subtensor_network=self.subtensor_network,
+                            subtensor_address=self.subtensor_chain_endpoint
+                        )
+                        print("🔄 Created fresh connection for status logger")
                     except Exception as e:
                         logger.error(f"Failed to reconnect to substrate: {e}")
 
                 active_nodes = len(self.metagraph.nodes) if self.metagraph else 0
 
-                # Get substrate connection manager stats
-                substrate_stats = ""
-                if hasattr(self, 'substrate_manager') and self.substrate_manager:
-                    try:
-                        stats = self.substrate_manager.get_stats()
-                        substrate_stats = (
-                            f"Substrate Connections: {stats['connection_count']}, "
-                            f"Queries: {stats['query_count']}, "
-                            f"Age: {stats['connection_age']:.1f}s, "
-                            f"Cleanup: {stats['time_since_cleanup']:.1f}s ago"
-                        )
-                    except Exception as e:
-                        substrate_stats = f"Substrate Stats Error: {e}"
+                # Substrate manager disabled - using fresh connections
+                substrate_stats = "Substrate Manager: DISABLED (using fresh connections)"
 
                 logger.info(
                     f"\n"
@@ -2630,7 +2711,7 @@ class GaiaValidator:
                     continue # Wait for metagraph to be initialized
                 
                 logger.info("Syncing metagraph for miner state update...")
-                await self._sync_metagraph()  # Use managed connection instead of direct sync
+                await self._sync_metagraph()  # Use fresh connection instead of direct sync
                 if not self.metagraph.nodes:
                     logger.warning("Metagraph empty after sync, skipping miner state update.")
                     await asyncio.sleep(600)  # Sleep before retrying
@@ -3198,9 +3279,7 @@ class GaiaValidator:
                     del validator_nodes_by_uid_list
                     
                     # Force comprehensive cleanup for weight calculation (if fully initialized)
-                    if (hasattr(self, 'substrate_manager') and 
-                        self.substrate_manager is not None and
-                        hasattr(self, 'last_metagraph_sync')):
+                    if hasattr(self, 'last_metagraph_sync'):
                         memory_freed = self._comprehensive_memory_cleanup("weight_calculation")
                     else:
                         # Fallback to basic cleanup during startup
@@ -3710,24 +3789,23 @@ class GaiaValidator:
             try:
                 await asyncio.sleep(300)  # Run every 5 minutes (more frequent cleanup)
                 
-                if hasattr(self, 'substrate_manager') and self.substrate_manager:
-                    try:
-                        stats_before = self.substrate_manager.get_stats()
-                        logger.debug(f"Substrate cleanup - Before: queries={stats_before['query_count']}, age={stats_before['connection_age']:.1f}s")
-                        
-                        # Force cleanup if query count is high or connection is old  
-                        if stats_before['query_count'] > 150 or stats_before['connection_age'] > 400:  # 6.7 minutes
-                            logger.info("Forcing substrate connection refresh due to high usage/age")
-                            self.substrate = self.substrate_manager.force_reconnect()
-                            
-                        # Always force garbage collection
-                        self.substrate_manager._force_garbage_collection()
-                        
-                        stats_after = self.substrate_manager.get_stats()
-                        logger.debug(f"Substrate cleanup - After: queries={stats_after['query_count']}, age={stats_after['connection_age']:.1f}s")
-                        
-                    except Exception as e:
-                        logger.debug(f"Error during periodic substrate cleanup: {e}")
+                # SUBSTRATE MANAGER DISABLED - Create fresh connections instead
+                logger.debug("Substrate manager disabled - creating fresh connection for periodic cleanup")
+                try:
+                    # Create fresh substrate connection
+                    self.substrate = interface.get_substrate(
+                        subtensor_network=self.subtensor_network,
+                        subtensor_address=self.subtensor_chain_endpoint
+                    )
+                    print("🔄 Periodic cleanup - created fresh substrate connection")
+                    
+                    # Force garbage collection
+                    import gc
+                    collected = gc.collect()
+                    logger.debug(f"Periodic substrate cleanup - GC collected {collected} objects")
+                    
+                except Exception as e:
+                    logger.debug(f"Error during periodic substrate cleanup: {e}")
                 
             except asyncio.CancelledError:
                 logger.info("Periodic substrate cleanup task cancelled")
@@ -3785,9 +3863,7 @@ class GaiaValidator:
                     memory_freed = memory_before - memory_after
                     
                     # Use comprehensive cleanup instead of just GC for better results (if fully initialized)
-                    if (hasattr(self, 'substrate_manager') and 
-                        self.substrate_manager is not None and
-                        hasattr(self, 'last_metagraph_sync')):
+                    if hasattr(self, 'last_metagraph_sync'):
                         comp_memory_freed = self._comprehensive_memory_cleanup("periodic_aggressive")
                     else:
                         comp_memory_freed = 0  # Skip during startup
@@ -3812,7 +3888,7 @@ class GaiaValidator:
         """
         
         # Skip cleanup during early startup to prevent initialization issues
-        if not hasattr(self, 'substrate_manager') or self.substrate_manager is None:
+        if not hasattr(self, 'last_metagraph_sync'):
             logger.debug(f"Skipping comprehensive cleanup for {context} - validator not fully initialized")
             return 0
             
