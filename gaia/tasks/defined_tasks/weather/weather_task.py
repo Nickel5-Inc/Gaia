@@ -743,7 +743,7 @@ class WeatherTask(Task):
     ############################################################
 
     def _load_era5_climatology_sync(self, climatology_path: str) -> Optional[xr.Dataset]:
-        """Synchronous helper to load ERA5 climatology with blosc support."""
+        """Synchronous helper to load ERA5 climatology with enhanced blosc support."""
         # CRITICAL: Ensure blosc codec is available in this executor thread
         try:
             import blosc
@@ -756,13 +756,39 @@ class WeatherTask(Task):
                 numcodecs.registry.codec_registry['blosc'] = Blosc
                 logger.info(f"ERA5 climatology: Manually registered blosc codec in executor thread")
             
+            # Also try to register all blosc-related codecs
+            try:
+                from numcodecs import Blosc, LZ4, Zstd, Zlib, BZ2
+                for codec_class in [Blosc, LZ4, Zstd, Zlib, BZ2]:
+                    if hasattr(codec_class, 'codec_id'):
+                        codec_id = codec_class.codec_id
+                        if codec_id not in numcodecs.registry.codec_registry:
+                            numcodecs.registry.codec_registry[codec_id] = codec_class
+                            logger.debug(f"Registered codec: {codec_id}")
+            except Exception as reg_err:
+                logger.debug(f"Error registering additional codecs: {reg_err}")
+            
             # Verify blosc is now available
             codec = numcodecs.registry.get_codec({'id': 'blosc'})
             logger.debug(f"ERA5 climatology: Blosc codec verified in executor thread: {type(codec)}")
         except Exception as e:
             logger.warning(f"Failed to ensure blosc codec in ERA5 climatology executor thread: {e}")
         
-        return xr.open_zarr(climatology_path, consolidated=True)
+        try:
+            return xr.open_zarr(climatology_path, consolidated=True)
+        except ValueError as ve:
+            if 'codec not available' in str(ve) and 'blosc' in str(ve):
+                logger.warning(f"Blosc codec still not available, trying fallback approaches: {ve}")
+                try:
+                    # Try without consolidated metadata
+                    logger.info("Attempting to load without consolidated metadata...")
+                    return xr.open_zarr(climatology_path, consolidated=False)
+                except Exception as fallback_err:
+                    logger.error(f"Fallback loading also failed: {fallback_err}")
+                    # Return None to indicate failure - caller should handle gracefully
+                    return None
+            else:
+                raise
 
     async def _get_or_load_era5_climatology(self) -> Optional[xr.Dataset]:
         if self.era5_climatology_ds is None:
@@ -1405,6 +1431,15 @@ class WeatherTask(Task):
         W_era5 = self.config.get('weather_score_era5_weight', 0.8)
         proportional_weather_scores = (latest_day1_scores_array * W_day1) + (latest_era5_composite_scores_array * W_era5)
         logger.info(f"[CombinedWeatherScore] Calculated proportional scores.")
+        
+        # MEMORY LEAK FIX: Clear large score arrays immediately after use
+        try:
+            del latest_day1_scores_array, latest_era5_composite_scores_array
+            import gc
+            gc.collect()
+            logger.debug("Weather score calculation: cleared intermediate score arrays")
+        except Exception:
+            pass
 
         miner_bonuses_applied = np.zeros(256)
         bonus_value_add = self.config.get('weather_bonus_value_add', 0.05)

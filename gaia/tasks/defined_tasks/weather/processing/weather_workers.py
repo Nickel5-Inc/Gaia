@@ -615,6 +615,7 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                 }
                 
                 # Add explicit time encoding to ensure consistency between local and HTTP service paths
+                base_time = pd.to_datetime(gfs_init_time_utc)
                 for coord_name in combined_forecast_ds.coords:
                     if coord_name.lower() == 'time' and pd.api.types.is_datetime64_any_dtype(combined_forecast_ds.coords[coord_name].dtype):
                         encoding['time'] = {
@@ -718,9 +719,11 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
             )
             await update_job_status(task_instance, job_id, "completed")
             
-            # Immediately cleanup R2 inputs for completed job
+            # Immediately cleanup R2 inputs for completed job (with task tracking)
             if task_instance.config.get('weather_inference_type') == 'http_service':
-                asyncio.create_task(_immediate_r2_input_cleanup(task_instance, job_id))
+                cleanup_task = asyncio.create_task(_immediate_r2_input_cleanup(task_instance, job_id))
+                if hasattr(task_instance, 'validator') and hasattr(task_instance.validator, '_track_background_task'):
+                    task_instance.validator._track_background_task(cleanup_task, f"r2_cleanup_{job_id}")
             
             logger.info(f"[InferenceTask Job {job_id}] Background inference task completed successfully.")
 
@@ -740,9 +743,11 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
         except Exception as final_db_err:
              logger.error(f"[InferenceTask Job {job_id}] Failed to update job status to error after task failure: {final_db_err}")
         
-        # Cleanup R2 inputs for failed job
+        # Cleanup R2 inputs for failed job (with task tracking)
         if task_instance.config.get('weather_inference_type') == 'http_service':
-            asyncio.create_task(_immediate_r2_input_cleanup(task_instance, job_id))
+            cleanup_task = asyncio.create_task(_immediate_r2_input_cleanup(task_instance, job_id))
+            if hasattr(task_instance, 'validator') and hasattr(task_instance.validator, '_track_background_task'):
+                task_instance.validator._track_background_task(cleanup_task, f"r2_cleanup_failed_{job_id}")
     finally:
         # Comprehensive cleanup of large GFS datasets and other objects
         logger.debug(f"[InferenceTask Job {job_id}] Entering finally block for cleanup.")
@@ -1369,24 +1374,34 @@ async def finalize_scores_worker(self):
                         import sys
                         
                         # 1. Clear ERA5/xarray/dask/numpy module-level caches
+                        modules_cleared = 0
+                        cache_objects_cleared = 0
+                        
                         for module_name in list(sys.modules.keys()):
                             if any(pattern in module_name.lower() for pattern in 
                                    ['xarray', 'dask', 'numpy', 'pandas', 'fsspec', 'zarr', 'netcdf4', 'h5py', 'scipy', 'era5']):
                                 module = sys.modules.get(module_name)
                                 if hasattr(module, '__dict__'):
+                                    module_cleared = False
                                     for attr_name in list(module.__dict__.keys()):
                                         if any(cache_pattern in attr_name.lower() for cache_pattern in 
-                                               ['cache', 'registry', '_cached', '__pycache__', '_instance_cache']):
+                                               ['cache', 'registry', '_cached', '__pycache__', '_instance_cache', '_buffer', '_memo']):
                                             try:
                                                 cache_obj = getattr(module, attr_name)
-                                                if hasattr(cache_obj, 'clear'):
+                                                if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
                                                     cache_obj.clear()
-                                                    logger.debug(f"[FinalizeWorker] Run {run_id}: Cleared {module_name}.{attr_name}")
-                                                elif isinstance(cache_obj, dict):
+                                                    cache_objects_cleared += 1
+                                                    module_cleared = True
+                                                elif isinstance(cache_obj, (dict, list, set)):
                                                     cache_obj.clear()
-                                                    logger.debug(f"[FinalizeWorker] Run {run_id}: Cleared dict {module_name}.{attr_name}")
+                                                    cache_objects_cleared += 1
+                                                    module_cleared = True
                                             except Exception:
                                                 pass
+                                    if module_cleared:
+                                        modules_cleared += 1
+                        
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Cleared {cache_objects_cleared} cache objects from {modules_cleared} modules")
                         
                         # 2. Force multiple garbage collection passes
                         collected_total = 0
@@ -1418,12 +1433,31 @@ async def finalize_scores_worker(self):
                         except Exception:
                             pass
                         
-                        # 5. Clear netCDF4/HDF5 caches (important for ERA5 data)
+                        # 5. Clear library-specific caches
                         try:
+                            # Clear netCDF4/HDF5 caches (important for ERA5 data)
                             import netCDF4
                             if hasattr(netCDF4, '_default_fillvals'):
                                 netCDF4._default_fillvals.clear()
-                        except Exception:
+                                
+                            # Clear xarray backend caches
+                            import xarray as xr
+                            if hasattr(xr.backends, 'plugins'):
+                                if hasattr(xr.backends.plugins, 'clear'):
+                                    xr.backends.plugins.clear()
+                                elif isinstance(xr.backends.plugins, dict):
+                                    xr.backends.plugins.clear()
+                                    
+                            # Clear dask caches
+                            try:
+                                import dask
+                                if hasattr(dask, 'base') and hasattr(dask.base, 'tokenize'):
+                                    if hasattr(dask.base.tokenize, 'cache'):
+                                        dask.base.tokenize.cache.clear()
+                            except ImportError:
+                                pass
+                            
+                        except ImportError:
                             pass
                         
                         logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 aggressive cleanup collected {collected_total} objects")
