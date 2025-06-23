@@ -86,7 +86,8 @@ soil_moisture_predictions_table = sa.Table('soil_moisture_predictions', validato
     sa.Column('retry_count', sa.Integer, server_default=sa.text('0'), nullable=True),
     sa.Column('next_retry_time', postgresql.TIMESTAMP(timezone=True), nullable=True),
     sa.Column('last_retry_attempt', postgresql.TIMESTAMP(timezone=True), nullable=True),
-    sa.Column('retry_error_message', sa.Text, nullable=True)
+    sa.Column('retry_error_message', sa.Text, nullable=True),
+    sa.Column('last_error', sa.Text, nullable=True)
 )
 sa.Index('idx_smp_region_id', soil_moisture_predictions_table.c.region_id)
 sa.Index('idx_smp_miner_uid', soil_moisture_predictions_table.c.miner_uid)
