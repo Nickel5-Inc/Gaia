@@ -1945,9 +1945,9 @@ class WeatherTask(Task):
             # report the specific status the validator is looking for.
             # For completed jobs, also report as awaiting validation so validator includes us in scoring
             if result.get('input_data_hash'):
-                if status_to_report in ['in_progress', 'completed']:
-                    status_to_report = WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION.value
-                    logger.debug(f"[Miner Job {job_id}] Job status '{result['status']}' with hash converted to '{status_to_report}' for validator compatibility")
+                # Always report as awaiting validation when hash is available, regardless of current status
+                status_to_report = WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION.value
+                logger.debug(f"[Miner Job {job_id}] Job status '{result['status']}' with hash converted to '{status_to_report}' for validator compatibility")
 
             response = {
                 "job_id": job_id,

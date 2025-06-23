@@ -74,6 +74,8 @@
             "rootzone_rmse": "FLOAT",
             "surface_structure_score": "FLOAT",
             "rootzone_structure_score": "FLOAT",
+            "sentinel_bounds": "FLOAT[]",
+            "sentinel_crs": "INTEGER",
             "scored_at": "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
         },
         "indexes": [

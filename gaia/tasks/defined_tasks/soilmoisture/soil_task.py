@@ -875,6 +875,8 @@ class SoilMoistureTask(Task):
                         "rootzone_rmse": scores["metrics"].get("rootzone_rmse"),
                         "surface_structure_score": scores["metrics"].get("surface_ssim", 0),
                         "rootzone_structure_score": scores["metrics"].get("rootzone_ssim", 0),
+                        "sentinel_bounds": region.get("sentinel_bounds"),
+                        "sentinel_crs": region.get("sentinel_crs"),
                     }
 
                     # Use UPSERT to prevent duplicates in history table
@@ -884,13 +886,15 @@ class SoilMoistureTask(Task):
                             surface_sm_pred, rootzone_sm_pred,
                             surface_sm_truth, rootzone_sm_truth,
                             surface_rmse, rootzone_rmse,
-                            surface_structure_score, rootzone_structure_score)
+                            surface_structure_score, rootzone_structure_score,
+                            sentinel_bounds, sentinel_crs)
                         VALUES 
                         (:region_id, :miner_uid, :miner_hotkey, :target_time,
                             :surface_sm_pred, :rootzone_sm_pred,
                             :surface_sm_truth, :rootzone_sm_truth,
                             :surface_rmse, :rootzone_rmse,
-                            :surface_structure_score, :rootzone_structure_score)
+                            :surface_structure_score, :rootzone_structure_score,
+                            :sentinel_bounds, :sentinel_crs)
                         ON CONFLICT (region_id, miner_uid, target_time) 
                         DO UPDATE SET 
                             surface_sm_pred = EXCLUDED.surface_sm_pred,
@@ -900,7 +904,9 @@ class SoilMoistureTask(Task):
                             surface_rmse = EXCLUDED.surface_rmse,
                             rootzone_rmse = EXCLUDED.rootzone_rmse,
                             surface_structure_score = EXCLUDED.surface_structure_score,
-                            rootzone_structure_score = EXCLUDED.rootzone_structure_score
+                            rootzone_structure_score = EXCLUDED.rootzone_structure_score,
+                            sentinel_bounds = EXCLUDED.sentinel_bounds,
+                            sentinel_crs = EXCLUDED.sentinel_crs
                     """
                     await self.db_manager.execute(upsert_query, params)
 

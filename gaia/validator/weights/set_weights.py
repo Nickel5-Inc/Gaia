@@ -13,15 +13,21 @@ from dotenv import load_dotenv
 from fiber.logging_utils import get_logger
 import numpy as np
 from gaia import __spec_version__
+from gaia.validator.core.substrate_manager import SubstrateConnectionManager
 
 logger = get_logger(__name__)
 
 
 async def get_active_validator_uids(netuid, subtensor_network="finney", chain_endpoint=None, recent_blocks=500):
+    substrate_manager = None
     try:
-        # Always use fresh connections
-        substrate = SubstrateInterface(url=chain_endpoint) if chain_endpoint else get_substrate(subtensor_network=subtensor_network)
-        logger.info("🔄 Using fresh substrate connection for get_active_validator_uids")
+        # Use managed substrate connection
+        substrate_manager = SubstrateConnectionManager(
+            subtensor_network=subtensor_network,
+            chain_endpoint=chain_endpoint or "wss://entrypoint-finney.opentensor.ai:443"
+        )
+        substrate = substrate_manager.get_fresh_connection()
+        logger.info("🔄 Using managed substrate connection for get_active_validator_uids")
         
         loop = asyncio.get_event_loop()
         validator_permits = await loop.run_in_executor(
@@ -48,59 +54,13 @@ async def get_active_validator_uids(netuid, subtensor_network="finney", chain_en
         logger.error(traceback.format_exc())
         return []
     finally:
-        # MEMORY LEAK FIX: Aggressive substrate cleanup
-        if 'substrate' in locals():
+        # Clean up substrate manager
+        if substrate_manager:
             try:
-                # Clear substrate internal caches before closing
-                try:
-                    if hasattr(substrate, '_request_cache'):
-                        substrate._request_cache.clear()
-                    if hasattr(substrate, 'metadata_cache'):
-                        substrate.metadata_cache.clear()
-                    if hasattr(substrate, 'runtime_configuration'):
-                        substrate.runtime_configuration = None
-                    if hasattr(substrate, 'websocket') and substrate.websocket:
-                        substrate.websocket.close()
-                except Exception:
-                    pass
-                    
-                substrate.close()
-                
-                # Clear scalecodec caches after substrate operation
-                try:
-                    import sys
-                    import gc
-                    cleared_count = 0
-                    
-                    for module_name in list(sys.modules.keys()):
-                        if any(pattern in module_name.lower() for pattern in 
-                               ['scalecodec', 'substrate', 'scale_info']):
-                            module = sys.modules.get(module_name)
-                            if hasattr(module, '__dict__'):
-                                for attr_name in list(module.__dict__.keys()):
-                                    if any(cache_pattern in attr_name.lower() for cache_pattern in 
-                                           ['cache', 'registry', '_cached', '_memo']):
-                                        try:
-                                            cache_obj = getattr(module, attr_name)
-                                            if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
-                                                cache_obj.clear()
-                                                cleared_count += 1
-                                            elif isinstance(cache_obj, (dict, list, set)):
-                                                cache_obj.clear()
-                                                cleared_count += 1
-                                        except Exception:
-                                            pass
-                    
-                    # Force GC after clearing caches
-                    collected = gc.collect()
-                    if cleared_count > 0:
-                        logger.debug(f"get_active_validator_uids cleanup: cleared {cleared_count} cache objects, GC collected {collected}")
-                        
-                except Exception:
-                    pass
-                    
+                substrate_manager.cleanup()
+                logger.debug("Cleaned up substrate manager in get_active_validator_uids")
             except Exception as cleanup_error:
-                logger.debug(f"Error cleaning up substrate connection: {cleanup_error}")
+                logger.debug(f"Error cleaning up substrate manager: {cleanup_error}")
 
 
 class FiberWeightSetter:
@@ -111,13 +71,26 @@ class FiberWeightSetter:
             hotkey_name: str = "default",
             network: str = "finney",
             timeout: int = 30,
+            substrate_manager: Optional[SubstrateConnectionManager] = None,
     ):
-        """Initialize the weight setter with fiber connections"""
+        """Initialize the weight setter with managed substrate connections"""
         self.netuid = netuid
         self.network = network
-        # Always use fresh connections
-        logger.info("🔄 FiberWeightSetter using fresh connection")
-        self.substrate = interface.get_substrate(subtensor_network=network)
+        
+        # Use provided substrate manager or create a new one
+        if substrate_manager:
+            self.substrate_manager = substrate_manager
+            logger.info("🔄 FiberWeightSetter using provided substrate manager")
+        else:
+            # Create new managed connection
+            chain_endpoint = "wss://entrypoint-finney.opentensor.ai:443" if network == "finney" else f"wss://test.finney.opentensor.ai:443/"
+            self.substrate_manager = SubstrateConnectionManager(
+                subtensor_network=network,
+                chain_endpoint=chain_endpoint
+            )
+            logger.info("🔄 FiberWeightSetter created new substrate manager")
+        
+        self.substrate = self.substrate_manager.get_fresh_connection()
         self.nodes = None
         self.keypair = chain_utils.load_hotkey_keypair(
             wallet_name=wallet_name, hotkey_name=hotkey_name
@@ -125,14 +98,14 @@ class FiberWeightSetter:
         self.timeout = timeout
 
     def cleanup(self):
-        """Clean up substrate connection."""
-        if hasattr(self, 'substrate') and self.substrate:
+        """Clean up substrate manager."""
+        if hasattr(self, 'substrate_manager') and self.substrate_manager:
             try:
-                logger.debug("Cleaning up unmanaged substrate connection in FiberWeightSetter")
-                self.substrate.close()
+                logger.debug("Cleaning up substrate manager in FiberWeightSetter")
+                self.substrate_manager.cleanup()
                 self.substrate = None
             except Exception as e:
-                logger.debug(f"Error cleaning up substrate connection: {e}")
+                logger.debug(f"Error cleaning up substrate manager: {e}")
 
     def __del__(self):
         """Destructor to ensure cleanup happens when object is destroyed."""

@@ -20,6 +20,7 @@ from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
 from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+from gaia.validator.core.substrate_manager import SubstrateConnectionManager
 import ssl
 import logging
 from fiber import logging_utils
@@ -304,12 +305,17 @@ class Miner:
             """
             )
 
-            substrate_for_check = None
+            substrate_manager = None
             try:
                 self.logger.info("MINER_SELF_CHECK: Attempting to fetch own registered axon info...")
                 endpoint_to_use = self.config.chain_endpoint 
                 
-                substrate_for_check = SubstrateInterface(url=endpoint_to_use)
+                # Use managed substrate connection
+                substrate_manager = SubstrateConnectionManager(
+                    subtensor_network=self.subtensor_network,
+                    chain_endpoint=endpoint_to_use
+                )
+                substrate_for_check = substrate_manager.get_fresh_connection()
                 
                 all_nodes = fetch_nodes.get_nodes_for_netuid(substrate_for_check, self.netuid)
                 found_own_node = None
@@ -358,9 +364,9 @@ class Miner:
             except Exception as e_check:
                 self.logger.error(f"MINER_SELF_CHECK: Error fetching own axon info: {e_check}", exc_info=False) 
             finally:
-                if substrate_for_check:
-                    substrate_for_check.close()
-                    self.logger.debug("MINER_SELF_CHECK: Substrate connection for self-check closed.")
+                if substrate_manager:
+                    substrate_manager.cleanup()
+                    self.logger.debug("MINER_SELF_CHECK: Substrate manager for self-check cleaned up.")
 
             return True
         except Exception as e_outer_setup: 
