@@ -57,16 +57,41 @@ def _synchronous_zarr_open_unverified(
         import blosc
         import numcodecs
         import numcodecs.blosc
+        import zarr
         
-        # Force registration by adding to registry manually if not present
-        if 'blosc' not in numcodecs.registry.codec_registry:
-            from numcodecs.blosc import Blosc
-            numcodecs.registry.codec_registry['blosc'] = Blosc
-            logger.info(f"SYNC_ZARR_OPEN_UNVERIFIED: Manually registered blosc codec in executor thread")
+        # More robust codec registration
+        try:
+            from numcodecs import Blosc, LZ4, Zstd
+            import importlib
+            importlib.reload(numcodecs.blosc)
+            
+            # Test codec functionality
+            blosc_codec = Blosc()
+            import numpy as np
+            test_data = np.array([1, 2, 3], dtype='f4')
+            compressed = blosc_codec.encode(test_data)
+            # Correct decode method - only needs the compressed buffer
+            decompressed = blosc_codec.decode(compressed)
+            # Reshape the decoded data back to original format
+            decompressed = np.frombuffer(decompressed, dtype=test_data.dtype).reshape(test_data.shape)
+            
+            logger.debug(f"SYNC_ZARR_OPEN_UNVERIFIED: Blosc codec test successful in executor thread")
+        except Exception as codec_err:
+            logger.warning(f"SYNC_ZARR_OPEN_UNVERIFIED: Codec test failed: {codec_err}")
         
-        # Verify blosc is now available
-        codec = numcodecs.registry.get_codec({'id': 'blosc'})
-        logger.debug(f"SYNC_ZARR_OPEN_UNVERIFIED: Blosc codec verified in executor thread: {type(codec)}")
+        # Additional fallback: set zarr codec for this thread explicitly
+        try:
+            blosc_codec = numcodecs.Blosc()
+            codec_id = blosc_codec.codec_id
+            numcodecs.registry.codec_registry[codec_id] = blosc_codec
+            
+            if hasattr(numcodecs, 'register_codec'):
+                numcodecs.register_codec(blosc_codec)
+                
+            if hasattr(zarr, 'codec_registry') and hasattr(zarr.codec_registry, 'register_codec'):
+                zarr.codec_registry.register_codec(blosc_codec)
+        except Exception as e:
+            logger.debug(f"Failed to register blosc codec: {e}")
     except Exception as e:
         logger.warning(f"SYNC_ZARR_OPEN_UNVERIFIED: Failed to ensure blosc codec in executor thread: {e}")
     
@@ -167,16 +192,41 @@ def _synchronous_open_with_verifying_mapper(
         import blosc
         import numcodecs
         import numcodecs.blosc
+        import zarr
         
-        # Force registration by adding to registry manually if not present
-        if 'blosc' not in numcodecs.registry.codec_registry:
-            from numcodecs.blosc import Blosc
-            numcodecs.registry.codec_registry['blosc'] = Blosc
-            logger.info(f"Job {verifying_mapper.job_id_for_logging}: Manually registered blosc codec in executor thread")
+        # More robust codec registration
+        try:
+            from numcodecs import Blosc, LZ4, Zstd
+            import importlib
+            importlib.reload(numcodecs.blosc)
+            
+            # Test codec functionality
+            blosc_codec = Blosc()
+            import numpy as np
+            test_data = np.array([1, 2, 3], dtype='f4')
+            compressed = blosc_codec.encode(test_data)
+            # Correct decode method - only needs the compressed buffer
+            decompressed = blosc_codec.decode(compressed)
+            # Reshape the decoded data back to original format
+            decompressed = np.frombuffer(decompressed, dtype=test_data.dtype).reshape(test_data.shape)
+            
+            logger.debug(f"Job {verifying_mapper.job_id_for_logging}: Blosc codec test successful in executor thread")
+        except Exception as codec_err:
+            logger.warning(f"Job {verifying_mapper.job_id_for_logging}: Codec test failed: {codec_err}")
         
-        # Verify blosc is now available
-        codec = numcodecs.registry.get_codec({'id': 'blosc'})
-        logger.debug(f"Job {verifying_mapper.job_id_for_logging}: Blosc codec verified in executor thread: {type(codec)}")
+        # Additional fallback: set zarr codec for this thread explicitly
+        try:
+            blosc_codec = numcodecs.Blosc()
+            codec_id = blosc_codec.codec_id
+            numcodecs.registry.codec_registry[codec_id] = blosc_codec
+            
+            if hasattr(numcodecs, 'register_codec'):
+                numcodecs.register_codec(blosc_codec)
+                
+            if hasattr(zarr, 'codec_registry') and hasattr(zarr.codec_registry, 'register_codec'):
+                zarr.codec_registry.register_codec(blosc_codec)
+        except Exception as e:
+            logger.debug(f"Failed to register blosc codec: {e}")
     except Exception as e:
         logger.warning(f"Job {verifying_mapper.job_id_for_logging}: Failed to ensure blosc codec in executor thread: {e}")
     

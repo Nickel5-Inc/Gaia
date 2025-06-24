@@ -477,6 +477,16 @@ async def fetch_gfs_analysis_data(
 
                     if time_coordinate_decoded_successfully:
                         # full_ds.time is now datetime-like (cftime or datetime64)
+                        # Check for duplicate time values and handle them
+                        time_values = full_ds.time.values
+                        unique_times, unique_indices = np.unique(time_values, return_index=True)
+                        
+                        if len(unique_times) < len(time_values):
+                            logger.warning(f"Found {len(time_values) - len(unique_times)} duplicate time values in GFS dataset. Removing duplicates.")
+                            # Keep only the first occurrence of each unique time
+                            unique_indices_sorted = np.sort(unique_indices)
+                            full_ds = full_ds.isel(time=unique_indices_sorted)
+                        
                         analysis_slice = full_ds.sel(time=analysis_target_dt_np, method='nearest')
                         # analysis_slice.time.values is a scalar cftime.DatetimeGregorian (or similar cftime object)
                         # Convert cftime object to standard Python datetime, then to np.datetime64
@@ -505,6 +515,16 @@ async def fetch_gfs_analysis_data(
                             if not time_units:
                                 logger.error(f"Time units attribute missing from undecoded time coordinate for target {target_time}. Cannot select accurately.")
                                 continue # Skip this target_time
+
+                            # Check for duplicate time values in numerical case too
+                            time_values = full_ds.time.values
+                            unique_times, unique_indices = np.unique(time_values, return_index=True)
+                            
+                            if len(unique_times) < len(time_values):
+                                logger.warning(f"Found {len(time_values) - len(unique_times)} duplicate numerical time values in GFS dataset. Removing duplicates.")
+                                # Keep only the first occurrence of each unique time
+                                unique_indices_sorted = np.sort(unique_indices)
+                                full_ds = full_ds.isel(time=unique_indices_sorted)
 
                             numerical_target_for_sel = xr.coding.times.encode_cf_datetime(
                                 np.array([analysis_target_dt_np]), 

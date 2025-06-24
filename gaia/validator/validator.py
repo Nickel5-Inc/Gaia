@@ -2432,8 +2432,8 @@ class GaiaValidator:
                 logger.info("Auto-updater task started independently")
                 
                 tasks_lambdas = [ # Renamed to avoid conflict if tasks variable is used elsewhere
-                    lambda: self.geomagnetic_task.validator_execute(self),
-                    lambda: self.soil_task.validator_execute(self),
+                    #lambda: self.geomagnetic_task.validator_execute(self),
+                    #lambda: self.soil_task.validator_execute(self),
                     lambda: self.weather_task.validator_execute(self),
                     lambda: self.status_logger(),
                     lambda: self.main_scoring(),
@@ -4206,10 +4206,8 @@ class GaiaValidator:
                 import numpy as np
                 if hasattr(np, '_get_ndarray_cache'):
                     np._get_ndarray_cache().clear()
-                if hasattr(np, 'core') and hasattr(np.core, 'multiarray'):
-                    if hasattr(np.core.multiarray, '_reconstruct'):
-                        # Clear numpy reconstruction cache
-                        pass
+                # Skip numpy internal cache clearing to avoid deprecation warnings
+                # NumPy manages its own internal caches efficiently
                         
                 # Clear xarray caches
                 try:
