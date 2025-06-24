@@ -24,6 +24,8 @@ aioitertools==0.12.0
     # via aiobotocore
 aiosignal==1.3.2
     # via aiohttp
+aiostream==0.6.4
+    # via -r requirements.in
 alembic==1.16.1
     # via -r requirements.in
 annotated-types==0.7.0
@@ -304,6 +306,8 @@ more-itertools==10.7.0
     # via scalecodec
 mpmath==1.3.0
     # via sympy
+msgpack==1.1.1
+    # via -r requirements.in
 multidict==6.4.3
     # via
     #   aiobotocore
@@ -397,6 +401,8 @@ nvidia-nvtx-cu12==12.6.77
     # via torch
 oauthlib==3.2.2
     # via requests-oauthlib
+orjson==3.10.18
+    # via -r requirements.in
 packaging==25.0
     # via
     #   dask
@@ -528,6 +534,8 @@ pyyaml==6.0.2
     #   huggingface-hub
     #   pytorch-lightning
     #   timm
+pyzmq==27.0.0
+    # via -r requirements.in
 rasterio==1.4.3
     # via -r requirements.in
 requests==2.32.3
@@ -647,6 +655,7 @@ triton==3.3.0
     # via torch
 typing-extensions==4.13.2
     # via
+    #   aiostream
     #   alembic
     #   anyio
     #   azure-core
@@ -683,6 +692,8 @@ uvicorn==0.30.5
     # via
     #   -r requirements.in
     #   fiber
+uvloop==0.21.0
+    # via -r requirements.in
 websocket-client==1.8.0
     # via substrate-interface
 websockets==15.0.1
