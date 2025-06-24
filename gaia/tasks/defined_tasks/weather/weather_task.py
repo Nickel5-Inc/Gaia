@@ -607,16 +607,16 @@ class WeatherTask(Task):
 
     async def _run_inference_via_http_service(self, job_id: str) -> bool:
         """
-        Orchestrates running inference via the HTTP service.
-        This is now fully asynchronous and returns immediately after launching the job.
-        Includes duplicate checking to prevent redundant inference for the same timestep.
+        Runs weather inference using an external HTTP service (e.g., RunPod).
+        This method should only be called on miner nodes.
         """
-        logger.info(f"[{job_id}] Starting async inference via HTTP service.")
-        
-        # DIAGNOSTIC: Add detailed logging to compare data processing paths
-        logger.info(f"[{job_id}] DIAGNOSTIC - HTTP SERVICE INFERENCE PIPELINE STARTED")
-        
-        # Check for duplicates before expensive operations
+        if self.node_type != 'miner':
+            logger.error(f"[{job_id}] _run_inference_via_http_service called on {self.node_type} node. This method should only run on miners.")
+            return False
+
+        logger.info(f"[{job_id}] Starting HTTP service inference...")
+
+        # Duplicate check and job validation for miners only
         try:
             # Get job details including GFS timestep
             job_check_query = """
@@ -1142,7 +1142,7 @@ class WeatherTask(Task):
                         new_db_status = None
                         hash_match = None
 
-                        if miner_hash and miner_status == WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION:
+                        if miner_hash and miner_status == WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION.value:
                             if miner_hash == validator_input_hash:
                                 logger.info(f"[Run {run_id}] Hash MATCH for response ID {resp_id} (Miner status: {miner_status})!")
                                 new_db_status = 'input_validation_complete'
@@ -1156,12 +1156,12 @@ class WeatherTask(Task):
                                 logger.warning(f"[Run {run_id}] Hash MISMATCH for response ID {resp_id}. Miner: {miner_hash[:10]}... Validator: {validator_input_hash[:10]}... (Miner status: {miner_status})")
                                 new_db_status = 'input_hash_mismatch'
                                 hash_match = False
-                        elif miner_status == WeatherTaskStatus.FETCH_ERROR:
+                        elif miner_status == WeatherTaskStatus.FETCH_ERROR.value:
                             new_db_status = 'input_fetch_error'
-                        elif miner_status in [WeatherTaskStatus.FETCHING_GFS, WeatherTaskStatus.HASHING_INPUT, WeatherTaskStatus.FETCH_QUEUED]:
+                        elif miner_status in [WeatherTaskStatus.FETCHING_GFS.value, WeatherTaskStatus.HASHING_INPUT.value, WeatherTaskStatus.FETCH_QUEUED.value]:
                             logger.warning(f"[Run {run_id}] Miner for response ID {resp_id} timed out (status: {miner_status}).")
                             new_db_status = 'input_hash_timeout'
-                        elif miner_status in [WeatherTaskStatus.VALIDATOR_POLL_FAILED, WeatherTaskStatus.VALIDATOR_POLL_ERROR]:
+                        elif miner_status in [WeatherTaskStatus.VALIDATOR_POLL_FAILED.value, WeatherTaskStatus.VALIDATOR_POLL_ERROR.value]:
                              new_db_status = 'input_poll_error'
                         else:
                             new_db_status = 'input_fetch_error'
@@ -1223,7 +1223,7 @@ class WeatherTask(Task):
                                     logger.warning(f"[Run {run_id}] Failed to parse trigger response text for {miner_hk[:8]}: {json_err}")
                                     parsed_response = {"status": "parse_error", "message": str(json_err)}
                                     
-                            if parsed_response and parsed_response.get('status') == WeatherTaskStatus.INFERENCE_STARTED:
+                            if parsed_response and parsed_response.get('status') == WeatherTaskStatus.INFERENCE_STARTED.value:
                                 logger.info(f"[Run {run_id}] Successfully triggered inference for {miner_hk[:8]} (Job: {miner_job_id}).")
                                 return resp_id, True
                             else:
@@ -2410,7 +2410,12 @@ class WeatherTask(Task):
         self.job_status_logger_running = False
 
     async def _load_batch_from_db(self, job_id: str) -> Optional[Batch]:
-        """Loads the initial batch object from the pickle file path stored in the database."""
+        """Loads the initial batch object from the pickle file path stored in the database.
+        This method should only be called on miner nodes."""
+        if self.node_type != 'miner':
+            logger.error(f"[{job_id}] _load_batch_from_db called on {self.node_type} node. This method should only run on miners.")
+            return None
+            
         logger.info(f"[{job_id}] Loading initial batch from database path.")
         try:
             query = "SELECT input_batch_pickle_path FROM weather_miner_jobs WHERE id = :job_id"
@@ -2440,7 +2445,12 @@ class WeatherTask(Task):
         Finds jobs that were in-progress on RunPod and restarts the polling worker for them.
         This should be called on miner startup.
         """
-        if self.node_type != "miner" or self.config.get('weather_inference_type') != 'http_service':
+        if self.node_type != "miner":
+            logger.debug("recover_incomplete_http_jobs: Not a miner node, skipping recovery.")
+            return
+            
+        if self.config.get('weather_inference_type') != 'http_service':
+            logger.debug("recover_incomplete_http_jobs: Not using HTTP service inference, skipping recovery.")
             return
         
         logger.info("Checking for incomplete HTTP jobs to recover...")
