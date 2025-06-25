@@ -3269,7 +3269,7 @@ class GaiaValidator:
                     if not np.isnan(w_s): wc,total_w_avail = 0.70*w_s, total_w_avail+0.70
                     if not np.isnan(g_s): gc,total_w_avail = 0.15*sigmoid(g_s), total_w_avail+0.15
                     if not np.isnan(sm_s): sc,total_w_avail = 0.15*sm_s, total_w_avail+0.15
-                    weights_final[idx] = (wc+gc+sc)/total_w_avail if total_w_avail>0 else 0.0
+                    weights_final[idx] = (wc+gc+sc)/1 # prevent to set weights based on only task score.
                 # Reduce logging to prevent memory pressure - only log every 32nd UID or non-zero weights
                 if idx % 32 == 0 or weights_final[idx] > 0.0:
                     logger.debug(f"UID {idx} (HK: {hk_chain}): Wea={w_s if not np.isnan(w_s) else '-'} ({weather_counts[idx]} scores), Geo={g_s if not np.isnan(g_s) else '-'} ({geo_counts[idx]} scores), Soil={sm_s if not np.isnan(sm_s) else '-'} ({soil_counts[idx]} scores), AggW={weights_final[idx]:.4f}")
