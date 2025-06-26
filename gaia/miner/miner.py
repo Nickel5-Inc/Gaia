@@ -29,7 +29,7 @@ import asyncio
 import ipaddress
 from typing import Optional
 import warnings
-from contextlib import asynccontextmanager # Add this import
+# Removed asynccontextmanager import - using traditional startup/shutdown events
 import time
 
 # Imports for Alembic check
@@ -414,10 +414,8 @@ class Miner:
                 logger.error(f"Local inference service at {health_url} did not become ready within {INFERENCE_SERVICE_READY_TIMEOUT} seconds.")
                 return False
 
-            # Add required imports for lifespan and middleware
+            # Add required imports for middleware
             from collections import defaultdict
-            from contextlib import asynccontextmanager
-            import time
             
             # Simple in-memory rate limiter with proper cleanup
             request_counts = defaultdict(list)
@@ -458,33 +456,29 @@ class Miner:
                     except Exception as e:
                         self.logger.warning(f"Error in rate limiter cleanup: {e}")
 
-            # Use proper lifespan context manager instead of deprecated on_event  
-            @asynccontextmanager
-            async def lifespan(app: FastAPI):
-                # Startup
-                nonlocal self # Ensure self is captured if methods like self.database_manager are used
-                self.logger.info("Initializing database on application startup (via overridden on_event)...")
+            # Create FastAPI app using fiber server factory
+            app = fiber_server.factory_app(debug=True)
+            app.body_limit = MAX_REQUEST_SIZE
+            
+            # Traditional startup event handler
+            @app.on_event("startup")
+            async def startup_event():
+                self.logger.info("Initializing database on application startup...")
                 try:
                     await self.database_manager.ensure_engine_initialized()
                     await self.database_manager.initialize_database()
                     self.logger.info("Database initialization completed successfully")
                 except Exception as e_db:
                     self.logger.error(f"Failed to initialize database during startup: {e_db}", exc_info=True)
-                    # Depending on severity, you might want to sys.exit(1) here
-                
-
                 
                 # Weather Inference Service Setup
                 weather_enabled_env_val = os.getenv("WEATHER_MINER_ENABLED", "false") 
                 self.logger.info(f"DEBUG_WEATHER_ENABLED: Value of WEATHER_MINER_ENABLED from os.getenv: '{weather_enabled_env_val}'")
                 weather_enabled_env = weather_enabled_env_val.lower() in ["true", "1", "yes"]
                 
-
                 if weather_enabled_env:
                     if self.weather_task is None:
                         self.logger.error("WeatherTask was None at startup despite WEATHER_MINER_ENABLED being true. This indicates a problem in __init__ - weather task should already exist!")
-                        # Don't create a new one here - this would be a duplicate ABC object creation
-                        # Instead, log the error and let the system handle it gracefully
                         self.logger.error("Weather functionality will be disabled due to initialization failure")
                     
                     if self.weather_task:
@@ -543,16 +537,12 @@ class Miner:
                 cleanup_task = asyncio.create_task(cleanup_rate_limiter())
                 app.state.rate_limiter_cleanup = cleanup_task
                 self.logger.info("Rate limiter cleanup task started")
-
-                yield
-                # Shutdown
+                    
+            @app.on_event("shutdown") 
+            async def shutdown_event():
                 self.logger.info("Application shutting down...")
                 # Stop memory monitoring on shutdown
                 await self.stop_memory_monitoring()
-            
-            # Create FastAPI app with lifespan
-            app = FastAPI(debug=True, lifespan=lifespan)
-            app.body_limit = MAX_REQUEST_SIZE
             
             @app.middleware("http")
             async def rate_limit_middleware(request, call_next):
