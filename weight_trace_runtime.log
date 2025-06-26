@@ -1,2 +1,18 @@
 === Runtime Weight Trace Started: 20250626_173123 ===
 
+[WEIGHT_TRACE] 2025-06-26 22:11:08.305 - FIBER_ENTRY
+Weights: Total: 0, NonZero: 0, Max: 0.000000, Sample: []
+Metadata: {"function": "set_node_weights", "netuid": 237, "validator_uid": 18, "node_count": 0, "version_key": 2041, "wait_for_inclusion": true, "wait_for_finalization": false}
+--------------------------------------------------------------------------------
+[WEIGHT_TRACE] 2025-06-26 22:11:08.305 - NORMALIZATION_INPUT
+Weights: Total: 0, NonZero: 0, Max: 0.000000, Sample: []
+Metadata: {"function": "_normalize_and_quantize_weights", "input_node_count": 0, "input_node_ids": []}
+--------------------------------------------------------------------------------
+[WEIGHT_TRACE] 2025-06-26 22:11:08.306 - NORMALIZATION_OUTPUT
+Weights: Total: 0, NonZero: 0, Max: 0.000000, Sample: []
+Metadata: {"function": "_normalize_and_quantize_weights", "output_node_count": 0, "output_node_ids": [], "quantized": true}
+--------------------------------------------------------------------------------
+[WEIGHT_TRACE] 2025-06-26 22:11:26.636 - FIBER_EXIT
+Weights: Total: 0, NonZero: 0, Max: 0.000000, Sample: []
+Metadata: {"function": "set_node_weights", "result": true, "success": true}
+--------------------------------------------------------------------------------

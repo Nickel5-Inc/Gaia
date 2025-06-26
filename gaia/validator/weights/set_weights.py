@@ -14,6 +14,7 @@ from fiber.logging_utils import get_logger
 import numpy as np
 from gaia import __spec_version__
 from gaia.validator.utils.substrate_manager import get_fresh_substrate_connection, get_process_isolated_substrate
+from gaia.validator.utils.substrate_manager import get_fresh_substrate_connection, get_process_isolated_substrate
 
 logger = get_logger(__name__)
 
@@ -22,18 +23,23 @@ async def get_active_validator_uids(netuid, subtensor_network="finney", chain_en
     try:
         # Use process-isolated substrate for validator UID queries
         substrate = get_process_isolated_substrate(
+        # Use process-isolated substrate for validator UID queries
+        substrate = get_process_isolated_substrate(
             subtensor_network=subtensor_network,
             chain_endpoint=chain_endpoint or ""
         )
+        logger.info("🛡️ Using process-isolated substrate for get_active_validator_uids")
         logger.info("🛡️ Using process-isolated substrate for get_active_validator_uids")
         
         loop = asyncio.get_event_loop()
         validator_permits = await loop.run_in_executor(
             None, 
             lambda: substrate.query("SubtensorModule", "ValidatorPermit", [netuid])
+            lambda: substrate.query("SubtensorModule", "ValidatorPermit", [netuid])
         )
         last_update = await loop.run_in_executor(
             None,
+            lambda: substrate.query("SubtensorModule", "LastUpdate", [netuid])
             lambda: substrate.query("SubtensorModule", "LastUpdate", [netuid])
         )
         current_block = await loop.run_in_executor(
@@ -54,6 +60,8 @@ async def get_active_validator_uids(netuid, subtensor_network="finney", chain_en
     finally:
         # Process-isolated substrate automatically cleans up when processes terminate
         logger.debug("🛡️ get_active_validator_uids complete - process isolation prevents ABC memory leaks automatically")
+        # Process-isolated substrate automatically cleans up when processes terminate
+        logger.debug("🛡️ get_active_validator_uids complete - process isolation prevents ABC memory leaks automatically")
 
 
 class FiberWeightSetter:
@@ -68,6 +76,9 @@ class FiberWeightSetter:
         """Initialize the weight setter with fiber connections"""
         self.netuid = netuid
         self.network = network
+        # Use process-isolated substrate for initialization 
+        logger.info("🛡️ FiberWeightSetter using process-isolated substrate for initialization")
+        self.substrate = get_process_isolated_substrate(
         # Use process-isolated substrate for initialization 
         logger.info("🛡️ FiberWeightSetter using process-isolated substrate for initialization")
         self.substrate = get_process_isolated_substrate(
@@ -181,6 +192,8 @@ class FiberWeightSetter:
             return []
 
     def cleanup(self):
+        """No cleanup needed with process-isolated substrate."""
+        logger.debug("🛡️ No cleanup needed - process-isolated substrate handles cleanup automatically")
         """No cleanup needed with process-isolated substrate."""
         logger.debug("🛡️ No cleanup needed - process-isolated substrate handles cleanup automatically")
 
@@ -311,6 +324,9 @@ class FiberWeightSetter:
             # MEMORY LEAK PREVENTION: Use process-isolated substrate for weight setting
             # This ensures ABC objects are contained in separate processes and automatically destroyed
             logger.info("🛡️ Creating process-isolated substrate connection for weight setting")
+            # MEMORY LEAK PREVENTION: Use process-isolated substrate for weight setting
+            # This ensures ABC objects are contained in separate processes and automatically destroyed
+            logger.info("🛡️ Creating process-isolated substrate connection for weight setting")
             
             # Use process-isolated substrate connection for weight setting
             self.substrate = get_process_isolated_substrate(
@@ -325,6 +341,7 @@ class FiberWeightSetter:
                 "SubtensorModule",
                 "Uids",
                 [self.netuid, self.keypair.ss58_address]
+            )
             )
 
             version_key = __spec_version__
@@ -378,12 +395,17 @@ class FiberWeightSetter:
             finally:
                 # Process-isolated substrate automatically cleans up when processes terminate
                 logger.debug("Process-isolated substrate cleanup is automatic - no manual cleanup needed")
+                # Process-isolated substrate automatically cleans up when processes terminate
+                logger.debug("Process-isolated substrate cleanup is automatic - no manual cleanup needed")
 
         except Exception as e:
             logger.error(f"Error in weight setting: {str(e)}")
             logger.error(traceback.format_exc())
             return False
         finally:
+            # Process-isolated substrate automatically prevents ABC memory leaks
+            # No manual cleanup needed - each operation runs in separate processes that auto-terminate
+            logger.debug("🛡️ Weight setting complete - process isolation prevents ABC memory leaks automatically")
             # Process-isolated substrate automatically prevents ABC memory leaks
             # No manual cleanup needed - each operation runs in separate processes that auto-terminate
             logger.debug("🛡️ Weight setting complete - process isolation prevents ABC memory leaks automatically")
