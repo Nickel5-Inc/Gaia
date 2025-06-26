@@ -1,28 +1,40 @@
 Metadata-Version: 2.4
 Name: gaia
-Version: 1.2.0
+Version: 2.4.1
 Summary: This project implements the Gaia subnet for Bittensor
 Author: geardici, oneandahalfcats, qucat, gabby
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 License-File: LICENSE
 Requires-Dist: affine==2.4.0
+Requires-Dist: aioboto3==14.3.0
+Requires-Dist: aiobotocore[boto3]==2.22.0
+Requires-Dist: aiofiles==24.1.0
 Requires-Dist: aiohappyeyeballs==2.6.1
-Requires-Dist: aiohttp==3.11.18
+Requires-Dist: aiohttp==3.10.11
+Requires-Dist: aioitertools==0.12.0
 Requires-Dist: aiosignal==1.3.2
+Requires-Dist: alembic==1.16.1
 Requires-Dist: annotated-types==0.7.0
 Requires-Dist: anyio==4.9.0
+Requires-Dist: asciitree==0.3.3
 Requires-Dist: async-substrate-interface==1.1.1
 Requires-Dist: async-timeout==5.0.1
 Requires-Dist: asyncpg==0.30.0
 Requires-Dist: asyncstdlib==3.13.1
 Requires-Dist: attrs==25.3.0
+Requires-Dist: azure-core==1.34.0
+Requires-Dist: azure-storage-blob==12.25.1
 Requires-Dist: base58==2.1.1
 Requires-Dist: bittensor-commit-reveal==0.1.0
 Requires-Dist: bittensor-wallet==3.0.10
-Requires-Dist: boto3==1.38.14
-Requires-Dist: botocore==1.38.14
+Requires-Dist: blosc==1.11.3
+Requires-Dist: boto3==1.37.3
+Requires-Dist: botocore==1.37.3
 Requires-Dist: bt-decode==0.6.0
+Requires-Dist: cachetools==5.5.2
+Requires-Dist: cchardet==2.1.7
+Requires-Dist: cdsapi==0.7.6
 Requires-Dist: certifi==2025.4.26
 Requires-Dist: cffi==1.17.1
 Requires-Dist: cftime==1.6.4.post1
@@ -30,24 +42,41 @@ Requires-Dist: charset-normalizer==3.4.2
 Requires-Dist: click==8.2.0
 Requires-Dist: click-plugins==1.1.1
 Requires-Dist: cligj==0.7.2
+Requires-Dist: cloudpickle==3.1.1
 Requires-Dist: cmdstanpy==1.2.5
 Requires-Dist: colorama==0.4.6
 Requires-Dist: contourpy==1.3.2
 Requires-Dist: cryptography==43.0.3
 Requires-Dist: cycler==0.12.1
 Requires-Dist: cytoolz==1.0.1
+Requires-Dist: dask[array]==2025.5.1
+Requires-Dist: decorator==5.2.1
 Requires-Dist: ecdsa==0.19.1
+Requires-Dist: ecmwf-datastores-client==0.1.0
+Requires-Dist: einops==0.8.1
 Requires-Dist: eth-hash==0.7.1
 Requires-Dist: eth-keys==0.7.0
 Requires-Dist: eth-typing==5.0.0
 Requires-Dist: eth-utils==2.3.2
 Requires-Dist: exceptiongroup==1.3.0
 Requires-Dist: fastapi==0.112.0
+Requires-Dist: fasteners==0.19
 Requires-Dist: fiber[full]@ git+https://github.com/rayonlabs/fiber.git@production
 Requires-Dist: filelock==3.18.0
+Requires-Dist: flexcache==0.3
+Requires-Dist: flexparser==0.4
 Requires-Dist: fonttools==4.58.0
 Requires-Dist: frozenlist==1.6.0
 Requires-Dist: fsspec[http]==2025.3.2
+Requires-Dist: gcsfs==2025.3.2
+Requires-Dist: google-api-core==2.25.0rc1
+Requires-Dist: google-auth==2.40.2
+Requires-Dist: google-auth-oauthlib==1.2.2
+Requires-Dist: google-cloud-core==2.4.3
+Requires-Dist: google-cloud-storage==3.1.0
+Requires-Dist: google-crc32c==1.7.1
+Requires-Dist: google-resumable-media==2.7.2
+Requires-Dist: googleapis-common-protos==1.70.0
 Requires-Dist: greenlet==3.2.2
 Requires-Dist: h11==0.16.0
 Requires-Dist: h3==4.2.2
@@ -59,20 +88,38 @@ Requires-Dist: httpx==0.27.0
 Requires-Dist: huggingface-hub==0.31.2
 Requires-Dist: idna==3.10
 Requires-Dist: imageio==2.37.0
+Requires-Dist: importlib-metadata==8.7.0
 Requires-Dist: importlib-resources==6.5.2
+Requires-Dist: intake==2.0.8
+Requires-Dist: intake-xarray==2.0.0
+Requires-Dist: isodate==0.7.2
 Requires-Dist: jinja2==3.1.6
 Requires-Dist: jmespath==1.0.1
+Requires-Dist: kerchunk==0.2.7
 Requires-Dist: kiwisolver==1.4.8
 Requires-Dist: lazy-loader==0.4
 Requires-Dist: lightning-utilities==0.14.3
+Requires-Dist: linkify-it-py==2.0.3
+Requires-Dist: locket==1.0.0
+Requires-Dist: lz4==4.4.4
+Requires-Dist: mako==1.3.10
+Requires-Dist: markdown-it-py[linkify,plugins]==3.0.0
 Requires-Dist: markupsafe==3.0.2
 Requires-Dist: matplotlib==3.10.3
+Requires-Dist: mdit-py-plugins==0.4.2
+Requires-Dist: mdurl==0.1.2
+Requires-Dist: memray==1.17.2
+Requires-Dist: metpy==1.7.0
+Requires-Dist: microsoft-aurora==1.5.2
 Requires-Dist: more-itertools==10.7.0
 Requires-Dist: mpmath==1.3.0
+Requires-Dist: msgpack==1.1.1
 Requires-Dist: multidict==6.4.3
+Requires-Dist: multiurl==0.3.5
 Requires-Dist: netaddr==1.3.0
 Requires-Dist: netcdf4==1.7.2
 Requires-Dist: networkx==3.4.2
+Requires-Dist: numcodecs==0.13.1
 Requires-Dist: numpy==2.2.5
 Requires-Dist: nvidia-cublas-cu12==12.6.4.1
 Requires-Dist: nvidia-cuda-cupti-cu12==12.6.80
@@ -88,21 +135,36 @@ Requires-Dist: nvidia-cusparselt-cu12==0.6.3
 Requires-Dist: nvidia-nccl-cu12==2.26.2
 Requires-Dist: nvidia-nvjitlink-cu12==12.6.85
 Requires-Dist: nvidia-nvtx-cu12==12.6.77
+Requires-Dist: oauthlib==3.2.2
+Requires-Dist: orjson==3.10.18
 Requires-Dist: packaging==25.0
 Requires-Dist: pandas==2.2.3
+Requires-Dist: partd==1.4.2
 Requires-Dist: password-strength==0.0.3.post2
+Requires-Dist: patsy==1.0.1
 Requires-Dist: pillow==11.2.1
+Requires-Dist: pint==0.24.4
+Requires-Dist: platformdirs==4.3.8
+Requires-Dist: pooch==1.8.2
 Requires-Dist: propcache==0.3.1
+Requires-Dist: properscoring==0.1
 Requires-Dist: prophet==1.1.6
+Requires-Dist: proto-plus==1.26.1
+Requires-Dist: protobuf==6.31.0
 Requires-Dist: psutil==7.0.0
 Requires-Dist: psycopg2-binary==2.9.10
 Requires-Dist: py-bip39-bindings==0.1.11
 Requires-Dist: py-ed25519-zebra-bindings==1.2.0
 Requires-Dist: py-sr25519-bindings==0.2.2
+Requires-Dist: pyasn1==0.6.1
+Requires-Dist: pyasn1-modules==0.4.2
 Requires-Dist: pycparser==2.22
 Requires-Dist: pycryptodome==3.22.0
 Requires-Dist: pydantic==2.9.2
 Requires-Dist: pydantic-core==2.23.4
+Requires-Dist: pygments==2.19.1
+Requires-Dist: pyinstrument==5.0.2
+Requires-Dist: pyjwt==2.10.1
 Requires-Dist: pynacl==1.5.0
 Requires-Dist: pyparsing==3.2.3
 Requires-Dist: pyproj==3.7.1
@@ -114,7 +176,10 @@ Requires-Dist: pytz==2025.2
 Requires-Dist: pyyaml==6.0.2
 Requires-Dist: rasterio==1.4.3
 Requires-Dist: requests==2.32.3
-Requires-Dist: s3transfer==0.12.0
+Requires-Dist: requests-oauthlib==2.0.0
+Requires-Dist: rich==14.0.0
+Requires-Dist: rsa==4.9.1
+Requires-Dist: s3transfer==0.11.3
 Requires-Dist: safetensors==0.5.3
 Requires-Dist: scalecodec==1.2.11
 Requires-Dist: scikit-image==0.25.2
@@ -125,26 +190,40 @@ Requires-Dist: sniffio==1.3.1
 Requires-Dist: sqlalchemy==2.0.40
 Requires-Dist: stanio==0.5.1
 Requires-Dist: starlette==0.37.2
+Requires-Dist: statsmodels==0.14.4
 Requires-Dist: substrate-interface==1.7.10
 Requires-Dist: sympy==1.14.0
 Requires-Dist: tenacity==9.0.0
+Requires-Dist: textual==3.4.0
 Requires-Dist: tifffile==2025.5.10
+Requires-Dist: timm==0.6.13
 Requires-Dist: toml==0.10.0
+Requires-Dist: tomli==2.2.1
 Requires-Dist: toolz==1.0.0
 Requires-Dist: torch==2.7.0
 Requires-Dist: torchmetrics==1.7.1
+Requires-Dist: torchvision==0.22.0
 Requires-Dist: tqdm==4.67.1
+Requires-Dist: traitlets==5.14.3
 Requires-Dist: triton==3.3.0
 Requires-Dist: typing-extensions==4.13.2
 Requires-Dist: tzdata==2025.2
+Requires-Dist: uc-micro-py==1.0.3
+Requires-Dist: ujson==5.10.0
 Requires-Dist: urllib3==2.4.0
 Requires-Dist: uvicorn==0.30.5
+Requires-Dist: uvloop==0.21.0
 Requires-Dist: websocket-client==1.8.0
 Requires-Dist: websockets==15.0.1
 Requires-Dist: wheel==0.45.1
+Requires-Dist: wrapt==1.17.2
 Requires-Dist: xarray==2025.4.0
+Requires-Dist: xhistogram==0.3.2
+Requires-Dist: xskillscore==0.0.26
 Requires-Dist: xxhash==3.5.0
 Requires-Dist: yarl==1.20.0
+Requires-Dist: zarr==2.18.3
+Requires-Dist: zipp==3.21.0
 Dynamic: license-file
 
 ![Project Logo](docs/logo-full.png)
@@ -159,7 +238,7 @@ Gaia is a platform for research and development of geospatial machine learning m
 Read more about the long-term vision in our [whitepaper](https://www.gaiaresearch.ai/whitepaper).
 
 >[!NOTE]
-> BETA VERSION = 1.1.9
+> BETA VERSION = 2.0.0
 >
 > The beta version of Gaia launches with limited functionality. Many of the planned features are not yet available, however we are still accepting miners and validators for the initial tasks. 
 
@@ -174,7 +253,7 @@ pip install -e .
 ```
 
 ## Miners
-[Quicklink](docs/MINER.md)
+[Quicklink - Mining Guide](docs/MINER.md)
 
 Miners develop models to understand future events. These events currently include soil moisture and geomagnetic readings at the equator. Miners will receive data from validators for the models that we have in place. They are also free to gather their own data from other resources. The tasks are consistent in design and in timing; this predictability allows miners the flexibility to retrieve any data that their model requires. 
 
@@ -186,7 +265,7 @@ The incentive split was previously 50:50, but has been adjusted to favor higher-
 
 
 ## Validators
-[Quicklink](docs/VALIDATOR.md)
+[Quicklink - Validating Guide](docs/VALIDATOR.md)
 
 Validators will connect to a few API's to provide miners with the data they need to run models.
 
@@ -214,6 +293,57 @@ source ../.gaia/bin/activate
 pip install "git+https://github.com/rayonlabs/fiber.git@production#egg=fiber[full]"
 ```
 
+### PostgreSQL Configuration for Local Connections
+
+If you are running the validator and PostgreSQL on the same machine and intend to use the default database user (`postgres`), you might encounter a "Peer authentication failed" error. This typically happens if the validator application is run as an OS user different from `postgres` (e.g., as `root` via `pm2`).
+
+To resolve this and enable password authentication for the `postgres` user via local Unix domain sockets (recommended for security over `peer` when OS users don't match):
+
+1.  **Locate your `pg_hba.conf` file.**
+    This file is critical for PostgreSQL's client authentication. Common locations include:
+    *   `/etc/postgresql/<YOUR_PG_VERSION>/main/pg_hba.conf`
+    *   `/var/lib/pgsql/data/pg_hba.conf`
+    You can find its exact location by connecting to `psql` and running `SHOW hba_file;`.
+
+2.  **Edit `pg_hba.conf` with `sudo` privileges.**
+    Open the file using a text editor, for example:
+    ```bash
+    sudo nano /path/to/your/pg_hba.conf 
+    ```
+    (Replace `/path/to/your/pg_hba.conf` with the actual path).
+
+3.  **Modify the `local` connection rule for the `postgres` user.**
+    Look for a line similar to:
+    ```
+    # TYPE  DATABASE        USER            ADDRESS                 METHOD
+    local   all             postgres                                peer
+    ```
+    Change `peer` to `md5`. The line should now look like:
+    ```
+    # TYPE  DATABASE        USER            ADDRESS                 METHOD
+    local   all             postgres                                md5
+    ```
+    If you have a more general rule like `local all all peer`, you can either change that to `md5` (which will require passwords for all local users) or add the more specific line for `postgres` *before* the general `peer` rule.
+
+4.  **Save the `pg_hba.conf` file.**
+
+5.  **Reload the PostgreSQL configuration.**
+    For the changes to take effect, PostgreSQL needs to reload its configuration:
+    ```bash
+    sudo systemctl reload postgresql
+    # Or, for older systems:
+    # sudo service postgresql reload
+    ```
+
+6.  **Ensure Environment Variables are Set.**
+    Make sure your `.env` file (or your environment configuration method for `pm2`) correctly sets:
+    *   `DB_USER=postgres`
+    *   `DB_PASSWORD=your_actual_postgres_password`
+    *   `DB_HOST=/var/run/postgresql` (or your correct Unix socket directory)
+    *   `DB_NAME=your_database_name` (e.g., `validator_db`)
+    *   `DB_PORT` (will be ignored if `DB_HOST` is a Unix socket path, but good to have)
+
+After these steps, your validator should be able to connect to the local PostgreSQL server using the `postgres` user and its password. For enhanced security in production, consider creating a dedicated, less-privileged PostgreSQL user for the validator application.
 
 #### Register miner and/or validator on subnet
 ```bash
@@ -246,6 +376,194 @@ fiber-post-ip --netuid <NETUID> --external_ip <YOUR_IP> --external_port <YOUR_PO
 - Further instructions are linked below, but ensure that you start the miner with the `--port` argument pointing to the FORWARDING/INTERNAL port configured in the proxy server script above.
 
 
+## Database Synchronization (Validators)
+
+**🚀 NEW: Automated Database Sync System**
+
+Gaia now includes a streamlined database synchronization system that eliminates manual pgBackRest configuration and provides application-controlled backup scheduling. This system automatically sets up and manages database backups to Cloudflare R2 storage.
+
+### Key Benefits
+
+✅ **One-command setup** - No more manual pgbackrest configuration  
+✅ **Application-controlled scheduling** - No cron jobs needed, easily configurable  
+✅ **Automated recovery** - Self-healing backup system  
+✅ **Simplified replica setup** - No manual IP coordination required  
+✅ **Real-time monitoring** - Health checks and status reporting  
+
+### Quick Setup
+
+#### 1. Configure Environment Variables
+
+Add these to your `.env` file:
+
+```bash
+# Required for R2 backup storage
+PGBACKREST_R2_BUCKET=your-backup-bucket-name
+PGBACKREST_R2_ENDPOINT=https://your-account-id.r2.cloudflarestorage.com
+PGBACKREST_R2_ACCESS_KEY_ID=your-r2-access-key
+PGBACKREST_R2_SECRET_ACCESS_KEY=your-r2-secret-key
+
+# Optional - defaults shown
+PGBACKREST_STANZA_NAME=gaia
+PGBACKREST_R2_REGION=auto
+PGBACKREST_PGDATA=/var/lib/postgresql/data
+PGBACKREST_PGPORT=5432
+PGBACKREST_PGUSER=postgres
+
+# Set to True for primary node, False for replica
+IS_SOURCE_VALIDATOR_FOR_DB_SYNC=True
+```
+
+#### 2. Run Automated Setup
+
+**Primary Node (creates backups):**
+```bash
+sudo python gaia/validator/sync/setup_auto_sync.py --primary
+```
+
+**Replica Node (restores from backups):**
+```bash
+sudo python gaia/validator/sync/setup_auto_sync.py --replica
+```
+
+**Test Mode (faster setup, shorter retention):**
+```bash
+sudo python gaia/validator/sync/setup_auto_sync.py --primary --test
+```
+
+#### 3. The System is Ready!
+
+- **Primary nodes** automatically create backups (full daily at 2 AM, differential every 4 hours)
+- **Replica nodes** can restore with a simple command
+- **All scheduling happens in the application** - no cron jobs to manage
+- **Health monitoring** runs continuously with automatic recovery
+
+### Advanced Operations
+
+**Check backup status:**
+```python
+from gaia.validator.sync.auto_sync_manager import *
+import asyncio
+asyncio.run(check_status())
+```
+
+**Restore from latest backup (replicas):**
+```python
+from gaia.validator.sync.auto_sync_manager import *
+import asyncio
+asyncio.run(restore_latest())
+```
+
+**Change backup schedule dynamically:**
+```python
+# No need to edit cron - just update in the application
+manager.update_schedule({
+    'full_backup_time': '03:00',
+    'diff_backup_interval': 6  # Every 6 hours instead of 4
+})
+```
+
+### Migration from Legacy System
+
+If you're currently using the manual pgBackRest setup, the new system will:
+- ✅ Detect existing configuration and work alongside it
+- ✅ Gradually replace cron-based scheduling with application control
+- ✅ Provide the same functionality with better monitoring and error handling
+
+The legacy scripts in `gaia/validator/sync/pgbackrest/` remain available but are no longer recommended for new installations.
+
+### Troubleshooting
+
+1. **Setup fails:** Check environment variables and ensure running as root
+2. **Backup failures:** The system includes automatic recovery and will retry failed operations
+3. **Connection issues:** Verify R2 credentials and network connectivity
+4. **Status monitoring:** All operations are logged and monitored automatically
+
+For detailed logs, check `/var/log/pgbackrest/` and the validator application logs.
+
+## Common Issues and Solutions
+
+### Multiprocessing SyntaxError with 'async' keyword
+
+**Problem:** Validator crashes with `SyntaxError: invalid syntax` related to `async` keyword in multiprocessing workers.
+
+**Cause:** An old `asyncio` package (v3.4.3) was installed that uses `async` as a function name, but `async` became a reserved keyword in Python 3.7+.
+
+**Solution:** The validator automatically detects and fixes this issue on startup. However, to prevent it from happening:
+
+1. **Manual fix (immediate):**
+   ```bash
+   # Remove the problematic package
+   pip uninstall asyncio -y
+   
+   # Remove any remaining files
+   find ~/.local/lib/python*/site-packages -name "*asyncio*" -exec rm -rf {} +
+   find /usr/local/lib/python*/site-packages -name "*asyncio*" -exec rm -rf {} +
+   ```
+
+2. **Automatic prevention:** The validator now includes automatic detection and removal of problematic asyncio packages during startup.
+
+3. **Prevention in new installs:** Always use Python's built-in `asyncio` module. Never install the separate `asyncio` package on Python 3.7+.
+
+**Verification:** After fixing, test multiprocessing compatibility:
+```bash
+python -c "import asyncio, multiprocessing; print('✅ Asyncio import successful')"
+```
+
+### Excessive DEBUG Logging Spam
+
+**Problem:** Validator logs are flooded with hundreds of `"Logging mode is DEBUG"` messages from fiber modules.
+
+**Cause:** Every module logs its logging mode during import, and multiprocessing workers import modules independently.
+
+**Solution:** The validator automatically suppresses these verbose DEBUG messages by default.
+
+**Control options:**
+- **Default behavior:** DEBUG spam is suppressed for cleaner logs
+- **Enable all DEBUG messages:** Set `GAIA_ENABLE_DEBUG_SPAM=true` in your environment
+- **Only important messages are shown:** INFO level and above are still logged normally
+
+```bash
+# To see all DEBUG spam (not recommended in production)
+export GAIA_ENABLE_DEBUG_SPAM=true
+
+# Default behavior (recommended) - suppress spam
+unset GAIA_ENABLE_DEBUG_SPAM
+```
+
+### Multiprocessing Performance Configuration
+
+**Problem:** Small weather tasks may run slower with multiprocessing due to overhead.
+
+**Cause:** Process creation and module imports (~30-40 seconds) can exceed computation time for small workloads.
+
+**Solution:** Smart multiprocessing with configurable thresholds.
+
+**Configuration options:**
+```bash
+# Set minimum computations required for multiprocessing (default: 10)
+export GAIA_MP_THRESHOLD=20
+
+# Completely disable multiprocessing (forces sequential)
+export GAIA_DISABLE_MP=true
+
+# Default behavior (recommended) - auto-detect based on workload size
+unset GAIA_MP_THRESHOLD
+unset GAIA_DISABLE_MP
+```
+
+**When multiprocessing helps:**
+- ✅ Large weather scoring runs (10+ computations)
+- ✅ Production validation with many miners
+- ✅ Complex climatology computations
+
+**When to use sequential:**
+- ✅ Small test runs (< 10 computations)
+- ✅ Development/debugging
+- ✅ Memory-constrained systems
+
+---
+
 ### Follow the Setup Guides for [Miner](docs/MINER.md) or [Validator](docs/VALIDATOR.md)
 #### Custom Miner Models: [HERE](gaia/models/custom_models/CUSTOMMODELS.md)
 
@@ -264,7 +582,7 @@ fiber-post-ip --netuid <NETUID> --external_ip <YOUR_IP> --external_port <YOUR_PO
 
 --- 
 
-## Data acknowledgements
+## Data/Model acknowledgements
 
 ### ECMWF Open Data
 #### Copyright statement
@@ -278,6 +596,13 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+### Microsoft Aurora
+
+**A Foundation Model for the Earth System.**<br>
+Cristian Bodnar, Wessel P. Bruinsma, Ana Lucic, Megan Stanley, Anna Allen, Johannes Brandstetter, Patrick Garvan, Maik Riechert, Jonathan A. Weyn, Haiyu Dong, Jayesh K. Gupta, Kit Thambiratnam, Alexander T. Archibald, Chun-Chieh Wu, Elizabeth Heider, Max Welling, Richard E. Turner, and Paris Perdikaris.<br>
+*Nature*, 2025.<br>
+DOI: [10.1038/s41586-025-09005-y](https://doi.org/10.1038/s41586-025-09005-y)
 
 #### Disclaimer
 ECMWF does not accept any liability whatsoever for any error or omission in the data, their availability, or for any loss or damage arising from their use.
