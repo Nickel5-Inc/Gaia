@@ -215,6 +215,26 @@ except Exception as e:
         """Make an RPC request in an isolated process."""
         return self._run_substrate_operation("rpc_request", method, params or [])
     
+    def get_block(self, block_hash: str = None) -> Dict[str, Any]:
+        """
+        Get block information using process isolation.
+        This provides compatibility with the original substrate interface.
+        """
+        try:
+            if block_hash:
+                result = self.rpc_request("chain_getBlock", [block_hash])
+            else:
+                result = self.rpc_request("chain_getBlock", [])
+            
+            # Return the block part of the response, or the full result if no block key
+            if isinstance(result, dict) and "block" in result:
+                return result["block"]
+            else:
+                return result
+        except Exception as e:
+            logger.error(f"Error in process-isolated get_block: {e}")
+            raise
+    
     def close(self):
         """Close method for compatibility (no-op since each operation uses its own process)."""
         logger.debug(f"ProcessIsolatedSubstrate close() called (no-op - {self._operation_count} operations completed)")

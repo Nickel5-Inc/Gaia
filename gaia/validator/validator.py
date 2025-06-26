@@ -62,11 +62,7 @@ from cryptography.fernet import Fernet
 import httpx
 from fiber.chain import chain_utils, interface
 from fiber.chain import weights as w
-from fiber.chain.fetch_nodes import get_nodes_for_netuid
-from fiber.chain.chain_utils import query_substrate
-from fiber.chain import chain_utils, interface
-from fiber.chain import weights as w
-from fiber.chain.fetch_nodes import get_nodes_for_netuid
+# Note: get_nodes_for_netuid replaced with process-isolated _fetch_nodes_process_isolated
 from fiber.chain.chain_utils import query_substrate
 from fiber.logging_utils import get_logger
 from fiber.encrypted.validator import client as vali_client, handshake
@@ -1977,8 +1973,9 @@ class GaiaValidator:
                     chain_endpoint=self.subtensor_chain_endpoint
                 )
                 logger.info("🔄 Created fresh connection for node fetching using substrate manager")
-                nodes = get_nodes_for_netuid(self.substrate, netuid)
-                logger.info(f"⚠️ Fetched {len(nodes) if nodes else 0} nodes with substrate call (check for new connections in logs)")
+                # Use process-isolated node fetching instead of fiber library function
+                nodes = await self._fetch_nodes_process_isolated(netuid)
+                logger.info(f"🛡️ Fetched {len(nodes) if nodes else 0} nodes with process-isolated substrate (ABC leak prevented)")
                 return nodes
             finally:
                 # Always restore originals
@@ -1989,9 +1986,111 @@ class GaiaValidator:
         except Exception as e:
             logger.error(f"Error in ultra-aggressive node fetching: {e}")
             logger.error(traceback.format_exc())
-            # Final fallback
-            logger.error("CRITICAL: All node fetching approaches failed - using direct call")
-            return get_nodes_for_netuid(self.substrate, netuid)
+            # Final fallback - use process-isolated fetching
+            logger.error("CRITICAL: All node fetching approaches failed - using process-isolated fallback")
+            return await self._fetch_nodes_process_isolated(netuid)
+
+    async def _fetch_nodes_process_isolated(self, netuid: int):
+        """
+        Fetch nodes using process-isolated substrate queries to prevent ABC memory leaks.
+        This replaces the fiber library's get_nodes_for_netuid function which creates internal substrate connections.
+        """
+        try:
+            logger.debug(f"🛡️ Fetching nodes for netuid {netuid} using process-isolated substrate")
+            
+            # Use process-isolated substrate for all queries
+            substrate = get_process_isolated_substrate(
+                subtensor_network=self.subtensor_network,
+                chain_endpoint=self.subtensor_chain_endpoint
+            )
+            
+            # Query node data using process isolation with longer timeout for complex operations
+            # Use 30s timeout since we're making many queries sequentially
+            timeout = 30.0
+            logger.debug(f"🛡️ Making {13} substrate queries with {timeout}s timeout each")
+            
+            hotkeys = substrate._run_substrate_operation("query", "SubtensorModule", "Hotkeys", [netuid], timeout)
+            coldkeys = substrate._run_substrate_operation("query", "SubtensorModule", "Coldkeys", [netuid], timeout)
+            uids = substrate._run_substrate_operation("query", "SubtensorModule", "Uids", [netuid], timeout)
+            stakes = substrate._run_substrate_operation("query", "SubtensorModule", "Stake", [netuid], timeout)
+            trust = substrate._run_substrate_operation("query", "SubtensorModule", "Trust", [netuid], timeout)
+            vtrust = substrate._run_substrate_operation("query", "SubtensorModule", "ValidatorTrust", [netuid], timeout)
+            incentive = substrate._run_substrate_operation("query", "SubtensorModule", "Incentive", [netuid], timeout)
+            emission = substrate._run_substrate_operation("query", "SubtensorModule", "Emission", [netuid], timeout)
+            consensus = substrate._run_substrate_operation("query", "SubtensorModule", "Consensus", [netuid], timeout)
+            dividends = substrate._run_substrate_operation("query", "SubtensorModule", "Dividends", [netuid], timeout)
+            last_update = substrate._run_substrate_operation("query", "SubtensorModule", "LastUpdate", [netuid], timeout)
+            validator_permit = substrate._run_substrate_operation("query", "SubtensorModule", "ValidatorPermit", [netuid], timeout)
+            
+            # Get axon info with extended timeout
+            axons = substrate._run_substrate_operation("query", "SubtensorModule", "Axons", [netuid], timeout)
+            
+            # Build node objects (similar to fiber's get_nodes_for_netuid)
+            nodes = []
+            
+            if hotkeys and len(hotkeys) > 0:
+                for i, hotkey in enumerate(hotkeys):
+                    try:
+                        # Create a Node-like object with the data
+                        from types import SimpleNamespace
+                        
+                        node = SimpleNamespace()
+                        node.node_id = i
+                        node.hotkey = hotkey
+                        node.coldkey = coldkeys[i] if i < len(coldkeys) else ""
+                        
+                        # Handle stake (might be in different format)
+                        if stakes and i < len(stakes):
+                            stake_value = stakes[i]
+                            # Convert stake to float (handle different formats)
+                            if isinstance(stake_value, dict):
+                                node.stake = float(sum(stake_value.values())) if stake_value else 0.0
+                            else:
+                                node.stake = float(stake_value) if stake_value else 0.0
+                        else:
+                            node.stake = 0.0
+                        
+                        # Set other attributes with safe indexing
+                        node.trust = float(trust[i]) if trust and i < len(trust) else 0.0
+                        node.vtrust = float(vtrust[i]) if vtrust and i < len(vtrust) else 0.0
+                        node.incentive = float(incentive[i]) if incentive and i < len(incentive) else 0.0
+                        node.emission = float(emission[i]) if emission and i < len(emission) else 0.0
+                        node.consensus = float(consensus[i]) if consensus and i < len(consensus) else 0.0
+                        node.dividends = float(dividends[i]) if dividends and i < len(dividends) else 0.0
+                        node.last_update = int(last_update[i]) if last_update and i < len(last_update) else 0
+                        
+                        # Handle axon info
+                        if axons and i < len(axons):
+                            axon_info = axons[i]
+                            if axon_info:
+                                node.ip = axon_info.get('ip', '')
+                                node.port = int(axon_info.get('port', 0))
+                                node.ip_type = int(axon_info.get('ip_type', 4))
+                                node.protocol = int(axon_info.get('protocol', 4))
+                            else:
+                                node.ip = ''
+                                node.port = 0
+                                node.ip_type = 4
+                                node.protocol = 4
+                        else:
+                            node.ip = ''
+                            node.port = 0
+                            node.ip_type = 4
+                            node.protocol = 4
+                        
+                        nodes.append(node)
+                        
+                    except Exception as e:
+                        logger.warning(f"Error processing node {i}: {e}")
+                        continue
+            
+            logger.info(f"🛡️ Process-isolated node fetch completed: {len(nodes)} nodes (NO ABC memory leak)")
+            return nodes
+            
+        except Exception as e:
+            logger.error(f"Error in process-isolated node fetching: {e}")
+            logger.error(traceback.format_exc())
+            return []
 
     async def _sync_metagraph(self):
         """Sync the metagraph using managed substrate connection with custom implementation to prevent memory leaks."""
