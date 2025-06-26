@@ -9,6 +9,7 @@ import hashlib
 import tempfile
 import traceback
 import numpy as np
+import pandas as pd
 
 from fiber.logging_utils import get_logger
 
@@ -64,23 +65,88 @@ async def fetch_era5_data(
     cache_key = hashlib.md5("_".join(time_strings).encode()).hexdigest()
     cache_filename = cache_dir / f"era5_data_{cache_key}.nc"
 
-    if cache_filename.exists():
-        try:
-            logger.info(f"Loading cached ERA5 data from: {cache_filename}")
-            ds_combined = xr.open_dataset(cache_filename)
-            target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
-            if all(t_np_ns in ds_combined.time.values for t_np_ns in target_times_np_ns):
-                logger.info("Cache hit is valid.")
-                return ds_combined
-            else:
-                logger.warning("Cached file exists but missing requested times. Re-fetching.")
-                ds_combined.close()
-                cache_filename.unlink()
-        except Exception as e:
-            logger.warning(f"Failed to load or validate cache file {cache_filename}: {e}. Re-fetching.")
-            if cache_filename.exists():
-                try: cache_filename.unlink()
-                except OSError: pass
+    # Check for cache files in multiple formats
+    cache_files_to_check = [
+        cache_filename,  # .nc format
+        cache_filename.with_suffix('.pkl')  # pickle fallback format
+    ]
+    
+    for potential_cache_file in cache_files_to_check:
+        if potential_cache_file.exists():
+            try:
+                logger.info(f"Loading cached ERA5 data from: {potential_cache_file}")
+                
+                if potential_cache_file.suffix == '.pkl':
+                    # Load pickle format
+                    import pickle
+                    with open(potential_cache_file, 'rb') as f:
+                        ds_combined = pickle.load(f)
+                    logger.info("Loaded cached data from pickle format")
+                else:
+                    # Load netCDF format with corrected engine handling
+                    load_successful = False
+                    
+                    # 1. Try default engine first (most reliable)
+                    try:
+                        logger.debug("Attempting to load cache with default engine...")
+                        ds_combined = xr.open_dataset(potential_cache_file)
+                        logger.info("Successfully loaded cached data with default engine")
+                        load_successful = True
+                    except Exception as default_load_err:
+                        logger.debug(f"Default load failed: {default_load_err}")
+                        
+                        # 2. Try explicit netcdf4 engine
+                        try:
+                            logger.debug("Attempting to load cache with netcdf4 engine...")
+                            ds_combined = xr.open_dataset(potential_cache_file, engine='netcdf4')
+                            logger.info("Successfully loaded cached data with netcdf4 engine")
+                            load_successful = True
+                        except Exception as netcdf4_load_err:
+                            logger.debug(f"netcdf4 load failed: {netcdf4_load_err}")
+                            
+                            # 3. Try with decode_cf=False to handle problematic metadata
+                            try:
+                                logger.debug("Attempting to load cache with decode_cf=False...")
+                                ds_combined = xr.open_dataset(potential_cache_file, decode_cf=False)
+                                logger.info("Successfully loaded cached data with decode_cf=False")
+                                load_successful = True
+                            except Exception as decode_load_err:
+                                logger.debug(f"decode_cf=False load failed: {decode_load_err}")
+                    
+                    if not load_successful:
+                        logger.warning(f"Failed to load cache file with all methods: {potential_cache_file}")
+                        continue
+                
+                # Validate cache content
+                target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
+                if all(t_np_ns in ds_combined.time.values for t_np_ns in target_times_np_ns):
+                    logger.info("Cache hit is valid.")
+                    
+                    # CRITICAL FIX: Force data loading for cached datasets too
+                    # This prevents lazy-loading issues when cache files might be moved/deleted
+                    try:
+                        logger.debug("Loading cached data into memory to prevent file access issues...")
+                        for var_name in ds_combined.data_vars:
+                            _ = ds_combined[var_name].values  # Force loading
+                        logger.debug("Successfully loaded cached data into memory")
+                    except Exception as load_err:
+                        logger.warning(f"Error during cached data loading: {load_err}")
+                        # Continue - the data might still be accessible
+                    
+                    return ds_combined
+                else:
+                    logger.warning("Cached file exists but missing requested times. Re-fetching.")
+                    if hasattr(ds_combined, 'close'):
+                        ds_combined.close()
+                    potential_cache_file.unlink()
+                    
+            except Exception as e:
+                logger.warning(f"Failed to load or validate cache file {potential_cache_file}: {e}. Re-fetching.")
+                if potential_cache_file.exists():
+                    try: 
+                        potential_cache_file.unlink()
+                    except OSError: 
+                        pass
 
     logger.info(f"Cache miss or invalid cache for times: {time_strings[0]} to {time_strings[-1]}. Fetching from CDS API.")
 
@@ -141,8 +207,65 @@ async def fetch_era5_data(
             logger.info(f"Pressure level data downloaded to {temp_pl_file}")
 
             logger.info("Loading and processing downloaded files...")
-            ds_sl = xr.open_dataset(temp_sl_file)
-            ds_pl = xr.open_dataset(temp_pl_file)
+            
+            # ROBUST BACKEND APPROACH: Use multiple fallback methods for maximum compatibility
+            logger.info("Loading downloaded files using robust backend detection with fallbacks...")
+            
+            # Load single level file with corrected engine handling
+            ds_sl = None
+            try:
+                logger.debug("Loading single level file with default engine...")
+                ds_sl = xr.open_dataset(temp_sl_file)
+                logger.debug("✅ Successfully loaded single level file with default engine")
+            except Exception as default_err:
+                logger.debug(f"Default load failed for single level: {default_err}")
+                
+                # Try explicit netcdf4 engine
+                try:
+                    logger.debug("Loading single level file with netcdf4 engine...")
+                    ds_sl = xr.open_dataset(temp_sl_file, engine='netcdf4')
+                    logger.debug("✅ Successfully loaded single level file with netcdf4 engine")
+                except Exception as netcdf4_err:
+                    logger.debug(f"netcdf4 load failed for single level: {netcdf4_err}")
+                    
+                    # Try with decode_cf=False
+                    try:
+                        logger.debug("Loading single level file with decode_cf=False...")
+                        ds_sl = xr.open_dataset(temp_sl_file, decode_cf=False)
+                        logger.debug("✅ Successfully loaded single level file with decode_cf=False")
+                    except Exception as decode_err:
+                        logger.debug(f"decode_cf=False load failed for single level: {decode_err}")
+            
+            if ds_sl is None:
+                raise ValueError("Failed to load single level file with any method")
+            
+            # Load pressure level file with corrected engine handling
+            ds_pl = None
+            try:
+                logger.debug("Loading pressure level file with default engine...")
+                ds_pl = xr.open_dataset(temp_pl_file)
+                logger.debug("✅ Successfully loaded pressure level file with default engine")
+            except Exception as default_err:
+                logger.debug(f"Default load failed for pressure level: {default_err}")
+                
+                # Try explicit netcdf4 engine
+                try:
+                    logger.debug("Loading pressure level file with netcdf4 engine...")
+                    ds_pl = xr.open_dataset(temp_pl_file, engine='netcdf4')
+                    logger.debug("✅ Successfully loaded pressure level file with netcdf4 engine")
+                except Exception as netcdf4_err:
+                    logger.debug(f"netcdf4 load failed for pressure level: {netcdf4_err}")
+                    
+                    # Try with decode_cf=False
+                    try:
+                        logger.debug("Loading pressure level file with decode_cf=False...")
+                        ds_pl = xr.open_dataset(temp_pl_file, decode_cf=False)
+                        logger.debug("✅ Successfully loaded pressure level file with decode_cf=False")
+                    except Exception as decode_err:
+                        logger.debug(f"decode_cf=False load failed for pressure level: {decode_err}")
+            
+            if ds_pl is None:
+                raise ValueError("Failed to load pressure level file with any method")
 
             logger.info(f"Variables in downloaded single-level ERA5: {list(ds_sl.data_vars)}")
             logger.info(f"Variables in downloaded pressure-level ERA5: {list(ds_pl.data_vars)}")
@@ -206,8 +329,83 @@ async def fetch_era5_data(
 
             logger.info("Data processing and coordinate adjustments complete.")
             
+            # Force data loading before temp file cleanup
+            logger.info("Loading data into memory to prevent lazy-loading issues with temporary files...")
+            try:
+                for var_name in ds_combined.data_vars:
+                    _ = ds_combined[var_name].values  # Force loading
+                logger.debug("Successfully loaded all variables into memory")
+            except Exception as load_err:
+                logger.warning(f"Error during forced data loading: {load_err}")
+            
             logger.info(f"Saving processed data to cache: {cache_filename}")
-            ds_combined.to_netcdf(cache_filename)
+            
+            # IMPROVED SAVE APPROACH: Use auto-detection first, then available engines
+            save_successful = False
+            
+            # FIXED: Robust save approach with correct xarray engine usage
+            save_successful = False
+            
+            # 1. Try default netcdf4 (most common and reliable)
+            try:
+                logger.debug("Attempting to save with default netcdf4 engine...")
+                ds_combined.to_netcdf(cache_filename)  # Default engine
+                logger.info(f"✅ Successfully saved processed data with default engine: {cache_filename}")
+                save_successful = True
+            except Exception as default_save_err:
+                logger.debug(f"Default save failed: {default_save_err}")
+                
+                # 2. Try explicit netcdf4 engine
+                try:
+                    logger.debug("Attempting to save with explicit netcdf4 engine...")
+                    ds_combined.to_netcdf(cache_filename, engine='netcdf4')
+                    logger.info(f"✅ Successfully saved with netcdf4 engine: {cache_filename}")
+                    save_successful = True
+                except Exception as netcdf4_save_err:
+                    logger.debug(f"netcdf4 save failed: {netcdf4_save_err}")
+                    
+                    # 3. Try with computed dataset (resolve lazy operations)
+                    try:
+                        logger.debug("Computing dataset and saving with default engine...")
+                        ds_computed = ds_combined.compute()
+                        ds_computed.to_netcdf(cache_filename)
+                        logger.info(f"✅ Successfully saved computed dataset: {cache_filename}")
+                        save_successful = True
+                    except Exception as computed_save_err:
+                        logger.debug(f"Computed dataset save failed: {computed_save_err}")
+                        
+                        # 4. Try NETCDF4 format explicitly
+                        try:
+                            logger.debug("Attempting to save with NETCDF4 format...")
+                            if 'ds_computed' not in locals():
+                                ds_computed = ds_combined.compute()
+                            ds_computed.to_netcdf(cache_filename, format='NETCDF4')
+                            logger.info(f"✅ Successfully saved with NETCDF4 format: {cache_filename}")
+                            save_successful = True
+                        except Exception as netcdf4_format_save_err:
+                            logger.debug(f"NETCDF4 format save failed: {netcdf4_format_save_err}")
+                            
+                            # 5. Try NETCDF3_64BIT format (most compatible)
+                            try:
+                                logger.debug("Attempting to save with NETCDF3_64BIT format...")
+                                if 'ds_computed' not in locals():
+                                    ds_computed = ds_combined.compute()
+                                ds_computed.to_netcdf(cache_filename, format='NETCDF3_64BIT')
+                                logger.info(f"✅ Successfully saved with NETCDF3_64BIT format: {cache_filename}")
+                                save_successful = True
+                            except Exception as netcdf3_save_err:
+                                logger.debug(f"NETCDF3_64BIT save failed: {netcdf3_save_err}")
+            
+            if not save_successful:
+                logger.error("Failed to save with all netCDF engines, using pickle fallback...")
+                try:
+                    pickle_filename = cache_filename.with_suffix('.pkl')
+                    import pickle
+                    with open(pickle_filename, 'wb') as f:
+                        pickle.dump(ds_combined, f)
+                    logger.warning(f"Saved data in pickle format as fallback: {pickle_filename}")
+                except Exception as pickle_err:
+                    logger.error(f"Pickle fallback also failed: {pickle_err}")
 
             return ds_combined
 

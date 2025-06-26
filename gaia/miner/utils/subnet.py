@@ -1,6 +1,6 @@
 from functools import partial
 from fastapi import Depends, Request, HTTPException, Header, Path, Query
-from fastapi.responses import JSONResponse, FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.routing import APIRouter
 from pydantic import BaseModel, Field
 from fiber.encrypted.miner.dependencies import blacklist_low_stake, verify_request
@@ -16,7 +16,6 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 import traceback
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
-import json
 from pydantic import ValidationError
 import os
 from pathlib import Path
@@ -28,6 +27,29 @@ import urllib.parse
 import base64
 import asyncio
 
+# High-performance JSON operations for miner routes
+try:
+    from gaia.utils.performance import dumps, loads
+    from fastapi.responses import JSONResponse as _FastAPIJSONResponse
+    
+    class JSONResponse(_FastAPIJSONResponse):
+        """Optimized JSONResponse using orjson for 2-3x faster miner route responses."""
+        def render(self, content: Any) -> bytes:
+            try:
+                # Use high-performance orjson serialization
+                return dumps(content).encode('utf-8')
+            except Exception:
+                # Fallback to FastAPI's default JSON encoder
+                return super().render(content)
+    
+    logger = get_logger(__name__)
+    logger.info("🚀 Miner routes using orjson for high-performance JSON responses")
+    
+except ImportError:
+    from fastapi.responses import JSONResponse
+    logger = get_logger(__name__)
+    logger.info("⚡ Miner routes using standard JSON - install orjson for 2-3x performance boost")
+
 from gaia.tasks.defined_tasks.weather.schemas.weather_inputs import (
     WeatherForecastRequest, WeatherKerchunkRequest, WeatherInputData,
     WeatherInitiateFetchRequest, WeatherGetInputStatusRequest, WeatherStartInferenceRequest
@@ -38,8 +60,6 @@ from gaia.tasks.defined_tasks.weather.schemas.weather_outputs import (
 )
 
 MAX_REQUEST_SIZE = 800 * 1024 * 1024  # 800MB
-
-logger = get_logger(__name__)
 
 current_file_path = Path(__file__).resolve()
 gaia_repo_root = current_file_path.parent.parent.parent.parent 

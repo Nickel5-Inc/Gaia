@@ -1,7 +1,6 @@
 import asyncio
 import gc
 import os
-import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import uuid
@@ -16,6 +15,16 @@ import xskillscore as xs
 from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple
 if TYPE_CHECKING:
     from ..weather_task import WeatherTask
+
+# High-performance JSON operations for weather data
+try:
+    from gaia.utils.performance import dumps, loads
+except ImportError:
+    import json
+    def dumps(obj, **kwargs):
+        return json.dumps(obj, **kwargs) 
+    def loads(s):
+        return json.loads(s)
 from ..utils.remote_access import open_verified_remote_zarr_dataset
 from ..utils.era5_api import fetch_era5_data
 from ..utils.gfs_api import fetch_gfs_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
@@ -37,7 +46,7 @@ async def _update_run_status(task_instance: 'WeatherTask', run_id: int, status: 
         params["error_msg"] = error_message
     if gfs_metadata is not None:
             update_fields.append("gfs_input_metadata = :gfs_meta")
-            params["gfs_meta"] = json.dumps(gfs_metadata, default=str)
+            params["gfs_meta"] = dumps(gfs_metadata, default=str)
     if status in ["completed", "error", "scored", "final_scoring_failed", "ensemble_failed", "initial_scoring_failed", "verification_failed"]:
             update_fields.append("completion_time = :comp_time")
             params["comp_time"] = datetime.now(timezone.utc)
@@ -164,7 +173,7 @@ async def build_score_row(task_instance: 'WeatherTask', forecast_run_id: int, gr
         exists_query = "SELECT id FROM score_table WHERE task_name = 'weather' AND run_id = :run_id"
         existing = await task_instance.db_manager.fetch_one(exists_query, {"run_id": str(forecast_run_id)})
         db_params = {k: v for k, v in score_data.items() if k not in ['task_name', 'subtask_name', 'run_id', 'run_timestamp']}
-        db_params["metadata"] = json.dumps(score_data['metadata'])
+        db_params["metadata"] = dumps(score_data['metadata'])
 
         if existing:
             update_query = "UPDATE score_table SET avg_score = :avg_score, max_score = :max_score, min_score = :min_score, miner_count = :miner_count, best_miner = :best_miner, ensemble_score = :ensemble_score, metadata = :metadata WHERE id = :id"
@@ -251,7 +260,7 @@ async def _request_fresh_token(task_instance: 'WeatherTask', miner_hotkey: str, 
             logger.warning(f"[VerifyLogic] No response received from miner {miner_hotkey[:12]} for job {job_id}")
             return None
         if response_dict.get("status_code") == 200:
-            miner_response_data = json.loads(response_dict['text'])
+            miner_response_data = loads(response_dict['text'])
             miner_status = miner_response_data.get("status")
             
             if miner_status == "completed":
@@ -1062,7 +1071,7 @@ async def calculate_era5_miner_score(
         params.setdefault('metrics', {}) 
         params.setdefault('error_message', None)
 
-        params["metrics_json"] = json.dumps(params.pop("metrics"), default=str) 
+        params["metrics_json"] = dumps(params.pop("metrics"), default=str) 
         
         try:
             await task_instance.db_manager.execute(insert_query, params)
@@ -1181,7 +1190,7 @@ async def _calculate_and_store_aggregated_era5_score(
         "response_id": response_id, "run_id": run_id, "miner_uid": miner_uid, "miner_hotkey": miner_hotkey,
         "score_type": agg_score_type, 
         "score": final_score_val if np.isfinite(final_score_val) else 0.0,
-        "metrics_json": json.dumps(metrics_for_agg_score, default=str),
+        "metrics_json": dumps(metrics_for_agg_score, default=str),
         "calculation_time": datetime.now(timezone.utc),
         "error_message": None,
         "lead_hours": None, 

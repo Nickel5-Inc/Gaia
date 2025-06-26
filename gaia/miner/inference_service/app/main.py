@@ -5,7 +5,6 @@ print("[MAIN_PY_DEBUG] Script execution started.", flush=True)
 
 import asyncio
 import base64
-import json
 import logging
 import os
 import pickle
@@ -15,7 +14,7 @@ from typing import Any, AsyncGenerator, Dict, Optional, List, Tuple
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Request, Security, status
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, Response
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 import pandas as pd
@@ -35,6 +34,33 @@ import sys # Ensure sys is imported if you use it for stdout/stderr explicitly l
 import boto3 # For R2
 from botocore.exceptions import ClientError # For R2 error handling
 from botocore.config import Config
+
+# High-performance JSON operations for inference service
+try:
+    from gaia.utils.performance import dumps, loads
+    from fastapi.responses import JSONResponse as _FastAPIJSONResponse
+    
+    class JSONResponse(_FastAPIJSONResponse):
+        """Optimized JSONResponse using orjson for 2-3x faster inference service responses."""
+        def render(self, content: Any) -> bytes:
+            try:
+                # Use high-performance orjson serialization  
+                return dumps(content).encode('utf-8')
+            except Exception:
+                # Fallback to FastAPI's default JSON encoder
+                return super().render(content)
+    
+    _logger = logging.getLogger(__name__)
+    if os.getenv("LOG_LEVEL", "DEBUG").upper() in ["DEBUG", "INFO"]:
+        _logger.info("🚀 Inference service using orjson for high-performance JSON responses")
+    JSON_PERFORMANCE_AVAILABLE = True
+    
+except ImportError:
+    from fastapi.responses import JSONResponse
+    _logger = logging.getLogger(__name__)
+    if os.getenv("LOG_LEVEL", "DEBUG").upper() in ["DEBUG", "INFO"]:
+        _logger.info("⚡ Inference service using standard JSON - install orjson for 2-3x performance boost")
+    JSON_PERFORMANCE_AVAILABLE = False
 
 # --- Global Variables to be populated at startup --- 
 APP_CONFIG = {}

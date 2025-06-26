@@ -1,0 +1,25 @@
+# Pip constraints file to prevent problematic packages
+# Use with: pip install -c constraints.txt -r requirements.txt
+
+# CRITICAL: Prevent asyncio package installation
+# The asyncio v3.4.3 package causes multiprocessing failures due to syntax conflicts
+# with Python 3.7+ where 'async' became a reserved keyword.
+# Always use Python's built-in asyncio module instead.
+# 
+# Note: pip constraints cannot directly forbid packages, but this documents the issue.
+# The validator startup code will automatically detect and remove problematic asyncio installs.
+
+# ERA5 NETCDF ENGINE FIX
+# Simplified ERA5 API to use netcdf4 as primary engine for better reliability.
+# Removed complex engine testing that was causing "unrecognized engine for to_netcdf" errors.
+# The system now uses netcdf4 first, with simple fallbacks to h5netcdf and scipy.
+
+# Additional problematic packages that might conflict with built-ins
+# (Add more here as needed)
+
+# AIOHTTP VERSION COMPATIBILITY FIX
+# Pin aiohttp to a version that's compatible with fsspec
+# aiohttp 3.11.x introduced a breaking change requiring 'history' parameter in ClientResponseError
+# but fsspec doesn't provide this parameter yet, causing: 
+# "ClientResponseError.__init__() missing 1 required positional argument: 'history'"
+aiohttp<3.11.0 

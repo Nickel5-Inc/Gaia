@@ -18,6 +18,17 @@ import torch
 import os
 from gaia.database.validator_schema import node_table
 
+# High-performance JSON operations
+try:
+    from gaia.utils.performance import dumps, loads
+    JSON_PERFORMANCE_AVAILABLE = True
+except ImportError:
+    import json
+    def dumps(obj, **kwargs):
+        return json.dumps(obj, **kwargs)
+    def loads(s):
+        return json.loads(s)
+    JSON_PERFORMANCE_AVAILABLE = False
 
 logger = get_logger(__name__)
 
@@ -681,7 +692,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 prediction = prediction.tolist()
                 
             try:
-                prediction_json = json.dumps(prediction, default=self._json_serializer)
+                # Use high-performance JSON serialization
+                prediction_json = dumps(prediction, default=self._json_serializer)
+                if JSON_PERFORMANCE_AVAILABLE:
+                    logger.debug("Using orjson for database prediction serialization")
             except Exception as e:
                 logger.error(f"JSON serialization error: {e}")
                 return False
@@ -754,8 +768,11 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 prediction_data = raw_prediction_from_db
             elif isinstance(raw_prediction_from_db, str):
                 try:
-                    prediction_data = json.loads(raw_prediction_from_db)
-                except json.JSONDecodeError as e:
+                    # Use high-performance JSON deserialization
+                    prediction_data = loads(raw_prediction_from_db)
+                    if JSON_PERFORMANCE_AVAILABLE:
+                        logger.debug("Using orjson for database prediction deserialization")
+                except Exception as e:
                     logger.error(f"Failed to parse JSON string from DB for baseline prediction '{task_name}' task_id '{task_id}': {raw_prediction_from_db}. Error: {e}")
                     return None 
             elif isinstance(raw_prediction_from_db, (int, float, bool)) or raw_prediction_from_db is None:

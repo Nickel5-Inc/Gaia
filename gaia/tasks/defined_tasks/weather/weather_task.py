@@ -4,9 +4,19 @@ from typing import Any, Dict, List, Optional, Union, Tuple
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 import os
+import sys
 import importlib.util
-import json
 from pydantic import Field, ConfigDict
+
+# High-performance JSON operations for weather task
+try:
+    from gaia.utils.performance import dumps, loads
+except ImportError:
+    import json
+    def dumps(obj, **kwargs):
+        return json.dumps(obj, **kwargs)
+    def loads(s):
+        return json.loads(s)
 from fiber.logging_utils import get_logger
 from gaia.tasks.base.task import Task
 from gaia.tasks.base.deterministic_job_id import DeterministicJobID
@@ -158,8 +168,8 @@ def _load_config(self):
     ]
     try:
         day1_vars_levels_json = os.getenv('WEATHER_DAY1_VARIABLES_LEVELS_JSON')
-        config['day1_variables_levels_to_score'] = json.loads(day1_vars_levels_json) if day1_vars_levels_json else default_day1_vars_levels
-    except json.JSONDecodeError:
+        config['day1_variables_levels_to_score'] = loads(day1_vars_levels_json) if day1_vars_levels_json else default_day1_vars_levels
+    except Exception:
         logger.warning("Invalid JSON for WEATHER_DAY1_VARIABLES_LEVELS_JSON. Using default.")
         config['day1_variables_levels_to_score'] = default_day1_vars_levels
 
@@ -171,8 +181,8 @@ def _load_config(self):
     }
     try:
         day1_clim_bounds_json = os.getenv('WEATHER_DAY1_CLIMATOLOGY_BOUNDS_JSON')
-        config['day1_climatology_bounds'] = json.loads(day1_clim_bounds_json) if day1_clim_bounds_json else default_day1_clim_bounds
-    except json.JSONDecodeError:
+        config['day1_climatology_bounds'] = loads(day1_clim_bounds_json) if day1_clim_bounds_json else default_day1_clim_bounds
+    except Exception:
         logger.warning("Invalid JSON for WEATHER_DAY1_CLIMATOLOGY_BOUNDS_JSON. Using default.")
         config['day1_climatology_bounds'] = default_day1_clim_bounds
 
@@ -191,8 +201,8 @@ def _load_config(self):
     }
     try:
         clone_delta_json = os.getenv('WEATHER_DAY1_CLONE_DELTA_THRESHOLDS_JSON')
-        config['day1_clone_delta_thresholds'] = json.loads(clone_delta_json) if clone_delta_json else default_clone_delta_thresholds
-    except json.JSONDecodeError:
+        config['day1_clone_delta_thresholds'] = loads(clone_delta_json) if clone_delta_json else default_clone_delta_thresholds
+    except Exception:
         logger.warning("Invalid JSON for WEATHER_DAY1_CLONE_DELTA_THRESHOLDS_JSON. Using default.")
         config['day1_clone_delta_thresholds'] = default_clone_delta_thresholds
 
@@ -347,6 +357,14 @@ class WeatherTask(Task):
         # Add progress tracking
         self.progress_callbacks: List[callable] = []
         self.current_operations: Dict[str, WeatherProgressUpdate] = {}
+
+        # Initialize async processing configuration and logging
+        try:
+            from .utils.async_processing import log_async_processing_summary
+            log_async_processing_summary()
+        except Exception as async_config_error:
+            logger.warning(f"Could not load async processing summary: {async_config_error}")
+            logger.info("Weather task async processing optimizations may not be available")
         
 
 
@@ -601,7 +619,7 @@ class WeatherTask(Task):
                 logger.info(f"[{job_id}] Job started on RunPod. RunPod Job ID: {runpod_job_id}")
                 return runpod_job_id
 
-            except (httpx.HTTPStatusError, httpx.RequestError, json.JSONDecodeError) as e:
+            except (httpx.HTTPStatusError, httpx.RequestError, Exception) as e:
                 logger.error(f"[{job_id}] Error starting inference job: {e}", exc_info=True)
                 return None
 
@@ -729,7 +747,11 @@ class WeatherTask(Task):
             await self.db_manager.execute(query, {"runpod_id": runpod_job_id, "job_id": job_id})
             
             logger.info(f"[{job_id}] Saved RunPod ID {runpod_job_id}. Launching background poller.")
-            asyncio.create_task(poll_runpod_job_worker(self, job_id, runpod_job_id))
+            # Track the polling task to prevent memory leaks
+            if hasattr(self, 'validator') and hasattr(self.validator, 'create_tracked_task'):
+                self.validator.create_tracked_task(poll_runpod_job_worker(self, job_id, runpod_job_id), f"runpod_poll_{job_id}")
+            else:
+                asyncio.create_task(poll_runpod_job_worker(self, job_id, runpod_job_id))
             return True
         except Exception as e:
             error_msg = f"DB error after starting RunPod job: {e}"
@@ -852,31 +874,113 @@ class WeatherTask(Task):
         except Exception as e:
             logger.warning(f"Failed to ensure blosc codec in ERA5 climatology executor thread: {e}")
         
+        # Import xarray for use in opening strategies
+        import xarray as xr
+        
         # Multiple zarr opening strategies with different configurations
         def ensure_codec_before_opening():
             """Re-register codecs immediately before each opening attempt."""
             try:
-                # Force re-registration right before opening
-                blosc_codec = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
-                codec_id = blosc_codec.codec_id
-                numcodecs.registry.codec_registry[codec_id] = blosc_codec
+                # FIXED: Robust blosc codec registration 
                 
-                # Also try alternative registration methods
-                if hasattr(numcodecs, 'register_codec'):
-                    numcodecs.register_codec(blosc_codec)
+                # 1. Set environment variables to ensure blosc availability
+                os.environ['ZARR_V3_EXPERIMENTAL_API'] = '0'  # Use v2 API for better codec support
+                os.environ['BLOSC_NTHREADS'] = '1'  # Single thread to avoid threading issues
                 
-                # Force import of zarr's blosc support
+                # 2. Force import and re-registration of blosc codec
+                import numcodecs
+                from numcodecs import Blosc
+                
+                # 3. Create and register the main blosc codec (default zstd)
                 try:
-                    import zarr.codecs
-                    if hasattr(zarr.codecs, '_codec_registry'):
-                        zarr.codecs._codec_registry[codec_id] = blosc_codec
-                except:
-                    pass
+                    # Create the primary blosc codec that zarr expects (ID: 'blosc')
+                    blosc_codec = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
                     
-                # Set zarr environment to ensure blosc is available
-                os.environ['ZARR_V3_EXPERIMENTAL_API'] = '0'  # Use v2 API which has better codec support
+                    # Register with the standard 'blosc' ID that zarr looks for
+                    if hasattr(numcodecs.registry, 'codec_registry'):
+                        numcodecs.registry.codec_registry['blosc'] = blosc_codec
+                    
+                    # Alternative registration method
+                    if hasattr(numcodecs, 'register_codec'):
+                        numcodecs.register_codec(blosc_codec, codec_id='blosc')
+                    
+                    # CRITICAL FIX: Force module reload to pick up new codec registration
+                    import importlib
+                    if 'numcodecs.blosc' in sys.modules:
+                        importlib.reload(sys.modules['numcodecs.blosc'])
+                    if 'zarr.codecs' in sys.modules:
+                        importlib.reload(sys.modules['zarr.codecs'])
+                    
+                    logger.debug("Registered blosc codec with standard 'blosc' ID")
+                    
+                    # Also register alternative compression methods
+                    blosc_configs = [
+                        {'cname': 'zstd', 'clevel': 3, 'shuffle': Blosc.BITSHUFFLE, 'id': 'blosc_zstd'},
+                        {'cname': 'lz4', 'clevel': 1, 'shuffle': Blosc.SHUFFLE, 'id': 'blosc_lz4'},
+                        {'cname': 'zlib', 'clevel': 1, 'shuffle': Blosc.NOSHUFFLE, 'id': 'blosc_zlib'}
+                    ]
+                    
+                    for config in blosc_configs:
+                        try:
+                            config_copy = config.copy()  # Don't modify the original
+                            codec_id = config_copy.pop('id')
+                            alt_blosc_codec = Blosc(**config_copy)
+                            
+                            # Register alternative versions
+                            if hasattr(numcodecs.registry, 'codec_registry'):
+                                numcodecs.registry.codec_registry[codec_id] = alt_blosc_codec
+                            
+                            if hasattr(numcodecs, 'register_codec'):
+                                numcodecs.register_codec(alt_blosc_codec, codec_id=codec_id)
+                            
+                            logger.debug(f"Registered alternative blosc codec: {codec_id}")
+                            
+                        except Exception as config_err:
+                            logger.debug(f"Failed to register blosc config {config}: {config_err}")
+                            continue
+                            
+                except Exception as main_codec_err:
+                    logger.warning(f"Failed to register main blosc codec: {main_codec_err}")
+                    return False
                 
-                return True
+                # 4. Try to register with zarr if available
+                try:
+                    import zarr
+                    # Force reimport to pick up new codecs
+                    import importlib
+                    if 'zarr.codecs' in sys.modules:
+                        importlib.reload(sys.modules['zarr.codecs'])
+                    
+                    # Ensure zarr can see numcodecs
+                    if hasattr(zarr, 'codecs') and hasattr(zarr.codecs, 'get_codec'):
+                        # Test if blosc is available in zarr
+                        try:
+                            test_codec = zarr.codecs.get_codec({'id': 'blosc', 'cname': 'zstd', 'clevel': 1})
+                            logger.debug("Zarr blosc codec test successful")
+                        except Exception as test_err:
+                            logger.debug(f"Zarr blosc codec test failed: {test_err}")
+                            
+                except Exception as zarr_err:
+                    logger.debug(f"Zarr codec registration failed: {zarr_err}")
+                
+                # 5. Test codec availability with a simple compression test
+                try:
+                    test_data = b"test_compression_data" * 100
+                    blosc_test = Blosc(cname='zstd', clevel=1, shuffle=Blosc.NOSHUFFLE)
+                    compressed = blosc_test.encode(test_data)
+                    decompressed = blosc_test.decode(compressed)
+                    
+                    if decompressed == test_data:
+                        logger.debug("Blosc codec test successful - compression/decompression working")
+                        return True
+                    else:
+                        logger.warning("Blosc codec test failed - data mismatch after compression")
+                        return False
+                        
+                except Exception as test_err:
+                    logger.debug(f"Blosc codec test failed: {test_err}")
+                    return False
+                
             except Exception as codec_err:
                 logger.warning(f"Failed to ensure codec before opening: {codec_err}")
                 return False
@@ -1348,7 +1452,7 @@ sources:
                      "data": payload_dict 
                 }
 
-                logger.info(f"[Run {run_id}] Querying miners with weather initiate fetch request (Endpoint: /weather-initiate-fetch)... Payload size approx: {len(json.dumps(payload))} bytes")
+                logger.info(f"[Run {run_id}] Querying miners with weather initiate fetch request (Endpoint: /weather-initiate-fetch)... Payload size approx: {len(dumps(payload))} bytes")
                 responses = await validator.query_miners(
                      payload=payload,
                      endpoint="/weather-initiate-fetch"
@@ -1362,9 +1466,9 @@ sources:
                          miner_response = response_data
                          if isinstance(response_data, dict) and 'text' in response_data:
                              try:
-                                 miner_response = json.loads(response_data['text'])
+                                 miner_response = loads(response_data['text'])
                                  logger.debug(f"[Run {run_id}] Parsed JSON from response text for {miner_hotkey}: {miner_response}")
-                             except (json.JSONDecodeError, TypeError) as json_err:
+                             except (Exception, TypeError) as json_err:
                                  logger.warning(f"[Run {run_id}] Failed to parse response text for {miner_hotkey}: {json_err}")
                                  miner_response = {"status": "parse_error", "message": str(json_err)}
                                  
@@ -1458,8 +1562,8 @@ sources:
                             parsed_response = status_response
                             if isinstance(status_response, dict) and 'text' in status_response:
                                 try:
-                                    parsed_response = json.loads(status_response['text'])
-                                except (json.JSONDecodeError, TypeError) as json_err:
+                                    parsed_response = loads(status_response['text'])
+                                except (Exception, TypeError) as json_err:
                                     logger.warning(f"[Run {run_id}] Failed to parse status response text for {miner_hk[:8]}: {json_err}")
                                     parsed_response = {"status": "parse_error", "message": str(json_err)}
                             
@@ -1589,11 +1693,11 @@ sources:
                             parsed_response = trigger_response
                             if isinstance(trigger_response, dict) and 'text' in trigger_response:
                                 try:
-                                    parsed_response = json.loads(trigger_response['text'])
-                                except (json.JSONDecodeError, TypeError) as json_err:
+                                    parsed_response = loads(trigger_response['text'])
+                                except (Exception, TypeError) as json_err:
                                     logger.warning(f"[Run {run_id}] Failed to parse trigger response text for {miner_hk[:8]}: {json_err}")
                                     parsed_response = {"status": "parse_error", "message": str(json_err)}
-                                    
+                                
                             if parsed_response and parsed_response.get('status') == WeatherTaskStatus.INFERENCE_STARTED.value:
                                 logger.info(f"[Run {run_id}] Successfully triggered inference for {miner_hk[:8]} (Job: {miner_job_id}).")
                                 return resp_id, True
@@ -1998,7 +2102,7 @@ sources:
                 "req_time": datetime.now(timezone.utc),
                 "val_hk": validator_hotkey,
                 "gfs_init": gfs_init_time,
-                "gfs_meta": json.dumps(payload_data, default=str),
+                "gfs_meta": dumps(payload_data, default=str),
                 "status": "received",
                 "proc_start": datetime.now(timezone.utc)
             })
@@ -2527,6 +2631,13 @@ sources:
         except Exception as e:
             logger.warning(f"Error clearing fsspec caches: {e}")
 
+        # Clean up async processing resources (minimal cleanup needed for async)
+        try:
+            # Async processing uses built-in asyncio/dask which handles cleanup automatically
+            logger.info("Async processing cleanup completed (no explicit cleanup needed)")
+        except Exception as e:
+            logger.warning(f"Error during async processing cleanup: {e}")
+
         # Force garbage collection to help with cleanup
         try:
             import gc
@@ -2594,8 +2705,12 @@ sources:
             return
             
         self.cleanup_worker_running = True
-        for _ in range(num_workers):
-            worker = asyncio.create_task(cleanup_worker(self))
+        for i in range(num_workers):
+            # Track cleanup workers to prevent memory leaks
+            if hasattr(self, 'validator') and hasattr(self.validator, 'create_tracked_task'):
+                worker = self.validator.create_tracked_task(cleanup_worker(self), f"cleanup_worker_{i}")
+            else:
+                worker = asyncio.create_task(cleanup_worker(self))
             self.cleanup_workers.append(worker)
             
         logger.info(f"Started {num_workers} cleanup workers")
@@ -2734,8 +2849,8 @@ sources:
                                 parsed_response = status_response
                                 if isinstance(status_response, dict) and 'text' in status_response:
                                     try:
-                                        parsed_response = json.loads(status_response['text'])
-                                    except (json.JSONDecodeError, TypeError) as json_err:
+                                        parsed_response = loads(status_response['text'])
+                                    except (Exception, TypeError) as json_err:
                                         logger.warning(f"[Run {run_id}] Failed to parse status response text for {miner_hk[:8]}: {json_err}")
                                         parsed_response = {"status": "parse_error", "message": str(json_err)}
                                 
@@ -2762,7 +2877,11 @@ sources:
             return
         self.r2_cleanup_worker_running = True
         for i in range(num_workers):
-            task = asyncio.create_task(r2_cleanup_worker(self))
+            # Track R2 cleanup workers to prevent memory leaks
+            if hasattr(self, 'validator') and hasattr(self.validator, 'create_tracked_task'):
+                task = self.validator.create_tracked_task(r2_cleanup_worker(self), f"r2_cleanup_worker_{i}")
+            else:
+                task = asyncio.create_task(r2_cleanup_worker(self))
             self.r2_cleanup_workers.append(task)
         logger.info(f"Started {num_workers} R2 cleanup workers.")
 
@@ -2772,7 +2891,11 @@ sources:
             return
         self.job_status_logger_running = True
         for i in range(num_workers):
-            task = asyncio.create_task(weather_job_status_logger(self))
+            # Track job status logger workers to prevent memory leaks
+            if hasattr(self, 'validator') and hasattr(self.validator, 'create_tracked_task'):
+                task = self.validator.create_tracked_task(weather_job_status_logger(self), f"job_status_logger_{i}")
+            else:
+                task = asyncio.create_task(weather_job_status_logger(self))
             self.job_status_logger_workers.append(task)
         logger.info(f"Started {num_workers} job status logger workers.")
 
@@ -2838,7 +2961,11 @@ sources:
                 job_id = job['id']
                 runpod_job_id = job['runpod_job_id']
                 logger.info(f"  - Restarting poller for Job ID: {job_id}, RunPod ID: {runpod_job_id}")
-                asyncio.create_task(poll_runpod_job_worker(self, job_id, runpod_job_id))
+                # Track the recovery polling task to prevent memory leaks
+                if hasattr(self, 'validator') and hasattr(self.validator, 'create_tracked_task'):
+                    self.validator.create_tracked_task(poll_runpod_job_worker(self, job_id, runpod_job_id), f"recovery_runpod_poll_{job_id}")
+                else:
+                    asyncio.create_task(poll_runpod_job_worker(self, job_id, runpod_job_id))
         except Exception as e:
             logger.error(f"Error during incomplete HTTP job recovery: {e}", exc_info=True)
         

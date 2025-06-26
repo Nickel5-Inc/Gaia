@@ -13,15 +13,19 @@ from dotenv import load_dotenv
 from fiber.logging_utils import get_logger
 import numpy as np
 from gaia import __spec_version__
+from gaia.validator.utils.substrate_manager import get_fresh_substrate_connection
 
 logger = get_logger(__name__)
 
 
 async def get_active_validator_uids(netuid, subtensor_network="finney", chain_endpoint=None, recent_blocks=500):
     try:
-        # Always use fresh connections
-        substrate = SubstrateInterface(url=chain_endpoint) if chain_endpoint else get_substrate(subtensor_network=subtensor_network)
-        logger.info("🔄 Using fresh substrate connection for get_active_validator_uids")
+        # Use substrate manager for validator UID queries
+        substrate = get_fresh_substrate_connection(
+            subtensor_network=subtensor_network,
+            chain_endpoint=chain_endpoint or ""
+        )
+        logger.info("🔄 Using substrate manager for get_active_validator_uids")
         
         loop = asyncio.get_event_loop()
         validator_permits = await loop.run_in_executor(
@@ -115,9 +119,12 @@ class FiberWeightSetter:
         """Initialize the weight setter with fiber connections"""
         self.netuid = netuid
         self.network = network
-        # Always use fresh connections
-        logger.info("🔄 FiberWeightSetter using fresh connection")
-        self.substrate = interface.get_substrate(subtensor_network=network)
+        # Use substrate manager for initialization (will be replaced with fresh connection during weight setting)
+        logger.info("🔄 FiberWeightSetter using substrate manager for initialization")
+        self.substrate = get_fresh_substrate_connection(
+            subtensor_network=network,
+            chain_endpoint=""  # Use default endpoint
+        )
         self.nodes = None
         self.keypair = chain_utils.load_hotkey_keypair(
             wallet_name=wallet_name, hotkey_name=hotkey_name

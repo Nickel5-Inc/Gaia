@@ -439,20 +439,11 @@ class Miner:
 
                 if weather_enabled_env:
                     if self.weather_task is None:
-                        self.logger.warning("WeatherTask was None at startup despite WEATHER_MINER_ENABLED being true. Re-initializing. This might indicate an issue if __init__ didn't set it.")
-                        weather_task_args = {
-                            "db_manager": self.database_manager,
-                            "node_type": "miner",
-                            "inference_service_url": self.weather_inference_service_url
-                        }
-                        if self.weather_runpod_api_key:
-                            weather_task_args["runpod_api_key"] = self.weather_runpod_api_key
-                        try:
-                            self.weather_task = WeatherTask(**weather_task_args)
-                        except Exception as e:
-                            self.logger.error(f"Failed to instantiate WeatherTask: {e}", exc_info=True)
-                            self.weather_task = None
-
+                        self.logger.error("WeatherTask was None at startup despite WEATHER_MINER_ENABLED being true. This indicates a problem in __init__ - weather task should already exist!")
+                        # Don't create a new one here - this would be a duplicate ABC object creation
+                        # Instead, log the error and let the system handle it gracefully
+                        self.logger.error("Weather functionality will be disabled due to initialization failure")
+                    
                     if self.weather_task:
                         weather_inference_type = os.getenv("WEATHER_INFERENCE_TYPE", "local_model").lower()
                         service_url_env = self.weather_inference_service_url
@@ -518,15 +509,57 @@ class Miner:
             from collections import defaultdict
             import time
             
-            # Simple in-memory rate limiter
+            # Simple in-memory rate limiter with proper cleanup
             request_counts = defaultdict(list)
+            
+            async def cleanup_rate_limiter():
+                """Periodic cleanup of rate limiter to prevent memory leaks"""
+                while True:
+                    try:
+                        await asyncio.sleep(300)  # Clean every 5 minutes
+                        current_time = time.time()
+                        
+                        # Clean old requests and remove empty IP entries
+                        empty_ips = []
+                        for client_ip, requests in request_counts.items():
+                            # Remove old requests
+                            request_counts[client_ip] = [
+                                req_time for req_time in requests 
+                                if current_time - req_time < 60
+                            ]
+                            # Mark empty IPs for removal
+                            if not request_counts[client_ip]:
+                                empty_ips.append(client_ip)
+                        
+                        # Remove empty IP entries to prevent memory accumulation
+                        for ip in empty_ips:
+                            del request_counts[ip]
+                        
+                        if empty_ips:
+                            self.logger.debug(f"Rate limiter cleanup: Removed {len(empty_ips)} inactive IP entries")
+                        
+                        # Log memory usage periodically
+                        active_ips = len(request_counts)
+                        if active_ips > 100:  # Log if many IPs are being tracked
+                            self.logger.info(f"Rate limiter tracking {active_ips} IP addresses")
+                            
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        self.logger.warning(f"Error in rate limiter cleanup: {e}")
+            
+            # Start cleanup task
+            cleanup_task = asyncio.create_task(cleanup_rate_limiter())
+            
+            # Store cleanup task for shutdown
+            app.state.rate_limiter_cleanup = cleanup_task
             
             @app.middleware("http")
             async def rate_limit_middleware(request, call_next):
                 client_ip = request.client.host
                 current_time = time.time()
                 
-                # Clean old requests (older than 1 minute)
+                # Clean old requests for this IP (still needed for immediate cleanup)
                 request_counts[client_ip] = [
                     req_time for req_time in request_counts[client_ip] 
                     if current_time - req_time < 60

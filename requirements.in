@@ -1,6 +1,33 @@
+# CRITICAL: Exclude asyncio package to prevent multiprocessing failures
+# The asyncio v3.4.3 package uses 'async' as function name which conflicts with
+# Python 3.7+ where 'async' is a reserved keyword. This causes syntax errors
+# in multiprocessing workers. Always use Python's built-in asyncio module.
+# DO NOT install asyncio package separately!
+
+# PERFORMANCE: uvloop provides 2-4x faster async event loop performance
+# uvloop is a fast, drop-in replacement for asyncio event loop based on libuv.
+# Essential for validator performance with hundreds of concurrent miner connections.
+
+# PERFORMANCE: Ultra-fast JSON processing (2-3x faster than standard json)
+# orjson is critical for validator performance - heavy JSON usage in miner communication
+orjson
+
+# PERFORMANCE: Ultra-fast binary serialization (5-10x faster than pickle)
+# msgpack provides compact, fast serialization for internal data structures
+msgpack
+
+# PERFORMANCE: Fast compression for large data transfers
+# lz4 offers excellent speed/compression ratio for weather/geomagnetic data
+lz4
+
+# PERFORMANCE: Fast character encoding detection
+# cchardet (C-based) is much faster than chardet for text processing
+cchardet
+
 aiohttp
 asyncpg
 alembic
+uvloop
 boto3
 botocore
 cryptography
@@ -51,3 +78,4 @@ gcsfs
 aioboto3
 blosc 
 memray
+intake-xarray

@@ -253,6 +253,87 @@ The legacy scripts in `gaia/validator/sync/pgbackrest/` remain available but are
 
 For detailed logs, check `/var/log/pgbackrest/` and the validator application logs.
 
+## Common Issues and Solutions
+
+### Multiprocessing SyntaxError with 'async' keyword
+
+**Problem:** Validator crashes with `SyntaxError: invalid syntax` related to `async` keyword in multiprocessing workers.
+
+**Cause:** An old `asyncio` package (v3.4.3) was installed that uses `async` as a function name, but `async` became a reserved keyword in Python 3.7+.
+
+**Solution:** The validator automatically detects and fixes this issue on startup. However, to prevent it from happening:
+
+1. **Manual fix (immediate):**
+   ```bash
+   # Remove the problematic package
+   pip uninstall asyncio -y
+   
+   # Remove any remaining files
+   find ~/.local/lib/python*/site-packages -name "*asyncio*" -exec rm -rf {} +
+   find /usr/local/lib/python*/site-packages -name "*asyncio*" -exec rm -rf {} +
+   ```
+
+2. **Automatic prevention:** The validator now includes automatic detection and removal of problematic asyncio packages during startup.
+
+3. **Prevention in new installs:** Always use Python's built-in `asyncio` module. Never install the separate `asyncio` package on Python 3.7+.
+
+**Verification:** After fixing, test multiprocessing compatibility:
+```bash
+python -c "import asyncio, multiprocessing; print('✅ Asyncio import successful')"
+```
+
+### Excessive DEBUG Logging Spam
+
+**Problem:** Validator logs are flooded with hundreds of `"Logging mode is DEBUG"` messages from fiber modules.
+
+**Cause:** Every module logs its logging mode during import, and multiprocessing workers import modules independently.
+
+**Solution:** The validator automatically suppresses these verbose DEBUG messages by default.
+
+**Control options:**
+- **Default behavior:** DEBUG spam is suppressed for cleaner logs
+- **Enable all DEBUG messages:** Set `GAIA_ENABLE_DEBUG_SPAM=true` in your environment
+- **Only important messages are shown:** INFO level and above are still logged normally
+
+```bash
+# To see all DEBUG spam (not recommended in production)
+export GAIA_ENABLE_DEBUG_SPAM=true
+
+# Default behavior (recommended) - suppress spam
+unset GAIA_ENABLE_DEBUG_SPAM
+```
+
+### Multiprocessing Performance Configuration
+
+**Problem:** Small weather tasks may run slower with multiprocessing due to overhead.
+
+**Cause:** Process creation and module imports (~30-40 seconds) can exceed computation time for small workloads.
+
+**Solution:** Smart multiprocessing with configurable thresholds.
+
+**Configuration options:**
+```bash
+# Set minimum computations required for multiprocessing (default: 10)
+export GAIA_MP_THRESHOLD=20
+
+# Completely disable multiprocessing (forces sequential)
+export GAIA_DISABLE_MP=true
+
+# Default behavior (recommended) - auto-detect based on workload size
+unset GAIA_MP_THRESHOLD
+unset GAIA_DISABLE_MP
+```
+
+**When multiprocessing helps:**
+- ✅ Large weather scoring runs (10+ computations)
+- ✅ Production validation with many miners
+- ✅ Complex climatology computations
+
+**When to use sequential:**
+- ✅ Small test runs (< 10 computations)
+- ✅ Development/debugging
+- ✅ Memory-constrained systems
+
 ---
 
 ### Follow the Setup Guides for [Miner](docs/MINER.md) or [Validator](docs/VALIDATOR.md)

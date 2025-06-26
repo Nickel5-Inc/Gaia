@@ -54,6 +54,13 @@ async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: 
         target_pressure_levels_hpa: Optional[List[int]] = None
     ):
         """Synchronous function containing the blocking xarray/OPeNDAP logic."""
+        # THREADING FIX: Explicitly import netCDF4 in thread context to ensure backend availability
+        try:
+            import netCDF4
+            logger.debug("Successfully imported netCDF4 in thread context")
+        except ImportError as netcdf_err:
+            logger.warning(f"netCDF4 not available in thread context: {netcdf_err}")
+            
         logger.debug(f"Executing synchronous fetch for {run_time} in thread.")
         date_str = run_time.strftime('%Y%m%d')
         cycle_str = f"{run_time.hour:02d}"
@@ -374,24 +381,58 @@ async def fetch_gfs_analysis_data(
     cache_key = hashlib.md5("_anal_".join(time_strings).encode()).hexdigest()
     cache_filename = cache_dir / f"gfs_analysis_{cache_key}.nc"
 
+    # Check for both netCDF and pickle cache files
+    pickle_filename = cache_filename.with_suffix('.pkl')
+    cache_file_to_use = None
+    is_pickle = False
+    
     if cache_filename.exists():
+        cache_file_to_use = cache_filename
+        is_pickle = False
+    elif pickle_filename.exists():
+        cache_file_to_use = pickle_filename
+        is_pickle = True
+    
+    if cache_file_to_use:
         try:
             if progress_callback:
                 await progress_callback({
                     "operation": "gfs_download",
                     "stage": "loading_cache",
                     "progress": 0.5,
-                    "message": f"Loading cached GFS analysis from {cache_filename.name}"
+                    "message": f"Loading cached GFS analysis from {cache_file_to_use.name}"
                 })
             
-            logger.info(f"Loading cached GFS analysis data from: {cache_filename}")
-            ds_cached = xr.open_dataset(cache_filename)
+            logger.info(f"Loading cached GFS analysis data from: {cache_file_to_use}")
+            
+            if is_pickle:
+                import pickle
+                with open(cache_file_to_use, 'rb') as f:
+                    ds_cached = pickle.load(f)
+                logger.info("Successfully loaded GFS analysis from pickle cache")
+            else:
+                # Try different engines for netCDF loading
+                ds_cached = None
+                engines_to_try = ['netcdf4', 'scipy', 'h5netcdf']
+                
+                for engine in engines_to_try:
+                    try:
+                        ds_cached = xr.open_dataset(cache_file_to_use, engine=engine)
+                        logger.debug(f"Successfully loaded cache using '{engine}' engine")
+                        break
+                    except Exception as engine_err:
+                        logger.debug(f"Failed to load with '{engine}' engine: {engine_err}")
+                        continue
+                
+                if ds_cached is None:
+                    raise Exception("Failed to load with any netCDF engine")
+            
             target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
             if all(t_np_ns in ds_cached.time.values for t_np_ns in target_times_np_ns):
                 logger.info("GFS Analysis cache hit is valid.")
                 
                 if progress_callback:
-                    file_size = cache_filename.stat().st_size if cache_filename.exists() else 0
+                    file_size = cache_file_to_use.stat().st_size if cache_file_to_use.exists() else 0
                     await progress_callback({
                         "operation": "gfs_download",
                         "stage": "completed",
@@ -404,12 +445,13 @@ async def fetch_gfs_analysis_data(
                 return ds_cached
             else:
                 logger.warning("Cached GFS analysis file missing requested times. Re-fetching.")
-                ds_cached.close()
-                cache_filename.unlink()
+                if hasattr(ds_cached, 'close'):
+                    ds_cached.close()
+                cache_file_to_use.unlink()
         except Exception as e:
-            logger.warning(f"Failed load/validate GFS analysis cache {cache_filename}: {e}. Re-fetching.")
-            if cache_filename.exists():
-                try: cache_filename.unlink()
+            logger.warning(f"Failed load/validate GFS analysis cache {cache_file_to_use}: {e}. Re-fetching.")
+            if cache_file_to_use.exists():
+                try: cache_file_to_use.unlink()
                 except OSError: pass
 
     logger.info(f"GFS Analysis cache miss for times: {time_strings[0]}...{time_strings[-1]}. Fetching from NOMADS.")
@@ -423,6 +465,13 @@ async def fetch_gfs_analysis_data(
         })
 
     def _sync_fetch_and_process_analysis():
+        # THREADING FIX: Explicitly import netCDF4 in thread context to ensure backend availability
+        try:
+            import netCDF4
+            logger.debug("Successfully imported netCDF4 in thread context")
+        except ImportError as netcdf_err:
+            logger.warning(f"netCDF4 not available in thread context: {netcdf_err}")
+        
         analysis_slices = []
         progress_info = {"processed_files": 0, "total_files": len(target_times)}
         
@@ -451,6 +500,9 @@ async def fetch_gfs_analysis_data(
                     full_ds = xr.open_dataset(base_url, decode_times=False, chunks={})
                     logger.info(f"Successfully opened GFS dataset with decode_times=False. Raw time variable attributes: {full_ds.time.attrs}")
                     logger.info(f"Raw time variable sample values: {full_ds.time.values[:5] if len(full_ds.time.values) > 5 else full_ds.time.values}")
+                    
+                    # MEMORY LEAK FIX: Track dataset for cleanup
+                    dataset_to_cleanup = full_ds
                     
                     time_coordinate_decoded_successfully = False
                     try:
@@ -580,6 +632,21 @@ async def fetch_gfs_analysis_data(
 
                 except Exception as e:
                     logger.error(f"Failed to fetch/process analysis for original target {target_time}: {e}", exc_info=True)
+                finally:
+                    # MEMORY LEAK FIX: Always cleanup the full dataset to prevent accumulation
+                    if 'dataset_to_cleanup' in locals() and dataset_to_cleanup is not None:
+                        try:
+                            dataset_to_cleanup.close()
+                            del dataset_to_cleanup
+                            logger.debug(f"Cleaned up GFS dataset for {target_time}")
+                        except Exception as cleanup_err:
+                            logger.debug(f"Error during dataset cleanup for {target_time}: {cleanup_err}")
+                    
+                    # Force garbage collection after each time step to prevent accumulation
+                    if idx % 5 == 0:  # Every 5 iterations
+                        import gc
+                        collected = gc.collect()
+                        logger.debug(f"GC collected {collected} objects after processing {idx+1} time steps")
 
         if not analysis_slices:
             logger.error("Failed to fetch any valid GFS analysis slices.")
@@ -588,8 +655,29 @@ async def fetch_gfs_analysis_data(
         try:
             logger.info(f"Combining {len(analysis_slices)} analysis slices...")
             combined_ds = xr.concat(analysis_slices, dim='time')
+            
+            # MEMORY LEAK FIX: Clean up individual slices after concat to free memory
+            for slice_ds in analysis_slices:
+                try:
+                    slice_ds.close()
+                except:
+                    pass
+            analysis_slices.clear()
+            del analysis_slices
+            
+            # Force garbage collection after concat
+            import gc
+            collected = gc.collect()
+            logger.debug(f"Post-concat cleanup: freed {len(analysis_slices)} slices, GC collected {collected} objects")
+            
         except Exception as e_concat:
              logger.error(f"Failed to combine analysis slices: {e_concat}")
+             # Cleanup on error too
+             for slice_ds in analysis_slices:
+                 try:
+                     slice_ds.close()
+                 except:
+                     pass
              return None, progress_info
              
         logger.debug("Starting analysis dataset processing...")
@@ -679,7 +767,29 @@ async def fetch_gfs_analysis_data(
         try:
             logger.info(f"Saving processed GFS analysis data to cache: {cache_filename}")
             cache_dir.mkdir(parents=True, exist_ok=True)
-            processed_ds.to_netcdf(cache_filename)
+            
+            # Try different netCDF engines in order of preference
+            engines_to_try = ['netcdf4', 'scipy', 'h5netcdf']
+            saved_successfully = False
+            
+            for engine in engines_to_try:
+                try:
+                    processed_ds.to_netcdf(cache_filename, engine=engine)
+                    logger.info(f"Successfully saved GFS analysis cache using '{engine}' engine")
+                    saved_successfully = True
+                    break
+                except Exception as engine_err:
+                    logger.debug(f"Failed to save with '{engine}' engine: {engine_err}")
+                    continue
+            
+            if not saved_successfully:
+                # Final fallback: save as pickle (less efficient but works)
+                import pickle
+                pickle_filename = cache_filename.with_suffix('.pkl')
+                logger.warning(f"All netCDF engines failed, falling back to pickle format: {pickle_filename}")
+                with open(pickle_filename, 'wb') as f:
+                    pickle.dump(processed_ds, f)
+                logger.info(f"Successfully saved GFS analysis cache as pickle")
                 
         except Exception as e_cache:
             logger.error(f"Failed to save GFS analysis to cache {cache_filename}: {e_cache}")
