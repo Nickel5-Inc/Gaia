@@ -4,7 +4,7 @@ from typing import List, Optional
 import asyncio
 import traceback
 from fiber.chain import interface, chain_utils, weights as w
-from fiber.chain.fetch_nodes import get_nodes_for_netuid
+# Note: get_nodes_for_netuid replaced with process-isolated _fetch_nodes_process_isolated
 from fiber import SubstrateInterface
 from fiber.chain.interface import get_substrate
 import sys
@@ -80,6 +80,106 @@ class FiberWeightSetter:
         )
         self.timeout = timeout
 
+    async def _fetch_nodes_process_isolated(self, netuid: int):
+        """
+        Fetch nodes using process-isolated substrate queries to prevent ABC memory leaks.
+        This replaces the fiber library's get_nodes_for_netuid function.
+        """
+        try:
+            logger.debug(f"🛡️ Weight setter fetching nodes for netuid {netuid} using process-isolated substrate")
+            
+            # Use process-isolated substrate for all queries
+            substrate = get_process_isolated_substrate(
+                subtensor_network=self.network,
+                chain_endpoint=""  # Use default endpoint
+            )
+            
+            # Query node data using process isolation with longer timeout for complex operations
+            # Use 30s timeout since we're making many queries sequentially
+            timeout = 30.0
+            logger.debug(f"🛡️ Weight setter making {11} substrate queries with {timeout}s timeout each")
+            
+            hotkeys = substrate._run_substrate_operation("query", "SubtensorModule", "Hotkeys", [netuid], timeout)
+            coldkeys = substrate._run_substrate_operation("query", "SubtensorModule", "Coldkeys", [netuid], timeout)
+            stakes = substrate._run_substrate_operation("query", "SubtensorModule", "Stake", [netuid], timeout)
+            trust = substrate._run_substrate_operation("query", "SubtensorModule", "Trust", [netuid], timeout)
+            vtrust = substrate._run_substrate_operation("query", "SubtensorModule", "ValidatorTrust", [netuid], timeout)
+            incentive = substrate._run_substrate_operation("query", "SubtensorModule", "Incentive", [netuid], timeout)
+            emission = substrate._run_substrate_operation("query", "SubtensorModule", "Emission", [netuid], timeout)
+            consensus = substrate._run_substrate_operation("query", "SubtensorModule", "Consensus", [netuid], timeout)
+            dividends = substrate._run_substrate_operation("query", "SubtensorModule", "Dividends", [netuid], timeout)
+            last_update = substrate._run_substrate_operation("query", "SubtensorModule", "LastUpdate", [netuid], timeout)
+            
+            # Get axon info with extended timeout
+            axons = substrate._run_substrate_operation("query", "SubtensorModule", "Axons", [netuid], timeout)
+            
+            # Build node objects (similar to fiber's get_nodes_for_netuid)
+            nodes = []
+            
+            if hotkeys and len(hotkeys) > 0:
+                for i, hotkey in enumerate(hotkeys):
+                    try:
+                        # Create a Node-like object with the data
+                        from types import SimpleNamespace
+                        
+                        node = SimpleNamespace()
+                        node.node_id = i
+                        node.hotkey = hotkey
+                        node.coldkey = coldkeys[i] if i < len(coldkeys) else ""
+                        
+                        # Handle stake (might be in different format)
+                        if stakes and i < len(stakes):
+                            stake_value = stakes[i]
+                            # Convert stake to float (handle different formats)
+                            if isinstance(stake_value, dict):
+                                node.stake = float(sum(stake_value.values())) if stake_value else 0.0
+                            else:
+                                node.stake = float(stake_value) if stake_value else 0.0
+                        else:
+                            node.stake = 0.0
+                        
+                        # Set other attributes with safe indexing
+                        node.trust = float(trust[i]) if trust and i < len(trust) else 0.0
+                        node.vtrust = float(vtrust[i]) if vtrust and i < len(vtrust) else 0.0
+                        node.incentive = float(incentive[i]) if incentive and i < len(incentive) else 0.0
+                        node.emission = float(emission[i]) if emission and i < len(emission) else 0.0
+                        node.consensus = float(consensus[i]) if consensus and i < len(consensus) else 0.0
+                        node.dividends = float(dividends[i]) if dividends and i < len(dividends) else 0.0
+                        node.last_update = int(last_update[i]) if last_update and i < len(last_update) else 0
+                        
+                        # Handle axon info
+                        if axons and i < len(axons):
+                            axon_info = axons[i]
+                            if axon_info:
+                                node.ip = axon_info.get('ip', '')
+                                node.port = int(axon_info.get('port', 0))
+                                node.ip_type = int(axon_info.get('ip_type', 4))
+                                node.protocol = int(axon_info.get('protocol', 4))
+                            else:
+                                node.ip = ''
+                                node.port = 0
+                                node.ip_type = 4
+                                node.protocol = 4
+                        else:
+                            node.ip = ''
+                            node.port = 0
+                            node.ip_type = 4
+                            node.protocol = 4
+                        
+                        nodes.append(node)
+                        
+                    except Exception as e:
+                        logger.warning(f"Error processing weight setter node {i}: {e}")
+                        continue
+            
+            logger.info(f"🛡️ Weight setter process-isolated node fetch completed: {len(nodes)} nodes (NO ABC memory leak)")
+            return nodes
+            
+        except Exception as e:
+            logger.error(f"Error in weight setter process-isolated node fetching: {e}")
+            logger.error(traceback.format_exc())
+            return []
+
     def cleanup(self):
         """No cleanup needed with process-isolated substrate."""
         logger.debug("🛡️ No cleanup needed - process-isolated substrate handles cleanup automatically")
@@ -90,13 +190,17 @@ class FiberWeightSetter:
 
 
 
-    def calculate_weights(self, weights: List[float] = None) -> tuple[torch.Tensor, List[int]]:
+    async def calculate_weights(self, weights: List[float] = None) -> tuple[torch.Tensor, List[int]]:
         """Convert input weights to normalized tensor with min/max bounds"""
         if weights is None:
             logger.warning("No weights provided")
             return None, []
 
-        nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid) if self.nodes is None else self.nodes
+        # Use process-isolated node fetching to prevent ABC memory leaks
+        if self.nodes is None:
+            nodes = await self._fetch_nodes_process_isolated(self.netuid)
+        else:
+            nodes = self.nodes
         node_ids = [node.node_id for node in nodes]
 
 
@@ -214,7 +318,7 @@ class FiberWeightSetter:
                 chain_endpoint=""  # Use default endpoint
             )
             logger.info("✅ Process-isolated substrate connection created for weight setting")
-            self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
+            self.nodes = await self._fetch_nodes_process_isolated(self.netuid)
             logger.info(f"Found {len(self.nodes)} nodes in subnet")
 
             validator_uid = self.substrate.query(
@@ -243,7 +347,7 @@ class FiberWeightSetter:
                         logger.info(f"Setting validator UID {uid} weight to zero (was {weights_copy[uid]:.6f})")
                         weights_copy[uid] = 0.0
 
-            calculated_weights, node_ids = self.calculate_weights(weights_copy)
+            calculated_weights, node_ids = await self.calculate_weights(weights_copy)
             if calculated_weights is None:
                 logger.warning("No weights calculated - skipping weight setting")
                 return False
