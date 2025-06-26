@@ -59,8 +59,8 @@ class BaseDatabaseManager(ABC):
     # Operation constants
     DEFAULT_BATCH_SIZE = 1000
     MAX_RETRIES = 3
-    MAX_CONNECTIONS = 60  # Use 80 total: Reserve 20 for pgBackRest, admin, monitoring
-    MAX_OVERFLOW = 20     # Burst capacity, total max = 80 connections
+    MAX_CONNECTIONS = 40  # REDUCED: 60->40 to reduce thread contention 
+    MAX_OVERFLOW = 10     # REDUCED: 20->10, total max = 50 connections
     
     # Pool health check settings
     POOL_HEALTH_CHECK_INTERVAL = 30  # REDUCED from 60 to 30 for faster detection

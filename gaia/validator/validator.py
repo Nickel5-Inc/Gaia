@@ -398,17 +398,17 @@ class GaiaValidator:
         ssl_context.verify_mode = ssl.CERT_NONE
         
         self.miner_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0),
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=3.0),  # REDUCED: 120s->30s read, 10s->5s connect
             follow_redirects=True,
             verify=False,
             limits=httpx.Limits(
-                max_connections=100,  # Restore higher limit for 200+ miners
-                max_keepalive_connections=50,  # Allow more keepalive for efficiency
-                keepalive_expiry=300,  # 5 minutes - good balance for regular queries
+                max_connections=60,   # REDUCED: 100->60 to prevent resource exhaustion
+                max_keepalive_connections=20,  # REDUCED: 50->20 to reduce memory pressure
+                keepalive_expiry=60,  # REDUCED: 300->60 seconds for faster cleanup
             ),
             transport=httpx.AsyncHTTPTransport(
-                retries=2,  # Reduced from 3
-                verify=False,  # Explicitly set verify=False on transport
+                retries=1,  # REDUCED: 2->1 to fail faster
+                verify=False,
             ),
         )
         # Client for API communication with SSL verification enabled
@@ -923,23 +923,23 @@ class GaiaValidator:
                 ssl_context.verify_mode = ssl.CERT_NONE
                 
                 self.miner_client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0),
+                    timeout=httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=3.0),  # REDUCED timeouts
                     follow_redirects=True,
                     verify=False,
                     limits=httpx.Limits(
-                        max_connections=100,  # Restore higher limit for 200+ miners
-                        max_keepalive_connections=50,  # Allow more keepalive for efficiency
-                        keepalive_expiry=300,  # 5 minutes - good balance for regular queries
+                        max_connections=60,   # REDUCED: 100->60
+                        max_keepalive_connections=20,  # REDUCED: 50->20
+                        keepalive_expiry=60,  # REDUCED: 300->60 seconds
                     ),
                     transport=httpx.AsyncHTTPTransport(
-                        retries=2,  # Reduced from 3
-                        verify=False,  # Explicitly set verify=False on transport
+                        retries=1,  # REDUCED: 2->1
+                        verify=False,
                     ),
                 )
 
             # Use chunked processing to reduce database contention and memory spikes
-            chunk_size = 50  # Process miners in chunks of 50
-            chunk_concurrency = 15  # Lower concurrency per chunk to reduce DB pressure
+            chunk_size = 30  # REDUCED: 50->30 for better resource management
+            chunk_concurrency = 6   # REDUCED: 15->6 to prevent thread/connection exhaustion
             chunks = []
             
             # Split miners into chunks
@@ -951,8 +951,8 @@ class GaiaValidator:
             logger.info(f"Processing {len(miners_to_query)} miners in {len(chunks)} chunks of {chunk_size} (concurrency: {chunk_concurrency} per chunk)")
 
             # Configuration for immediate retries
-            max_retries_per_miner = 2  # Total of 2 attempts (1 initial + 1 retry)
-            base_timeout = 15.0
+            max_retries_per_miner = 1  # REDUCED: 2->1 attempts to fail faster
+            base_timeout = 10.0  # REDUCED: 15->10 seconds for faster failure detection
             
             async def query_single_miner_with_retries(miner_hotkey: str, node, semaphore: asyncio.Semaphore) -> Optional[Dict]:
                 """Query a single miner with immediate retries on failure."""
@@ -1035,7 +1035,7 @@ class GaiaValidator:
                                         payload=payload,  # REUSE SAME PAYLOAD REFERENCE - NO COPYING!
                                         endpoint=endpoint,
                                     ),
-                                    timeout=240.0  # Keep longer timeout for actual request
+                                    timeout=45.0  # REDUCED: 240s->45s to prevent connection hanging
                                 )
                                 request_duration = time.time() - request_start_time
                                 
@@ -1190,9 +1190,13 @@ class GaiaValidator:
                 except Exception as cleanup_err:
                     logger.debug(f"Error during chunk cleanup: {cleanup_err}")
                 
-                # Small delay between chunks to allow database recovery
+                # Aggressive connection cleanup between chunks to prevent accumulation
                 if chunk_idx < len(chunks) - 1:  # Don't delay after the last chunk
                     await asyncio.sleep(0.5)  # 500ms delay between chunks
+                    
+                    # Force connection cleanup every few chunks to prevent SSL hanging
+                    if (chunk_idx + 1) % 3 == 0:  # Every 3 chunks
+                        await self._aggressive_connection_cleanup()
 
             total_time = time.time() - start_time
             
@@ -1282,6 +1286,47 @@ class GaiaValidator:
                         
         except Exception as e:
             logger.debug(f"Error during connection cleanup: {e}")
+
+    async def _aggressive_connection_cleanup(self):
+        """Aggressively close all idle and potentially hanging connections."""
+        try:
+            if hasattr(self, 'miner_client') and not self.miner_client.is_closed:
+                # Force close ALL idle connections, not just stale ones
+                if hasattr(self.miner_client, '_transport') and hasattr(self.miner_client._transport, '_pool'):
+                    pool = self.miner_client._transport._pool
+                    if hasattr(pool, '_connections'):
+                        connections = pool._connections
+                        closed_count = 0
+                        
+                        # Handle both dict and list cases
+                        if hasattr(connections, 'items'):  # Dict-like
+                            connection_items = list(connections.items())
+                            for key, conn in connection_items:
+                                # Close ALL idle connections (no time check)
+                                if hasattr(conn, 'is_idle') and conn.is_idle():
+                                    try:
+                                        await conn.aclose()
+                                        del connections[key]
+                                        closed_count += 1
+                                        logger.debug(f"Aggressively closed idle connection to {key}")
+                                    except Exception as e:
+                                        logger.debug(f"Error closing connection: {e}")
+                        else:  # List-like
+                            for conn in list(connections):
+                                if hasattr(conn, 'is_idle') and conn.is_idle():
+                                    try:
+                                        await conn.aclose()
+                                        connections.remove(conn)
+                                        closed_count += 1
+                                        logger.debug(f"Aggressively closed idle connection")
+                                    except Exception as e:
+                                        logger.debug(f"Error closing connection: {e}")
+                    
+                        if closed_count > 0:
+                            logger.info(f"Aggressively cleaned up {closed_count} idle connections")
+                        
+        except Exception as e:
+            logger.debug(f"Error during aggressive connection cleanup: {e}")
 
     def _log_memory_usage(self, context: str, threshold_mb: float = 100.0):
         """Enhanced memory logging with detailed breakdown and automatic cleanup."""
