@@ -973,7 +973,7 @@ class SoilMoistureTask(Task):
                                     UPDATE soil_moisture_predictions
                                     SET retry_count = COALESCE(retry_count, 0) + 1,
                                         next_retry_time = :next_retry_time,
-                                        last_error = :error_message,
+                                        retry_error_message = :error_message,
                                         status = 'retry_scheduled'
                                     WHERE region_id = :region_id
                                     AND miner_uid = :miner_uid
@@ -1000,7 +1000,7 @@ class SoilMoistureTask(Task):
                                     UPDATE soil_moisture_predictions
                                     SET retry_count = COALESCE(retry_count, 0) + 1,
                                         next_retry_time = :next_retry_time,
-                                        last_error = :error_message,
+                                        retry_error_message = :error_message,
                                         status = 'retry_scheduled'
                                     WHERE region_id = :region_id
                                     AND miner_uid = :miner_uid
@@ -1143,7 +1143,7 @@ class SoilMoistureTask(Task):
                                         UPDATE soil_moisture_predictions
                                         SET retry_count = COALESCE(retry_count, 0) + 1,
                                             next_retry_time = :next_retry_time,
-                                            last_error = :error_message,
+                                            retry_error_message = :error_message,
                                             status = 'retry_scheduled'
                                         WHERE region_id = :region_id
                                         AND miner_uid = :miner_uid
@@ -1601,7 +1601,7 @@ class SoilMoistureTask(Task):
                         'miner_hotkey', p.miner_hotkey,
                         'retry_count', p.retry_count,
                         'next_retry_time', p.next_retry_time,
-                        'last_error', p.last_error,
+                        'retry_error_message', p.retry_error_message,
                         'surface_sm', p.surface_sm,
                         'rootzone_sm', p.rootzone_sm,
                         'uncertainty_surface', p.uncertainty_surface,
@@ -1629,12 +1629,12 @@ class SoilMoistureTask(Task):
                     -- Processing/scoring errors - immediate retry on startup
                     (
                         p.status IN ('sent_to_miner', 'retry_scheduled')
-                        AND p.last_error IS NOT NULL
+                        AND p.retry_error_message IS NOT NULL
                         AND (
-                            p.last_error LIKE '%processing%' OR
-                            p.last_error LIKE '%scoring%' OR
-                            p.last_error LIKE '%calculate%' OR
-                            p.last_error LIKE '%_FillValue%'
+                            p.retry_error_message LIKE '%processing%' OR
+                            p.retry_error_message LIKE '%scoring%' OR
+                            p.retry_error_message LIKE '%calculate%' OR
+                            p.retry_error_message LIKE '%_FillValue%'
                         )
                         AND COALESCE(p.retry_count, 0) < 10
                     )
@@ -1668,14 +1668,14 @@ class SoilMoistureTask(Task):
             
             for task in eligible_tasks:
                 for pred in task["predictions"]:
-                    last_error = pred.get("last_error", "") or ""
+                    retry_error_message = pred.get("retry_error_message", "") or ""
                     
                     if pred.get("next_retry_time"):
                         scheduled_retries += 1
                     else:
                         old_pending += 1
                     
-                    if last_error and any(keyword in last_error.lower() for keyword in ['processing', 'scoring', 'calculate', '_fillvalue']):
+                    if retry_error_message and any(keyword in retry_error_message.lower() for keyword in ['processing', 'scoring', 'calculate', '_fillvalue']):
                         processing_errors += 1
                         # Force immediate retry for processing/scoring errors
                         immediate_retry_query = """
@@ -1728,17 +1728,17 @@ class SoilMoistureTask(Task):
             logger.info(f"🔧 Forcing immediate retries for error types: {error_types}")
             
             # Find all tasks with these error types
-            filter_conditions = " OR ".join([f"p.last_error ILIKE '%{error_type}%'" for error_type in error_types])
+            filter_conditions = " OR ".join([f"p.retry_error_message ILIKE '%{error_type}%'" for error_type in error_types])
             
             force_retry_query = f"""
                 UPDATE soil_moisture_predictions
                 SET next_retry_time = :immediate_time,
                     status = 'retry_scheduled'
                 WHERE status IN ('sent_to_miner', 'retry_scheduled')
-                AND last_error IS NOT NULL
+                AND retry_error_message IS NOT NULL
                 AND ({filter_conditions})
                 AND COALESCE(retry_count, 0) < 10
-                RETURNING miner_uid, target_time, last_error
+                RETURNING miner_uid, target_time, retry_error_message
             """
             
             updated_tasks = await self.db_manager.fetch_all(force_retry_query, {
@@ -1748,7 +1748,7 @@ class SoilMoistureTask(Task):
             if updated_tasks:
                 logger.info(f"✅ Forced immediate retry for {len(updated_tasks)} stuck tasks")
                 for task in updated_tasks:
-                    logger.info(f"   - Miner {task['miner_uid']} at {task['target_time']}: {task['last_error']}")
+                    logger.info(f"   - Miner {task['miner_uid']} at {task['target_time']}: {task['retry_error_message']}")
                 
                 # Trigger scoring immediately
                 logger.info("🚀 Starting forced retry scoring...")

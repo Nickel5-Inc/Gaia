@@ -726,7 +726,7 @@ class SoilScoringMechanism(ScoringMechanism):
                 UPDATE soil_moisture_predictions
                 SET retry_count = COALESCE(retry_count, 0) + 1,
                     next_retry_time = :next_retry_time,
-                    last_error = :error_message,
+                    retry_error_message = :error_message,
                     status = 'retry_scheduled'
                 WHERE miner_uid = :miner_id
                 AND target_time = :target_date
