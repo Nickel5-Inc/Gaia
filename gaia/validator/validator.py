@@ -2006,7 +2006,7 @@ class GaiaValidator:
             
             # Query node data using process isolation with longer timeout for complex operations
             # Use 30s timeout since we're making many queries sequentially
-            timeout = 30.0
+            timeout = 90.0
             logger.debug(f"🛡️ Making {13} substrate queries with {timeout}s timeout each")
             
             hotkeys = substrate._run_substrate_operation("query", "SubtensorModule", "Hotkeys", [netuid], timeout)
