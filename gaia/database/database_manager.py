@@ -59,19 +59,25 @@ class BaseDatabaseManager(ABC):
     # Operation constants
     DEFAULT_BATCH_SIZE = 1000
     MAX_RETRIES = 3
-    MAX_CONNECTIONS = 20
+    MAX_CONNECTIONS = 40  # REDUCED: 60->40 to reduce thread contention 
+    MAX_OVERFLOW = 10     # REDUCED: 20->10, total max = 50 connections
     
     # Pool health check settings
-    POOL_HEALTH_CHECK_INTERVAL = 60  # seconds
+    POOL_HEALTH_CHECK_INTERVAL = 30  # REDUCED from 60 to 30 for faster detection
     POOL_RECOVERY_ATTEMPTS = 3
 
     # Circuit breaker settings
-    CIRCUIT_BREAKER_THRESHOLD = 5
-    CIRCUIT_BREAKER_RECOVERY_TIME = 60  # seconds
+    CIRCUIT_BREAKER_THRESHOLD = 3  # REDUCED from 5 to 3 for faster response
+    CIRCUIT_BREAKER_RECOVERY_TIME = 30  # REDUCED from 60 to 30 seconds
+
+    # Connection pool aggressive settings for high-load environments
+    POOL_PRE_PING_TIMEOUT = 5      # Fast ping timeout
+    POOL_AGGRESSIVE_CLEANUP_THRESHOLD = 0.7  # Clean when 70% of connections in use
+    POOL_FORCE_RESET_THRESHOLD = 0.9        # Force reset when 90% of connections in use
 
     # New timeout constants for finer control
-    CONNECTION_TEST_TIMEOUT = 20  # More aggressive timeout for simple SELECT 1 in _test_connection
-    ENGINE_COMMAND_TIMEOUT = 20   # Default command timeout for asyncpg, affects pool_pre_ping
+    CONNECTION_TEST_TIMEOUT = 10  # REDUCED from 20 for faster failure detection
+    ENGINE_COMMAND_TIMEOUT = 15   # REDUCED from 20 for faster timeout
 
     # Operation statuses
     STATUS_PENDING = 'pending'
@@ -283,6 +289,9 @@ class BaseDatabaseManager(ABC):
             return None
 
     async def check_health(self) -> Dict[str, Any]:
+        # Get detailed pool statistics
+        pool_stats = self._get_pool_statistics()
+        
         health_info = {
             'status': 'healthy',
             'timestamp': time.time(),
@@ -290,7 +299,8 @@ class BaseDatabaseManager(ABC):
                 'active_sessions': len(self._active_sessions),
                 'operations': self._active_operations,
                 'last_pool_check': self._last_pool_check,
-                'pool_healthy': self._pool_health_status
+                'pool_healthy': self._pool_health_status,
+                'statistics': pool_stats
             },
             'circuit_breaker': {
                 'status': self._circuit_breaker['status'],
@@ -301,6 +311,18 @@ class BaseDatabaseManager(ABC):
             'connection_test': False,
             'errors': []
         }
+        
+        # Check for connection leaks
+        leak_info = await self._detect_connection_leaks()
+        health_info['leak_detection'] = leak_info
+        
+        # Warn if pool utilization is high
+        utilization = pool_stats.get('utilization', 0.0)
+        if utilization > 0.7:
+            health_info['errors'].append(f"High pool utilization: {utilization:.1%}")
+            if utilization > 0.9:
+                health_info['status'] = 'critical'
+        
         try:
             async with self.session(operation_name="check_health_select_1") as session: # Added operation_name
                 await session.execute(text("SELECT 1"))
@@ -308,6 +330,7 @@ class BaseDatabaseManager(ABC):
         except Exception as e:
             health_info['status'] = 'unhealthy'
             health_info['errors'].append(str(e))
+            
         return health_info
 
     async def _check_pool_health(self) -> bool:
@@ -320,6 +343,28 @@ class BaseDatabaseManager(ABC):
                     logger.error("Database engine not initialized")
                     self._pool_health_status = False
                     return False
+                
+                # Get pool statistics for monitoring
+                pool_stats = self._get_pool_statistics()
+                pool_utilization = pool_stats.get('utilization', 0.0)
+                
+                # Log pool stats for visibility
+                logger.info(f"Pool health check - Utilization: {pool_utilization:.1%}, "
+                          f"Active: {pool_stats.get('checked_out', 0)}, "
+                          f"Available: {pool_stats.get('checked_in', 0)}, "
+                          f"Total: {pool_stats.get('size', 0)}")
+                
+                # Aggressive cleanup if pool utilization is high
+                if pool_utilization >= self.POOL_AGGRESSIVE_CLEANUP_THRESHOLD:
+                    logger.warning(f"High pool utilization ({pool_utilization:.1%}) - performing aggressive cleanup")
+                    await self._aggressive_pool_cleanup()
+                
+                # Force pool reset if utilization is critical
+                if pool_utilization >= self.POOL_FORCE_RESET_THRESHOLD:
+                    logger.error(f"Critical pool utilization ({pool_utilization:.1%}) - forcing pool reset")
+                    await self.reset_pool()
+                    return True  # Reset successful, pool is now healthy
+                
                 healthy = await self._ensure_pool()
                 if not healthy:
                     logger.warning("Pool health check failed - attempting recovery")
@@ -359,6 +404,97 @@ class BaseDatabaseManager(ABC):
                 self._pool_health_status = False
                 return False
 
+    def _get_pool_statistics(self) -> Dict[str, Any]:
+        """Get detailed connection pool statistics."""
+        stats = {
+            'size': 0,
+            'checked_in': 0,
+            'checked_out': 0,
+            'overflow': 0,
+            'invalid': 0,
+            'utilization': 0.0,
+            'total_capacity': 0
+        }
+        
+        if not self._engine or not hasattr(self._engine, 'pool'):
+            return stats
+        
+        try:
+            pool = self._engine.pool
+            stats['size'] = pool.size()
+            stats['checked_in'] = pool.checkedin()
+            stats['checked_out'] = pool.checked_out()
+            stats['overflow'] = pool.overflow()
+            stats['invalid'] = pool.invalid()
+            
+            total_capacity = self.MAX_CONNECTIONS + self.MAX_OVERFLOW
+            stats['total_capacity'] = total_capacity
+            
+            if total_capacity > 0:
+                stats['utilization'] = stats['checked_out'] / total_capacity
+                
+        except Exception as e:
+            logger.debug(f"Error getting pool statistics: {e}")
+            
+        return stats
+
+    async def _aggressive_pool_cleanup(self):
+        """Perform aggressive connection pool cleanup to free up connections."""
+        if not self._engine:
+            return
+            
+        try:
+            logger.info("Starting aggressive pool cleanup")
+            
+            # Force close any idle connections that have been sitting around
+            pool = self._engine.pool
+            if hasattr(pool, 'invalidate'):
+                # Invalidate connections that might be stale
+                pool.invalidate()
+                logger.info("Invalidated potentially stale connections")
+            
+            # Clear any tracked sessions that might be holding connections
+            if len(self._active_sessions) > 0:
+                logger.warning(f"Clearing {len(self._active_sessions)} tracked sessions that may be holding connections")
+                self._active_sessions.clear()
+                self._active_operations = 0
+            
+            # Force garbage collection to clean up any unreferenced connections
+            import gc
+            collected = gc.collect()
+            logger.info(f"Aggressive cleanup: garbage collected {collected} objects")
+            
+        except Exception as e:
+            logger.error(f"Error during aggressive pool cleanup: {e}")
+
+    async def _detect_connection_leaks(self) -> Dict[str, Any]:
+        """Detect potential connection leaks and provide diagnostics."""
+        leak_info = {
+            'potential_leaks': False,
+            'session_count': len(self._active_sessions),
+            'operations_count': self._active_operations,
+            'pool_stats': self._get_pool_statistics(),
+            'recommendations': []
+        }
+        
+        pool_stats = leak_info['pool_stats']
+        utilization = pool_stats.get('utilization', 0.0)
+        
+        # Check for signs of connection leaks
+        if utilization > 0.8:
+            leak_info['potential_leaks'] = True
+            leak_info['recommendations'].append(f"High pool utilization: {utilization:.1%}")
+        
+        if pool_stats.get('checked_out', 0) > pool_stats.get('size', 0) * 0.7:
+            leak_info['potential_leaks'] = True
+            leak_info['recommendations'].append("Many connections checked out for extended period")
+        
+        if len(self._active_sessions) > 10:
+            leak_info['potential_leaks'] = True
+            leak_info['recommendations'].append(f"High number of tracked sessions: {len(self._active_sessions)}")
+        
+        return leak_info
+
     async def _initialize_engine(self) -> bool:
         if not self.db_url:
             raise DatabaseError("Database URL not initialized")
@@ -370,16 +506,17 @@ class BaseDatabaseManager(ABC):
                 self.db_url,
                 pool_pre_ping=True,
                 pool_size=self.MAX_CONNECTIONS,
-                max_overflow=10,
+                max_overflow=self.MAX_OVERFLOW,
                 pool_timeout=self.DEFAULT_CONNECTION_TIMEOUT,
-                pool_recycle=3600,
+                pool_recycle=1800,  # REDUCED from 3600 to 1800 for faster connection refresh
                 pool_use_lifo=True,
                 echo=False,
                 connect_args={
                     "command_timeout": self.ENGINE_COMMAND_TIMEOUT,
                     "timeout": self.DEFAULT_CONNECTION_TIMEOUT,
                     "server_settings": {
-                        "jit": "off"
+                        "jit": "off",
+                        "application_name": f"gaia_{self.node_type}_{os.getpid()}"
                     },
                 },
             )

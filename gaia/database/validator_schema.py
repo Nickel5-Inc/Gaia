@@ -108,7 +108,8 @@ soil_moisture_history_table = sa.Table('soil_moisture_history', validator_metada
     sa.Column('rootzone_rmse', sa.Float, nullable=True),
     sa.Column('surface_structure_score', sa.Float, nullable=True),
     sa.Column('rootzone_structure_score', sa.Float, nullable=True),
-    sa.Column('scored_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False)
+    sa.Column('scored_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    sa.UniqueConstraint('region_id', 'miner_uid', 'target_time', name='uq_smh_region_miner_target_time')
 )
 sa.Index('idx_smh_region_id', soil_moisture_history_table.c.region_id)
 sa.Index('idx_smh_miner_uid', soil_moisture_history_table.c.miner_uid)

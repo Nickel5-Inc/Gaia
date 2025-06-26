@@ -1,8 +1,17 @@
 import base64
-import json
 import pickle
 import logging
 from typing import Any, Dict, Optional
+
+# High-performance JSON operations for inference service
+try:
+    from gaia.utils.performance import loads
+    JSON_PERFORMANCE_AVAILABLE = True
+except ImportError:
+    import json
+    def loads(s):
+        return json.loads(s)
+    JSON_PERFORMANCE_AVAILABLE = False
 
 # Conditional import for Batch type hint
 try:
@@ -21,7 +30,11 @@ async def prepare_input_batch_from_payload(payload_str: str, config: Dict[str, A
     The payload_str is expected to be a JSON string containing a "serialized_aurora_batch" field.
     """
     try:
-        payload_dict = json.loads(payload_str)
+        # Use high-performance JSON parsing
+        payload_dict = loads(payload_str)
+        if JSON_PERFORMANCE_AVAILABLE:
+            logger.debug("Using orjson for inference payload JSON parsing")
+            
         # Expect "batch_data" from WeatherTask
         if "batch_data" not in payload_dict:
             logger.error("\'batch_data\' field missing in the JSON payload.")
@@ -49,8 +62,8 @@ async def prepare_input_batch_from_payload(payload_str: str, config: Dict[str, A
         logger.info("Successfully deserialized input Aurora Batch.")
         return deserialized_batch
 
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in payload: {e}")
+    except Exception as e:  # Catch all JSON parsing exceptions
+        logger.error(f"JSON parsing error in payload: {e}")
         return None
     except base64.binascii.Error as e:
         logger.error(f"Base64 decoding error: {e}")

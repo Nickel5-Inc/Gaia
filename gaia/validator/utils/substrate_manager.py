@@ -1,6 +1,8 @@
 import time
 import gc
-from typing import Optional, Dict, Tuple
+import threading
+from typing import Optional
+from contextlib import contextmanager
 from fiber.chain.interface import get_substrate
 from substrateinterface import SubstrateInterface
 from fiber.logging_utils import get_logger
@@ -8,284 +10,315 @@ from fiber.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-class SubstrateConnectionManager:
+class SubstrateManager:
     """
-    Manages substrate connections to prevent memory leaks from frequent reconnections.
-    Reuses connections when possible and properly cleans up old ones.
-    Implements singleton pattern to ensure only one manager per network/endpoint combination.
-    Enhanced with aggressive memory management to handle scalecodec memory leaks.
+    Substrate connection manager that prevents memory leaks with always-fresh connections.
+    
+    Key principles:
+    1. ALWAYS create fresh connections (dispose old, create new) to prevent memory leaks
+    2. Manager instance stays stable - only recreated when network changes
+    3. Thorough cleanup of scalecodec caches when disposing connections  
+    4. Thread-safe operations
+    5. Handles endpoint changes gracefully without manager recreation
+    
+    This manager prioritizes memory leak prevention over connection reuse.
     """
-    
-    _instances: Dict[Tuple[str, str], 'SubstrateConnectionManager'] = {}
-    _lock = None
-    
-    def __new__(cls, subtensor_network: str, chain_endpoint: str):
-        """Ensure singleton behavior per network/endpoint combination."""
-        import threading
-        
-        # Initialize lock if not exists (thread-safe)
-        if cls._lock is None:
-            cls._lock = threading.Lock()
-        
-        key = (subtensor_network, chain_endpoint)
-        
-        with cls._lock:
-            if key not in cls._instances:
-                instance = super().__new__(cls)
-                cls._instances[key] = instance
-                logger.info(f"Created new SubstrateConnectionManager singleton for {subtensor_network}@{chain_endpoint}")
-            else:
-                logger.debug(f"Reusing existing SubstrateConnectionManager for {subtensor_network}@{chain_endpoint}")
-            
-            return cls._instances[key]
     
     def __init__(self, subtensor_network: str, chain_endpoint: str):
-        # Prevent re-initialization of singleton instances
-        if hasattr(self, '_initialized'):
-            return
-            
         self.subtensor_network = subtensor_network
         self.chain_endpoint = chain_endpoint
-        self._connection: Optional[SubstrateInterface] = None
-        self._last_used = 0
-        self._max_age = 600  # Further reduced to 10 minutes for more frequent refreshes
+        self._current_connection: Optional[SubstrateInterface] = None
+        self._connection_created_at: Optional[float] = None
+        self._lock = threading.Lock()
         self._connection_count = 0
-        self._query_count = 0  # Track number of queries to detect heavy usage
-        self._last_cleanup = time.time()
-        self._cleanup_interval = 180  # Force cleanup every 3 minutes (reduced from 5)
-        self._initialized = True
-        logger.info(f"SubstrateConnectionManager initialized for network: {subtensor_network}")
+        
+        logger.info(f"SubstrateManager initialized for {subtensor_network}@{chain_endpoint}")
     
-    def get_connection(self) -> SubstrateInterface:
-        """Get a substrate connection, reusing existing one if recent enough with enhanced cleanup."""
-        now = time.time()
-        
-        # Check if we need periodic cleanup or a new connection
-        needs_cleanup = (now - self._last_cleanup > self._cleanup_interval)
-        needs_new_connection = (
-            self._connection is None or 
-            (now - self._last_used > self._max_age) or
-            self._query_count > 150  # Further reduced from 250 for more aggressive refreshes
-        )
-        
-        if needs_cleanup:
-            self._force_garbage_collection()
+    def get_fresh_connection(self) -> SubstrateInterface:
+        """
+        Get a fresh substrate connection. Always disposes old connection and creates new one.
+        This prevents connection stacking and memory accumulation.
+        """
+        with self._lock:
+            # ALWAYS dispose existing connection first - no reuse, always fresh
+            if self._current_connection is not None:
+                logger.debug("🧹 Disposing old connection to create fresh one")
+                self._dispose_connection_thoroughly(self._current_connection)
+                self._current_connection = None
             
-        if needs_new_connection:
-            # Clean up old connection first with enhanced cleanup
-            if self._connection is not None:
-                try:
-                    logger.debug(f"Cleaning up old substrate connection (age: {now - self._last_used:.1f}s, queries: {self._query_count})")
-                    
-                    # More aggressive cleanup for scalecodec objects
-                    if hasattr(self._connection, 'websocket') and self._connection.websocket:
-                        try:
-                            self._connection.websocket.close()
-                        except Exception:
-                            pass
-                    
-                    # Clear any cached data in the connection
-                    if hasattr(self._connection, '_request_cache'):
-                        self._connection._request_cache.clear()
-                    
-                    # Clear substrate interface internal caches if they exist
-                    if hasattr(self._connection, 'metadata_cache'):
-                        self._connection.metadata_cache.clear()
-                    if hasattr(self._connection, 'runtime_configuration'):
-                        self._connection.runtime_configuration = None
-                    
-                    # Close the main connection
-                    self._connection.close()
-                    
-                except Exception as e:
-                    logger.debug(f"Error cleaning up old substrate connection: {e}")
-                finally:
-                    self._connection = None
-                    self._query_count = 0
-                    # Force aggressive garbage collection after connection cleanup
-                    collected = gc.collect()
-                    logger.debug(f"Post-connection cleanup GC freed {collected} objects")
-            
-            # Create new connection
+            # Create fresh connection
             try:
-                logger.debug(f"Creating new substrate connection #{self._connection_count + 1}")
-                self._connection = get_substrate(
-                    subtensor_network=self.subtensor_network,
-                    subtensor_address=self.chain_endpoint
-                )
-                self._connection_count += 1
-                logger.info(f"Successfully created substrate connection #{self._connection_count}")
-            except Exception as e:
-                logger.error(f"Failed to create substrate connection: {e}")
-                raise
-        
-        self._last_used = now
-        self._query_count += 1
-        return self._connection
-    
-    def _force_garbage_collection(self):
-        """Force garbage collection to clean up scalecodec objects with enhanced cleanup."""
-        try:
-            # More aggressive cleanup - import gc locally to ensure it's available
-            import gc
-            
-            # Clear any module-level caches that might accumulate scalecodec objects
-            try:
-                # Clear substrate interface module caches if accessible
-                import sys
-                for module_name in list(sys.modules.keys()):
-                    if 'scalecodec' in module_name or 'substrate' in module_name:
-                        module = sys.modules.get(module_name)
-                        if hasattr(module, '__dict__'):
-                            # Clear any cached objects in the module
-                            for attr_name in list(module.__dict__.keys()):
-                                if attr_name.startswith('_cache') or attr_name.endswith('_cache'):
-                                    try:
-                                        cache_obj = getattr(module, attr_name)
-                                        if hasattr(cache_obj, 'clear'):
-                                            cache_obj.clear()
-                                    except Exception:
-                                        pass
-            except Exception:
-                pass  # Fail silently for module cache cleanup
-            
-            # Force multiple garbage collection passes for more thorough cleanup
-            collected_total = 0
-            for _ in range(3):  # Multiple passes can catch circular references
-                collected = gc.collect()
-                collected_total += collected
-                if collected == 0:
-                    break  # No more objects to collect
-            
-            self._last_cleanup = time.time()
-            if collected_total > 0:
-                logger.debug(f"Enhanced garbage collection freed {collected_total} objects")
-        except Exception as e:
-            logger.debug(f"Error during enhanced garbage collection: {e}")
-    
-    def force_reconnect(self) -> SubstrateInterface:
-        """Force a new connection (useful for error recovery) with enhanced cleanup."""
-        logger.info("Forcing substrate reconnection...")
-        # Clean up current connection
-        if self._connection is not None:
-            try:
-                self._connection.close()
-                if hasattr(self._connection, 'websocket') and self._connection.websocket:
-                    self._connection.websocket.close()
-            except Exception as e:
-                logger.debug(f"Error during forced cleanup: {e}")
-            finally:
-                self._connection = None
-                self._query_count = 0
-        
-        # Force garbage collection
-        self._force_garbage_collection()
-        
-        # Reset age to force new connection
-        self._last_used = 0
-        return self.get_connection()
-    
-    def cleanup(self):
-        """Clean up the connection manager resources with enhanced cleanup."""
-        if self._connection is not None:
-            try:
-                logger.info("Cleaning up substrate connection manager...")
+                logger.debug(f"Creating fresh substrate connection #{self._connection_count + 1}")
                 
-                # Enhanced cleanup for scalecodec objects
-                try:
-                    # Clear substrate interface caches before closing
-                    if hasattr(self._connection, 'metadata_cache'):
-                        self._connection.metadata_cache.clear()
-                    if hasattr(self._connection, 'runtime_configuration'):
-                        self._connection.runtime_configuration = None
-                    if hasattr(self._connection, '_request_cache'):
-                        self._connection._request_cache.clear()
-                    
-                    # Close websocket first
-                    if hasattr(self._connection, 'websocket') and self._connection.websocket:
-                        self._connection.websocket.close()
-                    
-                    # Close main connection
-                    self._connection.close()
-                    
-                    # Clear any scalecodec module-level caches
-                    import sys
-                    for module_name in list(sys.modules.keys()):
-                        if 'scalecodec' in module_name.lower():
-                            module = sys.modules.get(module_name)
-                            if hasattr(module, '__dict__'):
-                                for attr_name in list(module.__dict__.keys()):
-                                    if 'cache' in attr_name.lower() or 'registry' in attr_name.lower():
-                                        try:
-                                            cache_obj = getattr(module, attr_name)
-                                            if hasattr(cache_obj, 'clear'):
-                                                cache_obj.clear()
-                                            elif isinstance(cache_obj, dict):
-                                                cache_obj.clear()
-                                        except Exception:
-                                            pass
-                            
-                except Exception as e:
-                    logger.debug(f"Error during enhanced substrate cleanup: {e}")
-                finally:
-                    self._connection = None
-                    self._query_count = 0
-                    
+                # Handle empty/None chain_endpoint properly
+                if self.chain_endpoint and self.chain_endpoint.strip():
+                    self._current_connection = get_substrate(
+                        subtensor_network=self.subtensor_network,
+                        subtensor_address=self.chain_endpoint
+                    )
+                else:
+                    # Use default endpoint when chain_endpoint is empty/None
+                    self._current_connection = get_substrate(
+                        subtensor_network=self.subtensor_network
+                    )
+                
+                self._connection_count += 1
+                self._connection_created_at = time.time()
+                logger.debug(f"✅ Fresh substrate connection #{self._connection_count} created")
+                return self._current_connection
+                
             except Exception as e:
-                logger.debug(f"Error during connection manager cleanup: {e}")
-            finally:
-                self._connection = None
-                self._query_count = 0
+                logger.error(f"❌ Failed to create fresh substrate connection: {e}")
+                raise
+    
+
+    
+    def _dispose_connection_thoroughly(self, connection: SubstrateInterface):
+        """
+        Thoroughly dispose of a substrate connection with full cleanup.
+        This is the key to preventing scalecodec memory leaks.
+        """
+        try:
+            logger.debug("🧹 Starting thorough substrate connection disposal...")
+            
+            # 1. Close websocket first (if exists)
+            try:
+                if hasattr(connection, 'websocket') and connection.websocket:
+                    connection.websocket.close()
+                    logger.debug("   ✓ Websocket closed")
+            except Exception as e:
+                logger.debug(f"   ⚠ Error closing websocket: {e}")
+            
+            # 2. Clear connection-level caches
+            try:
+                cache_attrs = ['metadata_cache', '_request_cache', 'runtime_configuration', 
+                              '_metadata', '_runtime_info', '_type_registry']
+                for attr in cache_attrs:
+                    if hasattr(connection, attr):
+                        cache_obj = getattr(connection, attr)
+                        if cache_obj is not None:
+                            if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
+                                cache_obj.clear()
+                            elif isinstance(cache_obj, dict):
+                                cache_obj.clear()
+                            setattr(connection, attr, None)
+                logger.debug("   ✓ Connection caches cleared")
+            except Exception as e:
+                logger.debug(f"   ⚠ Error clearing connection caches: {e}")
+            
+            # 3. Close main connection
+            try:
+                connection.close()
+                logger.debug("   ✓ Main connection closed")
+            except Exception as e:
+                logger.debug(f"   ⚠ Error closing main connection: {e}")
+            
+            # 4. Scalecodec module cleanup
+            try:
+                self._clear_scalecodec_caches()
+                logger.debug("   ✓ Scalecodec caches cleared")
+            except Exception as e:
+                logger.debug(f"   ⚠ Error clearing scalecodec caches: {e}")
+            
+            # 5. Force garbage collection
+            try:
+                collected = gc.collect()
+                logger.debug(f"   ✓ Garbage collection freed {collected} objects")
+            except Exception as e:
+                logger.debug(f"   ⚠ Error during garbage collection: {e}")
+            
+            logger.debug("🧹 Thorough substrate disposal completed")
+            
+        except Exception as e:
+            logger.debug(f"❌ Error during thorough disposal: {e}")
+    
+    def _clear_scalecodec_caches(self):
+        """
+        Clear scalecodec module caches thoroughly.
+        This is critical for preventing memory accumulation.
+        """
+        import sys
         
-        # Force final garbage collection with focus on scalecodec objects
-        self._force_garbage_collection()
+        cleared_count = 0
+        scalecodec_patterns = [
+            'scalecodec', 'substrate', 'scale_info', 'metadata', 
+            'substrateinterface', 'scale_codec'
+        ]
+        
+        for module_name in list(sys.modules.keys()):
+            if any(pattern in module_name.lower() for pattern in scalecodec_patterns):
+                module = sys.modules.get(module_name)
+                if module and hasattr(module, '__dict__'):
+                    # Clear all cache-like attributes
+                    for attr_name in list(module.__dict__.keys()):
+                        if any(cache_word in attr_name.lower() for cache_word in 
+                               ['cache', 'registry', '_cached', '_memo', '_lru', '_store', 
+                                '_type_registry', '_metadata', '_runtime', '_version']):
+                            try:
+                                cache_obj = getattr(module, attr_name)
+                                if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
+                                    cache_obj.clear()
+                                    cleared_count += 1
+                                elif isinstance(cache_obj, (dict, list, set)):
+                                    cache_obj.clear()
+                                    cleared_count += 1
+                            except Exception:
+                                pass
+        
+        if cleared_count > 0:
+            logger.debug(f"   Cleared {cleared_count} scalecodec cache objects")
     
-    @property
-    def connection_age(self) -> float:
-        """Get the age of the current connection in seconds."""
-        if self._connection is None:
-            return 0
-        return time.time() - self._last_used
+    def force_cleanup(self):
+        """
+        Force cleanup of current connection and caches.
+        Useful for emergency memory cleanup.
+        """
+        with self._lock:
+            if self._current_connection is not None:
+                logger.info("🚨 Force cleanup of substrate connection")
+                self._dispose_connection_thoroughly(self._current_connection)
+                self._current_connection = None
+            else:
+                # Even if no connection, clear scalecodec caches
+                logger.debug("🧹 Force cleanup of scalecodec caches (no active connection)")
+                self._clear_scalecodec_caches()
+                gc.collect()
     
-    @property 
-    def connection_count(self) -> int:
-        """Get the total number of connections created."""
-        return self._connection_count
-    
-    @property
-    def query_count(self) -> int:
-        """Get the total number of queries made on current connection."""
-        return self._query_count
+    @contextmanager
+    def fresh_connection(self):
+        """
+        Context manager for automatic connection cleanup.
+        
+        Usage:
+            with manager.fresh_connection() as substrate:
+                # Use substrate connection
+                result = substrate.query(...)
+            # Connection automatically disposed here
+        """
+        connection = None
+        try:
+            connection = self.get_fresh_connection()
+            yield connection
+        finally:
+            # Always cleanup, even on exceptions
+            if connection is not None:
+                with self._lock:
+                    if self._current_connection == connection:
+                        self._dispose_connection_thoroughly(connection)
+                        self._current_connection = None
     
     def get_stats(self) -> dict:
-        """Get connection manager statistics."""
-        return {
-            "connection_count": self._connection_count,
-            "query_count": self._query_count,
-            "connection_age": self.connection_age,
-            "has_connection": self._connection is not None,
-            "last_used": self._last_used,
-            "max_age": self._max_age,
-            "last_cleanup": self._last_cleanup,
-            "time_since_cleanup": time.time() - self._last_cleanup
-        }
+        """Get manager statistics."""
+        with self._lock:
+            connection_age = None
+            
+            if self._current_connection is not None and self._connection_created_at is not None:
+                connection_age = time.time() - self._connection_created_at
+            
+            return {
+                "connection_count": self._connection_count,
+                "has_active_connection": self._current_connection is not None,
+                "connection_age_seconds": connection_age,
+                "network": self.subtensor_network,
+                "endpoint": self.chain_endpoint
+            }
     
-    @classmethod
-    def get_all_instances(cls) -> Dict[Tuple[str, str], 'SubstrateConnectionManager']:
-        """Get all active singleton instances (useful for debugging/monitoring)."""
-        return cls._instances.copy()
+    def shutdown(self):
+        """Complete shutdown with cleanup."""
+        logger.info("🛑 Shutting down SubstrateManager...")
+        with self._lock:
+            if self._current_connection is not None:
+                self._dispose_connection_thoroughly(self._current_connection)
+                self._current_connection = None
+        logger.info("✅ SubstrateManager shutdown complete")
+
+
+# Global manager instance (singleton per process)
+_global_manager: Optional[SubstrateManager] = None
+_global_lock = threading.Lock()
+
+
+def get_substrate_manager(subtensor_network: str, chain_endpoint: str) -> SubstrateManager:
+    """
+    Get the global substrate manager (singleton).
+    Creates one only if it doesn't exist or if the network actually changed.
+    The manager handles different endpoints gracefully without recreation.
+    """
+    global _global_manager
     
-    @classmethod
-    def cleanup_all(cls):
-        """Clean up all singleton instances (useful for shutdown)."""
-        with cls._lock:
-            for key, instance in cls._instances.items():
-                try:
-                    instance.cleanup()
-                    logger.info(f"Cleaned up SubstrateConnectionManager for {key[0]}@{key[1]}")
-                except Exception as e:
-                    logger.error(f"Error cleaning up instance {key}: {e}")
-            cls._instances.clear()
-            logger.info("All SubstrateConnectionManager instances cleaned up")
-            # Final garbage collection after all cleanup
-            gc.collect() 
+    with _global_lock:
+        # Only create new manager if none exists or network truly changed
+        # Don't recreate for endpoint differences - the manager can handle that
+        needs_new_manager = (
+            _global_manager is None or 
+            _global_manager.subtensor_network != subtensor_network
+        )
+        
+        if needs_new_manager:
+            # Cleanup old manager if exists
+            if _global_manager is not None:
+                logger.info(f"Network changed: {_global_manager.subtensor_network} → {subtensor_network}, recreating manager")
+                _global_manager.shutdown()
+            
+            # Create new manager - normalize endpoint
+            normalized_endpoint = chain_endpoint.strip() if chain_endpoint else ""
+            _global_manager = SubstrateManager(subtensor_network, normalized_endpoint)
+            logger.info(f"🔄 Created new global SubstrateManager for {subtensor_network}")
+        else:
+            # Just update endpoint if it's different, but don't recreate manager
+            normalized_endpoint = chain_endpoint.strip() if chain_endpoint else ""
+            if _global_manager.chain_endpoint != normalized_endpoint:
+                logger.debug(f"Updating endpoint: {_global_manager.chain_endpoint} → {normalized_endpoint}")
+                _global_manager.chain_endpoint = normalized_endpoint
+                # Force disposal of current connection since endpoint changed
+                _global_manager.force_cleanup()
+        
+        return _global_manager
+
+
+def cleanup_global_substrate_manager():
+    """Cleanup the global substrate manager."""
+    global _global_manager
+    
+    with _global_lock:
+        if _global_manager is not None:
+            _global_manager.shutdown()
+            _global_manager = None
+            logger.info("🧹 Global substrate manager cleaned up")
+
+
+def get_fresh_substrate_connection(subtensor_network: str, chain_endpoint: str) -> SubstrateInterface:
+    """
+    Convenience function to get a fresh substrate connection.
+    Always creates a new connection and disposes of any previous one.
+    """
+    manager = get_substrate_manager(subtensor_network, chain_endpoint)
+    return manager.get_fresh_connection()
+
+
+def force_substrate_cleanup(subtensor_network: str, chain_endpoint: str):
+    """
+    Force cleanup of substrate connections and caches.
+    Useful for emergency memory management.
+    """
+    manager = get_substrate_manager(subtensor_network, chain_endpoint)
+    manager.force_cleanup()
+
+
+def get_substrate_manager_stats(subtensor_network: str, chain_endpoint: str) -> dict:
+    """
+    Get substrate manager statistics without creating new connections.
+    """
+    global _global_manager
+    
+    with _global_lock:
+        if _global_manager is None:
+            return {"status": "no_manager", "has_manager": False}
+        
+        try:
+            stats = _global_manager.get_stats()
+            stats["has_manager"] = True
+            stats["status"] = "active"
+            return stats
+        except Exception as e:
+            return {"status": "error", "has_manager": True, "error": str(e)} 

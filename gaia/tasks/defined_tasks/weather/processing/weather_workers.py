@@ -42,8 +42,7 @@ from ..utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data, GFS_SURFACE
 from ..utils.era5_api import fetch_era5_data
 from ..utils.hashing import compute_verification_hash, compute_input_data_hash, CANONICAL_VARS_FOR_HASHING
 from ..weather_scoring.metrics import calculate_rmse
-from ..weather_scoring_mechanism import evaluate_miner_forecast_day1
-from ..weather_scoring_mechanism import evaluate_miner_forecast_day1
+from ..weather_scoring_mechanism import evaluate_miner_forecast_day1, precompute_climatology_cache
 from ..schemas.weather_outputs import WeatherProgressUpdate
 
 from sqlalchemy import update
@@ -929,6 +928,47 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
 
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: Configured. Starting evaluation for {len(responses)} miners.")
 
+                # MAJOR PERFORMANCE OPTIMIZATION: Pre-compute climatology interpolations once
+                # instead of computing them for each miner individually
+                logger.info(f"[Day1ScoringWorker] Run {run_id}: Pre-computing climatology cache for massive performance boost...")
+                
+                # Get a sample target grid from GFS analysis data
+                sample_var = None
+                for var_name in ['2t', 'msl', 'z', 't']:  # Try common variables
+                    if var_name in gfs_analysis_ds_for_run.data_vars:
+                        sample_var = gfs_analysis_ds_for_run[var_name]
+                        break
+                
+                if sample_var is None:
+                    logger.warning(f"[Day1ScoringWorker] Run {run_id}: Could not find suitable sample variable for target grid template")
+                    sample_var = next(iter(gfs_analysis_ds_for_run.data_vars.values()))  # Use first available variable
+                
+                # Determine times to evaluate (same logic as in evaluate_miner_forecast_day1)
+                hardcoded_valid_times = day1_scoring_config.get("hardcoded_valid_times_for_eval")
+                if hardcoded_valid_times:
+                    times_to_evaluate = hardcoded_valid_times
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Using hardcoded times for climatology cache: {times_to_evaluate}")
+                else:
+                    lead_times_to_score_hours = day1_scoring_config.get('lead_times_hours', task_instance.config.get('initial_scoring_lead_hours', [6,12]))
+                    times_to_evaluate = [gfs_init_time + timedelta(hours=h) for h in lead_times_to_score_hours]
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Using lead_hours {lead_times_to_score_hours} for climatology cache")
+                
+                # Pre-compute climatology cache - this is where the magic happens!
+                try:
+                    climatology_cache_start_time = time.time()
+                    precomputed_climatology = await precompute_climatology_cache(
+                        era5_climatology_ds,
+                        day1_scoring_config,
+                        times_to_evaluate,
+                        sample_var.isel(time=0) if 'time' in sample_var.dims else sample_var  # Remove time dimension for template
+                    )
+                    climatology_cache_time = time.time() - climatology_cache_start_time
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: ✅ Pre-computed climatology cache in {climatology_cache_time:.2f}s - this will dramatically speed up miner scoring!")
+                except Exception as e_cache:
+                    logger.error(f"[Day1ScoringWorker] Run {run_id}: Failed to pre-compute climatology cache: {e_cache}")
+                    logger.warning(f"[Day1ScoringWorker] Run {run_id}: Falling back to individual climatology computation per miner")
+                    precomputed_climatology = None
+
                 scoring_tasks = []
                 
                 for miner_response_rec in responses:
@@ -941,7 +981,8 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                             gfs_reference_ds_for_run,
                             era5_climatology_ds,
                             day1_scoring_config,
-                            gfs_init_time
+                            gfs_init_time,
+                            precomputed_climatology  # NEW: Pass the pre-computed climatology cache
                         )
                     )
 
@@ -1358,16 +1399,23 @@ async def finalize_scores_worker(self):
                     miner_scoring_results = await asyncio.gather(*scoring_execution_tasks)
                     successful_final_scores_count = 0
                     
-                    # CRITICAL: Memory cleanup after ERA5 scoring - similar to initial scoring
-                    logger.info(f"[FinalizeWorker] Run {run_id}: Starting comprehensive memory cleanup after ERA5 scoring...")
-                    
-                    # Check memory before cleanup
-                    try:
-                        process = psutil.Process()
-                        memory_before_mb = process.memory_info().rss / (1024 * 1024)
-                        logger.info(f"[FinalizeWorker] Run {run_id}: Memory before ERA5 cleanup: {memory_before_mb:.1f} MB")
-                    except Exception:
-                        memory_before_mb = None
+                                    # CRITICAL: Memory cleanup after ERA5 scoring - similar to initial scoring
+                logger.info(f"[FinalizeWorker] Run {run_id}: Starting comprehensive memory cleanup after ERA5 scoring...")
+                
+                # Cleanup async processing resources (minimal cleanup needed)
+                try:
+                    # Async processing cleanup is handled automatically by asyncio/dask
+                    logger.debug(f"[FinalizeWorker] Run {run_id}: Async processing cleanup completed")
+                except Exception as async_cleanup_err:
+                    logger.debug(f"[FinalizeWorker] Run {run_id}: Error during async processing cleanup: {async_cleanup_err}")
+                
+                # Check memory before cleanup
+                try:
+                    process = psutil.Process()
+                    memory_before_mb = process.memory_info().rss / (1024 * 1024)
+                    logger.info(f"[FinalizeWorker] Run {run_id}: Memory before ERA5 cleanup: {memory_before_mb:.1f} MB")
+                except Exception:
+                    memory_before_mb = None
                     
                     # AGGRESSIVE MEMORY CLEANUP for ERA5 data
                     try:
@@ -1965,7 +2013,7 @@ async def r2_cleanup_worker(task_instance: 'WeatherTask'):
                 completed_jobs_with_inputs = await task_instance.db_manager.fetch_all("""
                     SELECT DISTINCT id FROM weather_miner_jobs 
                     WHERE status IN ('completed', 'error', 'failed') 
-                    AND created_at < NOW() - INTERVAL '1 hour'  -- Only cleanup inputs for jobs older than 1 hour
+                    AND updated_at < NOW() - INTERVAL '1 hour'  -- Only cleanup inputs for jobs older than 1 hour
                 """)
                 
                 # Get all input objects

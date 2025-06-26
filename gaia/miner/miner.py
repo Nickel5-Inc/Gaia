@@ -29,7 +29,7 @@ import asyncio
 import ipaddress
 from typing import Optional
 import warnings
-from contextlib import asynccontextmanager # Add this import
+# Removed asynccontextmanager import - using traditional startup/shutdown events
 import time
 
 # Imports for Alembic check
@@ -414,45 +414,73 @@ class Miner:
                 logger.error(f"Local inference service at {health_url} did not become ready within {INFERENCE_SERVICE_READY_TIMEOUT} seconds.")
                 return False
 
+            # Add required imports for middleware
+            from collections import defaultdict
+            
+            # Simple in-memory rate limiter with proper cleanup
+            request_counts = defaultdict(list)
+            
+            async def cleanup_rate_limiter():
+                """Periodic cleanup of rate limiter to prevent memory leaks"""
+                while True:
+                    try:
+                        await asyncio.sleep(300)  # Clean every 5 minutes
+                        current_time = time.time()
+                        
+                        # Clean old requests and remove empty IP entries
+                        empty_ips = []
+                        for client_ip, requests in request_counts.items():
+                            # Remove old requests
+                            request_counts[client_ip] = [
+                                req_time for req_time in requests 
+                                if current_time - req_time < 60
+                            ]
+                            # Mark empty IPs for removal
+                            if not request_counts[client_ip]:
+                                empty_ips.append(client_ip)
+                        
+                        # Remove empty IP entries to prevent memory accumulation
+                        for ip in empty_ips:
+                            del request_counts[ip]
+                        
+                        if empty_ips:
+                            self.logger.debug(f"Rate limiter cleanup: Removed {len(empty_ips)} inactive IP entries")
+                        
+                        # Log memory usage periodically
+                        active_ips = len(request_counts)
+                        if active_ips > 100:  # Log if many IPs are being tracked
+                            self.logger.info(f"Rate limiter tracking {active_ips} IP addresses")
+                            
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        self.logger.warning(f"Error in rate limiter cleanup: {e}")
+
+            # Create FastAPI app using fiber server factory
             app = fiber_server.factory_app(debug=True)
             app.body_limit = MAX_REQUEST_SIZE
-
+            
+            # Traditional startup event handler
             @app.on_event("startup")
-            async def overridden_startup_event():
-                nonlocal self # Ensure self is captured if methods like self.database_manager are used
-                self.logger.info("Initializing database on application startup (via overridden on_event)...")
+            async def startup_event():
+                self.logger.info("Initializing database on application startup...")
                 try:
                     await self.database_manager.ensure_engine_initialized()
                     await self.database_manager.initialize_database()
                     self.logger.info("Database initialization completed successfully")
                 except Exception as e_db:
                     self.logger.error(f"Failed to initialize database during startup: {e_db}", exc_info=True)
-                    # Depending on severity, you might want to sys.exit(1) here
-                
-
                 
                 # Weather Inference Service Setup
                 weather_enabled_env_val = os.getenv("WEATHER_MINER_ENABLED", "false") 
                 self.logger.info(f"DEBUG_WEATHER_ENABLED: Value of WEATHER_MINER_ENABLED from os.getenv: '{weather_enabled_env_val}'")
                 weather_enabled_env = weather_enabled_env_val.lower() in ["true", "1", "yes"]
                 
-
                 if weather_enabled_env:
                     if self.weather_task is None:
-                        self.logger.warning("WeatherTask was None at startup despite WEATHER_MINER_ENABLED being true. Re-initializing. This might indicate an issue if __init__ didn't set it.")
-                        weather_task_args = {
-                            "db_manager": self.database_manager,
-                            "node_type": "miner",
-                            "inference_service_url": self.weather_inference_service_url
-                        }
-                        if self.weather_runpod_api_key:
-                            weather_task_args["runpod_api_key"] = self.weather_runpod_api_key
-                        try:
-                            self.weather_task = WeatherTask(**weather_task_args)
-                        except Exception as e:
-                            self.logger.error(f"Failed to instantiate WeatherTask: {e}", exc_info=True)
-                            self.weather_task = None
-
+                        self.logger.error("WeatherTask was None at startup despite WEATHER_MINER_ENABLED being true. This indicates a problem in __init__ - weather task should already exist!")
+                        self.logger.error("Weather functionality will be disabled due to initialization failure")
+                    
                     if self.weather_task:
                         weather_inference_type = os.getenv("WEATHER_INFERENCE_TYPE", "local_model").lower()
                         service_url_env = self.weather_inference_service_url
@@ -505,28 +533,23 @@ class Miner:
                 else:
                     self.logger.info("Weather task is disabled (checked in startup event). self.weather_task should be None.")
 
-                yield
+                # Start rate limiter cleanup task (now that event loop is running)
+                cleanup_task = asyncio.create_task(cleanup_rate_limiter())
+                app.state.rate_limiter_cleanup = cleanup_task
+                self.logger.info("Rate limiter cleanup task started")
+                    
+            @app.on_event("shutdown") 
+            async def shutdown_event():
                 self.logger.info("Application shutting down...")
                 # Stop memory monitoring on shutdown
                 await self.stop_memory_monitoring()
-            
-            
-
-            app.body_limit = MAX_REQUEST_SIZE
-
-            # Add rate limiting middleware to prevent request spam
-            from collections import defaultdict
-            import time
-            
-            # Simple in-memory rate limiter
-            request_counts = defaultdict(list)
             
             @app.middleware("http")
             async def rate_limit_middleware(request, call_next):
                 client_ip = request.client.host
                 current_time = time.time()
                 
-                # Clean old requests (older than 1 minute)
+                # Clean old requests for this IP (still needed for immediate cleanup)
                 request_counts[client_ip] = [
                     req_time for req_time in request_counts[client_ip] 
                     if current_time - req_time < 60

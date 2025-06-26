@@ -22,7 +22,19 @@ except ImportError:
     print("psutil not found, memory logging will be skipped.") # Use print for early feedback
 
 os.environ["NODE_TYPE"] = "validator"
+
+
+
 import asyncio
+
+# === PERFORMANCE OPTIMIZATION INTEGRATION ===
+try:
+    from gaia.utils import performance
+    print("🚀 [PERFORMANCE] High-performance libraries integration activated")
+    # Performance status will be logged when the module is imported
+except Exception as e:
+    print(f"⚠️ [PERFORMANCE] Performance optimization integration failed: {e}")
+# === END PERFORMANCE OPTIMIZATION INTEGRATION ===
 
 # === WEIGHT TRACING INTEGRATION ===
 try:
@@ -82,7 +94,10 @@ import numpy as np
 from gaia.validator.basemodel_evaluator import BaseModelEvaluator
 from gaia.validator.utils.db_wipe import handle_db_wipe
 from gaia.validator.utils.earthdata_tokens import ensure_valid_earthdata_token
-# Substrate connection manager completely removed - using fresh connections only
+from gaia.validator.utils.substrate_manager import (
+    get_substrate_manager, cleanup_global_substrate_manager,
+    get_fresh_substrate_connection, force_substrate_cleanup
+)
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 
 # Imports for Alembic check
@@ -191,6 +206,115 @@ async def perform_handshake_with_retry(
 
 
 class GaiaValidator:
+    def _check_and_fix_asyncio_compatibility(self):
+        """
+        CRITICAL: Check for and fix asyncio compatibility issues that break multiprocessing.
+        
+        Problem: Old asyncio packages (e.g., v3.4.3) use 'async' as a function name,
+        but 'async' became a reserved keyword in Python 3.7+. This causes SyntaxError
+        in multiprocessing workers when they try to import the validator module.
+        
+        Solution: Detect and remove problematic asyncio packages, forcing use of built-in asyncio.
+        """
+        try:
+            import sys
+            import os
+            import shutil
+            
+            print("[STARTUP] Checking asyncio compatibility for multiprocessing...")
+            
+            # Check if we're using a problematic asyncio installation
+            problematic_asyncio_detected = False
+            asyncio_package_path = None
+            
+            # Look for asyncio package in site-packages
+            for path in sys.path:
+                if 'site-packages' in path:
+                    potential_asyncio_path = os.path.join(path, 'asyncio')
+                    potential_asyncio_dist = os.path.join(path, 'asyncio-3.4.3.dist-info')
+                    
+                    if os.path.exists(potential_asyncio_path) and os.path.exists(potential_asyncio_dist):
+                        print(f"[STARTUP] ⚠️ Detected problematic asyncio package at: {potential_asyncio_path}")
+                        problematic_asyncio_detected = True
+                        asyncio_package_path = path
+                        break
+            
+            if not problematic_asyncio_detected:
+                print("[STARTUP] ✅ No problematic asyncio packages detected")
+                return
+            
+            # Test if asyncio import would cause syntax errors in multiprocessing context
+            try:
+                # Quick test - try to import asyncio and check its file location
+                import asyncio
+                asyncio_file = asyncio.__file__
+                
+                if 'site-packages' in asyncio_file and 'asyncio' in asyncio_file:
+                    print(f"[STARTUP] ❌ Asyncio importing from site-packages: {asyncio_file}")
+                    print("[STARTUP] This will cause multiprocessing worker failures!")
+                    
+                    # Attempt to fix by removing the problematic package
+                    asyncio_dir = os.path.join(asyncio_package_path, 'asyncio')
+                    asyncio_dist_dir = os.path.join(asyncio_package_path, 'asyncio-3.4.3.dist-info')
+                    
+                    print(f"[STARTUP] 🔧 Attempting to remove problematic asyncio package...")
+                    
+                    # Remove the asyncio package directory
+                    if os.path.exists(asyncio_dir):
+                        shutil.rmtree(asyncio_dir)
+                        print(f"[STARTUP] Removed: {asyncio_dir}")
+                    
+                    # Remove the distribution info
+                    if os.path.exists(asyncio_dist_dir):
+                        shutil.rmtree(asyncio_dist_dir)
+                        print(f"[STARTUP] Removed: {asyncio_dist_dir}")
+                    
+                    # Clear import cache to force reimport of built-in asyncio
+                    if 'asyncio' in sys.modules:
+                        del sys.modules['asyncio']
+                    if 'asyncio.base_events' in sys.modules:
+                        del sys.modules['asyncio.base_events']
+                    
+                    # Clear import cache
+                    import importlib
+                    if hasattr(importlib, 'invalidate_caches'):
+                        importlib.invalidate_caches()
+                    
+                    # Verify the fix worked
+                    try:
+                        import asyncio
+                        new_asyncio_file = asyncio.__file__
+                        if '/usr/lib/python' in new_asyncio_file:
+                            print(f"[STARTUP] ✅ Successfully fixed asyncio! Now using: {new_asyncio_file}")
+                            
+                            # Test that multiprocessing can import asyncio without syntax errors
+                            import multiprocessing
+                            import subprocess
+                            test_result = subprocess.run([
+                                sys.executable, '-c', 
+                                'import asyncio; print("✅ Asyncio import successful in subprocess")'
+                            ], capture_output=True, text=True, timeout=10)
+                            
+                            if test_result.returncode == 0:
+                                print("[STARTUP] ✅ Asyncio multiprocessing compatibility verified")
+                            else:
+                                print(f"[STARTUP] ⚠️ Asyncio test failed: {test_result.stderr}")
+                                
+                        else:
+                            print(f"[STARTUP] ⚠️ Asyncio still not using built-in version: {new_asyncio_file}")
+                    except Exception as verify_err:
+                        print(f"[STARTUP] ⚠️ Error verifying asyncio fix: {verify_err}")
+                        
+                else:
+                    print(f"[STARTUP] ✅ Asyncio using built-in version: {asyncio_file}")
+                    
+            except Exception as test_err:
+                print(f"[STARTUP] ⚠️ Error testing asyncio: {test_err}")
+                
+        except Exception as e:
+            print(f"[STARTUP] ⚠️ Warning: Asyncio compatibility check failed: {e}")
+            # Don't fail startup - this is a non-critical optimization
+
     def _clear_pycache_files(self):
         """Clear all Python bytecode cache files in the repository to prevent caching issues."""
         try:
@@ -226,6 +350,9 @@ class GaiaValidator:
         Initialize the GaiaValidator with provided arguments.
         """
         print("[STARTUP DEBUG] Starting GaiaValidator.__init__")
+        
+        # CRITICAL: Check for asyncio compatibility issues that break multiprocessing
+        self._check_and_fix_asyncio_compatibility()
         
         # Clear Python bytecode cache on startup to prevent caching issues
         if os.getenv('VALIDATOR_CLEAR_PYCACHE_ON_STARTUP', 'true').lower() in ['true', '1', 'yes']:
@@ -271,17 +398,17 @@ class GaiaValidator:
         ssl_context.verify_mode = ssl.CERT_NONE
         
         self.miner_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0),
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=3.0),  # REDUCED: 120s->30s read, 10s->5s connect
             follow_redirects=True,
             verify=False,
             limits=httpx.Limits(
-                max_connections=100,  # Restore higher limit for 200+ miners
-                max_keepalive_connections=50,  # Allow more keepalive for efficiency
-                keepalive_expiry=300,  # 5 minutes - good balance for regular queries
+                max_connections=60,   # REDUCED: 100->60 to prevent resource exhaustion
+                max_keepalive_connections=20,  # REDUCED: 50->20 to reduce memory pressure
+                keepalive_expiry=60,  # REDUCED: 300->60 seconds for faster cleanup
             ),
             transport=httpx.AsyncHTTPTransport(
-                retries=2,  # Reduced from 3
-                verify=False,  # Explicitly set verify=False on transport
+                retries=1,  # REDUCED: 2->1 to fail faster
+                verify=False,
             ),
         )
         # Client for API communication with SSL verification enabled
@@ -641,16 +768,13 @@ class GaiaValidator:
             
             w.blocks_since_last_update = blocks_since_wrapper
 
-            # SUBSTRATE MANAGER DISABLED - Using fresh connections
-            # Substrate manager completely removed - using fresh connections only
-            
+            # Use new aggressive substrate manager for memory leak prevention
             try:
-                # Use fresh connection directly
-                self.substrate = interface.get_substrate(
+                self.substrate = get_fresh_substrate_connection(
                     subtensor_network=self.subtensor_network,
-                    subtensor_address=self.subtensor_chain_endpoint
+                    chain_endpoint=self.subtensor_chain_endpoint
                 )
-                print("🔄 Created fresh substrate connection")
+                logger.info("🔄 Created fresh substrate connection using substrate manager")
             except Exception as e_sub_init:
                 logger.error(f"CRITICAL: Failed to initialize SubstrateInterface with endpoint {self.subtensor_chain_endpoint}: {e_sub_init}", exc_info=True)
                 return False
@@ -665,12 +789,12 @@ class GaiaValidator:
             # Standard Metagraph Sync
             try:
                 # Use direct sync here since _sync_metagraph is async and we're in sync method
-                # Create fresh substrate connection
-                self.substrate = interface.get_substrate(
+                # Create fresh substrate connection using substrate manager
+                self.substrate = get_fresh_substrate_connection(
                     subtensor_network=self.subtensor_network,
-                    subtensor_address=self.subtensor_chain_endpoint
+                    chain_endpoint=self.subtensor_chain_endpoint
                 )
-                print("🔄 Created fresh connection for metagraph sync")
+                logger.info("🔄 Created fresh connection for metagraph sync using substrate manager")
                 self.metagraph.sync_nodes()  # Sync nodes after initialization
                 logger.info(f"Successfully synced {len(self.metagraph.nodes) if self.metagraph.nodes else '0'} nodes from the network.")
             except Exception as e_meta_sync:
@@ -708,6 +832,16 @@ class GaiaValidator:
                 "data": base64.b64encode(obj).decode("ascii"),
             }
         raise TypeError(f"Type {type(obj)} not serializable")
+    
+    def serialize_for_miners(self, payload: Dict) -> bytes:
+        """Optimized serialization for miner communication using performance utilities."""
+        try:
+            from gaia.utils.performance import serialize_miner_payload
+            return serialize_miner_payload(payload)
+        except ImportError:
+            # Fallback to standard JSON if performance utils not available
+            import json
+            return json.dumps(payload, default=self.custom_serializer).encode('utf-8')
 
     async def query_miners(self, payload: Dict, endpoint: str, hotkeys: Optional[List[str]] = None) -> Dict:
         """Query miners with the given payload in parallel with batch retry logic."""
@@ -761,7 +895,7 @@ class GaiaValidator:
             else:
                 miners_to_query = nodes_to_consider
                 if self.args.test and len(miners_to_query) > 10:
-                    selected_hotkeys_for_test = list(miners_to_query.keys())[-10:]
+                    selected_hotkeys_for_test = list(miners_to_query.keys())[-15:]
                     miners_to_query = {k: miners_to_query[k] for k in selected_hotkeys_for_test}
                     logger.info(f"Test mode: Selected the last {len(miners_to_query)} miners to query for endpoint: {endpoint} (no specific hotkeys provided).")
                 elif not self.args.test:
@@ -789,23 +923,23 @@ class GaiaValidator:
                 ssl_context.verify_mode = ssl.CERT_NONE
                 
                 self.miner_client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0),
+                    timeout=httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=3.0),  # REDUCED timeouts
                     follow_redirects=True,
                     verify=False,
                     limits=httpx.Limits(
-                        max_connections=100,  # Restore higher limit for 200+ miners
-                        max_keepalive_connections=50,  # Allow more keepalive for efficiency
-                        keepalive_expiry=300,  # 5 minutes - good balance for regular queries
+                        max_connections=60,   # REDUCED: 100->60
+                        max_keepalive_connections=20,  # REDUCED: 50->20
+                        keepalive_expiry=60,  # REDUCED: 300->60 seconds
                     ),
                     transport=httpx.AsyncHTTPTransport(
-                        retries=2,  # Reduced from 3
-                        verify=False,  # Explicitly set verify=False on transport
+                        retries=1,  # REDUCED: 2->1
+                        verify=False,
                     ),
                 )
 
             # Use chunked processing to reduce database contention and memory spikes
-            chunk_size = 50  # Process miners in chunks of 50
-            chunk_concurrency = 15  # Lower concurrency per chunk to reduce DB pressure
+            chunk_size = 30  # REDUCED: 50->30 for better resource management
+            chunk_concurrency = 6   # REDUCED: 15->6 to prevent thread/connection exhaustion
             chunks = []
             
             # Split miners into chunks
@@ -817,8 +951,8 @@ class GaiaValidator:
             logger.info(f"Processing {len(miners_to_query)} miners in {len(chunks)} chunks of {chunk_size} (concurrency: {chunk_concurrency} per chunk)")
 
             # Configuration for immediate retries
-            max_retries_per_miner = 2  # Total of 2 attempts (1 initial + 1 retry)
-            base_timeout = 15.0
+            max_retries_per_miner = 1  # REDUCED: 2->1 attempts to fail faster
+            base_timeout = 10.0  # REDUCED: 15->10 seconds for faster failure detection
             
             async def query_single_miner_with_retries(miner_hotkey: str, node, semaphore: asyncio.Semaphore) -> Optional[Dict]:
                 """Query a single miner with immediate retries on failure."""
@@ -901,7 +1035,7 @@ class GaiaValidator:
                                         payload=payload,  # REUSE SAME PAYLOAD REFERENCE - NO COPYING!
                                         endpoint=endpoint,
                                     ),
-                                    timeout=240.0  # Keep longer timeout for actual request
+                                    timeout=45.0  # REDUCED: 240s->45s to prevent connection hanging
                                 )
                                 request_duration = time.time() - request_start_time
                                 
@@ -1056,9 +1190,13 @@ class GaiaValidator:
                 except Exception as cleanup_err:
                     logger.debug(f"Error during chunk cleanup: {cleanup_err}")
                 
-                # Small delay between chunks to allow database recovery
+                # Aggressive connection cleanup between chunks to prevent accumulation
                 if chunk_idx < len(chunks) - 1:  # Don't delay after the last chunk
                     await asyncio.sleep(0.5)  # 500ms delay between chunks
+                    
+                    # Force connection cleanup every few chunks to prevent SSL hanging
+                    if (chunk_idx + 1) % 3 == 0:  # Every 3 chunks
+                        await self._aggressive_connection_cleanup()
 
             total_time = time.time() - start_time
             
@@ -1148,6 +1286,47 @@ class GaiaValidator:
                         
         except Exception as e:
             logger.debug(f"Error during connection cleanup: {e}")
+
+    async def _aggressive_connection_cleanup(self):
+        """Aggressively close all idle and potentially hanging connections."""
+        try:
+            if hasattr(self, 'miner_client') and not self.miner_client.is_closed:
+                # Force close ALL idle connections, not just stale ones
+                if hasattr(self.miner_client, '_transport') and hasattr(self.miner_client._transport, '_pool'):
+                    pool = self.miner_client._transport._pool
+                    if hasattr(pool, '_connections'):
+                        connections = pool._connections
+                        closed_count = 0
+                        
+                        # Handle both dict and list cases
+                        if hasattr(connections, 'items'):  # Dict-like
+                            connection_items = list(connections.items())
+                            for key, conn in connection_items:
+                                # Close ALL idle connections (no time check)
+                                if hasattr(conn, 'is_idle') and conn.is_idle():
+                                    try:
+                                        await conn.aclose()
+                                        del connections[key]
+                                        closed_count += 1
+                                        logger.debug(f"Aggressively closed idle connection to {key}")
+                                    except Exception as e:
+                                        logger.debug(f"Error closing connection: {e}")
+                        else:  # List-like
+                            for conn in list(connections):
+                                if hasattr(conn, 'is_idle') and conn.is_idle():
+                                    try:
+                                        await conn.aclose()
+                                        connections.remove(conn)
+                                        closed_count += 1
+                                        logger.debug(f"Aggressively closed idle connection")
+                                    except Exception as e:
+                                        logger.debug(f"Error closing connection: {e}")
+                    
+                        if closed_count > 0:
+                            logger.info(f"Aggressively cleaned up {closed_count} idle connections")
+                        
+        except Exception as e:
+            logger.debug(f"Error during aggressive connection cleanup: {e}")
 
     def _log_memory_usage(self, context: str, threshold_mb: float = 100.0):
         """Enhanced memory logging with detailed breakdown and automatic cleanup."""
@@ -1335,7 +1514,7 @@ class GaiaValidator:
             else:
                 logger.info("Validator memory monitoring disabled by configuration")
             
-            asyncio.create_task(self._watchdog_loop())
+            self.create_tracked_task(self._watchdog_loop(), "watchdog_loop")
 
     async def _watchdog_loop(self):
         """Run the watchdog monitoring in the main event loop."""
@@ -1777,12 +1956,12 @@ class GaiaValidator:
             #     fetch_nodes_module.get_substrate = ultra_patched_get_substrate
             
             try:
-                # Create fresh substrate connection
-                self.substrate = interface.get_substrate(
+                # Create fresh substrate connection using substrate manager
+                self.substrate = get_fresh_substrate_connection(
                     subtensor_network=self.subtensor_network,
-                    subtensor_address=self.subtensor_chain_endpoint
+                    chain_endpoint=self.subtensor_chain_endpoint
                 )
-                print("🔄 Created fresh connection for node fetching")
+                logger.info("🔄 Created fresh connection for node fetching using substrate manager")
                 nodes = get_nodes_for_netuid(self.substrate, netuid)
                 logger.info(f"⚠️ Fetched {len(nodes) if nodes else 0} nodes with substrate call (check for new connections in logs)")
                 return nodes
@@ -1802,13 +1981,13 @@ class GaiaValidator:
     async def _sync_metagraph(self):
         """Sync the metagraph using managed substrate connection with custom implementation to prevent memory leaks."""
         sync_start = time.time()
-        # Use fresh substrate connection for metagraph operations  
+        # Use fresh substrate connection for metagraph operations with substrate manager
         old_substrate = getattr(self, 'substrate', None)
-        self.substrate = interface.get_substrate(
+        self.substrate = get_fresh_substrate_connection(
             subtensor_network=self.subtensor_network,
-            subtensor_address=self.subtensor_chain_endpoint
+            chain_endpoint=self.subtensor_chain_endpoint
         )
-        print("🔄 Created fresh connection for metagraph sync")
+        logger.info("🔄 Created fresh connection for metagraph sync using substrate manager")
         
         # Ensure metagraph uses the fresh connection and update substrate reference
         if hasattr(self, 'metagraph') and self.metagraph:
@@ -1854,10 +2033,27 @@ class GaiaValidator:
             logger.info("Substrate connection refreshed during metagraph sync")
 
     def _track_background_task(self, task: asyncio.Task, task_name: str = "unnamed"):
-        """Track a background task for proper cleanup."""
+        """Track background tasks for proper cleanup and memory leak prevention."""
         self._background_tasks.add(task)
-        task.add_done_callback(lambda t: self._background_tasks.discard(t))
-        logger.debug(f"Tracking background task: {task_name}")
+        
+        # Add cleanup callback when task completes
+        def cleanup_task(completed_task):
+            self._background_tasks.discard(completed_task)
+            if completed_task.cancelled():
+                logger.debug(f"Background task '{task_name}' was cancelled")
+            elif completed_task.exception():
+                logger.warning(f"Background task '{task_name}' failed: {completed_task.exception()}")
+            else:
+                logger.debug(f"Background task '{task_name}' completed successfully")
+        
+        task.add_done_callback(cleanup_task)
+        logger.debug(f"Tracking background task '{task_name}' (total: {len(self._background_tasks)})")
+        return task
+
+    def create_tracked_task(self, coro, task_name: str = "unnamed"):
+        """Create and track a background task to prevent memory leaks."""
+        task = asyncio.create_task(coro)
+        return self._track_background_task(task, task_name)
         
     def _aggressive_substrate_cleanup(self, context: str = "substrate_cleanup"):
         """Aggressive cleanup of substrate/scalecodec module caches."""
@@ -2003,9 +2199,10 @@ class GaiaValidator:
             except Exception as e:
                 logger.debug(f"Error cleaning up WeatherTask: {e}")
 
-            # Substrate connection manager removed - using fresh connections only
+            # Clean up substrate manager
             try:
-                logger.info("Substrate connection manager removed - using fresh connections only")
+                cleanup_global_substrate_manager()
+                logger.info("Cleaned up substrate manager")
             except Exception as e:
                 logger.debug(f"Error cleaning up substrate manager: {e}")
 
@@ -2086,11 +2283,11 @@ class GaiaValidator:
             elif task_name == "geomagnetic":
                 await self.geomagnetic_task.cleanup_resources()
             elif task_name == "scoring":
-                self.substrate = interface.get_substrate(
+                self.substrate = get_fresh_substrate_connection(
                     subtensor_network=self.subtensor_network,
-                    subtensor_address=self.subtensor_chain_endpoint
+                    chain_endpoint=self.subtensor_chain_endpoint
                 )
-                print("🔄 Force reconnect - created fresh substrate connection")
+                logger.info("🔄 Force reconnect - created fresh substrate connection using substrate manager")
                 await self._sync_metagraph()  # Use fresh connection
             elif task_name == "deregistration":
                 await self._sync_metagraph()  # Use managed connection instead of direct sync
@@ -2428,12 +2625,12 @@ class GaiaValidator:
                 
                 # Start auto-updater as independent task (not in main loop to avoid self-cancellation)
                 logger.info("Starting independent auto-updater task...")
-                auto_updater_task = asyncio.create_task(self.check_for_updates())
+                auto_updater_task = self.create_tracked_task(self.check_for_updates(), "auto_updater")
                 logger.info("Auto-updater task started independently")
                 
                 tasks_lambdas = [ # Renamed to avoid conflict if tasks variable is used elsewhere
-                    lambda: self.geomagnetic_task.validator_execute(self),
-                    lambda: self.soil_task.validator_execute(self),
+                    #lambda: self.geomagnetic_task.validator_execute(self),
+                    #lambda: self.soil_task.validator_execute(self),
                     lambda: self.weather_task.validator_execute(self),
                     lambda: self.status_logger(),
                     lambda: self.main_scoring(),
@@ -2446,8 +2643,25 @@ class GaiaValidator:
                     lambda: self.aggressive_memory_cleanup(),  # Added aggressive memory cleanup task
                     #lambda: self.plot_database_metrics_periodically() # Added plotting task
                 ]
+                # ABC tracking disabled to prevent substrate interference
+                # The ABC tracker can interfere with substrate operations by trying to track
+                # unhashable objects like MetadataVersioned. Enable manually for debugging only.
+                abc_tracking_enabled = os.getenv('ENABLE_ABC_TRACKING', 'false').lower() == 'true'
+                if abc_tracking_enabled:
+                    try:
+                        from gaia.utils.abc_debugger import install_abc_tracker, abc_leak_monitor
+                        install_abc_tracker()
+                        logger.info("🔍 ABC object tracking MANUALLY ENABLED for memory leak analysis")
+                        tasks_lambdas.append(lambda: abc_leak_monitor(check_interval=300))  # Check every 5 minutes
+                    except ImportError as e:
+                        logger.warning(f"ABC debugger not available: {e}")
+                else:
+                    logger.debug("ABC tracking disabled (set ENABLE_ABC_TRACKING=true to enable manually)")
+                
                 if not memray_active: # Add tracemalloc snapshot taker only if memray is not active
                     tasks_lambdas.append(lambda: self.memory_snapshot_taker())
+                # ABC monitor disabled - causes 28s freeze doing isinstance(obj, ABC) on all objects
+                # tasks_lambdas.append(lambda: self.abc_object_monitor())
 
 
                 # Add DB Sync tasks conditionally
@@ -2495,10 +2709,10 @@ class GaiaValidator:
                 shutdown_waiter = None # Define here for access in except CancelledError
                 try:
                     logger.info(f"Creating {len(tasks_lambdas)} main service tasks...")
-                    active_service_tasks = [asyncio.create_task(t()) for t in tasks_lambdas]
+                    active_service_tasks = [self.create_tracked_task(t(), f"service_task_{i}") for i, t in enumerate(tasks_lambdas)]
                     logger.info(f"All {len(active_service_tasks)} main service tasks created.")
 
-                    shutdown_waiter = asyncio.create_task(self._shutdown_event.wait())
+                    shutdown_waiter = self.create_tracked_task(self._shutdown_event.wait(), "shutdown_waiter")
                     
                     # Tasks to monitor are all service tasks plus the shutdown_waiter
                     all_tasks_being_monitored = active_service_tasks + [shutdown_waiter]
@@ -2721,18 +2935,12 @@ class GaiaValidator:
                 logger.error("Weight setting operation timed out - restarting cycle")
                 await self.update_task_status('scoring', 'error')
                 try:
-                    # MEMORY LEAK FIX: Clean up old substrate before creating new one
-                    if hasattr(self, 'substrate') and self.substrate:
-                        try:
-                            self.substrate.close()
-                        except Exception:
-                            pass
-                        
-                    self.substrate = interface.get_substrate(
+                    # Use substrate manager for reconnection
+                    self.substrate = get_fresh_substrate_connection(
                         subtensor_network=self.subtensor_network,
-                        subtensor_address=self.subtensor_chain_endpoint
+                        chain_endpoint=self.subtensor_chain_endpoint
                     )
-                    print("🔄 Force reconnect - created fresh substrate connection")
+                    logger.info("🔄 Force reconnect - created fresh substrate connection using substrate manager")
                     
                     # Clear scalecodec caches after reconnection
                     try:
@@ -2796,18 +3004,12 @@ class GaiaValidator:
                 except Exception as block_error:
 
                     try:
-                        # MEMORY LEAK FIX: Clean up old substrate before creating new one
-                        if hasattr(self, 'substrate') and self.substrate:
-                            try:
-                                self.substrate.close()
-                            except Exception:
-                                pass
-                                
-                        self.substrate = interface.get_substrate(
+                        # Use substrate manager for status logger reconnection
+                        self.substrate = get_fresh_substrate_connection(
                             subtensor_network=self.subtensor_network,
-                            subtensor_address=self.subtensor_chain_endpoint
+                            chain_endpoint=self.subtensor_chain_endpoint
                         )
-                        print("🔄 Created fresh connection for status logger")
+                        logger.info("🔄 Created fresh connection for status logger using substrate manager")
                         
                         # Clear scalecodec caches after status logger reconnection
                         try:
@@ -2844,8 +3046,19 @@ class GaiaValidator:
 
                 active_nodes = len(self.metagraph.nodes) if self.metagraph else 0
 
-                # Substrate manager disabled - using fresh connections
-                substrate_stats = "Substrate Manager: DISABLED (using fresh connections)"
+                # Get substrate manager stats
+                try:
+                    from gaia.validator.utils.substrate_manager import get_substrate_manager
+                    manager = get_substrate_manager(self.subtensor_network, self.subtensor_chain_endpoint)
+                    stats = manager.get_stats()
+                    
+                    if stats["has_active_connection"]:
+                        age_info = f"age: {stats['connection_age_seconds']:.1f}s" if stats['connection_age_seconds'] else "new"
+                        substrate_stats = f"Substrate Manager: ACTIVE (conn #{stats['connection_count']}, {age_info})"
+                    else:
+                        substrate_stats = f"Substrate Manager: READY (created {stats['connection_count']} connections)"
+                except Exception:
+                    substrate_stats = "Substrate Manager: ACTIVE (status unknown)"
 
                 logger.info(
                     f"\n"
@@ -3265,11 +3478,14 @@ class GaiaValidator:
                 if node_obj: hk_chain = node_obj.get('hotkey', 'N/A')
                 if np.isnan(w_s) and np.isnan(g_s) and np.isnan(sm_s): weights_final[idx] = 0.0
                 else:
-                    wc, gc, sc, total_w_avail = 0.0,0.0,0.0,0.0
-                    if not np.isnan(w_s): wc,total_w_avail = 0.70*w_s, total_w_avail+0.70
-                    if not np.isnan(g_s): gc,total_w_avail = 0.15*sigmoid(g_s), total_w_avail+0.15
-                    if not np.isnan(sm_s): sc,total_w_avail = 0.15*sm_s, total_w_avail+0.15
-                    weights_final[idx] = (wc+gc+sc)/total_w_avail if total_w_avail>0 else 0.0
+                    # Fixed task weight calculation - no normalization by available tasks
+                    # Each task contributes its allocated portion: Weather=0.70, Geomagnetic=0.15, Soil=0.15
+                    # Perfect scores across all tasks = 1.0 total weight
+                    wc, gc, sc = 0.0, 0.0, 0.0
+                    if not np.isnan(w_s): wc = 0.70 * w_s
+                    if not np.isnan(g_s): gc = 0.15 * sigmoid(g_s)
+                    if not np.isnan(sm_s): sc = 0.15 * sm_s
+                    weights_final[idx] = wc + gc + sc
                 # Reduce logging to prevent memory pressure - only log every 32nd UID or non-zero weights
                 if idx % 32 == 0 or weights_final[idx] > 0.0:
                     logger.debug(f"UID {idx} (HK: {hk_chain}): Wea={w_s if not np.isnan(w_s) else '-'} ({weather_counts[idx]} scores), Geo={g_s if not np.isnan(g_s) else '-'} ({geo_counts[idx]} scores), Soil={sm_s if not np.isnan(sm_s) else '-'} ({soil_counts[idx]} scores), AggW={weights_final[idx]:.4f}")
@@ -3721,7 +3937,13 @@ class GaiaValidator:
                         if len(value) > 5:
                             log_output += f"  ... and {len(value) - 5} more ...\n"
                 else:
-                    log_output += f"  {title}: {json.dumps(value, indent=2, default=str)}\n"
+                    # Use high-performance JSON for database monitoring
+                    try:
+                        from gaia.utils.performance import dumps
+                        log_output += f"  {title}: {dumps(value, default=str)}\n"
+                    except ImportError:
+                        import json
+                        log_output += f"  {title}: {json.dumps(value, indent=2, default=str)}\n"
             except Exception as e_log:
                 log_output += f"  Error formatting log for {key}: {e_log}\n"
         
@@ -3996,17 +4218,24 @@ class GaiaValidator:
         """Periodically force substrate connection cleanup to prevent memory leaks."""
         while True:
             try:
-                await asyncio.sleep(300)  # Run every 5 minutes (more frequent cleanup)
+                await asyncio.sleep(120)  # INCREASED frequency: Run every 2 minutes due to tracemalloc showing 70MB from scalecodec
                 
-                # SUBSTRATE MANAGER DISABLED - Create fresh connections instead
-                logger.debug("Substrate manager disabled - creating fresh connection for periodic cleanup")
+                # Use substrate manager for periodic cleanup
+                logger.debug("Using substrate manager for periodic cleanup")
                 try:
-                    # Create fresh substrate connection
-                    self.substrate = interface.get_substrate(
+                    # Force thorough cleanup of substrate connections and caches
+                    force_substrate_cleanup(
                         subtensor_network=self.subtensor_network,
-                        subtensor_address=self.subtensor_chain_endpoint
+                        chain_endpoint=self.subtensor_chain_endpoint
                     )
-                    print("🔄 Periodic cleanup - created fresh substrate connection")
+                    logger.debug("🧹 Forced thorough substrate cleanup")
+                    
+                    # Also create a fresh connection to verify system health
+                    self.substrate = get_fresh_substrate_connection(
+                        subtensor_network=self.subtensor_network,
+                        chain_endpoint=self.subtensor_chain_endpoint
+                    )
+                    logger.debug("✅ Verified substrate connection health")
                     
                     # Force garbage collection
                     import gc
@@ -4206,10 +4435,8 @@ class GaiaValidator:
                 import numpy as np
                 if hasattr(np, '_get_ndarray_cache'):
                     np._get_ndarray_cache().clear()
-                if hasattr(np, 'core') and hasattr(np.core, 'multiarray'):
-                    if hasattr(np.core.multiarray, '_reconstruct'):
-                        # Clear numpy reconstruction cache
-                        pass
+                # Skip numpy internal cache clearing to avoid deprecation warnings
+                # NumPy manages its own internal caches efficiently
                         
                 # Clear xarray caches
                 try:
@@ -4322,8 +4549,96 @@ class GaiaValidator:
             logger.debug(f"Error in comprehensive memory cleanup: {e}")
             return 0
 
+    async def abc_object_monitor(self):
+        """Monitor and cleanup ABC (Abstract Base Class) object accumulation."""
+        import weakref
+        import gc
+        from abc import ABC
+        
+        last_abc_count = 0
+        
+        while True:
+            try:
+                await asyncio.sleep(180)  # Check every 3 minutes
+                
+                # Get detailed ABC statistics if tracker is available
+                try:
+                    from gaia.utils.abc_debugger import get_abc_stats, print_abc_report
+                    abc_stats = get_abc_stats()
+                    current_abc_count = abc_stats['total_in_memory']
+                    
+                    # Enhanced logging with detailed tracking
+                    if current_abc_count > 10000:
+                        logger.warning(f"High ABC object count: {current_abc_count} objects")
+                        # Print detailed report for troubleshooting
+                        if current_abc_count > 20000:
+                            logger.warning("Printing detailed ABC object analysis:")
+                            print_abc_report()
+                    
+                except ImportError:
+                    # Fallback to basic counting if debugger not available
+                    current_abc_objects = []
+                    for obj in gc.get_objects():
+                        if isinstance(obj, ABC):
+                            current_abc_objects.append(obj)
+                    current_abc_count = len(current_abc_objects)
+                
+                abc_growth = current_abc_count - last_abc_count
+                
+                if current_abc_count > 10000:  # High ABC object count
+                    logger.warning(f"High ABC object count: {current_abc_count} objects "
+                                 f"(growth: +{abc_growth} since last check)")
+                    
+                    # Aggressive ABC cleanup
+                    if current_abc_count > 50000:  # Critical threshold
+                        logger.error(f"CRITICAL ABC object accumulation: {current_abc_count} objects")
+                        
+                        # Force multiple GC passes to clean up ABC objects
+                        total_collected = 0
+                        for _ in range(3):
+                            collected = gc.collect()
+                            total_collected += collected
+                            await asyncio.sleep(0.1)
+                        
+                        logger.info(f"ABC emergency cleanup: GC collected {total_collected} objects")
+                
+                last_abc_count = current_abc_count
+                
+                if current_abc_count > 1000:  # Log if significant
+                    logger.debug(f"ABC object monitor: {current_abc_count} ABC objects tracked")
+                
+            except asyncio.CancelledError:
+                logger.info("ABC object monitor task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in ABC object monitor: {e}")
+                await asyncio.sleep(60)
+
 
 if __name__ == "__main__":
+    # Configure uvloop for better async performance (2-4x faster event loop)
+    try:
+        import uvloop
+        import platform
+        
+        # uvloop works best on Unix-like systems
+        if platform.system() in ['Linux', 'Darwin']:  # Linux or macOS
+            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+            logger.info("🚀 Using uvloop for enhanced async performance (2-4x faster than default asyncio)")
+            print("[STARTUP DEBUG] uvloop event loop policy installed - significant performance boost expected")
+            print("[STARTUP DEBUG] uvloop is particularly beneficial for validator workloads with many concurrent network operations")
+        else:
+            logger.info(f"⚡ uvloop available but not recommended for {platform.system()}, using default asyncio")
+            print(f"[STARTUP DEBUG] uvloop available but skipping on {platform.system()} - using standard asyncio")
+    except ImportError:
+        logger.info("⚡ uvloop not available - install with 'pip install uvloop' for 2-4x async performance boost")
+        print("[STARTUP DEBUG] uvloop not available - consider installing for significant performance improvements")
+        print("[STARTUP DEBUG] uvloop provides major benefits for validators handling hundreds of miner connections")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to install uvloop event loop policy: {e}, using default asyncio")
+        print(f"[STARTUP DEBUG] Warning: uvloop installation failed: {e}")
+        print("[STARTUP DEBUG] Falling back to standard asyncio event loop")
+
     parser = ArgumentParser()
 
     subtensor_group = parser.add_argument_group("subtensor")
@@ -4414,9 +4729,21 @@ if __name__ == "__main__":
             logger.warning(f"requirements.txt not found at {requirements_path}, skipping pip install")
             print(f"[STARTUP DEBUG] Warning: requirements.txt not found at {requirements_path}")
         else:
+            # Check if constraints file exists to prevent problematic packages
+            constraints_path = os.path.join(project_root, "constraints.txt")
+            pip_command = [sys.executable, "-m", "pip", "install"]
+            
+            # Add constraints file if it exists to prevent problematic packages like asyncio
+            if os.path.exists(constraints_path):
+                pip_command.extend(["-c", constraints_path])
+                logger.info(f"Using constraints file: {constraints_path}")
+                print(f"[STARTUP DEBUG] Using constraints file to prevent problematic packages: {constraints_path}")
+            
+            pip_command.extend(["-r", requirements_path])
+            
             # Run pip install with timeout to prevent hanging
             result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-r", requirements_path],
+                pip_command,
                 capture_output=True,
                 text=True,
                 timeout=300,  # 5 minute timeout
