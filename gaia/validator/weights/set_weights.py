@@ -101,8 +101,14 @@ class FiberWeightSetter:
 
         # Use standard fiber function but with process-isolated substrate
         if self.nodes is None:
-            # The process isolated substrate acts as a drop-in replacement
-            self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
+            try:
+                # The process isolated substrate acts as a drop-in replacement
+                self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
+                logger.info(f"Successfully fetched {len(self.nodes)} nodes")
+            except Exception as e:
+                logger.error(f"Failed to fetch nodes: {e}")
+                logger.error("Substrate network appears to be completely broken - cannot set weights without node data")
+                return None, []
         
         node_ids = [node.node_id for node in self.nodes]
 
@@ -211,13 +217,20 @@ class FiberWeightSetter:
 
             logger.info(f"Setting weights for subnet {self.netuid}...")
             
-            # Get active validators to zero out their weights
+            # Get active validators to zero out their weights (with timeout)
             try:
-                active_validator_uids = await get_active_validator_uids(
-                    netuid=self.netuid, 
-                    subtensor_network=self.network
+                active_validator_uids = await asyncio.wait_for(
+                    get_active_validator_uids(
+                        netuid=self.netuid, 
+                        subtensor_network=self.network
+                    ),
+                    timeout=30.0  # 30 second timeout for active validator detection
                 )
                 logger.info(f"Found {len(active_validator_uids)} active validators - zeroing their weights")
+            except asyncio.TimeoutError:
+                logger.warning("Active validator detection timed out after 30s - substrate network may be overloaded")
+                logger.warning("Continuing weight setting without active validator detection")
+                active_validator_uids = []
             except Exception as e:
                 logger.error(f"Failed to get active validators: {e}")
                 logger.warning("Continuing weight setting without active validator detection")
@@ -231,42 +244,55 @@ class FiberWeightSetter:
                         logger.info(f"Setting validator UID {uid} weight to zero (was {weights_copy[uid]:.6f})")
                         weights_copy[uid] = 0.0
 
-            # Calculate final weights
+            # Calculate final weights (this includes node fetching)
             calculated_weights, node_ids = await self.calculate_weights(weights_copy)
             if calculated_weights is None:
-                logger.warning("No weights calculated - skipping weight setting")
+                logger.error("Failed to calculate weights - substrate network may be completely broken")
+                logger.error("Skipping weight setting until network recovers")
                 return False
 
-            # Get validator UID
+            # Get validator UID (with timeout)
             try:
-                validator_uid = self.substrate.query(
-                    "SubtensorModule",
-                    "Uids",
-                    [self.netuid, self.keypair.ss58_address]
+                validator_uid = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.substrate.query("SubtensorModule", "Uids", [self.netuid, self.keypair.ss58_address])
+                    ),
+                    timeout=30.0  # 30 second timeout
                 )
+            except asyncio.TimeoutError:
+                logger.error("Validator UID query timed out after 30s - substrate network is completely broken")
+                return False
             except Exception as e:
                 logger.error(f"Failed to get validator UID: {e}")
                 return False
 
             version_key = __spec_version__
 
-            # Set weights using standard fiber function
+            # Set weights using standard fiber function (with timeout)
             try:
                 logger.info(f"Setting weights for {len(self.nodes)} nodes")
-                await self._async_set_node_weights(
-                    substrate=self.substrate,
-                    keypair=self.keypair,
-                    node_ids=[node.node_id for node in self.nodes],
-                    node_weights=calculated_weights.tolist(),
-                    netuid=self.netuid,
-                    validator_node_id=validator_uid,
-                    version_key=version_key,
-                    wait_for_inclusion=True,
-                    wait_for_finalization=False,
+                await asyncio.wait_for(
+                    self._async_set_node_weights(
+                        substrate=self.substrate,
+                        keypair=self.keypair,
+                        node_ids=[node.node_id for node in self.nodes],
+                        node_weights=calculated_weights.tolist(),
+                        netuid=self.netuid,
+                        validator_node_id=validator_uid,
+                        version_key=version_key,
+                        wait_for_inclusion=True,
+                        wait_for_finalization=False,
+                    ),
+                    timeout=120.0  # 2 minute timeout for weight transaction
                 )
-                logger.info("Weight commit initiated successfully")
+                logger.info("✅ Weight commit completed successfully")
                 return True
 
+            except asyncio.TimeoutError:
+                logger.error("⏰ Weight transaction timed out after 2 minutes - substrate network is severely overloaded")
+                logger.error("Weight setting will be retried in next cycle when network improves")
+                return False
             except Exception as e:
                 logger.error(f"Error setting weights: {str(e)}")
                 return False

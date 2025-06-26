@@ -2093,44 +2093,37 @@ class GaiaValidator:
             return []
 
     async def _sync_metagraph(self):
-        """Sync the metagraph using managed substrate connection with custom implementation to prevent memory leaks."""
+        """Sync the metagraph using fresh substrate connection with standard fiber methods."""
         sync_start = time.time()
-        # Use fresh substrate connection for metagraph operations with substrate manager
-        old_substrate = getattr(self, 'substrate', None)
-        self.substrate = get_fresh_substrate_connection(
-            subtensor_network=self.subtensor_network,
-            chain_endpoint=self.subtensor_chain_endpoint
-        )
-        logger.info("🔄 Created fresh connection for metagraph sync using substrate manager")
         
-        # Ensure metagraph uses the fresh connection and update substrate reference
-        if hasattr(self, 'metagraph') and self.metagraph:
-            self.metagraph.substrate = self.substrate
-        
-        # SUBSTRATE MANAGER DISABLED: Use our custom node fetching with fresh connections
         try:
+            # Use fresh isolated substrate connection for memory leak prevention
+            old_substrate = getattr(self, 'substrate', None)
+            self.substrate = get_fresh_substrate_connection(
+                subtensor_network=self.subtensor_network,
+                chain_endpoint=self.subtensor_chain_endpoint
+            )
+            logger.info("🔄 Created fresh isolated connection for metagraph sync")
+            
+            # Update metagraph to use the fresh connection
             if hasattr(self, 'metagraph') and self.metagraph:
-                # Use our ultra-aggressive caching to prevent memory leaks
-                logger.debug("Using ultra-aggressive caching with minimal substrate calls to prevent memory leaks")
-                active_nodes_list = await self._fetch_nodes_managed(self.metagraph.netuid)
+                self.metagraph.substrate = self.substrate
                 
-                if active_nodes_list:
-                    # Update metagraph nodes manually instead of calling sync_nodes()
-                    self.metagraph.nodes = {node.hotkey: node for node in active_nodes_list}
-                    logger.info(f"✅ Custom metagraph sync: Updated with {len(self.metagraph.nodes)} nodes using fresh connection (NO memory leak)")
-                else:
-                    logger.warning("No nodes returned from custom node fetching")
-                    self.metagraph.nodes = {}
+                # Use standard fiber sync_nodes() method - simple and reliable
+                logger.debug("Using standard fiber sync_nodes() with fresh isolated connection")
+                await asyncio.to_thread(self.metagraph.sync_nodes)
+                
+                node_count = len(self.metagraph.nodes) if self.metagraph.nodes else 0
+                logger.info(f"✅ Metagraph sync completed: {node_count} nodes using fresh isolated connection")
             else:
                 logger.error("Metagraph not initialized, cannot sync nodes")
                 return
+                
         except Exception as e:
-            logger.error(f"Error during custom metagraph sync: {e}")
+            logger.error(f"Error during metagraph sync: {e}")
             logger.error(traceback.format_exc())
-            # Fallback to regular sync_nodes if our custom method fails, but log the issue
-            logger.warning("Falling back to regular metagraph.sync_nodes() - this may create memory leaks")
-            if hasattr(self, 'metagraph') and self.metagraph:
-                self.metagraph.sync_nodes()
+            # Don't fall back to anything complex - just log and continue
+            logger.warning("Metagraph sync failed - will retry on next cycle")
             
         sync_duration = time.time() - sync_start
         self.last_metagraph_sync = time.time()
@@ -2138,13 +2131,13 @@ class GaiaValidator:
         # Enhanced logging
         if sync_duration > 30:  # Log slow syncs
             logger.warning(f"Slow metagraph sync: {sync_duration:.2f}s")
+        else:
+            logger.debug(f"Metagraph sync completed in {sync_duration:.2f}s")
         
         # Log substrate connection status
         connection_changed = old_substrate != self.substrate
-        logger.debug(f"Custom metagraph sync completed in {sync_duration:.2f}s using fresh connection (connection changed: {connection_changed})")
-        
         if connection_changed:
-            logger.info("Substrate connection refreshed during metagraph sync")
+            logger.debug("Substrate connection refreshed during metagraph sync")
 
     def _track_background_task(self, task: asyncio.Task, task_name: str = "unnamed"):
         """Track background tasks for proper cleanup and memory leak prevention."""
