@@ -2013,7 +2013,7 @@ async def r2_cleanup_worker(task_instance: 'WeatherTask'):
                 completed_jobs_with_inputs = await task_instance.db_manager.fetch_all("""
                     SELECT DISTINCT id FROM weather_miner_jobs 
                     WHERE status IN ('completed', 'error', 'failed') 
-                    AND created_at < NOW() - INTERVAL '1 hour'  -- Only cleanup inputs for jobs older than 1 hour
+                    AND updated_at < NOW() - INTERVAL '1 hour'  -- Only cleanup inputs for jobs older than 1 hour
                 """)
                 
                 # Get all input objects
