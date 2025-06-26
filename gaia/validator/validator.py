@@ -525,6 +525,9 @@ class GaiaValidator:
 
         # Add lock for miner table operations
         self.miner_table_lock = asyncio.Lock()
+        
+        # Add lock for metagraph sync to prevent concurrent syncs
+        self.metagraph_sync_lock = asyncio.Lock()
 
         # Memory monitoring configuration
         self.memory_monitor_enabled = os.getenv('VALIDATOR_MEMORY_MONITORING_ENABLED', 'true').lower() in ['true', '1', 'yes']
@@ -1597,7 +1600,7 @@ class GaiaValidator:
                 try:
                     await asyncio.wait_for(
                         self._sync_metagraph(),
-                        timeout=10  # 10 second timeout
+                        timeout=15  # 15 second timeout (allows for 6-7s connection + sync time)
                     )
                 except asyncio.TimeoutError:
                     logger.error("Metagraph sync timed out")
@@ -2094,50 +2097,58 @@ class GaiaValidator:
 
     async def _sync_metagraph(self):
         """Sync the metagraph using fresh substrate connection with standard fiber methods."""
-        sync_start = time.time()
-        
-        try:
-            # Use fresh isolated substrate connection for memory leak prevention
-            old_substrate = getattr(self, 'substrate', None)
-            self.substrate = get_fresh_substrate_connection(
-                subtensor_network=self.subtensor_network,
-                chain_endpoint=self.subtensor_chain_endpoint
-            )
-            logger.info("🔄 Created fresh isolated connection for metagraph sync")
-            
-            # Update metagraph to use the fresh connection
-            if hasattr(self, 'metagraph') and self.metagraph:
-                self.metagraph.substrate = self.substrate
-                
-                # Use standard fiber sync_nodes() method - simple and reliable
-                logger.debug("Using standard fiber sync_nodes() with fresh isolated connection")
-                await asyncio.to_thread(self.metagraph.sync_nodes)
-                
-                node_count = len(self.metagraph.nodes) if self.metagraph.nodes else 0
-                logger.info(f"✅ Metagraph sync completed: {node_count} nodes using fresh isolated connection")
-            else:
-                logger.error("Metagraph not initialized, cannot sync nodes")
+        # Use lock to prevent concurrent syncs
+        async with self.metagraph_sync_lock:
+            # Check if another sync just completed while we were waiting for the lock
+            current_time = time.time()
+            if hasattr(self, 'last_metagraph_sync') and current_time - self.last_metagraph_sync < 30:
+                logger.debug(f"Metagraph recently synced {current_time - self.last_metagraph_sync:.1f}s ago, skipping")
                 return
-                
-        except Exception as e:
-            logger.error(f"Error during metagraph sync: {e}")
-            logger.error(traceback.format_exc())
-            # Don't fall back to anything complex - just log and continue
-            logger.warning("Metagraph sync failed - will retry on next cycle")
             
-        sync_duration = time.time() - sync_start
-        self.last_metagraph_sync = time.time()
-        
-        # Enhanced logging
-        if sync_duration > 30:  # Log slow syncs
-            logger.warning(f"Slow metagraph sync: {sync_duration:.2f}s")
-        else:
-            logger.debug(f"Metagraph sync completed in {sync_duration:.2f}s")
-        
-        # Log substrate connection status
-        connection_changed = old_substrate != self.substrate
-        if connection_changed:
-            logger.debug("Substrate connection refreshed during metagraph sync")
+            sync_start = time.time()
+            
+            try:
+                # Use fresh isolated substrate connection for memory leak prevention
+                old_substrate = getattr(self, 'substrate', None)
+                self.substrate = get_fresh_substrate_connection(
+                    subtensor_network=self.subtensor_network,
+                    chain_endpoint=self.subtensor_chain_endpoint
+                )
+                logger.info("🔄 Created fresh isolated connection for metagraph sync")
+                
+                # Update metagraph to use the fresh connection
+                if hasattr(self, 'metagraph') and self.metagraph:
+                    self.metagraph.substrate = self.substrate
+                    
+                    # Use standard fiber sync_nodes() method - simple and reliable
+                    logger.debug("Using standard fiber sync_nodes() with fresh isolated connection")
+                    await asyncio.to_thread(self.metagraph.sync_nodes)
+                    
+                    node_count = len(self.metagraph.nodes) if self.metagraph.nodes else 0
+                    logger.info(f"✅ Metagraph sync completed: {node_count} nodes using fresh isolated connection")
+                else:
+                    logger.error("Metagraph not initialized, cannot sync nodes")
+                    return
+                    
+            except Exception as e:
+                logger.error(f"Error during metagraph sync: {e}")
+                logger.error(traceback.format_exc())
+                # Don't fall back to anything complex - just log and continue
+                logger.warning("Metagraph sync failed - will retry on next cycle")
+                
+            sync_duration = time.time() - sync_start
+            self.last_metagraph_sync = time.time()
+            
+            # Enhanced logging
+            if sync_duration > 30:  # Log slow syncs
+                logger.warning(f"Slow metagraph sync: {sync_duration:.2f}s")
+            else:
+                logger.debug(f"Metagraph sync completed in {sync_duration:.2f}s")
+            
+            # Log substrate connection status
+            connection_changed = old_substrate != self.substrate
+            if connection_changed:
+                logger.debug("Substrate connection refreshed during metagraph sync")
 
     def _track_background_task(self, task: asyncio.Task, task_name: str = "unnamed"):
         """Track background tasks for proper cleanup and memory leak prevention."""
@@ -2736,8 +2747,8 @@ class GaiaValidator:
                 logger.info("Auto-updater task started independently")
                 
                 tasks_lambdas = [ # Renamed to avoid conflict if tasks variable is used elsewhere
-                    #lambda: self.geomagnetic_task.validator_execute(self),
-                    #lambda: self.soil_task.validator_execute(self),
+                    lambda: self.geomagnetic_task.validator_execute(self),
+                    lambda: self.soil_task.validator_execute(self),
                     lambda: self.weather_task.validator_execute(self),
                     lambda: self.status_logger(),
                     lambda: self.main_scoring(),
