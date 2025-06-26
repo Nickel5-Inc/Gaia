@@ -415,7 +415,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
     @track_operation('write')
     async def batch_update_miners(self, miners_data: List[Dict[str, Any]]) -> None:
         """
-        Update multiple miners using upsert (INSERT ... ON CONFLICT DO UPDATE).
+        Update multiple miners using chunked upsert operations to prevent timeouts.
         Args:
             miners_data: List of dictionaries containing miner update data.
                         Each dict should have 'index' and other miner fields.
@@ -435,71 +435,128 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             logger.warning("No valid miners to update after filtering")
             return
 
-        updated_count = 0
-        inserted_count = 0
+        # CHUNKING: Process miners in chunks to prevent timeouts and database locks
+        chunk_size = 50  # Process 50 miners at a time
+        total_processed = 0
+        
+        logger.info(f"Processing {len(valid_miners_to_update)} miners in chunks of {chunk_size}")
+        
         try:
-            async with self.lightweight_session() as session:
-                async with session.begin():
-                    for miner_data in valid_miners_to_update:
-                        index_val = miner_data['index']
-                        
-                        # Prepare values for upsert
-                        insert_values = {
-                            'uid': index_val,
-                            'last_updated': datetime.now(timezone.utc)
-                        }
-                        update_values = {
-                            'last_updated': datetime.now(timezone.utc)
-                        }
-                        
-                        # Add fields that are present in miner_data
-                        for field in ['hotkey', 'coldkey', 'ip', 'ip_type', 'port', 'incentive', 'stake', 'trust', 'vtrust', 'protocol']:
-                            if field in miner_data:
-                                insert_values[field] = miner_data[field]
-                                update_values[field] = miner_data[field]
-
-                        if not update_values:
-                            logger.warning(f"No values to update for miner index {index_val}. Skipping.")
-                            continue
-
-                        # Use PostgreSQL's ON CONFLICT DO UPDATE for proper upsert
-                        upsert_query = """
-                        INSERT INTO node_table (uid, hotkey, coldkey, ip, ip_type, port, incentive, stake, trust, vtrust, protocol, last_updated)
-                        VALUES (:uid, :hotkey, :coldkey, :ip, :ip_type, :port, :incentive, :stake, :trust, :vtrust, :protocol, :last_updated)
-                        ON CONFLICT (uid) DO UPDATE SET
-                            hotkey = EXCLUDED.hotkey,
-                            coldkey = EXCLUDED.coldkey,
-                            ip = EXCLUDED.ip,
-                            ip_type = EXCLUDED.ip_type,
-                            port = EXCLUDED.port,
-                            incentive = EXCLUDED.incentive,
-                            stake = EXCLUDED.stake,
-                            trust = EXCLUDED.trust,
-                            vtrust = EXCLUDED.vtrust,
-                            protocol = EXCLUDED.protocol,
-                            last_updated = EXCLUDED.last_updated
-                        """
-                        
-                        result = await session.execute(text(upsert_query), insert_values)
-                        
-                        # Check if this was an insert or update by checking if the row existed before
-                        check_query = "SELECT 1 FROM node_table WHERE uid = :uid AND last_updated = :last_updated"
-                        exists_result = await session.execute(text(check_query), {
-                            'uid': index_val, 
-                            'last_updated': insert_values['last_updated']
-                        })
-                        
-                        if exists_result.fetchone():
-                            # We can't easily distinguish insert vs update with ON CONFLICT, 
-                            # so we'll assume success and count all operations
-                            updated_count += 1
+            for chunk_start in range(0, len(valid_miners_to_update), chunk_size):
+                chunk_end = min(chunk_start + chunk_size, len(valid_miners_to_update))
+                chunk_miners = valid_miners_to_update[chunk_start:chunk_end]
+                
+                logger.debug(f"Processing miner chunk {chunk_start//chunk_size + 1}: miners {chunk_start+1}-{chunk_end}")
+                
+                chunk_processed = 0
+                
+                # Process this chunk in a separate session with timeout
+                try:
+                    # Use asyncio.wait_for to add timeout to the entire chunk operation
+                    chunk_processed = await asyncio.wait_for(
+                        self._process_miner_chunk(chunk_miners),
+                        timeout=30.0  # 30 second timeout per chunk
+                    )
+                    total_processed += chunk_processed
+                    
+                except asyncio.TimeoutError:
+                    logger.error(f"Chunk {chunk_start//chunk_size + 1} timed out after 30 seconds")
+                    # Try to process individually as fallback
+                    for miner_data in chunk_miners:
+                        try:
+                            await asyncio.wait_for(
+                                self._process_single_miner(miner_data),
+                                timeout=5.0  # 5 second timeout per individual miner
+                            )
+                            total_processed += 1
+                        except asyncio.TimeoutError:
+                            logger.error(f"Individual miner UID {miner_data.get('index')} timed out")
+                        except Exception as individual_e:
+                            logger.error(f"Error processing individual miner UID {miner_data.get('index')}: {individual_e}")
                             
-            logger.info(f"Successfully batch processed {updated_count} miners (upserts executed in one transaction).")
+                except Exception as chunk_e:
+                    logger.error(f"Error processing chunk {chunk_start//chunk_size + 1}: {chunk_e}")
+                    # Try individual fallback for this chunk
+                    for miner_data in chunk_miners:
+                        try:
+                            await self._process_single_miner(miner_data)
+                            total_processed += 1
+                        except Exception as individual_e:
+                            logger.error(f"Error processing individual miner UID {miner_data.get('index')}: {individual_e}")
+                
+                # Small delay between chunks to reduce database pressure
+                await asyncio.sleep(0.1)
+                        
+            logger.info(f"Successfully batch processed {total_processed}/{len(valid_miners_to_update)} miners")
                         
         except Exception as e:
             logger.error(f"Error in batch_update_miners: {str(e)}")
             logger.error(traceback.format_exc())
             raise DatabaseError(f"Failed to batch update miners: {str(e)}")
+
+    async def _process_miner_chunk(self, chunk_miners: List[Dict[str, Any]]) -> int:
+        """Process a chunk of miners in a single transaction."""
+        processed_count = 0
+        
+        async with self.lightweight_session() as session:
+            async with session.begin():
+                for miner_data in chunk_miners:
+                    index_val = miner_data['index']
+                    
+                    # Prepare values for upsert
+                    insert_values = {
+                        'uid': index_val,
+                        'last_updated': datetime.now(timezone.utc)
+                    }
+                    
+                    # Add fields that are present in miner_data
+                    for field in ['hotkey', 'coldkey', 'ip', 'ip_type', 'port', 'incentive', 'stake', 'trust', 'vtrust', 'protocol']:
+                        if field in miner_data:
+                            insert_values[field] = miner_data[field]
+
+                    if len(insert_values) <= 2:  # Only uid and last_updated
+                        logger.warning(f"No values to update for miner index {index_val}. Skipping.")
+                        continue
+
+                    # Use PostgreSQL's ON CONFLICT DO UPDATE for efficient upsert
+                    # REMOVED: unnecessary existence check that was causing the timeout
+                    upsert_query = """
+                    INSERT INTO node_table (uid, hotkey, coldkey, ip, ip_type, port, incentive, stake, trust, vtrust, protocol, last_updated)
+                    VALUES (:uid, :hotkey, :coldkey, :ip, :ip_type, :port, :incentive, :stake, :trust, :vtrust, :protocol, :last_updated)
+                    ON CONFLICT (uid) DO UPDATE SET
+                        hotkey = EXCLUDED.hotkey,
+                        coldkey = EXCLUDED.coldkey,
+                        ip = EXCLUDED.ip,
+                        ip_type = EXCLUDED.ip_type,
+                        port = EXCLUDED.port,
+                        incentive = EXCLUDED.incentive,
+                        stake = EXCLUDED.stake,
+                        trust = EXCLUDED.trust,
+                        vtrust = EXCLUDED.vtrust,
+                        protocol = EXCLUDED.protocol,
+                        last_updated = EXCLUDED.last_updated
+                    """
+                    
+                    await session.execute(text(upsert_query), insert_values)
+                    processed_count += 1
+                    
+        return processed_count
+
+    async def _process_single_miner(self, miner_data: Dict[str, Any]) -> None:
+        """Process a single miner as fallback when batch operations fail."""
+        await self.update_miner_info(
+            index=miner_data['index'],
+            hotkey=miner_data.get('hotkey'),
+            coldkey=miner_data.get('coldkey'),
+            ip=miner_data.get('ip'),
+            ip_type=miner_data.get('ip_type'),
+            port=miner_data.get('port'),
+            incentive=miner_data.get('incentive'),
+            stake=miner_data.get('stake'),
+            trust=miner_data.get('trust'),
+            vtrust=miner_data.get('vtrust'),
+            protocol=miner_data.get('protocol')
+        )
 
     @track_operation('read')
     async def get_miner_info(self, index: int):

@@ -13,28 +13,28 @@ from dotenv import load_dotenv
 from fiber.logging_utils import get_logger
 import numpy as np
 from gaia import __spec_version__
-from gaia.validator.utils.substrate_manager import get_fresh_substrate_connection
+from gaia.validator.utils.substrate_manager import get_fresh_substrate_connection, get_process_isolated_substrate
 
 logger = get_logger(__name__)
 
 
 async def get_active_validator_uids(netuid, subtensor_network="finney", chain_endpoint=None, recent_blocks=500):
     try:
-        # Use substrate manager for validator UID queries
-        substrate = get_fresh_substrate_connection(
+        # Use process-isolated substrate for validator UID queries
+        substrate = get_process_isolated_substrate(
             subtensor_network=subtensor_network,
             chain_endpoint=chain_endpoint or ""
         )
-        logger.info("🔄 Using substrate manager for get_active_validator_uids")
+        logger.info("🛡️ Using process-isolated substrate for get_active_validator_uids")
         
         loop = asyncio.get_event_loop()
         validator_permits = await loop.run_in_executor(
             None, 
-            lambda: substrate.query("SubtensorModule", "ValidatorPermit", [netuid]).value
+            lambda: substrate.query("SubtensorModule", "ValidatorPermit", [netuid])
         )
         last_update = await loop.run_in_executor(
             None,
-            lambda: substrate.query("SubtensorModule", "LastUpdate", [netuid]).value
+            lambda: substrate.query("SubtensorModule", "LastUpdate", [netuid])
         )
         current_block = await loop.run_in_executor(
             None,
@@ -52,59 +52,8 @@ async def get_active_validator_uids(netuid, subtensor_network="finney", chain_en
         logger.error(traceback.format_exc())
         return []
     finally:
-        # MEMORY LEAK FIX: Aggressive substrate cleanup
-        if 'substrate' in locals():
-            try:
-                # Clear substrate internal caches before closing
-                try:
-                    if hasattr(substrate, '_request_cache'):
-                        substrate._request_cache.clear()
-                    if hasattr(substrate, 'metadata_cache'):
-                        substrate.metadata_cache.clear()
-                    if hasattr(substrate, 'runtime_configuration'):
-                        substrate.runtime_configuration = None
-                    if hasattr(substrate, 'websocket') and substrate.websocket:
-                        substrate.websocket.close()
-                except Exception:
-                    pass
-                    
-                substrate.close()
-                
-                # Clear scalecodec caches after substrate operation
-                try:
-                    import sys
-                    import gc
-                    cleared_count = 0
-                    
-                    for module_name in list(sys.modules.keys()):
-                        if any(pattern in module_name.lower() for pattern in 
-                               ['scalecodec', 'substrate', 'scale_info']):
-                            module = sys.modules.get(module_name)
-                            if hasattr(module, '__dict__'):
-                                for attr_name in list(module.__dict__.keys()):
-                                    if any(cache_pattern in attr_name.lower() for cache_pattern in 
-                                           ['cache', 'registry', '_cached', '_memo']):
-                                        try:
-                                            cache_obj = getattr(module, attr_name)
-                                            if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
-                                                cache_obj.clear()
-                                                cleared_count += 1
-                                            elif isinstance(cache_obj, (dict, list, set)):
-                                                cache_obj.clear()
-                                                cleared_count += 1
-                                        except Exception:
-                                            pass
-                    
-                    # Force GC after clearing caches
-                    collected = gc.collect()
-                    if cleared_count > 0:
-                        logger.debug(f"get_active_validator_uids cleanup: cleared {cleared_count} cache objects, GC collected {collected}")
-                        
-                except Exception:
-                    pass
-                    
-            except Exception as cleanup_error:
-                logger.debug(f"Error cleaning up substrate connection: {cleanup_error}")
+        # Process-isolated substrate automatically cleans up when processes terminate
+        logger.debug("🛡️ get_active_validator_uids complete - process isolation prevents ABC memory leaks automatically")
 
 
 class FiberWeightSetter:
@@ -119,9 +68,9 @@ class FiberWeightSetter:
         """Initialize the weight setter with fiber connections"""
         self.netuid = netuid
         self.network = network
-        # Use substrate manager for initialization (will be replaced with fresh connection during weight setting)
-        logger.info("🔄 FiberWeightSetter using substrate manager for initialization")
-        self.substrate = get_fresh_substrate_connection(
+        # Use process-isolated substrate for initialization 
+        logger.info("🛡️ FiberWeightSetter using process-isolated substrate for initialization")
+        self.substrate = get_process_isolated_substrate(
             subtensor_network=network,
             chain_endpoint=""  # Use default endpoint
         )
@@ -132,21 +81,12 @@ class FiberWeightSetter:
         self.timeout = timeout
 
     def cleanup(self):
-        """Clean up substrate connection."""
-        if hasattr(self, 'substrate') and self.substrate:
-            try:
-                logger.debug("Cleaning up unmanaged substrate connection in FiberWeightSetter")
-                self.substrate.close()
-                self.substrate = None
-            except Exception as e:
-                logger.debug(f"Error cleaning up substrate connection: {e}")
+        """No cleanup needed with process-isolated substrate."""
+        logger.debug("🛡️ No cleanup needed - process-isolated substrate handles cleanup automatically")
 
     def __del__(self):
-        """Destructor to ensure cleanup happens when object is destroyed."""
-        try:
-            self.cleanup()
-        except Exception:
-            pass  # Ignore errors in destructor
+        """No cleanup needed with process-isolated substrate."""
+        pass  # Process isolation handles cleanup automatically
 
 
 
@@ -264,21 +204,16 @@ class FiberWeightSetter:
 
             logger.info(f"\nSetting weights for subnet {self.netuid}...")
 
-            # SAFETY MEASURE: Always create a fresh substrate connection for weight setting
-            # This ensures we have the most current blockchain state and aren't affected by
-            # any potential caching or staleness issues in managed connections
-            logger.info("Creating fresh substrate connection for weight setting (bypassing managed connection)")
+            # MEMORY LEAK PREVENTION: Use process-isolated substrate for weight setting
+            # This ensures ABC objects are contained in separate processes and automatically destroyed
+            logger.info("🛡️ Creating process-isolated substrate connection for weight setting")
             
-            # Clean up any existing connection first
-            if hasattr(self, 'substrate') and self.substrate:
-                try:
-                    self.substrate.close()
-                except Exception as e:
-                    logger.debug(f"Error closing old connection before fresh creation: {e}")
-            
-            # Create completely fresh substrate connection
-            self.substrate = interface.get_substrate(subtensor_network=self.network)
-            logger.info("✅ Fresh substrate connection created for weight setting")
+            # Use process-isolated substrate connection for weight setting
+            self.substrate = get_process_isolated_substrate(
+                subtensor_network=self.network,
+                chain_endpoint=""  # Use default endpoint
+            )
+            logger.info("✅ Process-isolated substrate connection created for weight setting")
             self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
             logger.info(f"Found {len(self.nodes)} nodes in subnet")
 
@@ -286,7 +221,7 @@ class FiberWeightSetter:
                 "SubtensorModule",
                 "Uids",
                 [self.netuid, self.keypair.ss58_address]
-            ).value
+            )
 
             version_key = __spec_version__
 
@@ -337,79 +272,17 @@ class FiberWeightSetter:
                 logger.error(f"Error initiating weight commit: {str(e)}")
                 return False
             finally:
-                # Clean up the fresh substrate connection to prevent memory leaks
-                if hasattr(self, 'substrate') and self.substrate:
-                    try:
-                        logger.debug("Cleaning up fresh substrate connection after weight setting")
-                        self.substrate.close()
-                        self.substrate = None
-                    except Exception as cleanup_e:
-                        logger.debug(f"Error cleaning up fresh substrate connection: {cleanup_e}")
+                # Process-isolated substrate automatically cleans up when processes terminate
+                logger.debug("Process-isolated substrate cleanup is automatic - no manual cleanup needed")
 
         except Exception as e:
             logger.error(f"Error in weight setting: {str(e)}")
             logger.error(traceback.format_exc())
             return False
         finally:
-            # MEMORY LEAK FIX: Aggressive substrate cleanup with scalecodec cache clearing
-            if hasattr(self, 'substrate') and self.substrate:
-                try:
-                    logger.debug("Final cleanup of fresh substrate connection with aggressive scalecodec cleanup")
-                    
-                    # Clear substrate internal caches before closing
-                    try:
-                        if hasattr(self.substrate, '_request_cache'):
-                            self.substrate._request_cache.clear()
-                        if hasattr(self.substrate, 'metadata_cache'):
-                            self.substrate.metadata_cache.clear()
-                        if hasattr(self.substrate, 'runtime_configuration'):
-                            self.substrate.runtime_configuration = None
-                        if hasattr(self.substrate, 'websocket') and self.substrate.websocket:
-                            self.substrate.websocket.close()
-                    except Exception as cache_clear_err:
-                        logger.debug(f"Error clearing substrate caches: {cache_clear_err}")
-                    
-                    # Close the connection
-                    self.substrate.close()
-                    self.substrate = None
-                    
-                    # AGGRESSIVE: Clear scalecodec module-level caches after substrate operations
-                    try:
-                        import sys
-                        scalecodec_modules_cleared = 0
-                        
-                        for module_name in list(sys.modules.keys()):
-                            if any(pattern in module_name.lower() for pattern in 
-                                   ['scalecodec', 'substrate', 'scale_info', 'metadata']):
-                                module = sys.modules.get(module_name)
-                                if hasattr(module, '__dict__'):
-                                    for attr_name in list(module.__dict__.keys()):
-                                        if any(cache_pattern in attr_name.lower() for cache_pattern in 
-                                               ['cache', 'registry', '_cached', '_memo', '_lru', '_store']):
-                                            try:
-                                                cache_obj = getattr(module, attr_name)
-                                                if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
-                                                    cache_obj.clear()
-                                                    scalecodec_modules_cleared += 1
-                                                elif isinstance(cache_obj, (dict, list, set)):
-                                                    cache_obj.clear() 
-                                                    scalecodec_modules_cleared += 1
-                                            except Exception:
-                                                pass
-                        
-                        if scalecodec_modules_cleared > 0:
-                            logger.debug(f"Substrate cleanup: cleared {scalecodec_modules_cleared} scalecodec cache objects")
-                                                
-                        # Force garbage collection after substrate operations
-                        import gc
-                        collected = gc.collect()
-                        logger.debug(f"Substrate cleanup: GC collected {collected} objects")
-                        
-                    except Exception as aggressive_cleanup_err:
-                        logger.debug(f"Error during aggressive substrate cleanup: {aggressive_cleanup_err}")
-                        
-                except Exception as cleanup_e:
-                    logger.debug(f"Error in final substrate cleanup: {cleanup_e}")
+            # Process-isolated substrate automatically prevents ABC memory leaks
+            # No manual cleanup needed - each operation runs in separate processes that auto-terminate
+            logger.debug("🛡️ Weight setting complete - process isolation prevents ABC memory leaks automatically")
 
     async def _async_set_node_weights(self, **kwargs):
         """Async wrapper for the synchronous set_node_weights function with timeout"""

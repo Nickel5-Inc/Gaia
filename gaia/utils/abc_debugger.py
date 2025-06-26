@@ -195,6 +195,89 @@ def find_abc_leaks(threshold: int = 1000) -> List[str]:
     
     return issues
 
+def lightweight_substrate_cleanup() -> int:
+    """
+    Lightweight cleanup targeting specific substrate/scalecodec module caches.
+    Much more efficient than iterating through all objects.
+    """
+    logger.debug("🧹 Starting lightweight substrate cleanup...")
+    
+    cleanup_count = 0
+    
+    try:
+        # 1. Target specific problematic modules for cache clearing
+        problematic_modules = [
+            'scalecodec', 'substrate', 'scale_info', 'substrateinterface', 
+            'scale_codec', 'metadata', 'metadataversioned'
+        ]
+        
+        cleared_modules = 0
+        for module_name in list(sys.modules.keys()):
+            if any(pattern in module_name.lower() for pattern in problematic_modules):
+                module = sys.modules.get(module_name)
+                if module and hasattr(module, '__dict__'):
+                    # Clear specific cache attributes
+                    cache_attrs = [
+                        'registry', '_registry', 'cache', '_cache', '_cached',
+                        '_type_registry', '_metadata', '_runtime', '_lru',
+                        '_memo', '_store', '_buffer', '_instances'
+                    ]
+                    
+                    for attr_name in list(module.__dict__.keys()):
+                        if any(cache_word in attr_name.lower() for cache_word in cache_attrs):
+                            try:
+                                cache_obj = getattr(module, attr_name)
+                                if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
+                                    cache_obj.clear()
+                                    cleanup_count += 1
+                                elif isinstance(cache_obj, (dict, list, set)):
+                                    cache_obj.clear()
+                                    cleanup_count += 1
+                            except Exception:
+                                pass
+                    cleared_modules += 1
+        
+        # 2. Clear Python's internal type cache (lightweight)
+        try:
+            if hasattr(sys, '_clear_type_cache'):
+                sys._clear_type_cache()
+                logger.debug("   ✓ Cleared Python type cache")
+        except Exception:
+            pass
+        
+        # 3. Single garbage collection pass
+        collected = gc.collect()
+        
+        if cleared_modules > 0 or collected > 0:
+            logger.debug(f"   ✓ Cleared {cleanup_count} cache objects from {cleared_modules} modules, GC: {collected}")
+        
+    except Exception as e:
+        logger.debug(f"Error during lightweight substrate cleanup: {e}")
+    
+    return cleanup_count
+
+def get_abc_memory_usage_lightweight() -> Dict[str, Any]:
+    """Get ABC memory usage using psutil instead of iterating through all objects."""
+    try:
+        import psutil
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        
+        return {
+            'total_memory_mb': memory_info.rss / (1024 * 1024),
+            'memory_estimate_mb': memory_info.rss / (1024 * 1024),
+            'total_abc_objects': 'unknown',  # Avoid expensive gc.get_objects() call
+            'problematic_objects': 'unknown'
+        }
+    except ImportError:
+        # Fallback to basic info without iterating through objects
+        return {
+            'total_memory_mb': 0,
+            'memory_estimate_mb': 0,
+            'total_abc_objects': 'unknown',
+            'problematic_objects': 'unknown'
+        }
+
 async def abc_leak_monitor(check_interval: int = 180):
     """
     Continuous ABC leak monitoring
@@ -214,9 +297,9 @@ async def abc_leak_monitor(check_interval: int = 180):
                 # Print detailed report when leaks detected
                 print_abc_report()
                 
-                # Force garbage collection
-                collected = gc.collect()
-                logger.info(f"Forced GC collected {collected} objects")
+                # Use lightweight cleanup instead of force GC
+                cleaned = lightweight_substrate_cleanup()
+                logger.info(f"Lightweight cleanup removed {cleaned} cache objects")
             
         except Exception as e:
             logger.error(f"Error in ABC leak monitor: {e}")
