@@ -414,11 +414,54 @@ class Miner:
                 logger.error(f"Local inference service at {health_url} did not become ready within {INFERENCE_SERVICE_READY_TIMEOUT} seconds.")
                 return False
 
-            app = fiber_server.factory_app(debug=True)
-            app.body_limit = MAX_REQUEST_SIZE
+            # Add required imports for lifespan and middleware
+            from collections import defaultdict
+            from contextlib import asynccontextmanager
+            import time
+            
+            # Simple in-memory rate limiter with proper cleanup
+            request_counts = defaultdict(list)
+            
+            async def cleanup_rate_limiter():
+                """Periodic cleanup of rate limiter to prevent memory leaks"""
+                while True:
+                    try:
+                        await asyncio.sleep(300)  # Clean every 5 minutes
+                        current_time = time.time()
+                        
+                        # Clean old requests and remove empty IP entries
+                        empty_ips = []
+                        for client_ip, requests in request_counts.items():
+                            # Remove old requests
+                            request_counts[client_ip] = [
+                                req_time for req_time in requests 
+                                if current_time - req_time < 60
+                            ]
+                            # Mark empty IPs for removal
+                            if not request_counts[client_ip]:
+                                empty_ips.append(client_ip)
+                        
+                        # Remove empty IP entries to prevent memory accumulation
+                        for ip in empty_ips:
+                            del request_counts[ip]
+                        
+                        if empty_ips:
+                            self.logger.debug(f"Rate limiter cleanup: Removed {len(empty_ips)} inactive IP entries")
+                        
+                        # Log memory usage periodically
+                        active_ips = len(request_counts)
+                        if active_ips > 100:  # Log if many IPs are being tracked
+                            self.logger.info(f"Rate limiter tracking {active_ips} IP addresses")
+                            
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        self.logger.warning(f"Error in rate limiter cleanup: {e}")
 
-            @app.on_event("startup")
-            async def overridden_startup_event():
+            # Use proper lifespan context manager instead of deprecated on_event  
+            @asynccontextmanager
+            async def lifespan(app: FastAPI):
+                # Startup
                 nonlocal self # Ensure self is captured if methods like self.database_manager are used
                 self.logger.info("Initializing database on application startup (via overridden on_event)...")
                 try:
@@ -496,63 +539,20 @@ class Miner:
                 else:
                     self.logger.info("Weather task is disabled (checked in startup event). self.weather_task should be None.")
 
+                # Start rate limiter cleanup task (now that event loop is running)
+                cleanup_task = asyncio.create_task(cleanup_rate_limiter())
+                app.state.rate_limiter_cleanup = cleanup_task
+                self.logger.info("Rate limiter cleanup task started")
+
                 yield
+                # Shutdown
                 self.logger.info("Application shutting down...")
                 # Stop memory monitoring on shutdown
                 await self.stop_memory_monitoring()
             
-            
-
+            # Create FastAPI app with lifespan
+            app = FastAPI(debug=True, lifespan=lifespan)
             app.body_limit = MAX_REQUEST_SIZE
-
-            # Add rate limiting middleware to prevent request spam
-            from collections import defaultdict
-            import time
-            
-            # Simple in-memory rate limiter with proper cleanup
-            request_counts = defaultdict(list)
-            
-            async def cleanup_rate_limiter():
-                """Periodic cleanup of rate limiter to prevent memory leaks"""
-                while True:
-                    try:
-                        await asyncio.sleep(300)  # Clean every 5 minutes
-                        current_time = time.time()
-                        
-                        # Clean old requests and remove empty IP entries
-                        empty_ips = []
-                        for client_ip, requests in request_counts.items():
-                            # Remove old requests
-                            request_counts[client_ip] = [
-                                req_time for req_time in requests 
-                                if current_time - req_time < 60
-                            ]
-                            # Mark empty IPs for removal
-                            if not request_counts[client_ip]:
-                                empty_ips.append(client_ip)
-                        
-                        # Remove empty IP entries to prevent memory accumulation
-                        for ip in empty_ips:
-                            del request_counts[ip]
-                        
-                        if empty_ips:
-                            self.logger.debug(f"Rate limiter cleanup: Removed {len(empty_ips)} inactive IP entries")
-                        
-                        # Log memory usage periodically
-                        active_ips = len(request_counts)
-                        if active_ips > 100:  # Log if many IPs are being tracked
-                            self.logger.info(f"Rate limiter tracking {active_ips} IP addresses")
-                            
-                    except asyncio.CancelledError:
-                        break
-                    except Exception as e:
-                        self.logger.warning(f"Error in rate limiter cleanup: {e}")
-            
-            # Start cleanup task
-            cleanup_task = asyncio.create_task(cleanup_rate_limiter())
-            
-            # Store cleanup task for shutdown
-            app.state.rate_limiter_cleanup = cleanup_task
             
             @app.middleware("http")
             async def rate_limit_middleware(request, call_next):
