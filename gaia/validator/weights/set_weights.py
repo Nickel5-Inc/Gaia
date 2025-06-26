@@ -4,7 +4,7 @@ from typing import List, Optional
 import asyncio
 import traceback
 from fiber.chain import interface, chain_utils, weights as w
-# Note: get_nodes_for_netuid replaced with process-isolated _fetch_nodes_process_isolated
+from fiber.chain.fetch_nodes import get_nodes_for_netuid
 from fiber import SubstrateInterface
 from fiber.chain.interface import get_substrate
 import sys
@@ -13,33 +13,40 @@ from dotenv import load_dotenv
 from fiber.logging_utils import get_logger
 import numpy as np
 from gaia import __spec_version__
-from gaia.validator.utils.substrate_manager import get_fresh_substrate_connection, get_process_isolated_substrate
+from gaia.validator.utils.substrate_manager import get_process_isolated_substrate
 
 logger = get_logger(__name__)
 
 
 async def get_active_validator_uids(netuid, subtensor_network="finney", chain_endpoint=None, recent_blocks=500):
     try:
-        # Use process-isolated substrate for validator UID queries
+        # Use process isolated substrate for consistency
         substrate = get_process_isolated_substrate(
             subtensor_network=subtensor_network,
             chain_endpoint=chain_endpoint or ""
         )
-        logger.info("🛡️ Using process-isolated substrate for get_active_validator_uids")
         
         loop = asyncio.get_event_loop()
+        
+        # Get validator permits - nodes with vpermit == 1 are validators
         validator_permits = await loop.run_in_executor(
             None, 
             lambda: substrate.query("SubtensorModule", "ValidatorPermit", [netuid])
         )
+        
+        # Get last update times for all nodes
         last_update = await loop.run_in_executor(
             None,
             lambda: substrate.query("SubtensorModule", "LastUpdate", [netuid])
         )
+        
+        # Get current block number using get_block method
         current_block = await loop.run_in_executor(
             None,
             lambda: int(substrate.get_block()["header"]["number"])
         )
+        
+        # Find active validators: vpermit == 1 AND recently updated
         active_validators = [
             uid for uid, permit in enumerate(validator_permits)
             if permit == 1 and uid < len(last_update) and (current_block - last_update[uid]) < recent_blocks
@@ -51,9 +58,6 @@ async def get_active_validator_uids(netuid, subtensor_network="finney", chain_en
         logger.error(f"Error getting active validators: {e}")
         logger.error(traceback.format_exc())
         return []
-    finally:
-        # Process-isolated substrate automatically cleans up when processes terminate
-        logger.debug("🛡️ get_active_validator_uids complete - process isolation prevents ABC memory leaks automatically")
 
 
 class FiberWeightSetter:
@@ -65,14 +69,13 @@ class FiberWeightSetter:
             network: str = "finney",
             timeout: int = 30,
     ):
-        """Initialize the weight setter with fiber connections"""
+        """Initialize the weight setter with process-isolated substrate as a drop-in replacement"""
         self.netuid = netuid
         self.network = network
-        # Use process-isolated substrate for initialization 
-        logger.info("🛡️ FiberWeightSetter using process-isolated substrate for initialization")
+        # Use process isolated substrate - acts as drop-in replacement for standard substrate
         self.substrate = get_process_isolated_substrate(
             subtensor_network=network,
-            chain_endpoint=""  # Use default endpoint
+            chain_endpoint=""
         )
         self.nodes = None
         self.keypair = chain_utils.load_hotkey_keypair(
@@ -80,113 +83,13 @@ class FiberWeightSetter:
         )
         self.timeout = timeout
 
-    async def _fetch_nodes_process_isolated(self, netuid: int):
-        """
-        Fetch nodes using process-isolated substrate queries to prevent ABC memory leaks.
-        This replaces the fiber library's get_nodes_for_netuid function.
-        """
-        try:
-            logger.debug(f"🛡️ Weight setter fetching nodes for netuid {netuid} using process-isolated substrate")
-            
-            # Use process-isolated substrate for all queries
-            substrate = get_process_isolated_substrate(
-                subtensor_network=self.network,
-                chain_endpoint=""  # Use default endpoint
-            )
-            
-            # Query node data using process isolation with longer timeout for complex operations
-            # Use 30s timeout since we're making many queries sequentially
-            timeout = 30.0
-            logger.debug(f"🛡️ Weight setter making {11} substrate queries with {timeout}s timeout each")
-            
-            hotkeys = substrate._run_substrate_operation("query", "SubtensorModule", "Hotkeys", [netuid], timeout)
-            coldkeys = substrate._run_substrate_operation("query", "SubtensorModule", "Coldkeys", [netuid], timeout)
-            stakes = substrate._run_substrate_operation("query", "SubtensorModule", "Stake", [netuid], timeout)
-            trust = substrate._run_substrate_operation("query", "SubtensorModule", "Trust", [netuid], timeout)
-            vtrust = substrate._run_substrate_operation("query", "SubtensorModule", "ValidatorTrust", [netuid], timeout)
-            incentive = substrate._run_substrate_operation("query", "SubtensorModule", "Incentive", [netuid], timeout)
-            emission = substrate._run_substrate_operation("query", "SubtensorModule", "Emission", [netuid], timeout)
-            consensus = substrate._run_substrate_operation("query", "SubtensorModule", "Consensus", [netuid], timeout)
-            dividends = substrate._run_substrate_operation("query", "SubtensorModule", "Dividends", [netuid], timeout)
-            last_update = substrate._run_substrate_operation("query", "SubtensorModule", "LastUpdate", [netuid], timeout)
-            
-            # Get axon info with extended timeout
-            axons = substrate._run_substrate_operation("query", "SubtensorModule", "Axons", [netuid], timeout)
-            
-            # Build node objects (similar to fiber's get_nodes_for_netuid)
-            nodes = []
-            
-            if hotkeys and len(hotkeys) > 0:
-                for i, hotkey in enumerate(hotkeys):
-                    try:
-                        # Create a Node-like object with the data
-                        from types import SimpleNamespace
-                        
-                        node = SimpleNamespace()
-                        node.node_id = i
-                        node.hotkey = hotkey
-                        node.coldkey = coldkeys[i] if i < len(coldkeys) else ""
-                        
-                        # Handle stake (might be in different format)
-                        if stakes and i < len(stakes):
-                            stake_value = stakes[i]
-                            # Convert stake to float (handle different formats)
-                            if isinstance(stake_value, dict):
-                                node.stake = float(sum(stake_value.values())) if stake_value else 0.0
-                            else:
-                                node.stake = float(stake_value) if stake_value else 0.0
-                        else:
-                            node.stake = 0.0
-                        
-                        # Set other attributes with safe indexing
-                        node.trust = float(trust[i]) if trust and i < len(trust) else 0.0
-                        node.vtrust = float(vtrust[i]) if vtrust and i < len(vtrust) else 0.0
-                        node.incentive = float(incentive[i]) if incentive and i < len(incentive) else 0.0
-                        node.emission = float(emission[i]) if emission and i < len(emission) else 0.0
-                        node.consensus = float(consensus[i]) if consensus and i < len(consensus) else 0.0
-                        node.dividends = float(dividends[i]) if dividends and i < len(dividends) else 0.0
-                        node.last_update = int(last_update[i]) if last_update and i < len(last_update) else 0
-                        
-                        # Handle axon info
-                        if axons and i < len(axons):
-                            axon_info = axons[i]
-                            if axon_info:
-                                node.ip = axon_info.get('ip', '')
-                                node.port = int(axon_info.get('port', 0))
-                                node.ip_type = int(axon_info.get('ip_type', 4))
-                                node.protocol = int(axon_info.get('protocol', 4))
-                            else:
-                                node.ip = ''
-                                node.port = 0
-                                node.ip_type = 4
-                                node.protocol = 4
-                        else:
-                            node.ip = ''
-                            node.port = 0
-                            node.ip_type = 4
-                            node.protocol = 4
-                        
-                        nodes.append(node)
-                        
-                    except Exception as e:
-                        logger.warning(f"Error processing weight setter node {i}: {e}")
-                        continue
-            
-            logger.info(f"🛡️ Weight setter process-isolated node fetch completed: {len(nodes)} nodes (NO ABC memory leak)")
-            return nodes
-            
-        except Exception as e:
-            logger.error(f"Error in weight setter process-isolated node fetching: {e}")
-            logger.error(traceback.format_exc())
-            return []
-
     def cleanup(self):
-        """No cleanup needed with process-isolated substrate."""
-        logger.debug("🛡️ No cleanup needed - process-isolated substrate handles cleanup automatically")
+        """Process isolated substrate handles cleanup automatically"""
+        pass
 
     def __del__(self):
-        """No cleanup needed with process-isolated substrate."""
-        pass  # Process isolation handles cleanup automatically
+        """Process isolated substrate handles cleanup automatically"""
+        pass
 
 
 
@@ -196,12 +99,12 @@ class FiberWeightSetter:
             logger.warning("No weights provided")
             return None, []
 
-        # Use process-isolated node fetching to prevent ABC memory leaks
+        # Use standard fiber function but with process-isolated substrate
         if self.nodes is None:
-            nodes = await self._fetch_nodes_process_isolated(self.netuid)
-        else:
-            nodes = self.nodes
-        node_ids = [node.node_id for node in nodes]
+            # The process isolated substrate acts as a drop-in replacement
+            self.nodes = get_nodes_for_netuid(substrate=self.substrate, netuid=self.netuid)
+        
+        node_ids = [node.node_id for node in self.nodes]
 
 
         aligned_weights = [
@@ -300,62 +203,54 @@ class FiberWeightSetter:
         return weights_tensor, node_ids
 
     async def set_weights(self, weights: List[float] = None) -> bool:
-        """Set weights on chain"""
+        """Set weights on chain using standard fiber approach with process isolation"""
         try:
             if weights is None:
                 logger.info("No weights provided - skipping weight setting")
                 return False
 
-            logger.info(f"\nSetting weights for subnet {self.netuid}...")
-
-            # MEMORY LEAK PREVENTION: Use process-isolated substrate for weight setting
-            # This ensures ABC objects are contained in separate processes and automatically destroyed
-            logger.info("🛡️ Creating process-isolated substrate connection for weight setting")
+            logger.info(f"Setting weights for subnet {self.netuid}...")
             
-            # Use process-isolated substrate connection for weight setting
-            self.substrate = get_process_isolated_substrate(
-                subtensor_network=self.network,
-                chain_endpoint=""  # Use default endpoint
-            )
-            logger.info("✅ Process-isolated substrate connection created for weight setting")
-            self.nodes = await self._fetch_nodes_process_isolated(self.netuid)
-            logger.info(f"Found {len(self.nodes)} nodes in subnet")
+            # Get active validators to zero out their weights
+            try:
+                active_validator_uids = await get_active_validator_uids(
+                    netuid=self.netuid, 
+                    subtensor_network=self.network
+                )
+                logger.info(f"Found {len(active_validator_uids)} active validators - zeroing their weights")
+            except Exception as e:
+                logger.error(f"Failed to get active validators: {e}")
+                logger.warning("Continuing weight setting without active validator detection")
+                active_validator_uids = []
 
-            validator_uid = self.substrate.query(
-                "SubtensorModule",
-                "Uids",
-                [self.netuid, self.keypair.ss58_address]
-            )
-
-            version_key = __spec_version__
-
-            if validator_uid is None:
-                logger.error("❗Validator not found in nodes list")
-                return False
-
-            active_validator_uids = await get_active_validator_uids(
-                netuid=self.netuid, 
-                subtensor_network=self.network
-            )
-            logger.info(f"Found {len(active_validator_uids)} active validators - zeroing their weights")
-            
+            # Copy weights and zero out validators
             weights_copy = weights.copy()
-            
             for uid in active_validator_uids:
                 if uid < len(weights_copy):
                     if weights_copy[uid] > 0:
                         logger.info(f"Setting validator UID {uid} weight to zero (was {weights_copy[uid]:.6f})")
                         weights_copy[uid] = 0.0
 
+            # Calculate final weights
             calculated_weights, node_ids = await self.calculate_weights(weights_copy)
             if calculated_weights is None:
                 logger.warning("No weights calculated - skipping weight setting")
                 return False
 
-            # Log if all weights are zero but still proceed to set them
-            if torch.is_tensor(calculated_weights) and calculated_weights.sum().item() == 0:
-                logger.info("All calculated weights are zero - proceeding to set zero weights on-chain")
+            # Get validator UID
+            try:
+                validator_uid = self.substrate.query(
+                    "SubtensorModule",
+                    "Uids",
+                    [self.netuid, self.keypair.ss58_address]
+                )
+            except Exception as e:
+                logger.error(f"Failed to get validator UID: {e}")
+                return False
 
+            version_key = __spec_version__
+
+            # Set weights using standard fiber function
             try:
                 logger.info(f"Setting weights for {len(self.nodes)} nodes")
                 await self._async_set_node_weights(
@@ -369,39 +264,22 @@ class FiberWeightSetter:
                     wait_for_inclusion=True,
                     wait_for_finalization=False,
                 )
-                logger.info("Weight commit initiated, continuing...")
+                logger.info("Weight commit initiated successfully")
                 return True
 
             except Exception as e:
-                logger.error(f"Error initiating weight commit: {str(e)}")
+                logger.error(f"Error setting weights: {str(e)}")
                 return False
-            finally:
-                # Process-isolated substrate automatically cleans up when processes terminate
-                logger.debug("Process-isolated substrate cleanup is automatic - no manual cleanup needed")
 
         except Exception as e:
             logger.error(f"Error in weight setting: {str(e)}")
             logger.error(traceback.format_exc())
             return False
-        finally:
-            # Process-isolated substrate automatically prevents ABC memory leaks
-            # No manual cleanup needed - each operation runs in separate processes that auto-terminate
-            logger.debug("🛡️ Weight setting complete - process isolation prevents ABC memory leaks automatically")
 
     async def _async_set_node_weights(self, **kwargs):
-        """Async wrapper for the synchronous set_node_weights function with timeout"""
-        try:
-            loop = asyncio.get_event_loop()
-            return await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: w.set_node_weights(**kwargs)),
-                timeout=340
-            )
-        except asyncio.TimeoutError:
-            logger.error("Weight setting timed out after 120 seconds")
-            raise
-        except Exception as e:
-            logger.error(f"Error in weight setting: {str(e)}")
-            raise
+        """Async wrapper for the synchronous set_node_weights function"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: w.set_node_weights(**kwargs))
 
 
 async def main():

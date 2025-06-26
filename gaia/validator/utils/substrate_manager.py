@@ -207,13 +207,13 @@ except Exception as e:
             logger.error(f"Process-isolated {operation_type} failed after {execution_time:.2f}s: {e}")
             raise
     
-    def query(self, module: str, storage_function: str, params: List = None) -> Any:
+    def query(self, module: str, storage_function: str, params: List = None, timeout: float = 90.0) -> Any:
         """Query the substrate in an isolated process."""
-        return self._run_substrate_operation("query", module, storage_function, params or [])
+        return self._run_substrate_operation("query", module, storage_function, params or [], timeout=timeout)
     
-    def rpc_request(self, method: str, params: List = None) -> Any:
+    def rpc_request(self, method: str, params: List = None, timeout: float = 90.0) -> Any:
         """Make an RPC request in an isolated process."""
-        return self._run_substrate_operation("rpc_request", method, params or [])
+        return self._run_substrate_operation("rpc_request", method, params or [], timeout=timeout)
     
     def get_block(self, block_hash: str = None) -> Dict[str, Any]:
         """
@@ -226,10 +226,19 @@ except Exception as e:
             else:
                 result = self.rpc_request("chain_getBlock", [])
             
-            # Return the block part of the response, or the full result if no block key
-            if isinstance(result, dict) and "block" in result:
-                return result["block"]
+            # Handle different response structures more robustly
+            if isinstance(result, dict):
+                if "block" in result:
+                    return result["block"]
+                elif "header" in result:
+                    # Already in the right format
+                    return result
+                else:
+                    # Return full result if structure is unexpected
+                    logger.debug(f"Unexpected get_block response structure: {list(result.keys())}")
+                    return result
             else:
+                logger.warning(f"get_block returned non-dict result: {type(result)}")
                 return result
         except Exception as e:
             logger.error(f"Error in process-isolated get_block: {e}")

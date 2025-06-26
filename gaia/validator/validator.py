@@ -2005,25 +2005,25 @@ class GaiaValidator:
             )
             
             # Query node data using process isolation with longer timeout for complex operations
-            # Use 30s timeout since we're making many queries sequentially
-            timeout = 90.0
+            # Use 120s timeout since the substrate network can be slow during high load
+            timeout = 120.0
             logger.debug(f"🛡️ Making {13} substrate queries with {timeout}s timeout each")
             
-            hotkeys = substrate._run_substrate_operation("query", "SubtensorModule", "Hotkeys", [netuid], timeout)
-            coldkeys = substrate._run_substrate_operation("query", "SubtensorModule", "Coldkeys", [netuid], timeout)
-            uids = substrate._run_substrate_operation("query", "SubtensorModule", "Uids", [netuid], timeout)
-            stakes = substrate._run_substrate_operation("query", "SubtensorModule", "Stake", [netuid], timeout)
-            trust = substrate._run_substrate_operation("query", "SubtensorModule", "Trust", [netuid], timeout)
-            vtrust = substrate._run_substrate_operation("query", "SubtensorModule", "ValidatorTrust", [netuid], timeout)
-            incentive = substrate._run_substrate_operation("query", "SubtensorModule", "Incentive", [netuid], timeout)
-            emission = substrate._run_substrate_operation("query", "SubtensorModule", "Emission", [netuid], timeout)
-            consensus = substrate._run_substrate_operation("query", "SubtensorModule", "Consensus", [netuid], timeout)
-            dividends = substrate._run_substrate_operation("query", "SubtensorModule", "Dividends", [netuid], timeout)
-            last_update = substrate._run_substrate_operation("query", "SubtensorModule", "LastUpdate", [netuid], timeout)
-            validator_permit = substrate._run_substrate_operation("query", "SubtensorModule", "ValidatorPermit", [netuid], timeout)
+            hotkeys = substrate._run_substrate_operation("query", "SubtensorModule", "Hotkeys", [netuid], timeout=timeout)
+            coldkeys = substrate._run_substrate_operation("query", "SubtensorModule", "Coldkeys", [netuid], timeout=timeout)
+            uids = substrate._run_substrate_operation("query", "SubtensorModule", "Uids", [netuid], timeout=timeout)
+            stakes = substrate._run_substrate_operation("query", "SubtensorModule", "Stake", [netuid], timeout=timeout)
+            trust = substrate._run_substrate_operation("query", "SubtensorModule", "Trust", [netuid], timeout=timeout)
+            vtrust = substrate._run_substrate_operation("query", "SubtensorModule", "ValidatorTrust", [netuid], timeout=timeout)
+            incentive = substrate._run_substrate_operation("query", "SubtensorModule", "Incentive", [netuid], timeout=timeout)
+            emission = substrate._run_substrate_operation("query", "SubtensorModule", "Emission", [netuid], timeout=timeout)
+            consensus = substrate._run_substrate_operation("query", "SubtensorModule", "Consensus", [netuid], timeout=timeout)
+            dividends = substrate._run_substrate_operation("query", "SubtensorModule", "Dividends", [netuid], timeout=timeout)
+            last_update = substrate._run_substrate_operation("query", "SubtensorModule", "LastUpdate", [netuid], timeout=timeout)
+            validator_permit = substrate._run_substrate_operation("query", "SubtensorModule", "ValidatorPermit", [netuid], timeout=timeout)
             
             # Get axon info with extended timeout
-            axons = substrate._run_substrate_operation("query", "SubtensorModule", "Axons", [netuid], timeout)
+            axons = substrate._run_substrate_operation("query", "SubtensorModule", "Axons", [netuid], timeout=timeout)
             
             # Build node objects (similar to fiber's get_nodes_for_netuid)
             nodes = []
