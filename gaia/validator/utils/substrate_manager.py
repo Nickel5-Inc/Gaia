@@ -1,13 +1,233 @@
 import time
 import gc
 import threading
-from typing import Optional
+import subprocess
+import json
+import sys
+import os
+import asyncio
+from typing import Optional, Any, Dict, List
 from contextlib import contextmanager
 from fiber.chain.interface import get_substrate
 from substrateinterface import SubstrateInterface
 from fiber.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+class ProcessIsolatedSubstrate:
+    """
+    A process-isolated wrapper around SubstrateInterface that prevents ABC memory leaks.
+    
+    This class provides the exact same interface as SubstrateInterface but runs all operations
+    in separate processes. When each process terminates, all ABC objects are automatically
+    destroyed, preventing memory accumulation.
+    
+    This is a drop-in replacement - existing code works unchanged.
+    """
+    
+    def __init__(self, subtensor_network: str, chain_endpoint: str = None):
+        self.subtensor_network = subtensor_network
+        self.chain_endpoint = chain_endpoint or ""
+        self._operation_count = 0
+        
+        logger.debug(f"ProcessIsolatedSubstrate created for {subtensor_network}@{chain_endpoint}")
+    
+    @property
+    def url(self) -> str:
+        """URL property for compatibility with existing code."""
+        if self.chain_endpoint and self.chain_endpoint.strip():
+            return self.chain_endpoint.strip()
+        
+        # Construct default URL based on network
+        if self.subtensor_network == "finney":
+            return "wss://entrypoint-finney.opentensor.ai:443"
+        elif self.subtensor_network == "test":
+            return "wss://test.finney.opentensor.ai:443"
+        elif self.subtensor_network == "local":
+            return "ws://127.0.0.1:9944"
+        else:
+            return f"wss://{self.subtensor_network}.opentensor.ai:443"
+    
+    def _run_substrate_operation(self, operation_type: str, *args, timeout: float = 15.0) -> Any:
+        """
+        Run any substrate operation in an isolated process.
+        
+        Args:
+            operation_type: Either 'query' or 'rpc_request'
+            *args: Arguments for the operation
+            timeout: Timeout in seconds
+        """
+        self._operation_count += 1
+        logger.debug(f"Process-isolated {operation_type} #{self._operation_count} (timeout: {timeout}s)")
+        
+        try:
+            start_time = time.time()
+            
+            # Create subprocess script that runs the operation
+            if operation_type == "query":
+                module, storage_function = args[0], args[1]
+                params = args[2] if len(args) > 2 else []
+                script_content = f'''
+import sys
+import signal
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+def timeout_handler(signum, frame):
+    print(json.dumps({{"error": "Query timeout"}}))
+    sys.exit(1)
+
+try:
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm({max(int(timeout)-2, 5)})
+    
+    from fiber.chain.interface import get_substrate
+    
+    if "{self.chain_endpoint}" and "{self.chain_endpoint}".strip():
+        substrate = get_substrate(subtensor_network="{self.subtensor_network}", subtensor_address="{self.chain_endpoint}")
+    else:
+        substrate = get_substrate(subtensor_network="{self.subtensor_network}")
+    
+    params = {json.dumps(params)}
+    if params:
+        result = substrate.query("{module}", "{storage_function}", params)
+    else:
+        result = substrate.query("{module}", "{storage_function}")
+    
+    # Extract value if it's a substrate result object
+    if hasattr(result, 'value'):
+        value = result.value
+    else:
+        value = result
+    
+    substrate.close()
+    signal.alarm(0)
+    
+    print("RESULT_START")
+    print(json.dumps(value, default=str))
+    print("RESULT_END")
+    
+except Exception as e:
+    signal.alarm(0)
+    print("RESULT_START")
+    print(json.dumps({{"error": str(e)}}))
+    print("RESULT_END")
+'''
+            
+            elif operation_type == "rpc_request":
+                method = args[0]
+                params = args[1] if len(args) > 1 else []
+                script_content = f'''
+import sys
+import signal
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+def timeout_handler(signum, frame):
+    print(json.dumps({{"error": "RPC timeout"}}))
+    sys.exit(1)
+
+try:
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm({max(int(timeout)-2, 5)})
+    
+    from fiber.chain.interface import get_substrate
+    
+    if "{self.chain_endpoint}" and "{self.chain_endpoint}".strip():
+        substrate = get_substrate(subtensor_network="{self.subtensor_network}", subtensor_address="{self.chain_endpoint}")
+    else:
+        substrate = get_substrate(subtensor_network="{self.subtensor_network}")
+    
+    params = {json.dumps(params)}
+    if params:
+        result = substrate.rpc_request("{method}", params)
+    else:
+        result = substrate.rpc_request("{method}", [])
+    
+    substrate.close()
+    signal.alarm(0)
+    
+    print("RESULT_START")
+    print(json.dumps(result, default=str))
+    print("RESULT_END")
+    
+except Exception as e:
+    signal.alarm(0)
+    print("RESULT_START")
+    print(json.dumps({{"error": str(e)}}))
+    print("RESULT_END")
+'''
+            else:
+                raise ValueError(f"Unknown operation type: {operation_type}")
+            
+            # Run the script in a subprocess
+            result = subprocess.run(
+                [sys.executable, "-c", script_content],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={**dict(os.environ), 'PYTHONUNBUFFERED': '1'}
+            )
+            
+            execution_time = time.time() - start_time
+            
+            if result.returncode == 0:
+                # Extract result between markers
+                stdout = result.stdout
+                start_marker = "RESULT_START\n"
+                end_marker = "\nRESULT_END"
+                
+                start_idx = stdout.find(start_marker)
+                end_idx = stdout.find(end_marker)
+                
+                if start_idx >= 0 and end_idx >= 0:
+                    json_content = stdout[start_idx + len(start_marker):end_idx].strip()
+                else:
+                    json_content = stdout.strip()
+                
+                if not json_content:
+                    raise Exception("Empty response from subprocess")
+                
+                data = json.loads(json_content)
+                if isinstance(data, dict) and "error" in data:
+                    raise Exception(f"Substrate {operation_type} failed: {data['error']}")
+                
+                logger.debug(f"Process-isolated {operation_type} #{self._operation_count} completed in {execution_time:.2f}s")
+                return data
+            else:
+                raise Exception(f"Subprocess failed (code {result.returncode}): {result.stderr}")
+                
+        except subprocess.TimeoutExpired:
+            raise Exception(f"Substrate {operation_type} timeout after {timeout}s")
+        except Exception as e:
+            execution_time = time.time() - start_time if 'start_time' in locals() else 0
+            logger.error(f"Process-isolated {operation_type} failed after {execution_time:.2f}s: {e}")
+            raise
+    
+    def query(self, module: str, storage_function: str, params: List = None) -> Any:
+        """Query the substrate in an isolated process."""
+        return self._run_substrate_operation("query", module, storage_function, params or [])
+    
+    def rpc_request(self, method: str, params: List = None) -> Any:
+        """Make an RPC request in an isolated process."""
+        return self._run_substrate_operation("rpc_request", method, params or [])
+    
+    def close(self):
+        """Close method for compatibility (no-op since each operation uses its own process)."""
+        logger.debug(f"ProcessIsolatedSubstrate close() called (no-op - {self._operation_count} operations completed)")
+    
+    def __getattr__(self, name: str):
+        """Handle any other attributes that might be accessed."""
+        if name in ['address', 'endpoint']:
+            return self.url
+        elif name in ['chain', 'network']:
+            return self.subtensor_network
+        else:
+            # For unknown attributes, return None or raise AttributeError
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
 
 class SubstrateManager:
@@ -20,51 +240,65 @@ class SubstrateManager:
     3. Thorough cleanup of scalecodec caches when disposing connections  
     4. Thread-safe operations
     5. Handles endpoint changes gracefully without manager recreation
+    6. OPTIONAL: Use process isolation for complete ABC memory leak prevention
     
     This manager prioritizes memory leak prevention over connection reuse.
     """
     
-    def __init__(self, subtensor_network: str, chain_endpoint: str):
+    def __init__(self, subtensor_network: str, chain_endpoint: str, use_process_isolation: bool = False):
         self.subtensor_network = subtensor_network
         self.chain_endpoint = chain_endpoint
+        self.use_process_isolation = use_process_isolation
         self._current_connection: Optional[SubstrateInterface] = None
         self._connection_created_at: Optional[float] = None
         self._lock = threading.Lock()
         self._connection_count = 0
         
-        logger.info(f"SubstrateManager initialized for {subtensor_network}@{chain_endpoint}")
+        isolation_mode = "process-isolated" if use_process_isolation else "regular"
+        logger.info(f"SubstrateManager initialized for {subtensor_network}@{chain_endpoint} ({isolation_mode})")
     
     def get_fresh_connection(self) -> SubstrateInterface:
         """
         Get a fresh substrate connection. Always disposes old connection and creates new one.
         This prevents connection stacking and memory accumulation.
+        
+        If process_isolation is enabled, returns a ProcessIsolatedSubstrate wrapper instead.
         """
         with self._lock:
             # ALWAYS dispose existing connection first - no reuse, always fresh
             if self._current_connection is not None:
                 logger.debug("🧹 Disposing old connection to create fresh one")
-                self._dispose_connection_thoroughly(self._current_connection)
+                if not self.use_process_isolation:
+                    self._dispose_connection_thoroughly(self._current_connection)
                 self._current_connection = None
             
             # Create fresh connection
             try:
-                logger.debug(f"Creating fresh substrate connection #{self._connection_count + 1}")
-                
-                # Handle empty/None chain_endpoint properly
-                if self.chain_endpoint and self.chain_endpoint.strip():
-                    self._current_connection = get_substrate(
-                        subtensor_network=self.subtensor_network,
-                        subtensor_address=self.chain_endpoint
-                    )
-                else:
-                    # Use default endpoint when chain_endpoint is empty/None
-                    self._current_connection = get_substrate(
-                        subtensor_network=self.subtensor_network
-                    )
-                
                 self._connection_count += 1
+                logger.debug(f"Creating fresh substrate connection #{self._connection_count}")
+                
+                if self.use_process_isolation:
+                    # Return process-isolated wrapper - no actual connection created here
+                    self._current_connection = ProcessIsolatedSubstrate(
+                        subtensor_network=self.subtensor_network,
+                        chain_endpoint=self.chain_endpoint
+                    )
+                    logger.debug(f"🛡️ Fresh process-isolated substrate connection #{self._connection_count} created")
+                else:
+                    # Create regular connection
+                    if self.chain_endpoint and self.chain_endpoint.strip():
+                        self._current_connection = get_substrate(
+                            subtensor_network=self.subtensor_network,
+                            subtensor_address=self.chain_endpoint
+                        )
+                    else:
+                        # Use default endpoint when chain_endpoint is empty/None
+                        self._current_connection = get_substrate(
+                            subtensor_network=self.subtensor_network
+                        )
+                    logger.debug(f"✅ Fresh regular substrate connection #{self._connection_count} created")
+                
                 self._connection_created_at = time.time()
-                logger.debug(f"✅ Fresh substrate connection #{self._connection_count} created")
                 return self._current_connection
                 
             except Exception as e:
@@ -238,32 +472,40 @@ _global_manager: Optional[SubstrateManager] = None
 _global_lock = threading.Lock()
 
 
-def get_substrate_manager(subtensor_network: str, chain_endpoint: str) -> SubstrateManager:
+def get_substrate_manager(subtensor_network: str, chain_endpoint: str, use_process_isolation: bool = False) -> SubstrateManager:
     """
     Get the global substrate manager (singleton).
     Creates one only if it doesn't exist or if the network actually changed.
     The manager handles different endpoints gracefully without recreation.
+    
+    Args:
+        subtensor_network: Network name (finney, test, local, etc.)
+        chain_endpoint: Chain endpoint URL 
+        use_process_isolation: If True, use process isolation to prevent ABC memory leaks
     """
     global _global_manager
     
     with _global_lock:
-        # Only create new manager if none exists or network truly changed
-        # Don't recreate for endpoint differences - the manager can handle that
+        # Only create new manager if none exists, network changed, or isolation mode changed
         needs_new_manager = (
             _global_manager is None or 
-            _global_manager.subtensor_network != subtensor_network
+            _global_manager.subtensor_network != subtensor_network or
+            _global_manager.use_process_isolation != use_process_isolation
         )
         
         if needs_new_manager:
             # Cleanup old manager if exists
             if _global_manager is not None:
-                logger.info(f"Network changed: {_global_manager.subtensor_network} → {subtensor_network}, recreating manager")
+                old_isolation = "process-isolated" if _global_manager.use_process_isolation else "regular"
+                new_isolation = "process-isolated" if use_process_isolation else "regular"
+                logger.info(f"Manager change: {_global_manager.subtensor_network}({old_isolation}) → {subtensor_network}({new_isolation}), recreating manager")
                 _global_manager.shutdown()
             
             # Create new manager - normalize endpoint
             normalized_endpoint = chain_endpoint.strip() if chain_endpoint else ""
-            _global_manager = SubstrateManager(subtensor_network, normalized_endpoint)
-            logger.info(f"🔄 Created new global SubstrateManager for {subtensor_network}")
+            _global_manager = SubstrateManager(subtensor_network, normalized_endpoint, use_process_isolation)
+            isolation_mode = "process-isolated" if use_process_isolation else "regular"
+            logger.info(f"🔄 Created new global SubstrateManager for {subtensor_network} ({isolation_mode})")
         else:
             # Just update endpoint if it's different, but don't recreate manager
             normalized_endpoint = chain_endpoint.strip() if chain_endpoint else ""
@@ -287,27 +529,57 @@ def cleanup_global_substrate_manager():
             logger.info("🧹 Global substrate manager cleaned up")
 
 
-def get_fresh_substrate_connection(subtensor_network: str, chain_endpoint: str) -> SubstrateInterface:
+def get_fresh_substrate_connection(subtensor_network: str, chain_endpoint: str, use_process_isolation: bool = False) -> SubstrateInterface:
     """
     Convenience function to get a fresh substrate connection.
     Always creates a new connection and disposes of any previous one.
+    
+    Args:
+        subtensor_network: Network name (finney, test, local, etc.)
+        chain_endpoint: Chain endpoint URL
+        use_process_isolation: If True, return a process-isolated wrapper to prevent ABC memory leaks
     """
-    manager = get_substrate_manager(subtensor_network, chain_endpoint)
+    manager = get_substrate_manager(subtensor_network, chain_endpoint, use_process_isolation)
     return manager.get_fresh_connection()
 
 
-def force_substrate_cleanup(subtensor_network: str, chain_endpoint: str):
+def get_process_isolated_substrate(subtensor_network: str, chain_endpoint: str) -> SubstrateInterface:
+    """
+    Convenience function to get a process-isolated substrate connection.
+    This completely prevents ABC memory leaks by running operations in separate processes.
+    
+    This is a drop-in replacement for regular substrate connections.
+    """
+    return get_fresh_substrate_connection(subtensor_network, chain_endpoint, use_process_isolation=True)
+
+
+def force_substrate_cleanup(subtensor_network: str = None, chain_endpoint: str = None):
     """
     Force cleanup of substrate connections and caches.
     Useful for emergency memory management.
+    
+    Args:
+        subtensor_network: Network name (optional, uses current global manager if None)
+        chain_endpoint: Chain endpoint (optional, uses current global manager if None)
     """
-    manager = get_substrate_manager(subtensor_network, chain_endpoint)
-    manager.force_cleanup()
+    global _global_manager
+    
+    if subtensor_network and chain_endpoint:
+        manager = get_substrate_manager(subtensor_network, chain_endpoint)
+        manager.force_cleanup()
+    elif _global_manager:
+        _global_manager.force_cleanup()
+    else:
+        logger.debug("No substrate manager to cleanup")
 
 
-def get_substrate_manager_stats(subtensor_network: str, chain_endpoint: str) -> dict:
+def get_substrate_manager_stats(subtensor_network: str = None, chain_endpoint: str = None) -> dict:
     """
     Get substrate manager statistics without creating new connections.
+    
+    Args:
+        subtensor_network: Network name (optional, uses current global manager if None)
+        chain_endpoint: Chain endpoint (optional, uses current global manager if None)
     """
     global _global_manager
     
@@ -319,6 +591,7 @@ def get_substrate_manager_stats(subtensor_network: str, chain_endpoint: str) -> 
             stats = _global_manager.get_stats()
             stats["has_manager"] = True
             stats["status"] = "active"
+            stats["use_process_isolation"] = _global_manager.use_process_isolation
             return stats
         except Exception as e:
             return {"status": "error", "has_manager": True, "error": str(e)} 

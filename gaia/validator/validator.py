@@ -96,7 +96,7 @@ from gaia.validator.utils.db_wipe import handle_db_wipe
 from gaia.validator.utils.earthdata_tokens import ensure_valid_earthdata_token
 from gaia.validator.utils.substrate_manager import (
     get_substrate_manager, cleanup_global_substrate_manager,
-    get_fresh_substrate_connection, force_substrate_cleanup
+    get_fresh_substrate_connection, get_process_isolated_substrate, force_substrate_cleanup
 )
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 
@@ -698,6 +698,27 @@ class GaiaValidator:
             except Exception as e_cleanup_file:
                 logger.error(f"Failed to create cleanup completion file after error: {e_cleanup_file}")
 
+    def _get_substrate_interface(self):
+        """
+        Get substrate interface with process isolation to prevent ABC memory leaks.
+        This replaces direct substrate usage to avoid accumulating ABC objects.
+        """
+        try:
+            # Use process-isolated substrate interface to prevent ABC object accumulation
+            return get_process_isolated_substrate(
+                subtensor_network=self.subtensor_network,
+                chain_endpoint=self.subtensor_chain_endpoint
+            )
+        except Exception as e:
+            logger.warning(f"Failed to create process-isolated substrate interface: {e}")
+            # Fallback to regular substrate interface
+            logger.info("Falling back to regular substrate interface")
+            return get_fresh_substrate_connection(
+                subtensor_network=self.subtensor_network,
+                chain_endpoint=self.subtensor_chain_endpoint,
+                use_process_isolation=False
+            )
+
     def setup_neuron(self) -> bool:
         """
         Set up the neuron with necessary configurations and connections.
@@ -760,7 +781,7 @@ class GaiaValidator:
                     "SubtensorModule",
                     "LastUpdate",
                     [netuid]
-                ).value
+                )
                 if last_updated_value is None or node_id >= len(last_updated_value):
                     return None
                 last_update = int(last_updated_value[node_id])
@@ -768,15 +789,12 @@ class GaiaValidator:
             
             w.blocks_since_last_update = blocks_since_wrapper
 
-            # Use new aggressive substrate manager for memory leak prevention
+            # Use isolated substrate interface for complete ABC memory leak prevention
             try:
-                self.substrate = get_fresh_substrate_connection(
-                    subtensor_network=self.subtensor_network,
-                    chain_endpoint=self.subtensor_chain_endpoint
-                )
-                logger.info("🔄 Created fresh substrate connection using substrate manager")
+                self.substrate = self._get_substrate_interface()
+                logger.info("🛡️  Created isolated substrate interface for memory leak prevention")
             except Exception as e_sub_init:
-                logger.error(f"CRITICAL: Failed to initialize SubstrateInterface with endpoint {self.subtensor_chain_endpoint}: {e_sub_init}", exc_info=True)
+                logger.error(f"CRITICAL: Failed to initialize isolated substrate interface with endpoint {self.subtensor_chain_endpoint}: {e_sub_init}", exc_info=True)
                 return False
 
             # Standard Metagraph Initialization
@@ -789,12 +807,9 @@ class GaiaValidator:
             # Standard Metagraph Sync
             try:
                 # Use direct sync here since _sync_metagraph is async and we're in sync method
-                # Create fresh substrate connection using substrate manager
-                self.substrate = get_fresh_substrate_connection(
-                    subtensor_network=self.subtensor_network,
-                    chain_endpoint=self.subtensor_chain_endpoint
-                )
-                logger.info("🔄 Created fresh connection for metagraph sync using substrate manager")
+                # Create fresh isolated substrate connection for metagraph sync
+                self.substrate = self._get_substrate_interface()
+                logger.info("🛡️  Created fresh isolated connection for metagraph sync")
                 self.metagraph.sync_nodes()  # Sync nodes after initialization
                 logger.info(f"Successfully synced {len(self.metagraph.nodes) if self.metagraph.nodes else '0'} nodes from the network.")
             except Exception as e_meta_sync:
@@ -812,7 +827,7 @@ class GaiaValidator:
                     "SubtensorModule", 
                     "Uids", 
                     [self.netuid, self.keypair.ss58_address]
-                ).value
+                )
             validator_uid = self.validator_uid
 
             return True
@@ -2639,24 +2654,13 @@ class GaiaValidator:
                     lambda: self.manage_earthdata_token(),
                     lambda: self.monitor_client_health(),  # Added HTTP client monitoring
                     #lambda: self.database_monitor(),
-                    lambda: self.periodic_substrate_cleanup(),  # Added substrate cleanup task
+                    # Periodic substrate cleanup removed - using isolated substrate interface instead  # Added substrate cleanup task
                     lambda: self.aggressive_memory_cleanup(),  # Added aggressive memory cleanup task
                     #lambda: self.plot_database_metrics_periodically() # Added plotting task
                 ]
-                # ABC tracking disabled to prevent substrate interference
-                # The ABC tracker can interfere with substrate operations by trying to track
-                # unhashable objects like MetadataVersioned. Enable manually for debugging only.
-                abc_tracking_enabled = os.getenv('ENABLE_ABC_TRACKING', 'false').lower() == 'true'
-                if abc_tracking_enabled:
-                    try:
-                        from gaia.utils.abc_debugger import install_abc_tracker, abc_leak_monitor
-                        install_abc_tracker()
-                        logger.info("🔍 ABC object tracking MANUALLY ENABLED for memory leak analysis")
-                        tasks_lambdas.append(lambda: abc_leak_monitor(check_interval=300))  # Check every 5 minutes
-                    except ImportError as e:
-                        logger.warning(f"ABC debugger not available: {e}")
-                else:
-                    logger.debug("ABC tracking disabled (set ENABLE_ABC_TRACKING=true to enable manually)")
+                # Using process-isolated substrate manager - ABC tracking no longer needed
+                # Process isolation prevents ABC object accumulation completely
+                logger.info("🛡️  Using process-isolated substrate manager - ABC memory leaks prevented by process isolation")
                 
                 if not memray_active: # Add tracemalloc snapshot taker only if memray is not active
                     tasks_lambdas.append(lambda: self.memory_snapshot_taker())
@@ -2825,7 +2829,7 @@ class GaiaValidator:
                                     "SubtensorModule", 
                                     "Uids", 
                                     [self.netuid, self.keypair.ss58_address]
-                                ).value
+                                )
                                 validator_uid = int(self.validator_uid)
                             except Exception as e:
                                 logger.error(f"Error getting validator UID: {e}")
@@ -2839,7 +2843,7 @@ class GaiaValidator:
                             "SubtensorModule",
                             "LastUpdate",
                             [self.netuid]
-                        ).value
+                        )
                         if last_updated_value is not None and validator_uid < len(last_updated_value):
                             last_updated = int(last_updated_value[validator_uid])
                             resp = self.substrate.rpc_request("chain_getHeader", [])  
@@ -4215,42 +4219,14 @@ class GaiaValidator:
                 await asyncio.sleep(60) # Wait a bit before retrying if an error occurs
 
     async def periodic_substrate_cleanup(self):
-        """Periodically force substrate connection cleanup to prevent memory leaks."""
+        """Placeholder - substrate cleanup no longer needed with isolated substrate interface."""
+        logger.info("🛡️  Periodic substrate cleanup is disabled - using isolated substrate interface for memory leak prevention")
+        
+        # Keep this method running to maintain task compatibility, but it does nothing
+        # Process isolation prevents ABC object accumulation completely
         while True:
-            try:
-                await asyncio.sleep(120)  # INCREASED frequency: Run every 2 minutes due to tracemalloc showing 70MB from scalecodec
-                
-                # Use substrate manager for periodic cleanup
-                logger.debug("Using substrate manager for periodic cleanup")
-                try:
-                    # Force thorough cleanup of substrate connections and caches
-                    force_substrate_cleanup(
-                        subtensor_network=self.subtensor_network,
-                        chain_endpoint=self.subtensor_chain_endpoint
-                    )
-                    logger.debug("🧹 Forced thorough substrate cleanup")
-                    
-                    # Also create a fresh connection to verify system health
-                    self.substrate = get_fresh_substrate_connection(
-                        subtensor_network=self.subtensor_network,
-                        chain_endpoint=self.subtensor_chain_endpoint
-                    )
-                    logger.debug("✅ Verified substrate connection health")
-                    
-                    # Force garbage collection
-                    import gc
-                    collected = gc.collect()
-                    logger.debug(f"Periodic substrate cleanup - GC collected {collected} objects")
-                    
-                except Exception as e:
-                    logger.debug(f"Error during periodic substrate cleanup: {e}")
-                
-            except asyncio.CancelledError:
-                logger.info("Periodic substrate cleanup task cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error in periodic substrate cleanup: {e}")
-                await asyncio.sleep(60)  # Shorter retry on error
+            await asyncio.sleep(3600)  # Sleep for 1 hour and do nothing meaningful
+            logger.debug("🛡️  Isolated substrate interface prevents memory leaks - no cleanup needed")
 
     async def aggressive_memory_cleanup(self):
         """Enhanced aggressive memory cleanup with pressure monitoring."""
@@ -4589,18 +4565,19 @@ class GaiaValidator:
                     logger.warning(f"High ABC object count: {current_abc_count} objects "
                                  f"(growth: +{abc_growth} since last check)")
                     
-                    # Aggressive ABC cleanup
+                    # Lightweight substrate cleanup instead of aggressive ABC cleanup
                     if current_abc_count > 50000:  # Critical threshold
                         logger.error(f"CRITICAL ABC object accumulation: {current_abc_count} objects")
                         
-                        # Force multiple GC passes to clean up ABC objects
-                        total_collected = 0
-                        for _ in range(3):
+                        # Use lightweight substrate cleanup instead of expensive GC passes
+                        try:
+                            from gaia.utils.abc_debugger import lightweight_substrate_cleanup
+                            cleanup_count = lightweight_substrate_cleanup()
+                            logger.info(f"Lightweight substrate cleanup removed {cleanup_count} cache objects")
+                        except ImportError:
+                            # Fallback to single GC pass
                             collected = gc.collect()
-                            total_collected += collected
-                            await asyncio.sleep(0.1)
-                        
-                        logger.info(f"ABC emergency cleanup: GC collected {total_collected} objects")
+                            logger.info(f"Fallback GC collected {collected} objects")
                 
                 last_abc_count = current_abc_count
                 
