@@ -413,6 +413,44 @@ async def fetch_srtm(bbox, sentinel_bounds=None, sentinel_crs=None, sentinel_sha
         return None, None, None, None
 
 
+async def _load_ifs_cache_with_fallbacks(cache_file_path):
+    """
+    Load cached IFS data with robust fallback handling for both netCDF and pickle formats.
+    This matches the pattern used in the weather code for reliability.
+    """
+    try:
+        def _load_with_fallbacks():
+            # First, try to load as netCDF with multiple engines
+            engines_to_try = ['netcdf4', 'scipy', 'h5netcdf']
+            
+            for engine in engines_to_try:
+                try:
+                    ds = xr.open_dataset(cache_file_path, engine=engine)
+                    print(f"Successfully loaded IFS cache using '{engine}' engine")
+                    return ds
+                except Exception as engine_err:
+                    print(f"Failed to load with '{engine}' engine: {engine_err}")
+                    continue
+            
+            # If all netCDF engines failed, try loading as pickle
+            try:
+                import pickle
+                with open(cache_file_path, 'rb') as f:
+                    ds = pickle.load(f)
+                print(f"Successfully loaded IFS cache as pickle format")
+                return ds
+            except Exception as pickle_err:
+                print(f"Failed to load as pickle: {pickle_err}")
+                return None
+        
+        # Run the loading in a thread since it might be blocking
+        return await asyncio.to_thread(_load_with_fallbacks)
+        
+    except Exception as e:
+        print(f"Error loading IFS cache from {cache_file_path}: {e}")
+        return None
+
+
 async def fetch_ifs_forecast(
     bbox, datetime_obj, sentinel_bounds=None, sentinel_crs=None, sentinel_shape=None
 ):
@@ -437,30 +475,32 @@ async def fetch_ifs_forecast(
         # Try loading target day's cached data first
         if os.path.exists(today_cache):
             print(f"Loading cached IFS data from: {today_cache}")
-            ds = xr.open_dataset(today_cache)
-            data = await extract_ifs_variables(
-                ds,
-                bbox,
-                sentinel_bounds=sentinel_bounds,
-                sentinel_crs=sentinel_crs,
-                sentinel_shape=sentinel_shape,
-            )
-            if data is not None:
-                return data
+            ds = await _load_ifs_cache_with_fallbacks(today_cache)
+            if ds is not None:
+                data = await extract_ifs_variables(
+                    ds,
+                    bbox,
+                    sentinel_bounds=sentinel_bounds,
+                    sentinel_crs=sentinel_crs,
+                    sentinel_shape=sentinel_shape,
+                )
+                if data is not None:
+                    return data
 
         # If we're before 2 UTC, try yesterday's data
         if use_previous_day and os.path.exists(yesterday_cache):
             print("Before 2:00 UTC, using previous day's cached data...")
-            ds = xr.open_dataset(yesterday_cache)
-            data = await extract_ifs_variables(
-                ds,
-                bbox,
-                sentinel_bounds=sentinel_bounds,
-                sentinel_crs=sentinel_crs,
-                sentinel_shape=sentinel_shape,
-            )
-            if data is not None:
-                return data
+            ds = await _load_ifs_cache_with_fallbacks(yesterday_cache)
+            if ds is not None:
+                data = await extract_ifs_variables(
+                    ds,
+                    bbox,
+                    sentinel_bounds=sentinel_bounds,
+                    sentinel_crs=sentinel_crs,
+                    sentinel_shape=sentinel_shape,
+                )
+                if data is not None:
+                    return data
 
         # Download data based on timing
         if use_previous_day:
@@ -491,14 +531,15 @@ async def fetch_ifs_forecast(
         if grib_paths:
             success = await process_global_ifs(grib_paths, timesteps, cache_file)
             if success:
-                ds = xr.open_dataset(cache_file)
-                return await extract_ifs_variables(
-                    ds,
-                    bbox,
-                    sentinel_bounds=sentinel_bounds,
-                    sentinel_crs=sentinel_crs,
-                    sentinel_shape=sentinel_shape,
-                )
+                ds = await _load_ifs_cache_with_fallbacks(cache_file)
+                if ds is not None:
+                    return await extract_ifs_variables(
+                        ds,
+                        bbox,
+                        sentinel_bounds=sentinel_bounds,
+                        sentinel_crs=sentinel_crs,
+                        sentinel_shape=sentinel_shape,
+                    )
         print("Failed to download new forecast data")
         return None
 
@@ -565,8 +606,39 @@ async def process_global_ifs(grib_paths, timesteps, output_path):
 
         if datasets:
             combined_ds = xr.concat(datasets, dim="time")
-            await asyncio.to_thread(combined_ds.to_netcdf, output_path)
-            return True
+            
+            # Robust netCDF saving with fallback engines (same pattern as weather code)
+            def _save_with_fallbacks():
+                engines_to_try = ['netcdf4', 'scipy', 'h5netcdf']
+                saved_successfully = False
+                
+                for engine in engines_to_try:
+                    try:
+                        combined_ds.to_netcdf(output_path, engine=engine)
+                        print(f"Successfully saved IFS data using '{engine}' engine")
+                        saved_successfully = True
+                        break
+                    except Exception as engine_err:
+                        print(f"Failed to save with '{engine}' engine: {engine_err}")
+                        continue
+                
+                if not saved_successfully:
+                    # Final fallback: save as pickle
+                    import pickle
+                    pickle_path = output_path.replace('.nc', '.pkl')
+                    print(f"All netCDF engines failed, falling back to pickle format: {pickle_path}")
+                    with open(pickle_path, 'wb') as f:
+                        pickle.dump(combined_ds, f)
+                    print(f"Successfully saved IFS data as pickle")
+                    # Update output path for caller
+                    import os
+                    import shutil
+                    shutil.move(pickle_path, output_path)
+                
+                return saved_successfully
+            
+            success = await asyncio.to_thread(_save_with_fallbacks)
+            return True  # Return True even if we used pickle fallback
         return False
 
     except Exception as e:
@@ -729,6 +801,15 @@ async def get_soil_data(bbox, datetime_obj=None):
             sentinel_shape=(222, 222),
         )
 
+        # Handle None data gracefully
+        if ifs_data is None:
+            print("Warning: IFS data is None, using empty list as fallback")
+            ifs_data = []
+        
+        if sentinel_data is None:
+            print("Warning: Sentinel data is None, using empty list as fallback")
+            sentinel_data = []
+
         profile = {
             "driver": "GTiff",
             "height": 222,
@@ -808,13 +889,24 @@ async def combine_tiffs(
 
             dst.write(srtm_resized.astype("float32"), band_idx)
             band_idx += 1
-            ndvi = (sentinel_data[1] - sentinel_data[0]) / (
-                sentinel_data[1] + sentinel_data[0]
-            )
-            dst.write(ndvi.astype("float32"), band_idx)
+            
+            # Calculate NDVI only if we have at least 2 Sentinel bands
+            if len(sentinel_data) >= 2:
+                ndvi = (sentinel_data[1] - sentinel_data[0]) / (
+                    sentinel_data[1] + sentinel_data[0]
+                )
+                dst.write(ndvi.astype("float32"), band_idx)
+                band_order = f"1-{len(sentinel_data)}:Sentinel(B4,B8), {len(sentinel_data)+1}-{len(sentinel_data)+len(ifs_data)}:IFS+Evap, {len(sentinel_data)+len(ifs_data)+1}:SRTM, {len(sentinel_data)+len(ifs_data)+2}:NDVI"
+            else:
+                # No NDVI band if we don't have Sentinel data, fill with zeros
+                print("Warning: No Sentinel data available, skipping NDVI calculation")
+                dummy_ndvi = np.zeros(target_shape, dtype="float32")
+                dst.write(dummy_ndvi, band_idx)
+                band_order = f"1-{len(sentinel_data)}:Sentinel, {len(sentinel_data)+1}-{len(sentinel_data)+len(ifs_data)}:IFS+Evap, {len(sentinel_data)+len(ifs_data)+1}:SRTM, {len(sentinel_data)+len(ifs_data)+2}:NDVI(dummy)"
+            
             dst.update_tags(
                 sentinel_transform=str(profile["sentinel_transform"]),
-                band_order="1-2:Sentinel(B4,B8), 3-19:IFS+Evap, 20:SRTM, 21:NDVI",
+                band_order=band_order,
             )
         print(f"Successfully wrote combined data to {output_file}")
         return output_file
@@ -962,5 +1054,5 @@ def get_data_dir():
     data_dir = os.path.join(cwd, "data")
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
-        logger.info(f"Created data directory at: {data_dir}")
+        print(f"Created data directory at: {data_dir}")
     return data_dir

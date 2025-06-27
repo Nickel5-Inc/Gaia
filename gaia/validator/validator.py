@@ -528,6 +528,10 @@ class GaiaValidator:
         
         # Add lock for metagraph sync to prevent concurrent syncs
         self.metagraph_sync_lock = asyncio.Lock()
+        
+        # Track substrate connection age for reuse (10 minute reuse window)
+        self.substrate_connection_created_at = 0
+        self.substrate_reuse_window = 600  # 10 minutes
 
         # Memory monitoring configuration
         self.memory_monitor_enabled = os.getenv('VALIDATOR_MEMORY_MONITORING_ENABLED', 'true').lower() in ['true', '1', 'yes']
@@ -791,6 +795,7 @@ class GaiaValidator:
             # Use isolated substrate interface for complete ABC memory leak prevention
             try:
                 self.substrate = self._get_substrate_interface()
+                self.substrate_connection_created_at = time.time()  # Track initial connection age
                 logger.info("🛡️  Created isolated substrate interface for memory leak prevention")
             except Exception as e_sub_init:
                 logger.error(f"CRITICAL: Failed to initialize isolated substrate interface with endpoint {self.subtensor_chain_endpoint}: {e_sub_init}", exc_info=True)
@@ -806,9 +811,8 @@ class GaiaValidator:
             # Standard Metagraph Sync
             try:
                 # Use direct sync here since _sync_metagraph is async and we're in sync method
-                # Create fresh isolated substrate connection for metagraph sync
-                self.substrate = self._get_substrate_interface()
-                logger.info("🛡️  Created fresh isolated connection for metagraph sync")
+                # Reuse the substrate connection we just created for initial sync
+                self.metagraph.substrate = self.substrate
                 self.metagraph.sync_nodes()  # Sync nodes after initialization
                 logger.info(f"Successfully synced {len(self.metagraph.nodes) if self.metagraph.nodes else '0'} nodes from the network.")
             except Exception as e_meta_sync:
@@ -1600,7 +1604,7 @@ class GaiaValidator:
                 try:
                     await asyncio.wait_for(
                         self._sync_metagraph(),
-                        timeout=15  # 15 second timeout (allows for 6-7s connection + sync time)
+                        timeout=120  # 120 second timeout (allows for substrate network delays)
                     )
                 except asyncio.TimeoutError:
                     logger.error("Metagraph sync timed out")
@@ -2108,24 +2112,37 @@ class GaiaValidator:
             sync_start = time.time()
             
             try:
-                # Use fresh isolated substrate connection for memory leak prevention
-                old_substrate = getattr(self, 'substrate', None)
-                self.substrate = get_fresh_substrate_connection(
-                    subtensor_network=self.subtensor_network,
-                    chain_endpoint=self.subtensor_chain_endpoint
+                # Check if we need a fresh substrate connection (reuse for 10 minutes)
+                current_time = time.time()
+                connection_age = current_time - self.substrate_connection_created_at
+                needs_fresh_connection = (
+                    not hasattr(self, 'substrate') or 
+                    self.substrate is None or 
+                    connection_age > self.substrate_reuse_window
                 )
-                logger.info("🔄 Created fresh isolated connection for metagraph sync")
+                
+                if needs_fresh_connection:
+                    old_substrate = getattr(self, 'substrate', None)
+                    self.substrate = get_fresh_substrate_connection(
+                        subtensor_network=self.subtensor_network,
+                        chain_endpoint=self.subtensor_chain_endpoint
+                    )
+                    self.substrate_connection_created_at = current_time
+                    logger.info(f"🔄 Created fresh substrate connection (age: {connection_age:.1f}s, limit: {self.substrate_reuse_window}s)")
+                else:
+                    logger.debug(f"♻️ Reusing substrate connection (age: {connection_age:.1f}s, limit: {self.substrate_reuse_window}s)")
                 
                 # Update metagraph to use the fresh connection
                 if hasattr(self, 'metagraph') and self.metagraph:
                     self.metagraph.substrate = self.substrate
                     
                     # Use standard fiber sync_nodes() method - simple and reliable
-                    logger.debug("Using standard fiber sync_nodes() with fresh isolated connection")
+                    connection_type = "fresh" if needs_fresh_connection else "reused"
+                    logger.debug(f"Using standard fiber sync_nodes() with {connection_type} substrate connection")
                     await asyncio.to_thread(self.metagraph.sync_nodes)
                     
                     node_count = len(self.metagraph.nodes) if self.metagraph.nodes else 0
-                    logger.info(f"✅ Metagraph sync completed: {node_count} nodes using fresh isolated connection")
+                    logger.info(f"✅ Metagraph sync completed: {node_count} nodes using {connection_type} substrate connection")
                 else:
                     logger.error("Metagraph not initialized, cannot sync nodes")
                     return
@@ -2146,9 +2163,10 @@ class GaiaValidator:
                 logger.debug(f"Metagraph sync completed in {sync_duration:.2f}s")
             
             # Log substrate connection status
-            connection_changed = old_substrate != self.substrate
-            if connection_changed:
+            if needs_fresh_connection:
                 logger.debug("Substrate connection refreshed during metagraph sync")
+            else:
+                logger.debug("Substrate connection reused during metagraph sync")
 
     def _track_background_task(self, task: asyncio.Task, task_name: str = "unnamed"):
         """Track background tasks for proper cleanup and memory leak prevention."""
@@ -2405,6 +2423,7 @@ class GaiaValidator:
                     subtensor_network=self.subtensor_network,
                     chain_endpoint=self.subtensor_chain_endpoint
                 )
+                self.substrate_connection_created_at = time.time()  # Track connection age for reuse
                 logger.info("🔄 Force reconnect - created fresh substrate connection using substrate manager")
                 await self._sync_metagraph()  # Use fresh connection
             elif task_name == "deregistration":

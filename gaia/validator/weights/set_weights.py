@@ -40,10 +40,10 @@ async def get_active_validator_uids(netuid, subtensor_network="finney", chain_en
             lambda: substrate.query("SubtensorModule", "LastUpdate", [netuid])
         )
         
-        # Get current block number using get_block method
+        # Get current block number using rpc_request (consistent with validator.py pattern)
         current_block = await loop.run_in_executor(
             None,
-            lambda: int(substrate.get_block()["header"]["number"])
+            lambda: int(substrate.rpc_request("chain_getHeader", [])["result"]["number"], 16)
         )
         
         # Find active validators: vpermit == 1 AND recently updated
