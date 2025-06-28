@@ -123,7 +123,11 @@ class MinerScoreSender:
             "predictionId": row["id"],
             "predictionDate": row["target_time"].isoformat(),
             "soilPredictionRegionId": row["region_id"],
-            "sentinelRegionBounds": json.dumps(row["sentinel_bounds"]) if row["sentinel_bounds"] else "[]",
+            "sentinelRegionBounds": row["sentinel_bounds"]
+                if isinstance(row["sentinel_bounds"], list)
+                and len(row["sentinel_bounds"]) == 4
+                and all(isinstance(x, (int, float)) and math.isfinite(x) for x in row["sentinel_bounds"])
+                else [],
             "sentinelRegionCrs": row["sentinel_crs"] if row["sentinel_crs"] else 4326,
             "soilPredictionTargetDate": row["target_time"].isoformat(),
             "soilSurfaceRmse": row["surface_rmse"],

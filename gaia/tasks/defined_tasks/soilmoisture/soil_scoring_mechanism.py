@@ -650,7 +650,7 @@ class SoilScoringMechanism(ScoringMechanism):
             logger.error(traceback.format_exc())
             return False
 
-    def prepare_soil_history_records(self, miner_id: str, miner_hotkey: str, metrics: Dict, target_time: datetime) -> Dict[str, Any]:
+    def prepare_soil_history_records(self, miner_id: str, miner_hotkey: str, metrics: Dict, target_time: datetime, region_id: int = None) -> Dict[str, Any]:
         """
         Prepare data for insertion into the soil_moisture_history table.
 
@@ -686,6 +686,9 @@ class SoilScoringMechanism(ScoringMechanism):
                 "rootzone_structure_score": rootzone_ssim,
                 "scored_at": target_time,
             }
+            if region_id is not None:
+                record["region_id"] = region_id  # 👈 This enables `sentinel_bounds` to show up later
+
             return record
 
         except Exception as e:
