@@ -3505,13 +3505,14 @@ class GaiaValidator:
                     
                     # Find non-zero scores
                     non_zero_mask = uid_scores != 0.0
+                    completeness_factor = np.sum(non_zero_mask) / 24
                     
                     if np.any(non_zero_mask):
                         masked_s = uid_scores[non_zero_mask]
                         masked_w = uid_weights[non_zero_mask]
                         weight_sum = np.sum(masked_w)
                         if weight_sum > 0:
-                            geomagnetic_scores[uid] = np.sum(masked_s * masked_w) / weight_sum
+                            geomagnetic_scores[uid] = (np.sum(masked_s * masked_w) / weight_sum) * completeness_factor
                         else:
                             geomagnetic_scores[uid] = 0.0
                     else:
