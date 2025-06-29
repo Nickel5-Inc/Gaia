@@ -256,7 +256,7 @@ class ComprehensiveDatabaseSetup:
             ]
             success, stdout, stderr = await self._run_command(check_alembic_cmd, timeout=10)
             # PostgreSQL returns 't' for true, 'f' for false
-            if not success or 't' not in stdout.strip():
+            if not success or 't' not in stdout.strip().replace('exists', '').strip():
                 logger.info("❌ Alembic not configured")
                 return False
             
