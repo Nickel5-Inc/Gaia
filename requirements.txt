@@ -740,6 +740,7 @@ zarr==2.18.3
     #   kerchunk
 zipp==3.21.0
     # via importlib-metadata
+cfgrib
 
 # The following packages are considered to be unsafe in a requirements file:
 # setuptools
