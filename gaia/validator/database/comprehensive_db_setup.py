@@ -946,6 +946,20 @@ class ComprehensiveDatabaseSetup:
         
         db_url = f"postgresql+psycopg2://{self.config.postgres_user}:{self.config.postgres_password}@localhost:{self.config.port}/{self.config.database_name}"
         
+        # CRITICAL: Check for and repair alembic_version corruption BEFORE attempting migrations
+        logger.info("🔍 Pre-migration corruption check...")
+        try:
+            from gaia.validator.database.alembic_corruption_repair import repair_alembic_corruption
+            repair_success = repair_alembic_corruption(db_url)
+            if not repair_success:
+                logger.warning("⚠️ Alembic corruption repair failed, but continuing with migration attempt...")
+            else:
+                logger.info("✅ Pre-migration corruption check passed")
+        except ImportError:
+            logger.warning("⚠️ Alembic corruption repair module not found - skipping corruption check")
+        except Exception as e:
+            logger.warning(f"⚠️ Error during corruption repair: {e} - continuing with migration attempt...")
+        
         cmd = [
             sys.executable, '-m', 'alembic',
             '--config', str(self.alembic_config_path),
@@ -960,6 +974,26 @@ class ComprehensiveDatabaseSetup:
             return True
         else:
             logger.error(f"Failed to run Alembic migrations: {stderr}")
+            
+            # If migration failed due to corruption, try repair and retry once
+            if "can't locate revision" in stderr.lower() or "invalid" in stderr.lower():
+                logger.info("🔧 Migration failed with corruption symptoms - attempting repair and retry...")
+                try:
+                    from gaia.validator.database.alembic_corruption_repair import repair_alembic_corruption
+                    repair_success = repair_alembic_corruption(db_url)
+                    if repair_success:
+                        logger.info("🔄 Corruption repaired - retrying migration...")
+                        success, stdout, stderr = await self._run_command(cmd, timeout=120, cwd=project_root_dir)
+                        if success:
+                            logger.info("✅ Alembic migrations successful after repair")
+                            return True
+                        else:
+                            logger.error(f"Migration still failed after repair: {stderr}")
+                    else:
+                        logger.error("❌ Corruption repair failed")
+                except Exception as e:
+                    logger.error(f"Error during corruption repair retry: {e}")
+            
             return False
 
     async def _setup_backup_system(self) -> bool:
