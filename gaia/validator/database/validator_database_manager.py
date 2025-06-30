@@ -795,8 +795,11 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             Optional[Dict]: The prediction data or None if not found
         """
         try:
+            # Use more specific query optimization
+            # Only select needed columns to reduce data transfer
             query = """
-            SELECT * FROM baseline_predictions 
+            SELECT id, task_name, task_id, region_id, timestamp, prediction, created_at
+            FROM baseline_predictions 
             WHERE task_name = :task_name 
             AND task_id = :task_id
             """
@@ -810,12 +813,17 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 query += " AND region_id = :region_id"
                 params["region_id"] = region_id
             
+            # Add explicit ordering and limiting for faster execution
             query += " ORDER BY created_at DESC LIMIT 1"
             
-            result = await self.fetch_one(query, params)
+            # Use a shorter timeout for this specific query since it should be fast
+            result = await asyncio.wait_for(
+                self.fetch_one(query, params),
+                timeout=30.0  # 30 second timeout instead of default 120s
+            )
             
             if not result:
-                logger.warning(f"No baseline prediction found for {task_name}, task_id: {task_id}, region: {region_id}")
+                logger.debug(f"No baseline prediction found for {task_name}, task_id: {task_id}, region: {region_id}")
                 return None
                 
             raw_prediction_from_db = result['prediction']
@@ -847,11 +855,65 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 "created_at": result['created_at']
             }
             
+        except asyncio.TimeoutError:
+            logger.error(f"Baseline prediction query timed out for {task_name}, task_id: {task_id}, region: {region_id}")
+            # For timeout, return None but log as error for monitoring
+            return None
         except Exception as e:
             logger.error(f"Error retrieving baseline prediction: {e}")
             logger.error(traceback.format_exc())
             return None
-    
+            
+    @track_operation('read')
+    async def get_baseline_predictions_by_task_name(self, 
+                                                  task_name: str, 
+                                                  limit: int = 100) -> List[Dict]:
+        """
+        Retrieve recent baseline predictions for a specific task type.
+        This method is optimized for queries that only filter by task_name.
+        
+        Args:
+            task_name: Name of the task
+            limit: Maximum number of predictions to return
+            
+        Returns:
+            List[Dict]: List of prediction data
+        """
+        try:
+            # Optimized query for task_name-only filtering
+            query = """
+            SELECT id, task_name, task_id, region_id, timestamp, created_at
+            FROM baseline_predictions 
+            WHERE task_name = :task_name
+            ORDER BY created_at DESC 
+            LIMIT :limit
+            """
+            
+            params = {
+                "task_name": task_name,
+                "limit": limit
+            }
+            
+            # Use a shorter timeout for this query
+            results = await asyncio.wait_for(
+                self.fetch_all(query, params),
+                timeout=60.0  # 60 second timeout
+            )
+            
+            if not results:
+                logger.debug(f"No baseline predictions found for task_name: {task_name}")
+                return []
+                
+            return [dict(row) for row in results]
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Baseline predictions query by task_name timed out for {task_name}")
+            return []
+        except Exception as e:
+            logger.error(f"Error retrieving baseline predictions by task_name: {e}")
+            logger.error(traceback.format_exc())
+            return []
+
     def _json_serializer(self, obj):
         """
         Custom JSON serializer for objects not serializable by default json code.
@@ -904,3 +966,420 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                  logger.error(f"Error executing query (outer): {str(e)}")
                  logger.error(traceback.format_exc())
             raise DatabaseError(f"Failed to execute query: {str(e)}")
+
+    @track_operation('write')
+    async def cleanup_old_baseline_predictions(self, 
+                                             days_to_keep: int = 30,
+                                             batch_size: int = 1000) -> int:
+        """
+        Clean up old baseline predictions to prevent table bloat.
+        
+        Args:
+            days_to_keep: Number of days of predictions to keep
+            batch_size: Number of records to delete per batch
+            
+        Returns:
+            int: Number of records deleted
+        """
+        try:
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_to_keep)
+            
+            # First, count how many records would be deleted
+            count_query = """
+            SELECT COUNT(*) as count 
+            FROM baseline_predictions 
+            WHERE created_at < :cutoff_date
+            """
+            
+            count_result = await self.fetch_one(count_query, {"cutoff_date": cutoff_date})
+            total_to_delete = count_result['count'] if count_result else 0
+            
+            if total_to_delete == 0:
+                logger.info("No old baseline predictions to clean up")
+                return 0
+                
+            logger.info(f"Found {total_to_delete} old baseline predictions to delete (older than {days_to_keep} days)")
+            
+            # Delete in batches to avoid long-running transactions
+            total_deleted = 0
+            while True:
+                delete_query = """
+                DELETE FROM baseline_predictions 
+                WHERE id IN (
+                    SELECT id FROM baseline_predictions 
+                    WHERE created_at < :cutoff_date 
+                    ORDER BY created_at ASC 
+                    LIMIT :batch_size
+                )
+                """
+                
+                result = await self.execute(delete_query, {
+                    "cutoff_date": cutoff_date,
+                    "batch_size": batch_size
+                })
+                
+                deleted_count = result.rowcount if hasattr(result, 'rowcount') else batch_size
+                total_deleted += deleted_count
+                
+                if deleted_count < batch_size:
+                    # No more records to delete
+                    break
+                    
+                # Small delay between batches to reduce database load
+                await asyncio.sleep(0.1)
+                
+            logger.info(f"Cleaned up {total_deleted} old baseline predictions")
+            return total_deleted
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up old baseline predictions: {e}")
+            logger.error(traceback.format_exc())
+            return 0
+
+    @track_operation('read')
+    async def get_database_performance_stats(self) -> Dict[str, Any]:
+        """
+        Get database performance statistics to help identify issues.
+        
+        Returns:
+            Dict containing database performance metrics
+        """
+        try:
+            stats = {}
+            
+            # Connection pool stats
+            if self._engine and hasattr(self._engine.pool, 'size'):
+                pool = self._engine.pool
+                stats['connection_pool'] = {
+                    'size': pool.size(),
+                    'checked_in': pool.checkedin(),
+                    'checked_out': pool.checkedout(),
+                    'overflow': pool.overflow(),
+                    'invalidated': pool.invalidated(),
+                }
+            
+            # Table size statistics
+            table_stats_query = """
+            SELECT 
+                schemaname,
+                tablename,
+                attname,
+                n_distinct,
+                correlation,
+                null_frac
+            FROM pg_stats 
+            WHERE schemaname = 'public' 
+            AND tablename = 'baseline_predictions'
+            ORDER BY attname;
+            """
+            
+            table_stats = await self.fetch_all(table_stats_query)
+            stats['table_statistics'] = table_stats
+            
+            # Index usage statistics
+            index_stats_query = """
+            SELECT 
+                indexrelname as index_name,
+                idx_tup_read,
+                idx_tup_fetch,
+                idx_scan,
+                schemaname,
+                tablename
+            FROM pg_stat_user_indexes 
+            WHERE tablename = 'baseline_predictions'
+            ORDER BY idx_scan DESC;
+            """
+            
+            index_stats = await self.fetch_all(index_stats_query)
+            stats['index_usage'] = index_stats
+            
+            # Recent slow queries (if pg_stat_statements is available)
+            try:
+                slow_queries_query = """
+                SELECT 
+                    query,
+                    calls,
+                    total_time,
+                    mean_time,
+                    rows
+                FROM pg_stat_statements 
+                WHERE query ILIKE '%baseline_predictions%'
+                ORDER BY mean_time DESC 
+                LIMIT 10;
+                """
+                
+                slow_queries = await self.fetch_all(slow_queries_query)
+                stats['slow_queries'] = slow_queries
+            except Exception:
+                # pg_stat_statements extension might not be available
+                stats['slow_queries'] = "pg_stat_statements extension not available"
+            
+            # Table size information
+            table_size_query = """
+            SELECT 
+                pg_size_pretty(pg_total_relation_size('baseline_predictions')) as total_size,
+                pg_size_pretty(pg_relation_size('baseline_predictions')) as table_size,
+                pg_size_pretty(pg_total_relation_size('baseline_predictions') - pg_relation_size('baseline_predictions')) as index_size,
+                (SELECT COUNT(*) FROM baseline_predictions) as row_count;
+            """
+            
+            size_info = await self.fetch_one(table_size_query)
+            stats['table_size'] = size_info
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting database performance stats: {e}")
+            return {"error": str(e)}
+            
+    @track_operation('write')
+    async def optimize_baseline_predictions_table(self) -> Dict[str, Any]:
+        """
+        Run maintenance operations on the baseline_predictions table.
+        
+        Returns:
+            Dict containing results of optimization operations
+        """
+        try:
+            results = {}
+            
+            # Analyze table statistics
+            analyze_query = "ANALYZE baseline_predictions;"
+            await self.execute(analyze_query)
+            results['analyze'] = "completed"
+            
+            # Vacuum the table (not FULL to avoid locking)
+            vacuum_query = "VACUUM baseline_predictions;"
+            await self.execute(vacuum_query)
+            results['vacuum'] = "completed"
+            
+            # Check for unused indexes
+            unused_indexes_query = """
+            SELECT 
+                schemaname,
+                tablename,
+                indexname,
+                idx_scan,
+                idx_tup_read,
+                idx_tup_fetch
+            FROM pg_stat_user_indexes 
+            WHERE tablename = 'baseline_predictions'
+            AND idx_scan = 0;
+            """
+            
+            unused_indexes = await self.fetch_all(unused_indexes_query)
+            results['unused_indexes'] = unused_indexes
+            
+            # Clean up old predictions (keep last 30 days)
+            cleaned_count = await self.cleanup_old_baseline_predictions(days_to_keep=30)
+            results['cleaned_old_records'] = cleaned_count
+            
+            logger.info(f"Baseline predictions table optimization completed: {results}")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error optimizing baseline predictions table: {e}")
+            return {"error": str(e)}
+
+    @track_operation('write')
+    async def cleanup_old_geomagnetic_predictions(self, 
+                                                days_to_keep: int = 7,
+                                                batch_size: int = 1000) -> int:
+        """
+        Clean up old geomagnetic predictions to prevent table bloat.
+        
+        Args:
+            days_to_keep: Number of days of predictions to keep
+            batch_size: Number of records to delete per batch
+            
+        Returns:
+            int: Number of records deleted
+        """
+        try:
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_to_keep)
+            
+            # First, count how many records would be deleted
+            count_query = """
+            SELECT COUNT(*) as count_to_delete 
+            FROM geomagnetic_predictions 
+            WHERE query_time < :cutoff_date
+            """
+            count_result = await self.fetch_one(count_query, {"cutoff_date": cutoff_date})
+            total_to_delete = count_result["count_to_delete"] if count_result else 0
+            
+            if total_to_delete == 0:
+                logger.info(f"No old geomagnetic predictions to clean up (cutoff: {cutoff_date})")
+                return 0
+                
+            logger.info(f"Cleaning up {total_to_delete} old geomagnetic prediction records (older than {cutoff_date})")
+            
+            # Delete in batches to avoid long-running transactions
+            total_deleted = 0
+            while True:
+                delete_query = """
+                DELETE FROM geomagnetic_predictions 
+                WHERE id IN (
+                    SELECT id FROM geomagnetic_predictions 
+                    WHERE query_time < :cutoff_date 
+                    ORDER BY query_time ASC 
+                    LIMIT :batch_size
+                )
+                """
+                
+                result = await self.execute(delete_query, {
+                    "cutoff_date": cutoff_date,
+                    "batch_size": batch_size
+                })
+                
+                if hasattr(result, 'rowcount') and result.rowcount == 0:
+                    break
+                    
+                total_deleted += batch_size
+                
+                # Log progress every 5000 records
+                if total_deleted % 5000 == 0:
+                    logger.info(f"Deleted {total_deleted}/{total_to_delete} old geomagnetic predictions...")
+                
+                # Brief pause between batches to avoid overwhelming the database
+                await asyncio.sleep(0.1)
+                
+                if total_deleted >= total_to_delete:
+                    break
+            
+            logger.info(f"Successfully cleaned up {total_deleted} old geomagnetic prediction records")
+            return total_deleted
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up old geomagnetic predictions: {e}")
+            logger.error(traceback.format_exc())
+            return 0
+
+    @track_operation('write')
+    async def optimize_geomagnetic_predictions_table(self) -> Dict[str, Any]:
+        """
+        Run maintenance operations on the geomagnetic_predictions table.
+        
+        Returns:
+            Dict containing results of optimization operations
+        """
+        try:
+            results = {}
+            
+            # Analyze table statistics
+            analyze_query = "ANALYZE geomagnetic_predictions;"
+            await self.execute(analyze_query)
+            results['analyze'] = "completed"
+            
+            # Vacuum the table (not FULL to avoid locking)
+            vacuum_query = "VACUUM geomagnetic_predictions;"
+            await self.execute(vacuum_query)
+            results['vacuum'] = "completed"
+            
+            # Check table size and bloat
+            size_query = """
+            SELECT 
+                schemaname,
+                tablename,
+                pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size,
+                pg_total_relation_size(schemaname||'.'||tablename) as size_bytes
+            FROM pg_tables 
+            WHERE tablename = 'geomagnetic_predictions';
+            """
+            
+            size_info = await self.fetch_one(size_query)
+            if size_info:
+                results['table_size'] = size_info['size']
+                results['table_size_bytes'] = size_info['size_bytes']
+            
+            # Check for unused indexes
+            unused_indexes_query = """
+            SELECT 
+                schemaname,
+                tablename,
+                indexname,
+                idx_scan,
+                idx_tup_read,
+                idx_tup_fetch
+            FROM pg_stat_user_indexes 
+            WHERE tablename = 'geomagnetic_predictions'
+            AND idx_scan = 0;
+            """
+            
+            unused_indexes = await self.fetch_all(unused_indexes_query)
+            results['unused_indexes'] = unused_indexes
+            
+            # Clean up old predictions (keep last 7 days)
+            cleaned_count = await self.cleanup_old_geomagnetic_predictions(days_to_keep=7)
+            results['cleaned_old_records'] = cleaned_count
+            
+            # Check for orphaned records (miners no longer in metagraph)
+            orphan_check_query = """
+            SELECT COUNT(*) as orphan_count
+            FROM geomagnetic_predictions gp
+            WHERE NOT EXISTS (
+                SELECT 1 FROM node_table nt 
+                WHERE nt.hotkey = gp.miner_hotkey
+            );
+            """
+            
+            orphan_result = await self.fetch_one(orphan_check_query)
+            if orphan_result and orphan_result['orphan_count'] > 0:
+                results['orphaned_records'] = orphan_result['orphan_count']
+                logger.warning(f"Found {orphan_result['orphan_count']} orphaned geomagnetic prediction records")
+            
+            logger.info(f"Geomagnetic predictions table optimization completed: {results}")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error optimizing geomagnetic predictions table: {e}")
+            logger.error(traceback.format_exc())
+            return {"error": str(e)}
+
+    @track_operation('write')
+    async def emergency_geomagnetic_cleanup(self) -> Dict[str, Any]:
+        """
+        Emergency cleanup for geomagnetic_predictions table when performance is severely degraded.
+        
+        Returns:
+            Dict containing cleanup results
+        """
+        try:
+            results = {}
+            logger.warning("Starting emergency geomagnetic predictions cleanup...")
+            
+            # 1. Force analyze and vacuum
+            await self.execute("VACUUM ANALYZE geomagnetic_predictions;")
+            results['vacuum_analyze'] = "completed"
+            
+            # 2. Clean up very old records (older than 3 days)
+            old_cleanup = await self.cleanup_old_geomagnetic_predictions(days_to_keep=3)
+            results['old_records_cleaned'] = old_cleanup
+            
+            # 3. Remove orphaned records (miners not in node_table)
+            orphan_cleanup_query = """
+            DELETE FROM geomagnetic_predictions gp
+            WHERE NOT EXISTS (
+                SELECT 1 FROM node_table nt 
+                WHERE nt.hotkey = gp.miner_hotkey
+            );
+            """
+            
+            orphan_result = await self.execute(orphan_cleanup_query)
+            orphan_count = getattr(orphan_result, 'rowcount', 0)
+            results['orphaned_records_cleaned'] = orphan_count
+            
+            # 4. Reindex the table to fix any corruption
+            await self.execute("REINDEX TABLE geomagnetic_predictions;")
+            results['reindex'] = "completed"
+            
+            # 5. Update table statistics
+            await self.execute("ANALYZE geomagnetic_predictions;")
+            results['final_analyze'] = "completed"
+            
+            logger.info(f"Emergency geomagnetic cleanup completed: {results}")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error during emergency geomagnetic cleanup: {e}")
+            logger.error(traceback.format_exc())
+            return {"error": str(e)}

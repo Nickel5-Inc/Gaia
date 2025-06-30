@@ -52,32 +52,32 @@ class BaseDatabaseManager(ABC):
     _lock = asyncio.Lock()
 
     # Default timeouts
-    DEFAULT_QUERY_TIMEOUT = 120  # Changed from 30 seconds
-    DEFAULT_TRANSACTION_TIMEOUT = 180  # 3 minutes
-    DEFAULT_CONNECTION_TIMEOUT = 60  # 10 seconds
+    DEFAULT_QUERY_TIMEOUT = 60  # Reduced from 120 to 60 seconds for faster failure detection
+    DEFAULT_TRANSACTION_TIMEOUT = 120  # Reduced from 180 to 120 seconds
+    DEFAULT_CONNECTION_TIMEOUT = 30  # Reduced from 60 to 30 seconds
 
     # Operation constants
     DEFAULT_BATCH_SIZE = 1000
     MAX_RETRIES = 3
-    MAX_CONNECTIONS = 40  # REDUCED: 60->40 to reduce thread contention 
-    MAX_OVERFLOW = 10     # REDUCED: 20->10, total max = 50 connections
+    MAX_CONNECTIONS = 50  # Increased from 40 to 50 for better throughput
+    MAX_OVERFLOW = 15     # Increased from 10 to 15, total max = 65 connections
     
     # Pool health check settings
-    POOL_HEALTH_CHECK_INTERVAL = 30  # REDUCED from 60 to 30 for faster detection
+    POOL_HEALTH_CHECK_INTERVAL = 20  # Reduced from 30 to 20 for faster detection
     POOL_RECOVERY_ATTEMPTS = 3
 
     # Circuit breaker settings
     CIRCUIT_BREAKER_THRESHOLD = 3  # REDUCED from 5 to 3 for faster response
-    CIRCUIT_BREAKER_RECOVERY_TIME = 30  # REDUCED from 60 to 30 seconds
+    CIRCUIT_BREAKER_RECOVERY_TIME = 20  # REDUCED from 30 to 20 seconds
 
     # Connection pool aggressive settings for high-load environments
-    POOL_PRE_PING_TIMEOUT = 5      # Fast ping timeout
+    POOL_PRE_PING_TIMEOUT = 3      # Reduced from 5 to 3 for faster ping timeout
     POOL_AGGRESSIVE_CLEANUP_THRESHOLD = 0.7  # Clean when 70% of connections in use
     POOL_FORCE_RESET_THRESHOLD = 0.9        # Force reset when 90% of connections in use
 
     # New timeout constants for finer control
-    CONNECTION_TEST_TIMEOUT = 10  # REDUCED from 20 for faster failure detection
-    ENGINE_COMMAND_TIMEOUT = 15   # REDUCED from 20 for faster timeout
+    CONNECTION_TEST_TIMEOUT = 5  # REDUCED from 10 for faster failure detection
+    ENGINE_COMMAND_TIMEOUT = 10   # REDUCED from 15 for faster timeout
 
     # Operation statuses
     STATUS_PENDING = 'pending'
@@ -511,14 +511,23 @@ class BaseDatabaseManager(ABC):
                 pool_recycle=1800,  # REDUCED from 3600 to 1800 for faster connection refresh
                 pool_use_lifo=True,
                 echo=False,
+                # Optimized connection arguments for better performance
                 connect_args={
                     "command_timeout": self.ENGINE_COMMAND_TIMEOUT,
                     "timeout": self.DEFAULT_CONNECTION_TIMEOUT,
                     "server_settings": {
                         "jit": "off",
-                        "application_name": f"gaia_{self.node_type}_{os.getpid()}"
+                        "application_name": f"gaia_{self.node_type}_{os.getpid()}",
+                        "tcp_keepalives_idle": "30",  # Send keepalive every 30 seconds
+                        "tcp_keepalives_interval": "10",  # Retry every 10 seconds
+                        "tcp_keepalives_count": "3",  # Drop after 3 failed attempts
+                        "statement_timeout": "60000",  # 60 second statement timeout
+                        "lock_timeout": "30000",  # 30 second lock timeout
                     },
                 },
+                # Additional engine options for stability
+                pool_reset_on_return='commit',  # Reset connections on return
+                pool_ping_on_return=True,  # Ping on connection return
             )
             async with self._engine.connect() as conn:
                 await asyncio.wait_for(conn.execute(text("SELECT 1")), timeout=self.CONNECTION_TEST_TIMEOUT)

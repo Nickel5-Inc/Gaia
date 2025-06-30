@@ -13,44 +13,137 @@ from fiber.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+def debug_raw_data(data):
+    """
+    Debug function to examine the raw data format and structure.
+    This helps understand what we're actually receiving from Kyoto WDC.
+    """
+    logger.info("=== RAW DATA ANALYSIS ===")
+    lines = data.splitlines()
+    logger.info(f"Total lines in response: {len(lines)}")
+    
+    dst_lines = [line for line in lines if line.startswith("DST")]
+    logger.info(f"Lines starting with 'DST': {len(dst_lines)}")
+    
+    if dst_lines:
+        logger.info("=== SAMPLE DST LINES ===")
+        for i, line in enumerate(dst_lines[:5]):  # Show first 5 DST lines
+            logger.info(f"DST Line {i+1} (length {len(line)}): '{line}'")
+            logger.info(f"  Characters 0-10: '{line[:10]}'")
+            logger.info(f"  Characters 10-20: '{line[10:20]}'")
+            logger.info(f"  Characters 20-30: '{line[20:30]}'")
+            if len(line) > 30:
+                logger.info(f"  Characters 30-40: '{line[30:40]}'")
+            logger.info("")
+    
+    # Show non-DST lines for context
+    non_dst_lines = [line for line in lines if not line.startswith("DST") and line.strip()]
+    if non_dst_lines:
+        logger.info("=== SAMPLE NON-DST LINES ===")
+        for i, line in enumerate(non_dst_lines[:3]):  # Show first 3 non-DST lines
+            logger.info(f"Non-DST Line {i+1}: '{line}'")
+    
+    logger.info("=== END RAW DATA ANALYSIS ===")
+
+
 def parse_data(data):
     dates = []
     hourly_values = []
+    
+    # Add diagnostic logging
+    debug_raw_data(data)
 
     def parse_line(line):
+        logger.debug(f"Parsing DST line: '{line}'")
         try:
             # Extract year, month, and day
             year = int("20" + line[3:5])  # Prefix with "20" for full year
             month = int(line[5:7])
             day = int(line[8:10].strip())
-        except ValueError:
-            print(f"Skipping line due to invalid date format: {line}")
+            logger.debug(f"Extracted date: {year}-{month:02d}-{day:02d}")
+        except ValueError as e:
+            logger.error(f"Skipping line due to invalid date format: {line} - Error: {e}")
             return
 
-        # Iterate over 24 hourly values
-        for hour in range(24):
-            start_idx = 20 + (hour * 4)
-            end_idx = start_idx + 4
-            value_str = line[start_idx:end_idx].strip()
-
-            # Skip placeholder and invalid values
-            if value_str != PLACEHOLDER_VALUE and value_str:
+        # Extract the data portion (after position 20) and split by spaces
+        data_portion = line[20:].strip()
+        # Split by whitespace and filter out empty strings
+        raw_values = [v for v in data_portion.split() if v]
+        
+        # Handle "squished together" values like "-189999" which should be "-18" + "9999"
+        values = []
+        for value in raw_values:
+            # Check if this looks like a negative number followed by 9999 (e.g., "-189999")
+            if value.startswith('-') and value.endswith('9999') and len(value) > 5:
+                # Split it: "-189999" -> ["-18", "9999"]
+                actual_value = value[:-4]  # Remove the "9999" part
+                placeholder = "9999"
+                values.extend([actual_value, placeholder])
+                logger.debug(f"Split squished value '{value}' into ['{actual_value}', '{placeholder}']")
+            else:
+                values.append(value)
+        
+        logger.debug(f"Found {len(values)} processed values: {values}")
+        
+        # Process up to 24 hourly values
+        # NOTE: Data format uses 1-24 hour indexing, not 0-23
+        # values[0] = hour 1 (01:00), values[1] = hour 2 (02:00), ..., values[23] = hour 24 (00:00 next day)
+        for i in range(min(24, len(values))):
+            value_str = values[i]
+            
+            # Convert 1-24 indexing to 0-23 hour format
+            # Hour 1-23 maps to 1-23, Hour 24 maps to 0 (next day)
+            if i < 23:
+                hour = i + 1  # hours 1-23
+                target_day = day
+            else:
+                hour = 0  # hour 24 becomes hour 0 of next day
+                # Calculate next day (handle month/year rollover)
                 try:
-                    value = int(value_str)
+                    next_day_date = datetime(year, month, day, tzinfo=timezone.utc) + timedelta(days=1)
+                    target_day = next_day_date.day
+                    target_month = next_day_date.month  
+                    target_year = next_day_date.year
+                except:
+                    # Skip if date calculation fails
+                    logger.debug(f"Skipping hour 24 due to date calculation error")
+                    continue
+            
+            # Skip placeholder values (9999, 999, etc.)
+            if value_str in ['9999', '999', '99999', PLACEHOLDER_VALUE]:
+                logger.debug(f"Skipping placeholder value at position {i} (hour {hour}): '{value_str}'")
+                continue
+                
+            # Skip empty values
+            if not value_str:
+                continue
+                
+            try:
+                value = int(value_str)
+                
+                # Create timestamp with correct date
+                if i < 23:
                     timestamp = datetime(year, month, day, hour, tzinfo=timezone.utc)
+                else:
+                    timestamp = datetime(target_year, target_month, target_day, hour, tzinfo=timezone.utc)
 
-                    # Only include valid timestamps and exclude future timestamps
-                    if timestamp < datetime.now(timezone.utc):
-                        dates.append(timestamp)
-                        hourly_values.append(value)
-                except ValueError:
-                    print(f"Skipping invalid value: {value_str}")
+                # Only include valid timestamps and exclude future timestamps
+                if timestamp < datetime.now(timezone.utc):
+                    dates.append(timestamp)
+                    hourly_values.append(value)
+                    logger.debug(f"Added data point: {timestamp} -> {value} (position {i})")
+                else:
+                    logger.debug(f"Skipping future timestamp: {timestamp}")
+            except ValueError:
+                logger.debug(f"Skipping invalid value at position {i}: '{value_str}'")
 
     # Parse all lines that start with "DST"
     for line in data.splitlines():
         if line.startswith("DST"):
             parse_line(line)
 
+    logger.info(f"Parsed {len(dates)} data points from {len([l for l in data.splitlines() if l.startswith('DST')])} DST lines")
+    
     # Create a DataFrame with parsed data
     return pd.DataFrame({"timestamp": dates, "Dst": hourly_values})
 
@@ -80,6 +173,92 @@ def clean_data(df):
 
 def _clean_data_sync(df):
     return clean_data(df)
+
+
+async def get_geomag_data_for_hour(target_hour, include_historical=False, max_wait_minutes=30):
+    """
+    Fetch geomagnetic data for a specific hour, waiting if necessary.
+    
+    Args:
+        target_hour (datetime): The specific hour to fetch data for
+        include_historical (bool): Whether to include current month's historical data
+        max_wait_minutes (int): Maximum minutes to wait for data to become available
+        
+    Returns:
+        tuple: (timestamp, Dst value, historical_data) for the target hour ONLY.
+               Returns "N/A" values if target hour data is not available within time limit.
+    """
+    target_hour_aligned = target_hour.replace(minute=0, second=0, microsecond=0)
+    start_time = datetime.now(timezone.utc)
+    max_wait_time = start_time + timedelta(minutes=max_wait_minutes)
+    
+    logger.info(f"Fetching geomagnetic data for target hour: {target_hour_aligned} (will wait up to {max_wait_minutes} minutes)")
+    
+    while datetime.now(timezone.utc) < max_wait_time:
+        try:
+            # Fetch raw data
+            raw_data = await fetch_data()
+            loop = asyncio.get_event_loop()
+
+            # Parse and clean raw data into DataFrame
+            parsed_df = await loop.run_in_executor(None, _parse_data_sync, raw_data)
+            cleaned_df = await loop.run_in_executor(None, _clean_data_sync, parsed_df)
+
+            if not cleaned_df.empty:
+                # Check if we have data for the target hour
+                target_data = cleaned_df[cleaned_df["timestamp"] == target_hour_aligned]
+                
+                if not target_data.empty:
+                    # Found target hour data!
+                    timestamp = target_data.iloc[0]["timestamp"]
+                    dst_value = float(target_data.iloc[0]["Dst"])
+                    logger.info(f"✅ Found data for target hour {target_hour_aligned}: {dst_value}")
+                    
+                    if include_historical:
+                        now = datetime.now(timezone.utc)
+                        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                        historical_data = cleaned_df[cleaned_df["timestamp"] >= start_of_month]
+                        return timestamp, dst_value, historical_data
+                    else:
+                        return timestamp, dst_value
+                else:
+                    # Target hour data not available yet
+                    latest_timestamp = cleaned_df["timestamp"].max()
+                    wait_time_left = (max_wait_time - datetime.now(timezone.utc)).total_seconds()
+                    
+                    if wait_time_left > 30:  # Only wait if we have more than 30 seconds left
+                        logger.info(f"⏳ Target hour {target_hour_aligned} not available yet (latest: {latest_timestamp}), waiting...")
+                        await asyncio.sleep(30)  # Wait 30 seconds before retry
+                        continue
+                    else:
+                        # Time's up - do NOT use latest data, return N/A
+                        logger.warning(f"❌ Target hour {target_hour_aligned} not available within {max_wait_minutes} minutes. Skipping cycle.")
+                        break
+            else:
+                # No data at all, wait and retry
+                wait_time_left = (max_wait_time - datetime.now(timezone.utc)).total_seconds()
+                if wait_time_left > 30:
+                    logger.warning("No geomagnetic data available, waiting...")
+                    await asyncio.sleep(30)
+                    continue
+                else:
+                    break
+                    
+        except Exception as e:
+            logger.error(f"Error fetching geomagnetic data: {e}")
+            wait_time_left = (max_wait_time - datetime.now(timezone.utc)).total_seconds()
+            if wait_time_left > 30:
+                await asyncio.sleep(30)
+                continue
+            else:
+                break
+    
+    # Failed to get target hour data within time limit - return N/A
+    logger.error(f"❌ Failed to fetch data for target hour {target_hour_aligned} within {max_wait_minutes} minutes. Cycle will be skipped.")
+    if include_historical:
+        return "N/A", "N/A", None
+    else:
+        return "N/A", "N/A"
 
 
 async def get_latest_geomag_data(include_historical=False):

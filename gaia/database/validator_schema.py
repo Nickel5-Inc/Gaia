@@ -49,7 +49,13 @@ baseline_predictions_table = sa.Table('baseline_predictions', validator_metadata
     sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False, comment="Timestamp of prediction storage"),
     comment="Stores baseline model predictions for various tasks."
 )
+# Primary composite index for the most common query pattern
 sa.Index('idx_baseline_task_on_baseline_predictions', baseline_predictions_table.c.task_name, baseline_predictions_table.c.task_id)
+# Additional indexes for performance optimization
+sa.Index('idx_baseline_task_name_only', baseline_predictions_table.c.task_name)
+sa.Index('idx_baseline_created_at', baseline_predictions_table.c.created_at.desc())
+sa.Index('idx_baseline_task_name_created_at', baseline_predictions_table.c.task_name, baseline_predictions_table.c.created_at.desc())
+sa.Index('idx_baseline_region_task', baseline_predictions_table.c.region_id, baseline_predictions_table.c.task_name)
 
 # --- Soil Moisture Tables ---
 soil_moisture_regions_table = sa.Table('soil_moisture_regions', validator_metadata,
@@ -86,7 +92,8 @@ soil_moisture_predictions_table = sa.Table('soil_moisture_predictions', validato
     sa.Column('retry_count', sa.Integer, server_default=sa.text('0'), nullable=True),
     sa.Column('next_retry_time', postgresql.TIMESTAMP(timezone=True), nullable=True),
     sa.Column('last_retry_attempt', postgresql.TIMESTAMP(timezone=True), nullable=True),
-    sa.Column('retry_error_message', sa.Text, nullable=True)
+    sa.Column('retry_error_message', sa.Text, nullable=True),
+    sa.Column('last_error', sa.Text, nullable=True)
 )
 sa.Index('idx_smp_region_id', soil_moisture_predictions_table.c.region_id)
 sa.Index('idx_smp_miner_uid', soil_moisture_predictions_table.c.miner_uid)
@@ -108,6 +115,8 @@ soil_moisture_history_table = sa.Table('soil_moisture_history', validator_metada
     sa.Column('rootzone_rmse', sa.Float, nullable=True),
     sa.Column('surface_structure_score', sa.Float, nullable=True),
     sa.Column('rootzone_structure_score', sa.Float, nullable=True),
+    sa.Column('sentinel_bounds', postgresql.ARRAY(sa.Float), nullable=True),
+    sa.Column('sentinel_crs', sa.Integer, nullable=True),
     sa.Column('scored_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
     sa.UniqueConstraint('region_id', 'miner_uid', 'target_time', name='uq_smh_region_miner_target_time')
 )
@@ -243,10 +252,17 @@ geomagnetic_predictions_table = sa.Table('geomagnetic_predictions', validator_me
     sa.Column('last_retry_attempt', postgresql.TIMESTAMP(timezone=True), nullable=True),
     sa.Column('retry_error_message', sa.Text, nullable=True)
 )
+# Existing indexes
 sa.Index('idx_gp_miner_uid', geomagnetic_predictions_table.c.miner_uid)
 sa.Index('idx_gp_miner_hotkey', geomagnetic_predictions_table.c.miner_hotkey)
 sa.Index('idx_gp_query_time', geomagnetic_predictions_table.c.query_time)
 sa.Index('idx_gp_status', geomagnetic_predictions_table.c.status)
+# Additional performance indexes for common query patterns
+sa.Index('idx_gp_status_query_time', geomagnetic_predictions_table.c.status, geomagnetic_predictions_table.c.query_time.desc())
+sa.Index('idx_gp_miner_uid_query_time', geomagnetic_predictions_table.c.miner_uid, geomagnetic_predictions_table.c.query_time.desc())
+sa.Index('idx_gp_query_time_status', geomagnetic_predictions_table.c.query_time.desc(), geomagnetic_predictions_table.c.status)
+# Partial index for pending tasks only - using postgresql_where parameter
+sa.Index('idx_gp_pending_tasks', geomagnetic_predictions_table.c.query_time.desc(), postgresql_where=geomagnetic_predictions_table.c.status == 'pending')
 
 geomagnetic_history_table = sa.Table('geomagnetic_history', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True), # SERIAL PRIMARY KEY
@@ -258,6 +274,9 @@ geomagnetic_history_table = sa.Table('geomagnetic_history', validator_metadata,
     sa.Column('score', sa.Float, nullable=False),
     sa.Column('scored_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False)
 )
+# Additional indexes for geomagnetic_history performance
+sa.Index('idx_gh_query_time_miner_uid', geomagnetic_history_table.c.query_time, geomagnetic_history_table.c.miner_uid)
+sa.Index('idx_gh_miner_hotkey_scored_at', geomagnetic_history_table.c.miner_hotkey, geomagnetic_history_table.c.scored_at.desc())
 
 # Placeholder for trigger function/trigger definitions if we move them here or handle in Alembic only
 # For now, the check_node_table_size function and its trigger are defined in the first migration directly.

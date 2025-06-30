@@ -657,6 +657,7 @@ async def fetch_gfs_analysis_data(
             combined_ds = xr.concat(analysis_slices, dim='time')
             
             # MEMORY LEAK FIX: Clean up individual slices after concat to free memory
+            len_analysis_slices = len(analysis_slices)
             for slice_ds in analysis_slices:
                 try:
                     slice_ds.close()
@@ -668,7 +669,7 @@ async def fetch_gfs_analysis_data(
             # Force garbage collection after concat
             import gc
             collected = gc.collect()
-            logger.debug(f"Post-concat cleanup: freed {len(analysis_slices)} slices, GC collected {collected} objects")
+            logger.debug(f"Post-concat cleanup: freed {len_analysis_slices} slices, GC collected {collected} objects")
             
         except Exception as e_concat:
              logger.error(f"Failed to combine analysis slices: {e_concat}")
@@ -798,7 +799,7 @@ async def fetch_gfs_analysis_data(
         
         # Update final progress info
         progress_info.update({
-            "processed_files": len(analysis_slices),
+            "processed_files": len_analysis_slices,
             "completed": True,
             "step_progress": 0.8  # Processing complete, ready for caching
         })

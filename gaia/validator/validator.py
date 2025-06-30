@@ -65,6 +65,57 @@ from fiber.chain import weights as w
 # Note: get_nodes_for_netuid replaced with process-isolated _fetch_nodes_process_isolated
 from fiber.chain.chain_utils import query_substrate
 from fiber.logging_utils import get_logger
+
+# Patch query_substrate to handle ProcessIsolatedSubstrate results
+_original_query_substrate = query_substrate
+
+def patched_query_substrate(substrate, module: str, storage_function: str, params=None, block_hash=None):
+    """Patched version of query_substrate that handles ProcessIsolatedSubstrate results."""
+    try:
+        result = _original_query_substrate(substrate, module, storage_function, params, block_hash)
+        return result
+    except AttributeError as e:
+        if "'int' object has no attribute 'value'" in str(e) or "'list' object has no attribute 'value'" in str(e):
+            # The error is because substrate.query returned a raw value instead of an object with .value
+            logger.debug(f"query_substrate compatibility fix: handling .value attribute error")
+            
+            class CompatibleResult:
+                def __init__(self, val):
+                    self.value = val
+                    self._value = val
+                    
+                def __str__(self):
+                    return str(self.value)
+                    
+                def __repr__(self):
+                    return repr(self.value)
+                    
+                def __int__(self):
+                    return int(self.value) if hasattr(self.value, '__int__') else self.value
+                    
+                def __len__(self):
+                    return len(self.value) if hasattr(self.value, '__len__') else 1
+                    
+                def __getitem__(self, key):
+                    return self.value[key] if hasattr(self.value, '__getitem__') else self.value
+                    
+                def __iter__(self):
+                    return iter(self.value) if hasattr(self.value, '__iter__') else iter([self.value])
+            
+            # Get the actual result by calling substrate.query directly (this should return the raw value)
+            try:
+                direct_result = substrate.query(module, storage_function, params, block_hash)
+                logger.debug(f"query_substrate compatibility fix: wrapped {type(direct_result).__name__} as CompatibleResult")
+                return CompatibleResult(direct_result)
+            except Exception as inner_e:
+                logger.error(f"query_substrate compatibility fix failed: {inner_e}")
+                raise e  # Re-raise original error
+        else:
+            raise
+
+# Replace the imported function with our patched version
+import fiber.chain.chain_utils
+fiber.chain.chain_utils.query_substrate = patched_query_substrate
 from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
@@ -819,7 +870,8 @@ class GaiaValidator:
                 logger.error(f"CRITICAL: Metagraph sync_nodes() FAILED: {e_meta_sync}", exc_info=True)
                 return False # Sync failure is critical for neuron operation
 
-            resp = self.substrate.rpc_request("chain_getHeader", [])  
+            # Use shorter timeout for setup operations to fail faster when network is down
+            resp = self.substrate.rpc_request("chain_getHeader", [], timeout=30.0)  
             hex_num = resp["result"]["number"]
             self.current_block = int(hex_num, 16)
             logger.info(f"Initial block number type: {type(self.current_block)}, value: {self.current_block}")
@@ -1539,13 +1591,14 @@ class GaiaValidator:
         while self.watchdog_running:
             try:
                 # Add timeout to prevent long execution
+                # Note: Increased from 30s to 150s to accommodate metagraph sync (120s) plus buffer
                 try:
                     await asyncio.wait_for(
                         self._watchdog_check(),
-                        timeout=30  # 30 second timeout
+                        timeout=150  # 150 second timeout (120s for metagraph sync + 30s buffer)
                     )
                 except asyncio.TimeoutError:
-                    logger.error("Watchdog check timed out after 30 seconds")
+                    logger.error("Watchdog check timed out after 150 seconds")
                 except Exception as e:
                     logger.error(f"Error in watchdog loop: {e}")
                     logger.error(traceback.format_exc())
@@ -1974,10 +2027,11 @@ class GaiaValidator:
             #     fetch_nodes_module.get_substrate = ultra_patched_get_substrate
             
             try:
-                # Create fresh substrate connection using substrate manager
+                # Create fresh substrate connection using substrate manager with process isolation
                 self.substrate = get_fresh_substrate_connection(
                     subtensor_network=self.subtensor_network,
-                    chain_endpoint=self.subtensor_chain_endpoint
+                    chain_endpoint=self.subtensor_chain_endpoint,
+                    use_process_isolation=True
                 )
                 logger.info("🔄 Created fresh connection for node fetching using substrate manager")
                 # Use process-isolated node fetching instead of fiber library function
@@ -2125,7 +2179,8 @@ class GaiaValidator:
                     old_substrate = getattr(self, 'substrate', None)
                     self.substrate = get_fresh_substrate_connection(
                         subtensor_network=self.subtensor_network,
-                        chain_endpoint=self.subtensor_chain_endpoint
+                        chain_endpoint=self.subtensor_chain_endpoint,
+                        use_process_isolation=True
                     )
                     self.substrate_connection_created_at = current_time
                     logger.info(f"🔄 Created fresh substrate connection (age: {connection_age:.1f}s, limit: {self.substrate_reuse_window}s)")
@@ -2421,7 +2476,8 @@ class GaiaValidator:
             elif task_name == "scoring":
                 self.substrate = get_fresh_substrate_connection(
                     subtensor_network=self.subtensor_network,
-                    chain_endpoint=self.subtensor_chain_endpoint
+                    chain_endpoint=self.subtensor_chain_endpoint,
+                    use_process_isolation=True
                 )
                 self.substrate_connection_created_at = time.time()  # Track connection age for reuse
                 logger.info("🔄 Force reconnect - created fresh substrate connection using substrate manager")
@@ -3460,12 +3516,149 @@ class GaiaValidator:
                             geo_counts[uid] += 1
 
             if soil_results:
-                for result in soil_results:
+                # MEMORY LEAK FIX: Process soil scores with aggressive memory management
+                logger.info(f"Processing {len(soil_results)} soil records with enhanced memory management")
+                zero_soil_scores = 0
+                
+                # Pre-allocate arrays to reduce memory allocations
+                num_results = len(soil_results)
+                scores_matrix = np.full((256, num_results), np.nan, dtype=np.float32)  # Use float32 to save memory
+                weights_matrix = np.full((256, num_results), 0.0, dtype=np.float32)
+                
+                # ENHANCED DEBUG LOGGING for soil score issue investigation
+                total_scores_processed = 0
+                total_valid_scores = 0
+                total_nan_scores = 0
+                sample_logged = False
+                
+                # Process all results in one pass to build the matrix
+                for result_idx, result in enumerate(soil_results):
+                    age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
+                    decay = np.exp(-age_days * np.log(2))
                     scores = result.get('score', [np.nan]*256)
-                    if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                    if not isinstance(scores, list) or len(scores) != 256: 
+                        scores = [np.nan]*256 # Defensive
+                        logger.warning(f"Applied defensive fallback for soil scores in result {result_idx}")
+                    
+                    # Enhanced logging for first result
+                    if result_idx == 0:
+                        logger.info(f"SOIL DEBUG: First result - created_at={result['created_at']}, age_days={age_days:.3f}, decay={decay:.6f}")
+                        logger.info(f"SOIL DEBUG: Scores type={type(scores)}, len={len(scores)}")
+                        logger.info(f"SOIL DEBUG: First 10 scores: {scores[:10]}")
+                        logger.info(f"SOIL DEBUG: Score types: {[type(x) for x in scores[:5]]}")
+                    
+                    # Process all UIDs for this result
                     for uid in range(256):
-                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
+                        score_val = scores[uid]
+                        original_val = score_val
+                        total_scores_processed += 1
+                        
+                        # Enhanced validation logging
+                        is_string = isinstance(score_val, str)
+                        is_nan = False
+                        nan_check_failed = False
+                        
+                        try:
+                            is_nan = np.isnan(score_val)
+                        except Exception as e:
+                            is_nan = True
+                            nan_check_failed = True
+                            if not sample_logged:
+                                logger.error(f"SOIL DEBUG: np.isnan() failed for UID {uid}: {e}, score_val={score_val}, type={type(score_val)}")
+                                sample_logged = True
+                        
+                        if is_string or is_nan: 
+                            score_val = 0.0
+                            if is_string:
+                                logger.warning(f"SOIL DEBUG: String score at UID {uid}: '{original_val}'")
+                            elif nan_check_failed:
+                                logger.warning(f"SOIL DEBUG: NaN check failed for UID {uid}: {original_val}")
+                            else:
+                                total_nan_scores += 1
+                        else:
+                            total_valid_scores += 1
+                        
+                        if score_val == 0.0: 
+                            zero_soil_scores += 1
+                        
+                        scores_matrix[uid, result_idx] = score_val
+                        if score_val != 0.0:
+                            weights_matrix[uid, result_idx] = decay
                             soil_counts[uid] += 1
+                
+                # Enhanced summary logging
+                logger.info(f"SOIL DEBUG: Processed {total_scores_processed} total scores")
+                logger.info(f"SOIL DEBUG: Valid scores: {total_valid_scores}, NaN scores: {total_nan_scores}")
+                logger.info(f"SOIL DEBUG: Zero scores counted: {zero_soil_scores}")
+                logger.info(f"SOIL DEBUG: UIDs with non-zero counts: {np.sum(soil_counts > 0)}")
+                
+                # Log concerning conditions
+                if zero_soil_scores == 256:
+                    logger.error(f"SOIL DEBUG: ALL 256 SCORES CONVERTED TO ZERO! This indicates a systematic conversion issue.")
+                elif zero_soil_scores > 200:
+                    logger.warning(f"SOIL DEBUG: High zero score count ({zero_soil_scores}/256) - possible data quality issue")
+                
+                # Vectorized calculation for all UIDs at once
+                for uid in range(256):
+                    uid_scores = scores_matrix[uid, :]
+                    uid_weights = weights_matrix[uid, :]
+                    
+                    # Find non-zero scores
+                    non_zero_mask = uid_scores != 0.0
+                    
+                    if np.any(non_zero_mask):
+                        masked_s = uid_scores[non_zero_mask]
+                        masked_w = uid_weights[non_zero_mask]
+                        weight_sum = np.sum(masked_w)
+                        if weight_sum > 0:
+                            base_score = np.sum(masked_s * masked_w) / weight_sum
+                            
+                            # Completeness factor: fair threshold-based approach for soil 
+                            num_predictions = np.sum(non_zero_mask)
+                            expected_predictions = len(soil_results)  # Number of available scoring periods
+                            completeness_ratio = num_predictions / max(expected_predictions, 1)
+                            
+                            # Consistent threshold with geomagnetic task
+                            completeness_threshold = 0.30  # 30% threshold for fair new miner treatment
+                            if completeness_ratio >= completeness_threshold:
+                                completeness_factor = 1.0  # Full weight for adequate participation
+                            else:
+                                # Gradual scaling below threshold, not linear penalty
+                                completeness_factor = (completeness_ratio / completeness_threshold) ** 0.5  # Square root for gentler penalty
+                            
+                            soil_scores[uid] = base_score * completeness_factor
+                            
+                            # Debug logging for transparency
+                            if num_predictions > 0:
+                                logger.debug(f"Soil UID {uid}: {num_predictions}/{expected_predictions} predictions "
+                                           f"({completeness_ratio:.2f}), factor={completeness_factor:.3f}, "
+                                           f"base={base_score:.4f}, final={soil_scores[uid]:.4f}")
+                        else:
+                            soil_scores[uid] = 0.0
+                    else:
+                        soil_scores[uid] = 0.0
+                
+                # Final validation logging
+                final_valid_soil_scores = np.sum(~np.isnan(soil_scores) & (soil_scores != 0.0))
+                logger.info(f"SOIL DEBUG: Final result - {final_valid_soil_scores} UIDs have valid soil scores")
+                
+                # IMMEDIATE cleanup of large matrices
+                del scores_matrix, weights_matrix
+                import gc
+                gc.collect()
+                
+                logger.info(f"Processed {len(soil_results)} soil records with {zero_soil_scores} zero scores (memory-optimized)")
+
+            if weather_results:
+                latest_result = weather_results[0]
+                scores = latest_result.get('score', [np.nan]*256)
+                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
+                score_age_days = (now - latest_result['created_at']).total_seconds() / (24 * 3600)
+                logger.info(f"Using latest weather score from {latest_result['created_at']} ({score_age_days:.1f} days ago)")
+                for uid in range(256):
+                    if isinstance(scores[uid], str) or np.isnan(scores[uid]): weather_scores[uid] = 0.0
+                    else: weather_scores[uid] = scores[uid]; weather_counts[uid] += (scores[uid] != 0.0)
+                logger.info(f"Weather scores: {sum(1 for s in weather_scores if s == 0.0)} UIDs have zero score")
 
             if geomagnetic_results:
                 # MEMORY LEAK FIX: Process geomagnetic scores with vectorized operations
@@ -3511,7 +3704,29 @@ class GaiaValidator:
                         masked_w = uid_weights[non_zero_mask]
                         weight_sum = np.sum(masked_w)
                         if weight_sum > 0:
-                            geomagnetic_scores[uid] = np.sum(masked_s * masked_w) / weight_sum
+                            base_score = np.sum(masked_s * masked_w) / weight_sum
+                            
+                            # Completeness factor: fair threshold-based approach
+                            # Expected: ~1 prediction per hour over 24 hours = 24 predictions
+                            num_predictions = np.sum(non_zero_mask)
+                            expected_predictions = len(geomagnetic_results)  # Number of available scoring periods
+                            completeness_ratio = num_predictions / max(expected_predictions, 1)
+                            
+                            # Threshold-based completeness: full weight if >30% participation, scaled below
+                            completeness_threshold = 0.30  # 30% threshold for fair new miner treatment
+                            if completeness_ratio >= completeness_threshold:
+                                completeness_factor = 1.0  # Full weight for adequate participation
+                            else:
+                                # Gradual scaling below threshold, not linear penalty
+                                completeness_factor = (completeness_ratio / completeness_threshold) ** 0.5  # Square root for gentler penalty
+                            
+                            geomagnetic_scores[uid] = base_score * completeness_factor
+                            
+                            # Debug logging for transparency
+                            if num_predictions > 0:
+                                logger.debug(f"Geo UID {uid}: {num_predictions}/{expected_predictions} predictions "
+                                           f"({completeness_ratio:.2f}), factor={completeness_factor:.3f}, "
+                                           f"base={base_score:.4f}, final={geomagnetic_scores[uid]:.4f}")
                         else:
                             geomagnetic_scores[uid] = 0.0
                     else:
@@ -3524,97 +3739,144 @@ class GaiaValidator:
                 
                 logger.info(f"Processed {len(geomagnetic_results)} geomagnetic records with {zero_scores_count} zero scores (memory-optimized)")
 
-            if weather_results:
-                latest_result = weather_results[0]
-                scores = latest_result.get('score', [np.nan]*256)
-                if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
-                score_age_days = (now - latest_result['created_at']).total_seconds() / (24 * 3600)
-                logger.info(f"Using latest weather score from {latest_result['created_at']} ({score_age_days:.1f} days ago)")
-                for uid in range(256):
-                    if isinstance(scores[uid], str) or np.isnan(scores[uid]): weather_scores[uid] = 0.0
-                    else: weather_scores[uid] = scores[uid]; weather_counts[uid] += (scores[uid] != 0.0)
-                logger.info(f"Weather scores: {sum(1 for s in weather_scores if s == 0.0)} UIDs have zero score")
-
-            if soil_results:
-                # MEMORY LEAK FIX: Process soil scores with aggressive memory management
-                logger.info(f"Processing {len(soil_results)} soil records with enhanced memory management")
-                zero_soil_scores = 0
+            logger.info("Aggregate scores calculated. Implementing hybrid excellence/diversity pathway system...")
+            
+            # HYBRID PATHWAY SYSTEM: Calculate both excellence and diversity weights, use maximum
+            
+            # Step 1: Batch calculate percentiles for all tasks (efficient single pass)
+            task_percentiles = {}
+            task_valid_scores = {}
+            
+            for task_name, scores_array in [('weather', weather_scores), ('geomagnetic', geomagnetic_scores), ('soil', soil_scores)]:
+                valid_scores = scores_array[~np.isnan(scores_array) & (scores_array != 0.0)]
+                task_valid_scores[task_name] = valid_scores
                 
-                # Pre-allocate arrays to reduce memory allocations
-                num_results = len(soil_results)
-                scores_matrix = np.full((256, num_results), np.nan, dtype=np.float32)  # Use float32 to save memory
-                weights_matrix = np.full((256, num_results), 0.0, dtype=np.float32)
-                
-                # Process all results in one pass to build the matrix
-                for result_idx, result in enumerate(soil_results):
-                    age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                    decay = np.exp(-age_days * np.log(2))
-                    scores = result.get('score', [np.nan]*256)
-                    if not isinstance(scores, list) or len(scores) != 256: 
-                        scores = [np.nan]*256 # Defensive
-                    
-                    # Process all UIDs for this result
-                    for uid in range(256):
-                        score_val = scores[uid]
-                        if isinstance(score_val, str) or np.isnan(score_val): 
-                            score_val = 0.0
-                        if score_val == 0.0: 
-                            zero_soil_scores += 1
-                        
-                        scores_matrix[uid, result_idx] = score_val
-                        if score_val != 0.0:
-                            weights_matrix[uid, result_idx] = decay
-                            soil_counts[uid] += 1
-                
-                # Vectorized calculation for all UIDs at once
-                for uid in range(256):
-                    uid_scores = scores_matrix[uid, :]
-                    uid_weights = weights_matrix[uid, :]
-                    
-                    # Find non-zero scores
-                    non_zero_mask = uid_scores != 0.0
-                    
-                    if np.any(non_zero_mask):
-                        masked_s = uid_scores[non_zero_mask]
-                        masked_w = uid_weights[non_zero_mask]
-                        weight_sum = np.sum(masked_w)
-                        if weight_sum > 0:
-                            soil_scores[uid] = np.sum(masked_s * masked_w) / weight_sum
-                        else:
-                            soil_scores[uid] = 0.0
-                    else:
-                        soil_scores[uid] = 0.0
-                
-                # IMMEDIATE cleanup of large matrices
-                del scores_matrix, weights_matrix
-                import gc
-                gc.collect()
-                
-                logger.info(f"Processed {len(soil_results)} soil records with {zero_soil_scores} zero scores (memory-optimized)")
-
-            logger.info("Aggregate scores calculated. Proceeding to weight normalization...")
-            def sigmoid(x, k=20, x0=0.93): return 1 / (1 + math.exp(-k * (x - x0)))
-            weights_final = np.zeros(256)
-            for idx in range(256):
-                w_s, g_s, sm_s = weather_scores[idx], geomagnetic_scores[idx], soil_scores[idx]
-                if np.isnan(w_s) or w_s==0: w_s=np.nan
-                if np.isnan(g_s) or g_s==0: g_s=np.nan
-                if np.isnan(sm_s) or sm_s==0: sm_s=np.nan
-                node_obj, hk_chain = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None, "N/A"
-                if node_obj: hk_chain = node_obj.get('hotkey', 'N/A')
-                if np.isnan(w_s) and np.isnan(g_s) and np.isnan(sm_s): weights_final[idx] = 0.0
+                if len(valid_scores) >= 5:  # Minimum sample for percentiles
+                    # Pre-calculate percentile thresholds for efficiency
+                    percentiles = np.percentile(valid_scores, [15, 25, 35, 50, 65, 75, 85, 95])
+                    task_percentiles[task_name] = {
+                        'valid_count': len(valid_scores),
+                        'percentile_85': percentiles[6],  # Excellence threshold (top 15%)
+                        'sorted_scores': np.sort(valid_scores)  # For efficient rank calculation
+                    }
+                    logger.info(f"{task_name.capitalize()} task: {len(valid_scores)} valid scores, 85th percentile: {percentiles[6]:.4f}")
                 else:
-                    # Fixed task weight calculation - no normalization by available tasks
-                    # Each task contributes its allocated portion: Weather=0.70, Geomagnetic=0.15, Soil=0.15
-                    # Perfect scores across all tasks = 1.0 total weight
-                    wc, gc, sc = 0.0, 0.0, 0.0
-                    if not np.isnan(w_s): wc = 0.70 * w_s
-                    if not np.isnan(g_s): gc = 0.15 * sigmoid(g_s)
-                    if not np.isnan(sm_s): sc = 0.15 * sm_s
-                    weights_final[idx] = wc + gc + sc
-                # Reduce logging to prevent memory pressure - only log every 32nd UID or non-zero weights
-                if idx % 32 == 0 or weights_final[idx] > 0.0:
-                    logger.debug(f"UID {idx} (HK: {hk_chain}): Wea={w_s if not np.isnan(w_s) else '-'} ({weather_counts[idx]} scores), Geo={g_s if not np.isnan(g_s) else '-'} ({geo_counts[idx]} scores), Soil={sm_s if not np.isnan(sm_s) else '-'} ({soil_counts[idx]} scores), AggW={weights_final[idx]:.4f}")
+                    task_percentiles[task_name] = {'valid_count': 0}
+                    logger.info(f"{task_name.capitalize()} task: insufficient scores ({len(valid_scores)}) for percentile calculation")
+            
+            # Step 2: Calculate dynamic sigmoid for geomagnetic (existing logic)
+            valid_geo_scores = task_valid_scores['geomagnetic']
+            if len(valid_geo_scores) > 0:
+                geo_mean = np.mean(valid_geo_scores)
+                geo_std = np.std(valid_geo_scores)
+                sigmoid_x0 = geo_mean
+                sigmoid_k = max(10, min(30, 20 / max(geo_std, 0.01)))
+                logger.info(f"Dynamic sigmoid for geo: x0={sigmoid_x0:.4f} (mean), k={sigmoid_k:.1f}, std={geo_std:.4f}")
+            else:
+                sigmoid_x0 = 0.90
+                sigmoid_k = 15
+                logger.info(f"No valid geo scores, using fallback sigmoid: x0={sigmoid_x0}, k={sigmoid_k}")
+            
+            def geo_sigmoid(x, k=sigmoid_k, x0=sigmoid_x0): 
+                return 1 / (1 + math.exp(-k * (x - x0)))
+            
+            def diversity_sigmoid(percentile_rank):
+                """Sigmoid curve for diversity pathway performance scaling"""
+                min_mult, max_mult = 0.3, 1.2
+                center, steepness = 35, 0.08
+                sigmoid_val = 1 / (1 + math.exp(-steepness * (percentile_rank - center)))
+                return min_mult + (max_mult - min_mult) * sigmoid_val
+            
+            def get_percentile_rank(score, task_name):
+                """Efficiently calculate percentile rank using pre-sorted scores"""
+                if task_name not in task_percentiles or task_percentiles[task_name]['valid_count'] == 0:
+                    return 50  # Default to median if no data
+                
+                sorted_scores = task_percentiles[task_name]['sorted_scores']
+                rank = np.searchsorted(sorted_scores, score, side='right')
+                percentile = (rank / len(sorted_scores)) * 100
+                return min(100, max(0, percentile))
+            
+            # Step 3: Calculate weights for each miner using hybrid pathways
+            weights_final = np.zeros(256)
+            excellence_count = {'weather': 0, 'geomagnetic': 0, 'soil': 0}
+            diversity_count = {'1_task': 0, '2_task': 0, '3_task': 0}
+            
+            for idx in range(256):
+                # Get scores for this miner
+                w_s, g_s, sm_s = weather_scores[idx], geomagnetic_scores[idx], soil_scores[idx]
+                if np.isnan(w_s) or w_s == 0: w_s = np.nan
+                if np.isnan(g_s) or g_s == 0: g_s = np.nan  
+                if np.isnan(sm_s) or sm_s == 0: sm_s = np.nan
+                
+                # Skip if no valid scores
+                if np.isnan(w_s) and np.isnan(g_s) and np.isnan(sm_s):
+                    weights_final[idx] = 0.0
+                    continue
+                
+                # EXCELLENCE PATHWAY: Check for top 15% performance in any task
+                excellence_weight = 0.0
+                task_weights = {'weather': 0.70, 'geomagnetic': 0.15, 'soil': 0.15}
+                
+                for task_name, score in [('weather', w_s), ('geomagnetic', g_s), ('soil', sm_s)]:
+                    if not np.isnan(score) and task_name in task_percentiles:
+                        task_data = task_percentiles[task_name]
+                        if (task_data['valid_count'] >= 10 and 
+                            score >= task_data['percentile_85']):
+                            # Excellence achieved in this task
+                            task_excellence = score * task_weights[task_name]
+                            if task_excellence > excellence_weight:
+                                excellence_weight = task_excellence
+                                excellence_count[task_name] += 1
+                
+                # DIVERSITY PATHWAY: Multi-task performance with sigmoid scaling
+                diversity_contributions = {}
+                
+                for task_name, score in [('weather', w_s), ('geomagnetic', g_s), ('soil', sm_s)]:
+                    if not np.isnan(score):
+                        percentile_rank = get_percentile_rank(score, task_name)
+                        sigmoid_mult = diversity_sigmoid(percentile_rank)
+                        
+                        # Apply task-specific adjustments
+                        if task_name == 'geomagnetic':
+                            # Use dynamic sigmoid for geo scores
+                            final_score = geo_sigmoid(score)
+                        else:
+                            # Use raw score for weather/soil
+                            final_score = score
+                        
+                        diversity_contributions[task_name] = (
+                            final_score * task_weights[task_name] * sigmoid_mult
+                        )
+                
+                # Apply multi-task bonus to diversity pathway
+                num_tasks = len(diversity_contributions)
+                if num_tasks > 0:
+                    multi_task_bonus = 0.7 + (num_tasks * 0.15)  # 0.85, 1.0, 1.15
+                    diversity_weight = sum(diversity_contributions.values()) * multi_task_bonus
+                    diversity_count[f'{num_tasks}_task'] += 1
+                else:
+                    diversity_weight = 0.0
+                
+                # FINAL WEIGHT: Maximum of excellence and diversity pathways
+                weights_final[idx] = max(excellence_weight, diversity_weight)
+                
+                # Debug logging for significant weights or pathway switches
+                if weights_final[idx] > 0.1:
+                    pathway = "excellence" if excellence_weight > diversity_weight else "diversity"
+                    node_obj = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None
+                    hk_chain = node_obj.get('hotkey', 'N/A')[:8] if node_obj else 'N/A'
+                    logger.debug(f"UID {idx} ({hk_chain}): {pathway} pathway, "
+                               f"excellence={excellence_weight:.4f}, diversity={diversity_weight:.4f}, "
+                               f"final={weights_final[idx]:.4f}")
+            
+            # Log pathway usage statistics
+            total_excellence = sum(excellence_count.values())
+            total_diversity = sum(diversity_count.values())
+            logger.info(f"Pathway usage - Excellence: {total_excellence} miners "
+                       f"(W:{excellence_count['weather']}, G:{excellence_count['geomagnetic']}, S:{excellence_count['soil']})")
+            logger.info(f"Diversity: {total_diversity} miners "
+                       f"(1-task:{diversity_count['1_task']}, 2-task:{diversity_count['2_task']}, 3-task:{diversity_count['3_task']})")
             logger.info(f"Weights before normalization: Min={np.min(weights_final):.4f}, Max={np.max(weights_final):.4f}, Mean={np.mean(weights_final):.4f}")
             
             non_zero_mask = weights_final != 0.0
@@ -3667,7 +3929,8 @@ class GaiaValidator:
             # Clean up all intermediate arrays to prevent memory leaks
             try:
                 del weather_scores, geomagnetic_scores, soil_scores
-                del weather_counts, geo_counts, soil_counts
+                del task_percentiles, task_valid_scores
+                del excellence_count, diversity_count
                 del weights_final, transformed_w
                 if 'nz_weights' in locals(): del nz_weights
                 if 'norm_weights' in locals(): del norm_weights

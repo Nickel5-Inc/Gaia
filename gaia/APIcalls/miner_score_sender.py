@@ -142,8 +142,8 @@ class MinerScoreSender:
             SELECT soil_moisture_history.id, 
                    soil_moisture_history.target_time,
                    soil_moisture_history.region_id, 
-                   soil_moisture_predictions.sentinel_bounds, 
-                   soil_moisture_predictions.sentinel_crs,
+                   COALESCE(soil_moisture_history.sentinel_bounds, soil_moisture_regions.sentinel_bounds) as sentinel_bounds,
+                   COALESCE(soil_moisture_history.sentinel_crs, soil_moisture_regions.sentinel_crs) as sentinel_crs,
                    soil_moisture_history.surface_rmse, 
                    soil_moisture_history.rootzone_rmse, 
                    soil_moisture_history.surface_sm_pred,
@@ -154,8 +154,8 @@ class MinerScoreSender:
                    soil_moisture_history.rootzone_structure_score, 
                    soil_moisture_history.scored_at
             FROM soil_moisture_history
-            LEFT JOIN soil_moisture_predictions 
-            ON soil_moisture_history.region_id = soil_moisture_predictions.region_id
+            LEFT JOIN soil_moisture_regions 
+            ON soil_moisture_history.region_id = soil_moisture_regions.id
             WHERE soil_moisture_history.miner_hotkey = :miner_hotkey
             ORDER BY soil_moisture_history.scored_at DESC
             LIMIT 10

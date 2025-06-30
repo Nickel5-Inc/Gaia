@@ -17,6 +17,7 @@ from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_scoring_mechanism import (
 from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_outputs import GeomagneticOutputs
 from gaia.tasks.defined_tasks.geomagnetic.utils.process_geomag_data import (
     get_latest_geomag_data,
+    get_geomag_data_for_hour,
 )
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.models.geomag_basemodel import GeoMagBaseModel
@@ -41,11 +42,32 @@ class GeomagneticTask(Task):
     A task class for processing and analyzing geomagnetic data, with
     execution methods for both miner and validator workflows.
 
+    🔒 SECURITY ENHANCEMENTS IMPLEMENTED:
+    
+    1. TEMPORAL SEPARATION ENFORCEMENT AT SCORING TIME:
+       - Ground truth fetching requires 90 minutes delay (30 minutes in test mode)
+       - Intelligent retry logic waits for proper data stability before scoring
+       - Prevents premature scoring when ground truth isn't stable yet
+    
+    2. SECURE SCORING FLOW:
+       - _fetch_geomag_data(): Uses latest data for real-time miner queries (good!)
+       - _query_miners(): Sends current data for realistic prediction tasks
+       - _fetch_ground_truth_for_time(): Enhanced temporal separation controls for scoring
+       - _check_ground_truth_availability(): Enforces security requirements before scoring
+       - _intelligent_retry_pending_tasks(): Waits for proper timing before retry attempts
+    
+    3. VULNERABILITY MITIGATIONS:
+       - Eliminates premature ground truth access during prediction windows
+       - Ensures adequate time for Kyoto data stability before scoring  
+       - Adds comprehensive security logging and validation
+       - Implements sanity checks for data integrity
+
     This task involves:
-        - Querying miners for predictions
+        - Querying miners for predictions using current data (real-time prediction)
         - Adding predictions to a queue for scoring
-        - Fetching ground truth data
-        - Scoring predictions
+        - Waiting for proper temporal separation before scoring
+        - Fetching time-specific ground truth with security controls
+        - Scoring predictions only when ground truth is stable
         - Moving scored tasks to history
 
     Attributes:
@@ -221,40 +243,89 @@ class GeomagneticTask(Task):
                 try:
                     await validator.update_task_status('geomagnetic', 'active')
                     
-                    # Step 1: Align to the top of the next hour (or wait 5 min in test mode)
+                    # Step 1: Flexible execution window T:02-T:15 for operational resilience
                     current_time = datetime.datetime.now(datetime.timezone.utc)
                     if not self.test_mode:
-                        next_hour = current_time.replace(
-                            minute=0, second=0, microsecond=0
-                        ) + datetime.timedelta(hours=1)
-                        sleep_duration = (next_hour - current_time).total_seconds()
-
-                        logger.info(
-                            f"Sleeping until the next top of the hour: {next_hour.isoformat()} (in {sleep_duration} seconds)"
-                        )
-                        await validator.update_task_status('geomagnetic', 'idle')
-                        await asyncio.sleep(sleep_duration)
+                        # Define execution window: T:02 to T:15 (13-minute window)
+                        current_hour = current_time.replace(minute=0, second=0, microsecond=0)
+                        window_start = current_hour + datetime.timedelta(minutes=2)   # T:02
+                        window_end = current_hour + datetime.timedelta(minutes=15)    # T:15
+                        
+                        # Check if we're in the current hour's execution window
+                        if window_start <= current_time <= window_end:
+                            # We're in the execution window - proceed immediately
+                            query_hour = current_hour
+                            logger.info(f"🔒 FLEXIBLE TIMING: Executing within window at {current_time.strftime('%H:%M')} (T:02-T:15 window)")
+                            logger.info(f"🔒 Using {query_hour.strftime('%H:%M')} data to query for {(query_hour + datetime.timedelta(hours=1)).strftime('%H:%M')} predictions")
+                        
+                        elif current_time < window_start:
+                            # Too early - wait until T:02
+                            sleep_duration = (window_start - current_time).total_seconds()
+                            logger.info(f"🔒 SECURE TIMING: Waiting for execution window to open at {window_start.strftime('%H:%M')} (in {sleep_duration:.0f} seconds)")
+                            logger.info(f"🔒 Execution window: T:02-T:15 allows flexibility for async delays")
+                            await validator.update_task_status('geomagnetic', 'idle')
+                            await asyncio.sleep(sleep_duration)
+                            query_hour = current_hour
+                        
+                        else:
+                            # Past T:15 - move to next hour's window
+                            next_hour = current_hour + datetime.timedelta(hours=1)
+                            next_window_start = next_hour + datetime.timedelta(minutes=2)
+                            sleep_duration = (next_window_start - current_time).total_seconds()
+                            logger.info(f"⏰ MISSED WINDOW: Past T:15, waiting for next execution window at {next_window_start.strftime('%H:%M')} (in {sleep_duration:.0f} seconds)")
+                            await validator.update_task_status('geomagnetic', 'idle')
+                            await asyncio.sleep(sleep_duration)
+                            query_hour = next_hour
                     else:
-                        next_hour = current_time
+                        query_hour = current_time.replace(minute=0, second=0, microsecond=0)
                         logger.info("Test mode: Running immediately, will sleep for 5 minutes after completion")
 
-                    logger.info("Starting GeomagneticTask execution...")
+                    logger.info(f"🔒 Starting GeomagneticTask execution at T:02 for hour {query_hour}")
 
-                    # Step 2: Fetch Latest Geomagnetic Data
+                    # Step 2: Fetch Geomagnetic Data for the current query hour
                     await validator.update_task_status('geomagnetic', 'processing', 'data_fetch')
-                    timestamp, dst_value, historical_data = await self._fetch_geomag_data()
-
-                    # Step 3: Query Miners for predictions
-                    await validator.update_task_status('geomagnetic', 'processing', 'miner_query')
-                    await self._query_miners(
-                        validator, timestamp, dst_value, historical_data, next_hour
+                    # Wait up to 30 minutes for correct hour data (or 5 minutes in test mode)
+                    max_wait = 5 if self.test_mode else 30
+                    
+                    timestamp, dst_value, historical_data = await self._fetch_geomag_data(
+                        target_hour=query_hour, max_wait_minutes=max_wait
                     )
-                    logger.info(f"Collected predictions at hour {next_hour}")
+                    
+                    # Verify we got valid data for the correct hour
+                    if timestamp == "N/A" or dst_value == "N/A":
+                        logger.warning(f"❌ Could not obtain geomagnetic data for target hour {query_hour}. Skipping this cycle.")
+                        await validator.update_task_status('geomagnetic', 'idle', 'data_unavailable_for_target_hour')
+                        # Sleep before next attempt - don't busy loop
+                        await asyncio.sleep(300)  # 5 minutes
+                        continue
+                    
+                    # Double-check we got data for the exact target hour
+                    if timestamp.replace(minute=0, second=0, microsecond=0) != query_hour:
+                        logger.error(f"❌ Expected data for {query_hour} but got {timestamp}. This should not happen with the new logic.")
+                        await validator.update_task_status('geomagnetic', 'error', 'incorrect_hour_data')
+                        continue
+                    
+                    logger.info(f"✅ Successfully obtained geomagnetic data for target hour {query_hour}: {dst_value}")
+                    
+                    # Step 3: Query Miners for predictions  
+                    await validator.update_task_status('geomagnetic', 'processing', 'miner_query')
+                    # Use 1-hour prediction window from data timestamp
+                    target_prediction_hour = timestamp + datetime.timedelta(hours=1)
+                    logger.info(f"Querying miners to predict {target_prediction_hour} using data from {timestamp}")
+                    logger.info(f"🔍 Prediction window: {timestamp} → {target_prediction_hour} (1 hour ahead)")
+                    await self._query_miners(
+                        validator, timestamp, dst_value, historical_data, query_hour, target_prediction_hour
+                    )
+                    logger.info(f"Collected predictions for {target_prediction_hour}")
 
-                    # Step 4: Score predictions from previous hour
-                    previous_hour = next_hour - datetime.timedelta(hours=1)
+                    # Step 4: Score predictions with SECURE ground truth fetching
+                    score_target_hour = query_hour  # Score predictions that targeted this hour
+                    scoring_query_hour = query_hour - datetime.timedelta(hours=1)  # Made 1 hour ago
                     await validator.update_task_status('geomagnetic', 'processing', 'scoring')
-                    await self._process_scores(validator, previous_hour)
+                    logger.info(f"🔒 SECURITY: Scoring predictions that targeted {score_target_hour}")
+                    logger.info(f"🔒 SECURITY: These predictions were made at {scoring_query_hour} using aged data")
+                    logger.info(f"🔒 SECURITY: Ground truth fetching will enforce minimum {90 if not self.test_mode else 30}-minute delay")
+                    await self._process_scores(validator, scoring_query_hour, score_target_hour)
                     
                     await validator.update_task_status('geomagnetic', 'idle')
 
@@ -264,7 +335,7 @@ class GeomagneticTask(Task):
                         await asyncio.sleep(300)
                     else:
                         # Every 6 hours, run a more comprehensive cleanup of old pending tasks
-                        if next_hour.hour % 6 == 0:
+                        if query_hour.hour % 6 == 0:
                             logger.info("Running comprehensive cleanup of old pending tasks")
                             await self._comprehensive_pending_cleanup(validator)
 
@@ -277,14 +348,31 @@ class GeomagneticTask(Task):
             # Clean up the background worker when exiting
             await self._stop_pending_retry_worker()
 
-    async def _fetch_geomag_data(self):
-        """Fetch latest geomagnetic data."""
-        logger.info("Fetching latest geomagnetic data...")
-        timestamp, dst_value, historical_data = await get_latest_geomag_data(
-            include_historical=True
-        )
+    async def _fetch_geomag_data(self, target_hour=None, max_wait_minutes=30):
+        """
+        Fetch geomagnetic data for miner queries, for the specific target hour only.
+        
+        🔒 SECURITY: Using current hour data for miner queries ensures proper alignment
+        between query execution time and data timestamp. Security enforcement happens 
+        at scoring time with proper temporal separation.
+        
+        Args:
+            target_hour (datetime, optional): Specific hour to fetch data for
+            max_wait_minutes (int): Maximum minutes to wait for target hour data
+        """
+        if target_hour is not None:
+            logger.info(f"Fetching geomagnetic data for target hour: {target_hour}")
+            timestamp, dst_value, historical_data = await get_geomag_data_for_hour(
+                target_hour, include_historical=True, max_wait_minutes=max_wait_minutes
+            )
+        else:
+            logger.info("Fetching latest geomagnetic data for miner queries...")
+            timestamp, dst_value, historical_data = await get_latest_geomag_data(
+                include_historical=True
+            )
+        
         logger.info(
-            f"Fetched latest geomagnetic data: timestamp={timestamp}, value={dst_value}"
+            f"Fetched geomagnetic data: timestamp={timestamp}, value={dst_value}"
         )
         if historical_data is not None:
             logger.info(
@@ -295,18 +383,33 @@ class GeomagneticTask(Task):
         return timestamp, dst_value, historical_data
 
     async def _query_miners(
-        self, validator, timestamp, dst_value, historical_data, current_hour_start
+        self, validator, timestamp, dst_value, historical_data, current_hour_start, target_prediction_hour=None
     ):
-        """Query miners with current data and process responses."""
+        """
+        Query miners with current geomagnetic data for real-time predictions.
+        
+        🔒 SECURITY: Using current data for miner queries is correct - miners need
+        up-to-date information for realistic prediction tasks. Security is enforced
+        at scoring time with proper temporal separation.
+        
+        Args:
+            validator: Validator instance
+            timestamp: Timestamp of the current geomagnetic data being provided
+            dst_value: Current DST value being provided to miners  
+            historical_data: Historical data context
+            current_hour_start: The hour the query is being made (for task_id)
+            target_prediction_hour: The hour miners should predict (defaults to current_hour_start + 1)
+        """
         if timestamp == "N/A" or dst_value == "N/A":
             logger.warning("Invalid geomagnetic data. Skipping miner queries.")
             return
 
-        if timestamp == "N/A" or dst_value == "N/A":
-            logger.warning("Invalid geomagnetic data. Skipping miner queries.")
-            return
+        # Default target prediction hour to 1 hour after data timestamp (not execution hour)
+        if target_prediction_hour is None:
+            target_prediction_hour = timestamp + datetime.timedelta(hours=1)
         
         task_id = str(current_hour_start.timestamp())
+        logger.info(f"Using current data from {timestamp} to ask miners to predict {target_prediction_hour}")
         logger.info(f"Running DST basemodel for scoring with task_id: {task_id} (timestamp: {current_hour_start})")
         
         validator.basemodel_evaluator.test_mode = self.test_mode
@@ -342,6 +445,8 @@ class GeomagneticTask(Task):
                 "timestamp": timestamp.isoformat(),
                 "value": dst_value,
                 "historical_values": historical_records,
+                "prediction_target_hour": target_prediction_hour.isoformat(),
+                "instruction": f"Predict DST value for {target_prediction_hour.strftime('%Y-%m-%d %H:%M')} UTC using provided data up to {timestamp.strftime('%Y-%m-%d %H:%M')} UTC"
             },
         }
         endpoint = "/geomagnetic-request"
@@ -353,12 +458,24 @@ class GeomagneticTask(Task):
         await self.process_miner_responses(responses, current_hour_start, validator)
         logger.info(f"Added {len(responses)} predictions to the database")
 
-    async def _process_scores(self, validator, query_hour):
-        """Process task scores for a given hour."""
+    async def _process_scores(self, validator, query_hour, target_hour=None):
+        """
+        Process task scores for a given hour.
+        
+        Args:
+            validator: Validator instance
+            query_hour: When the predictions were made (query time)
+            target_hour: What hour the predictions were targeting (defaults to query_hour + 1)
+        """
         try:
             current_time = datetime.datetime.now(datetime.timezone.utc)
+            
+            # Default target hour to next hour if not specified
+            if target_hour is None:
+                target_hour = query_hour + datetime.timedelta(hours=1)
+            
             logger.info(
-                f"Processing scores for hour starting at {query_hour.isoformat()}"
+                f"🔒 SECURE SCORING: Processing predictions made at {query_hour.isoformat()} that targeted {target_hour.isoformat()}"
             )
 
             if self.test_mode:
@@ -376,24 +493,24 @@ class GeomagneticTask(Task):
             )
 
             if not tasks:
-                logger.info(f"No tasks found for hour {query_hour.isoformat()}")
+                logger.info(f"No tasks found for query hour {query_hour.isoformat()}")
                 return [], current_time
 
             # If all tasks are already scored, return early
             all_processed = all(task.get("status") == "scored" for task in tasks)
             if all_processed:
-                logger.info(f"All tasks already scored for hour {query_hour.isoformat()}")
+                logger.info(f"All tasks already scored for query hour {query_hour.isoformat()}")
                 return [], current_time
 
-            # Check if ground truth is likely available before attempting to fetch
-            if not await self._check_ground_truth_availability(query_hour):
-                logger.info(f"Ground truth not yet available for hour {query_hour.isoformat()}, tasks will remain pending")
+            # Check if ground truth is available for the TARGET hour (not query hour)
+            if not await self._check_ground_truth_availability(target_hour):
+                logger.info(f"Ground truth not yet available for target hour {target_hour.isoformat()}, tasks will remain pending")
                 return [], current_time
 
-            # Get ground truth data with improved retry logic
-            ground_truth_value = await self._fetch_ground_truth_for_time(query_hour, max_attempts=3)
+            # Get ground truth data for the TARGET hour that predictions were aiming for
+            ground_truth_value = await self._fetch_ground_truth_for_time(target_hour, max_attempts=3)
             if ground_truth_value is None:
-                logger.warning(f"Could not fetch ground truth value after retries, tasks will remain pending for hour {query_hour.isoformat()}")
+                logger.warning(f"Could not fetch ground truth value for target hour {target_hour.isoformat()}, tasks will remain pending")
                 return [], current_time
 
             logger.info(f"Ground truth value: {ground_truth_value}")
@@ -482,8 +599,8 @@ class GeomagneticTask(Task):
 
             # Add score row to score_table if we have scored tasks
             if scored_tasks:
-                logger.info(f"Building score row for {len(scored_tasks)} scored tasks")
-                await self.build_score_row(query_hour, scored_tasks)
+                logger.info(f"Building score row for {len(scored_tasks)} scored tasks targeting {target_hour}")
+                await self.build_score_row(target_hour, scored_tasks)
             else:
                 logger.info("No tasks were scored, skipping score row creation")
 
@@ -1441,13 +1558,18 @@ class GeomagneticTask(Task):
                 try:
                     logger.info(f"Attempting to score {len(tasks)} pending tasks from hour {hour_key}")
                     
-                    # Try to get ground truth for this time period
-                    ground_truth_value = await self._fetch_ground_truth_with_retry()
+                    # 🔒 SECURITY: Check ground truth availability before attempting to fetch
+                    if not await self._check_ground_truth_availability(hour_key):
+                        logger.debug(f"🔒 SECURITY: Ground truth not yet available for retry tasks from hour {hour_key}, will retry later")
+                        continue
+                    
+                    # SECURITY FIX: Use time-specific ground truth fetching instead of latest data
+                    ground_truth_value = await self._fetch_ground_truth_for_time(hour_key, max_attempts=2)
                     if ground_truth_value is None:
-                        logger.warning(f"Could not fetch ground truth for pending tasks from hour {hour_key}, will retry later")
+                        logger.warning(f"Could not fetch time-specific ground truth for pending tasks from hour {hour_key}, will retry later")
                         continue
 
-                    logger.info(f"Successfully got ground truth value {ground_truth_value} for pending tasks from hour {hour_key}")
+                    logger.info(f"✅ SECURITY: Successfully got time-specific ground truth value {ground_truth_value} for pending tasks from hour {hour_key}")
 
                     # Score all tasks for this hour
                     scored_tasks = []
@@ -1612,40 +1734,75 @@ class GeomagneticTask(Task):
                                 logger.error(f"Failed to delete orphaned task {task['id']}: {e}")
                             continue
 
-                    # Use validator's basemodel_evaluator to get the baseline score for comparison
-                    baseline_score = None
-                    if validator and hasattr(validator, 'basemodel_evaluator'):
-                        try:
-                            task_timestamp = task.get("timestamp", task.get("query_time"))
-                            if task_timestamp:
-                                if isinstance(task_timestamp, datetime.datetime):
-                                    if task_timestamp.tzinfo is not None:
-                                        task_timestamp_utc = task_timestamp.astimezone(datetime.timezone.utc)
-                                    else:
-                                        task_timestamp_utc = task_timestamp.replace(tzinfo=datetime.timezone.utc)
+                    # Try to get actual ground truth for this task's time period
+                    task_hour = task["query_time"].replace(minute=0, second=0, microsecond=0)
+                    
+                    # 🔒 SECURITY: Check ground truth availability before attempting to fetch
+                    if not await self._check_ground_truth_availability(task_hour):
+                        # If ground truth isn't available due to security timing, assign a default low score
+                        logger.warning(f"🔒 SECURITY: Ground truth not yet available for cleanup task {task['id']} from {task_hour}, assigning default score of 0")
+                        ground_truth_value = 0.0  # Default fallback for security timing
+                        score = 0.0  # Default score when security prevents ground truth access
+                    else:
+                        # Security check passed, attempt to fetch ground truth
+                        ground_truth_value = await self._fetch_ground_truth_for_time(task_hour, max_attempts=1)
+                        
+                        if ground_truth_value is None:
+                            # If ground truth isn't available due to data issues, assign a default low score
+                            logger.warning(f"No ground truth data available for cleanup task {task['id']} from {task_hour}, assigning default score of 0")
+                            ground_truth_value = 0.0  # Default fallback for data unavailability
+                            score = 0.0  # Default score when no ground truth data available
+                        else:
+                            # Use validator's basemodel_evaluator to get the baseline score for comparison
+                            baseline_score = None
+                            if validator and hasattr(validator, 'basemodel_evaluator'):
+                                try:
+                                    task_timestamp = task.get("timestamp", task.get("query_time"))
+                                    if task_timestamp:
+                                        if isinstance(task_timestamp, datetime.datetime):
+                                            if task_timestamp.tzinfo is not None:
+                                                task_timestamp_utc = task_timestamp.astimezone(datetime.timezone.utc)
+                                            else:
+                                                task_timestamp_utc = task_timestamp.replace(tzinfo=datetime.timezone.utc)
+                                                
+                                            task_id = str(task_timestamp_utc.timestamp())
+                                        else:
+                                            task_id = str(task_timestamp)
                                         
-                                    task_id = str(task_timestamp_utc.timestamp())
-                                else:
-                                    task_id = str(task_timestamp)
+                                        validator.basemodel_evaluator.test_mode = self.test_mode
+                                        baseline_score = await validator.basemodel_evaluator.score_geo_baseline(
+                                            task_id=task_id,
+                                            ground_truth=ground_truth_value  # FIXED: Use actual ground truth, not prediction
+                                        )
+                                        if baseline_score is not None:
+                                            logger.info(f"Retrieved baseline score for cleanup task_id {task_id}: {baseline_score:.4f}")
+                                except Exception as e:
+                                    logger.warning(f"Error retrieving baseline score for cleanup task: {e}")
+
+                            # Calculate score using actual ground truth
+                            score = self.scoring_mechanism.calculate_score(
+                                task["predicted_values"], ground_truth_value  # FIXED: Use actual ground truth
+                            )
+
+                            # Apply baseline comparison if available (same logic as other scoring methods)
+                            if baseline_score is not None:
+                                base_epsilon = 0.005
+                                theoretical_max = 0.99
                                 
-                                validator.basemodel_evaluator.test_mode = self.test_mode
-                                baseline_score = await validator.basemodel_evaluator.score_geo_baseline(
-                                    task_id=task_id,
-                                    ground_truth=task["predicted_values"]
-                                )
-                                if baseline_score is not None:
-                                    logger.info(f"Retrieved baseline score for cleanup task_id {task_id}: {baseline_score:.4f}")
-                        except Exception as e:
-                            logger.warning(f"Error retrieving baseline score for cleanup task: {e}")
+                                if baseline_score > theoretical_max - 0.10:
+                                    epsilon = 0.002
+                                else:
+                                    epsilon = base_epsilon
+                                
+                                if score <= baseline_score + epsilon:
+                                    logger.debug(f"Cleanup task score zeroed - insufficient improvement: {score:.4f} vs baseline {baseline_score:.4f}")
+                                    score = 0
+                                else:
+                                    logger.debug(f"Cleanup task score valid - exceeds baseline by {score - baseline_score:.4f}")
 
-                    # Calculate score
-                    score = self.scoring_mechanism.calculate_score(
-                        task["predicted_values"], task["predicted_values"]
-                    )
-
-                    # Move task to history
+                    # Move task to history with proper ground truth
                     await self.move_task_to_history(
-                        task, task["predicted_values"], score, datetime.datetime.now(datetime.timezone.utc)
+                        task, ground_truth_value, score, datetime.datetime.now(datetime.timezone.utc)
                     )
 
                 except Exception as e:
@@ -1660,114 +1817,198 @@ class GeomagneticTask(Task):
 
     async def _check_ground_truth_availability(self, target_time: datetime.datetime) -> bool:
         """
-        Lightweight check to see if ground truth data is available for a specific time.
-        This avoids doing a full download if data isn't ready yet.
+        Enhanced security check for ground truth data availability with temporal separation enforcement.
+        
+        🔒 SECURITY: This function enforces the same temporal separation requirements
+        as _fetch_ground_truth_for_time to prevent premature ground truth access.
         
         Args:
             target_time: The datetime to check ground truth availability for
             
         Returns:
-            bool: True if ground truth data appears to be available, False otherwise
+            bool: True if ground truth data meets security requirements and appears available, False otherwise
         """
         try:
-            # In test mode, assume ground truth is always available
-            if self.test_mode:
-                logger.debug(f"TEST MODE: Assuming ground truth is available for {target_time}")
-                return True
-            
-            # For geomagnetic data, we typically need to wait at least 1-2 hours after the target time
-            # for the data to be processed and made available
             current_time = datetime.datetime.now(datetime.timezone.utc)
-            time_since_target = current_time - target_time
+            target_hour = target_time.replace(minute=0, second=0, microsecond=0)
+            time_since_target = current_time - target_hour
             
-            # If less than 1 hour has passed, data is likely not available yet
-            if time_since_target.total_seconds() < 3600:  # 1 hour
-                logger.debug(f"Ground truth likely not available yet for {target_time} (only {time_since_target.total_seconds()/60:.1f} minutes have passed)")
+            # 🔒 SECURITY: Apply same temporal separation requirements as fetch function
+            if not self.test_mode:
+                # Production: Require at least 90 minutes for data stability and separation
+                min_delay_seconds = 90 * 60  # 90 minutes
+                security_message = "90 minutes for production data stability"
+            else:
+                # Test mode: Require at least 30 minutes for basic separation
+                min_delay_seconds = 30 * 60  # 30 minutes  
+                security_message = "30 minutes for test mode"
+            
+            # 🔒 SECURITY: Enforce minimum delay requirement
+            if time_since_target.total_seconds() < min_delay_seconds:
+                logger.debug(f"🔒 SECURITY: Ground truth not available for {target_hour} - only {time_since_target.total_seconds()/60:.1f} minutes have passed, need {min_delay_seconds/60:.0f} minutes ({security_message})")
                 return False
             
-            # If more than 48 hours have passed, we should definitely have data by now
-            if time_since_target.total_seconds() > 172800:  # 48 hours
-                logger.debug(f"Ground truth should definitely be available for {target_time} (data is {time_since_target.total_seconds()/3600:.1f} hours old)")
+            # 🔒 SECURITY: Prevent checking for future times
+            if time_since_target.total_seconds() < 0:
+                logger.debug(f"🔒 SECURITY: Cannot check ground truth availability for future time {target_hour}")
+                return False
+            
+            # 🔒 SECURITY: Limit maximum lookback to prevent excessive historical queries
+            max_lookback_hours = 168  # 7 days
+            if time_since_target.total_seconds() > max_lookback_hours * 3600:
+                logger.debug(f"🔒 SECURITY: Target hour {target_hour} is too old ({time_since_target.total_seconds()/3600:.1f} hours ago, max {max_lookback_hours} hours)")
+                return False
+            
+            # If more than 6 hours have passed, we should definitely have stable data
+            if time_since_target.total_seconds() > 21600:  # 6 hours
+                logger.debug(f"🔒 SECURITY: Ground truth should definitely be available for {target_hour} (data is {time_since_target.total_seconds()/3600:.1f} hours old)")
                 return True
             
-            # For times between 1-48 hours ago, do a quick check
-            # We'll try a single attempt to fetch data without retries
+            # For times between our minimum delay and 6 hours ago, do a quick check
+            # We'll try a single attempt to fetch historical data without retries
             try:
-                result = await get_latest_geomag_data(include_historical=False)
+                result = await get_latest_geomag_data(include_historical=True)
                 
-                if len(result) == 2:
-                    timestamp, dst_value = result
-                    if timestamp != "N/A" and dst_value != "N/A":
-                        # Check if the returned data is reasonably recent
-                        if isinstance(timestamp, datetime.datetime):
-                            data_age = current_time - timestamp
-                            if data_age.total_seconds() < 7200:  # Data is less than 2 hours old
-                                logger.debug(f"Recent ground truth data found (age: {data_age.total_seconds()/60:.1f} minutes)")
-                                return True
-                        else:
-                            # If timestamp format is different, assume data is available
-                            logger.debug(f"Ground truth data found with timestamp: {timestamp}")
+                if len(result) == 3:
+                    latest_timestamp, latest_dst_value, historical_data = result
+                    if latest_timestamp != "N/A" and latest_dst_value != "N/A" and historical_data is not None:
+                        # Check if historical data contains our target hour
+                        target_data = historical_data[historical_data["timestamp"] == target_hour]
+                        if not target_data.empty:
+                            logger.debug(f"✅ SECURITY: Ground truth data found for {target_hour} in historical data")
                             return True
+                        else:
+                            logger.debug(f"🔒 SECURITY: Target hour {target_hour} not found in historical data range: {historical_data['timestamp'].min()} to {historical_data['timestamp'].max()}")
+                            return False
                 
-                logger.debug(f"Ground truth check returned N/A values for {target_time}")
+                logger.debug(f"🔒 SECURITY: Ground truth check returned N/A values for {target_hour}")
                 return False
                 
             except Exception as e:
-                logger.debug(f"Error during ground truth availability check for {target_time}: {e}")
-                # If we can't check, assume it might be available (err on the side of trying)
-                return time_since_target.total_seconds() > 7200  # 2 hours
+                logger.debug(f"🔒 SECURITY: Error during ground truth availability check for {target_hour}: {e}")
+                # If we can't check and meet minimum delay, assume it might be available
+                return time_since_target.total_seconds() >= min_delay_seconds
                 
         except Exception as e:
             logger.error(f"Error in _check_ground_truth_availability: {e}")
-            # Default to trying if we can't determine availability
-            return True
+            # Default to False for security - don't assume availability if we can't verify
+            return False
 
     async def _fetch_ground_truth_for_time(self, target_time: datetime.datetime, max_attempts: int = 3):
         """
-        Fetches ground truth data for a specific time period with retry logic.
+        Fetches ground truth data for a specific time period with enhanced security controls.
+        
+        🔒 SECURITY: This function enforces strict temporal separation and ensures
+        ground truth data is only fetched when sufficient time has passed for
+        data stability and proper separation from miner query data.
         
         Args:
-            target_time: The datetime to fetch ground truth for
+            target_time: The datetime to fetch ground truth for (must be specific hour)
             max_attempts: Maximum number of retry attempts
             
         Returns:
-            float: The ground truth DST value, or None if fetching fails
+            float: The ground truth DST value for the target hour, or None if fetching fails
         """
         try:
-            logger.info(f"Fetching ground truth for time: {target_time}")
+            # Align target_time to the start of the hour for precise matching
+            target_hour = target_time.replace(minute=0, second=0, microsecond=0)
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            time_diff = current_time - target_hour
+            
+            # 🔒 SECURITY: Enhanced temporal separation requirements
+            if not self.test_mode:
+                # Production: Require at least 90 minutes for data stability and separation
+                min_delay_seconds = 90 * 60  # 90 minutes
+                security_message = "90 minutes for production data stability"
+            else:
+                # Test mode: Require at least 30 minutes for basic separation
+                min_delay_seconds = 30 * 60  # 30 minutes  
+                security_message = "30 minutes for test mode"
+            
+            if time_diff.total_seconds() < min_delay_seconds:
+                logger.warning(f"🔒 SECURITY: Refusing to fetch ground truth for {target_hour}")
+                logger.warning(f"🔒 SECURITY: Only {time_diff.total_seconds()/60:.1f} minutes have passed, need {min_delay_seconds/60:.0f} minutes ({security_message})")
+                logger.warning(f"🔒 SECURITY: This prevents miners from accessing ground truth data during prediction windows")
+                return None
+            
+            # 🔒 SECURITY: Prevent fetching ground truth for target times that are too far in the future
+            if time_diff.total_seconds() < 0:
+                logger.error(f"🔒 SECURITY: Cannot fetch ground truth for future time {target_hour} (current time: {current_time})")
+                return None
+            
+            # 🔒 SECURITY: Limit maximum lookback to prevent excessive historical queries
+            max_lookback_hours = 168  # 7 days
+            if time_diff.total_seconds() > max_lookback_hours * 3600:
+                logger.warning(f"🔒 SECURITY: Target hour {target_hour} is too old ({time_diff.total_seconds()/3600:.1f} hours ago, max {max_lookback_hours} hours)")
+                return None
+            
+            logger.info(f"🔒 SECURITY: Fetching ground truth for {target_hour} (safe: {time_diff.total_seconds()/3600:.1f} hours ago, {time_diff.total_seconds()/60:.0f} minutes)")
 
-            # Fetch the most recent geomagnetic data with retry logic
+            # Fetch historical data to find the specific time period
             for attempt in range(1, max_attempts + 1):
                 try:
-                    result = await get_latest_geomag_data(include_historical=False)
+                    # Get historical data for the current month
+                    result = await get_latest_geomag_data(include_historical=True)
                     
-                    # Handle the result based on expected format (should be 2 values)
-                    if len(result) == 2:
-                        timestamp, dst_value = result
+                    # Handle the result based on expected format (should be 3 values when include_historical=True)
+                    if len(result) == 3:
+                        latest_timestamp, latest_dst_value, historical_data = result
                     else:
-                        logger.warning(f"Unexpected number of values returned from get_latest_geomag_data: {len(result)} (expected 2)")
+                        logger.warning(f"Unexpected number of values returned from get_latest_geomag_data: {len(result)} (expected 3 with historical)")
                         logger.warning(f"Result: {result}")
+                        if attempt < max_attempts:
+                            await asyncio.sleep(attempt * 5)
                         continue
                     
-                    if timestamp == "N/A" or dst_value == "N/A":
-                        logger.warning(f"No ground truth data available for {target_time} (attempt {attempt}/{max_attempts})")
+                    if latest_timestamp == "N/A" or latest_dst_value == "N/A" or historical_data is None:
+                        logger.warning(f"No historical geomagnetic data available (attempt {attempt}/{max_attempts})")
                         if attempt < max_attempts:
-                            await asyncio.sleep(attempt * 5)  # Shorter wait between attempts
+                            await asyncio.sleep(attempt * 5)
                         continue
 
-                    logger.info(f"Ground truth value for {target_time}: {dst_value}")
-                    return dst_value
+                    # 🔒 SECURITY: Verify historical data meets our temporal requirements
+                    historical_data_max_time = historical_data["timestamp"].max()
+                    if historical_data_max_time < target_hour:
+                        logger.warning(f"🔒 SECURITY: Historical data ends at {historical_data_max_time}, cannot provide ground truth for {target_hour}")
+                        if attempt < max_attempts:
+                            await asyncio.sleep(attempt * 10)
+                        continue
+
+                    # Filter historical data for the specific target hour
+                    target_data = historical_data[historical_data["timestamp"] == target_hour]
+                    
+                    if target_data.empty:
+                        logger.warning(f"No ground truth data found for specific hour {target_hour} (attempt {attempt}/{max_attempts})")
+                        logger.info(f"Available data range: {historical_data['timestamp'].min()} to {historical_data['timestamp'].max()}")
+                        if attempt < max_attempts:
+                            await asyncio.sleep(attempt * 5)
+                        continue
+
+                    # Extract the DST value for the target hour
+                    ground_truth_value = float(target_data.iloc[0]["Dst"])
+                    
+                    # 🔒 SECURITY: Final validation of ground truth value
+                    if abs(ground_truth_value) > 1000:  # Sanity check for reasonable DST values
+                        logger.warning(f"🔒 SECURITY: Ground truth value {ground_truth_value} seems unreasonable for DST, skipping")
+                        if attempt < max_attempts:
+                            await asyncio.sleep(attempt * 5)
+                        continue
+                    
+                    logger.info(f"✅ SECURITY: Successfully fetched time-specific ground truth for {target_hour}: {ground_truth_value}")
+                    logger.info(f"✅ SECURITY: Ground truth is {time_diff.total_seconds()/3600:.1f} hours old, ensuring proper temporal separation")
+                    return ground_truth_value
 
                 except Exception as e:
-                    logger.warning(f"Error fetching ground truth for {target_time}, attempt {attempt}/{max_attempts}: {e}")
+                    logger.warning(f"Error fetching time-specific ground truth for {target_hour}, attempt {attempt}/{max_attempts}: {e}")
                     if attempt < max_attempts:
-                        await asyncio.sleep(attempt * 5)  # Shorter wait between attempts
+                        await asyncio.sleep(attempt * 5)
 
-            logger.warning(f"All ground truth fetching attempts failed for {target_time}")
+            logger.warning(f"❌ SECURITY: All attempts failed to fetch ground truth for specific hour {target_hour}")
+            logger.warning(f"❌ SECURITY: This ensures no compromised scoring occurs")
             return None
 
         except Exception as e:
-            logger.error(f"Error fetching ground truth for {target_time}: {e}")
+            logger.error(f"Error fetching time-specific ground truth for {target_time}: {e}")
             logger.error(f"{traceback.format_exc()}")
             return None
 

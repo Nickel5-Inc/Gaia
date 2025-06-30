@@ -58,16 +58,46 @@ class ProcessIsolatedSubstrate:
             *args: Arguments for the operation
             timeout: Timeout in seconds
         """
+        import inspect
+        
         self._operation_count += 1
-        logger.debug(f"Process-isolated {operation_type} #{self._operation_count} (timeout: {timeout}s)")
+        
+        # Get calling context for better logging
+        frame = inspect.currentframe()
+        caller_info = "unknown"
+        try:
+            # Go up the stack to find the actual caller (skip wrapper methods)
+            caller_frame = frame.f_back.f_back if frame.f_back else None
+            if caller_frame:
+                caller_info = f"{caller_frame.f_code.co_filename.split('/')[-1]}:{caller_frame.f_code.co_name}:{caller_frame.f_lineno}"
+        except:
+            pass
+        finally:
+            del frame  # Prevent reference cycles
+        
+        # Create operation description
+        if operation_type == "query" and len(args) >= 2:
+            op_desc = f"query({args[0]}.{args[1]})"
+            if len(args) > 2 and args[2]:  # params
+                op_desc += f" with params"
+            if len(args) > 3 and args[3]:  # block_hash
+                op_desc += f" at block"
+        elif operation_type == "rpc_request" and len(args) >= 1:
+            op_desc = f"rpc({args[0]})"
+        else:
+            op_desc = f"{operation_type}"
+        
+        logger.debug(f"Process-isolated {op_desc} #{self._operation_count} (timeout: {timeout}s) called from {caller_info}")
         
         try:
             start_time = time.time()
+            operation_desc = op_desc  # Store for completion logging
             
             # Create subprocess script that runs the operation
             if operation_type == "query":
                 module, storage_function = args[0], args[1]
                 params = args[2] if len(args) > 2 else []
+                block_hash = args[3] if len(args) > 3 else None
                 script_content = f'''
 import sys
 import signal
@@ -76,7 +106,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 def timeout_handler(signum, frame):
-    print(json.dumps({{"error": "Query timeout"}}))
+    print(json.dumps(dict(error="Query timeout")))
     sys.exit(1)
 
 try:
@@ -90,9 +120,16 @@ try:
     else:
         substrate = get_substrate(subtensor_network="{self.subtensor_network}")
     
-    params = {json.dumps(params)}
-    if params:
+    params = {repr(params)}
+    block_hash = {repr(block_hash)}
+    
+    # Call substrate.query with appropriate parameters
+    if params and block_hash is not None:
+        result = substrate.query("{module}", "{storage_function}", params, block_hash)
+    elif params:
         result = substrate.query("{module}", "{storage_function}", params)
+    elif block_hash is not None:
+        result = substrate.query("{module}", "{storage_function}", None, block_hash)
     else:
         result = substrate.query("{module}", "{storage_function}")
     
@@ -102,17 +139,52 @@ try:
     else:
         value = result
     
+    # Create a simple wrapper object that mimics substrate result structure for compatibility
+    class SubstrateResultWrapper:
+        def __init__(self, val):
+            self.value = val
+            self._value = val  # Some code might expect _value
+            
+        def __str__(self):
+            return str(self.value)
+            
+        def __repr__(self):
+            return repr(self.value)
+            
+        def __int__(self):
+            return int(self.value) if hasattr(self.value, '__int__') else self.value
+            
+        def __index__(self):
+            # Required for using SubstrateResult as list/array index
+            if hasattr(self.value, '__index__'):
+                return self.value.__index__()
+            elif hasattr(self.value, '__int__'):
+                return int(self.value)
+            else:
+                return int(self.value)
+            
+        def __len__(self):
+            return len(self.value) if hasattr(self.value, '__len__') else 1
+            
+        def __getitem__(self, key):
+            return self.value[key] if hasattr(self.value, '__getitem__') else self.value
+            
+        def __iter__(self):
+            return iter(self.value) if hasattr(self.value, '__iter__') else iter([self.value])
+        
+    wrapped_result = SubstrateResultWrapper(value)
+    
     substrate.close()
     signal.alarm(0)
     
     print("RESULT_START")
-    print(json.dumps(value, default=str))
+    print(json.dumps(dict(value=value, wrapped=True), default=str))
     print("RESULT_END")
     
 except Exception as e:
     signal.alarm(0)
     print("RESULT_START")
-    print(json.dumps({{"error": str(e)}}))
+    print(json.dumps(dict(error=str(e))))
     print("RESULT_END")
 '''
             
@@ -127,28 +199,44 @@ import warnings
 warnings.filterwarnings('ignore')
 
 def timeout_handler(signum, frame):
-    print(json.dumps({{"error": "RPC timeout"}}))
+    print(json.dumps(dict(error="RPC timeout")))
     sys.exit(1)
 
 try:
     signal.signal(signal.SIGALRM, timeout_handler)
     signal.alarm({max(int(timeout)-2, 5)})
     
+    import time
+    start_time = time.time()
+    
     from fiber.chain.interface import get_substrate
+    
+    print(f"DEBUG: Connecting to substrate...", file=sys.stderr)
+    connection_start = time.time()
     
     if "{self.chain_endpoint}" and "{self.chain_endpoint}".strip():
         substrate = get_substrate(subtensor_network="{self.subtensor_network}", subtensor_address="{self.chain_endpoint}")
     else:
         substrate = get_substrate(subtensor_network="{self.subtensor_network}")
     
-    params = {json.dumps(params)}
+    connection_time = time.time() - connection_start
+    print(f"DEBUG: Connected in " + str(round(connection_time, 2)) + "s, making RPC request...", file=sys.stderr)
+    
+    params = {repr(params)}
+    request_start = time.time()
     if params:
         result = substrate.rpc_request("{method}", params)
     else:
         result = substrate.rpc_request("{method}", [])
     
+    request_time = time.time() - request_start
+    print(f"DEBUG: RPC request completed in " + str(round(request_time, 2)) + "s", file=sys.stderr)
+    
     substrate.close()
     signal.alarm(0)
+    
+    total_time = time.time() - start_time
+    print(f"DEBUG: Total operation time: " + str(round(total_time, 2)) + "s", file=sys.stderr)
     
     print("RESULT_START")
     print(json.dumps(result, default=str))
@@ -157,7 +245,7 @@ try:
 except Exception as e:
     signal.alarm(0)
     print("RESULT_START")
-    print(json.dumps({{"error": str(e)}}))
+    print(json.dumps(dict(error=str(e))))
     print("RESULT_END")
 '''
             else:
@@ -175,6 +263,12 @@ except Exception as e:
             execution_time = time.time() - start_time
             
             if result.returncode == 0:
+                # Log any debug output from subprocess
+                if result.stderr and result.stderr.strip():
+                    for debug_line in result.stderr.strip().split('\n'):
+                        if debug_line.startswith('DEBUG:'):
+                            logger.debug(f"Subprocess {operation_desc}: {debug_line}")
+                
                 # Extract result between markers
                 stdout = result.stdout
                 start_marker = "RESULT_START\n"
@@ -195,21 +289,106 @@ except Exception as e:
                 if isinstance(data, dict) and "error" in data:
                     raise Exception(f"Substrate {operation_type} failed: {data['error']}")
                 
-                logger.debug(f"Process-isolated {operation_type} #{self._operation_count} completed in {execution_time:.2f}s")
-                return data
+                # Handle wrapped results from subprocess
+                if isinstance(data, dict) and "wrapped" in data and data["wrapped"]:
+                    # Create a substrate-compatible result object
+                    class SubstrateResult:
+                        def __init__(self, val):
+                            self.value = val
+                            self._value = val
+                            
+                        def __str__(self):
+                            return str(self.value)
+                            
+                        def __repr__(self):
+                            return repr(self.value)
+                            
+                        def __int__(self):
+                            return int(self.value) if hasattr(self.value, '__int__') else self.value
+                            
+                        def __index__(self):
+                            # Required for using SubstrateResult as list/array index
+                            if hasattr(self.value, '__index__'):
+                                return self.value.__index__()
+                            elif hasattr(self.value, '__int__'):
+                                return int(self.value)
+                            else:
+                                return int(self.value)
+                            
+                        def __len__(self):
+                            return len(self.value) if hasattr(self.value, '__len__') else 1
+                            
+                        def __getitem__(self, key):
+                            return self.value[key] if hasattr(self.value, '__getitem__') else self.value
+                            
+                        def __iter__(self):
+                            return iter(self.value) if hasattr(self.value, '__iter__') else iter([self.value])
+                        
+                        # Comparison operators - delegate to underlying value
+                        def __eq__(self, other):
+                            return self.value == other
+                            
+                        def __ne__(self, other):
+                            return self.value != other
+                            
+                        def __lt__(self, other):
+                            return self.value < other
+                            
+                        def __le__(self, other):
+                            return self.value <= other
+                            
+                        def __gt__(self, other):
+                            return self.value > other
+                            
+                        def __ge__(self, other):
+                            return self.value >= other
+                        
+                        # Arithmetic operators for completeness
+                        def __add__(self, other):
+                            return self.value + other
+                            
+                        def __sub__(self, other):
+                            return self.value - other
+                            
+                        def __mul__(self, other):
+                            return self.value * other
+                            
+                        def __truediv__(self, other):
+                            return self.value / other
+                            
+                        def __floordiv__(self, other):
+                            return self.value // other
+                            
+                        def __mod__(self, other):
+                            return self.value % other
+                            
+                        def __hash__(self):
+                            return hash(self.value)
+                    
+                    result_obj = SubstrateResult(data["value"])
+                    logger.debug(f"Process-isolated {operation_desc} #{self._operation_count} completed in {execution_time:.2f}s → wrapped result")
+                    return result_obj
+                else:
+                    logger.debug(f"Process-isolated {operation_desc} #{self._operation_count} completed in {execution_time:.2f}s → raw result")
+                    return data
             else:
-                raise Exception(f"Subprocess failed (code {result.returncode}): {result.stderr}")
+                # Log stderr for failed subprocess to help with debugging
+                stderr_info = f": {result.stderr}" if result.stderr else ""
+                raise Exception(f"Subprocess failed (code {result.returncode}){stderr_info}")
                 
         except subprocess.TimeoutExpired:
+            execution_time = time.time() - start_time if 'start_time' in locals() else 0
+            logger.error(f"Process-isolated {operation_desc} #{self._operation_count} TIMED OUT after {execution_time:.2f}s")
+            logger.error(f"Network appears to be unresponsive. Consider checking substrate network status.")
             raise Exception(f"Substrate {operation_type} timeout after {timeout}s")
         except Exception as e:
             execution_time = time.time() - start_time if 'start_time' in locals() else 0
-            logger.error(f"Process-isolated {operation_type} failed after {execution_time:.2f}s: {e}")
+            logger.error(f"Process-isolated {operation_desc} #{self._operation_count} failed after {execution_time:.2f}s: {e}")
             raise
     
-    def query(self, module: str, storage_function: str, params: List = None, timeout: float = 90.0) -> Any:
+    def query(self, module: str, storage_function: str, params: List = None, block_hash: str = None, timeout: float = 90.0) -> Any:
         """Query the substrate in an isolated process."""
-        return self._run_substrate_operation("query", module, storage_function, params or [], timeout=timeout)
+        return self._run_substrate_operation("query", module, storage_function, params or [], block_hash, timeout=timeout)
     
     def rpc_request(self, method: str, params: List = None, timeout: float = 90.0) -> Any:
         """Make an RPC request in an isolated process."""
