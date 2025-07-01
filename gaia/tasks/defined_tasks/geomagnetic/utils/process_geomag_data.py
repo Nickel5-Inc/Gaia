@@ -70,16 +70,41 @@ def parse_data(data):
         # Split by whitespace and filter out empty strings
         raw_values = [v for v in data_portion.split() if v]
         
-        # Handle "squished together" values like "-189999" which should be "-18" + "9999"
+        # Handle "squished together" values where negative numbers are followed by multiple 9999 markers
         values = []
         for value in raw_values:
-            # Check if this looks like a negative number followed by 9999 (e.g., "-189999")
-            if value.startswith('-') and value.endswith('9999') and len(value) > 5:
-                # Split it: "-189999" -> ["-18", "9999"]
-                actual_value = value[:-4]  # Remove the "9999" part
-                placeholder = "9999"
-                values.extend([actual_value, placeholder])
-                logger.debug(f"Split squished value '{value}' into ['{actual_value}', '{placeholder}']")
+            # Check if this looks like a negative number followed by one or more 9999 markers
+            if value.startswith('-') and '9999' in value and len(value) > 5:
+                # Find where the actual negative value ends and the 9999 markers begin
+                # Look for the pattern where we have a reasonable negative number followed by 9999s
+                found_split = False
+                
+                # Try to find the split point by looking for reasonable negative values (up to -999)
+                for split_pos in range(2, min(6, len(value))):  # Check positions for -X, -XX, -XXX, -XXXX
+                    potential_value = value[:split_pos]
+                    remainder = value[split_pos:]
+                    
+                    # Check if the potential value is a reasonable negative number
+                    # and the remainder consists only of repeated "9999" patterns
+                    try:
+                        int(potential_value)  # Validate it's a number
+                        # Check if remainder is composed of "9999" repeated
+                        if len(remainder) > 0 and len(remainder) % 4 == 0 and all(remainder[i:i+4] == "9999" for i in range(0, len(remainder), 4)):
+                            # Split the value
+                            values.append(potential_value)
+                            # Add each 9999 as a separate placeholder
+                            num_9999s = len(remainder) // 4
+                            values.extend(["9999"] * num_9999s)
+                            logger.debug(f"Split squished value '{value}' into ['{potential_value}'] + {num_9999s} × '9999'")
+                            found_split = True
+                            break
+                    except ValueError:
+                        continue
+                
+                if not found_split:
+                    # Fallback: if we can't parse it properly, just add as-is
+                    values.append(value)
+                    logger.warning(f"Could not parse squished value '{value}', adding as-is")
             else:
                 values.append(value)
         
@@ -88,8 +113,12 @@ def parse_data(data):
         # Process up to 24 hourly values
         # NOTE: Data format uses 1-24 hour indexing, not 0-23
         # values[0] = hour 1 (01:00), values[1] = hour 2 (02:00), ..., values[23] = hour 24 (00:00 next day)
-        for i in range(min(24, len(values))):
-            value_str = values[i]
+        # IMPORTANT: The last value in the data is the daily mean (columns 117-120), NOT hourly data
+        # So we only process the first 24 values, excluding the daily mean
+        hourly_values_only = values[:-1] if len(values) > 24 else values  # Exclude daily mean (last value)
+        
+        for i in range(min(24, len(hourly_values_only))):
+            value_str = hourly_values_only[i]
             
             # Convert 1-24 indexing to 0-23 hour format
             # Hour 1-23 maps to 1-23, Hour 24 maps to 0 (next day)
