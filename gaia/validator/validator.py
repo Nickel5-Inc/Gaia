@@ -431,6 +431,13 @@ class GaiaValidator:
         )
         self.weights = [0.0] * 256
         self.last_set_weights_block = 0
+        
+        # Shared block info cache to reduce redundant substrate queries
+        self._shared_block_cache = {
+            'block_number': None,
+            'last_update_time': 0,
+            'cache_duration': 30  # 30 seconds cache
+        }
         self.current_block = 0
         self.nodes = {}
         self.memray_tracker: Optional[memray.Tracker] = None # For programmatic memray
@@ -2166,13 +2173,13 @@ class GaiaValidator:
             sync_start = time.time()
             
             try:
-                # Check if we need a fresh substrate connection (reuse for 10 minutes)
+                # Check if we need a fresh substrate connection (reuse for 15 minutes)
                 current_time = time.time()
                 connection_age = current_time - self.substrate_connection_created_at
                 needs_fresh_connection = (
                     not hasattr(self, 'substrate') or 
                     self.substrate is None or 
-                    connection_age > self.substrate_reuse_window
+                    connection_age > 900  # Increased from 600s (10min) to 900s (15min)
                 )
                 
                 if needs_fresh_connection:
@@ -2183,9 +2190,9 @@ class GaiaValidator:
                         use_process_isolation=True
                     )
                     self.substrate_connection_created_at = current_time
-                    logger.info(f"🔄 Created fresh substrate connection (age: {connection_age:.1f}s, limit: {self.substrate_reuse_window}s)")
+                    logger.info(f"🔄 Created fresh substrate connection (age: {connection_age:.1f}s, limit: 900s)")
                 else:
-                    logger.debug(f"♻️ Reusing substrate connection (age: {connection_age:.1f}s, limit: {self.substrate_reuse_window}s)")
+                    logger.debug(f"♻️ Reusing substrate connection (age: {connection_age:.1f}s, limit: 900s)")
                 
                 # Update metagraph to use the fresh connection
                 if hasattr(self, 'metagraph') and self.metagraph:
@@ -2246,6 +2253,48 @@ class GaiaValidator:
         task = asyncio.create_task(coro)
         return self._track_background_task(task, task_name)
         
+    def _get_current_block_cached(self, force_refresh: bool = False) -> int:
+        """Get current block number with intelligent caching to reduce substrate queries."""
+        current_time = time.time()
+        cache = self._shared_block_cache
+        
+        # Check if we need to refresh the cache
+        should_refresh = (
+            force_refresh or
+            cache['block_number'] is None or
+            current_time - cache['last_update_time'] > cache['cache_duration']
+        )
+        
+        if should_refresh:
+            try:
+                resp = self.substrate.rpc_request("chain_getHeader", [])
+                hex_num = resp["result"]["number"]
+                block_number = int(hex_num, 16)
+                
+                # Update cache
+                cache['block_number'] = block_number
+                cache['last_update_time'] = current_time
+                
+                # Update instance variable for compatibility
+                self.current_block = block_number
+                
+                logger.debug(f"Refreshed shared block cache: {block_number} (age will be 0s)")
+                return block_number
+                
+            except Exception as e:
+                logger.error(f"Failed to get current block: {e}")
+                # Return cached value if available, otherwise raise
+                if cache['block_number'] is not None:
+                    logger.warning(f"Using stale cached block number: {cache['block_number']}")
+                    return cache['block_number']
+                raise
+        else:
+            # Use cached value
+            cached_age = current_time - cache['last_update_time']
+            logger.debug(f"Using cached block number: {cache['block_number']} (age: {cached_age:.1f}s)")
+            self.current_block = cache['block_number']
+            return cache['block_number']
+
     def _aggressive_substrate_cleanup(self, context: str = "substrate_cleanup"):
         """Aggressive cleanup of substrate/scalecodec module caches."""
         try:
@@ -3014,38 +3063,40 @@ class GaiaValidator:
                                 logger.error(traceback.format_exc())
                                 await self.update_task_status('scoring', 'error')
                                 return False
-                            
 
                         validator_uid = int(validator_uid)
+                        
+                        # Get current block info using shared cache
+                        current_block = self._get_current_block_cached()
+
+                        # Get last update info
                         last_updated_value = self.substrate.query(
                             "SubtensorModule",
                             "LastUpdate",
                             [self.netuid]
                         )
+                        
                         if last_updated_value is not None and validator_uid < len(last_updated_value):
                             last_updated = int(last_updated_value[validator_uid])
-                            resp = self.substrate.rpc_request("chain_getHeader", [])  
-                            hex_num = resp["result"]["number"]
-                            current_block = int(hex_num, 16)
                             blocks_since_update = current_block - last_updated
                             logger.info(f"Calculated blocks since update: {blocks_since_update} (current: {current_block}, last: {last_updated})")
                         else:
                             blocks_since_update = None
                             logger.warning("Could not determine last update value")
 
+                        # Check if we can set weights (using cached block)
                         min_interval = w.min_interval_to_set_weights(
                             self.substrate, 
                             self.netuid
                         )
                         if min_interval is not None:
                             min_interval = int(min_interval)
-                        resp = self.substrate.rpc_request("chain_getHeader", [])  
-                        hex_num = resp["result"]["number"]
-                        current_block = int(hex_num, 16)                     
+                            
                         if current_block - self.last_set_weights_block < min_interval:
                             logger.info(f"Recently set weights {current_block - self.last_set_weights_block} blocks ago")
                             await self.update_task_status('scoring', 'idle', 'waiting')
-                            await asyncio.sleep(60)
+                            # Longer sleep when waiting for weight setting interval
+                            await asyncio.sleep(120)  # Increased from 60 to 120 seconds
                             return True
 
                         # Only enter weight_setting state when actually setting weights
@@ -3078,6 +3129,9 @@ class GaiaValidator:
                                         await self.update_last_weights_block()
                                         self.last_successful_weight_set = time.time()
                                         logger.info("✅ Successfully set weights")
+                                        
+                                        # Invalidate shared block cache after weight setting
+                                        self._shared_block_cache['block_number'] = None
                                         
                                         # MEMORY LEAK FIX: Aggressive substrate cleanup after successful weight setting
                                         try:
@@ -3124,6 +3178,9 @@ class GaiaValidator:
                     )
                     logger.info("🔄 Force reconnect - created fresh substrate connection using substrate manager")
                     
+                    # Invalidate shared cache after reconnection
+                    self._shared_block_cache['block_number'] = None
+                    
                     # Clear scalecodec caches after reconnection
                     try:
                         import sys
@@ -3165,9 +3222,19 @@ class GaiaValidator:
                 await asyncio.sleep(12)
                 continue
             
-            # Add sleep to prevent rapid cycling when scoring completes quickly
-            # This ensures consistent timing regardless of scoring outcome
-            await asyncio.sleep(60)
+            # Adaptive sleep based on weight setting readiness
+            # Longer sleep when not ready to set weights, shorter when active
+            if hasattr(self, 'last_successful_weight_set'):
+                time_since_last_weights = time.time() - self.last_successful_weight_set
+                if time_since_last_weights > 3600:  # If it's been over an hour
+                    sleep_duration = 90  # Check more frequently
+                else:
+                    sleep_duration = 120  # Normal interval
+            else:
+                sleep_duration = 90  # Default for first run
+            
+            logger.debug(f"Scoring cycle sleeping for {sleep_duration}s")
+            await asyncio.sleep(sleep_duration)
 
     async def status_logger(self):
         """Log the status of the validator periodically."""
@@ -3177,9 +3244,8 @@ class GaiaValidator:
                 formatted_time = current_time_utc.strftime("%Y-%m-%d %H:%M:%S")
 
                 try:
-                    resp = self.substrate.rpc_request("chain_getHeader", [])  
-                    hex_num = resp["result"]["number"]
-                    self.current_block = int(hex_num, 16)
+                    # Use shared block cache to reduce redundant queries
+                    self.current_block = self._get_current_block_cached()
                     blocks_since_weights = (
                             self.current_block - self.last_set_weights_block
                     )
@@ -3256,7 +3322,8 @@ class GaiaValidator:
                 logger.error(f"Error in status logger: {e}")
                 logger.error(f"{traceback.format_exc()}")
             finally:
-                await asyncio.sleep(60)
+                # Reduced frequency - status updates every 2 minutes instead of 1 minute
+                await asyncio.sleep(120)
 
     async def handle_miner_deregistration_loop(self) -> None:
         logger.info("Starting miner state synchronization loop (handles hotkey changes, new miners, and info updates)")
@@ -3477,8 +3544,8 @@ class GaiaValidator:
             except Exception as e:
                 logger.error(f"Error in miner state synchronization loop: {e}", exc_info=True)
             
-            # Sleep at the end of the loop - runs immediately on first iteration, then every 10 minutes
-            await asyncio.sleep(600)  # Run every 10 minutes
+            # Sleep at the end of the loop - runs immediately on first iteration, then every 15 minutes  
+            await asyncio.sleep(900)  # Run every 15 minutes (reduced frequency)
 
     def _perform_weight_calculations_sync(self, weather_results, geomagnetic_results, soil_results, now, validator_nodes_by_uid_list):
         """

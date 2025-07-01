@@ -1727,6 +1727,11 @@ class GeomagneticTask(Task):
                 return
 
             logger.info(f"Found {len(pending_tasks_query)} pending tasks to cleanup")
+            
+            # Track cleanup statistics
+            skipped_too_young = 0
+            deleted_orphaned = 0
+            scored_ready = 0
 
             # Process each pending task
             for row in pending_tasks_query:
@@ -1751,6 +1756,7 @@ class GeomagneticTask(Task):
                                     {"task_id": task["id"]}
                                 )
                                 logger.info(f"Successfully deleted orphaned task {task['id']} for removed miner {task['miner_hotkey']}")
+                                deleted_orphaned += 1
                             except Exception as e:
                                 logger.error(f"Failed to delete orphaned task {task['id']}: {e}")
                             continue
@@ -1760,10 +1766,11 @@ class GeomagneticTask(Task):
                     
                     # 🔒 SECURITY: Check ground truth availability before attempting to fetch
                     if not await self._check_ground_truth_availability(task_hour):
-                        # If ground truth isn't available due to security timing, assign a default low score
-                        logger.warning(f"🔒 SECURITY: Ground truth not yet available for cleanup task {task['id']} from {task_hour}, assigning default score of 0")
-                        ground_truth_value = 0.0  # Default fallback for security timing
-                        score = 0.0  # Default score when security prevents ground truth access
+                        # If ground truth isn't available due to security timing, SKIP this task
+                        # It should remain pending until the 90-minute window passes
+                        logger.info(f"🔒 SECURITY: Ground truth not yet available for cleanup task {task['id']} from {task_hour}, keeping task pending until security window passes")
+                        skipped_too_young += 1
+                        continue  # Skip this task - don't score it prematurely
                     else:
                         # Security check passed, attempt to fetch ground truth
                         ground_truth_value = await self._fetch_ground_truth_for_time(task_hour, max_attempts=1)
@@ -1825,12 +1832,21 @@ class GeomagneticTask(Task):
                     await self.move_task_to_history(
                         task, ground_truth_value, score, datetime.datetime.now(datetime.timezone.utc)
                     )
+                    scored_ready += 1
 
                 except Exception as e:
                     logger.error(f"Error processing cleanup task {task['id']}: {e}")
                     continue
 
-            logger.info("Completed comprehensive cleanup of old pending tasks")
+            # Log cleanup summary
+            logger.info(f"Completed comprehensive cleanup: {scored_ready} tasks scored, {skipped_too_young} tasks kept pending (too young), {deleted_orphaned} orphaned tasks deleted")
+            
+            if skipped_too_young > 0:
+                logger.info(f"🔒 SECURITY: {skipped_too_young} tasks kept pending until 90-minute security window passes")
+            if scored_ready > 0:
+                logger.info(f"✅ Successfully scored {scored_ready} tasks with available ground truth")
+            if deleted_orphaned > 0:
+                logger.info(f"🧹 Cleaned up {deleted_orphaned} orphaned tasks from miners no longer in metagraph")
 
         except Exception as e:
             logger.error(f"Error in _comprehensive_pending_cleanup: {e}")
