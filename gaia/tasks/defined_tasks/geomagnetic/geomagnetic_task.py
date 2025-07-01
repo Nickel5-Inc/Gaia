@@ -238,6 +238,9 @@ class GeomagneticTask(Task):
         # Start the background worker for intelligent retry of pending tasks
         await self._start_pending_retry_worker(validator)
         
+        # Track the last executed hour to prevent double execution
+        last_executed_hour = None
+        
         try:
             while True:
                 try:
@@ -251,8 +254,19 @@ class GeomagneticTask(Task):
                         window_start = current_hour + datetime.timedelta(minutes=2)   # T:02
                         window_end = current_hour + datetime.timedelta(minutes=15)    # T:15
                         
+                        # Check if we've already executed for this hour
+                        if last_executed_hour == current_hour:
+                            # Already executed for this hour - wait for next hour's window
+                            next_hour = current_hour + datetime.timedelta(hours=1)
+                            next_window_start = next_hour + datetime.timedelta(minutes=2)
+                            sleep_duration = (next_window_start - current_time).total_seconds()
+                            logger.info(f"🔒 EXECUTION COMPLETE: Already executed for hour {current_hour.strftime('%H:%M')}, waiting for next window at {next_window_start.strftime('%H:%M')} (in {sleep_duration:.0f} seconds)")
+                            await validator.update_task_status('geomagnetic', 'idle')
+                            await asyncio.sleep(sleep_duration)
+                            query_hour = next_hour
+                        
                         # Check if we're in the current hour's execution window
-                        if window_start <= current_time <= window_end:
+                        elif window_start <= current_time <= window_end:
                             # We're in the execution window - proceed immediately
                             query_hour = current_hour
                             logger.info(f"🔒 FLEXIBLE TIMING: Executing within window at {current_time.strftime('%H:%M')} (T:02-T:15 window)")
@@ -327,17 +341,24 @@ class GeomagneticTask(Task):
                     logger.info(f"🔒 SECURITY: Ground truth fetching will enforce minimum {90 if not self.test_mode else 30}-minute delay")
                     await self._process_scores(validator, scoring_query_hour, score_target_hour)
                     
+                    # Mark this hour as executed to prevent re-execution
+                    last_executed_hour = query_hour
+                    logger.info(f"🔒 EXECUTION CYCLE COMPLETE: Marked hour {query_hour.strftime('%H:%M')} as executed")
+                    
                     await validator.update_task_status('geomagnetic', 'idle')
 
                     # In test mode, sleep for 5 minutes before next iteration
                     if self.test_mode:
                         logger.info("Test mode: Sleeping for 5 minutes before next execution")
                         await asyncio.sleep(300)
+                        last_executed_hour = None  # Reset in test mode to allow re-execution
                     else:
                         # Every 6 hours, run a more comprehensive cleanup of old pending tasks
                         if query_hour.hour % 6 == 0:
                             logger.info("Running comprehensive cleanup of old pending tasks")
                             await self._comprehensive_pending_cleanup(validator)
+                        
+                        # Continue loop immediately - will wait for next hour due to last_executed_hour check
 
                 except Exception as e:
                     logger.error(f"Unexpected error in validator_execute loop: {e}")
