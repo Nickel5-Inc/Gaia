@@ -214,9 +214,11 @@ async def _query_miners_for_forecasts(
         # Process responses and create database records
         for miner_hotkey, response in responses.items():
             if response.get("status") == "fetch_accepted" and response.get("job_id"):
-                # TODO: Get actual miner UID from substrate network
-                # For now, use mock UIDs
-                miner_uid = 1 if "1" in miner_hotkey else 2
+                # Get actual miner UID from substrate network
+                miner_uid = await _get_miner_uid_from_metagraph(validator, miner_hotkey)
+                if miner_uid is None:
+                    logger.warning(f"Could not find UID for miner {miner_hotkey[:8]}")
+                    continue
                 
                 response_id = await db.create_weather_miner_response(
                     pool=pool,
@@ -407,3 +409,39 @@ async def _queue_scoring_jobs(
     except Exception as e:
         logger.error(f"Error queueing scoring jobs for run {run_id}: {e}")
         raise
+
+
+async def _get_miner_uid_from_metagraph(validator, miner_hotkey: str) -> Optional[int]:
+    """
+    Get miner UID from the validator's metagraph.
+    
+    Args:
+        validator: Validator instance with metagraph
+        miner_hotkey: Miner's hotkey
+        
+    Returns:
+        Miner UID or None if not found
+    """
+    try:
+        if not hasattr(validator, 'metagraph') or not validator.metagraph:
+            logger.error("Validator has no metagraph available")
+            return None
+        
+        # Look up the miner node in the metagraph
+        node = validator.metagraph.nodes.get(miner_hotkey)
+        if not node:
+            logger.debug(f"Miner {miner_hotkey[:8]} not found in metagraph")
+            return None
+        
+        # Get the UID from the node
+        uid = getattr(node, 'uid', None)
+        if uid is not None:
+            logger.debug(f"Found UID {uid} for miner {miner_hotkey[:8]}")
+            return int(uid)
+        else:
+            logger.debug(f"No UID found for miner {miner_hotkey[:8]}")
+            return None
+        
+    except Exception as e:
+        logger.error(f"Error getting UID for miner {miner_hotkey[:8]}: {e}")
+        return None

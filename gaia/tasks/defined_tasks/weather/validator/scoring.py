@@ -538,16 +538,14 @@ async def _process_single_variable_day1(
             result["error_message"] = f"Sanity checks failed for {var_name}"
             return result
         
-        # Calculate bias-corrected skill score
-        # Note: This is a simplified implementation - the full algorithm would include
-        # bias correction, MSE skill score calculation, and clone detection
-        skill_score = await _calculate_simplified_skill_score(
-            truth_var_da, ref_var_da, lat_weights
+        # Calculate MSE skill score with bias correction
+        skill_score = await _calculate_mse_skill_score(
+            truth_var_da, truth_var_da, ref_var_da, lat_weights
         )
         
-        # Calculate ACC score
-        acc_score = await _calculate_simplified_acc_score(
-            truth_var_da, ref_var_da, clim_var_da, lat_weights
+        # Calculate ACC score using ERA5 climatology
+        acc_score = await _calculate_acc_score(
+            truth_var_da, truth_var_da, clim_var_da, lat_weights
         )
         
         result["skill_score"] = skill_score
@@ -573,27 +571,152 @@ async def _compute_era5_final_scoring_async(
 ) -> Dict[str, Any]:
     """
     Async implementation of ERA5 final scoring computation.
+    Calculates comprehensive statistical metrics against ERA5 analysis.
     """
     logger.info(f"[ERA5Score] Starting ERA5 final scoring for miner {miner_response_data['miner_hotkey']}")
-    
-    # This is a placeholder implementation - the full ERA5 scoring would include:
-    # - RMSE calculations against ERA5 analysis
-    # - Bias calculations
-    # - Correlation calculations
-    # - Comprehensive statistical metrics
     
     era5_results = {
         "response_id": miner_response_data["id"],
         "miner_hotkey": miner_response_data["miner_hotkey"],
-        "overall_era5_score": 0.5,  # Placeholder score
+        "overall_era5_score": None,
         "rmse_scores": {},
         "bias_scores": {},
         "correlation_scores": {},
+        "variable_scores": {},
         "error_message": None
     }
     
-    logger.info(f"[ERA5Score] ERA5 scoring completed (placeholder implementation)")
+    try:
+        # Load miner forecast data
+        forecast_ds = await _load_miner_forecast_data(miner_response_data)
+        if forecast_ds is None:
+            era5_results["error_message"] = "Failed to load miner forecast data"
+            return era5_results
+        
+        # Get variables to score from config
+        variables_to_score = era5_scoring_config.get("variables_to_score", [])
+        if not variables_to_score:
+            era5_results["error_message"] = "No variables configured for ERA5 scoring"
+            return era5_results
+        
+        variable_scores = []
+        
+        # Process each variable
+        for var_config in variables_to_score:
+            var_name = var_config["name"]
+            var_level = var_config.get("level")
+            var_key = f"{var_name}{var_level}" if var_level else var_name
+            
+            try:
+                # Extract variable data from forecast and ERA5
+                forecast_var = forecast_ds[var_name]
+                era5_var = era5_analysis_ds[var_name]
+                
+                # Handle pressure levels
+                if var_level:
+                    forecast_var = _extract_pressure_level(forecast_var, var_level)
+                    era5_var = _extract_pressure_level(era5_var, var_level)
+                    
+                    if forecast_var is None or era5_var is None:
+                        logger.warning(f"Missing pressure level {var_level} for {var_name}")
+                        continue
+                
+                # Interpolate to common grid if needed
+                if not forecast_var.dims == era5_var.dims:
+                    forecast_var = await asyncio.to_thread(
+                        lambda: forecast_var.interp_like(era5_var, method="linear")
+                    )
+                
+                # Calculate latitude weights
+                lat_weights = _calculate_latitude_weights(era5_var)
+                spatial_dims = [d for d in era5_var.dims if d.lower() in ("lat", "lon")]
+                
+                # Calculate RMSE
+                rmse_result = await asyncio.to_thread(
+                    lambda: xs.rmse(forecast_var, era5_var, dim=spatial_dims, weights=lat_weights, skipna=True)
+                )
+                if hasattr(rmse_result, "compute"):
+                    rmse_result = await asyncio.to_thread(rmse_result.compute)
+                rmse_score = float(rmse_result.item())
+                
+                # Calculate bias (mean error)
+                bias_result = await asyncio.to_thread(
+                    lambda: (forecast_var - era5_var).weighted(lat_weights).mean(dim=spatial_dims, skipna=True)
+                )
+                if hasattr(bias_result, "compute"):
+                    bias_result = await asyncio.to_thread(bias_result.compute)
+                bias_score = float(bias_result.item())
+                
+                # Calculate correlation
+                corr_result = await asyncio.to_thread(
+                    lambda: xs.pearson_r(forecast_var, era5_var, dim=spatial_dims, weights=lat_weights, skipna=True)
+                )
+                if hasattr(corr_result, "compute"):
+                    corr_result = await asyncio.to_thread(corr_result.compute)
+                corr_score = float(corr_result.item())
+                
+                # Store individual variable scores
+                era5_results["rmse_scores"][var_key] = rmse_score
+                era5_results["bias_scores"][var_key] = bias_score
+                era5_results["correlation_scores"][var_key] = corr_score
+                
+                # Calculate weighted variable score (higher correlation, lower RMSE/bias is better)
+                var_weight = var_config.get("weight", 1.0)
+                
+                # Normalize RMSE by variable-specific scaling
+                var_scaling = era5_scoring_config.get("variable_scaling", {}).get(var_name, 1.0)
+                normalized_rmse = rmse_score / var_scaling
+                
+                # Combined score: correlation - penalty for RMSE and bias
+                var_score = corr_score - (normalized_rmse * 0.1) - (abs(bias_score) * 0.05)
+                var_score = max(var_score, -1.0)  # Floor at -1
+                
+                era5_results["variable_scores"][var_key] = {
+                    "score": var_score,
+                    "weight": var_weight,
+                    "rmse": rmse_score,
+                    "bias": bias_score,
+                    "correlation": corr_score
+                }
+                
+                variable_scores.append(var_score * var_weight)
+                
+                logger.debug(f"[ERA5Score] {var_key}: RMSE={rmse_score:.4f}, Bias={bias_score:.4f}, Corr={corr_score:.4f}, Score={var_score:.4f}")
+                
+            except Exception as var_e:
+                logger.error(f"[ERA5Score] Error processing variable {var_key}: {var_e}")
+                era5_results["variable_scores"][var_key] = {
+                    "error": str(var_e)
+                }
+        
+        # Calculate overall ERA5 score as weighted average
+        if variable_scores:
+            total_weight = sum(var_config.get("weight", 1.0) for var_config in variables_to_score)
+            era5_results["overall_era5_score"] = sum(variable_scores) / total_weight
+        else:
+            era5_results["overall_era5_score"] = 0.0
+            era5_results["error_message"] = "No variables successfully scored"
+        
+        logger.info(f"[ERA5Score] ERA5 scoring completed. Overall score: {era5_results['overall_era5_score']:.4f}")
+        
+    except Exception as e:
+        logger.error(f"[ERA5Score] Error in ERA5 final scoring: {e}")
+        era5_results["error_message"] = str(e)
+        era5_results["overall_era5_score"] = 0.0
+    
     return era5_results
+
+
+async def _load_miner_forecast_data(miner_response_data: Dict[str, Any]) -> Optional[xr.Dataset]:
+    """Load miner forecast data from storage."""
+    try:
+        # This would load the miner's forecast from R2 or local storage
+        # For now, return None to indicate data loading needs to be implemented
+        logger.warning("Miner forecast data loading not yet implemented")
+        return None
+    except Exception as e:
+        logger.error(f"Error loading miner forecast data: {e}")
+        return None
 
 
 async def _compute_forecast_verification_async(
@@ -603,26 +726,269 @@ async def _compute_forecast_verification_async(
 ) -> Dict[str, Any]:
     """
     Async implementation of forecast verification computation.
+    Performs comprehensive data quality and integrity checks.
     """
     logger.info(f"[ForecastVerify] Starting verification for miner {miner_response_data['miner_hotkey']}")
-    
-    # This is a placeholder implementation - the full verification would include:
-    # - Data quality checks
-    # - Grid consistency validation
-    # - Variable range validation
-    # - Temporal consistency checks
     
     verification_results = {
         "response_id": miner_response_data["id"],
         "miner_hotkey": miner_response_data["miner_hotkey"],
-        "verification_passed": True,  # Placeholder result
+        "verification_passed": True,
         "quality_checks": {},
         "integrity_checks": {},
-        "error_message": None
+        "grid_checks": {},
+        "temporal_checks": {},
+        "variable_checks": {},
+        "error_message": None,
+        "warnings": []
     }
     
-    logger.info(f"[ForecastVerify] Verification completed (placeholder implementation)")
+    try:
+        # 1. Grid consistency validation
+        grid_checks = await _verify_grid_consistency(forecast_ds, verification_config)
+        verification_results["grid_checks"] = grid_checks
+        if not grid_checks.get("passed", False):
+            verification_results["verification_passed"] = False
+        
+        # 2. Variable range validation
+        variable_checks = await _verify_variable_ranges(forecast_ds, verification_config)
+        verification_results["variable_checks"] = variable_checks
+        if not variable_checks.get("passed", False):
+            verification_results["verification_passed"] = False
+        
+        # 3. Temporal consistency checks
+        temporal_checks = await _verify_temporal_consistency(forecast_ds, verification_config)
+        verification_results["temporal_checks"] = temporal_checks
+        if not temporal_checks.get("passed", False):
+            verification_results["verification_passed"] = False
+        
+        # 4. Data quality checks
+        quality_checks = await _verify_data_quality(forecast_ds, verification_config)
+        verification_results["quality_checks"] = quality_checks
+        if not quality_checks.get("passed", False):
+            verification_results["verification_passed"] = False
+        
+        # 5. Physical consistency checks
+        integrity_checks = await _verify_physical_consistency(forecast_ds, verification_config)
+        verification_results["integrity_checks"] = integrity_checks
+        if not integrity_checks.get("passed", False):
+            verification_results["verification_passed"] = False
+        
+        # Collect all warnings
+        all_warnings = []
+        for check_type in ["grid_checks", "variable_checks", "temporal_checks", "quality_checks", "integrity_checks"]:
+            warnings = verification_results[check_type].get("warnings", [])
+            all_warnings.extend([f"{check_type}: {w}" for w in warnings])
+        verification_results["warnings"] = all_warnings
+        
+        logger.info(f"[ForecastVerify] Verification completed. Passed: {verification_results['verification_passed']}, Warnings: {len(all_warnings)}")
+        
+    except Exception as e:
+        logger.error(f"[ForecastVerify] Error in forecast verification: {e}")
+        verification_results["error_message"] = str(e)
+        verification_results["verification_passed"] = False
+    
     return verification_results
+
+
+async def _verify_grid_consistency(forecast_ds: xr.Dataset, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify grid consistency and coordinate validity."""
+    result = {"passed": True, "warnings": [], "details": {}}
+    
+    try:
+        # Check for required dimensions
+        required_dims = config.get("required_dimensions", ["lat", "lon", "time"])
+        missing_dims = [dim for dim in required_dims if dim not in forecast_ds.dims]
+        if missing_dims:
+            result["passed"] = False
+            result["warnings"].append(f"Missing required dimensions: {missing_dims}")
+        
+        # Check coordinate ranges
+        if "lat" in forecast_ds.dims:
+            lat_values = forecast_ds.coords["lat"].values
+            if lat_values.min() < -90 or lat_values.max() > 90:
+                result["passed"] = False
+                result["warnings"].append(f"Invalid latitude range: [{lat_values.min():.2f}, {lat_values.max():.2f}]")
+        
+        if "lon" in forecast_ds.dims:
+            lon_values = forecast_ds.coords["lon"].values
+            if lon_values.min() < -180 or lon_values.max() > 360:
+                result["warnings"].append(f"Unusual longitude range: [{lon_values.min():.2f}, {lon_values.max():.2f}]")
+        
+        # Check grid resolution consistency
+        expected_resolution = config.get("expected_grid_resolution")
+        if expected_resolution and "lat" in forecast_ds.dims and "lon" in forecast_ds.dims:
+            lat_diff = np.diff(forecast_ds.coords["lat"].values)
+            lon_diff = np.diff(forecast_ds.coords["lon"].values)
+            
+            if not np.allclose(lat_diff, expected_resolution, atol=0.01):
+                result["warnings"].append(f"Inconsistent latitude resolution: expected {expected_resolution}, got {lat_diff[0]:.3f}")
+            if not np.allclose(lon_diff, expected_resolution, atol=0.01):
+                result["warnings"].append(f"Inconsistent longitude resolution: expected {expected_resolution}, got {lon_diff[0]:.3f}")
+        
+        result["details"]["grid_shape"] = dict(forecast_ds.dims)
+        
+    except Exception as e:
+        result["passed"] = False
+        result["warnings"].append(f"Grid verification error: {e}")
+    
+    return result
+
+
+async def _verify_variable_ranges(forecast_ds: xr.Dataset, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify variable values are within physically reasonable ranges."""
+    result = {"passed": True, "warnings": [], "details": {}}
+    
+    try:
+        variable_bounds = config.get("variable_bounds", {})
+        
+        for var_name, data_array in forecast_ds.data_vars.items():
+            bounds = variable_bounds.get(var_name)
+            if not bounds:
+                continue
+            
+            min_bound, max_bound = bounds
+            actual_min = float(data_array.min())
+            actual_max = float(data_array.max())
+            
+            result["details"][var_name] = {
+                "min": actual_min,
+                "max": actual_max,
+                "expected_min": min_bound,
+                "expected_max": max_bound
+            }
+            
+            if actual_min < min_bound:
+                result["passed"] = False
+                result["warnings"].append(f"{var_name} minimum {actual_min:.2f} below bound {min_bound}")
+            
+            if actual_max > max_bound:
+                result["passed"] = False
+                result["warnings"].append(f"{var_name} maximum {actual_max:.2f} above bound {max_bound}")
+        
+    except Exception as e:
+        result["passed"] = False
+        result["warnings"].append(f"Variable range verification error: {e}")
+    
+    return result
+
+
+async def _verify_temporal_consistency(forecast_ds: xr.Dataset, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify temporal consistency and forecast lead times."""
+    result = {"passed": True, "warnings": [], "details": {}}
+    
+    try:
+        if "time" not in forecast_ds.dims:
+            result["warnings"].append("No time dimension found")
+            return result
+        
+        time_values = pd.to_datetime(forecast_ds.coords["time"].values)
+        
+        # Check for monotonic time progression
+        if not time_values.is_monotonic_increasing:
+            result["passed"] = False
+            result["warnings"].append("Time coordinate is not monotonically increasing")
+        
+        # Check time intervals
+        time_diffs = np.diff(time_values)
+        expected_interval = config.get("expected_time_interval_hours", 6)
+        expected_delta = pd.Timedelta(hours=expected_interval)
+        
+        if not all(diff == expected_delta for diff in time_diffs):
+            result["warnings"].append(f"Inconsistent time intervals: expected {expected_interval}h")
+        
+        # Check forecast lead times
+        if "forecast_reference_time" in forecast_ds.coords:
+            ref_time = pd.to_datetime(forecast_ds.coords["forecast_reference_time"].values)
+            lead_times = time_values - ref_time
+            max_lead = config.get("max_forecast_lead_hours", 240)
+            
+            if lead_times.max() > pd.Timedelta(hours=max_lead):
+                result["warnings"].append(f"Forecast lead time exceeds {max_lead}h")
+        
+        result["details"]["time_range"] = {
+            "start": str(time_values.min()),
+            "end": str(time_values.max()),
+            "count": len(time_values)
+        }
+        
+    except Exception as e:
+        result["passed"] = False
+        result["warnings"].append(f"Temporal verification error: {e}")
+    
+    return result
+
+
+async def _verify_data_quality(forecast_ds: xr.Dataset, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify data quality - check for NaN values, data completeness."""
+    result = {"passed": True, "warnings": [], "details": {}}
+    
+    try:
+        max_nan_fraction = config.get("max_nan_fraction", 0.05)  # 5% max NaN values
+        
+        for var_name, data_array in forecast_ds.data_vars.items():
+            total_points = data_array.size
+            nan_count = int(data_array.isnull().sum())
+            nan_fraction = nan_count / total_points if total_points > 0 else 0
+            
+            result["details"][var_name] = {
+                "total_points": total_points,
+                "nan_count": nan_count,
+                "nan_fraction": nan_fraction
+            }
+            
+            if nan_fraction > max_nan_fraction:
+                result["passed"] = False
+                result["warnings"].append(f"{var_name} has {nan_fraction:.1%} NaN values (max allowed: {max_nan_fraction:.1%})")
+            
+            # Check for infinite values
+            inf_count = int(np.isinf(data_array.values).sum())
+            if inf_count > 0:
+                result["passed"] = False
+                result["warnings"].append(f"{var_name} contains {inf_count} infinite values")
+        
+    except Exception as e:
+        result["passed"] = False
+        result["warnings"].append(f"Data quality verification error: {e}")
+    
+    return result
+
+
+async def _verify_physical_consistency(forecast_ds: xr.Dataset, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify physical consistency between related variables."""
+    result = {"passed": True, "warnings": [], "details": {}}
+    
+    try:
+        # Check humidity variables are non-negative
+        humidity_vars = [var for var in forecast_ds.data_vars if var.startswith('q')]
+        for var_name in humidity_vars:
+            min_val = float(forecast_ds[var_name].min())
+            if min_val < 0:
+                result["passed"] = False
+                result["warnings"].append(f"Humidity variable {var_name} has negative values: {min_val:.6f}")
+        
+        # Check temperature consistency between levels (if pressure levels exist)
+        temp_vars = [var for var in forecast_ds.data_vars if var.startswith('t') and var != '2t']
+        if len(temp_vars) > 1 and any('plev' in str(forecast_ds[var].dims) for var in temp_vars):
+            # Basic check that temperature decreases with altitude (simplified)
+            result["warnings"].append("Temperature lapse rate checks not yet implemented")
+        
+        # Check wind speed consistency
+        if '10u' in forecast_ds.data_vars and '10v' in forecast_ds.data_vars:
+            u_wind = forecast_ds['10u']
+            v_wind = forecast_ds['10v']
+            wind_speed = np.sqrt(u_wind**2 + v_wind**2)
+            max_wind = float(wind_speed.max())
+            
+            max_reasonable_wind = config.get("max_wind_speed_ms", 100)  # 100 m/s
+            if max_wind > max_reasonable_wind:
+                result["warnings"].append(f"Unreasonably high wind speed: {max_wind:.1f} m/s")
+        
+    except Exception as e:
+        result["passed"] = False
+        result["warnings"].append(f"Physical consistency verification error: {e}")
+    
+    return result
 
 
 # ========== Helper Functions ==========
@@ -753,49 +1119,123 @@ async def _perform_basic_sanity_checks(
         return False
 
 
-async def _calculate_simplified_skill_score(
+async def _calculate_mse_skill_score(
+    forecast_da: xr.DataArray,
     truth_da: xr.DataArray,
     ref_da: xr.DataArray,
     weights: Optional[xr.DataArray]
 ) -> float:
-    """Calculate a simplified skill score."""
+    """
+    Calculate the MSE-based skill score: 1 - (MSE_forecast / MSE_reference).
+    Includes bias correction and proper MSE skill score calculation.
+    """
     try:
-        # This is a simplified implementation
-        # The full implementation would include bias correction and proper MSE skill score
+        spatial_dims = [d for d in forecast_da.dims if d.lower() in ("lat", "lon")]
+        if not spatial_dims:
+            logger.error("No spatial dimensions (lat/lon) found for MSE skill score.")
+            return -np.inf
+
+        # Step 1: Apply bias correction to forecast
+        forecast_bc_da = await _calculate_bias_corrected_forecast(forecast_da, truth_da)
         
-        # Calculate MSE for reference
-        ref_mse = xs.mse(ref_da, truth_da, dim=['lat', 'lon'], weights=weights, skipna=True)
+        # Step 2: Calculate MSE for bias-corrected forecast
+        mse_forecast = await asyncio.to_thread(
+            lambda: xs.mse(forecast_bc_da, truth_da, dim=spatial_dims, weights=weights, skipna=True)
+        )
         
-        # For now, return a placeholder skill score
-        # In the full implementation, this would be: 1 - (forecast_mse / ref_mse)
-        skill_score = float(0.7)  # Placeholder
+        # Step 3: Calculate MSE for reference
+        mse_reference = await asyncio.to_thread(
+            lambda: xs.mse(ref_da, truth_da, dim=spatial_dims, weights=weights, skipna=True)
+        )
         
+        # Ensure results are computed if they're dask arrays
+        if hasattr(mse_forecast, "compute"):
+            mse_forecast = await asyncio.to_thread(mse_forecast.compute)
+        if hasattr(mse_reference, "compute"):
+            mse_reference = await asyncio.to_thread(mse_reference.compute)
+        
+        mse_forecast_val = float(mse_forecast.item())
+        mse_reference_val = float(mse_reference.item())
+        
+        # Calculate skill score
+        if mse_reference_val == 0:
+            skill_score = 1.0 if mse_forecast_val == 0 else -np.inf
+        else:
+            skill_score = 1 - (mse_forecast_val / mse_reference_val)
+        
+        logger.debug(f"MSE Skill Score: {skill_score:.4f} (forecast_mse: {mse_forecast_val:.4f}, ref_mse: {mse_reference_val:.4f})")
         return skill_score
+        
     except Exception as e:
-        logger.error(f"Error calculating skill score: {e}")
-        return 0.0
+        logger.error(f"Error calculating MSE skill score: {e}")
+        return -np.inf
 
 
-async def _calculate_simplified_acc_score(
+async def _calculate_bias_corrected_forecast(
+    forecast_da: xr.DataArray, 
+    truth_da: xr.DataArray
+) -> xr.DataArray:
+    """Calculate a bias-corrected forecast by subtracting the spatial mean error."""
+    try:
+        spatial_dims = [d for d in forecast_da.dims if d.lower() in ("lat", "lon")]
+        if not spatial_dims:
+            logger.warning("No spatial dimensions found for bias correction")
+            return forecast_da
+        
+        # Calculate bias (spatial mean error)
+        error = forecast_da - truth_da
+        bias = error.mean(dim=spatial_dims)
+        
+        # Apply bias correction
+        forecast_bc_da = forecast_da - bias
+        
+        logger.debug(f"Applied bias correction: mean bias = {float(bias.mean()):.4f}")
+        return forecast_bc_da
+        
+    except Exception as e:
+        logger.error(f"Error in bias correction: {e}")
+        return forecast_da
+
+
+async def _calculate_acc_score(
+    forecast_da: xr.DataArray,
     truth_da: xr.DataArray,
-    ref_da: xr.DataArray,
     clim_da: xr.DataArray,
     weights: Optional[xr.DataArray]
 ) -> float:
-    """Calculate a simplified ACC score."""
+    """
+    Calculate the Anomaly Correlation Coefficient (ACC).
+    ACC = correlation(forecast_anomaly, truth_anomaly)
+    """
     try:
-        # This is a simplified implementation
-        # The full implementation would calculate proper anomaly correlation coefficient
+        spatial_dims = [d for d in forecast_da.dims if d.lower() in ("lat", "lon")]
+        if not spatial_dims:
+            logger.error("No spatial dimensions (lat/lon) found for ACC.")
+            return -np.inf
         
-        # Calculate correlation between truth and reference
-        correlation = xs.pearson_r(truth_da, ref_da, dim=['lat', 'lon'], weights=weights, skipna=True)
+        # Calculate anomalies by subtracting climatology
+        forecast_anom = forecast_da - clim_da
+        truth_anom = truth_da - clim_da
         
-        acc_score = float(correlation.compute()) if hasattr(correlation, 'compute') else float(correlation)
+        logger.debug(f"Forecast anomaly range: [{float(forecast_anom.min()):.2f}, {float(forecast_anom.max()):.2f}]")
+        logger.debug(f"Truth anomaly range: [{float(truth_anom.min()):.2f}, {float(truth_anom.max()):.2f}]")
         
+        # Calculate correlation between anomalies
+        acc_result = await asyncio.to_thread(
+            lambda: xs.pearson_r(forecast_anom, truth_anom, dim=spatial_dims, weights=weights, skipna=True)
+        )
+        
+        # Ensure result is computed if it's a dask array
+        if hasattr(acc_result, "compute"):
+            acc_result = await asyncio.to_thread(acc_result.compute)
+        
+        acc_score = float(acc_result.item())
+        logger.debug(f"ACC calculated: {acc_score:.4f}")
         return acc_score
+        
     except Exception as e:
-        logger.error(f"Error calculating ACC score: {e}")
-        return 0.0
+        logger.error(f"Error calculating ACC: {e}")
+        return -np.inf
 
 
 # ========== Legacy Compatibility Functions ==========

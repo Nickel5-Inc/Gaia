@@ -465,33 +465,52 @@ class WeatherMinerClient:
     async def _get_active_miners(self, validator) -> List[Dict[str, Any]]:
         """Get list of active miners from the validator."""
         try:
-            # This would typically query the substrate network for active miners
-            # For now, return a mock list for testing
-            # In production, this would be: return await validator.get_active_miners()
+            # Get active miners from the validator's metagraph
+            if not hasattr(validator, 'metagraph') or not validator.metagraph:
+                logger.error("Validator has no metagraph available")
+                return []
             
-            # Mock active miners for testing
-            mock_miners = [
-                {
-                    "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-                    "ip": "192.168.1.100",
-                    "port": 8091,
-                    "protocol": 4,  # HTTPS
-                    "uid": 1
-                },
-                {
-                    "hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
-                    "ip": "192.168.1.101", 
-                    "port": 8091,
-                    "protocol": 4,  # HTTPS
-                    "uid": 2
+            metagraph = validator.metagraph
+            active_miners = []
+            
+            # Iterate through all nodes in the metagraph
+            for hotkey, node in metagraph.nodes.items():
+                if not node or not node.ip or not node.port:
+                    logger.debug(f"Skipping miner {hotkey[:8]} - missing IP/port")
+                    continue
+                
+                # Convert IP if it's in integer format
+                ip_address = node.ip
+                if isinstance(ip_address, int):
+                    import ipaddress
+                    try:
+                        ip_address = str(ipaddress.ip_address(ip_address))
+                    except ValueError as e:
+                        logger.warning(f"Invalid IP for miner {hotkey[:8]}: {node.ip}")
+                        continue
+                
+                # Determine protocol (3=HTTP, 4=HTTPS)
+                protocol = getattr(node, 'protocol', 4)  # Default to HTTPS
+                
+                # Get UID if available
+                uid = getattr(node, 'uid', None)
+                
+                miner_info = {
+                    "hotkey": hotkey,
+                    "ip": ip_address,
+                    "port": int(node.port),
+                    "protocol": int(protocol),
+                    "uid": uid
                 }
-            ]
+                
+                active_miners.append(miner_info)
+                logger.debug(f"Found active miner: {hotkey[:8]} at {ip_address}:{node.port}")
             
-            logger.info(f"Retrieved {len(mock_miners)} active miners (mock data)")
-            return mock_miners
+            logger.info(f"Retrieved {len(active_miners)} active miners from metagraph")
+            return active_miners
             
         except Exception as e:
-            logger.error(f"Error getting active miners: {e}")
+            logger.error(f"Error getting active miners from metagraph: {e}")
             return []
 
     async def _get_miner_info(self, validator, miner_hotkey: str) -> Optional[Dict[str, Any]]:
@@ -525,17 +544,21 @@ class WeatherMinerClient:
     async def _get_auth_headers(self, validator, miner_hotkey: str) -> Dict[str, str]:
         """Get authentication headers for miner communication."""
         try:
-            # This would typically create signed headers for authentication
-            # For now, return basic headers
+            current_timestamp = int(datetime.utcnow().timestamp())
+            request_id = f"req_{current_timestamp}"
+            
             headers = {
                 "Content-Type": "application/json",
                 "User-Agent": "GaiaValidator/4.0",
                 "X-Validator-Hotkey": validator.keypair.ss58_address,
-                "X-Request-ID": f"req_{int(datetime.utcnow().timestamp())}"
+                "X-Request-ID": request_id,
+                "X-Timestamp": str(current_timestamp)
             }
             
-            # In production, this would include cryptographic signatures:
-            # headers["Authorization"] = await self._create_auth_signature(validator, miner_hotkey)
+            # Create cryptographic signature for authentication
+            auth_signature = await self._create_auth_signature(validator, miner_hotkey, current_timestamp)
+            if auth_signature:
+                headers["Authorization"] = f"Bearer {auth_signature}"
             
             return headers
             
@@ -543,12 +566,29 @@ class WeatherMinerClient:
             logger.error(f"Error creating auth headers: {e}")
             return {"Content-Type": "application/json"}
 
-    async def _create_auth_signature(self, validator, miner_hotkey: str) -> str:
+    async def _create_auth_signature(self, validator, miner_hotkey: str, timestamp: int) -> str:
         """Create cryptographic signature for authentication."""
-        # This would implement the actual signature creation
-        # using the validator's keypair and current timestamp
-        # For now, return a placeholder
-        return "Bearer mock_signature"
+        try:
+            # Create the message to sign
+            message_parts = [
+                validator.keypair.ss58_address,  # Validator hotkey
+                miner_hotkey,                   # Target miner hotkey
+                str(timestamp)                  # Timestamp
+            ]
+            message = "|".join(message_parts)
+            
+            # Sign the message using the validator's keypair
+            signature_bytes = validator.keypair.sign(message.encode('utf-8'))
+            
+            # Convert to hex string for transmission
+            signature_hex = signature_bytes.hex()
+            
+            logger.debug(f"Created auth signature for miner {miner_hotkey[:8]}")
+            return signature_hex
+            
+        except Exception as e:
+            logger.error(f"Error creating auth signature: {e}")
+            return None
 
     # ========== Batch Operations ==========
 
