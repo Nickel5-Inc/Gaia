@@ -1,0 +1,259 @@
+groups:
+  - name: gaia_validator_alerts
+    rules:
+      # IPC Queue Alerts
+      - alert: ValidatorIPCQueueFull
+        expr: gaia_ipc_queue_depth{queue="work"} > 500
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Validator IPC work queue is full!"
+          description: "The work queue between the IO-Engine and Compute Pool is over 500. The system is back-pressured and compute cannot keep up. Check compute worker logs."
+
+      - alert: ValidatorIPCQueueHigh
+        expr: gaia_ipc_queue_depth{queue="work"} > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Validator IPC work queue is building up"
+          description: "The work queue depth ({{ $value }}) has been above 100 for more than 10 minutes. Consider scaling compute workers."
+
+      - alert: ValidatorIPCResultQueueFull
+        expr: gaia_ipc_queue_depth{queue="result"} > 500
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Validator IPC result queue is full!"
+          description: "The result queue is over 500. The IO-Engine may not be processing results fast enough."
+
+      # Process Health Alerts
+      - alert: ValidatorProcessDown
+        expr: up{job="gaia-validator"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Validator process is down"
+          description: "The Gaia Validator process {{ $labels.instance }} has been down for more than 1 minute."
+
+      - alert: ValidatorProcessRestarting
+        expr: increase(gaia_child_process_restarts_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Validator process restarted"
+          description: "{{ $labels.process_type }} process has restarted {{ $value }} times in the last 5 minutes."
+
+      - alert: ValidatorProcessHighRestarts
+        expr: increase(gaia_child_process_restarts_total[1h]) > 5
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Validator process restarting frequently"
+          description: "{{ $labels.process_type }} process has restarted {{ $value }} times in the last hour. Check for memory leaks or crashes."
+
+      # Memory Usage Alerts
+      - alert: ValidatorHighMemoryUsage
+        expr: gaia_process_memory_rss_bytes / (1024*1024*1024) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Validator process using high memory"
+          description: "{{ $labels.process_type }} process is using {{ $value | humanize }}GB of memory for more than 10 minutes."
+
+      - alert: ValidatorCriticalMemoryUsage
+        expr: gaia_process_memory_rss_bytes / (1024*1024*1024) > 4
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Validator process using critical memory"
+          description: "{{ $labels.process_type }} process is using {{ $value | humanize }}GB of memory. Process may be killed by OOM killer."
+
+      # CPU Usage Alerts
+      - alert: ValidatorHighCPUUsage
+        expr: rate(gaia_process_cpu_seconds_total[5m]) * 100 > 80
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Validator process using high CPU"
+          description: "{{ $labels.process_type }} process is using {{ $value | humanize }}% CPU for more than 15 minutes."
+
+      - alert: ValidatorCriticalCPUUsage
+        expr: rate(gaia_process_cpu_seconds_total[5m]) * 100 > 95
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Validator process using critical CPU"
+          description: "{{ $labels.process_type }} process is using {{ $value | humanize }}% CPU for more than 5 minutes."
+
+      # IO-Engine Health Alerts
+      - alert: ValidatorEventLoopLag
+        expr: gaia_io_event_loop_lag_seconds > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IO-Engine event loop lag detected"
+          description: "Event loop lag is {{ $value | humanizeDuration }}. The IO-Engine may be overloaded."
+
+      - alert: ValidatorCriticalEventLoopLag
+        expr: gaia_io_event_loop_lag_seconds > 0.1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical IO-Engine event loop lag"
+          description: "Event loop lag is {{ $value | humanizeDuration }}. The IO-Engine is severely overloaded."
+
+      # Database Alerts
+      - alert: ValidatorDatabaseConnectionsHigh
+        expr: gaia_db_connections_active > 15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High number of database connections"
+          description: "{{ $value }} active database connections. May indicate connection leaks or high load."
+
+      - alert: ValidatorDatabaseConnectionsExhausted
+        expr: gaia_db_connections_active >= 20
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database connection pool exhausted"
+          description: "All {{ $value }} database connections are in use. New operations will fail."
+
+      # Compute Job Performance Alerts
+      - alert: ValidatorSlowComputeJobs
+        expr: histogram_quantile(0.95, rate(gaia_compute_job_duration_seconds_bucket[5m])) > 60
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Compute jobs are running slowly"
+          description: "95th percentile compute job duration is {{ $value | humanizeDuration }}. Jobs may be taking longer than expected."
+
+      - alert: ValidatorComputeJobFailures
+        expr: rate(gaia_compute_job_failures_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Compute job failures detected"
+          description: "{{ $value }} compute job failures per second. Check compute worker logs."
+
+      - alert: ValidatorHighComputeJobFailureRate
+        expr: rate(gaia_compute_job_failures_total[5m]) / rate(gaia_compute_job_duration_seconds_count[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High compute job failure rate"
+          description: "{{ $value | humanizePercentage }} of compute jobs are failing. System may be unstable."
+
+      # Weather Validation Specific Alerts
+      - alert: ValidatorNoWeatherRuns
+        expr: absent(gaia_weather_runs_active) or gaia_weather_runs_active == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No active weather forecast runs"
+          description: "No weather forecast runs have been active for 30 minutes. Check weather task scheduling."
+
+      - alert: ValidatorStuckWeatherRuns
+        expr: gaia_weather_runs_active{status="processing"} > 0
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Weather runs stuck in processing"
+          description: "{{ $value }} weather runs have been in processing state for over 6 hours."
+
+      - alert: ValidatorLowScoringPerformance
+        expr: avg(gaia_weather_score_day1) < 0.3
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low weather scoring performance"
+          description: "Average Day-1 score ({{ $value | humanizePercentage }}) has been below 30% for over 1 hour."
+
+      # Storage and Cache Alerts
+      - alert: ValidatorDiskSpaceLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk space"
+          description: "Disk space on / is below 20% ({{ $value | humanizePercentage }} available)."
+
+      - alert: ValidatorDiskSpaceCritical
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical disk space"
+          description: "Disk space on / is below 10% ({{ $value | humanizePercentage }} available). Immediate action required."
+
+      # Application-Level Alerts
+      - alert: ValidatorNoRecentActivity
+        expr: increase(gaia_compute_job_duration_seconds_count[30m]) == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No recent compute activity"
+          description: "No compute jobs have completed in the last 30 minutes. System may be idle or stuck."
+
+      - alert: ValidatorHighErrorRate
+        expr: rate(gaia_errors_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value }} errors per second. Check application logs."
+
+      # Network and External Dependencies
+      - alert: ValidatorSubstrateConnectionLost
+        expr: gaia_substrate_connection_status == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Substrate connection lost"
+          description: "Connection to Substrate network has been lost for over 2 minutes."
+
+      - alert: ValidatorMinersUnresponsive
+        expr: rate(gaia_miner_communication_timeouts_total[10m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High miner timeout rate"
+          description: "{{ $value }} miner communication timeouts per second. Network or miner issues detected."
+
+  - name: gaia_validator_deadman
+    rules:
+      # Deadman switch - ensures monitoring is working
+      - alert: ValidatorDeadManSwitch
+        expr: vector(1)
+        for: 0m
+        labels:
+          severity: none
+        annotations:
+          summary: "Validator monitoring is alive"
+          description: "This alert is always firing to ensure monitoring and alerting is functioning."

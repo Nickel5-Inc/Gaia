@@ -1,0 +1,28 @@
+# Testing Framework
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+pytest-mock>=3.11.0
+pytest-benchmark>=4.0.0
+pytest-timeout>=2.1.0
+
+# Test Database
+pytest-postgresql>=6.0.0
+
+# Mocking and Fixtures
+responses>=0.23.0
+freezegun>=1.2.0
+factory-boy>=3.3.0
+
+# Async Testing
+aioresponses>=0.7.4
+
+# Data Testing  
+hypothesis>=6.82.0
+
+# Performance Testing
+locust>=2.15.0
+
+# Load Testing Data
+xarray>=2023.6.0
+numpy>=1.24.0
