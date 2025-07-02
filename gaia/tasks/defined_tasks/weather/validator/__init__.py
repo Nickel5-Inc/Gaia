@@ -1,0 +1,1 @@
+# Weather validator logic package

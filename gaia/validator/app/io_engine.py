@@ -126,21 +126,28 @@ class IOEngine:
             name='IO-Engine Heartbeat'
         )
         
-        # TODO: During logic migration, register actual tasks here
-        # from gaia.tasks.defined_tasks.weather.task import WeatherTask
-        # from gaia.tasks.defined_tasks.geomagnetic.task import GeomagneticTask
-        # from gaia.tasks.defined_tasks.soilmoisture.task import SoilMoistureTask
-        # 
-        # tasks = [WeatherTask(), GeomagneticTask(), SoilMoistureTask()]
-        # for task in tasks:
-        #     self.scheduler.add_job(
-        #         task.run_scheduled_job,
-        #         'cron',
-        #         **self._parse_cron_schedule(task.cron_schedule),
-        #         args=[self],
-        #         id=f'task_{task.name}',
-        #         name=f'Scheduled {task.name} task'
-        #     )
+        # Register actual tasks
+        try:
+            from gaia.tasks.defined_tasks.weather.task import WeatherTask
+            
+            tasks = [WeatherTask()]
+            for task in tasks:
+                cron_params = self._parse_cron_schedule(task.cron_schedule)
+                self.scheduler.add_job(
+                    task.run_scheduled_job,
+                    'cron',
+                    **cron_params,
+                    args=[self],
+                    id=f'task_{task.name}',
+                    name=f'Scheduled {task.name} task',
+                    max_instances=1,  # Prevent overlapping runs
+                    coalesce=True     # Combine missed runs
+                )
+                logger.info(f"Registered task: {task.name} with schedule: {task.cron_schedule}")
+                
+        except ImportError as e:
+            logger.warning(f"Could not import task modules: {e}")
+            # Continue with just the heartbeat for now
         
         logger.info("Scheduled jobs configured")
 
@@ -168,18 +175,20 @@ class IOEngine:
         """Initialize database and HTTP connections."""
         logger.info("Initializing connections")
         
-        # TODO: Initialize database pool during logic migration
-        # from gaia.validator.db.connection import DBPoolManager
-        # self.db_pool = await DBPoolManager.get_pool(self.config)
+        # Initialize database pool
+        from gaia.validator.db.connection import get_db_pool
+        self.db_pool = await get_db_pool()
+        logger.info("Database pool initialized")
         
-        # TODO: Initialize HTTP client during logic migration
-        # import httpx
-        # self.http_client = httpx.AsyncClient(
-        #     timeout=self.config.HTTP_TIMEOUT_SECONDS,
-        #     limits=httpx.Limits(max_connections=self.config.HTTP_MAX_CONNECTIONS)
-        # )
+        # Initialize HTTP client
+        import httpx
+        self.http_client = httpx.AsyncClient(
+            timeout=self.config.HTTP_TIMEOUT_SECONDS,
+            limits=httpx.Limits(max_connections=self.config.HTTP_MAX_CONNECTIONS)
+        )
+        logger.info("HTTP client initialized")
         
-        logger.info("Connections initialized")
+        logger.info("All connections initialized successfully")
 
     async def cleanup_connections(self):
         """Clean up database and HTTP connections."""
@@ -190,7 +199,8 @@ class IOEngine:
             self.http_client = None
         
         if self.db_pool:
-            await self.db_pool.close()
+            from gaia.validator.db.connection import close_db_pool
+            await close_db_pool()
             self.db_pool = None
         
         logger.info("Connections cleaned up")

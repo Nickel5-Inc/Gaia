@@ -4,8 +4,31 @@ import os
 import queue
 from gaia.validator.utils.ipc_types import ResultUnit
 
-# This registry will be populated during the logic migration phase
-HANDLER_REGISTRY = {}
+# Handler registry for task dispatch
+HANDLER_REGISTRY = {
+    # Weather task handlers
+    "weather.hash.gfs_compute": None,  # Will be lazy-loaded
+    "weather.hash.verification_compute": None,  # Will be lazy-loaded  
+    "weather.hash.forecast_verify": None,  # Will be lazy-loaded
+}
+
+
+def _lazy_load_handler(task_name: str):
+    """Lazy load handlers to keep worker startup fast."""
+    if task_name == "weather.hash.gfs_compute":
+        from gaia.tasks.defined_tasks.weather.validator.hashing import handle_gfs_hash_computation
+        HANDLER_REGISTRY[task_name] = handle_gfs_hash_computation
+        return handle_gfs_hash_computation
+    elif task_name == "weather.hash.verification_compute":
+        from gaia.tasks.defined_tasks.weather.validator.hashing import handle_verification_hash_computation
+        HANDLER_REGISTRY[task_name] = handle_verification_hash_computation
+        return handle_verification_hash_computation
+    elif task_name == "weather.hash.forecast_verify":
+        from gaia.tasks.defined_tasks.weather.validator.hashing import handle_forecast_hash_verification
+        HANDLER_REGISTRY[task_name] = handle_forecast_hash_verification
+        return handle_forecast_hash_verification
+    else:
+        return None
 
 
 def main(config, work_q, result_q, worker_id: int):
@@ -28,7 +51,10 @@ def main(config, work_q, result_q, worker_id: int):
             try:
                 handler = HANDLER_REGISTRY.get(work_unit.task_name)
                 if not handler:
-                    raise ValueError(f"No handler found for task: {work_unit.task_name}")
+                    # Try lazy loading the handler
+                    handler = _lazy_load_handler(work_unit.task_name)
+                    if not handler:
+                        raise ValueError(f"No handler found for task: {work_unit.task_name}")
 
                 # This is where the magic happens: the handler is a pure function
                 result_payload = handler(config, **work_unit.payload)
