@@ -184,38 +184,68 @@ async def _query_miners_for_forecasts(
     Returns:
         List of miner response records
     """
+    from .miner_client import WeatherMinerClient
+    
     pool = await get_db_pool()
     miner_responses = []
     
     try:
-        # TODO: This is a placeholder - in the full implementation, this would:
-        # 1. Query the substrate network for active miners
-        # 2. Send forecast requests to each miner via HTTP
-        # 3. Create database records for each response
+        # TODO: Get actual validator instance from io_engine
+        # For now, this is a placeholder that needs validator integration
+        # In the full implementation, this would access the validator through io_engine
         
-        # For now, create a mock response structure
-        mock_miners = [
-            {"uid": 1, "hotkey": "mock_miner_1_hotkey"},
-            {"uid": 2, "hotkey": "mock_miner_2_hotkey"},
-        ]
+        # Create miner client
+        miner_client = WeatherMinerClient(io_engine)
         
-        for miner in mock_miners:
-            response_id = await db.create_weather_miner_response(
-                pool=pool,
-                run_id=run_id,
-                miner_uid=miner["uid"],
-                miner_hotkey=miner["hotkey"],
-                job_id=f"weather_job_{run_id}_{miner['uid']}",
-                input_hash_validator=validator_hash
-            )
-            
-            miner_responses.append({
-                "response_id": response_id,
-                "miner_uid": miner["uid"],
-                "miner_hotkey": miner["hotkey"],
-                "job_id": f"weather_job_{run_id}_{miner['uid']}"
-            })
-            
+        # Calculate GFS T-6 time
+        gfs_t_minus_6_run_time = gfs_init_time - timedelta(hours=6)
+        
+        logger.info(f"Sending initiate fetch requests for run {run_id}")
+        
+        # TODO: This requires validator instance - placeholder for now
+        # responses = await miner_client.initiate_fetch_from_miners(
+        #     validator=validator,  # Need to get this from io_engine
+        #     gfs_t0_run_time=gfs_init_time,
+        #     gfs_t_minus_6_run_time=gfs_t_minus_6_run_time
+        # )
+        
+        # For now, create mock responses to maintain functionality
+        mock_responses = {
+            "mock_miner_1_hotkey": {
+                "status": "fetch_accepted",
+                "job_id": f"weather_job_{run_id}_1"
+            },
+            "mock_miner_2_hotkey": {
+                "status": "fetch_accepted", 
+                "job_id": f"weather_job_{run_id}_2"
+            }
+        }
+        
+        # Process responses and create database records
+        for miner_hotkey, response in mock_responses.items():
+            if response.get("status") == "fetch_accepted" and response.get("job_id"):
+                # TODO: Get actual miner UID from substrate network
+                # For now, use mock UIDs
+                miner_uid = 1 if "1" in miner_hotkey else 2
+                
+                response_id = await db.create_weather_miner_response(
+                    pool=pool,
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                    miner_hotkey=miner_hotkey,
+                    job_id=response["job_id"],
+                    input_hash_validator=validator_hash
+                )
+                
+                miner_responses.append({
+                    "response_id": response_id,
+                    "miner_uid": miner_uid,
+                    "miner_hotkey": miner_hotkey,
+                    "job_id": response["job_id"]
+                })
+            else:
+                logger.warning(f"Miner {miner_hotkey} did not accept fetch request: {response}")
+                
         logger.info(f"Created {len(miner_responses)} miner response records")
         return miner_responses
         
@@ -242,45 +272,115 @@ async def _verify_miner_responses(
     Returns:
         List of verified miner responses
     """
+    from .miner_client import WeatherMinerClient
+    
     pool = await get_db_pool()
     verified_responses = []
     
-    for response in miner_responses:
-        try:
-            # TODO: In full implementation, this would:
-            # 1. Retrieve the miner's forecast URL
-            # 2. Verify the forecast hash using compute workers
-            # 3. Check forecast data integrity
-            # 4. Update the response status in the database
-            
-            # For now, simulate verification
-            logger.info(f"Verifying response {response['response_id']} from miner {response['miner_uid']}")
-            
-            # Mock verification result (in reality, this would use the compute pool)
-            verification_passed = True  # Mock result
-            
-            await db.update_weather_miner_response(
-                pool=pool,
-                response_id=response["response_id"],
-                verification_passed=verification_passed,
-                status="verified" if verification_passed else "verification_failed",
-                input_hash_match=True  # Mock - would compare miner hash vs validator hash
-            )
-            
-            if verification_passed:
-                verified_responses.append(response)
-                
-        except Exception as e:
-            logger.error(f"Error verifying miner response {response['response_id']}: {e}")
+    if not miner_responses:
+        logger.warning(f"No miner responses to verify for run {run_id}")
+        return verified_responses
+    
+    try:
+        # Create miner client
+        miner_client = WeatherMinerClient(io_engine)
+        
+        # Wait for miners to fetch GFS data and compute hashes
+        wait_minutes = io_engine.config.WEATHER.VALIDATOR_HASH_WAIT_MINUTES
+        logger.info(f"Waiting {wait_minutes} minutes for miners to fetch GFS and compute hashes...")
+        await asyncio.sleep(wait_minutes * 60)
+        
+        # Poll miners for their input status
+        logger.info(f"Polling miners for input status for run {run_id}")
+        
+        # TODO: This requires validator instance - placeholder for now
+        # status_responses = await miner_client.get_input_status_from_miners(
+        #     validator=validator,  # Need to get this from io_engine
+        #     miner_jobs=miner_responses
+        # )
+        
+        # For now, simulate status polling
+        mock_status_responses = {}
+        for response in miner_responses:
+            miner_hotkey = response["miner_hotkey"]
+            # Simulate that miners have computed matching hashes
+            mock_status_responses[miner_hotkey] = {
+                "status": "input_hashed_awaiting_validation",
+                "input_data_hash": validator_hash,  # Mock matching hash
+                "job_id": response["job_id"]
+            }
+        
+        # Process status responses and verify hashes
+        for response in miner_responses:
             try:
+                miner_hotkey = response["miner_hotkey"]
+                status_data = mock_status_responses.get(miner_hotkey, {})
+                
+                miner_status = status_data.get("status")
+                miner_hash = status_data.get("input_data_hash")
+                
+                verification_passed = False
+                hash_match = False
+                new_status = "verification_failed"
+                
+                if (miner_hash and 
+                    miner_status == "input_hashed_awaiting_validation" and 
+                    miner_hash == validator_hash):
+                    
+                    logger.info(f"Hash MATCH for response {response['response_id']} from miner {miner_hotkey[:8]}")
+                    verification_passed = True
+                    hash_match = True
+                    new_status = "verified"
+                    
+                    # Trigger inference on this miner
+                    # TODO: This requires validator instance - placeholder for now
+                    # trigger_success = await miner_client._trigger_single_miner_inference(
+                    #     validator=validator,
+                    #     miner_hotkey=miner_hotkey,
+                    #     job_id=response["job_id"]
+                    # )
+                    trigger_success = True  # Mock successful inference trigger
+                    
+                    if trigger_success:
+                        new_status = "inference_triggered"
+                        verified_responses.append(response)
+                        logger.info(f"Successfully triggered inference on {miner_hotkey[:8]}")
+                    else:
+                        logger.warning(f"Failed to trigger inference on {miner_hotkey[:8]}")
+                        new_status = "inference_trigger_failed"
+                        
+                elif miner_hash and miner_hash != validator_hash:
+                    logger.warning(f"Hash MISMATCH for response {response['response_id']}: miner={miner_hash[:10]}... validator={validator_hash[:10]}...")
+                    new_status = "input_hash_mismatch"
+                else:
+                    logger.warning(f"Miner {miner_hotkey[:8]} failed to provide valid input hash")
+                    new_status = "input_fetch_error"
+                
+                # Update database with verification results
                 await db.update_weather_miner_response(
                     pool=pool,
                     response_id=response["response_id"],
-                    status="verification_failed",
-                    error_message=str(e)
+                    verification_passed=verification_passed,
+                    status=new_status,
+                    input_hash_match=hash_match,
+                    input_hash_miner=miner_hash,
+                    input_hash_validator=validator_hash
                 )
-            except Exception as db_err:
-                logger.error(f"Failed to update response status: {db_err}")
+                
+            except Exception as e:
+                logger.error(f"Error verifying miner response {response['response_id']}: {e}")
+                try:
+                    await db.update_weather_miner_response(
+                        pool=pool,
+                        response_id=response["response_id"],
+                        status="verification_failed",
+                        error_message=str(e)
+                    )
+                except Exception as db_err:
+                    logger.error(f"Failed to update response status: {db_err}")
+    
+    except Exception as e:
+        logger.error(f"Error in miner response verification for run {run_id}: {e}")
     
     return verified_responses
 

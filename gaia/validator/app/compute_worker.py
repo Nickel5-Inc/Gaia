@@ -10,6 +10,9 @@ HANDLER_REGISTRY = {
     "weather.hash.gfs_compute": None,  # Will be lazy-loaded
     "weather.hash.verification_compute": None,  # Will be lazy-loaded  
     "weather.hash.forecast_verify": None,  # Will be lazy-loaded
+    "weather.scoring.day1_compute": None,  # Will be lazy-loaded
+    "weather.scoring.era5_final_compute": None,  # Will be lazy-loaded
+    "weather.scoring.forecast_verification": None,  # Will be lazy-loaded
 }
 
 
@@ -27,6 +30,18 @@ def _lazy_load_handler(task_name: str):
         from gaia.tasks.defined_tasks.weather.validator.hashing import handle_forecast_hash_verification
         HANDLER_REGISTRY[task_name] = handle_forecast_hash_verification
         return handle_forecast_hash_verification
+    elif task_name == "weather.scoring.day1_compute":
+        from gaia.tasks.defined_tasks.weather.validator.scoring import handle_day1_scoring_computation
+        HANDLER_REGISTRY[task_name] = handle_day1_scoring_computation
+        return handle_day1_scoring_computation
+    elif task_name == "weather.scoring.era5_final_compute":
+        from gaia.tasks.defined_tasks.weather.validator.scoring import handle_era5_final_scoring_computation
+        HANDLER_REGISTRY[task_name] = handle_era5_final_scoring_computation
+        return handle_era5_final_scoring_computation
+    elif task_name == "weather.scoring.forecast_verification":
+        from gaia.tasks.defined_tasks.weather.validator.scoring import handle_forecast_verification_computation
+        HANDLER_REGISTRY[task_name] = handle_forecast_verification_computation
+        return handle_forecast_verification_computation
     else:
         return None
 
