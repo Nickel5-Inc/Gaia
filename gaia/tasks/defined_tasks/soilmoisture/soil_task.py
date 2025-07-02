@@ -1902,6 +1902,27 @@ class SoilMoistureTask(Task):
                         surface_ssim = entry.get('surface_structure_score', 0) or 0
                         rootzone_ssim = entry.get('rootzone_structure_score', 0) or 0
                         
+                        # Recompute RMSE if metric missing / NULL
+                        try:
+                            import numpy as _np
+                            if surface_rmse is None and entry.get('surface_sm_pred') is not None and entry.get('surface_sm_truth') is not None:
+                                _pred = _np.array(entry['surface_sm_pred'], dtype=float)
+                                _truth = _np.array(entry['surface_sm_truth'], dtype=float)
+                                if _pred.size == _truth.size and _pred.size > 0:
+                                    surface_rmse = float(_np.sqrt(_np.mean((_pred - _truth) ** 2)))
+                        except Exception:
+                            pass
+
+                        try:
+                            import numpy as _np
+                            if rootzone_rmse is None and entry.get('rootzone_sm_pred') is not None and entry.get('rootzone_sm_truth') is not None:
+                                _pred_rz = _np.array(entry['rootzone_sm_pred'], dtype=float)
+                                _truth_rz = _np.array(entry['rootzone_sm_truth'], dtype=float)
+                                if _pred_rz.size == _truth_rz.size and _pred_rz.size > 0:
+                                    rootzone_rmse = float(_np.sqrt(_np.mean((_pred_rz - _truth_rz) ** 2)))
+                        except Exception:
+                            pass
+                        
                         # CRITICAL: Apply EXACT same validation as regular scoring flow
                         # Mirror SoilScoringMechanism.validate_metrics() exactly
                         
