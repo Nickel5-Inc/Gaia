@@ -1,9 +1,10 @@
-import traceback
-import httpx
-from datetime import datetime
-from fiber.logging_utils import get_logger
-import pytz
 import asyncio
+import traceback
+from datetime import datetime
+
+import httpx
+import pytz
+from fiber.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -32,24 +33,22 @@ async def fetch_data(url=None, max_retries=3):
     # Configure timeout and connection settings
     timeout_config = httpx.Timeout(
         connect=30.0,  # Connection timeout
-        read=60.0,     # Read timeout
-        write=30.0,    # Write timeout
-        pool=60.0      # Pool timeout
+        read=60.0,  # Read timeout
+        write=30.0,  # Write timeout
+        pool=60.0,  # Pool timeout
     )
-    
+
     limits = httpx.Limits(
-        max_keepalive_connections=5,
-        max_connections=10,
-        keepalive_expiry=30.0
+        max_keepalive_connections=5, max_connections=10, keepalive_expiry=30.0
     )
 
     for attempt in range(max_retries):
         try:
             async with httpx.AsyncClient(
-                timeout=timeout_config, 
+                timeout=timeout_config,
                 limits=limits,
                 verify=False,  # Disable SSL verification if needed
-                follow_redirects=True
+                follow_redirects=True,
             ) as client:
                 response = await client.get(url)
                 response.raise_for_status()
@@ -73,7 +72,7 @@ async def fetch_data(url=None, max_retries=3):
             logger.error(f"HTTP error {e.response.status_code}: {e}")
             if e.response.status_code in [500, 502, 503, 504]:  # Server errors, retry
                 if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 10  
+                    wait_time = (attempt + 1) * 10
                     logger.warning(f"Server error, retrying in {wait_time}s...")
                     await asyncio.sleep(wait_time)
                     continue

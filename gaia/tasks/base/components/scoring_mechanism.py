@@ -1,9 +1,9 @@
-from pydantic import BaseModel, Field
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
+from typing import Any, Dict
+
+from pydantic import BaseModel, Field
+
 from ..decorators import task_timer
-from .inputs import Inputs
-from .outputs import Outputs
 
 
 class ScoringMechanism(BaseModel, ABC):

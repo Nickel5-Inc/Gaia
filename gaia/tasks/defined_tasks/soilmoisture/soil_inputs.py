@@ -1,6 +1,8 @@
-from pydantic import BaseModel
-from typing import Dict, List, Optional, Any
 from datetime import datetime
+from typing import Any, Dict, List
+
+from pydantic import BaseModel
+
 from gaia.tasks.base.components.inputs import Inputs
 from gaia.tasks.base.decorators import handle_validation_error
 

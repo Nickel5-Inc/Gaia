@@ -1,7 +1,8 @@
 import os
 import sys
-from fiber.logging_utils import get_logger
 from unittest.mock import patch
+
+from fiber.logging_utils import get_logger
 
 #####Temp Health Check to run on local
 
@@ -16,11 +17,9 @@ with patch.dict(
     "os.environ",
     {"EARTHDATA_USERNAME": "mock_user", "EARTHDATA_PASSWORD": "mock_password"},
 ):
-    from gaia.validator.validator import GaiaValidator
-    from gaia.validator.database.validator_database_manager import (
-        ValidatorDatabaseManager,
-    )
     import requests
+
+    from gaia.validator.validator import GaiaValidator
 
 logger = get_logger(__name__)
 

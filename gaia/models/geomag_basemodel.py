@@ -1,18 +1,20 @@
-import traceback
-import pandas as pd
 import logging
+import traceback
+
+import pandas as pd
+
 logging.getLogger("prophet.plot").disabled = True
-from prophet import Prophet
-from datetime import datetime, timedelta
+import importlib.util
+import json
+import sys
+from datetime import datetime
+
+import numpy as np
 import pytz
+import torch
 from fiber.logging_utils import get_logger
 from huggingface_hub import hf_hub_download
-import importlib.util
-import sys
-import numpy as np
-import json
-import torch
-import random
+from prophet import Prophet
 
 logger = get_logger(__name__)
 
@@ -32,15 +34,15 @@ class FallbackGeoMagModel:
     def __init__(self, random_seed=42):
         np.random.seed(random_seed)
         self.random_seed = random_seed
-        
+
         self.model = Prophet(
             yearly_seasonality=True,
             weekly_seasonality=True,
             daily_seasonality=True,
             interval_width=0.95,
-            mcmc_samples=0
+            mcmc_samples=0,
         )
-        
+
         self._is_fallback = True
 
     def predict(self, x):
@@ -55,7 +57,7 @@ class FallbackGeoMagModel:
         """
         try:
             np.random.seed(self.random_seed)
-            
+
             # Ensure data is in the correct format
             if isinstance(x, pd.DataFrame):
                 # Data is already a DataFrame, just ensure columns are correct
@@ -71,7 +73,9 @@ class FallbackGeoMagModel:
                 df = pd.DataFrame(
                     {
                         "ds": [
-                            pd.to_datetime(x["ds"] if "ds" in x else x["timestamp"], utc=True)
+                            pd.to_datetime(
+                                x["ds"] if "ds" in x else x["timestamp"], utc=True
+                            )
                         ],
                         "y": [float(x["y"] if "y" in x else x["value"])],
                     }
@@ -83,7 +87,7 @@ class FallbackGeoMagModel:
 
             if self._is_fallback:
                 np.random.seed(self.random_seed)
-                
+
                 # Fit model on current data
                 self.model.fit(df)
 
@@ -109,9 +113,9 @@ class FallbackGeoMagModel:
             # Handle NaN/Inf values
             if np.isnan(result) or np.isinf(result) or not -1000 < float(result) < 1000:
                 logger.warning(f"Invalid prediction value: {result}, using input value")
-                return float(df["y"].iloc[-1]) / 100 # Normalize the fallback
+                return float(df["y"].iloc[-1]) / 100  # Normalize the fallback
 
-            return float(result) / 100 # Normalize the prediction to (-5, 5)
+            return float(result) / 100  # Normalize the prediction to (-5, 5)
 
         except Exception as e:
             logger.error(f"Error during prediction: {e}")
@@ -122,14 +126,18 @@ class FallbackGeoMagModel:
             return float(
                 x.get("y", 0.0)
                 if isinstance(x, dict)
-                else df["y"].iloc[-1] if "df" in locals() else 0.0
+                else df["y"].iloc[-1]
+                if "df" in locals()
+                else 0.0
             )
 
 
 class GeoMagBaseModel:
     """Wrapper class for geomagnetic prediction models."""
 
-    def __init__(self, repo_id="Nickel5HF/geomagmodel", filename="BaseModel.py", random_seed=42):
+    def __init__(
+        self, repo_id="Nickel5HF/geomagmodel", filename="BaseModel.py", random_seed=42
+    ):
         self.model = None
         self._is_fallback = True
         self.random_seed = random_seed
@@ -180,7 +188,7 @@ class GeoMagBaseModel:
         """
         try:
             np.random.seed(self.random_seed)
-            
+
             # Ensure data is in the correct format
             if isinstance(data, pd.DataFrame):
                 df = data.copy()
@@ -197,7 +205,11 @@ class GeoMagBaseModel:
                 # Create DataFrame from dict
                 df = pd.DataFrame(
                     {
-                        "ds": [pd.to_datetime(data.get("timestamp", data.get("ds")), utc=True)],
+                        "ds": [
+                            pd.to_datetime(
+                                data.get("timestamp", data.get("ds")), utc=True
+                            )
+                        ],
                         "y": [float(data.get("value", data.get("y", 0.0)))],
                     }
                 )
@@ -208,7 +220,7 @@ class GeoMagBaseModel:
 
             if self._is_fallback:
                 np.random.seed(self.random_seed)
-                
+
                 # Use Prophet model
                 self.model.fit(df)
                 future_dates = pd.date_range(
@@ -245,9 +257,9 @@ class GeoMagBaseModel:
             # Handle NaN/Inf values
             if np.isnan(result) or np.isinf(result) or not -1000 < float(result) < 1000:
                 logger.warning(f"Invalid prediction value: {result}, using input value")
-                return float(df["y"].iloc[-1]) / 100 # Normalize the fallback
+                return float(df["y"].iloc[-1]) / 100  # Normalize the fallback
 
-            return float(result) / 100 # Normalize the prediction to (-5, 5)
+            return float(result) / 100  # Normalize the prediction to (-5, 5)
 
         except Exception as e:
             logger.error(f"Error during prediction: {e}")
@@ -255,7 +267,9 @@ class GeoMagBaseModel:
             fallback_value = (
                 data.get("value", 0.0)
                 if isinstance(data, dict)
-                else df["y"].iloc[-1] if "df" in locals() else 0.0
+                else df["y"].iloc[-1]
+                if "df" in locals()
+                else 0.0
             )
             logger.error(f"Using input value as fallback: {fallback_value}")
-            return float(fallback_value) / 100 # Normalize the fallback value
+            return float(fallback_value) / 100  # Normalize the fallback value

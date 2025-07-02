@@ -44,6 +44,7 @@ prophet
 psutil
 psycopg2_binary
 pydantic
+pydantic-settings
 pyproj
 python-dotenv
 pytorch_lightning
@@ -80,3 +81,13 @@ blosc
 memray
 intake-xarray
 cfgrib
+
+# Phase 0 Refactor Dependencies
+apscheduler
+numba
+py-spy
+prometheus-client
+structlog
+pytest
+pytest-asyncio
+pytest-mock

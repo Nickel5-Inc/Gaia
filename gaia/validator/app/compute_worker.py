@@ -1,0 +1,110 @@
+import time
+import resource
+import os
+import queue
+from gaia.validator.utils.ipc_types import ResultUnit
+
+# Handler registry for task dispatch
+HANDLER_REGISTRY = {
+    # Weather task handlers
+    "weather.hash.gfs_compute": None,  # Will be lazy-loaded
+    "weather.hash.verification_compute": None,  # Will be lazy-loaded  
+    "weather.hash.forecast_verify": None,  # Will be lazy-loaded
+    "weather.scoring.day1_compute": None,  # Will be lazy-loaded
+    "weather.scoring.era5_final_compute": None,  # Will be lazy-loaded
+    "weather.scoring.forecast_verification": None,  # Will be lazy-loaded
+}
+
+
+def _lazy_load_handler(task_name: str):
+    """Lazy load handlers to keep worker startup fast."""
+    if task_name == "weather.hash.gfs_compute":
+        from gaia.tasks.defined_tasks.weather.validator.hashing import handle_gfs_hash_computation
+        HANDLER_REGISTRY[task_name] = handle_gfs_hash_computation
+        return handle_gfs_hash_computation
+    elif task_name == "weather.hash.verification_compute":
+        from gaia.tasks.defined_tasks.weather.validator.hashing import handle_verification_hash_computation
+        HANDLER_REGISTRY[task_name] = handle_verification_hash_computation
+        return handle_verification_hash_computation
+    elif task_name == "weather.hash.forecast_verify":
+        from gaia.tasks.defined_tasks.weather.validator.hashing import handle_forecast_hash_verification
+        HANDLER_REGISTRY[task_name] = handle_forecast_hash_verification
+        return handle_forecast_hash_verification
+    elif task_name == "weather.scoring.day1_compute":
+        from gaia.tasks.defined_tasks.weather.validator.scoring import handle_day1_scoring_computation
+        HANDLER_REGISTRY[task_name] = handle_day1_scoring_computation
+        return handle_day1_scoring_computation
+    elif task_name == "weather.scoring.era5_final_compute":
+        from gaia.tasks.defined_tasks.weather.validator.scoring import handle_era5_final_scoring_computation
+        HANDLER_REGISTRY[task_name] = handle_era5_final_scoring_computation
+        return handle_era5_final_scoring_computation
+    elif task_name == "weather.scoring.forecast_verification":
+        from gaia.tasks.defined_tasks.weather.validator.scoring import handle_forecast_verification_computation
+        HANDLER_REGISTRY[task_name] = handle_forecast_verification_computation
+        return handle_forecast_verification_computation
+    else:
+        return None
+
+
+def main(config, work_q, result_q, worker_id: int):
+    """The main execution loop for a compute worker process."""
+    pid = os.getpid()
+    worker_name = f"ComputeWorker-{worker_id}"
+    print(f"{worker_name} (PID: {pid}) started.")
+
+    # Set a hard memory limit for this process to prevent runaway jobs
+    limit_mb = config.PROCESS_MAX_RSS_MB.get('compute', 1024)
+    limit_bytes = limit_mb * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+
+    for job_number in range(config.MAX_JOBS_PER_WORKER):
+        try:
+            work_unit = work_q.get(timeout=config.WORKER_QUEUE_TIMEOUT_S)
+            print(f"{worker_name}: Received job {job_number+1}/{config.MAX_JOBS_PER_WORKER}: {work_unit.job_id}")
+
+            start_time = time.monotonic()
+            try:
+                handler = HANDLER_REGISTRY.get(work_unit.task_name)
+                if not handler:
+                    # Try lazy loading the handler
+                    handler = _lazy_load_handler(work_unit.task_name)
+                    if not handler:
+                        raise ValueError(f"No handler found for task: {work_unit.task_name}")
+
+                # This is where the magic happens: the handler is a pure function
+                result_payload = handler(config, **work_unit.payload)
+
+                result = ResultUnit(
+                    job_id=work_unit.job_id,
+                    task_name=work_unit.task_name,
+                    success=True,
+                    result=result_payload,
+                    worker_pid=pid,
+                    execution_time_ms=0
+                )
+            except Exception as e:
+                print(f"{worker_name} ERROR processing job {work_unit.job_id}: {e}")
+                result = ResultUnit(
+                    job_id=work_unit.job_id,
+                    task_name=work_unit.task_name,
+                    success=False,
+                    error=f"{type(e).__name__}: {e}",
+                    worker_pid=pid,
+                    execution_time_ms=0
+                )
+
+            result.execution_time_ms = (time.monotonic() - start_time) * 1000
+            result_q.put(result)
+
+        except queue.Empty:
+            # It's okay to time out, just means the queue is idle.
+            # The worker can exit if it's been idle for too long.
+            print(f"{worker_name}: Queue idle, exiting after {config.MAX_JOBS_PER_WORKER} jobs.")
+            break
+        except Exception as e:
+            # Catch-all for unexpected errors in the worker loop itself
+            print(f"{worker_name} CRITICAL ERROR: {e}")
+            # Exit to be restarted by the supervisor
+            break
+
+    print(f"{worker_name} (PID: {pid}) finished max jobs or was idle, exiting cleanly.")

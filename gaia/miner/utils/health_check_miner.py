@@ -1,10 +1,11 @@
 import os
 import sys
-import logging
 from unittest.mock import patch
-from gaia.miner.miner import Miner
+
 import requests
-from fiber.logging_utils import get_logger
+
+from gaia.miner.miner import Miner
+
 ######Temp Health Check to run on local
 
 logger = getLogger(__name__)
@@ -59,15 +60,15 @@ def check_miner_initialization():
             subtensor = type("subtensor", (), {"chain_endpoint": None, "network": None})
 
         # Mock model loading and any file creation
-        with patch(
-            "gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing.SoilMinerPreprocessing._load_model"
-        ) as mock_load_model, patch("os.makedirs") as mock_makedirs, patch(
-            "builtins.open"
-        ) as mock_open, patch(
-            "tempfile.NamedTemporaryFile"
-        ) as mock_tempfile, patch(
-            "os.unlink"
-        ) as mock_unlink:
+        with (
+            patch(
+                "gaia.tasks.defined_tasks.soilmoisture.soil_miner_preprocessing.SoilMinerPreprocessing._load_model"
+            ) as mock_load_model,
+            patch("os.makedirs") as mock_makedirs,
+            patch("builtins.open") as mock_open,
+            patch("tempfile.NamedTemporaryFile") as mock_tempfile,
+            patch("os.unlink") as mock_unlink,
+        ):
             # Mock return values to prevent unnecessary operations
             mock_load_model.return_value = None  # Simulate successful model loading
             mock_makedirs.return_value = None

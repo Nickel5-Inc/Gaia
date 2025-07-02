@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  # Test PostgreSQL database
+  test-postgres:
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_DB: test_gaia_validator
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+    ports:
+      - "5433:5432"  # Use different port to avoid conflicts
+    volumes:
+      - test_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test_user -d test_gaia_validator"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test-network
+
+  # Test validator application
+  test-validator:
+    build: .
+    environment:
+      # Test configuration
+      DATABASE_HOST: test-postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: test_gaia_validator
+      DATABASE_USER: test_user
+      DATABASE_PASSWORD: test_password
+      DATABASE_POOL_MIN_SIZE: 1
+      DATABASE_POOL_MAX_SIZE: 5
+      
+      # Minimal test settings
+      NUM_COMPUTE_WORKERS: 2
+      MAX_JOBS_PER_WORKER: 10
+      SUPERVISOR_CHECK_INTERVAL_S: 5
+      
+      # Test weather settings
+      WEATHER_GFS_CACHE_DIR: /tmp/test_gfs_cache
+      WEATHER_VALIDATOR_HASH_WAIT_MINUTES: 1
+      
+      # Disable external services for testing
+      PROMETHEUS_ENABLED: false
+      R2_CLEANUP_ENABLED: false
+    volumes:
+      - test_gfs_cache:/tmp/test_gfs_cache
+    depends_on:
+      test-postgres:
+        condition: service_healthy
+    networks:
+      - test-network
+    command: ["python", "-m", "pytest", "tests/integration/", "-v", "--tb=short"]
+
+  # Test runner for unit tests
+  test-runner:
+    build: .
+    environment:
+      # Minimal config for unit tests (no database required)
+      NUM_COMPUTE_WORKERS: 2
+      DATABASE_HOST: localhost  # Not used in unit tests
+    volumes:
+      - .:/app
+      - test_coverage:/app/htmlcov
+    command: ["python", "-m", "pytest", "tests/unit/", "-v", "--cov-report=html", "--cov-report=term"]
+    networks:
+      - test-network
+
+volumes:
+  test_postgres_data:
+  test_gfs_cache:
+  test_coverage:
+
+networks:
+  test-network:
+    driver: bridge

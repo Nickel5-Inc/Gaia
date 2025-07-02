@@ -1,23 +1,24 @@
-from datetime import datetime, timedelta, timezone
 import logging
-from typing import Dict, List, Optional
+from typing import Dict
+
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 
 logger = logging.getLogger(__name__)
 
+
 async def analyze_soil_moisture_tables(db_manager: ValidatorDatabaseManager) -> Dict:
     """
     Analyze soil moisture prediction and history tables to identify potential issues.
-    
+
     Args:
         db_manager: Database manager instance for querying
-        
+
     Returns:
         Dict containing analysis results
     """
     try:
         results = {}
-        
+
         # 1. Count predictions by status
         status_query = """
             SELECT status, COUNT(*) as count 
@@ -97,42 +98,48 @@ async def analyze_soil_moisture_tables(db_manager: ValidatorDatabaseManager) -> 
         logger.error(f"Error analyzing soil moisture tables: {e}")
         raise
 
+
 async def print_analysis_results(results: Dict) -> None:
     """
     Print analysis results in a readable format.
-    
+
     Args:
         results: Dictionary containing analysis results
     """
     print("\n=== Soil Moisture Task Analysis ===\n")
-    
+
     print("Prediction Status Distribution:")
     for status, count in results["prediction_status_counts"].items():
         print(f"  {status}: {count}")
-    
+
     print("\nMissing History Records:")
     print(f"  Total count: {results['missing_history_count']}")
-    if results['missing_history_samples']:
+    if results["missing_history_samples"]:
         print("  Sample entries:")
-        for sample in results['missing_history_samples']:
-            print(f"    Region {sample['region_id']}, Miner {sample['miner_uid']}, Time {sample['target_time']}")
-    
+        for sample in results["missing_history_samples"]:
+            print(
+                f"    Region {sample['region_id']}, Miner {sample['miner_uid']}, Time {sample['target_time']}"
+            )
+
     print("\nPrediction Age Distribution:")
     for bucket, count in results["prediction_age_distribution"].items():
         print(f"  {bucket}: {count}")
-    
+
     print("\nOrphaned Predictions:")
     print(f"  Total count: {results['orphaned_predictions_count']}")
-    if results['orphaned_predictions_samples']:
+    if results["orphaned_predictions_samples"]:
         print("  Sample entries:")
-        for sample in results['orphaned_predictions_samples']:
-            print(f"    Region {sample['region_id']}, Miner {sample['miner_uid']}, Time {sample['target_time']}")
-    
+        for sample in results["orphaned_predictions_samples"]:
+            print(
+                f"    Region {sample['region_id']}, Miner {sample['miner_uid']}, Time {sample['target_time']}"
+            )
+
     print("\nHistory Table Statistics:")
     stats = results["history_stats"]
     print(f"  Total records: {stats['total_records']}")
     print(f"  Date range: {stats['earliest_record']} to {stats['latest_record']}")
     print(f"  Unique miners: {stats['unique_miners']}")
+
 
 async def main():
     """
@@ -149,6 +156,8 @@ async def main():
         if db_manager:
             await db_manager.close()
 
+
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main()) 
+
+    asyncio.run(main())

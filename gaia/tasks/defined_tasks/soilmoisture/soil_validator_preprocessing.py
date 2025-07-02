@@ -1,25 +1,30 @@
-from gaia.tasks.base.components.preprocessing import Preprocessing
-from datetime import datetime, timezone, date
-from huggingface_hub import hf_hub_download
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.tasks.defined_tasks.soilmoisture.utils.region_selection import (
-    select_random_region,
-    get_deterministic_seed,
-)
-from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import get_soil_data, get_data_dir
 import json
-from typing import Dict, Optional, List
 import os
-import shutil
-from sqlalchemy import text
-from fiber.logging_utils import get_logger
 import random
+import shutil
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+from fiber.logging_utils import get_logger
+from huggingface_hub import hf_hub_download
+
+from gaia.tasks.base.components.preprocessing import Preprocessing
+from gaia.tasks.defined_tasks.soilmoisture.utils.region_selection import (
+    get_deterministic_seed,
+    select_random_region,
+)
+from gaia.tasks.defined_tasks.soilmoisture.utils.soil_apis import (
+    get_data_dir,
+    get_soil_data,
+)
+from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 
 logger = get_logger(__name__)
 
 
 class SentinelServerError(Exception):
     """Raised when Sentinel server returns 500 error"""
+
     pass
 
 
@@ -50,7 +55,7 @@ class SoilValidatorPreprocessing(Preprocessing):
 
         try:
             if os.path.exists(local_path):
-                with open(local_path, "r") as f:
+                with open(local_path) as f:
                     return json.load(f)
 
             logger.info("Local H3 map not found, downloading from HuggingFace...")
@@ -60,7 +65,7 @@ class SoilValidatorPreprocessing(Preprocessing):
                 repo_type="dataset",
                 local_dir="./data/h3_map",
             )
-            with open(map_path, "r") as f:
+            with open(map_path) as f:
                 return json.load(f)
 
         except Exception as e:
@@ -110,8 +115,8 @@ class SoilValidatorPreprocessing(Preprocessing):
                 )
 
                 if not (
-                    combined_data_bytes.startswith(b"II\x2A\x00")
-                    or combined_data_bytes.startswith(b"MM\x00\x2A")
+                    combined_data_bytes.startswith(b"II\x2a\x00")
+                    or combined_data_bytes.startswith(b"MM\x00\x2a")
                 ):
                     logger.error("Invalid TIFF format: Missing TIFF header")
                     logger.error(f"First 16 bytes: {combined_data_bytes[:16].hex()}")
@@ -143,7 +148,7 @@ class SoilValidatorPreprocessing(Preprocessing):
                         :sentinel_bounds, :sentinel_crs, :array_shape, :status)
                 RETURNING id
                 """,
-                data
+                data,
             )
             region_id = result.scalar_one()
             return region_id
@@ -162,9 +167,9 @@ class SoilValidatorPreprocessing(Preprocessing):
                 FROM soil_moisture_regions 
                 WHERE target_time = :target_time
                 """,
-                {"target_time": target_time}
+                {"target_time": target_time},
             )
-            count = result['count'] if result else 0
+            count = result["count"] if result else 0
             return count >= self.regions_per_timestep
         except Exception as e:
             logger.error(f"Error checking existing regions: {str(e)}")
@@ -190,12 +195,12 @@ class SoilValidatorPreprocessing(Preprocessing):
             seed = get_deterministic_seed(today, hour)
             random.seed(seed)
             logger.info(f"Set random seed to {seed} for target_time {target_time}")
-            
+
             regions = []
             used_bounds = set()
             consecutive_500_errors = 0
             MAX_500_ERRORS = 3
-            
+
             while len(regions) < self.regions_per_timestep:
                 try:
                     bbox = select_random_region(
@@ -203,7 +208,7 @@ class SoilValidatorPreprocessing(Preprocessing):
                         urban_cells_set=self._urban_cells,
                         lakes_cells_set=self._lakes_cells,
                         timestamp=target_time,
-                        used_bounds=used_bounds
+                        used_bounds=used_bounds,
                     )
                     if bbox:
                         soil_data = await self.get_soil_data(bbox, ifs_forecast_time)
@@ -218,7 +223,9 @@ class SoilValidatorPreprocessing(Preprocessing):
                                 "sentinel_crs": crs,
                                 "array_shape": (222, 222),
                             }
-                            region_id = await self.store_region(region_data, target_time)
+                            region_id = await self.store_region(
+                                region_data, target_time
+                            )
                             region_data["id"] = region_id
                             regions.append(region_data)
                             self._update_daily_count(target_time)
@@ -226,24 +233,34 @@ class SoilValidatorPreprocessing(Preprocessing):
                             data_dir = get_data_dir()
                             for filename in os.listdir(data_dir):
                                 filepath = os.path.join(data_dir, filename)
-                                if os.path.isdir(filepath) and filename.startswith('tmp'):
+                                if os.path.isdir(filepath) and filename.startswith(
+                                    "tmp"
+                                ):
                                     try:
                                         shutil.rmtree(filepath)
-                                        logger.info(f"Removed temp directory: {filepath}")
+                                        logger.info(
+                                            f"Removed temp directory: {filepath}"
+                                        )
                                     except Exception as e:
-                                        logger.error(f"Failed to remove temp directory {filepath}: {e}")
-                                elif filename.endswith('.tif'):
+                                        logger.error(
+                                            f"Failed to remove temp directory {filepath}: {e}"
+                                        )
+                                elif filename.endswith(".tif"):
                                     try:
                                         os.remove(filepath)
                                         logger.info(f"Removed tif file: {filepath}")
                                     except Exception as e:
-                                        logger.error(f"Failed to remove tif file {filepath}: {e}")
+                                        logger.error(
+                                            f"Failed to remove tif file {filepath}: {e}"
+                                        )
 
                 except SentinelServerError:
                     consecutive_500_errors += 1
                     if consecutive_500_errors >= MAX_500_ERRORS:
-                        logger.warning(f"Hit {MAX_500_ERRORS} consecutive 500 errors, stopping region collection")
-                        raise 
+                        logger.warning(
+                            f"Hit {MAX_500_ERRORS} consecutive 500 errors, stopping region collection"
+                        )
+                        raise
                     continue
 
             random.seed()

@@ -1,8 +1,9 @@
-import torch
-import torch.nn.functional as F
+from typing import Dict
+
 import numpy as np
 import rasterio
-from typing import Dict
+import torch
+import torch.nn.functional as F
 
 
 class SoilMoistureInferencePreprocessor:
@@ -24,7 +25,7 @@ class SoilMoistureInferencePreprocessor:
         return normalized
 
     def preprocess(self, tiff_path: str) -> Dict[str, torch.Tensor]:
-        """ Preprocessing for base model with normalization and masking"""
+        """Preprocessing for base model with normalization and masking"""
         try:
             with rasterio.open(tiff_path) as src:
                 sentinel_data = src.read([1, 2])  # B8, B4
@@ -93,11 +94,10 @@ class SoilMoistureInferencePreprocessor:
 
                 return {
                     "sentinel_ndvi": sentinel_ndvi,  # [3, H, W]
-                    "elevation": elevation,          # [1, H, W]
-                    "era5": ifs_data,                    # [17, H, W]
+                    "elevation": elevation,  # [1, H, W]
+                    "era5": ifs_data,  # [17, H, W]
                 }
 
         except Exception as e:
             print(f"Error preprocessing file {tiff_path}: {str(e)}")
             return None
-            

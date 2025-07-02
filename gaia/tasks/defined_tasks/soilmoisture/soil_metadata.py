@@ -1,5 +1,6 @@
-from gaia.tasks.base.components.metadata import Metadata, CoreMetadata
-from typing import Dict, Any, Optional
+from typing import Any, Dict
+
+from gaia.tasks.base.components.metadata import CoreMetadata, Metadata
 from gaia.tasks.base.decorators import handle_validation_error
 
 

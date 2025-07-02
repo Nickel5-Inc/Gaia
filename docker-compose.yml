@@ -1,0 +1,244 @@
+version: '3.8'
+
+services:
+  # Main Validator Application
+  validator:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILD_TYPE: production
+        BUILD_VERSION: ${BUILD_VERSION:-latest}
+        BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Database Configuration
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: ${POSTGRES_DB:-gaia_validator}
+      DATABASE_USER: ${POSTGRES_USER:-gaia_user}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-gaia_password}
+      DATABASE_POOL_MIN_SIZE: 5
+      DATABASE_POOL_MAX_SIZE: 20
+      
+      # Application Configuration
+      NUM_COMPUTE_WORKERS: ${NUM_COMPUTE_WORKERS:-8}
+      MAX_JOBS_PER_WORKER: ${MAX_JOBS_PER_WORKER:-100}
+      SUPERVISOR_CHECK_INTERVAL_S: ${SUPERVISOR_CHECK_INTERVAL_S:-30}
+      
+      # Memory Limits (MB)
+      PROCESS_MAX_RSS_MB_IO: ${PROCESS_MAX_RSS_MB_IO:-2048}
+      PROCESS_MAX_RSS_MB_COMPUTE: ${PROCESS_MAX_RSS_MB_COMPUTE:-1024}
+      PROCESS_MAX_RSS_MB_SUPERVISOR: ${PROCESS_MAX_RSS_MB_SUPERVISOR:-256}
+      
+      # Weather Configuration
+      WEATHER_GFS_CACHE_DIR: ${WEATHER_GFS_CACHE_DIR:-/app/data/cache/gfs}
+      WEATHER_VALIDATOR_HASH_WAIT_MINUTES: ${WEATHER_VALIDATOR_HASH_WAIT_MINUTES:-10}
+      
+      # Substrate Configuration
+      SUBSTRATE_NETWORK: ${SUBSTRATE_NETWORK:-finney}
+      SUBSTRATE_NETUID: ${SUBSTRATE_NETUID:-15}
+      SUBSTRATE_SUBTENSOR_ADDRESS: ${SUBSTRATE_SUBTENSOR_ADDRESS}
+      SUBSTRATE_WALLET_NAME: ${SUBSTRATE_WALLET_NAME}
+      SUBSTRATE_WALLET_HOTKEY: ${SUBSTRATE_WALLET_HOTKEY}
+      
+      # R2 Storage Configuration
+      R2_ENDPOINT_URL: ${R2_ENDPOINT_URL}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY}
+      R2_BUCKET_NAME: ${R2_BUCKET_NAME:-gaia-weather-data}
+      R2_CLEANUP_ENABLED: ${R2_CLEANUP_ENABLED:-true}
+      R2_CLEANUP_RETENTION_DAYS: ${R2_CLEANUP_RETENTION_DAYS:-30}
+      
+      # Logging Configuration
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_FILE: ${LOG_FILE:-/app/logs/validator.log}
+      
+      # Monitoring Configuration
+      PROMETHEUS_ENABLED: ${PROMETHEUS_ENABLED:-true}
+      PROMETHEUS_PORT: ${PROMETHEUS_PORT:-9090}
+      
+      # HTTP Configuration
+      HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-30}
+      HTTP_MAX_CONNECTIONS: ${HTTP_MAX_CONNECTIONS:-100}
+      HTTP_RETRY_ATTEMPTS: ${HTTP_RETRY_ATTEMPTS:-3}
+    
+    volumes:
+      # Persistent data storage
+      - validator_data:/app/data
+      - validator_logs:/app/logs
+      - validator_cache:/app/data/cache
+      # Configuration file (optional override)
+      - ${CONFIG_FILE:-./config/production.yaml}:/app/config/production.yaml:ro
+    
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"  # Prometheus metrics
+    
+    networks:
+      - validator-network
+    
+    # Resource limits for production
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-4G}
+          cpus: ${CPU_LIMIT:-4.0}
+        reservations:
+          memory: ${MEMORY_RESERVATION:-2G}
+          cpus: ${CPU_RESERVATION:-2.0}
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:14-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-gaia_validator}
+      POSTGRES_USER: ${POSTGRES_USER:-gaia_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gaia_password}
+      POSTGRES_INITDB_ARGS: "--auth-local=trust --auth-host=md5"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - validator-network
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+    
+    # Health check
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gaia_user} -d ${POSTGRES_DB:-gaia_validator}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Prometheus (Optional - for metrics collection)
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    profiles:
+      - monitoring
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus_alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9091:9090"
+    networks:
+      - validator-network
+    depends_on:
+      - validator
+
+  # Grafana (Optional - for dashboards)
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    profiles:
+      - monitoring
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin123}
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana_dashboard.json:/var/lib/grafana/dashboards/gaia-validator.json:ro
+      - ./monitoring/grafana_datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./monitoring/grafana_dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+    ports:
+      - "3000:3000"
+    networks:
+      - validator-network
+    depends_on:
+      - prometheus
+
+  # Redis (Optional - for caching and session storage)
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    profiles:
+      - caching
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - validator-network
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+  # Nginx (Optional - reverse proxy and load balancer)
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    profiles:
+      - proxy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - validator-network
+    depends_on:
+      - validator
+
+# Persistent volumes
+volumes:
+  validator_data:
+    driver: local
+  validator_logs:
+    driver: local
+  validator_cache:
+    driver: local
+  postgres_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# Networks
+networks:
+  validator-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
