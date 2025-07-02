@@ -708,14 +708,238 @@ async def _compute_era5_final_scoring_async(
 
 
 async def _load_miner_forecast_data(miner_response_data: Dict[str, Any]) -> Optional[xr.Dataset]:
-    """Load miner forecast data from storage."""
-    try:
-        # This would load the miner's forecast from R2 or local storage
-        # For now, return None to indicate data loading needs to be implemented
-        logger.warning("Miner forecast data loading not yet implemented")
+    """
+    Load miner forecast data from storage (local Zarr or R2).
+    
+    Args:
+        miner_response_data: Miner response record containing job_id and miner info
+        
+    Returns:
+        xr.Dataset containing the miner's forecast data, or None if loading fails
+    """
+    job_id = miner_response_data.get("job_id")
+    miner_hotkey = miner_response_data.get("miner_hotkey", "unknown")
+    
+    if not job_id:
+        logger.error(f"No job_id found in miner response data for {miner_hotkey[:8]}")
         return None
+    
+    try:
+        # Import required modules
+        import xarray as xr
+        from pathlib import Path
+        import os
+        
+        logger.info(f"Loading forecast data for miner {miner_hotkey[:8]}, job {job_id}")
+        
+        # First, try to get the forecast path from the database
+        # This requires database access - we'll need to get it from the task context
+        # For now, construct the expected path based on the job_id
+        
+        # Default forecast directory from environment or default
+        default_forecast_dir = Path(os.getenv("MINER_FORECAST_DIR", "./miner_forecasts/"))
+        
+        # Construct expected Zarr path - miners typically save as {job_id}.zarr
+        zarr_path = default_forecast_dir / f"{job_id}.zarr"
+        
+        logger.debug(f"Attempting to load forecast from: {zarr_path}")
+        
+        # Check if the Zarr store exists locally
+        if zarr_path.exists() and zarr_path.is_dir():
+            logger.info(f"Loading forecast from local Zarr store: {zarr_path}")
+            
+            # Load the Zarr dataset
+            try:
+                forecast_ds = await asyncio.to_thread(
+                    lambda: xr.open_zarr(zarr_path, consolidated=True)
+                )
+                
+                # Validate the dataset has the expected structure
+                if _validate_forecast_dataset(forecast_ds, miner_hotkey):
+                    logger.info(f"Successfully loaded forecast for {miner_hotkey[:8]} from {zarr_path}")
+                    return forecast_ds
+                else:
+                    logger.warning(f"Forecast dataset validation failed for {miner_hotkey[:8]}")
+                    return None
+                    
+            except Exception as zarr_error:
+                logger.error(f"Error reading Zarr store {zarr_path}: {zarr_error}")
+                # Fall through to try alternative loading methods
+        
+        # If local Zarr doesn't exist, try R2 or alternative storage
+        logger.debug(f"Local Zarr not found at {zarr_path}, attempting R2 loading")
+        
+        # Try to load from R2 (if configured)
+        r2_dataset = await _load_forecast_from_r2(job_id, miner_hotkey)
+        if r2_dataset is not None:
+            return r2_dataset
+        
+        # Try alternative local paths
+        alternative_paths = [
+            default_forecast_dir / f"{job_id}_forecast.zarr",
+            default_forecast_dir / f"forecast_{job_id}.zarr",
+            Path(f"./forecasts/{job_id}.zarr"),
+            Path(f"./outputs/{job_id}.zarr")
+        ]
+        
+        for alt_path in alternative_paths:
+            if alt_path.exists() and alt_path.is_dir():
+                logger.info(f"Found forecast at alternative path: {alt_path}")
+                try:
+                    forecast_ds = await asyncio.to_thread(
+                        lambda: xr.open_zarr(alt_path, consolidated=True)
+                    )
+                    if _validate_forecast_dataset(forecast_ds, miner_hotkey):
+                        logger.info(f"Successfully loaded forecast for {miner_hotkey[:8]} from {alt_path}")
+                        return forecast_ds
+                except Exception as alt_error:
+                    logger.debug(f"Failed to load from {alt_path}: {alt_error}")
+                    continue
+        
+        logger.error(f"Could not find forecast data for miner {miner_hotkey[:8]}, job {job_id}")
+        return None
+        
     except Exception as e:
-        logger.error(f"Error loading miner forecast data: {e}")
+        logger.error(f"Error loading miner forecast data for {miner_hotkey[:8]}: {e}")
+        return None
+
+
+def _validate_forecast_dataset(dataset: xr.Dataset, miner_hotkey: str) -> bool:
+    """
+    Validate that a forecast dataset has the expected structure and variables.
+    
+    Args:
+        dataset: The xarray Dataset to validate
+        miner_hotkey: Miner hotkey for logging
+        
+    Returns:
+        bool: True if dataset is valid, False otherwise
+    """
+    try:
+        # Check for required dimensions
+        required_dims = ["time", "lat", "lon"]
+        missing_dims = [dim for dim in required_dims if dim not in dataset.dims]
+        if missing_dims:
+            logger.warning(f"Forecast dataset for {miner_hotkey[:8]} missing dimensions: {missing_dims}")
+            return False
+        
+        # Check for required weather variables
+        expected_vars = ["2t", "10u", "10v", "msl"]  # Core surface variables
+        available_vars = list(dataset.data_vars.keys())
+        missing_vars = [var for var in expected_vars if var not in available_vars]
+        
+        if len(missing_vars) == len(expected_vars):
+            logger.warning(f"Forecast dataset for {miner_hotkey[:8]} missing all expected variables: {expected_vars}")
+            return False
+        
+        if missing_vars:
+            logger.debug(f"Forecast dataset for {miner_hotkey[:8]} missing some variables: {missing_vars}")
+        
+        # Check dataset is not empty
+        if dataset.dims.get("time", 0) == 0:
+            logger.warning(f"Forecast dataset for {miner_hotkey[:8]} has no time steps")
+            return False
+        
+        # Check for reasonable spatial coverage
+        lat_size = dataset.dims.get("lat", 0)
+        lon_size = dataset.dims.get("lon", 0)
+        if lat_size < 10 or lon_size < 10:
+            logger.warning(f"Forecast dataset for {miner_hotkey[:8]} has insufficient spatial coverage: {lat_size}x{lon_size}")
+            return False
+        
+        logger.debug(f"Forecast dataset validation passed for {miner_hotkey[:8]}: "
+                    f"{len(available_vars)} variables, {dataset.dims['time']} time steps, "
+                    f"{lat_size}x{lon_size} grid")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error validating forecast dataset for {miner_hotkey[:8]}: {e}")
+        return False
+
+
+async def _load_forecast_from_r2(job_id: str, miner_hotkey: str) -> Optional[xr.Dataset]:
+    """
+    Load miner forecast data from R2 storage.
+    
+    Args:
+        job_id: The job ID for the forecast
+        miner_hotkey: Miner hotkey for logging
+        
+    Returns:
+        xr.Dataset or None if loading fails
+    """
+    try:
+        import boto3
+        import os
+        import tempfile
+        import shutil
+        
+        # R2 configuration from environment
+        r2_access_key = os.getenv("R2_ACCESS_KEY_ID")
+        r2_secret_key = os.getenv("R2_SECRET_ACCESS_KEY") 
+        r2_endpoint = os.getenv("R2_ENDPOINT_URL")
+        r2_bucket = os.getenv("R2_BUCKET_NAME")
+        
+        if not all([r2_access_key, r2_secret_key, r2_endpoint, r2_bucket]):
+            logger.debug(f"R2 configuration incomplete, skipping R2 loading for {miner_hotkey[:8]}")
+            return None
+        
+        logger.debug(f"Attempting to load forecast for {miner_hotkey[:8]} from R2")
+        
+        # Create S3 client for R2
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=r2_access_key,
+            aws_secret_access_key=r2_secret_key,
+            endpoint_url=r2_endpoint,
+            region_name='auto'
+        )
+        
+        # Expected R2 key patterns
+        possible_keys = [
+            f"forecasts/{job_id}.zarr",
+            f"miner_forecasts/{job_id}.zarr", 
+            f"weather/{job_id}.zarr",
+            f"{job_id}.zarr"
+        ]
+        
+        for r2_key in possible_keys:
+            try:
+                # Check if the object exists in R2
+                s3_client.head_object(Bucket=r2_bucket, Key=r2_key)
+                logger.info(f"Found forecast in R2 at key: {r2_key}")
+                
+                # Download to temporary directory
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    local_zarr_path = Path(temp_dir) / f"{job_id}.zarr"
+                    
+                    # Download the Zarr store (this is a simplified approach)
+                    # In practice, you might need to download individual Zarr files
+                    await asyncio.to_thread(
+                        s3_client.download_file, r2_bucket, r2_key, str(local_zarr_path)
+                    )
+                    
+                    # Load the dataset
+                    forecast_ds = await asyncio.to_thread(
+                        lambda: xr.open_zarr(local_zarr_path, consolidated=True)
+                    )
+                    
+                    if _validate_forecast_dataset(forecast_ds, miner_hotkey):
+                        logger.info(f"Successfully loaded forecast for {miner_hotkey[:8]} from R2")
+                        return forecast_ds
+                        
+            except s3_client.exceptions.NoSuchKey:
+                logger.debug(f"R2 key not found: {r2_key}")
+                continue
+            except Exception as key_error:
+                logger.debug(f"Error checking R2 key {r2_key}: {key_error}")
+                continue
+        
+        logger.debug(f"No forecast found in R2 for {miner_hotkey[:8]}")
+        return None
+        
+    except Exception as e:
+        logger.debug(f"Error loading forecast from R2 for {miner_hotkey[:8]}: {e}")
         return None
 
 
