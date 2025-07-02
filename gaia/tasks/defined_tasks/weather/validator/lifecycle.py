@@ -190,9 +190,11 @@ async def _query_miners_for_forecasts(
     miner_responses = []
     
     try:
-        # TODO: Get actual validator instance from io_engine
-        # For now, this is a placeholder that needs validator integration
-        # In the full implementation, this would access the validator through io_engine
+        # Get validator instance from io_engine
+        validator = getattr(io_engine, 'validator', None)
+        if not validator:
+            logger.error("No validator instance available in io_engine")
+            return []
         
         # Create miner client
         miner_client = WeatherMinerClient(io_engine)
@@ -202,27 +204,15 @@ async def _query_miners_for_forecasts(
         
         logger.info(f"Sending initiate fetch requests for run {run_id}")
         
-        # TODO: This requires validator instance - placeholder for now
-        # responses = await miner_client.initiate_fetch_from_miners(
-        #     validator=validator,  # Need to get this from io_engine
-        #     gfs_t0_run_time=gfs_init_time,
-        #     gfs_t_minus_6_run_time=gfs_t_minus_6_run_time
-        # )
-        
-        # For now, create mock responses to maintain functionality
-        mock_responses = {
-            "mock_miner_1_hotkey": {
-                "status": "fetch_accepted",
-                "job_id": f"weather_job_{run_id}_1"
-            },
-            "mock_miner_2_hotkey": {
-                "status": "fetch_accepted", 
-                "job_id": f"weather_job_{run_id}_2"
-            }
-        }
+        # Send initiate fetch requests to miners
+        responses = await miner_client.initiate_fetch_from_miners(
+            validator=validator,
+            gfs_t0_run_time=gfs_init_time,
+            gfs_t_minus_6_run_time=gfs_t_minus_6_run_time
+        )
         
         # Process responses and create database records
-        for miner_hotkey, response in mock_responses.items():
+        for miner_hotkey, response in responses.items():
             if response.get("status") == "fetch_accepted" and response.get("job_id"):
                 # TODO: Get actual miner UID from substrate network
                 # For now, use mock UIDs
@@ -293,28 +283,25 @@ async def _verify_miner_responses(
         # Poll miners for their input status
         logger.info(f"Polling miners for input status for run {run_id}")
         
-        # TODO: This requires validator instance - placeholder for now
-        # status_responses = await miner_client.get_input_status_from_miners(
-        #     validator=validator,  # Need to get this from io_engine
-        #     miner_jobs=miner_responses
-        # )
+        # Get validator instance
+        validator = getattr(io_engine, 'validator', None)
+        if not validator:
+            logger.error("No validator instance available for verification")
+            return []
         
-        # For now, simulate status polling
-        mock_status_responses = {}
-        for response in miner_responses:
-            miner_hotkey = response["miner_hotkey"]
-            # Simulate that miners have computed matching hashes
-            mock_status_responses[miner_hotkey] = {
-                "status": "input_hashed_awaiting_validation",
-                "input_data_hash": validator_hash,  # Mock matching hash
-                "job_id": response["job_id"]
-            }
+        # Poll miners for input status with retry logic
+        status_responses = await miner_client.poll_miner_status_with_retry(
+            validator=validator,
+            miner_jobs=miner_responses,
+            max_wait_minutes=wait_minutes,
+            poll_interval_seconds=30
+        )
         
         # Process status responses and verify hashes
         for response in miner_responses:
             try:
                 miner_hotkey = response["miner_hotkey"]
-                status_data = mock_status_responses.get(miner_hotkey, {})
+                status_data = status_responses.get(miner_hotkey, {})
                 
                 miner_status = status_data.get("status")
                 miner_hash = status_data.get("input_data_hash")
@@ -333,13 +320,11 @@ async def _verify_miner_responses(
                     new_status = "verified"
                     
                     # Trigger inference on this miner
-                    # TODO: This requires validator instance - placeholder for now
-                    # trigger_success = await miner_client._trigger_single_miner_inference(
-                    #     validator=validator,
-                    #     miner_hotkey=miner_hotkey,
-                    #     job_id=response["job_id"]
-                    # )
-                    trigger_success = True  # Mock successful inference trigger
+                    trigger_responses = await miner_client.trigger_inference_from_miners(
+                        validator=validator,
+                        verified_miners=[response]
+                    )
+                    trigger_success = trigger_responses.get(miner_hotkey, {}).get("status") == "inference_started"
                     
                     if trigger_success:
                         new_status = "inference_triggered"
