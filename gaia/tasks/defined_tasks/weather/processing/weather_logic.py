@@ -240,9 +240,29 @@ async def _trigger_initial_scoring(task_instance: 'WeatherTask', run_id: int):
         task_instance.test_mode_run_scored_event.clear()
         logger.info(f"[TestMode] Prepared event for scoring completion of run {run_id}")
 
-    logger.info(f"Queueing run {run_id} for initial GFS-based scoring.")
-    await task_instance.initial_scoring_queue.put(run_id)
-    await _update_run_status(task_instance, run_id, "initial_scoring_queued")
+    # Create persistent scoring job for restart resilience
+    if await task_instance._create_scoring_job(run_id, 'day1_qc'):
+        logger.info(f"Queueing run {run_id} for initial GFS-based scoring with persistent tracking.")
+        await task_instance.initial_scoring_queue.put(run_id)
+        await _update_run_status(task_instance, run_id, "initial_scoring_queued")
+    else:
+        logger.error(f"Failed to create persistent scoring job for run {run_id}. Skipping scoring.")
+        await _update_run_status(task_instance, run_id, "initial_scoring_failed")
+
+async def _trigger_final_scoring(task_instance: 'WeatherTask', run_id: int):
+    """Trigger final ERA5 scoring for a specific run."""
+    try:
+        # Create persistent scoring job for restart resilience  
+        if await task_instance._create_scoring_job(run_id, 'era5_final'):
+            logger.info(f"[Run {run_id}] Successfully triggered final ERA5 scoring with persistent tracking")
+            # Update run status to indicate final scoring is queued/triggered
+            await _update_run_status(task_instance, run_id, "final_scoring_triggered")
+        else:
+            logger.error(f"[Run {run_id}] Failed to create persistent final scoring job")
+            await _update_run_status(task_instance, run_id, "final_scoring_failed")
+    except Exception as e:
+        logger.error(f"[Run {run_id}] Error triggering final scoring: {e}", exc_info=True)
+        await _update_run_status(task_instance, run_id, "final_scoring_failed")
 
 async def _request_fresh_token(task_instance: 'WeatherTask', miner_hotkey: str, job_id: str) -> Optional[Tuple[str, str, str]]:
     """Requests a fresh JWT, Zarr URL, and manifest_content_hash from the miner."""
@@ -468,15 +488,45 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
             logger.info(f"[VerifyLogic, Resp {response_id}] Manifest verified & Zarr store opened with on-read checks.")
             try:
                 logger.info(f"[VerifyLogic, Resp {response_id}] Verified dataset keys: {list(verified_dataset.keys()) if verified_dataset else 'N/A'}")
-                
+                # Clear any retry scheduling on success
+                await task_instance.db_manager.execute(
+                    """
+                    UPDATE weather_miner_responses
+                    SET retry_count = 0,
+                        next_retry_time = NULL
+                    WHERE id = :resp_id
+                    """,
+                    {"resp_id": response_id}
+                )
             except Exception as e_ds_ops:
                 logger.warning(f"[VerifyLogic, Resp {response_id}] Minor error during initial ops on verified dataset: {e_ds_ops}")
-                if error_message_for_db: error_message_for_db += f"; Post-verify op error: {e_ds_ops}"
-                else: error_message_for_db = f"Post-manifest op error: {e_ds_ops}"
+                if error_message_for_db:
+                    error_message_for_db += f"; Post-verify op error: {e_ds_ops}"
+                else:
+                    error_message_for_db = f"Post-manifest op error: {e_ds_ops}"
         else:
-            db_status_after_verification = "failed_manifest_verification"
-            error_message_for_db = "Manifest verification failed. See verification_logs for details."
-            logger.error(f"[VerifyLogic, Resp {response_id}] Manifest verification failed or could not open verified Zarr store.")
+            # Schedule retry – exponential backoff capped at 60 min
+            existing_retry_rec = await task_instance.db_manager.fetch_one(
+                "SELECT retry_count FROM weather_miner_responses WHERE id = :rid", {"rid": response_id}
+            )
+            current_retry_count = existing_retry_rec["retry_count"] if existing_retry_rec and existing_retry_rec["retry_count"] is not None else 0
+            new_retry_count = current_retry_count + 1
+            delay_minutes = min(5 * (2 ** (new_retry_count - 1)), 60)  # 5,10,20,40,60,60...
+            next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
+
+            db_status_after_verification = "retry_scheduled"
+            error_message_for_db = "Manifest verification failed. Scheduled retry."
+            logger.error(f"[VerifyLogic, Resp {response_id}] Manifest verification failed. Scheduling retry #{new_retry_count} in {delay_minutes} min.")
+
+            await task_instance.db_manager.execute(
+                """
+                UPDATE weather_miner_responses
+                SET retry_count = :rc,
+                    next_retry_time = :nrt
+                WHERE id = :resp_id
+                """,
+                {"resp_id": response_id, "rc": new_retry_count, "nrt": next_retry_at}
+            )
 
         await task_instance.db_manager.execute(""" 
             UPDATE weather_miner_responses 

@@ -799,6 +799,8 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 run_id = await task_instance.initial_scoring_queue.get()
                 
                 logger.info(f"[Day1ScoringWorker] Processing Day-1 QC scores for run {run_id}")
+                # Mark persistent scoring job as started
+                await task_instance._start_scoring_job(run_id, 'day1_qc')
                 await _update_run_status(task_instance, run_id, "day1_scoring_started")
                 
                 run_details_query = "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id"
@@ -830,6 +832,8 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 if not responses or len(responses) < min_members_for_scoring:
                     logger.warning(f"[Day1ScoringWorker] Run {run_id}: No verified responses found for Day-1 scoring.")
                     await _update_run_status(task_instance, run_id, "day1_scoring_failed", error_message="No verified members with opened stores")
+                    # Mark persistent scoring job as failed
+                    await task_instance._complete_scoring_job(run_id, 'day1_qc', success=False, error_message="No verified members with opened stores")
                     task_instance.initial_scoring_queue.task_done()
                     continue
                     
@@ -1184,6 +1188,8 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                     logger.error(f"[Day1ScoringWorker] Run {run_id}: Error triggering combined score update: {e_comb_score}", exc_info=True)
 
                 await _update_run_status(task_instance, run_id, "day1_scoring_complete")
+                # Mark persistent scoring job as completed successfully
+                await task_instance._complete_scoring_job(run_id, 'day1_qc', success=True)
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: Marked as day1_scoring_complete.")
                 
                 task_instance.initial_scoring_queue.task_done()
@@ -1241,6 +1247,8 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 if run_id:
                     try:
                         await _update_run_status(task_instance, run_id, "day1_scoring_failed", error_message=f"Day1 Worker error: {e}")
+                        # Mark persistent scoring job as failed
+                        await task_instance._complete_scoring_job(run_id, 'day1_qc', success=False, error_message=f"Day1 Worker error: {e}")
                     except Exception as db_err:
                         logger.error(f"[Day1ScoringWorker] Failed to update DB status on error: {db_err}")
                 if task_instance.initial_scoring_queue._unfinished_tasks > 0:
@@ -1345,6 +1353,9 @@ async def finalize_scores_worker(self):
 
                     logger.info(f"[FinalizeWorker] Processing final scores for run {run_id} (Init: {gfs_init_time}).")
                     
+                    # Start persistent scoring job tracking
+                    await self._start_scoring_job(run_id, 'era5_final')
+                    
                     await self.db_manager.execute(
                             "UPDATE weather_forecast_runs SET final_scoring_attempted_time = :now WHERE id = :rid",
                             {"now": now_utc, "rid": run_id}
@@ -1359,6 +1370,8 @@ async def finalize_scores_worker(self):
                     if era5_ds_for_run is None:
                         logger.error(f"[FinalizeWorker] Run {run_id}: Failed to fetch ERA5 data. Aborting final scoring for this run.")
                         await _update_run_status(self, run_id, "final_scoring_failed", error_message="ERA5 fetch failed")
+                        # Mark scoring job as failed
+                        await self._complete_scoring_job(run_id, 'era5_final', success=False, error_message="ERA5 fetch failed")
                         processed_run_ids.add(run_id)
                         continue
 
@@ -1374,6 +1387,8 @@ async def finalize_scores_worker(self):
                     if not verified_responses_for_run:
                         logger.warning(f"[FinalizeWorker] Run {run_id}: No verified responses. Skipping miner scoring.")
                         await _update_run_status(self, run_id, "final_scoring_skipped_no_verified_miners")
+                        # Mark scoring job as completed (skipped case)
+                        await self._complete_scoring_job(run_id, 'era5_final', success=True, error_message="No verified responses")
                         processed_run_ids.add(run_id)
                         if era5_ds_for_run: era5_ds_for_run.close()
                         continue
@@ -1586,6 +1601,8 @@ async def finalize_scores_worker(self):
                     if successful_final_scores_count > 0: 
                         logger.info(f"[FinalizeWorker] Run {run_id}: Marked as 'scored'.")
                         await _update_run_status(self, run_id, "scored")
+                        # Mark scoring job as completed successfully
+                        await self._complete_scoring_job(run_id, 'era5_final', success=True)
                         try:
                             logger.info(f"[FinalizeWorker] Run {run_id}: Triggering update of combined weather scores.")
                             await self.update_combined_weather_scores(run_id_trigger=run_id)
@@ -1593,6 +1610,8 @@ async def finalize_scores_worker(self):
                             logger.error(f"[FinalizeWorker] Run {run_id}: Error triggering combined score update: {e_comb_score}", exc_info=True)
                     else:
                          logger.warning(f"[FinalizeWorker] Run {run_id}: No miners successfully scored against ERA5. Skipping combined score update.")
+                         # Mark scoring job as completed but with limited success
+                         await self._complete_scoring_job(run_id, 'era5_final', success=True, error_message="No miners successfully scored")
                     processed_run_ids.add(run_id)
                     
                     # Final cleanup for any remaining dataset references (defensive)

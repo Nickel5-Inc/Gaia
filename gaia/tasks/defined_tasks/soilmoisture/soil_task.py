@@ -869,6 +869,17 @@ class SoilMoistureTask(Task):
             for prediction in predictions:
                 try:
                     miner_id = prediction["miner_id"]
+                    
+                    # CRITICAL FIX: Use individual miner scores instead of aggregate scores
+                    # Each prediction should have its own score with individual metrics
+                    prediction_score = prediction.get("score", {})
+                    prediction_metrics = prediction_score.get("metrics", {})
+                    
+                    # Fall back to aggregate scores only if individual scores are missing
+                    if not prediction_metrics:
+                        logger.warning(f"No individual metrics found for miner {miner_id}, using aggregate scores")
+                        prediction_metrics = scores.get("metrics", {})
+                    
                     params = {
                         "region_id": region["id"],
                         "miner_uid": miner_id,
@@ -885,6 +896,11 @@ class SoilMoistureTask(Task):
                         "sentinel_bounds": region.get("sentinel_bounds"),
                         "sentinel_crs": region.get("sentinel_crs"),
                     }
+                    
+                    # Log individual metrics for debugging
+                    logger.debug(f"Storing individual metrics for miner {miner_id}: "
+                               f"surface_rmse={prediction_metrics.get('surface_rmse'):.4f}, "
+                               f"rootzone_rmse={prediction_metrics.get('rootzone_rmse'):.4f}")
 
                     # Use UPSERT to prevent duplicates in history table
                     upsert_query = """
@@ -2159,6 +2175,141 @@ class SoilMoistureTask(Task):
             
         except Exception as e:
             logger.error(f"Error triggering retroactive scoring: {e}")
+            logger.error(traceback.format_exc())
+
+    async def cleanup_incorrect_history_rmse_values(self, days_back=3):
+        """
+        Clean up history entries that have incorrect aggregate RMSE values instead of individual ones.
+        This fixes the bug where all miners in a region got the same RMSE values.
+        
+        Args:
+            days_back (int): How many days back to clean up
+        """
+        try:
+            logger.info(f"🧹 Starting cleanup of incorrect RMSE values in history table for last {days_back} days...")
+            
+            cutoff_time = datetime.now(timezone.utc) - timedelta(days=days_back)
+            
+            # Find target times where multiple miners have identical RMSE values (indicating the bug)
+            suspicious_query = """
+                SELECT 
+                    target_time,
+                    surface_rmse,
+                    rootzone_rmse,
+                    COUNT(*) as miner_count
+                FROM soil_moisture_history h
+                WHERE h.target_time >= :cutoff_time
+                GROUP BY target_time, surface_rmse, rootzone_rmse
+                HAVING COUNT(*) > 5  -- More than 5 miners with identical RMSE values is suspicious
+                ORDER BY target_time DESC, miner_count DESC
+            """
+            
+            suspicious_entries = await self.db_manager.fetch_all(suspicious_query, {"cutoff_time": cutoff_time})
+            
+            if not suspicious_entries:
+                logger.info("✅ No suspicious RMSE entries found - no cleanup needed")
+                return
+            
+            logger.info(f"🔍 Found {len(suspicious_entries)} suspicious target times with identical RMSE values:")
+            for entry in suspicious_entries:
+                logger.info(f"   - {entry['target_time']}: {entry['miner_count']} miners with RMSE "
+                          f"surface={entry['surface_rmse']:.4f}, rootzone={entry['rootzone_rmse']:.4f}")
+            
+            total_deleted = 0
+            
+            # For each suspicious target time, check if we can recalculate individual RMSE values
+            for entry in suspicious_entries:
+                target_time = entry['target_time']
+                surface_rmse = entry['surface_rmse']
+                rootzone_rmse = entry['rootzone_rmse']
+                
+                try:
+                    logger.info(f"🔧 Processing cleanup for {target_time}...")
+                    
+                    # Get all history entries for this target time with these suspicious RMSE values
+                    affected_entries_query = """
+                        SELECT h.*, r.sentinel_bounds, r.sentinel_crs
+                        FROM soil_moisture_history h
+                        JOIN soil_moisture_regions r ON h.region_id = r.id
+                        WHERE h.target_time = :target_time
+                        AND h.surface_rmse = :surface_rmse
+                        AND h.rootzone_rmse = :rootzone_rmse
+                    """
+                    
+                    affected_entries = await self.db_manager.fetch_all(affected_entries_query, {
+                        "target_time": target_time,
+                        "surface_rmse": surface_rmse,
+                        "rootzone_rmse": rootzone_rmse
+                    })
+                    
+                    if not affected_entries:
+                        continue
+                    
+                    logger.info(f"   Found {len(affected_entries)} affected entries")
+                    
+                    # Check if we have the prediction and ground truth data to recalculate
+                    entries_with_data = [e for e in affected_entries 
+                                       if e.get('surface_sm_pred') is not None and 
+                                          e.get('rootzone_sm_pred') is not None and
+                                          e.get('surface_sm_truth') is not None and
+                                          e.get('rootzone_sm_truth') is not None]
+                    
+                    if len(entries_with_data) == 0:
+                        # No data to recalculate - just delete the problematic entries
+                        logger.info(f"   No prediction/truth data available for recalculation. Deleting {len(affected_entries)} entries...")
+                        
+                        delete_query = """
+                            DELETE FROM soil_moisture_history
+                            WHERE target_time = :target_time
+                            AND surface_rmse = :surface_rmse  
+                            AND rootzone_rmse = :rootzone_rmse
+                        """
+                        
+                        result = await self.db_manager.execute(delete_query, {
+                            "target_time": target_time,
+                            "surface_rmse": surface_rmse,
+                            "rootzone_rmse": rootzone_rmse
+                        })
+                        
+                        deleted_count = getattr(result, 'rowcount', len(affected_entries))
+                        total_deleted += deleted_count
+                        logger.info(f"   ✅ Deleted {deleted_count} problematic entries for {target_time}")
+                        
+                    else:
+                        logger.info(f"   Found {len(entries_with_data)} entries with prediction/truth data")
+                        logger.info(f"   TODO: Implement individual RMSE recalculation (complex - requires numpy processing)")
+                        # For now, just delete these too since the fix is already in place for new data
+                        # In the future, we could implement individual RMSE recalculation here
+                        
+                        delete_query = """
+                            DELETE FROM soil_moisture_history
+                            WHERE target_time = :target_time
+                            AND surface_rmse = :surface_rmse  
+                            AND rootzone_rmse = :rootzone_rmse
+                        """
+                        
+                        result = await self.db_manager.execute(delete_query, {
+                            "target_time": target_time,
+                            "surface_rmse": surface_rmse,
+                            "rootzone_rmse": rootzone_rmse
+                        })
+                        
+                        deleted_count = getattr(result, 'rowcount', len(affected_entries))
+                        total_deleted += deleted_count
+                        logger.info(f"   ✅ Deleted {deleted_count} entries with aggregate RMSE values for {target_time}")
+                
+                except Exception as e:
+                    logger.error(f"❌ Error processing cleanup for {target_time}: {e}")
+                    continue
+            
+            logger.info(f"🎯 Cleanup complete: Deleted {total_deleted} history entries with incorrect aggregate RMSE values")
+            
+            if total_deleted > 0:
+                logger.info("💡 These entries will be properly rescored with individual RMSE values when new predictions are made")
+                logger.info("🔄 Consider running retroactive scoring to rebuild score rows for these target times")
+            
+        except Exception as e:
+            logger.error(f"Error in cleanup_incorrect_history_rmse_values: {e}")
             logger.error(traceback.format_exc())
 
     async def _score_predictions_threaded(self, task, temp_path):

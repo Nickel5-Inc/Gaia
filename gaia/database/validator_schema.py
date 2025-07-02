@@ -162,6 +162,10 @@ weather_miner_responses_table = sa.Table('weather_miner_responses', validator_me
     sa.Column('input_hash_miner', sa.VARCHAR(64), nullable=True),
     sa.Column('input_hash_validator', sa.VARCHAR(64), nullable=True),
     sa.Column('input_hash_match', sa.Boolean, nullable=True),
+    sa.Column('retry_count', sa.Integer, server_default=sa.text('0'), nullable=True,
+              comment="Number of retry attempts for this miner response"),
+    sa.Column('next_retry_time', postgresql.TIMESTAMP(timezone=True), nullable=True,
+              comment="UTC timestamp when the validator should attempt the next retry"),
     sa.Column('last_polled_time', postgresql.TIMESTAMP(timezone=True), nullable=True),
     sa.UniqueConstraint('run_id', 'miner_uid', name='uq_weather_miner_responses_run_miner'),
     comment="Records miner responses for a specific forecast run. Tracks status through fetch, hash verification, and inference."
@@ -172,6 +176,8 @@ sa.Index('idx_wmr_miner_hotkey', weather_miner_responses_table.c.miner_hotkey)
 sa.Index('idx_wmr_verification_passed', weather_miner_responses_table.c.verification_passed)
 sa.Index('idx_wmr_status', weather_miner_responses_table.c.status)
 sa.Index('idx_wmr_job_id', weather_miner_responses_table.c.job_id)
+sa.Index('idx_wmr_retry_count', weather_miner_responses_table.c.retry_count)
+sa.Index('idx_wmr_next_retry_time', weather_miner_responses_table.c.next_retry_time)
 
 weather_miner_scores_table = sa.Table('weather_miner_scores', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True), # SERIAL PRIMARY KEY
@@ -198,6 +204,24 @@ sa.Index('idx_wms_score_type', weather_miner_scores_table.c.score_type)
 sa.Index('idx_wms_lead_hours', weather_miner_scores_table.c.lead_hours)
 sa.Index('idx_wms_variable_level', weather_miner_scores_table.c.variable_level)
 sa.Index('idx_wms_valid_time_utc', weather_miner_scores_table.c.valid_time_utc)
+
+weather_scoring_jobs_table = sa.Table('weather_scoring_jobs', validator_metadata,
+    sa.Column('id', sa.Integer, primary_key=True, autoincrement=True, comment="Serial ID for the scoring job"),
+    sa.Column('run_id', sa.Integer, sa.ForeignKey('weather_forecast_runs.id', ondelete='CASCADE'), nullable=False, comment="ID of the forecast run being scored"),
+    sa.Column('score_type', sa.VARCHAR(50), nullable=False, comment="Type of scoring job (e.g., 'day1_qc', 'era5_final')"),
+    sa.Column('status', sa.VARCHAR(20), nullable=False, server_default=sa.text("'queued'"), comment="Current status of the scoring job"),
+    sa.Column('started_at', postgresql.TIMESTAMP(timezone=True), nullable=True, comment="When the scoring job was started"),
+    sa.Column('completed_at', postgresql.TIMESTAMP(timezone=True), nullable=True, comment="When the scoring job was completed"),
+    sa.Column('error_message', sa.Text, nullable=True, comment="Error message if the job failed"),
+    sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False, comment="When the scoring job was created"),
+    sa.UniqueConstraint('run_id', 'score_type', name='uq_wsj_run_score_type'),
+    comment="Tracks scoring jobs for restart resilience - ensures no scoring work is lost during validator restarts."
+)
+sa.Index('idx_wsj_run_id', weather_scoring_jobs_table.c.run_id)
+sa.Index('idx_wsj_score_type', weather_scoring_jobs_table.c.score_type)
+sa.Index('idx_wsj_status', weather_scoring_jobs_table.c.status)
+sa.Index('idx_wsj_status_started', weather_scoring_jobs_table.c.status, weather_scoring_jobs_table.c.started_at)
+sa.Index('idx_wsj_created_at', weather_scoring_jobs_table.c.created_at)
 
 weather_ensemble_forecasts_table = sa.Table('weather_ensemble_forecasts', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True), # SERIAL PRIMARY KEY
