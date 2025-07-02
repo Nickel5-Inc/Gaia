@@ -163,9 +163,9 @@ from fiber.encrypted.validator import handshake
 from substrateinterface import SubstrateInterface
 
 from gaia.APIcalls.miner_score_sender import MinerScoreSender
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
-from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
-from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+from gaia.tasks.defined_tasks.geomagnetic.core.task import GeomagneticTask
+from gaia.tasks.defined_tasks.soilmoisture.core.task import SoilMoistureTask
+from gaia.tasks.defined_tasks.weather.core.task import WeatherTask
 from gaia.validator.basemodel_evaluator import BaseModelEvaluator
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 

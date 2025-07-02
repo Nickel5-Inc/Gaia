@@ -29,9 +29,9 @@ from fiber.logging_utils import get_logger
 
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from gaia.miner.utils.subnet import factory_router
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
-from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
-from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+from gaia.tasks.defined_tasks.geomagnetic.core.task import GeomagneticTask
+from gaia.tasks.defined_tasks.soilmoisture.core.task import SoilMoistureTask
+from gaia.tasks.defined_tasks.weather.core.task import WeatherTask
 
 MAX_REQUEST_SIZE = 100 * 1024 * 1024  # Reduced from 800MB to 100MB
 

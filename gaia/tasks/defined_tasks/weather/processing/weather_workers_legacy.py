@@ -4108,7 +4108,7 @@ async def _download_forecast_from_r2_to_local(
                 dirname_zarr = f"weather_forecast_{gfs_time_str}_miner_hk_{miner_hotkey_for_filename[:10]}_{unique_suffix}.zarr"
 
                 # Use the same forecast directory as local inference
-                from gaia.tasks.defined_tasks.weather.weather_task import (
+                from gaia.tasks.defined_tasks.weather.weather_task_legacy import (
                     MINER_FORECAST_DIR_BG,
                 )
 

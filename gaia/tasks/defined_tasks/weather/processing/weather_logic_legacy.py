@@ -12,7 +12,7 @@ import xarray as xr
 import xskillscore as xs
 
 if TYPE_CHECKING:
-    from ..weather_task import WeatherTask
+    from ..weather_task_legacy import WeatherTask
 
 # High-performance JSON operations for weather data
 try:

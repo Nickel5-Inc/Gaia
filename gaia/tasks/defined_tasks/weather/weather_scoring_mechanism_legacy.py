@@ -11,7 +11,7 @@ import xskillscore as xs
 from fiber.logging_utils import get_logger
 
 if TYPE_CHECKING:
-    from .weather_task import WeatherTask
+    from .weather_task_legacy import WeatherTask
 
 from .utils.remote_access import open_verified_remote_zarr_dataset
 from .weather_scoring.metrics import (
