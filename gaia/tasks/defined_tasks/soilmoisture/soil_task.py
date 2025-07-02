@@ -878,10 +878,10 @@ class SoilMoistureTask(Task):
                         "rootzone_sm_pred": prediction["rootzone_sm"],
                         "surface_sm_truth": ground_truth["surface_sm"] if ground_truth else None,
                         "rootzone_sm_truth": ground_truth["rootzone_sm"] if ground_truth else None,
-                        "surface_rmse": scores["metrics"].get("surface_rmse"),
-                        "rootzone_rmse": scores["metrics"].get("rootzone_rmse"),
-                        "surface_structure_score": scores["metrics"].get("surface_ssim", 0),
-                        "rootzone_structure_score": scores["metrics"].get("rootzone_ssim", 0),
+                        "surface_rmse": prediction.get("score", {}).get("metrics", {}).get("surface_rmse"),
+                        "rootzone_rmse": prediction.get("score", {}).get("metrics", {}).get("rootzone_rmse"),
+                        "surface_structure_score": prediction.get("score", {}).get("metrics", {}).get("surface_ssim", 0),
+                        "rootzone_structure_score": prediction.get("score", {}).get("metrics", {}).get("rootzone_ssim", 0),
                         "sentinel_bounds": region.get("sentinel_bounds"),
                         "sentinel_crs": region.get("sentinel_crs"),
                     }
@@ -1896,9 +1896,9 @@ class SoilMoistureTask(Task):
                         miner_uid = entry['miner_uid']
                         miner_hotkey = entry['miner_hotkey']
                         
-                        # Extract RMSE values from history (SSIM values are stored but not used in final score)
-                        surface_rmse = entry.get('surface_rmse', 0) or 0
-                        rootzone_rmse = entry.get('rootzone_rmse', 0) or 0
+                        # Extract RMSE values; keep None if missing so we don't default to 0 (which created identical scores).
+                        surface_rmse = entry.get('surface_rmse')
+                        rootzone_rmse = entry.get('rootzone_rmse')
                         surface_ssim = entry.get('surface_structure_score', 0) or 0
                         rootzone_ssim = entry.get('rootzone_structure_score', 0) or 0
                         
@@ -1951,20 +1951,32 @@ class SoilMoistureTask(Task):
                         alpha = 3.0
                         beta = 0.15
                         
-                        surface_score = 1.0 / (1.0 + math.exp(alpha * (surface_rmse - beta)))
-                        rootzone_score = 1.0 / (1.0 + math.exp(alpha * (rootzone_rmse - beta)))
-                        
-                        # Validate transformed scores
-                        if math.isnan(surface_score) or math.isinf(surface_score):
-                            logger.warning(f"Retroactive: Invalid surface score after sigmoid: {surface_score}, skipping entry")
+                        # Build list of available metric scores
+                        scores_available = []
+                        weights_available = []
+
+                        if has_surface:
+                            surface_score = 1.0 / (1.0 + math.exp(alpha * (surface_rmse - beta)))
+                            if math.isnan(surface_score) or math.isinf(surface_score):
+                                logger.warning(f"Retroactive: Invalid surface score after sigmoid: {surface_score}, skipping entry")
+                            else:
+                                scores_available.append(surface_score)
+                                weights_available.append(0.6)
+
+                        if has_rootzone:
+                            rootzone_score = 1.0 / (1.0 + math.exp(alpha * (rootzone_rmse - beta)))
+                            if math.isnan(rootzone_score) or math.isinf(rootzone_score):
+                                logger.warning(f"Retroactive: Invalid rootzone score after sigmoid: {rootzone_score}, skipping entry")
+                            else:
+                                scores_available.append(rootzone_score)
+                                weights_available.append(0.4)
+
+                        # Skip if no valid scores were added (both metrics missing or invalid)
+                        if not scores_available:
+                            logger.debug("Retroactive: No valid metric scores for this entry – skipping miner")
                             continue
-                            
-                        if math.isnan(rootzone_score) or math.isinf(rootzone_score):
-                            logger.warning(f"Retroactive: Invalid rootzone score after sigmoid: {rootzone_score}, skipping entry")
-                            continue
-                        
-                        # Final score calculation exactly as in SoilScoringMechanism.compute_final_score()
-                        composite_score = 0.6 * surface_score + 0.4 * rootzone_score
+
+                        composite_score = sum(s * w for s, w in zip(scores_available, weights_available)) / sum(weights_available)
                         
                         # Validate final score exactly as regular flow does
                         if math.isnan(composite_score) or math.isinf(composite_score):

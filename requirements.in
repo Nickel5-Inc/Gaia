@@ -79,3 +79,4 @@ aioboto3
 blosc 
 memray
 intake-xarray
+cfgrib

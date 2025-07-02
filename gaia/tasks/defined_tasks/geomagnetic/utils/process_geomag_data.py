@@ -70,17 +70,20 @@ def parse_data(data):
         # Split by whitespace and filter out empty strings
         raw_values = [v for v in data_portion.split() if v]
         
-        # Handle "squished together" values where negative numbers are followed by multiple 9999 markers
+        # Handle "squished together" values where a positive value (one- or two-digit) is immediately
+        # followed by one or more "9999" placeholder blocks, e.g. '4999999...' which really means
+        # value 4 followed by repeated 9999 missing-data markers.
         values = []
         for value in raw_values:
-            # Check if this looks like a negative number followed by one or more 9999 markers
-            if value.startswith('-') and '9999' in value and len(value) > 5:
+            if ((value.startswith('-') and '9999' in value and len(value) > 5) or
+                (value[:1].isdigit() and '9999' in value and len(value) > 5)):
                 # Find where the actual negative value ends and the 9999 markers begin
                 # Look for the pattern where we have a reasonable negative number followed by 9999s
                 found_split = False
                 
-                # Try to find the split point by looking for reasonable negative values (up to -999)
-                for split_pos in range(2, min(6, len(value))):  # Check positions for -X, -XX, -XXX, -XXXX
+                # For positive numbers, start split_pos at 1; for negative, at 2 (to skip the '-')
+                start_pos = 2 if value.startswith('-') else 1
+                for split_pos in range(start_pos, min(6, len(value))):  # Check positions for X, XX  or -X, -XX, -XXX
                     potential_value = value[:split_pos]
                     remainder = value[split_pos:]
                     
