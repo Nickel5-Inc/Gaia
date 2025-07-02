@@ -1,20 +1,19 @@
+import asyncio
 import os
-import subprocess
-import tempfile
+import shutil
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import httpx
+import matplotlib.pyplot as plt
 import numpy as np
 import requests
 import xarray as xr
-from pyproj import Transformer, CRS
+from dotenv import load_dotenv
+from pyproj import CRS, Transformer
 from skimage.transform import resize
 from tqdm import tqdm
-import shutil
-import matplotlib.pyplot as plt
-from dotenv import load_dotenv
-import httpx
-import asyncio
-import traceback
 
 load_dotenv()
 EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
@@ -54,8 +53,10 @@ def construct_smap_url(datetime_obj, test_mode=False):
     Example: SMAP_L4_SM_gph_20241111T013000_Vv7031_001.h5
     """
     if test_mode:
-        datetime_obj = datetime_obj - timedelta(days=7)  #  Force scoring to use old data in test mode
-    
+        datetime_obj = datetime_obj - timedelta(
+            days=7
+        )  #  Force scoring to use old data in test mode
+
     valid_time = get_valid_smap_time(datetime_obj)
     date_dir = valid_time.strftime("%Y.%m.%d")
     file_date = valid_time.strftime("%Y%m%d")
@@ -87,7 +88,7 @@ async def download_smap_data(url, output_path):
     # Determine authentication method
     auth_method = None
     headers = {}
-    
+
     if EARTHDATA_API_KEY:
         # Use API key authentication (preferred)
         headers["Authorization"] = f"Bearer {EARTHDATA_API_KEY}"
@@ -97,60 +98,83 @@ async def download_smap_data(url, output_path):
         auth_method = (EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
         print("Using EARTHDATA username/password authentication")
     else:
-        print("❌ No EARTHDATA credentials found! Set either EARTHDATA_API_KEY or EARTHDATA_USERNAME/EARTHDATA_PASSWORD")
+        print(
+            "❌ No EARTHDATA credentials found! Set either EARTHDATA_API_KEY or EARTHDATA_USERNAME/EARTHDATA_PASSWORD"
+        )
         return False
 
     try:
-        async with httpx.AsyncClient(auth=auth_method, headers=headers, follow_redirects=True, timeout=300.0) as client:
+        async with httpx.AsyncClient(
+            auth=auth_method, headers=headers, follow_redirects=True, timeout=300.0
+        ) as client:
             # Get content length first for progress bar
             try:
                 head_response = await client.head(url)
-                head_response.raise_for_status() # Check for errors like 404
+                head_response.raise_for_status()  # Check for errors like 404
                 total_size = int(head_response.headers.get("content-length", 0))
                 print(f"Downloading from: {url}")
-                print(f"File size: {total_size / (1024*1024):.1f} MB")
+                print(f"File size: {total_size / (1024 * 1024):.1f} MB")
             except httpx.HTTPStatusError as e:
-                print(f"Failed to get headers (url might be invalid or auth failed): {e.response.status_code} for {url}")
+                print(
+                    f"Failed to get headers (url might be invalid or auth failed): {e.response.status_code} for {url}"
+                )
                 return False
             except Exception as e_head:
                 print(f"Error getting file size: {e_head} for {url}")
-                total_size = 0 # Proceed without progress bar if size fetch fails
+                total_size = 0  # Proceed without progress bar if size fetch fails
 
             # Stream download with progress
             async with client.stream("GET", url) as response:
                 if response.status_code != 200:
-                    print(f"Download failed with status {response.status_code} for {url}")
+                    print(
+                        f"Download failed with status {response.status_code} for {url}"
+                    )
                     content_snippet = await response.aread()
-                    print(f"Response content: {content_snippet[:500]}") # Log part of the response
+                    print(
+                        f"Response content: {content_snippet[:500]}"
+                    )  # Log part of the response
                     if await loop.run_in_executor(None, cache_file.exists):
                         await loop.run_in_executor(None, cache_file.unlink)
                     return False
-                
+
                 # Use a temporary file for download to avoid partial files in cache on error
-                temp_dl_path = cache_file.with_suffix(cache_file.suffix + '.part')
+                temp_dl_path = cache_file.with_suffix(cache_file.suffix + ".part")
 
                 def _write_chunk_sync(file_handle, chunk_data):
                     file_handle.write(chunk_data)
 
                 try:
-                    with open(temp_dl_path, 'wb') as f:
-                        with tqdm(total=total_size, unit="B", unit_scale=True, desc=f"Downloading {cache_file.name}") as pbar:
+                    with open(temp_dl_path, "wb") as f:
+                        with tqdm(
+                            total=total_size,
+                            unit="B",
+                            unit_scale=True,
+                            desc=f"Downloading {cache_file.name}",
+                        ) as pbar:
                             async for chunk in response.aiter_bytes():
-                                await loop.run_in_executor(None, _write_chunk_sync, f, chunk)
+                                await loop.run_in_executor(
+                                    None, _write_chunk_sync, f, chunk
+                                )
                                 pbar.update(len(chunk))
-                    
+
                     # Download successful, move temp file to final cache location
-                    await loop.run_in_executor(None, shutil.move, str(temp_dl_path), str(cache_file))
+                    await loop.run_in_executor(
+                        None, shutil.move, str(temp_dl_path), str(cache_file)
+                    )
                     print(f"\nDownload successful for {url}!")
 
                     if output_path != str(cache_file):
-                        await loop.run_in_executor(None, shutil.copy, str(cache_file), output_path)
+                        await loop.run_in_executor(
+                            None, shutil.copy, str(cache_file), output_path
+                        )
                     return True
                 except Exception as e_write:
                     print(f"\nError during file write/move: {e_write}")
                     if await loop.run_in_executor(None, temp_dl_path.exists):
                         await loop.run_in_executor(None, temp_dl_path.unlink)
-                    if await loop.run_in_executor(None, cache_file.exists): # If main cache file was somehow created
+                    if await loop.run_in_executor(
+                        None, cache_file.exists
+                    ):  # If main cache file was somehow created
                         await loop.run_in_executor(None, cache_file.unlink)
                     return False
 
@@ -186,18 +210,24 @@ def process_smap_data(filepath, bbox, target_shape=(220, 220)):
         try:
             surface_fill_value = ds["sm_surface"]._FillValue
         except AttributeError:
-            surface_fill_value = ds["sm_surface"].attrs.get('_FillValue', 
-                                ds["sm_surface"].attrs.get('fill_value', 
-                                ds["sm_surface"].attrs.get('missing_value', -9999.0)))
-        
+            surface_fill_value = ds["sm_surface"].attrs.get(
+                "_FillValue",
+                ds["sm_surface"].attrs.get(
+                    "fill_value", ds["sm_surface"].attrs.get("missing_value", -9999.0)
+                ),
+            )
+
         # Handle fill values for rootzone soil moisture
         try:
             rootzone_fill_value = ds["sm_rootzone"]._FillValue
         except AttributeError:
-            rootzone_fill_value = ds["sm_rootzone"].attrs.get('_FillValue', 
-                                 ds["sm_rootzone"].attrs.get('fill_value', 
-                                 ds["sm_rootzone"].attrs.get('missing_value', -9999.0)))
-        
+            rootzone_fill_value = ds["sm_rootzone"].attrs.get(
+                "_FillValue",
+                ds["sm_rootzone"].attrs.get(
+                    "fill_value", ds["sm_rootzone"].attrs.get("missing_value", -9999.0)
+                ),
+            )
+
         surface_sm[surface_sm == surface_fill_value] = np.nan
         rootzone_sm[rootzone_sm == rootzone_fill_value] = np.nan
         surface_resampled = resize(surface_sm, target_shape, preserve_range=True)
@@ -209,12 +239,12 @@ def process_smap_data(filepath, bbox, target_shape=(220, 220)):
 async def get_smap_data(datetime_obj, bbox, crs="EPSG:4326"):
     """
     Get SMAP soil moisture data for a bounding box.
-    
+
     Args:
         datetime_obj: Datetime object for the data
         bbox: Bounding box tuple (left, bottom, right, top)
         crs: Coordinate reference system (default: "EPSG:4326")
-    
+
     Returns:
         dict: SMAP data with surface_sm and rootzone_sm
     """
@@ -222,22 +252,24 @@ async def get_smap_data(datetime_obj, bbox, crs="EPSG:4326"):
         smap_url = construct_smap_url(datetime_obj)
         cache_dir = Path("smap_cache")
         cache_dir.mkdir(exist_ok=True)
-        temp_filename = f"temp_smap_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.h5"
+        temp_filename = (
+            f"temp_smap_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.h5"
+        )
         temp_filepath = cache_dir / temp_filename
-        
+
         if not await download_smap_data(smap_url, str(temp_filepath)):
             return None
 
         # Process the data using the existing function
         result = process_smap_data(str(temp_filepath), bbox)
-        
+
         return result
 
     except Exception as e:
         print(f"Error getting SMAP data: {str(e)}")
         return None
     finally:
-        if 'temp_filepath' in locals() and temp_filepath.exists():
+        if "temp_filepath" in locals() and temp_filepath.exists():
             try:
                 temp_filepath.unlink()
             except Exception as e:
@@ -259,9 +291,11 @@ async def get_smap_data_multi_region(datetime_obj, regions):
         smap_url = construct_smap_url(datetime_obj)
         cache_dir = Path("smap_cache")
         cache_dir.mkdir(exist_ok=True)
-        temp_filename = f"temp_smap_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.h5"
+        temp_filename = (
+            f"temp_smap_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.h5"
+        )
         temp_filepath = cache_dir / temp_filename
-        
+
         if not await download_smap_data(smap_url, str(temp_filepath)):
             return None
 
@@ -316,9 +350,7 @@ async def get_smap_data_multi_region(datetime_obj, regions):
                 x_idx_start = max(0, min(x_idx_start, smap_x_size))
                 x_idx_end = max(0, min(x_idx_end, smap_x_size))
 
-                surface_roi = surface_data[
-                    y_idx_start:y_idx_end, x_idx_start:x_idx_end
-                ]
+                surface_roi = surface_data[y_idx_start:y_idx_end, x_idx_start:x_idx_end]
                 rootzone_roi = rootzone_data[
                     y_idx_start:y_idx_end, x_idx_start:x_idx_end
                 ]
@@ -339,15 +371,12 @@ async def get_smap_data_multi_region(datetime_obj, regions):
                 print(f"EASE2 bounds: {ease2_bounds}")
 
         # Return both the processed data and the file path for scoring
-        return {
-            "data": results,
-            "file_path": str(temp_filepath)
-        }
+        return {"data": results, "file_path": str(temp_filepath)}
 
     except Exception as e:
         print(f"Error getting SMAP data: {str(e)}")
         # Clean up on error only
-        if 'temp_filepath' in locals() and temp_filepath.exists():
+        if "temp_filepath" in locals() and temp_filepath.exists():
             try:
                 temp_filepath.unlink()
             except Exception as e:
@@ -446,7 +475,7 @@ def _process_smap_for_sentinel_sync(filepath, sentinel_bounds_tuple, sentinel_cr
         # Handle fill values
         surface_roi = surface_roi.astype(float)
         rootzone_roi = rootzone_roi.astype(float)
-        
+
         # Set fill values to NaN using the dataset's fill value
         # Try multiple ways to access fill value for compatibility
         fill_value = None
@@ -455,13 +484,13 @@ def _process_smap_for_sentinel_sync(filepath, sentinel_bounds_tuple, sentinel_cr
             fill_value = ds["sm_surface"]._FillValue
         except AttributeError:
             # Try accessing from attrs dictionary (newer xarray)
-            fill_value = ds["sm_surface"].attrs.get('_FillValue', None)
+            fill_value = ds["sm_surface"].attrs.get("_FillValue", None)
             if fill_value is None:
                 # Try other common fill value attribute names
-                fill_value = ds["sm_surface"].attrs.get('fill_value', None)
+                fill_value = ds["sm_surface"].attrs.get("fill_value", None)
                 if fill_value is None:
-                    fill_value = ds["sm_surface"].attrs.get('missing_value', None)
-        
+                    fill_value = ds["sm_surface"].attrs.get("missing_value", None)
+
         # Apply fill value if found, otherwise use a common SMAP fill value
         if fill_value is not None:
             surface_roi[surface_roi == fill_value] = np.nan
@@ -475,19 +504,32 @@ def _process_smap_for_sentinel_sync(filepath, sentinel_bounds_tuple, sentinel_cr
 
         # Resize to target shape for consistency
         target_shape = (11, 11)
-        surface_resampled = resize(surface_roi, target_shape, preserve_range=True, anti_aliasing=True)
-        rootzone_resampled = resize(rootzone_roi, target_shape, preserve_range=True, anti_aliasing=True)
+        surface_resampled = resize(
+            surface_roi, target_shape, preserve_range=True, anti_aliasing=True
+        )
+        rootzone_resampled = resize(
+            rootzone_roi, target_shape, preserve_range=True, anti_aliasing=True
+        )
 
         return {"surface_sm": surface_resampled, "rootzone_sm": rootzone_resampled}
 
-async def get_smap_data_for_sentinel_bounds(filepath, sentinel_bounds_tuple, sentinel_crs_str):
+
+async def get_smap_data_for_sentinel_bounds(
+    filepath, sentinel_bounds_tuple, sentinel_crs_str
+):
     """
     Process SMAP L4 data for a specified bounding box using a synchronous helper in an executor.
     """
     loop = asyncio.get_event_loop()
     try:
         # Offload the synchronous xr.open_dataset and processing
-        smap_dict = await loop.run_in_executor(None, _process_smap_for_sentinel_sync, filepath, sentinel_bounds_tuple, sentinel_crs_str)
+        smap_dict = await loop.run_in_executor(
+            None,
+            _process_smap_for_sentinel_sync,
+            filepath,
+            sentinel_bounds_tuple,
+            sentinel_crs_str,
+        )
         return smap_dict
     except Exception as e:
         print(f"Error in get_smap_data_for_sentinel_bounds: {e}")
@@ -507,7 +549,7 @@ async def test_smap_download():
         -26.0156800074561,
     )
     test_crs = "EPSG:4326"
-    print(f"Testing SMAP download for:")
+    print("Testing SMAP download for:")
     print(f"Date: {test_datetime}")
     print(f"Bounds: {test_bounds}")
     print(f"CRS: {test_crs}")

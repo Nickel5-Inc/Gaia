@@ -1,7 +1,9 @@
-import pandas as pd
 from typing import Optional
-from gaia.tasks.base.components.inputs import Inputs
+
+import pandas as pd
 from pydantic import Field
+
+from gaia.tasks.base.components.inputs import Inputs
 
 
 class GeomagneticInputs(Inputs):

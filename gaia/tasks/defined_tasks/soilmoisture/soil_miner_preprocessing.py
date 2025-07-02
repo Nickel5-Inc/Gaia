@@ -1,20 +1,20 @@
+import base64
+import os
+import tempfile
 import traceback
+from typing import Any, Dict
+
+import numpy as np
+import rasterio
+import torch
+from fiber.logging_utils import get_logger
+from huggingface_hub import hf_hub_download
+
+from gaia.models.soil_moisture_basemodel import SoilModel
 from gaia.tasks.base.components.preprocessing import Preprocessing
 from gaia.tasks.defined_tasks.soilmoisture.utils.inference_class import (
     SoilMoistureInferencePreprocessor,
 )
-from gaia.models.soil_moisture_basemodel import SoilModel
-from huggingface_hub import hf_hub_download
-import torch
-import io
-from typing import Dict, Any, Optional
-import safetensors.torch
-import rasterio
-import os
-import numpy as np
-from fiber.logging_utils import get_logger
-import tempfile
-import base64
 
 logger = get_logger(__name__)
 
@@ -40,7 +40,9 @@ class SoilMinerPreprocessing(Preprocessing):
                 logger.info(f"Loading model from local path: {local_path}")
                 model = SoilModel.load_from_checkpoint(local_path)
             else:
-                logger.info("Local checkpoint not found, downloading from HuggingFace...")
+                logger.info(
+                    "Local checkpoint not found, downloading from HuggingFace..."
+                )
                 checkpoint_path = hf_hub_download(
                     repo_id="Nickel5HF/soil-moisture-model",
                     filename="SoilModel.ckpt",
@@ -85,10 +87,10 @@ class SoilMinerPreprocessing(Preprocessing):
             logger.info(f"First 4 bytes raw: {tiff_bytes[:4]}")
 
             if not (
-                tiff_bytes.startswith(b"II\x2A\x00")
-                or tiff_bytes.startswith(b"MM\x00\x2A")
+                tiff_bytes.startswith(b"II\x2a\x00")
+                or tiff_bytes.startswith(b"MM\x00\x2a")
             ):
-                logger.error(f"Invalid TIFF header detected")
+                logger.error("Invalid TIFF header detected")
                 logger.error(f"First 16 bytes: {tiff_bytes[:16].hex()}")
                 raise ValueError(
                     "Invalid TIFF format: File does not start with valid TIFF header"
@@ -109,18 +111,20 @@ class SoilMinerPreprocessing(Preprocessing):
                     logger.info(f"Written file header: {header.hex()}")
 
                 with rasterio.open(temp_file_path) as dataset:
-                    logger.info(
-                        f"Successfully opened TIFF with shape: {dataset.shape}"
-                    )
+                    logger.info(f"Successfully opened TIFF with shape: {dataset.shape}")
                     logger.info(f"TIFF metadata: {dataset.profile}")
                     logger.info(
                         f"Band order: {dataset.tags().get('band_order', 'Not found')}"
                     )
 
                     if self.task.use_raw_preprocessing:
-                        model_inputs = self.preprocessor.preprocess_raw(temp_file_path) # Base model
+                        model_inputs = self.preprocessor.preprocess_raw(
+                            temp_file_path
+                        )  # Base model
                     else:
-                        model_inputs = self.preprocessor.preprocess(temp_file_path) # Custom model
+                        model_inputs = self.preprocessor.preprocess(
+                            temp_file_path
+                        )  # Custom model
                         for key in model_inputs:
                             if isinstance(model_inputs[key], torch.Tensor):
                                 model_inputs[key] = model_inputs[key].to(self.device)

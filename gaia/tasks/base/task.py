@@ -1,13 +1,15 @@
-from pydantic import BaseModel, Field
-from .components.metadata import Metadata
-from .components.inputs import Inputs
-from .components.outputs import Outputs
-from .components.scoring_mechanism import ScoringMechanism
-from .components.preprocessing import Preprocessing
-from .decorators import task_timer
 from abc import ABC, abstractmethod
+from typing import Any, Optional
+
 import networkx as nx
-from typing import Optional, Any
+from pydantic import BaseModel, Field
+
+from .components.inputs import Inputs
+from .components.metadata import Metadata
+from .components.outputs import Outputs
+from .components.preprocessing import Preprocessing
+from .components.scoring_mechanism import ScoringMechanism
+from .decorators import task_timer
 
 
 class Task(BaseModel, ABC):

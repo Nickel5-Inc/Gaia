@@ -1,13 +1,12 @@
-import subprocess
-import traceback
-import os
-import json
-import configparser
-import time
 import asyncio
-import sys
-from pathlib import Path
+import configparser
+import json
 import logging
+import os
+import subprocess
+import sys
+import traceback
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +210,8 @@ async def get_pm2_process_name():
         print(f"Error getting PM2 process name: {e}")
         return None
 
-#test6
+
+# test6
 async def perform_update(validator):
     """Enhanced update process with dependency management"""
     logger.info("Starting update process...")
@@ -259,14 +259,18 @@ async def perform_update(validator):
             logger.info("Step 5: Initiating PM2 restart...")
             process_name = await get_pm2_process_name()
             if process_name:
-                logger.info(f"Step 5a: Found PM2 process: {process_name}, initiating restart...")
+                logger.info(
+                    f"Step 5a: Found PM2 process: {process_name}, initiating restart..."
+                )
                 success = await restart_pm2_process(process_name)
                 if not success:
                     logger.error("Failed to restart via PM2")
                     return False
                 logger.info("Step 5a completed: PM2 restart initiated")
             else:
-                logger.warning("Step 5 completed: Not running under PM2, manual restart may be required")
+                logger.warning(
+                    "Step 5 completed: Not running under PM2, manual restart may be required"
+                )
 
             logger.info("Update process completed successfully - all steps finished")
             return True
@@ -289,30 +293,37 @@ async def restart_pm2_process(process_name):
             # Add a small delay to ensure any pending operations complete
             logger.info("Preparing for graceful shutdown...")
             await asyncio.sleep(2)
-            
+
             # First send SIGTERM to allow graceful shutdown
             logger.info("Sending SIGTERM for graceful shutdown...")
             term_proc = await asyncio.create_subprocess_exec(
-                "pm2", "sendSignal", "SIGTERM", process_name,
+                "pm2",
+                "sendSignal",
+                "SIGTERM",
+                process_name,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
-            
+
             # Wait for the SIGTERM command to complete
             term_stdout, term_stderr = await term_proc.communicate()
             if term_proc.returncode != 0:
                 logger.warning(f"SIGTERM command failed: {term_stderr.decode()}")
             else:
                 logger.info("SIGTERM sent successfully")
-            
+
             # Wait for process to indicate cleanup is done via its status file
             cleanup_file = "/tmp/validator_cleanup_done"
-            max_wait = 10  # Reduced to 10 seconds since PM2 will forcefully terminate anyway
+            max_wait = (
+                10  # Reduced to 10 seconds since PM2 will forcefully terminate anyway
+            )
             wait_interval = 1
             cleanup_detected = False
             for _ in range(max_wait // wait_interval):
                 if os.path.exists(cleanup_file):
-                    logger.info("Detected cleanup completion flag, proceeding with restart")
+                    logger.info(
+                        "Detected cleanup completion flag, proceeding with restart"
+                    )
                     cleanup_detected = True
                     try:
                         os.remove(cleanup_file)  # Clean up the file
@@ -320,40 +331,49 @@ async def restart_pm2_process(process_name):
                         logger.warning(f"Could not remove cleanup file: {e}")
                     break
                 await asyncio.sleep(wait_interval)
-            
+
             if not cleanup_detected:
-                logger.warning(f"Cleanup completion not detected after {max_wait} seconds")
-                logger.info("PM2 will handle any remaining background processes during restart")
-            
+                logger.warning(
+                    f"Cleanup completion not detected after {max_wait} seconds"
+                )
+                logger.info(
+                    "PM2 will handle any remaining background processes during restart"
+                )
+
             # Add small delay before restart to ensure main process has time to exit
             await asyncio.sleep(2)
-            
+
             # Then do the restart
             logger.info(f"Restarting process {process_name}...")
             restart_proc = await asyncio.create_subprocess_exec(
-                "pm2", "restart", process_name, "--update-env",
+                "pm2",
+                "restart",
+                process_name,
+                "--update-env",
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
-            
+
             stdout, stderr = await restart_proc.communicate()
-            
+
             if restart_proc.returncode == 0:
                 logger.info(f"PM2 restart successful on attempt {attempt + 1}")
                 # Don't return True immediately, instead just break the retry loop
                 # because the current process will be killed by the restart
                 break
-            
-            logger.warning(f"PM2 restart failed on attempt {attempt + 1}: {stderr.decode()}")
+
+            logger.warning(
+                f"PM2 restart failed on attempt {attempt + 1}: {stderr.decode()}"
+            )
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 * (attempt + 1))
-            
+
         except Exception as e:
             logger.error(f"Error during PM2 restart attempt {attempt + 1}: {str(e)}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 * (attempt + 1))
             continue
-    
+
     # Always return True at the end since if we get here, we've attempted the restart
     # The actual success/failure will be evident from whether the process restarts
     logger.info("Restart sequence completed, process should be restarting...")

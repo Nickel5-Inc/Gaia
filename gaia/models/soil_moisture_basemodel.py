@@ -1,10 +1,10 @@
-import torch.nn as nn
-import torch
-import torch.nn.functional as F
 import pytorch_lightning as pl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin
-from torchmetrics import R2Score
 from pytorch_msssim import ssim
+from torchmetrics import R2Score
 
 
 class SoilModel(pl.LightningModule, PyTorchModelHubMixin):

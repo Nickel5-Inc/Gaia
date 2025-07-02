@@ -1,4 +1,4 @@
-from gaia.tasks.base.components.metadata import Metadata, CoreMetadata
+from gaia.tasks.base.components.metadata import CoreMetadata, Metadata
 
 
 class GeomagneticMetadata(Metadata):

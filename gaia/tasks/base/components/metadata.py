@@ -1,8 +1,9 @@
 from abc import ABC, abstractmethod
+from typing import Any, Dict, Optional
 
-from typing import Dict, Any, Optional
-from ..decorators import handle_validation_error
 from pydantic import BaseModel, Field
+
+from ..decorators import handle_validation_error
 
 
 class CoreMetadata(BaseModel):

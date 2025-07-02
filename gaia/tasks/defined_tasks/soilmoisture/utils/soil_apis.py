@@ -1,28 +1,26 @@
 import asyncio
 import math
 import os
-import subprocess
 import tempfile
 import traceback
 import zipfile
 from datetime import datetime, timedelta, timezone
+
 import aiohttp
+import boto3
 import numpy as np
 import rasterio
+import requests
 import xarray as xr
-from aiohttp import ClientSession, BasicAuth
-from aiohttp.client_exceptions import ClientResponseError
+from aiohttp import BasicAuth
+from botocore.client import UNSIGNED
+from botocore.config import Config
 from dotenv import load_dotenv
 from pyproj import Transformer
 from rasterio.merge import merge
 from rasterio.transform import from_bounds
-from rasterio.warp import transform_bounds, reproject, Resampling
+from rasterio.warp import Resampling, reproject, transform_bounds
 from skimage.transform import resize
-import requests
-import boto3
-from botocore.config import Config
-from botocore.client import UNSIGNED
-import logging
 
 load_dotenv()
 EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
@@ -30,8 +28,9 @@ EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 
 EARTHDATA_AUTH = BasicAuth(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
 
+
 class SessionWithHeaderRedirection(requests.Session):
-    AUTH_HOST = 'urs.earthdata.nasa.gov'
+    AUTH_HOST = "urs.earthdata.nasa.gov"
 
     def __init__(self, username, password):
         super().__init__()
@@ -40,16 +39,20 @@ class SessionWithHeaderRedirection(requests.Session):
     def rebuild_auth(self, prepared_request, response):
         headers = prepared_request.headers
         url = prepared_request.url
-        if 'Authorization' in headers:
+        if "Authorization" in headers:
             original_parsed = requests.utils.urlparse(response.request.url)
             redirect_parsed = requests.utils.urlparse(url)
-            if (original_parsed.hostname != redirect_parsed.hostname) and \
-                    redirect_parsed.hostname != self.AUTH_HOST and \
-                    original_parsed.hostname != self.AUTH_HOST:
-                del headers['Authorization']
+            if (
+                (original_parsed.hostname != redirect_parsed.hostname)
+                and redirect_parsed.hostname != self.AUTH_HOST
+                and original_parsed.hostname != self.AUTH_HOST
+            ):
+                del headers["Authorization"]
         return
 
+
 session = SessionWithHeaderRedirection(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
+
 
 async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
     """
@@ -87,27 +90,34 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
         }
 
         print(f"Searching for Sentinel data for {month_start.strftime('%B %Y')}")
-        
+
         # Try with token first if available
         if use_token:
             try:
-                headers = {"Authorization": f'Bearer {token}'}
+                headers = {"Authorization": f"Bearer {token}"}
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
                         base_url, params=params, headers=headers
                     ) as response:
                         if response.status == 200:
                             response_json = await response.json()
-                            if "feed" in response_json and "entry" in response_json["feed"]:
+                            if (
+                                "feed" in response_json
+                                and "entry" in response_json["feed"]
+                            ):
                                 entries = response_json["feed"]["entry"]
                                 if entries:
-                                    print(f"Found {len(entries)} potential scenes using token auth")
+                                    print(
+                                        f"Found {len(entries)} potential scenes using token auth"
+                                    )
                                     return await process_entries(entries, search_date)
                         else:
-                            print(f"Token auth failed with status {response.status}, trying basic auth...")
+                            print(
+                                f"Token auth failed with status {response.status}, trying basic auth..."
+                            )
             except Exception as e:
                 print(f"Error with token auth: {str(e)}, falling back to basic auth")
-        
+
         # Fall back to basic auth if token failed or not available
         try:
             async with aiohttp.ClientSession(auth=EARTHDATA_AUTH) as session:
@@ -117,13 +127,17 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
                         if "feed" in response_json and "entry" in response_json["feed"]:
                             entries = response_json["feed"]["entry"]
                             if entries:
-                                print(f"Found {len(entries)} potential scenes using basic auth")
+                                print(
+                                    f"Found {len(entries)} potential scenes using basic auth"
+                                )
                                 return await process_entries(entries, search_date)
                     else:
-                        print(f"Both auth methods failed. Basic auth status: {response.status} {response.reason}")
+                        print(
+                            f"Both auth methods failed. Basic auth status: {response.status} {response.reason}"
+                        )
         except Exception as e:
             print(f"Error with basic auth: {str(e)}")
-            
+
         return None
 
     async def process_entries(entries, target_date):
@@ -179,14 +193,14 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
                     if success:
                         print(f"Downloaded B4 to: {b4_path}")
                     else:
-                        print(f"Failed to download B4 with both auth methods")
+                        print("Failed to download B4 with both auth methods")
                         continue
 
-                    success = await download_file_with_fallback(b8_url, b8_path) 
+                    success = await download_file_with_fallback(b8_url, b8_path)
                     if success:
                         print(f"Downloaded B8 to: {b8_path}")
                     else:
-                        print(f"Failed to download B8 with both auth methods")
+                        print("Failed to download B8 with both auth methods")
                         continue
 
                     return [b4_path, b8_path]
@@ -200,30 +214,38 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
         token = os.getenv("EARTHDATA_API_KEY")
         if token and len(token) > 10:
             try:
-                headers = {"Authorization": f'Bearer {token}'}
+                headers = {"Authorization": f"Bearer {token}"}
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, headers=headers) as response:
                         if response.status == 200:
                             with open(destination, "wb") as f:
-                                async for chunk in response.content.iter_chunked(1024 * 1024):
+                                async for chunk in response.content.iter_chunked(
+                                    1024 * 1024
+                                ):
                                     f.write(chunk)
                             return True
                         else:
-                            print(f"Token download failed with status {response.status}, trying basic auth...")
+                            print(
+                                f"Token download failed with status {response.status}, trying basic auth..."
+                            )
             except Exception as e:
                 print(f"Error with token download: {str(e)}")
-        
+
         # Fall back to basic auth
         try:
             async with aiohttp.ClientSession(auth=EARTHDATA_AUTH) as session:
                 async with session.get(url) as response:
                     if response.status == 200:
                         with open(destination, "wb") as f:
-                            async for chunk in response.content.iter_chunked(1024 * 1024):
+                            async for chunk in response.content.iter_chunked(
+                                1024 * 1024
+                            ):
                                 f.write(chunk)
                         return True
                     else:
-                        print(f"Basic auth download failed with status {response.status}")
+                        print(
+                            f"Basic auth download failed with status {response.status}"
+                        )
                         return False
         except Exception as e:
             print(f"Error with basic auth download: {str(e)}")
@@ -240,15 +262,19 @@ async def fetch_hls_b4_b8(bbox, datetime_obj, download_dir=None):
     try:
         print("No data found for current month, trying previous month...")
         if datetime_obj.month == 1:
-            prev_month_date = datetime_obj.replace(year=datetime_obj.year - 1, month=12, day=1)
+            prev_month_date = datetime_obj.replace(
+                year=datetime_obj.year - 1, month=12, day=1
+            )
         else:
             first_of_month = datetime_obj.replace(day=1)
             prev_month_date = first_of_month - timedelta(days=1)
             try:
-                prev_month_date = prev_month_date.replace(day=min(datetime_obj.day, prev_month_date.day))
+                prev_month_date = prev_month_date.replace(
+                    day=min(datetime_obj.day, prev_month_date.day)
+                )
             except ValueError:
                 pass
-        
+
         return await try_month(prev_month_date)
     except Exception as e:
         print(f"Error fetching previous month's data: {str(e)}")
@@ -262,87 +288,123 @@ async def download_srtm_tile(lat, lon, download_dir=None):
     try:
         lat_prefix = "N" if lat >= 0 else "S"
         lon_prefix = "E" if lon >= 0 else "W"
-        
+
         # Primary source (Earthdata)
-        tile_name = f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.SRTMGL1.hgt.zip"
-        earthdata_url = f"https://e4ftl01.cr.usgs.gov/MEASURES/SRTMGL1.003/2000.02.11/{tile_name}"
+        tile_name = (
+            f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.SRTMGL1.hgt.zip"
+        )
+        earthdata_url = (
+            f"https://e4ftl01.cr.usgs.gov/MEASURES/SRTMGL1.003/2000.02.11/{tile_name}"
+        )
         print(f"\n=== SRTM Download Debug for {tile_name} ===")
-        
+
         timeout = aiohttp.ClientTimeout(total=300)
-        async with aiohttp.ClientSession(timeout=timeout, auth=EARTHDATA_AUTH) as session:
+        async with aiohttp.ClientSession(
+            timeout=timeout, auth=EARTHDATA_AUTH
+        ) as session:
             try:
                 print("Attempting primary Earthdata source...")
                 async with session.get(earthdata_url) as response:
                     print(f"Earthdata status code: {response.status}")
-                    
+
                     if response.status == 200:
                         zip_path = os.path.join(download_dir, tile_name)
-                        final_tif_path = os.path.join(download_dir, f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.tif")
-                        
+                        final_tif_path = os.path.join(
+                            download_dir,
+                            f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.tif",
+                        )
+
                         with open(zip_path, "wb") as f:
-                            async for chunk in response.content.iter_chunked(1024 * 1024):
+                            async for chunk in response.content.iter_chunked(
+                                1024 * 1024
+                            ):
                                 f.write(chunk)
-                        
+
                         print(f"Downloaded zip file to: {zip_path}")
-                        
+
                         with zipfile.ZipFile(zip_path, "r") as zip_ref:
                             hgt_filename = zip_ref.namelist()[0]
                             zip_ref.extract(hgt_filename, download_dir)
-                        
+
                         hgt_path = os.path.join(download_dir, hgt_filename)
-                        
+
                         import subprocess
-                        subprocess.run([
-                            'gdal_translate',
-                            '-of', 'GTiff',
-                            '-co', 'COMPRESS=LZW',
-                            '-a_srs', 'EPSG:4326',
-                            hgt_path,
-                            final_tif_path
-                        ], check=True)
-                        
+
+                        subprocess.run(
+                            [
+                                "gdal_translate",
+                                "-of",
+                                "GTiff",
+                                "-co",
+                                "COMPRESS=LZW",
+                                "-a_srs",
+                                "EPSG:4326",
+                                hgt_path,
+                                final_tif_path,
+                            ],
+                            check=True,
+                        )
+
                         os.remove(zip_path)
                         os.remove(hgt_path)
-                        
+
                         return final_tif_path
                     else:
-                        raise Exception(f"Earthdata source failed with status {response.status}")
-                        
+                        raise Exception(
+                            f"Earthdata source failed with status {response.status}"
+                        )
+
             except Exception as e:
                 print(f"Earthdata source error: {str(e)}")
                 print("Attempting Copernicus DEM fallback source...")
-                
-                s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
-                
+
+                s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+
                 lat_abs = abs(lat)
                 lon_abs = abs(lon)
                 lat_dir = "N" if lat >= 0 else "S"
                 lon_dir = "E" if lon >= 0 else "W"
-                
+
                 for resolution_code in ["COG_10", "COG_30"]:
                     bucket = "copernicus-dem-30m"
-                    key = (f"Copernicus_DSM_{resolution_code}_{lat_dir}{lat_abs:02d}_00_"
-                          f"{lon_dir}{lon_abs:03d}_00_DEM/Copernicus_DSM_{resolution_code}_"
-                          f"{lat_dir}{lat_abs:02d}_00_{lon_dir}{lon_abs:03d}_00_DEM.tif")
-                    
-                    print(f"Trying Copernicus GLO-30 mirror with {resolution_code} at s3://{bucket}/{key}")
+                    key = (
+                        f"Copernicus_DSM_{resolution_code}_{lat_dir}{lat_abs:02d}_00_"
+                        f"{lon_dir}{lon_abs:03d}_00_DEM/Copernicus_DSM_{resolution_code}_"
+                        f"{lat_dir}{lat_abs:02d}_00_{lon_dir}{lon_abs:03d}_00_DEM.tif"
+                    )
+
+                    print(
+                        f"Trying Copernicus GLO-30 mirror with {resolution_code} at s3://{bucket}/{key}"
+                    )
                     try:
-                        final_tif_path = os.path.join(download_dir, f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.tif")
-                        await asyncio.to_thread(s3.download_file, bucket, key, final_tif_path)
+                        final_tif_path = os.path.join(
+                            download_dir,
+                            f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.tif",
+                        )
+                        await asyncio.to_thread(
+                            s3.download_file, bucket, key, final_tif_path
+                        )
                         return final_tif_path
                     except Exception as e:
                         print(f"Copernicus GLO-30 {resolution_code} failed: {str(e)}")
                         continue
-                
+
                 bucket = "copernicus-dem-90m"
-                key = (f"Copernicus_DSM_COG_90_{lat_dir}{lat_abs:02d}_00_"
-                      f"{lon_dir}{lon_abs:03d}_00_DEM/Copernicus_DSM_COG_90_"
-                      f"{lat_dir}{lat_abs:02d}_00_{lon_dir}{lon_abs:03d}_00_DEM.tif")
-                
+                key = (
+                    f"Copernicus_DSM_COG_90_{lat_dir}{lat_abs:02d}_00_"
+                    f"{lon_dir}{lon_abs:03d}_00_DEM/Copernicus_DSM_COG_90_"
+                    f"{lat_dir}{lat_abs:02d}_00_{lon_dir}{lon_abs:03d}_00_DEM.tif"
+                )
+
                 print(f"Trying Copernicus GLO-90 mirror at s3://{bucket}/{key}")
                 try:
-                    final_tif_path = os.path.join(download_dir, f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.tif")
-                    await asyncio.to_thread(s3.download_file, bucket, key, final_tif_path)
+                    final_tif_path = os.path.join(
+                        download_dir,
+                        f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}.tif",
+                    )
+                    await asyncio.to_thread(
+                        s3.download_file, bucket, key, final_tif_path
+                    )
                     return final_tif_path
                 except Exception as e:
                     print(f"Copernicus GLO-90 failed: {str(e)}")
@@ -353,7 +415,9 @@ async def download_srtm_tile(lat, lon, download_dir=None):
         return None
 
 
-async def fetch_srtm(bbox, sentinel_bounds=None, sentinel_crs=None, sentinel_shape=None):
+async def fetch_srtm(
+    bbox, sentinel_bounds=None, sentinel_crs=None, sentinel_shape=None
+):
     """Fetch and merge SRTM tiles using Sentinel-2 as reference asynchronously."""
     try:
         print("\n=== Fetching SRTM Data ===")
@@ -407,7 +471,7 @@ async def fetch_srtm(bbox, sentinel_bounds=None, sentinel_crs=None, sentinel_sha
         return output, None, output_transform, sentinel_crs
 
     except Exception as e:
-        print(f"\n=== Error in SRTM processing ===")
+        print("\n=== Error in SRTM processing ===")
         print(f"Error: {str(e)}")
         traceback.print_exc()
         return None, None, None, None
@@ -419,10 +483,11 @@ async def _load_ifs_cache_with_fallbacks(cache_file_path):
     This matches the pattern used in the weather code for reliability.
     """
     try:
+
         def _load_with_fallbacks():
             # First, try to load as netCDF with multiple engines
-            engines_to_try = ['netcdf4', 'scipy', 'h5netcdf']
-            
+            engines_to_try = ["netcdf4", "scipy", "h5netcdf"]
+
             for engine in engines_to_try:
                 try:
                     ds = xr.open_dataset(cache_file_path, engine=engine)
@@ -431,21 +496,22 @@ async def _load_ifs_cache_with_fallbacks(cache_file_path):
                 except Exception as engine_err:
                     print(f"Failed to load with '{engine}' engine: {engine_err}")
                     continue
-            
+
             # If all netCDF engines failed, try loading as pickle
             try:
                 import pickle
-                with open(cache_file_path, 'rb') as f:
+
+                with open(cache_file_path, "rb") as f:
                     ds = pickle.load(f)
-                print(f"Successfully loaded IFS cache as pickle format")
+                print("Successfully loaded IFS cache as pickle format")
                 return ds
             except Exception as pickle_err:
                 print(f"Failed to load as pickle: {pickle_err}")
                 return None
-        
+
         # Run the loading in a thread since it might be blocking
         return await asyncio.to_thread(_load_with_fallbacks)
-        
+
     except Exception as e:
         print(f"Error loading IFS cache from {cache_file_path}: {e}")
         return None
@@ -606,12 +672,12 @@ async def process_global_ifs(grib_paths, timesteps, output_path):
 
         if datasets:
             combined_ds = xr.concat(datasets, dim="time")
-            
+
             # Robust netCDF saving with fallback engines (same pattern as weather code)
             def _save_with_fallbacks():
-                engines_to_try = ['netcdf4', 'scipy', 'h5netcdf']
+                engines_to_try = ["netcdf4", "scipy", "h5netcdf"]
                 saved_successfully = False
-                
+
                 for engine in engines_to_try:
                     try:
                         combined_ds.to_netcdf(output_path, engine=engine)
@@ -621,22 +687,25 @@ async def process_global_ifs(grib_paths, timesteps, output_path):
                     except Exception as engine_err:
                         print(f"Failed to save with '{engine}' engine: {engine_err}")
                         continue
-                
+
                 if not saved_successfully:
                     # Final fallback: save as pickle
                     import pickle
-                    pickle_path = output_path.replace('.nc', '.pkl')
-                    print(f"All netCDF engines failed, falling back to pickle format: {pickle_path}")
-                    with open(pickle_path, 'wb') as f:
+
+                    pickle_path = output_path.replace(".nc", ".pkl")
+                    print(
+                        f"All netCDF engines failed, falling back to pickle format: {pickle_path}"
+                    )
+                    with open(pickle_path, "wb") as f:
                         pickle.dump(combined_ds, f)
-                    print(f"Successfully saved IFS data as pickle")
+                    print("Successfully saved IFS data as pickle")
                     # Update output path for caller
-                    import os
                     import shutil
+
                     shutil.move(pickle_path, output_path)
-                
+
                 return saved_successfully
-            
+
             success = await asyncio.to_thread(_save_with_fallbacks)
             return True  # Return True even if we used pickle fallback
         return False
@@ -750,7 +819,7 @@ async def get_soil_data(bbox, datetime_obj=None):
         datetime_obj = datetime.now(timezone.utc)
 
     try:
-        print(f"\n=== Starting Data Collection ===")
+        print("\n=== Starting Data Collection ===")
         sentinel_data = []
         ifs_resized = []
         srtm_resized = None
@@ -805,7 +874,7 @@ async def get_soil_data(bbox, datetime_obj=None):
         if ifs_data is None:
             print("Warning: IFS data is None, using empty list as fallback")
             ifs_data = []
-        
+
         if sentinel_data is None:
             print("Warning: Sentinel data is None, using empty list as fallback")
             sentinel_data = []
@@ -842,7 +911,7 @@ async def get_soil_data(bbox, datetime_obj=None):
         return output_file, sentinel_bounds, sentinel_crs
 
     except Exception as e:
-        print(f"\n=== Error Occurred ===")
+        print("\n=== Error Occurred ===")
         print(f"Error in get_soil_data: {str(e)}")
         import traceback
 
@@ -889,21 +958,21 @@ async def combine_tiffs(
 
             dst.write(srtm_resized.astype("float32"), band_idx)
             band_idx += 1
-            
+
             # Calculate NDVI only if we have at least 2 Sentinel bands
             if len(sentinel_data) >= 2:
                 ndvi = (sentinel_data[1] - sentinel_data[0]) / (
                     sentinel_data[1] + sentinel_data[0]
                 )
                 dst.write(ndvi.astype("float32"), band_idx)
-                band_order = f"1-{len(sentinel_data)}:Sentinel(B4,B8), {len(sentinel_data)+1}-{len(sentinel_data)+len(ifs_data)}:IFS+Evap, {len(sentinel_data)+len(ifs_data)+1}:SRTM, {len(sentinel_data)+len(ifs_data)+2}:NDVI"
+                band_order = f"1-{len(sentinel_data)}:Sentinel(B4,B8), {len(sentinel_data) + 1}-{len(sentinel_data) + len(ifs_data)}:IFS+Evap, {len(sentinel_data) + len(ifs_data) + 1}:SRTM, {len(sentinel_data) + len(ifs_data) + 2}:NDVI"
             else:
                 # No NDVI band if we don't have Sentinel data, fill with zeros
                 print("Warning: No Sentinel data available, skipping NDVI calculation")
                 dummy_ndvi = np.zeros(target_shape, dtype="float32")
                 dst.write(dummy_ndvi, band_idx)
-                band_order = f"1-{len(sentinel_data)}:Sentinel, {len(sentinel_data)+1}-{len(sentinel_data)+len(ifs_data)}:IFS+Evap, {len(sentinel_data)+len(ifs_data)+1}:SRTM, {len(sentinel_data)+len(ifs_data)+2}:NDVI(dummy)"
-            
+                band_order = f"1-{len(sentinel_data)}:Sentinel, {len(sentinel_data) + 1}-{len(sentinel_data) + len(ifs_data)}:IFS+Evap, {len(sentinel_data) + len(ifs_data) + 1}:SRTM, {len(sentinel_data) + len(ifs_data) + 2}:NDVI(dummy)"
+
             dst.update_tags(
                 sentinel_transform=str(profile["sentinel_transform"]),
                 band_order=band_order,
@@ -926,13 +995,13 @@ def calculate_penman_monteith(ds):
         # Temp (K to C)
         t2m_k = ds["t2m"].values
         d2m_k = ds["d2m"].values
-        print(f"Raw temperatures (K):")
+        print("Raw temperatures (K):")
         print(f"t2m: {t2m_k.mean():.2f}K ({t2m_k.min():.2f} to {t2m_k.max():.2f})")
         print(f"d2m: {d2m_k.mean():.2f}K ({d2m_k.min():.2f} to {d2m_k.max():.2f})")
 
         t2m = t2m_k - 273.15
         d2m = d2m_k - 273.15
-        print(f"\nConverted temperatures (°C):")
+        print("\nConverted temperatures (°C):")
         print(f"t2m: {t2m.mean():.2f}°C ({t2m.min():.2f} to {t2m.max():.2f})")
         print(f"d2m: {d2m.mean():.2f}°C ({d2m.min():.2f} to {d2m.max():.2f})")
 
@@ -959,7 +1028,7 @@ def calculate_penman_monteith(ds):
         # Wind speed (m/s)
         u10 = ds["u10"].values
         v10 = ds["v10"].values
-        print(f"\nWind components (m/s):")
+        print("\nWind components (m/s):")
         print(f"u10: {u10.mean():.2f} ({u10.min():.2f} to {u10.max():.2f})")
         print(f"v10: {v10.mean():.2f} ({v10.min():.2f} to {v10.max():.2f})")
         wind_speed = np.sqrt(u10**2 + v10**2)
@@ -970,14 +1039,14 @@ def calculate_penman_monteith(ds):
         # Vapor pressure (kPa)
         svp = 0.6108 * np.exp((17.27 * t2m) / (t2m + 237.3))
         avp = 0.6108 * np.exp((17.27 * d2m) / (d2m + 237.3))
-        print(f"\nVapor pressures (kPa):")
+        print("\nVapor pressures (kPa):")
         print(f"Saturation VP: {svp.mean():.2f} ({svp.min():.2f} to {svp.max():.2f})")
         print(f"Actual VP: {avp.mean():.2f} ({avp.min():.2f} to {avp.max():.2f})")
 
         # Psychrometric and slope
         psy = 0.000665 * sp
         delta = (4098 * svp) / ((t2m + 237.3) ** 2)
-        print(f"\nPsychrometric constants:")
+        print("\nPsychrometric constants:")
         print(f"Psychrometric constant: {psy.mean():.4f} kPa/°C")
         print(f"Slope of SVP: {delta.mean():.4f} kPa/°C")
 
@@ -987,7 +1056,7 @@ def calculate_penman_monteith(ds):
         )
         den = delta + psy * (1 + 0.34 * wind_speed)
         et0 = num / den
-        print(f"\nFinal calculations:")
+        print("\nFinal calculations:")
         print(f"Numerator: {num.mean():.4f}")
         print(f"Denominator: {den.mean():.4f}")
         print(f"ET0: {et0.mean():.2f} mm/day ({et0.min():.2f} to {et0.max():.2f})")
@@ -1030,7 +1099,7 @@ def partition_evaporation(total_evap, ds):
 
     except Exception as e:
         print(f"Error in evaporation partitioning: {str(e)}")
-        print(f"Using fallback value of 30% bare soil evaporation")
+        print("Using fallback value of 30% bare soil evaporation")
         return total_evap * 0.3  # Fallback value
 
 

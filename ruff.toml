@@ -1,0 +1,24 @@
+# Select all common rules, then add specifics.
+# See https://docs.astral.sh/ruff/rules/ for a full list.
+line-length = 88
+
+[lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort (import sorting)
+    "C",  # flake8-comprehensions (encourages efficient comprehensions)
+    "B",  # flake8-bugbear (finds likely bugs)
+    "UP", # pyupgrade (upgrades syntax to modern versions)
+    "TID",# flake8-tidy-imports
+    "T20",# flake8-print (flags print statements, encouraging proper logging)
+]
+ignore = ["E501"] # Delegate line length to the formatter.
+
+[lint.isort]
+known-first-party = ["gaia"]
+
+[lint.per-file-ignores]
+# Allow `__init__.py` files to have unused imports for package exposure.
+"__init__.py" = ["F401"]

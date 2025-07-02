@@ -1,8 +1,9 @@
-from gaia.tasks.base.components.preprocessing import Preprocessing
-import pandas as pd
-from gaia.models.geomag_basemodel import GeoMagBaseModel
-from typing import Dict
 import logging
+
+import pandas as pd
+
+from gaia.models.geomag_basemodel import GeoMagBaseModel
+from gaia.tasks.base.components.preprocessing import Preprocessing
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,9 @@ class GeomagneticPreprocessing(Preprocessing):
             processed_df = data.copy()
 
             # Convert timestamps to pandas datetime and remove timezone
-            processed_df["timestamp"] = pd.to_datetime(processed_df["timestamp"], utc=True)
+            processed_df["timestamp"] = pd.to_datetime(
+                processed_df["timestamp"], utc=True
+            )
             if processed_df["timestamp"].dt.tz is not None:
                 processed_df["timestamp"] = (
                     processed_df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
