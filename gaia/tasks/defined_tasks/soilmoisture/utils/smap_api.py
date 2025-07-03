@@ -82,7 +82,7 @@ async def download_smap_data(url, output_path):
         print(f"Using cached SMAP data from {cache_file}")
         if output_path != str(cache_file):
             await loop.run_in_executor(None, shutil.copy, str(cache_file), output_path)
-        return True
+        return {"success": True, "error_type": None, "status_code": 200, "message": "Using cached data"}
 
     # Determine authentication method
     auth_method = None
@@ -98,7 +98,7 @@ async def download_smap_data(url, output_path):
         print("Using EARTHDATA username/password authentication")
     else:
         print("❌ No EARTHDATA credentials found! Set either EARTHDATA_API_KEY or EARTHDATA_USERNAME/EARTHDATA_PASSWORD")
-        return False
+        return {"success": False, "error_type": "auth_missing", "status_code": None, "message": "No EARTHDATA credentials found"}
 
     try:
         async with httpx.AsyncClient(auth=auth_method, headers=headers, follow_redirects=True, timeout=300.0) as client:
@@ -111,7 +111,7 @@ async def download_smap_data(url, output_path):
                 print(f"File size: {total_size / (1024*1024):.1f} MB")
             except httpx.HTTPStatusError as e:
                 print(f"Failed to get headers (url might be invalid or auth failed): {e.response.status_code} for {url}")
-                return False
+                return {"success": False, "error_type": "http_error", "status_code": e.response.status_code, "message": f"HTTP {e.response.status_code}"}
             except Exception as e_head:
                 print(f"Error getting file size: {e_head} for {url}")
                 total_size = 0 # Proceed without progress bar if size fetch fails
@@ -124,7 +124,7 @@ async def download_smap_data(url, output_path):
                     print(f"Response content: {content_snippet[:500]}") # Log part of the response
                     if await loop.run_in_executor(None, cache_file.exists):
                         await loop.run_in_executor(None, cache_file.unlink)
-                    return False
+                    return {"success": False, "error_type": "http_error", "status_code": response.status_code, "message": f"HTTP {response.status_code}"}
                 
                 # Use a temporary file for download to avoid partial files in cache on error
                 temp_dl_path = cache_file.with_suffix(cache_file.suffix + '.part')
@@ -145,25 +145,25 @@ async def download_smap_data(url, output_path):
 
                     if output_path != str(cache_file):
                         await loop.run_in_executor(None, shutil.copy, str(cache_file), output_path)
-                    return True
+                    return {"success": True, "error_type": None, "status_code": 200, "message": "Download successful"}
                 except Exception as e_write:
                     print(f"\nError during file write/move: {e_write}")
                     if await loop.run_in_executor(None, temp_dl_path.exists):
                         await loop.run_in_executor(None, temp_dl_path.unlink)
                     if await loop.run_in_executor(None, cache_file.exists): # If main cache file was somehow created
                         await loop.run_in_executor(None, cache_file.unlink)
-                    return False
+                    return {"success": False, "error_type": "file_error", "status_code": None, "message": f"File write error: {str(e_write)}"}
 
     except httpx.RequestError as e_req:
         print(f"Request error during download from {url}: {e_req}")
         if await loop.run_in_executor(None, cache_file.exists):
             await loop.run_in_executor(None, cache_file.unlink)
-        return False
+        return {"success": False, "error_type": "network_error", "status_code": None, "message": f"Network error: {str(e_req)}"}
     except Exception as e:
         print(f"General error during download from {url}: {str(e)}")
         if await loop.run_in_executor(None, cache_file.exists):
             await loop.run_in_executor(None, cache_file.unlink)
-        return False
+        return {"success": False, "error_type": "general_error", "status_code": None, "message": f"General error: {str(e)}"}
 
 
 def process_smap_data(filepath, bbox, target_shape=(220, 220)):

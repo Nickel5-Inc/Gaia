@@ -65,7 +65,7 @@ class SoilMoistureTask(Task):
     )
     scoring_delay: timedelta = Field(
         default_factory=lambda: timedelta(days=3),
-        description="Delay before scoring due to SMAP data latency",
+        description="Delay before scoring due to SMAP data latency. Enhanced error handling distinguishes between 404 (data not available yet) vs other error types for optimized retry timing.",
     )
 
     validator_preprocessing: Optional["SoilValidatorPreprocessing"] = None # type: ignore # steven this is for the linter lol, just leave it here unless it's causing issues
@@ -165,12 +165,23 @@ class SoilMoistureTask(Task):
                 await validator.update_task_status('soil', 'active')
                 current_time = datetime.now(timezone.utc)
 
-                # Check for scoring every 5 minutes
-                if current_time.minute % 5 == 0:
+                # Check for scoring every 5 minutes AND ensure retries run frequently
+                should_score = (
+                    current_time.minute % 5 == 0 or  # Regular 5-minute intervals
+                    # Also check for retries every 60 seconds regardless of minute
+                    getattr(self, '_last_retry_check', datetime.min.replace(tzinfo=timezone.utc)) < current_time - timedelta(seconds=60)
+                )
+                
+                if should_score:
                     await validator.update_task_status('soil', 'processing', 'scoring')
+                    logger.info(f"🔄 Running retry/scoring check at {current_time}")
                     await self.validator_score()
-                    await asyncio.sleep(60)
-                    continue
+                    self._last_retry_check = current_time
+                    
+                    # Only sleep and continue for regular 5-minute intervals, not retry checks
+                    if current_time.minute % 5 == 0:
+                        await asyncio.sleep(60)
+                        continue
 
                 if self.test_mode:
                     logger.info("Running in test mode - bypassing window checks")
@@ -804,8 +815,27 @@ class SoilMoistureTask(Task):
                 GROUP BY p.status
             """
             debug_result = await self.db_manager.fetch_all(debug_query)
+            logger.info(f"📊 Task status summary at {datetime.now(timezone.utc)}")
             for row in debug_result:
-                logger.info(f"Status: {row['status']}, Count: {row['count']}, Time Range: {row['earliest']} to {row['latest']}")
+                logger.info(f"  {row['status']}: {row['count']} tasks, time range: {row['earliest']} to {row['latest']}")
+
+            # Check specifically how many are ready for retry
+            retry_ready_query = """
+                SELECT 
+                    COUNT(CASE WHEN p.status = 'retry_scheduled' AND p.next_retry_time <= :current_time AND p.retry_count < 5 THEN 1 END) as retry_ready,
+                    COUNT(CASE WHEN p.status = 'sent_to_miner' AND r.target_time <= :scoring_time THEN 1 END) as scoring_ready,
+                    COUNT(CASE WHEN p.status = 'retry_scheduled' AND p.retry_count >= 5 THEN 1 END) as stuck_retries
+                FROM soil_moisture_predictions p
+                JOIN soil_moisture_regions r ON p.region_id = r.id
+                WHERE p.status IN ('sent_to_miner', 'retry_scheduled')
+            """
+            ready_counts = await self.db_manager.fetch_one(retry_ready_query, {
+                "current_time": datetime.now(timezone.utc),
+                "scoring_time": scoring_time
+            })
+            logger.info(f"  Ready for retry: {ready_counts.get('retry_ready', 0)}")
+            logger.info(f"  Ready for scoring: {ready_counts.get('scoring_ready', 0)}")
+            logger.info(f"  Stuck retries (>=5): {ready_counts.get('stuck_retries', 0)}")
 
             # Get pending tasks
             pending_query = """
@@ -983,7 +1013,7 @@ class SoilMoistureTask(Task):
             for target_time, tasks_in_time_window in tasks_by_time.items():
                 temp_path = None
                 try:
-                    logger.info(f"Processing tasks for target_time: {target_time}")
+                    logger.info(f"🌍 Processing tasks for target_time: {target_time} ({len(tasks_in_time_window)} regions)")
                     # Transform tasks into the format expected by get_smap_data
                     regions_for_smap = []
                     for task in tasks_in_time_window:
@@ -1016,13 +1046,40 @@ class SoilMoistureTask(Task):
                                 await self.db_manager.execute(update_query, params)
                         continue
                     
-                    # Extract file path and processed data
-                    temp_path = smap_data_result.get("file_path")
-                    smap_processed_data = smap_data_result.get("data", {})
-                    
-                    if not temp_path or not os.path.exists(temp_path):
-                        logger.error(f"Failed to download or process SMAP data for {target_time}")
-                        # Update retry information for failed tasks
+                    # Check if SMAP result contains error information (enhanced error handling)
+                    if "success" in smap_data_result and not smap_data_result["success"]:
+                        error_type = smap_data_result.get("error_type", "unknown")
+                        status_code = smap_data_result.get("status_code")
+                        error_message = smap_data_result.get("message", "Unknown error")
+                        
+                        # Determine retry timing based on error type
+                        if error_type == "http_error" and status_code == 404:
+                            # Data not available yet - retry sooner since data might become available
+                            retry_hours = 1  # Retry in 1 hour for 404 errors
+                            detailed_message = f"SMAP data not available yet (HTTP 404) for {target_time}"
+                            logger.warning(f"⏳ {detailed_message} - will retry in {retry_hours} hour(s)")
+                        elif error_type == "http_error" and status_code in [401, 403]:
+                            # Authentication issue - retry later but log as concerning
+                            retry_hours = 4  # Longer retry for auth issues
+                            detailed_message = f"SMAP authentication failed (HTTP {status_code}) for {target_time}"
+                            logger.error(f"🔐 {detailed_message} - will retry in {retry_hours} hour(s)")
+                        elif error_type == "http_error" and status_code >= 500:
+                            # Server error - retry moderately soon
+                            retry_hours = 2  # Standard retry for server errors
+                            detailed_message = f"SMAP server error (HTTP {status_code}) for {target_time}"
+                            logger.error(f"🔧 {detailed_message} - will retry in {retry_hours} hour(s)")
+                        elif error_type == "network_error":
+                            # Network issue - retry moderately soon
+                            retry_hours = 1.5  # Quick retry for network issues
+                            detailed_message = f"Network error accessing SMAP data for {target_time}: {error_message}"
+                            logger.warning(f"🌐 {detailed_message} - will retry in {retry_hours} hour(s)")
+                        else:
+                            # Other errors - use default timing
+                            retry_hours = 2
+                            detailed_message = f"SMAP error ({error_type}) for {target_time}: {error_message}"
+                            logger.error(f"❌ {detailed_message} - will retry in {retry_hours} hour(s)")
+                        
+                        # Update retry information with detailed error
                         for task in tasks_in_time_window:
                             for prediction in task["predictions"]:
                                 update_query = """
@@ -1037,8 +1094,35 @@ class SoilMoistureTask(Task):
                                 params = {
                                     "region_id": task["id"],
                                     "miner_uid": prediction["miner_id"],
-                                    "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=2),  # SMAP data availability issue
-                                    "error_message": "Failed to download SMAP data"
+                                    "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=retry_hours),
+                                    "error_message": detailed_message
+                                }
+                                await self.db_manager.execute(update_query, params)
+                        continue
+                    
+                    # Extract file path and processed data
+                    temp_path = smap_data_result.get("file_path")
+                    smap_processed_data = smap_data_result.get("data", {})
+                    
+                    if not temp_path or not os.path.exists(temp_path):
+                        logger.error(f"SMAP data file missing after download for {target_time}")
+                        # Update retry information for failed tasks - this indicates file processing issues
+                        for task in tasks_in_time_window:
+                            for prediction in task["predictions"]:
+                                update_query = """
+                                    UPDATE soil_moisture_predictions
+                                    SET retry_count = COALESCE(retry_count, 0) + 1,
+                                        next_retry_time = :next_retry_time,
+                                        retry_error_message = :error_message,
+                                        status = 'retry_scheduled'
+                                    WHERE region_id = :region_id
+                                    AND miner_uid = :miner_uid
+                                """
+                                params = {
+                                    "region_id": task["id"],
+                                    "miner_uid": prediction["miner_id"],
+                                    "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=1),  # Quick retry for file processing issues
+                                    "error_message": f"SMAP data file missing after download for {target_time}"
                                 }
                                 await self.db_manager.execute(update_query, params)
                         continue
@@ -1605,7 +1689,16 @@ class SoilMoistureTask(Task):
         try:
             current_time = datetime.now(timezone.utc)
             
-            # First, check for and build any missing retroactive score rows
+            # First, clean up stuck retry tasks
+            logger.info("🧹 Cleaning up stuck retry tasks...")
+            try:
+                deleted_count = await self.cleanup_stuck_retries(max_retry_limit=5, days_back=7)
+                if deleted_count > 0:
+                    logger.info(f"Cleaned up {deleted_count} stuck retry tasks during startup")
+            except Exception as e:
+                logger.error(f"Error during stuck retry cleanup: {e}")
+            
+            # Then check for and build any missing retroactive score rows
             logger.info("🔍 Checking for missing soil moisture score rows...")
             try:
                 await self.build_retroactive_score_rows(days_back=7, force_rebuild=False)
@@ -1745,7 +1838,14 @@ class SoilMoistureTask(Task):
             logger.info(f"   - {processing_errors} processing/scoring errors")
             logger.info(f"   - {immediate_retry_count} tasks set for immediate retry")
             
-            # Force an immediate scoring attempt
+            # Force processing of old sent_to_miner tasks
+            logger.info("🚀 Checking for old sent_to_miner tasks...")
+            try:
+                await self.force_process_old_predictions()
+            except Exception as e:
+                logger.error(f"Error during forced processing: {e}")
+            
+            # Force an immediate scoring attempt for eligible retry tasks
             if eligible_tasks:
                 logger.info("🚀 Starting aggressive startup retry scoring...")
                 try:
@@ -1810,20 +1910,25 @@ class SoilMoistureTask(Task):
 
     async def build_retroactive_score_rows(self, days_back=7, force_rebuild=False):
         """
-        Retroactively build score rows from soil_moisture_history table for tasks 
-        that were completed but never had their scores properly aggregated.
+        Retroactively build score rows by scoring individual predictions against ground truth.
+        
+        This method:
+        1. Finds unscored predictions in soil_moisture_predictions table
+        2. Scores each prediction individually against SMAP ground truth
+        3. Aggregates scores by target_time to build score rows
+        4. Moves scored predictions to history table and cleans up
         
         Args:
-            days_back (int): How many days back to look for missing score rows
+            days_back (int): How many days back to look for unscored predictions
             force_rebuild (bool): Whether to rebuild existing score rows
         """
         try:
-            logger.info(f"🔄 Starting retroactive score row building for last {days_back} days...")
+            logger.info(f"🔄 Starting retroactive prediction scoring for last {days_back} days...")
             
             # Get cutoff time
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=days_back)
             
-            # Get miner mappings
+            # Get miner mappings for hotkey validation
             miner_query = """
                 SELECT uid, hotkey FROM node_table 
                 WHERE hotkey IS NOT NULL
@@ -1832,49 +1937,49 @@ class SoilMoistureTask(Task):
             hotkey_to_uid = {row["hotkey"]: row["uid"] for row in miner_mappings}
             logger.info(f"Found {len(hotkey_to_uid)} miner mappings for retroactive scoring")
             
-            # Find target times that have history entries but no score rows
-            missing_scores_query = """
-                SELECT DISTINCT h.target_time, COUNT(*) as history_count
-                FROM soil_moisture_history h
-                WHERE h.target_time >= :cutoff_time
+            # Find predictions that need scoring - completed but not yet moved to history
+            unscored_predictions_query = """
+                SELECT p.*, r.sentinel_bounds, r.sentinel_crs, r.target_time
+                FROM soil_moisture_predictions p
+                JOIN soil_moisture_regions r ON p.region_id = r.id
+                WHERE r.target_time >= :cutoff_time 
+                AND p.status = 'completed'
                 AND NOT EXISTS (
-                    SELECT 1 FROM score_table s 
-                    WHERE s.task_name = 'soil_moisture_region_global' 
-                    AND s.task_id = CAST(EXTRACT(EPOCH FROM CAST(h.target_time AS TIMESTAMPTZ)) AS TEXT)
+                    SELECT 1 FROM soil_moisture_history h 
+                    WHERE h.region_id = p.region_id 
+                    AND h.miner_uid = p.miner_uid 
+                    AND h.target_time = r.target_time
                 )
-                GROUP BY h.target_time
-                ORDER BY h.target_time DESC
+                ORDER BY r.target_time DESC, p.region_id, p.miner_uid
             """
             
-            if force_rebuild:
-                # If force rebuild, get all target times regardless of existing score rows
-                missing_scores_query = """
-                    SELECT DISTINCT h.target_time, COUNT(*) as history_count
-                    FROM soil_moisture_history h
-                    WHERE h.target_time >= :cutoff_time
-                    GROUP BY h.target_time
-                    ORDER BY h.target_time DESC
-                """
+            unscored_predictions = await self.db_manager.fetch_all(unscored_predictions_query, {"cutoff_time": cutoff_time})
             
-            missing_times = await self.db_manager.fetch_all(missing_scores_query, {"cutoff_time": cutoff_time})
-            
-            if not missing_times:
-                logger.info("✅ No missing score rows found in soil moisture history")
+            if not unscored_predictions:
+                logger.info("✅ No unscored predictions found for retroactive scoring")
                 return
             
-            logger.info(f"🔍 Found {len(missing_times)} target times with missing score rows:")
-            for time_row in missing_times:
-                logger.info(f"   - {time_row['target_time']}: {time_row['history_count']} history entries")
+            logger.info(f"🔍 Found {len(unscored_predictions)} unscored predictions for retroactive scoring")
+            
+            # Group predictions by target_time for batch processing
+            predictions_by_time = defaultdict(list)
+            for pred in unscored_predictions:
+                predictions_by_time[pred['target_time']].append(pred)
+            
+            logger.info(f"📊 Processing {len(predictions_by_time)} unique target times:")
+            for target_time, preds in predictions_by_time.items():
+                logger.info(f"   - {target_time}: {len(preds)} predictions")
             
             successful_builds = 0
             failed_builds = 0
+            total_scored_predictions = 0
             
-            # Process each missing target time
-            for time_row in missing_times:
-                target_time = time_row['target_time']
+            # Process each target time
+            for target_time, predictions in predictions_by_time.items():
                 try:
-                    # ADDITIONAL SAFETY CHECK: Verify this target time still needs processing
-                    # This protects against race conditions and ensures we don't rebuild existing rows
+                    logger.info(f"📊 Processing retroactive scoring for {target_time} ({len(predictions)} predictions)...")
+                    
+                    # Check if score row already exists (unless force rebuild)
                     if not force_rebuild:
                         existing_check_query = """
                             SELECT COUNT(*) as count FROM score_table 
@@ -1883,221 +1988,156 @@ class SoilMoistureTask(Task):
                         """
                         existing_result = await self.db_manager.fetch_one(existing_check_query, {"target_time": target_time})
                         if existing_result and existing_result.get("count", 0) > 0:
-                            logger.info(f"⏭️  Score row already exists for {target_time}, skipping retroactive rebuild")
+                            logger.info(f"⏭️  Score row already exists for {target_time}, skipping")
                             continue
                     
-                    logger.info(f"📊 Building retroactive score row for {target_time}...")
+                    # Group predictions by region for scoring
+                    predictions_by_region = defaultdict(list)
+                    for pred in predictions:
+                        predictions_by_region[pred['region_id']].append(pred)
                     
-                    # Get all history entries for this target time
-                    history_query = """
-                        SELECT h.*, r.sentinel_bounds, r.sentinel_crs
-                        FROM soil_moisture_history h
-                        JOIN soil_moisture_regions r ON h.region_id = r.id
-                        WHERE h.target_time = :target_time
-                        ORDER BY h.region_id, h.miner_uid
-                    """
-                    
-                    history_entries = await self.db_manager.fetch_all(history_query, {"target_time": target_time})
-                    
-                    if not history_entries:
-                        logger.warning(f"No history entries found for {target_time}")
-                        failed_builds += 1
-                        continue
-                    
-                    # Group by region and calculate aggregate scores per miner
-                    regions_data = defaultdict(lambda: defaultdict(list))
-                    
-                    for entry in history_entries:
-                        region_id = entry['region_id']
-                        miner_uid = entry['miner_uid']
-                        miner_hotkey = entry['miner_hotkey']
-                        
-                        # Extract RMSE values; keep None if missing so we don't default to 0 (which created identical scores).
-                        surface_rmse = entry.get('surface_rmse')
-                        rootzone_rmse = entry.get('rootzone_rmse')
-                        surface_ssim = entry.get('surface_structure_score', 0) or 0
-                        rootzone_ssim = entry.get('rootzone_structure_score', 0) or 0
-                        
-                        # Recompute RMSE if metric missing / NULL
-                        try:
-                            import numpy as _np
-                            if surface_rmse is None and entry.get('surface_sm_pred') is not None and entry.get('surface_sm_truth') is not None:
-                                _pred = _np.array(entry['surface_sm_pred'], dtype=float)
-                                _truth = _np.array(entry['surface_sm_truth'], dtype=float)
-                                if _pred.size == _truth.size and _pred.size > 0:
-                                    surface_rmse = float(_np.sqrt(_np.mean((_pred - _truth) ** 2)))
-                        except Exception:
-                            pass
-
-                        try:
-                            import numpy as _np
-                            if rootzone_rmse is None and entry.get('rootzone_sm_pred') is not None and entry.get('rootzone_sm_truth') is not None:
-                                _pred_rz = _np.array(entry['rootzone_sm_pred'], dtype=float)
-                                _truth_rz = _np.array(entry['rootzone_sm_truth'], dtype=float)
-                                if _pred_rz.size == _truth_rz.size and _pred_rz.size > 0:
-                                    rootzone_rmse = float(_np.sqrt(_np.mean((_pred_rz - _truth_rz) ** 2)))
-                        except Exception:
-                            pass
-                        
-                        # CRITICAL: Apply EXACT same validation as regular scoring flow
-                        # Mirror SoilScoringMechanism.validate_metrics() exactly
-                        
-                        # Validate metrics format and basic requirements
-                        has_surface = surface_rmse is not None and surface_rmse != 0
-                        has_rootzone = rootzone_rmse is not None and rootzone_rmse != 0
-                        
-                        if not (has_surface or has_rootzone):
-                            logger.warning(f"Retroactive: No valid metrics found for miner {miner_uid}, region {region_id}")
-                            continue
-                        
-                        # Validate surface metrics if present
-                        if has_surface:
-                            if not isinstance(surface_rmse, (int, float)) or math.isnan(surface_rmse) or math.isinf(surface_rmse):
-                                logger.warning(f"Retroactive: Invalid surface_rmse format: {surface_rmse}, skipping entry")
-                                continue
-                            if surface_rmse < 0:
-                                logger.warning(f"Retroactive: Surface RMSE must be positive, got {surface_rmse}, skipping entry")
-                                continue
-                            if surface_ssim is not None and surface_ssim != 0:
-                                if not isinstance(surface_ssim, (int, float)) or math.isnan(surface_ssim) or math.isinf(surface_ssim):
-                                    logger.warning(f"Retroactive: Invalid surface_ssim format: {surface_ssim}, setting to 0")
-                                    surface_ssim = 0
-                                elif not -1 <= surface_ssim <= 1:
-                                    logger.warning(f"Retroactive: Surface SSIM {surface_ssim} outside valid range [-1,1], setting to 0")
-                                    surface_ssim = 0
-                        
-                        # Validate rootzone metrics if present
-                        if has_rootzone:
-                            if not isinstance(rootzone_rmse, (int, float)) or math.isnan(rootzone_rmse) or math.isinf(rootzone_rmse):
-                                logger.warning(f"Retroactive: Invalid rootzone_rmse format: {rootzone_rmse}, skipping entry")
-                                continue
-                            if rootzone_rmse < 0:
-                                logger.warning(f"Retroactive: Rootzone RMSE must be positive, got {rootzone_rmse}, skipping entry")
-                                continue
-                            if rootzone_ssim is not None and rootzone_ssim != 0:
-                                if not isinstance(rootzone_ssim, (int, float)) or math.isnan(rootzone_ssim) or math.isinf(rootzone_ssim):
-                                    logger.warning(f"Retroactive: Invalid rootzone_ssim format: {rootzone_ssim}, setting to 0")
-                                    rootzone_ssim = 0
-                                elif not -1 <= rootzone_ssim <= 1:
-                                    logger.warning(f"Retroactive: Rootzone SSIM {rootzone_ssim} outside valid range [-1,1], setting to 0")
-                                    rootzone_ssim = 0
-                        
-                        # Apply sigmoid transformation exactly as in SoilScoringMechanism
-                        # sigmoid_rmse(rmse) = 1 / (1 + exp(alpha * (rmse - beta)))
-                        # Where alpha=3, beta=0.15 (SoilScoringMechanism defaults)
-                        alpha = 3.0
-                        beta = 0.15
-                        
-                        # Build list of available metric scores
-                        scores_available = []
-                        weights_available = []
-
-                        if has_surface:
-                            surface_score = 1.0 / (1.0 + math.exp(alpha * (surface_rmse - beta)))
-                            if math.isnan(surface_score) or math.isinf(surface_score):
-                                logger.warning(f"Retroactive: Invalid surface score after sigmoid: {surface_score}, skipping entry")
-                            else:
-                                scores_available.append(surface_score)
-                                weights_available.append(0.6)
-
-                        if has_rootzone:
-                            rootzone_score = 1.0 / (1.0 + math.exp(alpha * (rootzone_rmse - beta)))
-                            if math.isnan(rootzone_score) or math.isinf(rootzone_score):
-                                logger.warning(f"Retroactive: Invalid rootzone score after sigmoid: {rootzone_score}, skipping entry")
-                            else:
-                                scores_available.append(rootzone_score)
-                                weights_available.append(0.4)
-
-                        # Skip if no valid scores were added (both metrics missing or invalid)
-                        if not scores_available:
-                            logger.debug("Retroactive: No valid metric scores for this entry – skipping miner")
-                            continue
-
-                        composite_score = sum(s * w for s, w in zip(scores_available, weights_available)) / sum(weights_available)
-                        
-                        # Validate final score exactly as regular flow does
-                        if math.isnan(composite_score) or math.isinf(composite_score):
-                            logger.warning(f"Retroactive: Invalid composite score: {composite_score}, skipping entry")
-                            continue
-                        
-                        if not 0 <= composite_score <= 1:
-                            logger.warning(f"Retroactive: Final score {composite_score} outside valid range [0,1], skipping entry")
-                            continue
-                        
-                        logger.debug(f"Retroactive score calculation for miner {miner_uid}: "
-                                   f"surface_rmse={surface_rmse:.4f}→{surface_score:.4f}, "
-                                   f"rootzone_rmse={rootzone_rmse:.4f}→{rootzone_score:.4f}, "
-                                   f"final={composite_score:.4f}")
-                        
-                        regions_data[region_id][miner_uid] = {
-                            'score': composite_score,
-                            'hotkey': miner_hotkey,
-                            'surface_rmse': surface_rmse,
-                            'rootzone_rmse': rootzone_rmse,
-                            'surface_ssim': surface_ssim,
-                            'rootzone_ssim': rootzone_ssim
-                        }
-                    
-                    # Build the score array
-                    scores = [float("nan")] * 256
+                    # Score each region's predictions
                     miner_scores = defaultdict(list)
                     region_counts = defaultdict(set)
+                    scored_predictions_for_history = []
                     
-                    for region_id, miners in regions_data.items():
-                        for miner_uid, data in miners.items():
-                            # CRITICAL: Validate miner hotkey matches current metagraph
-                            # If hotkey doesn't match, we should DELETE the old prediction, not score it for the new miner
-                            is_valid_in_metagraph = False
-                            should_delete_old_prediction = False
+                    for region_id, region_predictions in predictions_by_region.items():
+                        logger.debug(f"Scoring {len(region_predictions)} predictions for region {region_id}")
+                        
+                        # Get SMAP ground truth file for this region/time
+                        smap_path = None
+                        try:
+                            # Use existing SMAP API to get file path
+                            from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import construct_smap_url
+                            from pathlib import Path
                             
-                            if self.validator and hasattr(self.validator, 'metagraph') and self.validator.metagraph is not None:
-                                miner_hotkey = data['hotkey']
-                                if miner_hotkey in self.validator.metagraph.nodes:
-                                    node_in_metagraph = self.validator.metagraph.nodes[miner_hotkey]
-                                    if hasattr(node_in_metagraph, 'node_id') and str(node_in_metagraph.node_id) == str(miner_uid):
-                                        is_valid_in_metagraph = True
-                                        logger.debug(f"Retroactive: Valid hotkey match for miner {miner_uid} ({miner_hotkey})")
-                                    else:
-                                        metagraph_uid = getattr(node_in_metagraph, 'node_id', 'unknown')
-                                        logger.warning(f"Retroactive: UID mismatch for hotkey {miner_hotkey} - History UID: {miner_uid}, Current UID: {metagraph_uid}. DELETING old prediction.")
-                                        should_delete_old_prediction = True
-                                else:
-                                    logger.warning(f"Retroactive: Hotkey {miner_hotkey} not in current metagraph. DELETING old prediction for UID {miner_uid}.")
-                                    should_delete_old_prediction = True
+                            # Get the SMAP URL and check if file exists in cache
+                            smap_url = construct_smap_url(target_time, test_mode=self.test_mode)
+                            cache_dir = Path("smap_cache")
+                            cache_file = cache_dir / Path(smap_url).name
+                            
+                            if cache_file.exists():
+                                smap_path = str(cache_file)
+                                logger.debug(f"Found cached SMAP file: {smap_path}")
                             else:
-                                # If no metagraph available, be conservative and skip retroactive scoring
-                                logger.warning(f"Retroactive: No metagraph available for validation. Skipping retroactive scoring for miner {miner_uid}.")
+                                # Try to download SMAP file
+                                from gaia.tasks.defined_tasks.soilmoisture.utils.smap_api import download_smap_data
+                                cache_dir.mkdir(exist_ok=True)
+                                
+                                if await download_smap_data(smap_url, str(cache_file)):
+                                    smap_path = str(cache_file)
+                                    logger.debug(f"Downloaded SMAP file: {smap_path}")
+                                else:
+                                    logger.warning(f"Failed to download SMAP file for {target_time}")
+                            
+                            if not smap_path or not os.path.exists(smap_path):
+                                logger.warning(f"SMAP file not available for {target_time}, skipping region {region_id}")
                                 continue
-                            
-                            # If hotkey doesn't match current metagraph, delete the old prediction from history
-                            if should_delete_old_prediction:
-                                try:
+                                
+                        except Exception as smap_error:
+                            logger.error(f"Error getting SMAP file for {target_time}: {smap_error}")
+                            continue
+                        
+                        # Score each prediction in this region
+                        for pred in region_predictions:
+                            try:
+                                # Validate miner is still in current metagraph
+                                miner_uid = pred['miner_uid']
+                                miner_hotkey = pred['miner_hotkey']
+                                
+                                is_valid_in_metagraph = False
+                                if self.validator and hasattr(self.validator, 'metagraph') and self.validator.metagraph is not None:
+                                    if miner_hotkey in self.validator.metagraph.nodes:
+                                        node_in_metagraph = self.validator.metagraph.nodes[miner_hotkey]
+                                        if hasattr(node_in_metagraph, 'node_id') and str(node_in_metagraph.node_id) == str(miner_uid):
+                                            is_valid_in_metagraph = True
+                                            logger.debug(f"Retroactive: Valid hotkey match for miner {miner_uid} ({miner_hotkey})")
+                                        else:
+                                            metagraph_uid = getattr(node_in_metagraph, 'node_id', 'unknown')
+                                            logger.warning(f"Retroactive: UID mismatch for hotkey {miner_hotkey} - Prediction UID: {miner_uid}, Current UID: {metagraph_uid}")
+                                    else:
+                                        logger.warning(f"Retroactive: Hotkey {miner_hotkey} not in current metagraph")
+                                else:
+                                    logger.warning("Retroactive: No metagraph available for validation")
+                                
+                                if not is_valid_in_metagraph:
+                                    # Delete invalid prediction instead of scoring it
                                     delete_query = """
-                                        DELETE FROM soil_moisture_history 
-                                        WHERE target_time = :target_time 
-                                        AND miner_uid = :miner_uid 
-                                        AND miner_hotkey = :miner_hotkey
-                                        AND region_id = :region_id
+                                        DELETE FROM soil_moisture_predictions 
+                                        WHERE id = :prediction_id
                                     """
-                                    await self.db_manager.execute(delete_query, {
-                                        "target_time": target_time,
-                                        "miner_uid": miner_uid,
-                                        "miner_hotkey": miner_hotkey,
-                                        "region_id": region_id
-                                    })
-                                    logger.info(f"Retroactive: Deleted mismatched prediction for UID {miner_uid}, hotkey {miner_hotkey}, region {region_id}")
-                                except Exception as delete_error:
-                                    logger.error(f"Error deleting mismatched prediction: {delete_error}")
-                                continue  # Skip scoring for this miner
-                            
-                            # Only score if hotkey validation passed
-                            if is_valid_in_metagraph:
-                                score_value = data['score']
-                                miner_scores[miner_uid].append(score_value)
+                                    await self.db_manager.execute(delete_query, {"prediction_id": pred['id']})
+                                    logger.info(f"Deleted mismatched prediction for UID {miner_uid}, hotkey {miner_hotkey}")
+                                    continue
+                                
+                                # Build prediction data for scoring
+                                pred_data = {
+                                    "bounds": pred["sentinel_bounds"],
+                                    "crs": pred["sentinel_crs"],
+                                    "predictions": {
+                                        "miner_id": pred["miner_uid"],
+                                        "miner_hotkey": pred["miner_hotkey"],
+                                        "surface_sm": pred["surface_sm"],
+                                        "rootzone_sm": pred["rootzone_sm"]
+                                    },
+                                    "target_time": target_time,
+                                    "region": {"id": region_id},
+                                    "miner_id": pred["miner_uid"],
+                                    "miner_hotkey": pred["miner_hotkey"],
+                                    "smap_file": smap_path,
+                                    "smap_file_path": smap_path
+                                }
+                                
+                                # Score the individual prediction
+                                logger.debug(f"Scoring prediction for miner {miner_uid} in region {region_id}")
+                                score = await self.scoring_mechanism.score(pred_data)
+                                
+                                if not score:
+                                    logger.warning(f"Failed to score prediction for miner {miner_uid}")
+                                    continue
+                                
+                                # Validate score structure
+                                total_score = score.get("total_score", 0)
+                                if not isinstance(total_score, (int, float)) or total_score < 0 or total_score > 1:
+                                    logger.warning(f"Invalid score {total_score} for miner {miner_uid}")
+                                    continue
+                                
+                                # Add to miner scores for aggregation
+                                miner_scores[miner_uid].append(total_score)
                                 region_counts[miner_uid].add(region_id)
-                                logger.debug(f"Retroactive: Added score {score_value:.4f} for miner {miner_uid} in region {region_id}")
+                                
+                                logger.debug(f"Retroactive: Scored miner {miner_uid} in region {region_id}: {total_score:.4f}")
+                                
+                                # Prepare for history table
+                                score_metrics = score.get("metrics", {})
+                                ground_truth = score.get("ground_truth", {})
+                                
+                                history_record = {
+                                    "region_id": region_id,
+                                    "miner_uid": miner_uid,
+                                    "miner_hotkey": miner_hotkey,
+                                    "target_time": target_time,
+                                    "surface_sm_pred": pred["surface_sm"],
+                                    "rootzone_sm_pred": pred["rootzone_sm"],
+                                    "surface_sm_truth": ground_truth.get("surface_sm"),
+                                    "rootzone_sm_truth": ground_truth.get("rootzone_sm"),
+                                    "surface_rmse": score_metrics.get("surface_rmse"),
+                                    "rootzone_rmse": score_metrics.get("rootzone_rmse"),
+                                    "surface_structure_score": score_metrics.get("surface_ssim", 0),
+                                    "rootzone_structure_score": score_metrics.get("rootzone_ssim", 0),
+                                    "sentinel_bounds": pred["sentinel_bounds"],
+                                    "sentinel_crs": pred["sentinel_crs"],
+                                    "prediction_id": pred["id"]
+                                }
+                                scored_predictions_for_history.append(history_record)
+                                total_scored_predictions += 1
+                                
+                            except Exception as pred_error:
+                                logger.error(f"Error scoring prediction {pred['id']} for miner {pred['miner_uid']}: {pred_error}")
+                                continue
                     
-                    # Calculate final scores for each miner
+                    # Build score array from aggregated miner scores
+                    scores = [float("nan")] * 256
                     for miner_uid, scores_list in miner_scores.items():
                         if scores_list:
                             avg_score = sum(scores_list) / len(scores_list)
@@ -2109,7 +2149,7 @@ class SoilMoistureTask(Task):
                                 logger.warning(f"Invalid miner UID for scoring: {miner_uid}")
                                 continue
                     
-                    # Create score row
+                    # Create and insert score row
                     current_datetime = target_time
                     score_row = {
                         "task_name": "soil_moisture_region_global",
@@ -2118,7 +2158,6 @@ class SoilMoistureTask(Task):
                         "status": "completed"
                     }
                     
-                    # Insert or update the score row (always use UPSERT to avoid conflicts)
                     upsert_query = """
                         INSERT INTO score_table 
                         (task_name, task_id, score, status)
@@ -2131,29 +2170,61 @@ class SoilMoistureTask(Task):
                     """
                     await self.db_manager.execute(upsert_query, score_row)
                     
-                    if force_rebuild:
-                        logger.info(f"✅ Updated retroactive score row for {target_time}")
-                    else:
-                        logger.info(f"✅ Created/updated retroactive score row for {target_time}")
+                    # Move scored predictions to history table
+                    if scored_predictions_for_history:
+                        history_insert_query = """
+                            INSERT INTO soil_moisture_history 
+                            (region_id, miner_uid, miner_hotkey, target_time, 
+                             surface_sm_pred, rootzone_sm_pred, surface_sm_truth, rootzone_sm_truth,
+                             surface_rmse, rootzone_rmse, surface_structure_score, rootzone_structure_score,
+                             sentinel_bounds, sentinel_crs)
+                            VALUES 
+                            (:region_id, :miner_uid, :miner_hotkey, :target_time,
+                             :surface_sm_pred, :rootzone_sm_pred, :surface_sm_truth, :rootzone_sm_truth,
+                             :surface_rmse, :rootzone_rmse, :surface_structure_score, :rootzone_structure_score,
+                             :sentinel_bounds, :sentinel_crs)
+                        """
+                        
+                        # Insert all history records
+                        for record in scored_predictions_for_history:
+                            await self.db_manager.execute(history_insert_query, record)
+                        
+                        # Delete corresponding predictions from predictions table
+                        prediction_ids = [record["prediction_id"] for record in scored_predictions_for_history]
+                        if prediction_ids:
+                            # Delete predictions one by one to ensure compatibility
+                            for prediction_id in prediction_ids:
+                                delete_prediction_query = """
+                                    DELETE FROM soil_moisture_predictions 
+                                    WHERE id = :prediction_id
+                                """
+                                await self.db_manager.execute(delete_prediction_query, {"prediction_id": prediction_id})
+                            
+                            logger.info(f"✅ Deleted {len(prediction_ids)} predictions from predictions table")
+                        
+                        logger.info(f"✅ Moved {len(scored_predictions_for_history)} scored predictions to history")
                     
                     # Log summary
                     non_nan_scores = [(i, s) for i, s in enumerate(scores) if not math.isnan(s)]
                     if non_nan_scores:
-                        logger.info(f"   📈 Built score row with {len(non_nan_scores)} miners, "
+                        logger.info(f"✅ Created retroactive score row for {target_time}: {len(non_nan_scores)} miners, "
                                   f"scores: {min(s for _, s in non_nan_scores):.4f} - {max(s for _, s in non_nan_scores):.4f}")
+                    else:
+                        logger.warning(f"⚠️  No valid scores generated for {target_time}")
                     
                     successful_builds += 1
                     
-                except Exception as e:
-                    logger.error(f"❌ Failed to build retroactive score row for {target_time}: {e}")
+                except Exception as time_error:
+                    logger.error(f"❌ Failed to process target_time {target_time}: {time_error}")
                     logger.error(traceback.format_exc())
                     failed_builds += 1
                     continue
             
-            logger.info(f"🎯 Retroactive score building complete: {successful_builds} successful, {failed_builds} failed")
+            logger.info(f"🎯 Retroactive scoring complete: {successful_builds} successful, {failed_builds} failed")
+            logger.info(f"📊 Total predictions scored: {total_scored_predictions}")
             
             if successful_builds > 0:
-                logger.info("💡 Retroactive scores have been added to the score_table and should be reflected in the next weight calculation")
+                logger.info("💡 Retroactive scores have been added and predictions moved to history")
             
         except Exception as e:
             logger.error(f"Error in build_retroactive_score_rows: {e}")
@@ -2492,4 +2563,168 @@ class SoilMoistureTask(Task):
                 
         logger.info(f"Threaded scoring completed: {len(scored_predictions)}/{len(predictions)} miners scored successfully")
         return scored_predictions, task_ground_truth
+
+    async def cleanup_stuck_retries(self, max_retry_limit=5, days_back=7):
+        """Clean up tasks that have exceeded the retry limit and are stuck forever."""
+        try:
+            cutoff_time = datetime.now(timezone.utc) - timedelta(days=days_back)
+            
+            logger.info(f"🧹 Cleaning up stuck retry tasks (retry_count >= {max_retry_limit}) from last {days_back} days...")
+            
+            # Find tasks that have exceeded retry limit
+            stuck_query = """
+                SELECT 
+                    COUNT(*) as total_stuck,
+                    MIN(r.target_time) as earliest_target,
+                    MAX(r.target_time) as latest_target
+                FROM soil_moisture_predictions p
+                JOIN soil_moisture_regions r ON p.region_id = r.id
+                WHERE p.status = 'retry_scheduled'
+                AND p.retry_count >= :max_retry_limit
+                AND r.target_time >= :cutoff_time
+            """
+            
+            stuck_summary = await self.db_manager.fetch_one(stuck_query, {
+                "max_retry_limit": max_retry_limit,
+                "cutoff_time": cutoff_time
+            })
+            
+            if not stuck_summary or stuck_summary.get("total_stuck", 0) == 0:
+                logger.info("✅ No stuck retry tasks found to clean up")
+                return 0
+            
+            logger.info(f"Found {stuck_summary['total_stuck']} stuck tasks from {stuck_summary['earliest_target']} to {stuck_summary['latest_target']}")
+            
+            # Option 1: Delete stuck predictions and let them be regenerated
+            # This is safer than trying to reset retry counts
+            delete_query = """
+                DELETE FROM soil_moisture_predictions p
+                USING soil_moisture_regions r
+                WHERE p.region_id = r.id
+                AND p.status = 'retry_scheduled'
+                AND p.retry_count >= :max_retry_limit
+                AND r.target_time >= :cutoff_time
+            """
+            
+            result = await self.db_manager.execute(delete_query, {
+                "max_retry_limit": max_retry_limit,
+                "cutoff_time": cutoff_time
+            })
+            
+            deleted_count = getattr(result, 'rowcount', 0) if result else 0
+            logger.info(f"✅ Deleted {deleted_count} stuck retry tasks - they can be regenerated in future runs")
+            
+            # Also reset any regions that might be stuck in 'sent_to_miners' status
+            # but have no active predictions
+            reset_regions_query = """
+                UPDATE soil_moisture_regions r
+                SET status = 'pending'
+                WHERE r.status = 'sent_to_miners'
+                AND r.target_time >= :cutoff_time
+                AND NOT EXISTS (
+                    SELECT 1 FROM soil_moisture_predictions p 
+                    WHERE p.region_id = r.id 
+                    AND p.status IN ('sent_to_miner', 'retry_scheduled')
+                )
+            """
+            
+            reset_result = await self.db_manager.execute(reset_regions_query, {"cutoff_time": cutoff_time})
+            reset_count = getattr(reset_result, 'rowcount', 0) if reset_result else 0
+            
+            if reset_count > 0:
+                logger.info(f"✅ Reset {reset_count} regions back to 'pending' status")
+            
+            return deleted_count
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up stuck retries: {e}")
+            logger.error(traceback.format_exc())
+            return 0
+
+    async def force_process_old_predictions(self, days_back=3):
+        """Force processing of old sent_to_miner tasks that should have been scored by now."""
+        try:
+            # For soil moisture, the scoring delay is 3 days, so anything older than that should be processed
+            scoring_cutoff = datetime.now(timezone.utc) - self.scoring_delay
+            
+            logger.info(f"🚀 Checking for old sent_to_miner tasks ready for scoring (older than {scoring_cutoff})...")
+            
+            # Count old tasks
+            old_tasks_query = """
+                SELECT 
+                    COUNT(*) as total_old,
+                    MIN(r.target_time) as earliest_target,
+                    MAX(r.target_time) as latest_target,
+                    COUNT(DISTINCT p.miner_uid) as unique_miners
+                FROM soil_moisture_predictions p
+                JOIN soil_moisture_regions r ON p.region_id = r.id
+                WHERE p.status = 'sent_to_miner'
+                AND r.target_time <= :scoring_cutoff
+            """
+            
+            old_summary = await self.db_manager.fetch_one(old_tasks_query, {"scoring_cutoff": scoring_cutoff})
+            
+            if not old_summary or old_summary.get("total_old", 0) == 0:
+                logger.info("✅ No old sent_to_miner tasks found ready for scoring")
+                return 0
+            
+            logger.info(f"Found {old_summary['total_old']} old sent_to_miner tasks from {old_summary['unique_miners']} miners")
+            logger.info(f"Target time range: {old_summary['earliest_target']} to {old_summary['latest_target']}")
+            
+            # Force immediate scoring attempt
+            logger.info("🚀 Forcing immediate scoring of old tasks...")
+            try:
+                result = await self.validator_score()
+                if result.get("status") == "success":
+                    logger.info("✅ Successfully processed old sent_to_miner tasks")
+                    return True
+                else:
+                    logger.warning(f"Scoring returned status: {result.get('status')}")
+                    return False
+            except Exception as e:
+                logger.error(f"Error during forced scoring: {e}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error forcing processing of old predictions: {e}")
+            logger.error(traceback.format_exc())
+            return False
+
+    async def fix_stuck_retries_now(self):
+        """
+        Manual method to immediately fix stuck retries and process old tasks.
+        Call this to test the retry fixes.
+        """
+        try:
+            logger.info("🔧 MANUAL FIX: Starting comprehensive retry cleanup and processing...")
+            
+            # Step 1: Clean up stuck retries
+            logger.info("Step 1: Cleaning up stuck retries...")
+            deleted_count = await self.cleanup_stuck_retries(max_retry_limit=5, days_back=7)
+            
+            # Step 2: Force processing of old predictions
+            logger.info("Step 2: Processing old sent_to_miner tasks...")
+            await self.force_process_old_predictions()
+            
+            # Step 3: Force immediate retries for processing errors
+            logger.info("Step 3: Forcing immediate retries for stuck tasks...")
+            await self.force_immediate_retries()
+            
+            # Step 4: Run scoring to process everything
+            logger.info("Step 4: Running comprehensive scoring...")
+            for attempt in range(3):
+                logger.info(f"Scoring attempt {attempt + 1}/3")
+                result = await self.validator_score()
+                if result.get("status") == "no_pending_tasks":
+                    logger.info("✅ All retries completed successfully!")
+                    break
+                await asyncio.sleep(5)
+            
+            logger.info("🎯 Manual retry fix completed!")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in manual retry fix: {e}")
+            logger.error(traceback.format_exc())
+            return False
 

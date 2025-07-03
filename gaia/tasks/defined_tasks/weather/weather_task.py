@@ -1720,8 +1720,9 @@ sources:
                             elif miner_status == WeatherTaskStatus.FETCH_ERROR.value:
                                 new_db_status = 'input_fetch_error'
                             elif miner_status in [WeatherTaskStatus.FETCHING_GFS.value, WeatherTaskStatus.HASHING_INPUT.value, WeatherTaskStatus.FETCH_QUEUED.value]:
-                                logger.warning(f"[Run {run_id}] Miner for response ID {resp_id} timed out (status: {miner_status}).")
-                                new_db_status = 'input_hash_timeout'
+                                logger.info(f"[Run {run_id}] Miner for response ID {resp_id} is still working (status: {miner_status}). Allowing more time to complete.")
+                                # Don't update status - let miner continue working
+                                new_db_status = None
                             elif miner_status in [WeatherTaskStatus.VALIDATOR_POLL_FAILED.value, WeatherTaskStatus.VALIDATOR_POLL_ERROR.value]:
                                  new_db_status = 'input_poll_error'
                             else:
@@ -1752,9 +1753,10 @@ sources:
                                 if len(miner_hash_results) > 20 and i % 20 == 19: # Yield every 20 items after the 20th
                                     await asyncio.sleep(0)
                         
-                            if update_tasks:
-                                 await asyncio.gather(*update_tasks)
-                                 logger.info(f"[Run {run_id}] Updated DB for {len(update_tasks)} miner responses after hash check.")
+                        # Execute all update tasks after the loop completes
+                        if update_tasks:
+                             await asyncio.gather(*update_tasks)
+                             logger.info(f"[Run {run_id}] Updated DB for {len(update_tasks)} miner responses after hash check.")
                      
                     if miners_to_trigger:
                         logger.info(f"[Run {run_id}] Triggering inference for {len(miners_to_trigger)} miners with matching input hashes.")
@@ -3349,12 +3351,13 @@ sources:
         
         # Get up to 10 runs to check, in case some have been processed already
         # Include both normal recoverable states and failure states that might be recoverable
+        # ORDER BY DESC to prioritize most recent runs first
         all_recoverable_states = recoverable_states + potentially_recoverable_failure_states
         recovery_query = """
         SELECT id, gfs_init_time_utc, status, run_initiation_time
         FROM weather_forecast_runs 
         WHERE status IN ({}) OR (status = 'awaiting_inference_results' AND run_initiation_time < :cutoff_time)
-        ORDER BY run_initiation_time ASC
+        ORDER BY run_initiation_time DESC
         LIMIT 10
         """.format(','.join(f"'{state}'" for state in all_recoverable_states))
         
@@ -3382,17 +3385,45 @@ sources:
             
             return "no_more_runs"
         
-        # Find the first run we haven't exceeded max attempts for
+        # Find the first run we can process (not exceeded max attempts and not in cooldown)
+        run_cooldown_minutes = 15  # Don't retry failed runs for at least 15 minutes
+        run_cooldown_time = datetime.now(timezone.utc) - timedelta(minutes=run_cooldown_minutes)
+        
         run_to_process = None
         for run in incomplete_runs:
             run_id = run['id']
+            status = run['status']
             attempt_count = processed_runs_this_session.get(run_id, 0)
-            if attempt_count < max_attempts_per_run:
-                run_to_process = run
-                break
+            
+            # Skip if exceeded max attempts
+            if attempt_count >= max_attempts_per_run:
+                continue
+                
+            # Skip if run is too old (older than 48 hours)
+            run_age_hours = (datetime.now(timezone.utc) - run['run_initiation_time']).total_seconds() / 3600
+            if run_age_hours > 48:
+                logger.warning(f"Run {run_id} is too old ({run_age_hours:.1f}h), marking as stale")
+                await _update_run_status(self, run_id, "stale_abandoned")
+                logger.info(f"Stale run {run_id} marked as abandoned - validator will immediately proceed to check for new run creation")
+                return "stale_processed"  # Special return value for stale runs
+            
+            # Check cooldown for failure states
+            if status in potentially_recoverable_failure_states:
+                # Use run_initiation_time as a proxy for when the run entered failure state
+                # This is less precise but better than crashing on missing columns
+                last_status_time = run['run_initiation_time']
+                
+                if last_status_time and last_status_time > run_cooldown_time:
+                    time_since_failure = (datetime.now(timezone.utc) - last_status_time).total_seconds() / 60
+                    logger.debug(f"Run {run_id} in failure state '{status}' is still in cooldown period ({time_since_failure:.1f}min < {run_cooldown_minutes}min). Skipping to check next run.")
+                    continue  # Skip this run and check the next one
+            
+            # This run is eligible for processing
+            run_to_process = run
+            break
         
         if not run_to_process:
-            logger.debug(f"All {len(incomplete_runs)} incomplete runs have reached max attempts ({max_attempts_per_run}) in this session")
+            logger.debug(f"All {len(incomplete_runs)} incomplete runs are either at max attempts ({max_attempts_per_run}) or in cooldown periods")
             return "no_more_runs"
         
         # Process the selected run
@@ -3408,16 +3439,9 @@ sources:
         
         logger.info(f"Sequential recovery processing: Run {run_id} (status='{status}', age={run_age_hours:.1f}h, attempt={attempt_count}/{max_attempts_per_run})")
         
-        # Skip runs that are too old (older than 48 hours)
-        if run_age_hours > 48:
-            logger.warning(f"Run {run_id} is too old ({run_age_hours:.1f}h), marking as stale")
-            await _update_run_status(self, run_id, "stale_abandoned")
-            logger.info(f"Stale run {run_id} marked as abandoned - validator will immediately proceed to check for new run creation")
-            return "stale_processed"  # Special return value for stale runs
-        
-        # Handle failure states that might be recoverable - reset them and try full workflow
+        # Handle failure states that might be recoverable (we already passed cooldown check above)
         if status in potentially_recoverable_failure_states:
-            logger.info(f"Recovering run {run_id}: resetting failure state '{status}' and re-running full hash verification workflow")
+            logger.info(f"Recovering run {run_id}: resetting failure state '{status}' and re-running full hash verification workflow (passed {run_cooldown_minutes}min cooldown)")
             
             # Reset run status
             await _update_run_status(self, run_id, "verifying_input_hashes")
@@ -3599,7 +3623,18 @@ sources:
             gfs_t0_run_time = run_info['gfs_init_time_utc']
             gfs_t_minus_6_run_time = gfs_t0_run_time - timedelta(hours=6)
             
-            # 1. Get miners to poll
+            # 1. Wait for miners to fetch and hash data (same as normal flow)
+            wait_minutes = self.config.get('validator_hash_wait_minutes', 10)
+            if self.test_mode:
+                original_wait = wait_minutes
+                wait_minutes = 1
+                logger.info(f"[Run {run_id}] TEST MODE: Using shortened wait time of {wait_minutes} minute(s) instead of {original_wait} minutes for recovery")
+            
+            logger.info(f"[Run {run_id}] Recovery workflow: Waiting {wait_minutes} minutes for miners to fetch GFS and compute input hash...")
+            await asyncio.sleep(wait_minutes * 60)
+            logger.info(f"[Run {run_id}] Recovery wait finished. Proceeding with input hash verification.")
+
+            # 2. Get miners to poll
             responses_to_check_query = """
                 SELECT id, miner_hotkey, job_id
                 FROM weather_miner_responses
@@ -3613,7 +3648,7 @@ sources:
                 await _update_run_status(self, run_id, "no_miners_to_poll")
                 return
 
-            # 2. Poll miners for hash status (exact logic from validator_execute)
+            # 3. Poll miners for hash status (exact logic from validator_execute)
             miner_hash_results = {}
             polling_tasks = []
 
@@ -3670,7 +3705,7 @@ sources:
                 miner_hash_results[resp_id] = status_data
             logger.info(f"[Run {run_id}] Collected input status from {len(miner_hash_results)}/{len(miners_to_poll)} miners.")
 
-            # 3. Compute validator reference hash (exact logic from validator_execute)
+            # 4. Compute validator reference hash (exact logic from validator_execute)
             validator_input_hash = None
             try:
                 logger.info(f"[Run {run_id}] Validator computing its own reference input hash...")
@@ -3694,7 +3729,7 @@ sources:
                 await _update_run_status(self, run_id, "error", f"Validator hash error: {val_hash_err}")
                 return
 
-            # 4. Compare hashes and update database (exact logic from validator_execute)
+            # 5. Compare hashes and update database (exact logic from validator_execute)
             miners_to_trigger = []
             if validator_input_hash:
                 from .schemas.weather_outputs import WeatherTaskStatus
@@ -3723,8 +3758,9 @@ sources:
                     elif miner_status == WeatherTaskStatus.FETCH_ERROR.value:
                         new_db_status = 'input_fetch_error'
                     elif miner_status in [WeatherTaskStatus.FETCHING_GFS.value, WeatherTaskStatus.HASHING_INPUT.value, WeatherTaskStatus.FETCH_QUEUED.value]:
-                        logger.warning(f"[Run {run_id}] Miner for response ID {resp_id} timed out (status: {miner_status}).")
-                        new_db_status = 'input_hash_timeout'
+                        logger.info(f"[Run {run_id}] Miner for response ID {resp_id} is still working (status: {miner_status}). Allowing more time to complete.")
+                        # Don't update status - let miner continue working
+                        new_db_status = None
                     elif miner_status in ["validator_poll_failed", "validator_poll_error"]:
                          new_db_status = 'input_poll_error'
                     else:
@@ -3755,11 +3791,12 @@ sources:
                         if len(miner_hash_results) > 20 and i % 20 == 19: # Yield every 20 items after the 20th
                             await asyncio.sleep(0)
                 
+                # Execute all update tasks after the loop completes
                 if update_tasks:
                      await asyncio.gather(*update_tasks)
                      logger.info(f"[Run {run_id}] Updated DB for {len(update_tasks)} miner responses after hash check.")
 
-            # 5. Trigger inference for matching miners (exact logic from validator_execute)
+            # 6. Trigger inference for matching miners (exact logic from validator_execute)
             if miners_to_trigger:
                 logger.info(f"[Run {run_id}] Triggering inference for {len(miners_to_trigger)} miners with matching input hashes.")
                 await _update_run_status(self, run_id, "triggering_inference")
@@ -3822,7 +3859,7 @@ sources:
                      await asyncio.gather(*final_update_tasks)
                 logger.info(f"[Run {run_id}] Completed inference trigger process. Successfully triggered {triggered_count}/{len(miners_to_trigger)} miners.")
                 
-                # 6. Update run status appropriately
+                # 7. Update run status appropriately
                 if triggered_count > 0:
                     await _update_run_status(self, run_id, "awaiting_inference_results")
                     logger.info(f"[Run {run_id}] Hash verification workflow completed successfully.")
@@ -3834,8 +3871,7 @@ sources:
                      await _update_run_status(self, run_id, "inference_trigger_failed") # No miners successfully triggered
             else:
                  logger.warning(f"[Run {run_id}] No miners eligible for inference trigger after hash verification.")
-                 await _update_run_status(self, run_id, "no_matching_hashes")
-
+                 
                  # Check if there are miner responses scheduled for retry
                  retry_cnt_row = await self.db_manager.fetch_one(
                      "SELECT COUNT(*) AS cnt FROM weather_miner_responses WHERE run_id = :rid AND status = 'retry_scheduled'",
@@ -3844,9 +3880,10 @@ sources:
                  retry_cnt = retry_cnt_row["cnt"] if retry_cnt_row else 0
 
                  if retry_cnt > 0:
-                     logger.info(f"[Run {run_id}] {retry_cnt} miner responses are scheduled for retry. Keeping run in 'verifying_miner_forecasts'.")
-                     await _update_run_status(self, run_id, "verifying_miner_forecasts")
+                     logger.info(f"[Run {run_id}] {retry_cnt} miner responses are scheduled for retry. Keeping run in 'verifying_input_hashes' for retry cycle.")
+                     await _update_run_status(self, run_id, "verifying_input_hashes")
                  else:
+                     logger.warning(f"[Run {run_id}] No miners with matching hashes and no retries scheduled. Marking as 'no_matching_hashes'.")
                      await _update_run_status(self, run_id, "no_matching_hashes")
             
         except Exception as e:

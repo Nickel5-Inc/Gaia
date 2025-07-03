@@ -281,6 +281,10 @@ class MinerScoreSender:
             raise
 
     async def run_async(self):
+        # Add 1-hour startup delay to prevent immediate execution on validator startup
+        logger.info("| MinerScoreSender | Delaying initial execution by 1 hour to avoid startup rush...")
+        await asyncio.sleep(3600)  # 1 hour delay
+        
         while True:
             try:
                 logger.info("| MinerScoreSender | Starting hourly process to send scores to Gaia API...")

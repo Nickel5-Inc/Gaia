@@ -3730,97 +3730,44 @@ class GaiaValidator:
                     else: weather_scores[uid] = scores[uid]; weather_counts[uid] += (scores[uid] != 0.0)
                 logger.info(f"Weather scores: {sum(1 for s in weather_scores if s == 0.0)} UIDs have zero score")
 
-            # ANTI-SYBIL: Process geomagnetic scores with 3-day lookback and daily averaging
-            logger.info("Processing geomagnetic scores with 3-day lookback for sybil attack protection...")
+            # Process geomagnetic scores with 24-hour lookback
+            logger.info("Processing geomagnetic scores with 24-hour lookback...")
             
             if geomagnetic_results:
-                # Group results by day for 3-day averaging approach
-                 daily_scores = {}  # day -> list of score rows for that day
-                 
-                 for result in geomagnetic_results:
-                     created_time = result['created_at']
-                     day_key = created_time.date()  # Group by calendar day
-                     
-                     if day_key not in daily_scores:
-                         daily_scores[day_key] = []
-                     daily_scores[day_key].append(result)
-                 
-                 logger.info(f"Geomagnetic data spans {len(daily_scores)} days: {sorted(daily_scores.keys())}")
-                 
-                 # Calculate scores for each UID using daily averaging including zeros
-                 for uid in range(256):
-                     daily_averages = []
-                     days_with_nonzero_scores = 0
-                     
-                     # Calculate average score for each day (including zeros)
-                     for day_key in sorted(daily_scores.keys()):
-                         day_results = daily_scores[day_key]
-                         day_scores = []
-                         
-                         # Collect all scores for this UID on this day
-                         for result in day_results:
-                             scores = result.get('score', [np.nan]*256)
-                             if not isinstance(scores, list) or len(scores) != 256:
-                                 scores = [np.nan]*256  # Defensive
-                             
-                             score_val = scores[uid] if uid < len(scores) else 0.0
-                             if isinstance(score_val, str) or np.isnan(score_val):
-                                 score_val = 0.0
-                             day_scores.append(score_val)
-                         
-                         # Calculate average for this day (including zeros)
-                         if day_scores:
-                             day_average = np.mean(day_scores)
-                             daily_averages.append(day_average)
-                             
-                             # Count days with nonzero scores for completeness factor
-                             if day_average > 0.0:
-                                 days_with_nonzero_scores += 1
-                         else:
-                             daily_averages.append(0.0)
-                     
-                     # For missing days (to get to 3 days), add zeros
-                     while len(daily_averages) < 3:
-                         daily_averages.append(0.0)
-                     
-                     # Keep only the last 3 days
-                     daily_averages = daily_averages[-3:]
-                     
-                     # Calculate final score as average of daily averages (including zero days)
-                     base_score = np.mean(daily_averages)
-                     
-                     # NEW COMPLETENESS FACTOR: 2/3 days of nonzero scores required for full weight
-                     num_days_available = len(daily_averages)
-                     if num_days_available >= 3:
-                         # Standard case: full 3 days available
-                         required_days_for_full = 2  # 2 out of 3 days
-                         if days_with_nonzero_scores >= required_days_for_full:
-                             completeness_factor = 1.0  # Full weight
-                         else:
-                             # Gradual scaling: 0 days = 0, 1 day = sqrt(1/2) = ~0.71
-                             completeness_factor = (days_with_nonzero_scores / required_days_for_full) ** 0.5
-                     elif num_days_available == 2:
-                         # Only 2 days available: need 1+ nonzero days for full weight
-                         if days_with_nonzero_scores >= 1:
-                             completeness_factor = 1.0
-                         else:
-                             completeness_factor = 0.0
-                     else:
-                         # Less than 2 days: give full weight (new miner grace period)
-                         completeness_factor = 1.0
-                     
-                     geomagnetic_scores[uid] = base_score * completeness_factor
-                     
-                     # Debug logging for transparency
-                     if base_score > 0 or days_with_nonzero_scores > 0:
-                         logger.debug(f"Geo UID {uid}: {days_with_nonzero_scores}/{num_days_available} days with scores, "
-                                    f"factor={completeness_factor:.3f}, base={base_score:.4f}, final={geomagnetic_scores[uid]:.4f}")
-                 
-                     logger.info(f"Processed 3-day geomagnetic scoring for sybil attack protection: "
-                                f"{len(daily_scores)} days of data, "
-                                f"{len([s for s in geomagnetic_scores if s > 0])} UIDs with positive scores")
+                logger.info(f"Processing {len(geomagnetic_results)} geomagnetic score records from last 24 hours")
+                
+                # Calculate scores for each UID by averaging all scores from the 24-hour period
+                for uid in range(256):
+                    uid_scores = []
+                    
+                    # Collect all scores for this UID from the 24-hour period
+                    for result in geomagnetic_results:
+                        scores = result.get('score', [np.nan]*256)
+                        if not isinstance(scores, list) or len(scores) != 256:
+                            scores = [np.nan]*256  # Defensive
+                        
+                        score_val = scores[uid] if uid < len(scores) else 0.0
+                        if isinstance(score_val, str) or np.isnan(score_val):
+                            score_val = 0.0
+                        uid_scores.append(score_val)
+                    
+                    # Calculate average score for this UID (no completeness factor)
+                    if uid_scores:
+                        geomagnetic_scores[uid] = np.mean(uid_scores)
+                    else:
+                        geomagnetic_scores[uid] = 0.0
+                        
+                    # Debug logging for UIDs with scores
+                    if geomagnetic_scores[uid] > 0:
+                        logger.debug(f"Geo UID {uid}: averaged {len([s for s in uid_scores if s > 0])}/{len(uid_scores)} non-zero scores, "
+                                   f"final={geomagnetic_scores[uid]:.4f}")
+                
+                valid_geo_scores = [s for s in geomagnetic_scores if s > 0]
+                logger.info(f"Processed 24-hour geomagnetic scoring: "
+                           f"{len(geomagnetic_results)} score records, "
+                           f"{len(valid_geo_scores)} UIDs with positive scores")
             else:
-                logger.info("No geomagnetic results in last 3 days - all scores set to 0")
+                logger.info("No geomagnetic results in last 24 hours - all scores set to 0")
                 geomagnetic_scores.fill(0.0)
 
             logger.info("Aggregate scores calculated. Implementing hybrid excellence/diversity pathway system...")
@@ -4054,7 +4001,7 @@ class GaiaValidator:
             FROM score_table 
             WHERE task_name = 'weather' AND created_at >= :start_time ORDER BY created_at DESC LIMIT 50
             """
-            # ANTI-SYBIL: Get 3 days of geomagnetic data for sybil attack protection
+            # Get 24 hours of geomagnetic data for scoring
             geomagnetic_query = """
             SELECT score, created_at 
             FROM score_table 
