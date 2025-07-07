@@ -309,14 +309,74 @@ class Miner:
                 self.logger.info("MINER_SELF_CHECK: Attempting to fetch own registered axon info...")
                 endpoint_to_use = self.config.chain_endpoint 
                 
+                # DEBUG: Log all parameters being used for self-check
+                self.logger.info("=" * 80)
+                self.logger.info("🔍 MINER_SELF_CHECK DEBUG: Parameters being used")
+                self.logger.info("=" * 80)
+                self.logger.info(f"🔑 Hotkey (self.keypair.ss58_address): '{self.keypair.ss58_address}'")
+                self.logger.info(f"📏 Hotkey length: {len(self.keypair.ss58_address)} characters")
+                self.logger.info(f"🌐 NetUID (self.netuid): {self.netuid}")
+                self.logger.info(f"🔗 Chain endpoint (self.config.chain_endpoint): '{endpoint_to_use}'")
+                self.logger.info(f"🧪 Hotkey format check:")
+                self.logger.info(f"   - Starts with: '{self.keypair.ss58_address[:10]}...'")
+                self.logger.info(f"   - Ends with: '...{self.keypair.ss58_address[-10:]}'")
+                self.logger.info(f"   - Has whitespace? {bool(self.keypair.ss58_address.strip() != self.keypair.ss58_address)}")
+                self.logger.info("=" * 80)
+                
                 substrate_for_check = SubstrateInterface(url=endpoint_to_use)
+                self.logger.info("✅ MINER_SELF_CHECK: Substrate connection established successfully")
                 
                 all_nodes = fetch_nodes.get_nodes_for_netuid(substrate_for_check, self.netuid)
+                self.logger.info(f"📋 MINER_SELF_CHECK: Retrieved {len(all_nodes)} nodes from metagraph")
+                
+                # DEBUG: Show sample of nodes for comparison
+                if all_nodes:
+                    self.logger.info("🔍 MINER_SELF_CHECK: Sample nodes from metagraph (first 3):")
+                    for i, node in enumerate(all_nodes[:3]):
+                        self.logger.info(f"   [{i}] Hotkey: '{node.hotkey}' (len: {len(node.hotkey)})")
+                        self.logger.info(f"       IP: {node.ip}, Port: {node.port}, Protocol: {node.protocol}")
+                        # Character-by-character comparison with our hotkey
+                        if len(node.hotkey) == len(self.keypair.ss58_address):
+                            diff_count = sum(1 for a, b in zip(node.hotkey, self.keypair.ss58_address) if a != b)
+                            self.logger.info(f"       Character differences with our hotkey: {diff_count}")
+                    
+                    if len(all_nodes) > 3:
+                        self.logger.info(f"   ... and {len(all_nodes) - 3} more nodes")
+                else:
+                    self.logger.error("❌ MINER_SELF_CHECK: No nodes found in metagraph!")
+                    self.logger.warning(f"MINER_SELF_CHECK: Hotkey {self.keypair.ss58_address} not found in metagraph. Public URL not set.")
+                    return True
                 found_own_node = None
+                self.logger.info(f"🔍 MINER_SELF_CHECK: Searching for exact hotkey match among {len(all_nodes)} nodes...")
+                exact_matches = 0
+                partial_matches = []
+                
                 for node_info_from_list in all_nodes:
                     if node_info_from_list.hotkey == self.keypair.ss58_address:
                         found_own_node = node_info_from_list
+                        exact_matches += 1
+                        self.logger.info(f"✅ MINER_SELF_CHECK: EXACT MATCH FOUND! Node hotkey: '{node_info_from_list.hotkey}'")
                         break
+                    # Check for partial matches to help debug
+                    elif node_info_from_list.hotkey.strip() == self.keypair.ss58_address.strip():
+                        partial_matches.append(("whitespace_difference", node_info_from_list.hotkey))
+                    elif len(node_info_from_list.hotkey) == len(self.keypair.ss58_address):
+                        diff_count = sum(1 for a, b in zip(node_info_from_list.hotkey, self.keypair.ss58_address) if a != b)
+                        if diff_count <= 3:  # Very close match
+                            partial_matches.append((f"{diff_count}_char_difference", node_info_from_list.hotkey))
+                
+                self.logger.info(f"🔍 MINER_SELF_CHECK: Search complete - Exact matches: {exact_matches}")
+                
+                if not found_own_node and partial_matches:
+                    self.logger.warning(f"⚠️ MINER_SELF_CHECK: No exact match found, but found {len(partial_matches)} partial matches:")
+                    for match_type, hotkey in partial_matches[:5]:  # Show first 5 partial matches
+                        self.logger.warning(f"   - {match_type}: '{hotkey}'")
+                elif not found_own_node:
+                    self.logger.error(f"❌ MINER_SELF_CHECK: No exact or partial matches found among {len(all_nodes)} nodes")
+                    # Show first few hotkeys for debugging
+                    self.logger.info("🔍 MINER_SELF_CHECK: First 5 hotkeys in metagraph for comparison:")
+                    for i, node in enumerate(all_nodes[:5]):
+                        self.logger.info(f"   [{i}] '{node.hotkey}'")
                 
                 if found_own_node:
                     self.logger.info(f"MINER_SELF_CHECK: Found own node info in metagraph. Raw IP from node object: '{found_own_node.ip}', Port: {found_own_node.port}, Protocol: {found_own_node.protocol}")
