@@ -330,12 +330,18 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             logger.info("Closing all database connections...")
             await self.close()  # Using the base class close method
             
-            # Clear operation stats
+            # Reset operation stats to initial state (keeping all required keys)
             self._operation_stats = {
                 'ddl_operations': 0,
                 'read_operations': 0,
                 'write_operations': 0,
-                'long_running_queries': []
+                'long_running_queries': [],
+                'total_sessions_acquired': 0,
+                'total_session_time_ms': 0.0,
+                'max_session_time_ms': 0.0,
+                'min_session_time_ms': float('inf'),
+                'avg_session_time_ms': 0.0,
+                'top_long_sessions': []
             }
         except Exception as e:
             logger.error(f"Error closing database connections: {e}")

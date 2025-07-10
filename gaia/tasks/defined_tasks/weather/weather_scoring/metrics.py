@@ -13,16 +13,17 @@ This module provides implementations of common metrics for
 evaluating weather forecasts, including RMSE, MAE, bias, correlation,
 """
 
-async def _compute_metric_to_scalar_array(metric_func, *args, **kwargs):
+def _compute_metric_to_scalar_array(metric_func, *args, **kwargs):
     """
-    Helper function to compute metrics and convert to scalar using async threading.
+    Helper function to compute metrics and convert to scalar using sync processing.
     Handles both numpy arrays and dask arrays properly.
+    This function is synchronous and designed to be called via asyncio.to_thread().
     """
-    result = await asyncio.to_thread(metric_func, *args, **kwargs)
+    result = metric_func(*args, **kwargs)
     
     # Force computation if it's a dask array
     if hasattr(result, 'compute'):
-        result = await asyncio.to_thread(result.compute)
+        result = result.compute()
     
     return result
 

@@ -54,11 +54,18 @@ class MinerScoreSender:
             score_value = float(row["score"])
 
             if all(not math.isnan(v) and not math.isinf(v) for v in [pred_value, truth_value, score_value]):
+                # query_time is when the prediction was made and the input data timestamp
+                query_time = row["query_time"]
+                
+                # Geomagnetic predictions target 1 hour into the future
+                from datetime import timedelta
+                target_time = query_time + timedelta(hours=1)
+                
                 return {
                     "predictionId": row["id"],
-                    "predictionDate": row["prediction_datetime"].isoformat(),
-                    "geomagneticPredictionTargetDate": row["prediction_datetime"].isoformat(),
-                    "geomagneticPredictionInputDate": row["prediction_datetime"].isoformat(),
+                    "predictionDate": query_time.isoformat(),                    # When prediction was made
+                    "geomagneticPredictionTargetDate": target_time.isoformat(), # What time was predicted (query_time + 1hr)
+                    "geomagneticPredictionInputDate": query_time.isoformat(),   # Input data timestamp
                     "geomagneticPredictedValue": pred_value,
                     "geomagneticGroundTruthValue": truth_value,
                     "geomagneticScore": score_value,
@@ -86,7 +93,7 @@ class MinerScoreSender:
 
         # Then fetch valid records
         query = """
-            SELECT id, query_time AS prediction_datetime, predicted_value, ground_truth_value, score, scored_at
+            SELECT id, query_time, predicted_value, ground_truth_value, score, scored_at
             FROM geomagnetic_history
             WHERE miner_hotkey = :miner_hotkey
             AND predicted_value IS NOT NULL 
@@ -179,7 +186,7 @@ class MinerScoreSender:
         try:
             if not self.api_client or self.api_client.is_closed:
                 self.api_client = httpx.AsyncClient(
-                    timeout=30.0,
+                    timeout=60.0,
                     follow_redirects=True,
                     limits=httpx.Limits(
                         max_connections=100,

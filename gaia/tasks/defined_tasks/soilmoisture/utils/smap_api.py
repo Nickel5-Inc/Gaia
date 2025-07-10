@@ -214,7 +214,12 @@ def process_smap_data(filepath, bbox, target_shape=(220, 220)):
     """
     Process SMAP L4 data for a specified bounding box.
     """
-    with xr.open_dataset(filepath, group="Geophysical_Data", engine="h5netcdf") as ds:
+    # Import xarray within the function to ensure thread-safety
+    import xarray as xr
+    from skimage.transform import resize
+    import numpy as np
+    
+    with xr.open_dataset(filepath, group="Geophysical_Data") as ds:
         surface_sm = (
             ds["sm_surface"]
             .sel(lat=slice(bbox[1], bbox[3]), lon=slice(bbox[0], bbox[2]))
@@ -312,7 +317,7 @@ async def get_smap_data_multi_region(datetime_obj, regions):
             return download_result  # Return the error information
 
         results = {}
-        with xr.open_dataset(str(temp_filepath), group="Geophysical_Data", engine="h5netcdf") as ds:
+        with xr.open_dataset(str(temp_filepath), group="Geophysical_Data") as ds:
             surface_data = ds["sm_surface"].values
             rootzone_data = ds["sm_rootzone"].values
 
@@ -430,7 +435,14 @@ def get_valid_smap_time(datetime_obj):
 
 def _process_smap_for_sentinel_sync(filepath, sentinel_bounds_tuple, sentinel_crs_str):
     """Synchronous helper to process SMAP data for sentinel bounds using proven EASE-Grid approach."""
-    with xr.open_dataset(filepath, group="Geophysical_Data", engine="h5netcdf") as ds:
+    # Import xarray within the thread to ensure backends are properly available
+    import xarray as xr
+    from rasterio.crs import CRS
+    from pyproj import Transformer
+    from skimage.transform import resize
+    import numpy as np
+    
+    with xr.open_dataset(filepath, group="Geophysical_Data") as ds:
         # Use the proven approach from get_smap_data_multi_region
         surface_data = ds["sm_surface"].values
         rootzone_data = ds["sm_rootzone"].values
