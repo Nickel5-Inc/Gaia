@@ -1,5 +1,6 @@
 import asyncpg
 import logging
+import os
 from typing import Optional
 from gaia.validator.utils.config import settings
 
@@ -18,8 +19,20 @@ async def get_db_pool() -> asyncpg.Pool:
     if _POOL is None:
         logger.info("Initializing database connection pool")
         
-        # Construct database URL from settings
-        db_url = f"postgresql://{settings.DATABASE.USER}:{settings.DATABASE.PASSWORD}@{settings.DATABASE.HOST}:{settings.DATABASE.PORT}/{settings.DATABASE.NAME}"
+        # Construct database URL from settings, handling both TCP and socket connections
+        db_connection_type = os.getenv("DB_CONNECTION_TYPE", "tcp").lower()
+        
+        if db_connection_type == "socket":
+            # For socket connections, use Unix domain socket format
+            socket_path = os.getenv("DB_SOCKET_PATH", "/var/run/postgresql")
+            db_url = f"postgresql://{settings.DATABASE.USER}:{settings.DATABASE.PASSWORD}@/{settings.DATABASE.NAME}?host={socket_path}"
+            logger.info(f"Using PostgreSQL socket connection: {socket_path}")
+        else:
+            # Default TCP connection
+            db_url = f"postgresql://{settings.DATABASE.USER}:{settings.DATABASE.PASSWORD}@{settings.DATABASE.HOST}:{settings.DATABASE.PORT}/{settings.DATABASE.NAME}"
+            logger.info(f"Using PostgreSQL TCP connection: {settings.DATABASE.HOST}:{settings.DATABASE.PORT}")
+        
+        logger.info(f"Database URL configured for connection type: {db_connection_type}")
         
         try:
             _POOL = await asyncpg.create_pool(

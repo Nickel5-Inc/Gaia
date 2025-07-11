@@ -185,6 +185,35 @@ class SoilMoistureTask(Task):
                 self.config, self.model, self.miner_preprocessing
             )
 
+    # === TASK PROPERTIES ===
+
+    @property
+    def cron_schedule(self) -> str:
+        """APScheduler-compatible cron string for soil moisture task execution."""
+        # Run every 6 hours at 15 minutes past the hour for soil moisture monitoring
+        return "15 */6 * * *"
+
+    async def run_scheduled_job(self, io_engine) -> None:
+        """
+        The main entry point called by the scheduler for soil moisture validation.
+        
+        Args:
+            io_engine: The IOEngine instance for database and compute access
+        """
+        logger.info("Starting scheduled soil moisture validation run")
+        
+        try:
+            # For now, delegate to existing validator_execute method
+            # TODO: Implement proper lifecycle orchestration through io_engine
+            if self.validator:
+                await self.validator_execute(self.validator)
+            else:
+                logger.warning("No validator instance available for soil moisture task")
+            logger.info("Soil moisture validation run completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Soil moisture validation run failed: {e}", exc_info=True)
+
     # === MAIN EXECUTION METHODS ===
 
     async def validator_execute(self, validator) -> None:
@@ -262,6 +291,23 @@ class SoilMoistureTask(Task):
         start_mins = start_hr * 60 + start_min
         end_mins = end_hr * 60 + end_min
         return start_mins <= current_mins <= end_mins
+
+    # === ABSTRACT METHOD IMPLEMENTATIONS ===
+
+    def validator_prepare_subtasks(self, data):
+        """
+        Prepare subtasks for validation.
+        Implementation of abstract method from base Task class.
+        """
+        try:
+            subtasks = [
+                {"timestamp": data["timestamp"], "value": value}
+                for value in data["values"]
+            ]
+            return subtasks
+        except Exception as e:
+            logger.error(f"Error in validator_prepare_subtasks: {e}")
+            return []
 
     # === LEGACY COMPATIBILITY METHODS ===
 

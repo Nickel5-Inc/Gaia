@@ -1,3 +1,4 @@
+import argparse
 import multiprocessing
 import time
 import psutil
@@ -10,6 +11,29 @@ from gaia.validator.utils.config import settings  # Assuming Phase 0 is complete
 
 def main():
     """The main entrypoint for the Gaia Validator application."""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Gaia Validator v4.0 - Multiprocessing Architecture")
+    parser.add_argument(
+        "--test-mode", 
+        action="store_true", 
+        help="Enable test mode for faster processing and development"
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set logging level (overrides LOG_LEVEL env var)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Determine test mode from args or environment
+    test_mode = args.test_mode or os.getenv("TEST_MODE", "false").lower() in ["true", "1", "yes"]
+    
+    if test_mode:
+        print("🧪 VALIDATOR RUNNING IN TEST MODE - Faster processing enabled")
+    
     config = settings
 
     # Use a manager for queues if more complex state needs to be shared in the future.
@@ -42,7 +66,7 @@ def main():
         io_proc = multiprocessing.Process(
             target=io_main,
             name="io_engine",
-            args=(config, work_queue, result_queue),
+            args=(config, work_queue, result_queue, test_mode),
             daemon=True
         )
         io_proc.start()

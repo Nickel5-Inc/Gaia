@@ -188,6 +188,35 @@ class GeomagneticTask(Task):
                 self.config, self.model, self.miner_preprocessing
             )
 
+    # === TASK PROPERTIES ===
+
+    @property
+    def cron_schedule(self) -> str:
+        """APScheduler-compatible cron string for geomagnetic task execution."""
+        # Run every hour at 10 minutes past the hour for real-time geomagnetic monitoring
+        return "10 * * * *"
+
+    async def run_scheduled_job(self, io_engine) -> None:
+        """
+        The main entry point called by the scheduler for geomagnetic validation.
+        
+        Args:
+            io_engine: The IOEngine instance for database and compute access
+        """
+        logger.info("Starting scheduled geomagnetic validation run")
+        
+        try:
+            # For now, delegate to existing validator_execute method
+            # TODO: Implement proper lifecycle orchestration through io_engine
+            if self.validator:
+                await self.validator_execute(self.validator)
+            else:
+                logger.warning("No validator instance available for geomagnetic task")
+            logger.info("Geomagnetic validation run completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Geomagnetic validation run failed: {e}", exc_info=True)
+
     # === MAIN EXECUTION METHODS ===
 
     async def validator_execute(self, validator) -> None:

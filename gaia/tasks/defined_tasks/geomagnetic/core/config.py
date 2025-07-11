@@ -9,7 +9,8 @@ import os
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from pydantic import BaseSettings, Field
+from pydantic import Field
+from pydantic_settings import BaseSettings
 
 
 class GeomagneticConfig(BaseSettings):

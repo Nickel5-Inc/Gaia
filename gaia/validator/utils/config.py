@@ -179,7 +179,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file='.env',
         env_nested_delimiter='__',  # Allows WEATHER__DB_RUN_RETENTION_DAYS in .env
-        case_sensitive=False
+        case_sensitive=False,
+        extra='ignore'  # Ignore extra fields to prevent validation errors
     )
 
 
