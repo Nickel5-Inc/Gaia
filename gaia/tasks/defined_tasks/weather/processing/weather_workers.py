@@ -149,23 +149,59 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
             logger.warning(f"[InferenceTask Job {job_id}] Job already in status '{current_status}'. Skipping duplicate inference.")
             return
         
-        # Check for other jobs with same timestep that are already in progress or completed
+        # Check for duplicate processing of this specific job
         if gfs_init_time:
-            duplicate_check_query = """
+            # Check if THIS specific job is already in progress or completed
+            current_job_check_query = """
                 SELECT id, status FROM weather_miner_jobs 
+                WHERE id = :current_job_id 
+                AND status IN ('in_progress', 'completed')
+                LIMIT 1
+            """
+            current_job = await task_instance.db_manager.fetch_one(current_job_check_query, {
+                "current_job_id": job_id
+            })
+            
+            if current_job:
+                logger.warning(f"[InferenceTask Job {job_id}] This job is already in status '{current_job['status']}'. Aborting duplicate inference.")
+                return
+            
+            # Check if inference has already been completed for this GFS timestep by another job
+            # If so, reuse the existing files instead of running inference again
+            completed_inference_query = """
+                SELECT id, target_netcdf_path, verification_hash
+                FROM weather_miner_jobs 
                 WHERE gfs_init_time_utc = :gfs_time 
                 AND id != :current_job_id 
-                AND status IN ('in_progress', 'completed')
-                ORDER BY id DESC LIMIT 1
+                AND status = 'completed'
+                AND target_netcdf_path IS NOT NULL
+                AND verification_hash IS NOT NULL
+                ORDER BY processing_end_time DESC 
+                LIMIT 1
             """
-            duplicate_job = await task_instance.db_manager.fetch_one(duplicate_check_query, {
+            completed_inference = await task_instance.db_manager.fetch_one(completed_inference_query, {
                 "gfs_time": gfs_init_time,
                 "current_job_id": job_id
             })
             
-            if duplicate_job:
-                logger.warning(f"[InferenceTask Job {job_id}] Found existing job {duplicate_job['id']} for same timestep {gfs_init_time} with status '{duplicate_job['status']}'. Aborting duplicate inference.")
-                await update_job_status(task_instance, job_id, "skipped_duplicate", f"Duplicate of job {duplicate_job['id']}")
+            if completed_inference:
+                logger.info(f"[InferenceTask Job {job_id}] Found completed inference for GFS time {gfs_init_time} from job {completed_inference['id']}. Reusing files instead of running new inference.")
+                
+                # Update current job to reuse the existing files
+                await update_job_status(task_instance, job_id, "completed", error_message="")
+                await task_instance.db_manager.execute("""
+                    UPDATE weather_miner_jobs 
+                    SET target_netcdf_path = :target_path,
+                        verification_hash = :hash,
+                        processing_end_time = NOW()
+                    WHERE id = :job_id
+                """, {
+                    "job_id": job_id,
+                    "target_path": completed_inference['target_netcdf_path'],
+                    "hash": completed_inference['verification_hash']
+                })
+                
+                logger.info(f"[InferenceTask Job {job_id}] Successfully reused inference files from job {completed_inference['id']}.")
                 return
                 
     except Exception as e:

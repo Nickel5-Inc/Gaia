@@ -316,31 +316,51 @@ async def _request_fresh_token(task_instance: 'WeatherTask', miner_hotkey: str, 
         logger.error(f"Unhandled exception in _request_fresh_token for job {job_id}: {e!r}", exc_info=True)
     return None
 
-async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_utc: datetime) -> Optional[Dict[str, Any]]:
+async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_utc: datetime, validator_hotkey: str = None) -> Optional[Dict[str, Any]]:
     """
-    Check if a job exists for the given GFS initialization time.
+    Check if a job exists for the given GFS initialization time and validator.
     (Intended for Miner-side usage)
+    
+    Args:
+        task_instance: WeatherTask instance
+        gfs_init_time_utc: GFS initialization time
+        validator_hotkey: Optional validator hotkey to filter by specific validator's jobs
     """
     if task_instance.node_type != 'miner':
         logger.error("get_job_by_gfs_init_time called on non-miner node.")
         return None
         
     try:
-        query = """
-        SELECT id as job_id, status, target_netcdf_path as zarr_store_path
-        FROM weather_miner_jobs
-        WHERE gfs_init_time_utc = :gfs_init_time
-        ORDER BY id DESC
-        LIMIT 1
-        """
+        # If validator_hotkey is provided, look for validator-specific jobs
+        if validator_hotkey:
+            query = """
+            SELECT id as job_id, status, target_netcdf_path as zarr_store_path
+            FROM weather_miner_jobs
+            WHERE gfs_init_time_utc = :gfs_init_time
+            AND validator_hotkey = :validator_hotkey
+            ORDER BY id DESC
+            LIMIT 1
+            """
+            params = {"gfs_init_time": gfs_init_time_utc, "validator_hotkey": validator_hotkey}
+        else:
+            # Fallback to original behavior for backward compatibility
+            query = """
+            SELECT id as job_id, status, target_netcdf_path as zarr_store_path
+            FROM weather_miner_jobs
+            WHERE gfs_init_time_utc = :gfs_init_time
+            ORDER BY id DESC
+            LIMIT 1
+            """
+            params = {"gfs_init_time": gfs_init_time_utc}
+            
         if not hasattr(task_instance, 'db_manager') or task_instance.db_manager is None:
              logger.error("DB manager not available in get_job_by_gfs_init_time")
              return None
              
-        job = await task_instance.db_manager.fetch_one(query, {"gfs_init_time": gfs_init_time_utc})
+        job = await task_instance.db_manager.fetch_one(query, params)
         return job
     except Exception as e:
-        logger.error(f"Error checking for existing job with GFS init time {gfs_init_time_utc}: {e}")
+        logger.error(f"Error checking for existing job with GFS init time {gfs_init_time_utc} and validator {validator_hotkey}: {e}")
         return None
 
 async def update_job_status(task_instance: 'WeatherTask', job_id: str, status: str, error_message: Optional[str] = None):
