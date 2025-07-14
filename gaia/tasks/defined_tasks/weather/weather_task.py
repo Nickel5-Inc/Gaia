@@ -1525,7 +1525,8 @@ sources:
 
                     payload_data = WeatherInitiateFetchData(
                          forecast_start_time=gfs_t0_run_time,   # T=0h time
-                         previous_step_time=gfs_t_minus_6_run_time # T=-6h time
+                         previous_step_time=gfs_t_minus_6_run_time, # T=-6h time
+                         validator_hotkey=validator.keypair.ss58_address if validator.keypair else None
                     )
                     payload_dict = payload_data.model_dump(mode='json')
                     
@@ -2443,9 +2444,8 @@ sources:
 
             logger.info(f"[Miner] Received initiate_fetch request for T0={t0_run_time}")
 
-            # Extract validator hotkey from request context if available
-            # TODO: Update the WeatherInitiateFetchData schema to include validator_hotkey
-            validator_hotkey = getattr(request_data, 'validator_hotkey', None)
+            # Extract validator hotkey from request data
+            validator_hotkey = request_data.validator_hotkey
             
             # Find existing job for this exact time and validator
             if validator_hotkey:
@@ -2533,12 +2533,13 @@ sources:
 
             insert_query = """
                 INSERT INTO weather_miner_jobs
-                (id, validator_request_time, gfs_init_time_utc, gfs_t_minus_6_time_utc, status)
-                VALUES (:id, :req_time, :gfs_init, :gfs_t_minus_6, :status)
+                (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_t_minus_6_time_utc, status)
+                VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_t_minus_6, :status)
             """
             await self.db_manager.execute(insert_query, {
                 "id": job_id,
                 "req_time": datetime.now(timezone.utc),
+                "val_hk": validator_hotkey,
                 "gfs_init": t0_run_time,
                 "gfs_t_minus_6": t_minus_6_run_time,
                 "status": "fetch_queued"
