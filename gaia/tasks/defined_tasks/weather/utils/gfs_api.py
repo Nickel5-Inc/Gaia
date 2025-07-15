@@ -57,7 +57,19 @@ async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: 
         # THREADING FIX: Explicitly import netCDF4 in thread context to ensure backend availability
         try:
             import netCDF4
-            logger.debug("Successfully imported netCDF4 in thread context")
+            import xarray as xr
+            
+            # Force re-registration of netcdf4 backend in this thread
+            if hasattr(xr.backends, 'NetCDF4BackendEntrypoint'):
+                try:
+                    # Manually register the netcdf4 backend in this thread context
+                    backend = xr.backends.NetCDF4BackendEntrypoint()
+                    xr.backends.backends.BACKENDS['netcdf4'] = backend
+                    logger.debug("Successfully re-registered netcdf4 backend in thread context")
+                except Exception as backend_reg_err:
+                    logger.warning(f"Could not manually register netcdf4 backend: {backend_reg_err}")
+            
+            logger.debug(f"Thread context - Available engines: {list(xr.backends.list_engines())}")
         except ImportError as netcdf_err:
             logger.warning(f"netCDF4 not available in thread context: {netcdf_err}")
             
@@ -468,7 +480,19 @@ async def fetch_gfs_analysis_data(
         # THREADING FIX: Explicitly import netCDF4 in thread context to ensure backend availability
         try:
             import netCDF4
-            logger.debug("Successfully imported netCDF4 in thread context")
+            import xarray as xr
+            
+            # Force re-registration of netcdf4 backend in this thread
+            if hasattr(xr.backends, 'NetCDF4BackendEntrypoint'):
+                try:
+                    # Manually register the netcdf4 backend in this thread context
+                    backend = xr.backends.NetCDF4BackendEntrypoint()
+                    xr.backends.backends.BACKENDS['netcdf4'] = backend
+                    logger.debug("Successfully re-registered netcdf4 backend in thread context")
+                except Exception as backend_reg_err:
+                    logger.warning(f"Could not manually register netcdf4 backend: {backend_reg_err}")
+            
+            logger.debug(f"Thread context - Available engines: {list(xr.backends.list_engines())}")
         except ImportError as netcdf_err:
             logger.warning(f"netCDF4 not available in thread context: {netcdf_err}")
         
