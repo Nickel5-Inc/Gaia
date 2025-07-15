@@ -1859,9 +1859,43 @@ sources:
                             elif miner_status == WeatherTaskStatus.FETCH_ERROR.value:
                                 new_db_status = 'input_fetch_error'
                             elif miner_status in [WeatherTaskStatus.FETCHING_GFS.value, WeatherTaskStatus.HASHING_INPUT.value, WeatherTaskStatus.FETCH_QUEUED.value]:
-                                logger.info(f"[Run {run_id}] Miner for response ID {resp_id} is still working (status: {miner_status}). Allowing more time to complete.")
-                                # Don't update status - let miner continue working
-                                new_db_status = None
+                                # Get current retry count for this response
+                                retry_count_query = "SELECT retry_count FROM weather_miner_responses WHERE id = :resp_id"
+                                retry_result = await self.db_manager.fetch_one(retry_count_query, {"resp_id": resp_id})
+                                current_retry_count = retry_result['retry_count'] if retry_result else 0
+                                
+                                # Define retry intervals in minutes: 5, 10, 15
+                                retry_intervals = [5, 10, 15]
+                                
+                                if current_retry_count < len(retry_intervals):
+                                    # Schedule next retry
+                                    next_interval = retry_intervals[current_retry_count]
+                                    next_retry_time = datetime.now(timezone.utc) + timedelta(minutes=next_interval)
+                                    
+                                    logger.info(f"[Run {run_id}] Miner for response ID {resp_id} is still working (status: {miner_status}). "
+                                              f"Scheduling retry {current_retry_count + 1}/3 in {next_interval} minutes at {next_retry_time.strftime('%H:%M:%S')} UTC.")
+                                    
+                                    # Update to retry_scheduled status with next retry time and incremented retry count
+                                    update_query = """
+                                        UPDATE weather_miner_responses
+                                        SET status = 'retry_scheduled',
+                                            retry_count = :retry_count,
+                                            next_retry_time = :next_retry_time,
+                                            last_polled_time = :now
+                                        WHERE id = :resp_id
+                                    """
+                                    update_tasks.append(self.db_manager.execute(update_query, {
+                                        "resp_id": resp_id,
+                                        "retry_count": current_retry_count + 1,
+                                        "next_retry_time": next_retry_time,
+                                        "now": datetime.now(timezone.utc)
+                                    }))
+                                    new_db_status = None  # Don't process in the main update logic
+                                else:
+                                    # Exhausted all retries, mark as failed
+                                    logger.warning(f"[Run {run_id}] Miner for response ID {resp_id} exhausted all 3 retries (status: {miner_status}). "
+                                                 f"Marking as input timeout after final retry at 15 minutes.")
+                                    new_db_status = 'input_hash_timeout'
                             elif miner_status in [WeatherTaskStatus.VALIDATOR_POLL_FAILED.value, WeatherTaskStatus.VALIDATOR_POLL_ERROR.value]:
                                  new_db_status = 'input_poll_error'
                             else:
@@ -4059,9 +4093,43 @@ sources:
                     elif miner_status == WeatherTaskStatus.FETCH_ERROR.value:
                         new_db_status = 'input_fetch_error'
                     elif miner_status in [WeatherTaskStatus.FETCHING_GFS.value, WeatherTaskStatus.HASHING_INPUT.value, WeatherTaskStatus.FETCH_QUEUED.value]:
-                        logger.info(f"[Run {run_id}] Miner for response ID {resp_id} is still working (status: {miner_status}). Allowing more time to complete.")
-                        # Don't update status - let miner continue working
-                        new_db_status = None
+                        # Get current retry count for this response
+                        retry_count_query = "SELECT retry_count FROM weather_miner_responses WHERE id = :resp_id"
+                        retry_result = await self.db_manager.fetch_one(retry_count_query, {"resp_id": resp_id})
+                        current_retry_count = retry_result['retry_count'] if retry_result else 0
+                        
+                        # Define retry intervals in minutes: 5, 10, 15
+                        retry_intervals = [5, 10, 15]
+                        
+                        if current_retry_count < len(retry_intervals):
+                            # Schedule next retry
+                            next_interval = retry_intervals[current_retry_count]
+                            next_retry_time = datetime.now(timezone.utc) + timedelta(minutes=next_interval)
+                            
+                            logger.info(f"[Run {run_id}] Miner for response ID {resp_id} is still working (status: {miner_status}). "
+                                      f"Scheduling retry {current_retry_count + 1}/3 in {next_interval} minutes at {next_retry_time.strftime('%H:%M:%S')} UTC.")
+                            
+                            # Update to retry_scheduled status with next retry time and incremented retry count
+                            update_query = """
+                                UPDATE weather_miner_responses
+                                SET status = 'retry_scheduled',
+                                    retry_count = :retry_count,
+                                    next_retry_time = :next_retry_time,
+                                    last_polled_time = :now
+                                WHERE id = :resp_id
+                            """
+                            update_tasks.append(self.db_manager.execute(update_query, {
+                                "resp_id": resp_id,
+                                "retry_count": current_retry_count + 1,
+                                "next_retry_time": next_retry_time,
+                                "now": datetime.now(timezone.utc)
+                            }))
+                            new_db_status = None  # Don't process in the main update logic
+                        else:
+                            # Exhausted all retries, mark as failed
+                            logger.warning(f"[Run {run_id}] Miner for response ID {resp_id} exhausted all 3 retries (status: {miner_status}). "
+                                         f"Marking as input timeout after final retry at 15 minutes.")
+                            new_db_status = 'input_hash_timeout'
                     elif miner_status in ["validator_poll_failed", "validator_poll_error"]:
                          new_db_status = 'input_poll_error'
                     else:
