@@ -541,13 +541,37 @@ class WeatherTask(Task):
             return None
         
         try:
+            # Enhanced R2 client configuration for better reliability
+            from botocore.config import Config
+            from botocore.client import Config as BotocoreConfig
+            
+            # Configure connection pool and retry settings
+            config = Config(
+                signature_version='s3v4',
+                region_name='auto',  # R2 is region-less
+                retries={
+                    'max_attempts': 5,
+                    'mode': 'adaptive'
+                },
+                max_pool_connections=200,  # Increased from default 10
+                connect_timeout=10,
+                read_timeout=60,
+                # Use S3 Transfer configuration for better multipart handling
+                s3={
+                    'multipart_threshold': 1024*1024*64,  # 64MB threshold for multipart
+                    'multipart_chunksize': 1024*1024*8,   # 8MB chunk size
+                    'max_concurrency': 10,
+                    'use_threads': True,
+                    'max_bandwidth': None
+                }
+            )
+            
             s3_client = boto3.client(
                 's3',
                 endpoint_url=endpoint_url,
                 aws_access_key_id=access_key_id,
                 aws_secret_access_key=secret_access_key,
-                config=boto3.session.Config(signature_version='s3v4'),
-                region_name='auto' # R2 is region-less
+                config=config
             )
             return s3_client
         except Exception as e:
@@ -555,7 +579,7 @@ class WeatherTask(Task):
             return None
 
     async def _upload_input_to_r2(self, s3_client: boto3.client, job_id: str, initial_batch: 'Batch') -> Optional[str]:
-        """Uploads the initial batch pickle to R2."""
+        """Uploads the initial batch pickle to R2 with robust retry logic."""
         if not self.r2_config or not self.r2_config.get("r2_bucket_name"):
             logger.error(f"[{job_id}] R2 bucket name not found in self.r2_config. Cannot upload input.")
             return None
@@ -563,21 +587,135 @@ class WeatherTask(Task):
 
         object_key = f"inputs/{job_id}/initial_batch.pkl"
         
+        # Serialize the batch to bytes first
         try:
             with io.BytesIO() as f:
                 pickle.dump(initial_batch, f)
                 f.seek(0)
-                await asyncio.to_thread(
-                    s3_client.upload_fileobj,
-                    f,
-                    bucket_name,
-                    object_key
-                )
-            logger.info(f"[{job_id}] Successfully uploaded initial batch to R2: s3://{bucket_name}/{object_key}")
-            return object_key
-        except (BotoClientError, Exception) as e:
-            logger.error(f"[{job_id}] Failed to upload initial batch to R2: {e}", exc_info=True)
+                data_bytes = f.getvalue()
+                
+            data_size_mb = len(data_bytes) / (1024 * 1024)
+            logger.info(f"[{job_id}] Prepared batch for upload: {data_size_mb:.2f} MB")
+            
+            # Use robust upload with retry logic
+            success = await self._robust_upload_bytes_to_r2(
+                s3_client, bucket_name, object_key, data_bytes, job_id
+            )
+            
+            if success:
+                logger.info(f"[{job_id}] Successfully uploaded initial batch to R2: s3://{bucket_name}/{object_key}")
+                return object_key
+            else:
+                logger.error(f"[{job_id}] Failed to upload initial batch to R2 after retries")
+                return None
+                
+        except Exception as e:
+            logger.error(f"[{job_id}] Error preparing batch for upload: {e}", exc_info=True)
             return None
+
+    async def _robust_upload_bytes_to_r2(
+        self, 
+        s3_client: boto3.client, 
+        bucket_name: str, 
+        object_key: str, 
+        data_bytes: bytes, 
+        job_id: str,
+        max_retries: int = 5
+    ) -> bool:
+        """
+        Robust upload to R2 with exponential backoff retry logic.
+        Handles multipart upload failures gracefully.
+        """
+        base_delay = 2.0  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Use TransferConfig for better multipart handling
+                from boto3.s3.transfer import TransferConfig
+                
+                transfer_config = TransferConfig(
+                    multipart_threshold=1024*1024*64,  # 64MB
+                    multipart_chunksize=1024*1024*8,   # 8MB chunks
+                    max_concurrency=5,  # Limit concurrency to prevent connection pool exhaustion
+                    use_threads=True,
+                    max_bandwidth=None
+                )
+                
+                # Upload with transfer config
+                with io.BytesIO(data_bytes) as f:
+                    await asyncio.to_thread(
+                        s3_client.upload_fileobj,
+                        f,
+                        bucket_name,
+                        object_key,
+                        Config=transfer_config
+                    )
+                
+                # Verify upload by checking object existence
+                try:
+                    await asyncio.to_thread(
+                        s3_client.head_object,
+                        Bucket=bucket_name,
+                        Key=object_key
+                    )
+                    logger.info(f"[{job_id}] Upload verified: s3://{bucket_name}/{object_key}")
+                    return True
+                except Exception as verify_error:
+                    logger.warning(f"[{job_id}] Upload verification failed: {verify_error}")
+                    # Continue to retry logic
+                    
+            except Exception as e:
+                error_msg = f"Attempt {attempt + 1}/{max_retries} failed: {type(e).__name__}: {str(e)}"
+                
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"[{job_id}] {error_msg}. Retrying in {delay:.1f}s...")
+                    await asyncio.sleep(delay)
+                    
+                    # Try to clean up any partial multipart uploads
+                    try:
+                        await self._cleanup_failed_multipart_uploads(s3_client, bucket_name, object_key, job_id)
+                    except Exception as cleanup_error:
+                        logger.debug(f"[{job_id}] Cleanup error (non-critical): {cleanup_error}")
+                    
+                    continue
+                else:
+                    logger.error(f"[{job_id}] All {max_retries} upload attempts failed. Final error: {e}")
+                    return False
+        
+        return False
+    
+    async def _cleanup_failed_multipart_uploads(
+        self, 
+        s3_client: boto3.client, 
+        bucket_name: str, 
+        object_key: str, 
+        job_id: str
+    ):
+        """Clean up any failed multipart uploads for the given object key."""
+        try:
+            # List multipart uploads
+            response = await asyncio.to_thread(
+                s3_client.list_multipart_uploads,
+                Bucket=bucket_name,
+                Prefix=object_key
+            )
+            
+            if 'Uploads' in response:
+                for upload in response['Uploads']:
+                    upload_id = upload['UploadId']
+                    logger.info(f"[{job_id}] Aborting failed multipart upload: {upload_id}")
+                    
+                    await asyncio.to_thread(
+                        s3_client.abort_multipart_upload,
+                        Bucket=bucket_name,
+                        Key=object_key,
+                        UploadId=upload_id
+                    )
+                    
+        except Exception as e:
+            logger.debug(f"[{job_id}] Error during multipart cleanup: {e}")
+            # This is non-critical, so we don't re-raise
 
     async def _invoke_inference_service(self, job_id: str, input_r2_key: str) -> Optional[str]:
         """
@@ -1525,7 +1663,8 @@ sources:
 
                     payload_data = WeatherInitiateFetchData(
                          forecast_start_time=gfs_t0_run_time,   # T=0h time
-                         previous_step_time=gfs_t_minus_6_run_time # T=-6h time
+                         previous_step_time=gfs_t_minus_6_run_time, # T=-6h time
+                         validator_hotkey=validator.keypair.ss58_address if validator.keypair else None
                     )
                     payload_dict = payload_data.model_dump(mode='json')
                     
@@ -1720,9 +1859,43 @@ sources:
                             elif miner_status == WeatherTaskStatus.FETCH_ERROR.value:
                                 new_db_status = 'input_fetch_error'
                             elif miner_status in [WeatherTaskStatus.FETCHING_GFS.value, WeatherTaskStatus.HASHING_INPUT.value, WeatherTaskStatus.FETCH_QUEUED.value]:
-                                logger.info(f"[Run {run_id}] Miner for response ID {resp_id} is still working (status: {miner_status}). Allowing more time to complete.")
-                                # Don't update status - let miner continue working
-                                new_db_status = None
+                                # Get current retry count for this response
+                                retry_count_query = "SELECT retry_count FROM weather_miner_responses WHERE id = :resp_id"
+                                retry_result = await self.db_manager.fetch_one(retry_count_query, {"resp_id": resp_id})
+                                current_retry_count = retry_result['retry_count'] if retry_result else 0
+                                
+                                # Define retry intervals in minutes: 5, 10, 15
+                                retry_intervals = [5, 10, 15]
+                                
+                                if current_retry_count < len(retry_intervals):
+                                    # Schedule next retry
+                                    next_interval = retry_intervals[current_retry_count]
+                                    next_retry_time = datetime.now(timezone.utc) + timedelta(minutes=next_interval)
+                                    
+                                    logger.info(f"[Run {run_id}] Miner for response ID {resp_id} is still working (status: {miner_status}). "
+                                              f"Scheduling retry {current_retry_count + 1}/3 in {next_interval} minutes at {next_retry_time.strftime('%H:%M:%S')} UTC.")
+                                    
+                                    # Update to retry_scheduled status with next retry time and incremented retry count
+                                    update_query = """
+                                        UPDATE weather_miner_responses
+                                        SET status = 'retry_scheduled',
+                                            retry_count = :retry_count,
+                                            next_retry_time = :next_retry_time,
+                                            last_polled_time = :now
+                                        WHERE id = :resp_id
+                                    """
+                                    update_tasks.append(self.db_manager.execute(update_query, {
+                                        "resp_id": resp_id,
+                                        "retry_count": current_retry_count + 1,
+                                        "next_retry_time": next_retry_time,
+                                        "now": datetime.now(timezone.utc)
+                                    }))
+                                    new_db_status = None  # Don't process in the main update logic
+                                else:
+                                    # Exhausted all retries, mark as failed
+                                    logger.warning(f"[Run {run_id}] Miner for response ID {resp_id} exhausted all 3 retries (status: {miner_status}). "
+                                                 f"Marking as input timeout after final retry at 15 minutes.")
+                                    new_db_status = 'input_hash_timeout'
                             elif miner_status in [WeatherTaskStatus.VALIDATOR_POLL_FAILED.value, WeatherTaskStatus.VALIDATOR_POLL_ERROR.value]:
                                  new_db_status = 'input_poll_error'
                             else:
@@ -2180,12 +2353,12 @@ sources:
                  logger.error(f"[Job {job_id}] Invalid or missing payload data.")
                  return {"status": "error", "message": "Invalid payload structure"}
 
-            existing_job = await self.get_job_by_gfs_init_time(gfs_init_time)
+            existing_job = await self.get_job_by_gfs_init_time(gfs_init_time, validator_hotkey)
 
             if existing_job:
                 existing_job_id = existing_job['id']
                 existing_status = existing_job['status']
-                logger.info(f"[Job {existing_job_id}] Found existing {existing_status} job for GFS init time {gfs_init_time}. Expected deterministic ID: {job_id}")
+                logger.info(f"[Job {existing_job_id}] Found existing {existing_status} job for GFS init time {gfs_init_time} and validator {validator_hotkey[:8]}. Expected deterministic ID: {job_id}")
                 
                 # Verify the existing job ID matches our deterministic generation
                 if existing_job_id == job_id:
@@ -2195,7 +2368,50 @@ sources:
                 
                 return {"status": "accepted", "job_id": existing_job_id, "message": f"Accepted. Reusing existing {existing_status} job."}
 
-            logger.info(f"[Job {job_id}] No suitable existing job found. Creating new job for GFS init time {gfs_init_time}.")
+            # Check if there's completed inference for this GFS timestep from any other validator
+            # If so, create a new job record but reuse the existing inference files
+            completed_inference_query = """
+                SELECT id, target_netcdf_path, verification_hash
+                FROM weather_miner_jobs 
+                WHERE gfs_init_time_utc = :gfs_time 
+                AND status = 'completed'
+                AND target_netcdf_path IS NOT NULL
+                AND verification_hash IS NOT NULL
+                ORDER BY processing_end_time DESC 
+                LIMIT 1
+            """
+            completed_inference = await self.db_manager.fetch_one(completed_inference_query, {
+                "gfs_time": gfs_init_time
+            })
+            
+            if completed_inference:
+                logger.info(f"[Job {job_id}] Found completed inference for GFS time {gfs_init_time} from job {completed_inference['id']}. Creating new job record but reusing files.")
+                
+                # Create new job record with reused files
+                insert_query = """
+                    INSERT INTO weather_miner_jobs (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_input_metadata, status, processing_start_time, processing_end_time, target_netcdf_path, verification_hash)
+                    VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_meta, :status, :proc_start, :proc_end, :target_path, :hash)
+                """
+                if gfs_init_time.tzinfo is None:
+                    gfs_init_time = gfs_init_time.replace(tzinfo=timezone.utc)
+
+                await self.db_manager.execute(insert_query, {
+                    "id": job_id,
+                    "req_time": datetime.now(timezone.utc),
+                    "val_hk": validator_hotkey,
+                    "gfs_init": gfs_init_time,
+                    "gfs_meta": dumps(payload_data, default=str),
+                    "status": "completed",
+                    "proc_start": datetime.now(timezone.utc),
+                    "proc_end": datetime.now(timezone.utc),
+                    "target_path": completed_inference['target_netcdf_path'],
+                    "hash": completed_inference['verification_hash']
+                })
+                
+                logger.info(f"[Job {job_id}] Created new job record reusing inference files from job {completed_inference['id']}.")
+                return {"status": "accepted", "job_id": job_id, "message": f"Accepted. Created new job reusing existing inference for timestep {gfs_init_time}."}
+
+            logger.info(f"[Job {job_id}] No existing inference found for GFS time {gfs_init_time}. Creating new job for computation.")
 
             logger.info(f"[Job {job_id}] Starting preprocessing...")
             preprocessing_start_time = time.time()
@@ -2400,20 +2616,39 @@ sources:
 
             logger.info(f"[Miner] Received initiate_fetch request for T0={t0_run_time}")
 
-            # Find any existing job for this exact time, regardless of status
-            existing_job_query = """
-                SELECT id, status, input_data_hash
-                FROM weather_miner_jobs 
-                WHERE gfs_init_time_utc = :gfs_init
-                AND gfs_t_minus_6_time_utc = :gfs_t_minus_6
-                ORDER BY validator_request_time DESC
-                LIMIT 1
-            """
+            # Extract validator hotkey from request data
+            validator_hotkey = request_data.validator_hotkey
             
-            existing_job = await self.db_manager.fetch_one(existing_job_query, {
-                "gfs_init": t0_run_time,
-                "gfs_t_minus_6": t_minus_6_run_time
-            })
+            # Find existing job for this exact time and validator
+            if validator_hotkey:
+                existing_job_query = """
+                    SELECT id, status, input_data_hash
+                    FROM weather_miner_jobs 
+                    WHERE gfs_init_time_utc = :gfs_init
+                    AND gfs_t_minus_6_time_utc = :gfs_t_minus_6
+                    AND validator_hotkey = :validator_hotkey
+                    ORDER BY validator_request_time DESC
+                    LIMIT 1
+                """
+                existing_job = await self.db_manager.fetch_one(existing_job_query, {
+                    "gfs_init": t0_run_time,
+                    "gfs_t_minus_6": t_minus_6_run_time,
+                    "validator_hotkey": validator_hotkey
+                })
+            else:
+                # Fallback to original behavior if validator hotkey is not available
+                existing_job_query = """
+                    SELECT id, status, input_data_hash
+                    FROM weather_miner_jobs 
+                    WHERE gfs_init_time_utc = :gfs_init
+                    AND gfs_t_minus_6_time_utc = :gfs_t_minus_6
+                    ORDER BY validator_request_time DESC
+                    LIMIT 1
+                """
+                existing_job = await self.db_manager.fetch_one(existing_job_query, {
+                    "gfs_init": t0_run_time,
+                    "gfs_t_minus_6": t_minus_6_run_time
+                })
 
             if existing_job:
                 job_id = existing_job['id']
@@ -2453,12 +2688,29 @@ sources:
                         response["input_data_hash"] = existing_job['input_data_hash']
                     return self._validate_and_format_response(response, ["status", "job_id"])
 
-            # If no job exists, create a new one using deterministic job ID
+            # Check if input data has already been fetched and hashed for this timestep
+            # This allows reuse of GFS data and hash across different validator requests
+            existing_input_query = """
+                SELECT id, input_data_hash, input_batch_pickle_path, status
+                FROM weather_miner_jobs 
+                WHERE gfs_init_time_utc = :gfs_init
+                AND gfs_t_minus_6_time_utc = :gfs_t_minus_6
+                AND input_data_hash IS NOT NULL
+                AND input_batch_pickle_path IS NOT NULL
+                AND status IN ('input_hashed_awaiting_validation', 'in_progress', 'completed')
+                ORDER BY validator_request_time DESC
+                LIMIT 1
+            """
+            existing_input_job = await self.db_manager.fetch_one(existing_input_query, {
+                "gfs_init": t0_run_time,
+                "gfs_t_minus_6": t_minus_6_run_time
+            })
+            
             # Extract miner hotkey for deterministic generation
             miner_hotkey = self.keypair.ss58_address if self.keypair else "unknown_miner"
-            # For fetch jobs, we don't have validator hotkey, so we'll use a consistent placeholder
-            # or extract it from the request context if available
-            validator_hotkey = getattr(request_data, 'validator_hotkey', 'unknown_validator')
+            # Use the validator hotkey extracted above, or fall back to placeholder
+            if not validator_hotkey:
+                validator_hotkey = 'unknown_validator'
             
             job_id = DeterministicJobID.generate_weather_job_id(
                 gfs_init_time=t0_run_time,  # SCHEDULED GFS time
@@ -2466,28 +2718,65 @@ sources:
                 validator_hotkey=validator_hotkey,
                 job_type="fetch"
             )
-            logger.info(f"[Miner Job {job_id}] No existing job found. Creating new deterministic job for T0={t0_run_time}.")
+            
+            if existing_input_job:
+                # Validate that the batch file still exists before reusing
+                batch_file_path = Path(existing_input_job['input_batch_pickle_path'])
+                if not batch_file_path.exists():
+                    logger.warning(f"[Miner Job {job_id}] Batch file {batch_file_path} from job {existing_input_job['id']} no longer exists. Cannot reuse input data.")
+                else:
+                    # Reuse existing input data and hash
+                    logger.info(f"[Miner Job {job_id}] Found existing input data from job {existing_input_job['id']}. Reusing GFS data and hash.")
+                    
+                    insert_query = """
+                        INSERT INTO weather_miner_jobs
+                        (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_t_minus_6_time_utc, 
+                         input_data_hash, input_batch_pickle_path, status)
+                        VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_t_minus_6, :hash, :pickle_path, :status)
+                    """
+                    await self.db_manager.execute(insert_query, {
+                        "id": job_id,
+                        "req_time": datetime.now(timezone.utc),
+                        "val_hk": validator_hotkey,
+                        "gfs_init": t0_run_time,
+                        "gfs_t_minus_6": t_minus_6_run_time,
+                        "hash": existing_input_job['input_data_hash'],
+                        "pickle_path": existing_input_job['input_batch_pickle_path'],
+                        "status": "input_hashed_awaiting_validation"
+                    })
+                    
+                    logger.info(f"[Miner Job {job_id}] Created new job record reusing input data and hash from job {existing_input_job['id']}.")
+                    return self._validate_and_format_response({
+                        "status": WeatherTaskStatus.FETCH_ACCEPTED.value, 
+                        "job_id": job_id, 
+                        "message": f"Accepted. Reusing existing input data and hash from job {existing_input_job['id']}.",
+                        "input_data_hash": existing_input_job['input_data_hash']
+                    }, ["status", "job_id"])
+            else:
+                # No existing input data found, need to fetch and hash
+                logger.info(f"[Miner Job {job_id}] No existing input data found. Creating new job for GFS fetch and hash computation.")
 
-            insert_query = """
-                INSERT INTO weather_miner_jobs
-                (id, validator_request_time, gfs_init_time_utc, gfs_t_minus_6_time_utc, status)
-                VALUES (:id, :req_time, :gfs_init, :gfs_t_minus_6, :status)
-            """
-            await self.db_manager.execute(insert_query, {
-                "id": job_id,
-                "req_time": datetime.now(timezone.utc),
-                "gfs_init": t0_run_time,
-                "gfs_t_minus_6": t_minus_6_run_time,
-                "status": "fetch_queued"
-            })
-            logger.info(f"[Miner Job {job_id}] DB record created. Launching background fetch/hash task.")
+                insert_query = """
+                    INSERT INTO weather_miner_jobs
+                    (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_t_minus_6_time_utc, status)
+                    VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_t_minus_6, :status)
+                """
+                await self.db_manager.execute(insert_query, {
+                    "id": job_id,
+                    "req_time": datetime.now(timezone.utc),
+                    "val_hk": validator_hotkey,
+                    "gfs_init": t0_run_time,
+                    "gfs_t_minus_6": t_minus_6_run_time,
+                    "status": "fetch_queued"
+                })
+                logger.info(f"[Miner Job {job_id}] DB record created. Launching background fetch/hash task.")
 
-            asyncio.create_task(fetch_and_hash_gfs_task(
-                task_instance=self,
-                job_id=job_id,
-                t0_run_time=t0_run_time,
-                t_minus_6_run_time=t_minus_6_run_time
-            ))
+                asyncio.create_task(fetch_and_hash_gfs_task(
+                    task_instance=self,
+                    job_id=job_id,
+                    t0_run_time=t0_run_time,
+                    t_minus_6_run_time=t_minus_6_run_time
+                ))
 
             return self._validate_and_format_response({
                 "status": WeatherTaskStatus.FETCH_ACCEPTED.value, 
@@ -2604,41 +2893,87 @@ sources:
                         "message": f"Inference already in progress."
                     }, ["status", "message"])
             
-            # Check for any other jobs with the same GFS timestep that are already running or completed
+            # Check if THIS specific job is already in progress or completed
             if gfs_init_time:
-                # Enhanced duplicate check - look for jobs in more statuses and within a reasonable time window
-                duplicate_check_query = """
+                # Check the current job status to avoid duplicate processing
+                current_job_check_query = """
                     SELECT id, status, validator_request_time, processing_start_time FROM weather_miner_jobs 
+                    WHERE id = :current_job_id 
+                    AND status IN ('in_progress', 'completed', 'processing', 'running_inference', 'processing_input', 'processing_output')
+                    LIMIT 1
+                """
+                current_job = await self.db_manager.fetch_one(current_job_check_query, {
+                    "current_job_id": job_id
+                })
+                
+                if current_job:
+                    logger.info(f"[{job_id}] This job is already in status '{current_job['status']}'. Acknowledging existing inference.")
+                    return self._validate_and_format_response({
+                        "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
+                        "message": f"Inference already in status: {current_job['status']}"
+                    }, ["status", "message"])
+                
+                # Check if inference has already been completed for this GFS timestep by any validator
+                # If so, reuse the existing files instead of running inference again
+                completed_jobs_query = """
+                    SELECT id, status, target_netcdf_path, verification_hash
+                    FROM weather_miner_jobs 
                     WHERE gfs_init_time_utc = :gfs_time 
                     AND id != :current_job_id 
-                    AND status IN ('in_progress', 'completed', 'processing', 'running_inference', 'processing_input', 'processing_output')
-                    AND validator_request_time >= NOW() - INTERVAL '6 hours'  -- Only check recent jobs
-                    ORDER BY validator_request_time DESC LIMIT 5
+                    AND status = 'completed'
+                    AND target_netcdf_path IS NOT NULL
+                    AND verification_hash IS NOT NULL
+                    ORDER BY processing_end_time DESC 
+                    LIMIT 1
                 """
-                duplicate_jobs = await self.db_manager.fetch_all(duplicate_check_query, {
+                completed_job = await self.db_manager.fetch_one(completed_jobs_query, {
                     "gfs_time": gfs_init_time,
                     "current_job_id": job_id
                 })
                 
-                if duplicate_jobs:
-                    logger.warning(f"[{job_id}] Found {len(duplicate_jobs)} recent job(s) for same timestep {gfs_init_time}:")
-                    for dup_job in duplicate_jobs:
-                        hours_ago = (datetime.now(timezone.utc) - dup_job['validator_request_time']).total_seconds() / 3600
-                        logger.warning(f"[{job_id}]   - Job {dup_job['id']}: status='{dup_job['status']}', requested {hours_ago:.1f}h ago")
+                if completed_job:
+                    logger.info(f"[{job_id}] Found completed inference for GFS time {gfs_init_time} from job {completed_job['id']}. Reusing files instead of running new inference.")
                     
-                    # Only block if there's a recent active job (not failed/error)
-                    active_duplicates = [j for j in duplicate_jobs if j['status'] in ('in_progress', 'completed', 'processing', 'running_inference', 'processing_input', 'processing_output')]
-                    if active_duplicates:
-                        recent_job = active_duplicates[0]
-                        logger.warning(f"[{job_id}] Blocking duplicate inference - active job {recent_job['id']} with status '{recent_job['status']}' for same timestep.")
-                        return self._validate_and_format_response({
-                            "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
-                            "message": f"Inference for timestep {gfs_init_time} already handled by job {recent_job['id']} (status: {recent_job['status']})."
-                        }, ["status", "message"])
-                    else:
-                        logger.info(f"[{job_id}] Found duplicate jobs for timestep but all are failed/error - allowing new inference to proceed.")
+                    # Update current job to reuse the existing files
+                    await self.db_manager.execute("""
+                        UPDATE weather_miner_jobs 
+                        SET target_netcdf_path = :target_path,
+                            verification_hash = :hash,
+                            status = 'completed',
+                            processing_end_time = NOW()
+                        WHERE id = :job_id
+                    """, {
+                        "job_id": job_id,
+                        "target_path": completed_job['target_netcdf_path'],
+                        "hash": completed_job['verification_hash']
+                    })
+                    
+                    return self._validate_and_format_response({
+                        "status": WeatherTaskStatus.INFERENCE_STARTED.value, 
+                        "message": f"Reusing completed inference from existing job for timestep {gfs_init_time}"
+                    }, ["status", "message"])
+                
+                # Log other jobs for informational purposes
+                other_jobs_query = """
+                    SELECT id, status, validator_request_time FROM weather_miner_jobs 
+                    WHERE gfs_init_time_utc = :gfs_time 
+                    AND id != :current_job_id 
+                    AND validator_request_time >= NOW() - INTERVAL '6 hours'
+                    ORDER BY validator_request_time DESC LIMIT 5
+                """
+                other_jobs = await self.db_manager.fetch_all(other_jobs_query, {
+                    "gfs_time": gfs_init_time,
+                    "current_job_id": job_id
+                })
+                
+                if other_jobs:
+                    logger.info(f"[{job_id}] Found {len(other_jobs)} other job(s) for same timestep {gfs_init_time}:")
+                    for job in other_jobs:
+                        hours_ago = (datetime.now(timezone.utc) - job['validator_request_time']).total_seconds() / 3600
+                        logger.info(f"[{job_id}]   - Job {job['id']}: status='{job['status']}', requested {hours_ago:.1f}h ago")
+                    logger.info(f"[{job_id}] No completed inference found to reuse. Proceeding with new inference.")
                 else:
-                    logger.info(f"[{job_id}] No recent duplicate jobs found for timestep {gfs_init_time} - proceeding with inference.")
+                    logger.info(f"[{job_id}] No other jobs found for timestep {gfs_init_time}. Proceeding with new inference.")
 
             # Check RunPod-specific duplicate prevention
             if job_details['runpod_job_id'] and current_status == 'in_progress':
@@ -3758,9 +4093,43 @@ sources:
                     elif miner_status == WeatherTaskStatus.FETCH_ERROR.value:
                         new_db_status = 'input_fetch_error'
                     elif miner_status in [WeatherTaskStatus.FETCHING_GFS.value, WeatherTaskStatus.HASHING_INPUT.value, WeatherTaskStatus.FETCH_QUEUED.value]:
-                        logger.info(f"[Run {run_id}] Miner for response ID {resp_id} is still working (status: {miner_status}). Allowing more time to complete.")
-                        # Don't update status - let miner continue working
-                        new_db_status = None
+                        # Get current retry count for this response
+                        retry_count_query = "SELECT retry_count FROM weather_miner_responses WHERE id = :resp_id"
+                        retry_result = await self.db_manager.fetch_one(retry_count_query, {"resp_id": resp_id})
+                        current_retry_count = retry_result['retry_count'] if retry_result else 0
+                        
+                        # Define retry intervals in minutes: 5, 10, 15
+                        retry_intervals = [5, 10, 15]
+                        
+                        if current_retry_count < len(retry_intervals):
+                            # Schedule next retry
+                            next_interval = retry_intervals[current_retry_count]
+                            next_retry_time = datetime.now(timezone.utc) + timedelta(minutes=next_interval)
+                            
+                            logger.info(f"[Run {run_id}] Miner for response ID {resp_id} is still working (status: {miner_status}). "
+                                      f"Scheduling retry {current_retry_count + 1}/3 in {next_interval} minutes at {next_retry_time.strftime('%H:%M:%S')} UTC.")
+                            
+                            # Update to retry_scheduled status with next retry time and incremented retry count
+                            update_query = """
+                                UPDATE weather_miner_responses
+                                SET status = 'retry_scheduled',
+                                    retry_count = :retry_count,
+                                    next_retry_time = :next_retry_time,
+                                    last_polled_time = :now
+                                WHERE id = :resp_id
+                            """
+                            update_tasks.append(self.db_manager.execute(update_query, {
+                                "resp_id": resp_id,
+                                "retry_count": current_retry_count + 1,
+                                "next_retry_time": next_retry_time,
+                                "now": datetime.now(timezone.utc)
+                            }))
+                            new_db_status = None  # Don't process in the main update logic
+                        else:
+                            # Exhausted all retries, mark as failed
+                            logger.warning(f"[Run {run_id}] Miner for response ID {resp_id} exhausted all 3 retries (status: {miner_status}). "
+                                         f"Marking as input timeout after final retry at 15 minutes.")
+                            new_db_status = 'input_hash_timeout'
                     elif miner_status in ["validator_poll_failed", "validator_poll_error"]:
                          new_db_status = 'input_poll_error'
                     else:

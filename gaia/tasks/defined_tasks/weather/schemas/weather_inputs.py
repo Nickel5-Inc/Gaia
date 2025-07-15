@@ -140,6 +140,7 @@ class WeatherInitiateFetchData(BaseModel):
     """ Data payload for the /weather-initiate-fetch request """
     forecast_start_time: datetime = Field(..., description="ISO 8601 timestamp for the T=0h GFS analysis run.")
     previous_step_time: datetime = Field(..., description="ISO 8601 timestamp for the T=-6h GFS analysis run.")
+    validator_hotkey: Optional[str] = Field(None, description="Validator hotkey for deterministic job ID generation.")
 
 class WeatherInitiateFetchRequest(BaseModel):
     """ Request model for /weather-initiate-fetch """

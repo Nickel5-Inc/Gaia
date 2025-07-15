@@ -169,6 +169,25 @@ async def fetch_era5_data(
     pressure_level_request['pressure_level'] = AURORA_PRESSURE_LEVELS
 
     def _sync_fetch_and_process():
+        # THREADING FIX: Re-initialize netcdf4 backend in thread context
+        try:
+            import netCDF4
+            import xarray as xr
+            
+            # Force re-registration of netcdf4 backend in this thread
+            if hasattr(xr.backends, 'NetCDF4BackendEntrypoint'):
+                try:
+                    # Manually register the netcdf4 backend in this thread context
+                    backend = xr.backends.NetCDF4BackendEntrypoint()
+                    xr.backends.backends.BACKENDS['netcdf4'] = backend
+                    logger.debug("Successfully re-registered netcdf4 backend in thread context")
+                except Exception as backend_reg_err:
+                    logger.warning(f"Could not manually register netcdf4 backend: {backend_reg_err}")
+            
+            logger.debug(f"Thread context - Available engines: {list(xr.backends.list_engines())}")
+        except ImportError as netcdf_err:
+            logger.warning(f"netCDF4 not available in thread context: {netcdf_err}")
+        
         temp_sl_file = None
         temp_pl_file = None
         try:

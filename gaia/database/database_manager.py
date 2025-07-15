@@ -527,7 +527,6 @@ class BaseDatabaseManager(ABC):
                 },
                 # Additional engine options for stability
                 pool_reset_on_return='commit',  # Reset connections on return
-                pool_ping_on_return=True,  # Ping on connection return
             )
             async with self._engine.connect() as conn:
                 await asyncio.wait_for(conn.execute(text("SELECT 1")), timeout=self.CONNECTION_TEST_TIMEOUT)
@@ -691,6 +690,7 @@ class BaseDatabaseManager(ABC):
         transaction_started_here = False
         acquired_at_iso_str = datetime.now(timezone.utc).isoformat()
         e_outer = None
+        session_id_for_log = "unknown"  # Initialize to prevent UnboundLocalError
 
         try:
             if provided_session:

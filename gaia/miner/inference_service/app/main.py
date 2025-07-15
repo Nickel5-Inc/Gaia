@@ -72,7 +72,7 @@ MODEL_HANDLER = None # Will be set to model handler if inference is enabled
 INFERENCE_CONFIG = None
 
 # Semaphore to limit concurrent R2 uploads (prevents connection pool exhaustion)
-R2_UPLOAD_SEMAPHORE = asyncio.Semaphore(20)  # Allow max 20 concurrent uploads
+R2_UPLOAD_SEMAPHORE = asyncio.Semaphore(10)  # Reduced from 20 to 10 to prevent connection pool exhaustion
 
 # --- Logging Configuration (Initial basic setup) ---
 _log_level_str = os.getenv("LOG_LEVEL", "DEBUG").upper()
@@ -322,7 +322,7 @@ async def _upload_to_r2(object_key: str, file_path: Path) -> bool:
         return False
 
 async def _upload_bytes_to_r2(object_key: str, data: bytes) -> bool:
-    """Uploads a bytes object to the configured R2 bucket."""
+    """Uploads a bytes object to the configured R2 bucket with robust retry logic."""
     global S3_CLIENT, R2_CONFIG
     if not S3_CLIENT or not R2_CONFIG.get('bucket_name'):
         _logger.error("S3_CLIENT not initialized or R2 bucket_name not configured. Cannot upload bytes to R2.")
@@ -332,25 +332,108 @@ async def _upload_bytes_to_r2(object_key: str, data: bytes) -> bool:
         return False
 
     bucket_name = R2_CONFIG['bucket_name']
-    _logger.info(f"Attempting to upload {len(data)} bytes to s3://{bucket_name}/{object_key}")
+    data_size_mb = len(data) / (1024 * 1024)
+    _logger.info(f"Attempting to upload {data_size_mb:.2f} MB to s3://{bucket_name}/{object_key}")
     
     # Use semaphore to limit concurrent uploads
     async with R2_UPLOAD_SEMAPHORE:
+        return await _robust_upload_bytes_to_r2(S3_CLIENT, bucket_name, object_key, data)
+
+async def _robust_upload_bytes_to_r2(
+    s3_client, 
+    bucket_name: str, 
+    object_key: str, 
+    data_bytes: bytes, 
+    max_retries: int = 5
+) -> bool:
+    """
+    Robust upload to R2 with exponential backoff retry logic.
+    Handles multipart upload failures gracefully.
+    """
+    base_delay = 2.0  # seconds
+    
+    for attempt in range(max_retries):
         try:
-            with io.BytesIO(data) as f:
+            # Use TransferConfig for better multipart handling
+            from boto3.s3.transfer import TransferConfig
+            
+            transfer_config = TransferConfig(
+                multipart_threshold=1024*1024*64,  # 64MB
+                multipart_chunksize=1024*1024*8,   # 8MB chunks
+                max_concurrency=5,  # Limit concurrency to prevent connection pool exhaustion
+                use_threads=True,
+                max_bandwidth=None
+            )
+            
+            # Upload with transfer config
+            with io.BytesIO(data_bytes) as f:
                 await asyncio.to_thread(
-                    S3_CLIENT.upload_fileobj,
+                    s3_client.upload_fileobj,
                     f,
                     bucket_name,
-                    object_key
+                    object_key,
+                    Config=transfer_config
                 )
-            _logger.info(f"Successfully uploaded bytes to s3://{bucket_name}/{object_key}")
-            return True
-        except ClientError as e_ce:
-            _logger.error(f"ClientError during R2 bytes upload to s3://{bucket_name}/{object_key}: {e_ce.response.get('Error', {}).get('Message', str(e_ce))}", exc_info=True)
+            
+            # Verify upload by checking object existence
+            try:
+                await asyncio.to_thread(
+                    s3_client.head_object,
+                    Bucket=bucket_name,
+                    Key=object_key
+                )
+                _logger.info(f"Successfully uploaded bytes to s3://{bucket_name}/{object_key}")
+                return True
+            except Exception as verify_error:
+                _logger.warning(f"Upload verification failed for {object_key}: {verify_error}")
+                # Continue to retry logic
+                
         except Exception as e:
-            _logger.error(f"Unexpected error during R2 bytes upload to s3://{bucket_name}/{object_key}: {e}", exc_info=True)
-        return False
+            error_msg = f"Attempt {attempt + 1}/{max_retries} failed for {object_key}: {type(e).__name__}: {str(e)}"
+            
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # Exponential backoff
+                _logger.warning(f"{error_msg}. Retrying in {delay:.1f}s...")
+                await asyncio.sleep(delay)
+                
+                # Try to clean up any partial multipart uploads
+                try:
+                    await _cleanup_failed_multipart_uploads(s3_client, bucket_name, object_key)
+                except Exception as cleanup_error:
+                    _logger.debug(f"Cleanup error for {object_key} (non-critical): {cleanup_error}")
+                
+                continue
+            else:
+                _logger.error(f"All {max_retries} upload attempts failed for {object_key}. Final error: {e}")
+                return False
+    
+    return False
+
+async def _cleanup_failed_multipart_uploads(s3_client, bucket_name: str, object_key: str):
+    """Clean up any failed multipart uploads for the given object key."""
+    try:
+        # List multipart uploads
+        response = await asyncio.to_thread(
+            s3_client.list_multipart_uploads,
+            Bucket=bucket_name,
+            Prefix=object_key
+        )
+        
+        if 'Uploads' in response:
+            for upload in response['Uploads']:
+                upload_id = upload['UploadId']
+                _logger.info(f"Aborting failed multipart upload: {upload_id} for {object_key}")
+                
+                await asyncio.to_thread(
+                    s3_client.abort_multipart_upload,
+                    Bucket=bucket_name,
+                    Key=object_key,
+                    UploadId=upload_id
+                )
+                
+    except Exception as e:
+        _logger.debug(f"Error during multipart cleanup for {object_key}: {e}")
+        # This is non-critical, so we don't re-raise
 
 # --- Pydantic Models for API (can be kept for structure, though not directly used by RunPod handler) ---
 class InferencePayload(BaseModel):
@@ -442,8 +525,20 @@ async def _process_and_upload_steps(
             # Continue processing other steps even if one fails
         
         finally:
-            if 'temp_xr_step' in locals(): del temp_xr_step
-            if 'nc_bytes' in locals(): del nc_bytes
+            # Aggressive memory cleanup to prevent memory pressure
+            if 'temp_xr_step' in locals(): 
+                del temp_xr_step
+            if 'nc_bytes' in locals(): 
+                del nc_bytes
+            if 'step_batch' in locals() and hasattr(step_batch, 'surf_vars'):
+                # Clear tensor references to help with memory
+                for var_name in list(step_batch.surf_vars.keys()):
+                    if hasattr(step_batch.surf_vars[var_name], 'cpu'):
+                        step_batch.surf_vars[var_name] = step_batch.surf_vars[var_name].cpu()
+            # Force garbage collection every 10 steps to prevent memory buildup
+            if i % 10 == 0:
+                import gc
+                gc.collect()
 
     if processing_errors:
         _logger.warning(f"[{job_run_uuid}] Encountered {len(processing_errors)} errors during processing steps. Will attempt to upload successfully processed steps.")
@@ -452,22 +547,40 @@ async def _process_and_upload_steps(
         _logger.error(f"[{job_run_uuid}] No upload tasks were created for {len(predictions)} predictions. Processing errors: {'; '.join(processing_errors)}")
         return 0, output_r2_prefix, "No steps were successfully processed for upload."
 
-    # --- Execute all uploads in parallel ---
+    # --- Execute all uploads in parallel with progress monitoring ---
     _logger.info(f"[{job_run_uuid}] Submitting {len(upload_tasks)} upload tasks to R2 for prefix '{output_r2_prefix}' (max {R2_UPLOAD_SEMAPHORE._value} concurrent).")
-    results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+    
+    # Add timeout to prevent hanging uploads
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*upload_tasks, return_exceptions=True),
+            timeout=3600  # 1 hour timeout for all uploads
+        )
+    except asyncio.TimeoutError:
+        _logger.error(f"[{job_run_uuid}] Upload operation timed out after 1 hour")
+        return 0, output_r2_prefix, "Upload operation timed out"
 
     # Process results
     successful_uploads = 0
     failed_uploads = 0
+    failed_objects = []
+    
     for i, res in enumerate(results):
         if res is True:
             successful_uploads += 1
-            # Log progress every 10 successful uploads to reduce log noise
-            if successful_uploads % 10 == 0 or successful_uploads == len(results):
-                _logger.info(f"[{job_run_uuid}] Upload progress: {successful_uploads}/{len(upload_tasks)} completed")
+            # Log progress every 5 successful uploads to reduce log noise
+            if successful_uploads % 5 == 0 or successful_uploads == len(results):
+                _logger.info(f"[{job_run_uuid}] Upload progress: {successful_uploads}/{len(upload_tasks)} completed ({(successful_uploads/len(upload_tasks)*100):.1f}%)")
         else:
             failed_uploads += 1
+            failed_objects.append(f"step_{i+1:03d}")
             _logger.error(f"[{job_run_uuid}] Upload task {i+1} failed. Result/Exception: {res}")
+    
+    # Log summary
+    if failed_uploads > 0:
+        _logger.error(f"[{job_run_uuid}] Upload summary: {successful_uploads} succeeded, {failed_uploads} failed. Failed objects: {failed_objects[:5]}{'...' if len(failed_objects) > 5 else ''}")
+    else:
+        _logger.info(f"[{job_run_uuid}] ✅ All {successful_uploads} uploads completed successfully")
             
     num_steps_uploaded = successful_uploads
 
@@ -907,16 +1020,29 @@ async def initialize_app_for_runpod():
                 try:
                     _logger.info(f"R2_INIT_INFO: Attempting to initialize S3 client for R2. Endpoint: {R2_CONFIG['endpoint_url']}, Bucket: {R2_CONFIG['bucket_name']}")
                     
-                    # Configure boto3 for high-concurrency uploads
+                    # Configure boto3 for high-concurrency uploads with robust multipart handling
                     r2_config = Config(
                         signature_version='s3v4',
-                        max_pool_connections=50,  # Increase from default 10 to handle concurrent uploads
+                        max_pool_connections=200,  # Increased from 50 to prevent connection pool exhaustion
                         retries={
-                            'max_attempts': 3,
-                            'mode': 'adaptive'
+                            'max_attempts': 5,
+                            'mode': 'adaptive',
+                            'timeout': 30
                         },
                         tcp_keepalive=True,
-                        region_name='auto'
+                        region_name='auto',
+                        multipart_threshold=1024*1024*64,  # 64MB threshold for multipart
+                        multipart_chunksize=1024*1024*8,   # 8MB chunk size
+                        connect_timeout=10,
+                        read_timeout=60,
+                        # Use S3 Transfer configuration for better multipart handling
+                        s3={
+                            'multipart_threshold': 1024*1024*64,
+                            'multipart_chunksize': 1024*1024*8,
+                            'max_concurrency': 10,
+                            'use_threads': True,
+                            'max_bandwidth': None
+                        }
                     )
                     
                     S3_CLIENT = boto3.client(

@@ -149,23 +149,59 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
             logger.warning(f"[InferenceTask Job {job_id}] Job already in status '{current_status}'. Skipping duplicate inference.")
             return
         
-        # Check for other jobs with same timestep that are already in progress or completed
+        # Check for duplicate processing of this specific job
         if gfs_init_time:
-            duplicate_check_query = """
+            # Check if THIS specific job is already in progress or completed
+            current_job_check_query = """
                 SELECT id, status FROM weather_miner_jobs 
+                WHERE id = :current_job_id 
+                AND status IN ('in_progress', 'completed')
+                LIMIT 1
+            """
+            current_job = await task_instance.db_manager.fetch_one(current_job_check_query, {
+                "current_job_id": job_id
+            })
+            
+            if current_job:
+                logger.warning(f"[InferenceTask Job {job_id}] This job is already in status '{current_job['status']}'. Aborting duplicate inference.")
+                return
+            
+            # Check if inference has already been completed for this GFS timestep by another job
+            # If so, reuse the existing files instead of running inference again
+            completed_inference_query = """
+                SELECT id, target_netcdf_path, verification_hash
+                FROM weather_miner_jobs 
                 WHERE gfs_init_time_utc = :gfs_time 
                 AND id != :current_job_id 
-                AND status IN ('in_progress', 'completed')
-                ORDER BY id DESC LIMIT 1
+                AND status = 'completed'
+                AND target_netcdf_path IS NOT NULL
+                AND verification_hash IS NOT NULL
+                ORDER BY processing_end_time DESC 
+                LIMIT 1
             """
-            duplicate_job = await task_instance.db_manager.fetch_one(duplicate_check_query, {
+            completed_inference = await task_instance.db_manager.fetch_one(completed_inference_query, {
                 "gfs_time": gfs_init_time,
                 "current_job_id": job_id
             })
             
-            if duplicate_job:
-                logger.warning(f"[InferenceTask Job {job_id}] Found existing job {duplicate_job['id']} for same timestep {gfs_init_time} with status '{duplicate_job['status']}'. Aborting duplicate inference.")
-                await update_job_status(task_instance, job_id, "skipped_duplicate", f"Duplicate of job {duplicate_job['id']}")
+            if completed_inference:
+                logger.info(f"[InferenceTask Job {job_id}] Found completed inference for GFS time {gfs_init_time} from job {completed_inference['id']}. Reusing files instead of running new inference.")
+                
+                # Update current job to reuse the existing files
+                await update_job_status(task_instance, job_id, "completed", error_message="")
+                await task_instance.db_manager.execute("""
+                    UPDATE weather_miner_jobs 
+                    SET target_netcdf_path = :target_path,
+                        verification_hash = :hash,
+                        processing_end_time = NOW()
+                    WHERE id = :job_id
+                """, {
+                    "job_id": job_id,
+                    "target_path": completed_inference['target_netcdf_path'],
+                    "hash": completed_inference['verification_hash']
+                })
+                
+                logger.info(f"[InferenceTask Job {job_id}] Successfully reused inference files from job {completed_inference['id']}.")
                 return
                 
     except Exception as e:
@@ -1786,6 +1822,54 @@ async def fetch_and_hash_gfs_task(
         await task_instance._emit_progress(update)
 
     try:
+        # Double-check if input data was already fetched by another concurrent job
+        # This prevents redundant work when multiple jobs are queued for the same timestep
+        concurrent_check_query = """
+            SELECT id, input_data_hash, input_batch_pickle_path
+            FROM weather_miner_jobs 
+            WHERE gfs_init_time_utc = :gfs_init
+            AND gfs_t_minus_6_time_utc = :gfs_t_minus_6
+            AND id != :current_job_id
+            AND input_data_hash IS NOT NULL
+            AND input_batch_pickle_path IS NOT NULL
+            AND status IN ('input_hashed_awaiting_validation', 'in_progress', 'completed')
+            ORDER BY validator_request_time ASC
+            LIMIT 1
+        """
+        concurrent_input_job = await task_instance.db_manager.fetch_one(concurrent_check_query, {
+            "gfs_init": t0_run_time,
+            "gfs_t_minus_6": t_minus_6_run_time,
+            "current_job_id": job_id
+        })
+        
+        if concurrent_input_job:
+            # Validate that the batch file still exists before reusing
+            batch_file_path = Path(concurrent_input_job['input_batch_pickle_path'])
+            if not batch_file_path.exists():
+                logger.warning(f"[FetchHashTask Job {job_id}] Batch file {batch_file_path} from concurrent job {concurrent_input_job['id']} no longer exists. Proceeding with normal fetch/hash.")
+            else:
+                logger.info(f"[FetchHashTask Job {job_id}] Found concurrent job {concurrent_input_job['id']} with input data. Reusing instead of re-fetching.")
+                
+                # Update current job to use the existing input data
+                update_query = """
+                    UPDATE weather_miner_jobs
+                    SET input_data_hash = :hash,
+                        input_batch_pickle_path = :pickle_path,
+                        status = :status,
+                        updated_at = :now
+                    WHERE id = :job_id
+                """
+                await task_instance.db_manager.execute(update_query, {
+                    "job_id": job_id,
+                    "hash": concurrent_input_job['input_data_hash'],
+                    "pickle_path": concurrent_input_job['input_batch_pickle_path'],
+                    "status": "input_hashed_awaiting_validation",
+                    "now": datetime.now(timezone.utc)
+                })
+                
+                logger.info(f"[FetchHashTask Job {job_id}] Successfully reused input data from concurrent job {concurrent_input_job['id']}.")
+                return
+
         await update_job_status(task_instance, job_id, "fetching_gfs")
 
         cache_dir_str = task_instance.config.get('gfs_analysis_cache_dir', './gfs_analysis_cache')
@@ -2636,8 +2720,8 @@ async def _download_forecast_from_r2_to_local(task_instance: 'WeatherTask', job_
                 local_file_path = temp_path / Path(nc_key).name
                 download_tasks.append(_download_single_file_from_r2(s3_client, bucket_name, nc_key, local_file_path))
             
-            # Execute downloads in parallel with some concurrency control
-            semaphore = asyncio.Semaphore(10)  # Limit concurrent downloads
+            # Execute downloads in parallel with conservative concurrency control
+            semaphore = asyncio.Semaphore(5)  # Reduced from 10 to 5 to prevent connection pool exhaustion
             
             completed_downloads = 0
             total_downloads = len(download_tasks)
@@ -3102,3 +3186,131 @@ async def _immediate_r2_input_cleanup(task_instance: 'WeatherTask', job_id: str)
 
     except Exception as e:
         logger.error(f"[{job_id}] Error during immediate R2 input cleanup: {e}", exc_info=True)
+
+async def _validate_forecast_completeness(
+    task_instance: 'WeatherTask', 
+    job_id: str, 
+    r2_output_prefix: str,
+    expected_steps: int = 40
+) -> Tuple[bool, List[str], List[str]]:
+    """
+    Validates that all expected forecast files are present in R2.
+    Returns (is_complete, missing_files, present_files).
+    """
+    try:
+        s3_client = await task_instance._get_r2_s3_client()
+        if not s3_client:
+            logger.error(f"[{job_id}] Cannot validate forecast: S3 client not available")
+            return False, [], []
+
+        bucket_name = task_instance.r2_config.get("r2_bucket_name")
+        if not bucket_name:
+            logger.error(f"[{job_id}] Cannot validate forecast: bucket name not configured")
+            return False, [], []
+
+        logger.info(f"[{job_id}] Validating forecast completeness in R2 prefix: {r2_output_prefix}")
+
+        # List all files in the output prefix
+        response = await asyncio.to_thread(
+            s3_client.list_objects_v2,
+            Bucket=bucket_name,
+            Prefix=r2_output_prefix
+        )
+
+        present_files = []
+        if 'Contents' in response:
+            for obj in response['Contents']:
+                key = obj['Key']
+                if key.endswith('.nc'):
+                    present_files.append(key)
+
+        logger.info(f"[{job_id}] Found {len(present_files)} .nc files in R2")
+
+        # Check for expected files (assuming step_000_T+0h.nc to step_039_T+234h.nc pattern)
+        expected_files = []
+        missing_files = []
+        
+        for step in range(expected_steps):
+            # Pattern: step_000_T+0h.nc, step_001_T+6h.nc, etc.
+            hours = step * 6
+            expected_file = f"step_{step:03d}_T+{hours}h.nc"
+            expected_key = f"{r2_output_prefix}{expected_file}"
+            expected_files.append(expected_key)
+            
+            # Check if this file exists in present_files
+            if not any(expected_key in pf for pf in present_files):
+                missing_files.append(expected_file)
+
+        is_complete = len(missing_files) == 0
+        completion_rate = (len(present_files) / expected_steps) * 100
+
+        if is_complete:
+            logger.info(f"[{job_id}] ✅ Forecast is complete: {len(present_files)}/{expected_steps} files (100%)")
+        else:
+            logger.warning(f"[{job_id}] ⚠️  Forecast is incomplete: {len(present_files)}/{expected_steps} files ({completion_rate:.1f}%)")
+            logger.warning(f"[{job_id}] Missing files: {missing_files[:5]}{'...' if len(missing_files) > 5 else ''}")
+
+        return is_complete, missing_files, present_files
+
+    except Exception as e:
+        logger.error(f"[{job_id}] Error validating forecast completeness: {e}", exc_info=True)
+        return False, [], []
+
+async def _cleanup_failed_multipart_uploads_for_job(
+    task_instance: 'WeatherTask', 
+    job_id: str, 
+    r2_output_prefix: str
+):
+    """
+    Cleans up any failed multipart uploads for a specific job.
+    This should be called when a job fails to help clean up partial uploads.
+    """
+    try:
+        s3_client = await task_instance._get_r2_s3_client()
+        if not s3_client:
+            logger.warning(f"[{job_id}] Cannot cleanup multipart uploads: S3 client not available")
+            return
+
+        bucket_name = task_instance.r2_config.get("r2_bucket_name")
+        if not bucket_name:
+            logger.warning(f"[{job_id}] Cannot cleanup multipart uploads: bucket name not configured")
+            return
+
+        logger.info(f"[{job_id}] Cleaning up failed multipart uploads for prefix: {r2_output_prefix}")
+
+        # List all multipart uploads
+        response = await asyncio.to_thread(
+            s3_client.list_multipart_uploads,
+            Bucket=bucket_name,
+            Prefix=r2_output_prefix
+        )
+
+        if 'Uploads' not in response:
+            logger.info(f"[{job_id}] No multipart uploads found to cleanup")
+            return
+
+        cleanup_count = 0
+        for upload in response['Uploads']:
+            upload_id = upload['UploadId']
+            key = upload['Key']
+            
+            try:
+                await asyncio.to_thread(
+                    s3_client.abort_multipart_upload,
+                    Bucket=bucket_name,
+                    Key=key,
+                    UploadId=upload_id
+                )
+                cleanup_count += 1
+                logger.info(f"[{job_id}] Aborted multipart upload: {upload_id} for {key}")
+                
+            except Exception as abort_error:
+                logger.warning(f"[{job_id}] Failed to abort multipart upload {upload_id}: {abort_error}")
+
+        if cleanup_count > 0:
+            logger.info(f"[{job_id}] Successfully cleaned up {cleanup_count} failed multipart uploads")
+        else:
+            logger.info(f"[{job_id}] No multipart uploads required cleanup")
+
+    except Exception as e:
+        logger.error(f"[{job_id}] Error during multipart upload cleanup: {e}", exc_info=True)
