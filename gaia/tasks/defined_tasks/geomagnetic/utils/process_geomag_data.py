@@ -54,13 +54,11 @@ def parse_data(data):
     debug_raw_data(data)
 
     def parse_line(line):
-        logger.debug(f"Parsing DST line: '{line}'")
         try:
             # Extract year, month, and day
             year = int("20" + line[3:5])  # Prefix with "20" for full year
             month = int(line[5:7])
             day = int(line[8:10].strip())
-            logger.debug(f"Extracted date: {year}-{month:02d}-{day:02d}")
         except ValueError as e:
             logger.error(f"Skipping line due to invalid date format: {line} - Error: {e}")
             return
@@ -111,8 +109,6 @@ def parse_data(data):
             else:
                 values.append(value)
         
-        logger.debug(f"Found {len(values)} processed values: {values}")
-        
         # Process up to 24 hourly values
         # NOTE: Data format uses 1-24 hour indexing, not 0-23
         # values[0] = hour 1 (01:00), values[1] = hour 2 (02:00), ..., values[23] = hour 24 (00:00 next day)
@@ -143,7 +139,6 @@ def parse_data(data):
             
             # Skip placeholder values (9999, 999, etc.)
             if value_str in ['9999', '999', '99999', PLACEHOLDER_VALUE]:
-                logger.debug(f"Skipping placeholder value at position {i} (hour {hour}): '{value_str}'")
                 continue
                 
             # Skip empty values
@@ -163,11 +158,9 @@ def parse_data(data):
                 if timestamp < datetime.now(timezone.utc):
                     dates.append(timestamp)
                     hourly_values.append(value)
-                    logger.debug(f"Added data point: {timestamp} -> {value} (position {i})")
-                else:
-                    logger.debug(f"Skipping future timestamp: {timestamp}")
+                # Future timestamps and invalid values are silently skipped as expected behavior
             except ValueError:
-                logger.debug(f"Skipping invalid value at position {i}: '{value_str}'")
+                pass  # Invalid values are expected and silently skipped
 
     # Parse all lines that start with "DST"
     for line in data.splitlines():

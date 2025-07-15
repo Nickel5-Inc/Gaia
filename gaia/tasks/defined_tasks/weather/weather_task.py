@@ -543,9 +543,8 @@ class WeatherTask(Task):
         try:
             # Enhanced R2 client configuration for better reliability
             from botocore.config import Config
-            from botocore.client import Config as BotocoreConfig
             
-            # Configure connection pool and retry settings
+            # Configure connection pool and retry settings (without s3 parameter)
             config = Config(
                 signature_version='s3v4',
                 region_name='auto',  # R2 is region-less
@@ -555,15 +554,7 @@ class WeatherTask(Task):
                 },
                 max_pool_connections=200,  # Increased from default 10
                 connect_timeout=10,
-                read_timeout=60,
-                # Use S3 Transfer configuration for better multipart handling
-                s3={
-                    'multipart_threshold': 1024*1024*64,  # 64MB threshold for multipart
-                    'multipart_chunksize': 1024*1024*8,   # 8MB chunk size
-                    'max_concurrency': 10,
-                    'use_threads': True,
-                    'max_bandwidth': None
-                }
+                read_timeout=60
             )
             
             s3_client = boto3.client(

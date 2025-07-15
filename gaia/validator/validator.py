@@ -455,7 +455,7 @@ class GaiaValidator:
         ssl_context.verify_mode = ssl.CERT_NONE
         
         self.miner_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=3.0),  # REDUCED: 120s->30s read, 10s->5s connect
+            timeout=httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=10.0),  # INCREASED: More reasonable timeouts for network latency
             follow_redirects=True,
             verify=False,
             limits=httpx.Limits(
@@ -464,7 +464,7 @@ class GaiaValidator:
                 keepalive_expiry=60,  # REDUCED: 300->60 seconds for faster cleanup
             ),
             transport=httpx.AsyncHTTPTransport(
-                retries=1,  # REDUCED: 2->1 to fail faster
+                retries=2,  # INCREASED: Allow more retries for better reliability
                 verify=False,
             ),
         )
@@ -1003,7 +1003,7 @@ class GaiaValidator:
                 ssl_context.verify_mode = ssl.CERT_NONE
                 
                 self.miner_client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=3.0),  # REDUCED timeouts
+                    timeout=httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=10.0),  # INCREASED: More reasonable timeouts for network latency
                     follow_redirects=True,
                     verify=False,
                     limits=httpx.Limits(
@@ -1012,14 +1012,15 @@ class GaiaValidator:
                         keepalive_expiry=60,  # REDUCED: 300->60 seconds
                     ),
                     transport=httpx.AsyncHTTPTransport(
-                        retries=1,  # REDUCED: 2->1
+                        retries=2,  # INCREASED: Allow more retries for better reliability
                         verify=False,
                     ),
                 )
 
-            # Use chunked processing to reduce database contention and memory spikes
+            # HANDSHAKE PRIORITIZATION: Use separate low-concurrency for handshakes vs requests
             chunk_size = 30  # REDUCED: 50->30 for better resource management
-            chunk_concurrency = 6   # REDUCED: 15->6 to prevent thread/connection exhaustion
+            handshake_concurrency = 2   # VERY LOW: Only 2 concurrent handshakes to prevent event loop congestion
+            request_concurrency = 8     # HIGHER: Can process more requests once handshakes are established
             chunks = []
             
             # Split miners into chunks
@@ -1028,14 +1029,19 @@ class GaiaValidator:
                 chunk = dict(miners_list[i:i + chunk_size])
                 chunks.append(chunk)
             
-            logger.info(f"Processing {len(miners_to_query)} miners in {len(chunks)} chunks of {chunk_size} (concurrency: {chunk_concurrency} per chunk)")
+            logger.info(f"Processing {len(miners_to_query)} miners in {len(chunks)} chunks of {chunk_size}")
+            logger.info(f"Handshake concurrency: {handshake_concurrency} (LOW to prevent event loop congestion)")
+            logger.info(f"Request concurrency: {request_concurrency} (HIGHER once handshakes established)")
 
             # Configuration for immediate retries
-            max_retries_per_miner = 1  # REDUCED: 2->1 attempts to fail faster
-            base_timeout = 10.0  # REDUCED: 15->10 seconds for faster failure detection
+            max_retries_per_miner = 2  # INCREASED: Allow more retry attempts for better reliability
+            base_timeout = 20.0  # INCREASED: More reasonable timeout for network latency
+            
+            # Global handshake semaphore to prevent overwhelming the event loop
+            global_handshake_semaphore = asyncio.Semaphore(handshake_concurrency)
             
             async def query_single_miner_with_retries(miner_hotkey: str, node, semaphore: asyncio.Semaphore) -> Optional[Dict]:
-                """Query a single miner with immediate retries on failure."""
+                """Query a single miner with PRIORITIZED handshake concurrency to prevent event loop congestion."""
                 base_url = f"https://{node.ip}:{node.port}"
                 process = psutil.Process() if PSUTIL_AVAILABLE else None
                 
@@ -1046,52 +1052,58 @@ class GaiaValidator:
                         try:
                             logger.debug(f"Miner {miner_hotkey} attempt {attempt + 1}/{max_retries_per_miner}")
                             
-                            # Perform handshake
+                            # PRIORITIZED HANDSHAKE: Use separate global low-concurrency semaphore
                             handshake_start_time = time.time()
+                            symmetric_key_str = None
+                            symmetric_key_uuid = None
+                            
                             try:
-                                # Get public key
-                                public_key_encryption_key = await asyncio.wait_for(
-                                    handshake.get_public_encryption_key(
-                                        self.miner_client, 
-                                        base_url, 
-                                        timeout=int(attempt_timeout)
-                                    ),
-                                    timeout=attempt_timeout
-                                )
-                                
-                                # Generate symmetric key
-                                symmetric_key: bytes = os.urandom(32)
-                                symmetric_key_uuid: str = os.urandom(32).hex()
-                                
-                                # Send symmetric key
-                                success = await asyncio.wait_for(
-                                    handshake.send_symmetric_key_to_server(
-                                        self.miner_client,
-                                        base_url,
-                                        self.keypair,
-                                        public_key_encryption_key,
-                                        symmetric_key,
-                                        symmetric_key_uuid,
-                                        miner_hotkey,
-                                        timeout=int(attempt_timeout),
-                                    ),
-                                    timeout=attempt_timeout
-                                )
-                                
-                                if not success:
-                                    raise Exception("Handshake failed: server returned unsuccessful status")
+                                # HANDSHAKE PHASE: Limited to 2 concurrent to prevent event loop congestion
+                                async with global_handshake_semaphore:
+                                    logger.debug(f"🤝 Starting handshake for {miner_hotkey} (global handshake #{global_handshake_semaphore._value})")
                                     
-                                symmetric_key_str = base64.b64encode(symmetric_key).decode()
+                                    # Get public key
+                                    public_key_encryption_key = await asyncio.wait_for(
+                                        handshake.get_public_encryption_key(
+                                            self.miner_client, 
+                                            base_url, 
+                                            timeout=int(attempt_timeout)
+                                        ),
+                                        timeout=attempt_timeout
+                                    )
                                     
+                                    # Generate symmetric key
+                                    symmetric_key: bytes = os.urandom(32)
+                                    symmetric_key_uuid = os.urandom(32).hex()
+                                    
+                                    # Send symmetric key
+                                    success = await asyncio.wait_for(
+                                        handshake.send_symmetric_key_to_server(
+                                            self.miner_client,
+                                            base_url,
+                                            self.keypair,
+                                            public_key_encryption_key,
+                                            symmetric_key,
+                                            symmetric_key_uuid,
+                                            miner_hotkey,
+                                            timeout=int(attempt_timeout),
+                                        ),
+                                        timeout=attempt_timeout
+                                    )
+                                    
+                                    if not success:
+                                        raise Exception("Handshake failed: server returned unsuccessful status")
+                                        
+                                    symmetric_key_str = base64.b64encode(symmetric_key).decode()
+                                    
+                                    logger.debug(f"✅ Handshake with {miner_hotkey} completed in {time.time() - handshake_start_time:.2f}s")
+                                        
                             except Exception as hs_err:
                                 logger.debug(f"Handshake failed for miner {miner_hotkey} attempt {attempt + 1}: {type(hs_err).__name__}")
                                 if attempt < max_retries_per_miner - 1:
                                     await asyncio.sleep(0.5 * (attempt + 1))  # Brief delay before retry
                                     continue
                                 return {"hotkey": miner_hotkey, "status": "failed", "reason": "Handshake Error", "details": f"{type(hs_err).__name__}"}
-
-                            handshake_duration = time.time() - handshake_start_time
-                            logger.debug(f"Handshake with {miner_hotkey} completed in {handshake_duration:.2f}s (attempt {attempt + 1})")
 
                             if process:
                                 logger.debug(f"Memory after handshake ({miner_hotkey}): {process.memory_info().rss / (1024*1024):.2f} MB")
@@ -1100,7 +1112,7 @@ class GaiaValidator:
                             
                             # Make the actual request - REUSE THE SAME PAYLOAD REFERENCE
                             try:
-                                logger.debug(f"Making request to {miner_hotkey} (attempt {attempt + 1})")
+                                logger.debug(f"📡 Making request to {miner_hotkey} (attempt {attempt + 1})")
                                 request_start_time = time.time()
                                 
                                 resp = await asyncio.wait_for(
@@ -1215,8 +1227,8 @@ class GaiaValidator:
                 chunk_start_time = time.time()
                 logger.info(f"Processing chunk {chunk_idx + 1}/{len(chunks)} with {len(chunk_miners)} miners...")
                 
-                # Create semaphore for this chunk
-                chunk_semaphore = asyncio.Semaphore(chunk_concurrency)
+                # Create semaphore for this chunk (request processing, higher concurrency)
+                chunk_semaphore = asyncio.Semaphore(request_concurrency)
                 
                 # Create tasks for this chunk only
                 chunk_tasks = []

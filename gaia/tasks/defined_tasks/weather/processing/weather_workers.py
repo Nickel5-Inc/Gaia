@@ -3226,15 +3226,16 @@ async def _validate_forecast_completeness(
 
         logger.info(f"[{job_id}] Found {len(present_files)} .nc files in R2")
 
-        # Check for expected files (assuming step_000_T+0h.nc to step_039_T+234h.nc pattern)
+        # Check for expected files (assuming step_001_T+6h.nc to step_040_T+240h.nc pattern)
         expected_files = []
         missing_files = []
         
         for step in range(expected_steps):
-            # Pattern: step_000_T+0h.nc, step_001_T+6h.nc, etc.
-            hours = step * 6
-            expected_file = f"step_{step:03d}_T+{hours}h.nc"
-            expected_key = f"{r2_output_prefix}{expected_file}"
+            # Pattern: step_001_T+6h.nc, step_002_T+12h.nc, etc. (starts from 1, not 0)
+            step_number = step + 1  # Upload routine uses 1-based indexing
+            hours = step_number * 6
+            expected_file = f"step_{step_number:03d}_T+{hours:03d}h.nc"
+            expected_key = f"{r2_output_prefix}/{expected_file}"  # Fix: Add missing slash
             expected_files.append(expected_key)
             
             # Check if this file exists in present_files
