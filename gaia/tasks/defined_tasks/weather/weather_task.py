@@ -551,18 +551,15 @@ class WeatherTask(Task):
                 region_name='auto',  # R2 is region-less
                 retries={
                     'max_attempts': 5,
-                    'mode': 'adaptive',
-                    'timeout': 30
+                    'mode': 'adaptive'
                 },
-                max_pool_connections=200,  # Increased from default 100
-                multipart_threshold=1024*1024*64,  # 64MB threshold for multipart
-                multipart_chunksize=1024*1024*8,   # 8MB chunk size
+                max_pool_connections=200,  # Increased from default 10
                 connect_timeout=10,
                 read_timeout=60,
                 # Use S3 Transfer configuration for better multipart handling
                 s3={
-                    'multipart_threshold': 1024*1024*64,
-                    'multipart_chunksize': 1024*1024*8,
+                    'multipart_threshold': 1024*1024*64,  # 64MB threshold for multipart
+                    'multipart_chunksize': 1024*1024*8,   # 8MB chunk size
                     'max_concurrency': 10,
                     'use_threads': True,
                     'max_bandwidth': None
