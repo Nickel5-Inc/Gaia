@@ -35,10 +35,13 @@ class DeterministicJobID:
         This ensures all validator nodes generate identical job IDs regardless of
         when they process the same forecast request.
         
+        NOTE: We no longer include validator_hotkey in the job ID to allow job reuse
+        across multiple validators for the same GFS timestep and miner.
+        
         Args:
             gfs_init_time: GFS initialization time (SCHEDULED, not processing time)
             miner_hotkey: Miner's hotkey
-            validator_hotkey: Validator's hotkey  
+            validator_hotkey: Validator's hotkey (kept for backwards compatibility but not used)
             job_type: Type of job (forecast, fetch, etc.)
             
         Returns:
@@ -47,14 +50,15 @@ class DeterministicJobID:
         # Normalize timestamp to ensure consistency across all nodes
         gfs_init_time = DeterministicJobID.normalize_scheduled_time(gfs_init_time)
         
-        # Create seed components
+        # Create seed components - NOTE: We exclude validator_hotkey to allow
+        # job reuse across multiple validators for the same timestep/miner
         timestamp_str = gfs_init_time.strftime("%Y%m%d%H%M%S")
         seed_components = [
             "weather_job",
             job_type,
             timestamp_str,
             miner_hotkey,
-            validator_hotkey
+            # validator_hotkey - REMOVED to allow cross-validator job reuse
         ]
         
         # Generate deterministic UUID

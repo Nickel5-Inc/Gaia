@@ -1757,9 +1757,15 @@ sources:
                         logger.debug(f"[Run {run_id}] Polling miner {miner_hk[:8]} (Job: {miner_job_id}) for input status using query_miners.")
                         
                         node = validator.metagraph.nodes.get(miner_hk)
-                        if not node or not node.ip or not node.port:
-                             logger.warning(f"[Run {run_id}] Miner {miner_hk[:8]} not found in metagraph or missing IP/Port. Cannot poll.")
-                             return resp_id, {"status": "validator_poll_error", "message": "Miner not found in metagraph"}
+                        if not node:
+                             logger.warning(f"[Run {run_id}] Miner {miner_hk[:8]} not found in metagraph. Cannot poll.")
+                             return resp_id, {"status": "validator_poll_error", "message": f"Miner {miner_hk[:8]} not found in metagraph"}
+                        elif not node.ip:
+                             logger.warning(f"[Run {run_id}] Miner {miner_hk[:8]} missing IP address in metagraph. Cannot poll.")
+                             return resp_id, {"status": "validator_poll_error", "message": f"Miner {miner_hk[:8]} missing IP address in metagraph"}
+                        elif not node.port:
+                             logger.warning(f"[Run {run_id}] Miner {miner_hk[:8]} missing port in metagraph. Cannot poll.")
+                             return resp_id, {"status": "validator_poll_error", "message": f"Miner {miner_hk[:8]} missing port in metagraph"}
 
                         try:
                             status_payload_data = WeatherGetInputStatusData(job_id=miner_job_id)
@@ -1780,18 +1786,24 @@ sources:
                                     try:
                                         parsed_response = loads(status_response['text'])
                                     except (Exception, TypeError) as json_err:
-                                        logger.warning(f"[Run {run_id}] Failed to parse status response text for {miner_hk[:8]}: {json_err}")
-                                        parsed_response = {"status": "parse_error", "message": str(json_err)}
+                                        logger.warning(f"[Run {run_id}] Failed to parse JSON response from miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {json_err}. Raw response: {status_response.get('text', '')[:200]}")
+                                        parsed_response = {"status": "parse_error", "message": f"JSON parse error from miner {miner_hk[:8]}: {type(json_err).__name__}: {str(json_err)}"}
                                 
                                 logger.debug(f"[Run {run_id}] Received status from {miner_hk[:8]}: {parsed_response}")
                                 return resp_id, parsed_response
                             else:
-                                 logger.warning(f"[Run {run_id}] No response received from target miner {miner_hk[:8]} via query_miners.")
-                                 return resp_id, {"status": "validator_poll_failed", "message": "No response from miner via query_miners"}
+                                 logger.warning(f"[Run {run_id}] No response received from miner {miner_hk[:8]} (IP: {node.ip}:{node.port}) via query_miners endpoint {endpoint}.")
+                                 return resp_id, {"status": "validator_poll_failed", "message": f"No response from miner {miner_hk[:8]} at {node.ip}:{node.port} on {endpoint}"}
                              
+                        except asyncio.TimeoutError as timeout_err:
+                            logger.error(f"[Run {run_id}] Timeout polling miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {timeout_err}")
+                            return resp_id, {"status": "validator_poll_error", "message": f"Timeout polling miner {miner_hk[:8]} at {node.ip}:{node.port}: {str(timeout_err)}"}
+                        except ConnectionError as conn_err:
+                            logger.error(f"[Run {run_id}] Connection error polling miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {conn_err}")
+                            return resp_id, {"status": "validator_poll_error", "message": f"Connection error to miner {miner_hk[:8]} at {node.ip}:{node.port}: {str(conn_err)}"}
                         except Exception as poll_err:
-                            logger.error(f"[Run {run_id}] Error polling miner {miner_hk[:8]}: {poll_err}", exc_info=True)
-                            return resp_id, {"status": "validator_poll_error", "message": str(poll_err)}
+                            logger.error(f"[Run {run_id}] Error polling miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {poll_err}", exc_info=True)
+                            return resp_id, {"status": "validator_poll_error", "message": f"Error polling miner {miner_hk[:8]} at {node.ip}:{node.port}: {type(poll_err).__name__}: {str(poll_err)}"}
 
                     for resp_rec in miners_to_poll:
                         polling_tasks.append(_poll_single_miner(resp_rec))
@@ -1889,6 +1901,7 @@ sources:
                                     new_db_status = 'input_hash_timeout'
                             elif miner_status in [WeatherTaskStatus.VALIDATOR_POLL_FAILED.value, WeatherTaskStatus.VALIDATOR_POLL_ERROR.value]:
                                  new_db_status = 'input_poll_error'
+                                 # The detailed error message is already captured in error_msg from status_data.get('message')
                             else:
                                 new_db_status = 'input_fetch_error'
 
@@ -2446,6 +2459,8 @@ sources:
         Handle a request for forecast data for a specific job.
         Now returns information about the Zarr store directly instead of Kerchunk JSON.
         
+        RESILIENCE: Implements fallback strategies for database synchronization scenarios.
+        
         Args:
             job_id: The unique identifier for the job
             
@@ -2458,19 +2473,32 @@ sources:
         logger.info(f"Handling forecast data request for job_id: {job_id}")
         
         try:
+            # Primary lookup: Try to find the exact job ID
             query = """
-            SELECT id as job_id, status, target_netcdf_path, verification_hash, error_message
+            SELECT id as job_id, status, target_netcdf_path, verification_hash, error_message, gfs_init_time_utc, validator_hotkey
             FROM weather_miner_jobs
             WHERE id = :job_id 
             """
             job = await self.db_manager.fetch_one(query, {"job_id": job_id})
             
             if not job:
-                logger.warning(f"Job not found for job_id: {job_id}")
-                return self._validate_and_format_response({
-                    "status": WeatherTaskStatus.NOT_FOUND.value, 
-                    "message": f"Job with ID {job_id} not found"
-                }, ["status", "message"])
+                # DATABASE SYNC RESILIENCE: Try alternative lookup methods
+                logger.warning(f"Job not found for job_id: {job_id}. Attempting database sync resilience fallback...")
+                
+                # Import the fallback function
+                from .processing.weather_logic import find_job_by_alternative_methods
+                fallback_job = await find_job_by_alternative_methods(self, job_id, "current_miner")
+                
+                if fallback_job:
+                    job = fallback_job
+                    original_job_id = job['job_id']
+                    logger.warning(f"Database sync resilience: Using equivalent job {original_job_id} for missing job {job_id}")
+                else:
+                    logger.warning(f"Job not found for job_id: {job_id} even after fallback attempts")
+                    return self._validate_and_format_response({
+                        "status": WeatherTaskStatus.NOT_FOUND.value, 
+                        "message": f"Job with ID {job_id} not found (tried fallback methods)"
+                    }, ["status", "message"])
                 
             if job["status"] == "completed":
                 zarr_path_str = job["target_netcdf_path"]
@@ -2707,7 +2735,7 @@ sources:
                 gfs_init_time=t0_run_time,  # SCHEDULED GFS time
                 miner_hotkey=miner_hotkey,
                 validator_hotkey=validator_hotkey,
-                job_type="fetch"
+                job_type="forecast"  # Changed from "fetch" to "forecast" to unify job IDs
             )
             
             if existing_input_job:
@@ -3293,17 +3321,23 @@ sources:
                                     try:
                                         parsed_response = loads(status_response['text'])
                                     except (Exception, TypeError) as json_err:
-                                        logger.warning(f"[Run {run_id}] Failed to parse status response text for {miner_hk[:8]}: {json_err}")
-                                        parsed_response = {"status": "parse_error", "message": str(json_err)}
+                                        logger.warning(f"[HashWorker] [Run {run_id}] Failed to parse JSON response from miner {miner_hk[:8]}: {json_err}. Raw response: {status_response.get('text', '')[:200]}")
+                                        parsed_response = {"status": "parse_error", "message": f"JSON parse error from miner {miner_hk[:8]}: {type(json_err).__name__}: {str(json_err)}"}
                                 
                                 logger.debug(f"[Run {run_id}] Received status from {miner_hk[:8]}: {parsed_response}")
                                 return resp_id, parsed_response
                             else:
-                                logger.warning(f"[Run {run_id}] No valid response received from {miner_hk[:8]} using query_miners.")
-                                return resp_id, {"status": "validator_poll_failed", "message": "No response from miner via query_miners"}
+                                logger.warning(f"[HashWorker] [Run {run_id}] No response received from miner {miner_hk[:8]} on /weather-get-input-status endpoint.")
+                                return resp_id, {"status": "validator_poll_failed", "message": f"No response from miner {miner_hk[:8]} on /weather-get-input-status endpoint"}
+                        except asyncio.TimeoutError as timeout_err:
+                            logger.error(f"[HashWorker] [Run {run_id}] Timeout polling miner {miner_hk[:8]}: {timeout_err}")
+                            return resp_id, {"status": "validator_poll_error", "message": f"Timeout polling miner {miner_hk[:8]}: {str(timeout_err)}"}
+                        except ConnectionError as conn_err:
+                            logger.error(f"[HashWorker] [Run {run_id}] Connection error polling miner {miner_hk[:8]}: {conn_err}")
+                            return resp_id, {"status": "validator_poll_error", "message": f"Connection error to miner {miner_hk[:8]}: {str(conn_err)}"}
                         except Exception as poll_err:
-                            logger.error(f"[Run {run_id}] Error polling miner {miner_hk[:8]}: {poll_err}", exc_info=True)
-                            return resp_id, {"status": "validator_poll_error", "message": str(poll_err)}
+                            logger.error(f"[HashWorker] [Run {run_id}] Error polling miner {miner_hk[:8]}: {poll_err}", exc_info=True)
+                            return resp_id, {"status": "validator_poll_error", "message": f"Error polling miner {miner_hk[:8]}: {type(poll_err).__name__}: {str(poll_err)}"}
 
             except Exception as e:
                 logger.error(f"Error in miner_fetch_hash_worker: {e}", exc_info=True)
@@ -4123,6 +4157,7 @@ sources:
                             new_db_status = 'input_hash_timeout'
                     elif miner_status in ["validator_poll_failed", "validator_poll_error"]:
                          new_db_status = 'input_poll_error'
+                         # The detailed error message is already captured in error_msg from status_data.get('message')
                     else:
                         new_db_status = 'input_fetch_error'
 

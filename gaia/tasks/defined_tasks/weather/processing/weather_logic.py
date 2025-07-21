@@ -319,6 +319,12 @@ async def _request_fresh_token(task_instance: 'WeatherTask', miner_hotkey: str, 
 async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_utc: datetime, validator_hotkey: str = None) -> Optional[Dict[str, Any]]:
     """
     Check if a job exists for the given GFS initialization time and validator.
+    With the new deterministic job ID system, we prioritize job reuse across validators.
+    
+    RESILIENCE: This function implements fallback strategies to handle
+    database synchronization scenarios where job IDs might not match exactly.
+    All fallbacks require exact GFS timestep matches for weather data validity.
+    
     (Intended for Miner-side usage)
     
     Args:
@@ -331,34 +337,45 @@ async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_u
         return None
         
     try:
-        # If validator_hotkey is provided, look for validator-specific jobs
+        # Strategy 1: Try to find a job from the same validator (exact GFS timestep match)
         if validator_hotkey:
-            query = """
-            SELECT id as job_id, status, target_netcdf_path as zarr_store_path
+            validator_specific_query = """
+            SELECT id as job_id, status, target_netcdf_path as zarr_store_path, validator_hotkey
             FROM weather_miner_jobs
             WHERE gfs_init_time_utc = :gfs_init_time
             AND validator_hotkey = :validator_hotkey
             ORDER BY id DESC
             LIMIT 1
             """
-            params = {"gfs_init_time": gfs_init_time_utc, "validator_hotkey": validator_hotkey}
-        else:
-            # Fallback to original behavior for backward compatibility
-            query = """
-            SELECT id as job_id, status, target_netcdf_path as zarr_store_path
-            FROM weather_miner_jobs
-            WHERE gfs_init_time_utc = :gfs_init_time
-            ORDER BY id DESC
-            LIMIT 1
-            """
-            params = {"gfs_init_time": gfs_init_time_utc}
+            job = await task_instance.db_manager.fetch_one(validator_specific_query, {
+                "gfs_init_time": gfs_init_time_utc, 
+                "validator_hotkey": validator_hotkey
+            })
             
-        if not hasattr(task_instance, 'db_manager') or task_instance.db_manager is None:
-             logger.error("DB manager not available in get_job_by_gfs_init_time")
-             return None
-             
-        job = await task_instance.db_manager.fetch_one(query, params)
-        return job
+            if job:
+                logger.info(f"Found existing job {job['job_id']} for GFS time {gfs_init_time_utc} from same validator {validator_hotkey[:8]}")
+                return job
+        
+        # Strategy 2: Look for any job with this exact GFS time (cross-validator reuse)
+        any_validator_query = """
+        SELECT id as job_id, status, target_netcdf_path as zarr_store_path, validator_hotkey
+        FROM weather_miner_jobs
+        WHERE gfs_init_time_utc = :gfs_init_time
+        ORDER BY id DESC
+        LIMIT 1
+        """
+        job = await task_instance.db_manager.fetch_one(any_validator_query, {
+            "gfs_init_time": gfs_init_time_utc
+        })
+        
+        if job:
+            other_validator = job.get('validator_hotkey', 'unknown')[:8]
+            logger.info(f"Found existing job {job['job_id']} for GFS time {gfs_init_time_utc} from different validator {other_validator} - enabling cross-validator reuse")
+            return job
+            
+        # No additional fallbacks - GFS timestep must match exactly for weather data validity
+            
+        return None
     except Exception as e:
         logger.error(f"Error checking for existing job with GFS init time {gfs_init_time_utc} and validator {validator_hotkey}: {e}")
         return None
@@ -438,6 +455,65 @@ async def update_job_paths(task_instance: 'WeatherTask', job_id: str, netcdf_pat
         logger.error(f"Error updating miner job paths for {job_id}: {e}")
         return False
 
+async def find_job_by_alternative_methods(task_instance: 'WeatherTask', job_id: str, miner_hotkey: str) -> Optional[Dict[str, Any]]:
+    """
+    Attempts to find a job using alternative methods when the exact job ID is not found.
+    This is critical for handling database synchronization scenarios where job IDs might not match.
+    
+    Args:
+        task_instance: WeatherTask instance
+        job_id: The original job ID that wasn't found
+        miner_hotkey: The miner's hotkey
+        
+    Returns:
+        Job details if found, None otherwise
+    """
+    if task_instance.node_type != 'miner':
+        logger.error("find_job_by_alternative_methods called on non-miner node.")
+        return None
+        
+    try:
+        # Extract timestamp from deterministic job ID if possible
+        # Format: weather_job_forecast_YYYYMMDDHHMMSS_miner_hotkey
+        job_parts = job_id.split('_')
+        if len(job_parts) >= 4 and job_parts[0] == 'weather' and job_parts[1] == 'job':
+            timestamp_str = job_parts[3]
+            if len(timestamp_str) == 14:  # YYYYMMDDHHMMSS
+                try:
+                    gfs_time = datetime.strptime(timestamp_str, '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+                    logger.info(f"Extracted GFS time {gfs_time} from job ID {job_id}")
+                    
+                    # Look for jobs with this GFS time and miner
+                    fallback_query = """
+                    SELECT id as job_id, status, target_netcdf_path, verification_hash, gfs_init_time_utc, validator_hotkey
+                    FROM weather_miner_jobs 
+                    WHERE gfs_init_time_utc = :gfs_time
+                    ORDER BY validator_request_time DESC
+                    LIMIT 1
+                    """
+                    
+                    fallback_job = await task_instance.db_manager.fetch_one(fallback_query, {
+                        "gfs_time": gfs_time
+                    })
+                    
+                    if fallback_job:
+                        original_job_id = fallback_job['job_id']
+                        other_validator = fallback_job.get('validator_hotkey', 'unknown')[:8]
+                        logger.warning(f"Database sync resilience: Found equivalent job {original_job_id} "
+                                     f"for missing job {job_id} (GFS: {gfs_time}) from validator {other_validator}")
+                        return fallback_job
+                        
+                except ValueError as ve:
+                    logger.debug(f"Could not parse timestamp from job ID {job_id}: {ve}")
+        
+        # No additional fallbacks - we need exact GFS timestep match for weather data validity
+            
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error in find_job_by_alternative_methods for job {job_id}: {e}")
+        return None
+
 async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict, response_details: Dict):
     """Handles fetching Zarr store info and verifying a single miner response's manifest integrity."""
     run_id = run_details['id']
@@ -460,15 +536,37 @@ async def verify_miner_response(task_instance: 'WeatherTask', run_details: Dict,
     try:
         token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, job_id)
         if token_data_tuple is None: 
-            # Miner job is still processing or failed - log warning and skip
-            logger.warning(f"[VerifyLogic, Resp {response_id}] Miner {miner_hotkey} job {job_id} not ready for verification (still processing or failed). Skipping.")
-            await task_instance.db_manager.execute("""
-                UPDATE weather_miner_responses 
-                SET status = 'awaiting_miner_completion', 
-                    error_message = 'Miner job still processing or not available for verification'
-                WHERE id = :id
-            """, {"id": response_id})
-            return  # Exit gracefully, this miner won't be scored for this run
+            # RESILIENCE: Try alternative job lookup methods before giving up
+            logger.warning(f"[VerifyLogic, Resp {response_id}] Primary job lookup failed for {job_id}. Attempting database sync resilience fallback...")
+            
+            # Try to find an equivalent job using alternative methods
+            fallback_job = await find_job_by_alternative_methods(task_instance, job_id, miner_hotkey)
+            if fallback_job and fallback_job.get('status') == 'completed':
+                fallback_job_id = fallback_job['job_id']
+                logger.info(f"[VerifyLogic, Resp {response_id}] Found fallback job {fallback_job_id}, retrying token request...")
+                
+                # Try token request with the fallback job ID
+                token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, fallback_job_id)
+                if token_data_tuple:
+                    # Update the response record with the correct job ID for future reference
+                    await task_instance.db_manager.execute("""
+                        UPDATE weather_miner_responses 
+                        SET job_id = :correct_job_id, 
+                            error_message = 'Used fallback job ID due to database sync' 
+                        WHERE id = :id
+                    """, {"id": response_id, "correct_job_id": fallback_job_id})
+                    logger.info(f"[VerifyLogic, Resp {response_id}] Database sync resilience successful - updated job ID from {job_id} to {fallback_job_id}")
+            
+            if token_data_tuple is None:
+                # Still no luck - miner job is processing, failed, or truly not found
+                logger.warning(f"[VerifyLogic, Resp {response_id}] Miner {miner_hotkey} job {job_id} not ready for verification (still processing, failed, or database sync issue). Skipping.")
+                await task_instance.db_manager.execute("""
+                    UPDATE weather_miner_responses 
+                    SET status = 'awaiting_miner_completion', 
+                        error_message = 'Miner job still processing or not available for verification'
+                    WHERE id = :id
+                """, {"id": response_id})
+                return  # Exit gracefully, this miner won't be scored for this run
 
         access_token, zarr_store_url, claimed_manifest_content_hash = token_data_tuple
         logger.info(f"[VerifyLogic, Resp {response_id}] Unpacked token data. URL: {zarr_store_url}, Manifest Hash: {claimed_manifest_content_hash[:10] if claimed_manifest_content_hash else 'N/A'}...")
@@ -1256,16 +1354,17 @@ async def _calculate_and_store_aggregated_era5_score(
         "num_acc_components_aggregated": len(acc_component_scores)
     }
 
+    calc_time = datetime.now(timezone.utc)
     db_params = {
         "response_id": response_id, "run_id": run_id, "miner_uid": miner_uid, "miner_hotkey": miner_hotkey,
         "score_type": agg_score_type, 
         "score": final_score_val if np.isfinite(final_score_val) else 0.0,
         "metrics_json": dumps(metrics_for_agg_score, default=str),
-        "calculation_time": datetime.now(timezone.utc),
+        "calculation_time": calc_time,
         "error_message": None,
-        "lead_hours": None, 
+        "lead_hours": -1,  # Use -1 for aggregated scores to fix NULL unique constraint issue
         "variable_level": "aggregated_final", 
-        "valid_time_utc": None 
+        "valid_time_utc": calc_time  # Use calculation time for aggregated scores to ensure uniqueness
     }
     
     insert_agg_query = """
@@ -1284,3 +1383,185 @@ async def _calculate_and_store_aggregated_era5_score(
     except Exception as e_db:
         logger.error(f"[AggFinalScore] DB error storing final composite ERA5 score for UID {miner_uid}, Run {run_id}: {e_db}", exc_info=True)
         return None
+
+async def reconcile_job_id_for_validator(task_instance: 'WeatherTask', miner_job_id: str, miner_hotkey: str, gfs_init_time: datetime) -> str:
+    """
+    Attempts to reconcile a job ID that might not match due to database synchronization.
+    This is used by validators to handle cases where miners return job IDs that don't exist
+    in the current validator database due to hourly overwrites.
+    
+    Args:
+        task_instance: WeatherTask instance
+        miner_job_id: The job ID returned by the miner
+        miner_hotkey: The miner's hotkey
+        gfs_init_time: The GFS initialization time for this job
+        
+    Returns:
+        The reconciled job ID (either original or a found equivalent)
+    """
+    if task_instance.node_type != 'validator':
+        logger.warning("reconcile_job_id_for_validator called on non-validator node.")
+        return miner_job_id
+        
+    try:
+        # Check if we have a job with the same GFS time that should match this miner job
+        # Generate what the job ID should be with our current deterministic system
+        from gaia.tasks.base.deterministic_job_id import DeterministicJobID
+        
+        # Extract miner hotkey from the provided miner_hotkey or try to get it
+        expected_job_id = DeterministicJobID.generate_weather_job_id(
+            gfs_init_time=gfs_init_time,
+            miner_hotkey=miner_hotkey,
+            validator_hotkey=task_instance.validator.hotkey if hasattr(task_instance, 'validator') and task_instance.validator else "unknown",
+            job_type="forecast"
+        )
+        
+        if miner_job_id == expected_job_id:
+            # Job ID matches what we expect, no reconciliation needed
+            return miner_job_id
+            
+        # Check if the expected job ID exists in our validator database
+        expected_job_query = """
+        SELECT job_id FROM weather_miner_responses 
+        WHERE job_id = :expected_job_id
+        AND miner_hotkey = :miner_hotkey
+        ORDER BY response_time DESC 
+        LIMIT 1
+        """
+        
+        expected_job_exists = await task_instance.db_manager.fetch_one(expected_job_query, {
+            "expected_job_id": expected_job_id,
+            "miner_hotkey": miner_hotkey
+        })
+        
+        if expected_job_exists:
+            logger.warning(f"Database sync reconciliation: Miner returned job ID {miner_job_id} but we have {expected_job_id} for same GFS time. Using our expected ID.")
+            return expected_job_id
+            
+        # Look for any job with the same GFS init time from this miner
+        gfs_time_query = """
+        SELECT r.job_id, f.gfs_init_time_utc
+        FROM weather_miner_responses r
+        JOIN weather_forecast_runs f ON r.run_id = f.id
+        WHERE r.miner_hotkey = :miner_hotkey
+        AND f.gfs_init_time_utc = :gfs_time
+        ORDER BY r.response_time DESC
+        LIMIT 1
+        """
+        
+        gfs_match = await task_instance.db_manager.fetch_one(gfs_time_query, {
+            "miner_hotkey": miner_hotkey,
+            "gfs_time": gfs_init_time
+        })
+        
+        if gfs_match:
+            reconciled_job_id = gfs_match['job_id']
+            logger.warning(f"Database sync reconciliation: Found equivalent job {reconciled_job_id} for miner job {miner_job_id} (same GFS time {gfs_init_time})")
+            return reconciled_job_id
+            
+        # No reconciliation possible, return original
+        logger.debug(f"No reconciliation possible for job ID {miner_job_id}, using as-is")
+        return miner_job_id
+        
+    except Exception as e:
+        logger.error(f"Error in reconcile_job_id_for_validator for job {miner_job_id}: {e}")
+        return miner_job_id  # Return original on error
+
+async def check_job_id_health(task_instance: 'WeatherTask') -> Dict[str, Any]:
+    """
+    Performs a health check on job ID consistency to identify potential database synchronization issues.
+    This helps detect problems before they cause verification failures.
+    
+    Returns:
+        Dict with health check results and any issues found
+    """
+    health_report = {
+        "status": "healthy",
+        "issues": [],
+        "stats": {},
+        "recommendations": []
+    }
+    
+    try:
+        if task_instance.node_type == 'miner':
+            # Check for orphaned jobs (jobs that might have been created by other validators)
+            orphaned_jobs_query = """
+            SELECT COUNT(*) as count, 
+                   COUNT(DISTINCT validator_hotkey) as validator_count,
+                   MIN(validator_request_time) as oldest_request,
+                   MAX(validator_request_time) as newest_request
+            FROM weather_miner_jobs 
+            WHERE validator_request_time >= NOW() - INTERVAL '24 hours'
+            """
+            orphaned_stats = await task_instance.db_manager.fetch_one(orphaned_jobs_query)
+            
+            health_report["stats"]["total_jobs_24h"] = orphaned_stats.get("count", 0)
+            health_report["stats"]["unique_validators_24h"] = orphaned_stats.get("validator_count", 0)
+            
+            if orphaned_stats.get("validator_count", 0) > 1:
+                health_report["issues"].append({
+                    "type": "multiple_validators",
+                    "description": f"Jobs from {orphaned_stats['validator_count']} different validators in last 24h",
+                    "impact": "Potential for job ID conflicts during database sync"
+                })
+                health_report["recommendations"].append("Enable database sync resilience features")
+            
+            # Check for jobs with non-standard job ID formats
+            non_standard_jobs_query = """
+            SELECT COUNT(*) as count 
+            FROM weather_miner_jobs 
+            WHERE id NOT LIKE 'weather_job_forecast_%'
+            AND validator_request_time >= NOW() - INTERVAL '24 hours'
+            """
+            non_standard_count = await task_instance.db_manager.fetch_one(non_standard_jobs_query)
+            
+            if non_standard_count.get("count", 0) > 0:
+                health_report["issues"].append({
+                    "type": "non_standard_job_ids",
+                    "count": non_standard_count["count"],
+                    "description": "Jobs with non-deterministic job ID format found",
+                    "impact": "These jobs may not be reusable across validators"
+                })
+                health_report["status"] = "warning"
+                
+        elif task_instance.node_type == 'validator':
+            # Check for mismatched job IDs in responses
+            mismatch_query = """
+            SELECT COUNT(*) as count,
+                   COUNT(DISTINCT miner_hotkey) as affected_miners
+            FROM weather_miner_responses 
+            WHERE error_message LIKE '%fallback%' OR error_message LIKE '%database sync%'
+            AND response_time >= NOW() - INTERVAL '24 hours'
+            """
+            mismatch_stats = await task_instance.db_manager.fetch_one(mismatch_query)
+            
+            health_report["stats"]["sync_issues_24h"] = mismatch_stats.get("count", 0)
+            health_report["stats"]["affected_miners_24h"] = mismatch_stats.get("affected_miners", 0)
+            
+            if mismatch_stats.get("count", 0) > 0:
+                health_report["issues"].append({
+                    "type": "job_id_mismatches",
+                    "count": mismatch_stats["count"],
+                    "affected_miners": mismatch_stats["affected_miners"],
+                    "description": "Job ID mismatches detected (database sync resilience activated)",
+                    "impact": "Some jobs required fallback lookup methods"
+                })
+                health_report["status"] = "warning"
+                health_report["recommendations"].append("Monitor database synchronization timing")
+            
+        # Set overall status
+        if len(health_report["issues"]) == 0:
+            health_report["status"] = "healthy"
+        elif any(issue["type"] in ["multiple_validators", "job_id_mismatches"] for issue in health_report["issues"]):
+            health_report["status"] = "warning"
+            
+    except Exception as e:
+        health_report["status"] = "error"
+        health_report["issues"].append({
+            "type": "health_check_error",
+            "description": f"Error during health check: {e}",
+            "impact": "Unable to assess job ID health"
+        })
+        logger.error(f"Error in check_job_id_health: {e}")
+        
+    return health_report

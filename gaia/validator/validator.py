@@ -125,6 +125,10 @@ from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTas
 from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
 from gaia.APIcalls.miner_score_sender import MinerScoreSender
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.tasks.base.miner_performance_calculator import (
+    MinerPerformanceCalculator,
+    calculate_daily_stats
+)
 from argparse import ArgumentParser
 import pandas as pd
 import json
@@ -432,6 +436,11 @@ class GaiaValidator:
             node_type="validator",
             test_mode=args.test,
         )
+        
+        # Initialize performance calculator for tracking miner statistics
+        self.performance_calculator = None  # Will be initialized when database is ready
+        self.last_performance_calculation = 0  # Track last calculation time
+        
         self.weights = [0.0] * 256
         self.last_set_weights_block = 0
         
@@ -2833,6 +2842,15 @@ class GaiaValidator:
                 await self.database_manager.initialize_database()
                 logger.info("Database tables initialized.")
                 
+                # Initialize performance calculator with database connection
+                try:
+                    db_connection = await self.database_manager.get_raw_connection()
+                    self.performance_calculator = MinerPerformanceCalculator(db_connection)
+                    logger.info("Performance calculator initialized.")
+                except Exception as e:
+                    logger.error(f"Failed to initialize performance calculator: {e}")
+                    # Continue without performance calculator - it's not critical
+                
                 # Initialize DB Sync Components - AFTER DB init
                 await self._initialize_db_sync_components()
 
@@ -3148,6 +3166,9 @@ class GaiaValidator:
                                         # Invalidate shared block cache after weight setting
                                         self._shared_block_cache['block_number'] = None
                                         
+                                        # Calculate performance statistics after successful weight setting
+                                        await self._calculate_performance_statistics()
+                                        
                                         # MEMORY LEAK FIX: Aggressive substrate cleanup after successful weight setting
                                         try:
                                             substrate_cleanup_count = self._aggressive_substrate_cleanup("post_weight_setting")
@@ -3438,6 +3459,27 @@ class GaiaValidator:
                                     except Exception as e_hist_del:
                                          logger.warning(f"  Could not clear {table_name} for old hotkey {original_hotkey}: {e_hist_del}")
 
+                                # 2.1. Delete from miner performance stats tables by UID and hotkey
+                                try:
+                                    if hasattr(self, 'performance_calculator') and self.performance_calculator:
+                                        # Use the performance calculator's cleanup method
+                                        cleanup_success = await self.performance_calculator.cleanup_specific_miner(
+                                            str(uid_to_process), original_hotkey
+                                        )
+                                        if cleanup_success:
+                                            logger.info(f"  Deleted performance stats for UID {uid_to_process} and old hotkey {original_hotkey} due to hotkey change.")
+                                    else:
+                                        # Fallback to direct database query if calculator not available
+                                        perf_stats_exists = await self.database_manager.fetch_one("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'miner_performance_stats')")
+                                        if perf_stats_exists and perf_stats_exists['exists']:
+                                            await self.database_manager.execute(
+                                                "DELETE FROM miner_performance_stats WHERE miner_uid = :uid OR miner_hotkey = :hotkey", 
+                                                {"uid": str(uid_to_process), "hotkey": original_hotkey}
+                                            )
+                                            logger.info(f"  Deleted performance stats for UID {uid_to_process} and old hotkey {original_hotkey} due to hotkey change.")
+                                except Exception as e_perf_del:
+                                    logger.warning(f"  Could not clear miner_performance_stats for UID {uid_to_process}: {e_perf_del}")
+
                                 # 3. Zero out ALL scores for the UID in score_table
                                 distinct_task_names_rows = await self.database_manager.fetch_all("SELECT DISTINCT task_name FROM score_table")
                                 all_task_names_in_scores = [row['task_name'] for row in distinct_task_names_rows if row['task_name']]
@@ -3469,6 +3511,15 @@ class GaiaValidator:
                                 
                             except Exception as e:
                                 logger.error(f"Error processing hotkey change for UID {uid_to_process}: {str(e)}", exc_info=True)
+
+                    # --- Step 2.5: Bulk cleanup of performance stats for any remaining deregistered miners ---
+                    if hasattr(self, 'performance_calculator') and self.performance_calculator:
+                        try:
+                            cleaned_count = await self.performance_calculator.cleanup_deregistered_miners()
+                            if cleaned_count > 0:
+                                logger.info(f"🧹 Bulk cleanup removed performance data for {cleaned_count} deregistered miners")
+                        except Exception as perf_cleanup_err:
+                            logger.warning(f"Error during bulk performance stats cleanup: {perf_cleanup_err}")
 
                     # --- Step 3: Update info for existing miners where hotkey didn't change ---
                     if uids_to_update_info:
@@ -4002,16 +4053,23 @@ class GaiaValidator:
             
             now = datetime.now(timezone.utc)
             one_day_ago = now - timedelta(days=1)
+            # Weather scores can arrive ~10 days delayed due to ERA5 final scoring
+            # ERA5 final scores have 80% weight vs 20% for day1_qc scores, so we must include them
+            weather_lookback = now - timedelta(days=15)
             
             query = """
             SELECT score, created_at 
             FROM score_table 
             WHERE task_name = :task_name AND created_at >= :start_time ORDER BY created_at DESC
             """
+            # Modified weather query to capture delayed ERA5 final scores (80% of weather score weight)
+            # Note: weather scores use GFS init time as created_at, not evaluation time
+            # Day1 QC scores (20% weight) arrive quickly, ERA5 final scores (80% weight) arrive ~10 days later
             weather_query = """
             SELECT score, created_at 
             FROM score_table 
-            WHERE task_name = 'weather' AND created_at >= :start_time ORDER BY created_at DESC LIMIT 50
+            WHERE task_name = 'weather' AND created_at >= :weather_start_time 
+            ORDER BY created_at DESC LIMIT 100
             """
             # Get 24 hours of geomagnetic data for scoring
             geomagnetic_query = """
@@ -4034,6 +4092,7 @@ class GaiaValidator:
             """
 
             params = {"start_time": one_day_ago}
+            weather_params = {"weather_start_time": weather_lookback}  # For weather 15-day lookback 
             one_day_ago = now - timedelta(days=1)  # For geomagnetic 24-hour lookback
             geo_params = {"geo_start_time": one_day_ago}  # For geomagnetic 24-hour lookback
             
@@ -4041,7 +4100,7 @@ class GaiaValidator:
             try:
                 self._log_memory_usage("calc_weights_before_db_fetch")
                 weather_results, geomagnetic_results, soil_results, validator_nodes_list = await asyncio.gather(
-                    self.database_manager.fetch_all(weather_query, params),
+                    self.database_manager.fetch_all(weather_query, weather_params),
                     self.database_manager.fetch_all(geomagnetic_query, geo_params),
                     self.database_manager.fetch_all(soil_query, params),
                     self.database_manager.fetch_all(validator_nodes_query),
@@ -4051,7 +4110,13 @@ class GaiaValidator:
                 
                 # Log individual dataset sizes
                 if weather_results and not isinstance(weather_results, Exception):
-                    logger.info(f"Weather dataset: {len(weather_results)} records")
+                    logger.info(f"Weather dataset: {len(weather_results)} records (lookback: 15 days for delayed ERA5 scores)")
+                    # Check age of weather scores to monitor delayed scoring
+                    if weather_results:
+                        oldest_score = min(row['created_at'] for row in weather_results)
+                        newest_score = max(row['created_at'] for row in weather_results) 
+                        score_age_range = (now - oldest_score).days
+                        logger.info(f"Weather scores age range: {score_age_range} days (newest: {(now - newest_score).days} days old)")
                 if geomagnetic_results and not isinstance(geomagnetic_results, Exception):
                     logger.info(f"Geomagnetic dataset: {len(geomagnetic_results)} records")
                 if soil_results and not isinstance(soil_results, Exception):
@@ -4232,6 +4297,58 @@ class GaiaValidator:
             logger.info("   - PGBACKREST_R2_SECRET_ACCESS_KEY")
         
         logger.info("DB Sync initialization completed (not active).")
+
+    async def _calculate_performance_statistics(self):
+        """Calculate and store miner performance statistics periodically."""
+        try:
+            # Only calculate if performance calculator is initialized and enough time has passed
+            if not self.performance_calculator:
+                logger.debug("Performance calculator not initialized, skipping statistics calculation")
+                return
+            
+            current_time = time.time()
+            # Calculate daily stats once every 2 hours (7200 seconds)
+            if current_time - self.last_performance_calculation < 7200:
+                logger.debug(f"Skipping performance calculation - only {current_time - self.last_performance_calculation:.0f}s since last calculation")
+                return
+            
+            logger.info("🔄 Calculating miner performance statistics...")
+            
+            # Calculate daily statistics for today
+            today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            # Get database connection for the performance calculator
+            db_connection = await self.database_manager.get_raw_connection()
+            
+            # Use daily stats calculation function
+            daily_performances = await calculate_daily_stats(db_connection, today)
+            
+            if daily_performances:
+                logger.info(f"✅ Calculated performance stats for {len(daily_performances)} miners")
+                
+                # Log summary of top performers
+                top_performers = [p for p in daily_performances if p.overall_avg_score is not None][:5]
+                if top_performers:
+                    logger.info("🏆 Top performers today:")
+                    for i, perf in enumerate(top_performers):
+                        logger.info(f"  {i+1}. {perf.miner_hotkey[:12]}... - Score: {perf.overall_avg_score:.3f}, Tasks: {perf.total_attempted}")
+            else:
+                logger.info("No miner performance data available for today")
+            
+            # Clean up performance data for deregistered miners
+            try:
+                cleaned_count = await self.performance_calculator.cleanup_deregistered_miners()
+                if cleaned_count > 0:
+                    logger.info(f"🧹 Cleaned up performance data for {cleaned_count} deregistered miners")
+            except Exception as cleanup_err:
+                logger.error(f"Error during deregistered miner cleanup: {cleanup_err}")
+            
+            # Update last calculation time
+            self.last_performance_calculation = current_time
+            
+        except Exception as e:
+            logger.error(f"Error calculating performance statistics: {e}")
+            logger.error(traceback.format_exc())
 
     async def database_monitor(self):
         """Periodically query and log database statistics from a consistent snapshot."""

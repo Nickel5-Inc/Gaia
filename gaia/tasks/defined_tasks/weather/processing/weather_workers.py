@@ -1182,7 +1182,7 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                                 "metrics": lead_scores_json,
                                 "ts": datetime.now(timezone.utc),
                                 "err": error_msg,
-                                "lead_hours_val": None,
+                                "lead_hours_val": -1,  # Use -1 for overall scores to fix NULL unique constraint issue
                                 "variable_level_val": "overall_day1",
                                 "valid_time_utc_val": run_record['gfs_init_time_utc'] if run_record else None
                             }
