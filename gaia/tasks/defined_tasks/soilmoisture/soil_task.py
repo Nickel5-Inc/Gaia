@@ -1155,7 +1155,7 @@ class SoilMoistureTask(Task):
                         # Determine retry timing based on error type
                         if error_type == "http_error" and status_code == 404:
                             # Data not available yet - retry sooner since data might become available
-                            retry_hours = 1  # Retry in 1 hour for 404 errors
+                            retry_hours = 24  # Retry in 24 hour for 404 errors
                             detailed_message = f"SMAP data not available yet (HTTP 404) for {target_time}"
                             logger.warning(f"⏳ {detailed_message} - will retry in {retry_hours} hour(s)")
                         elif error_type == "http_error" and status_code in [401, 403]:
