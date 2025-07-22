@@ -572,7 +572,6 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 aws_access_key_id=access_key_id,
                 aws_secret_access_key=secret_access_key,
                 config=config
-                config=config
             )
             return s3_client
         except Exception as e:
@@ -581,7 +580,6 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
     async def _upload_input_to_r2(self, s3_client: boto3.client, job_id: str, initial_batch: 'Batch') -> Optional[str]:
         """Uploads the initial batch pickle to R2 with robust retry logic."""
-        """Uploads the initial batch pickle to R2 with robust retry logic."""
         if not self.r2_config or not self.r2_config.get("r2_bucket_name"):
             logger.error(f"[{job_id}] R2 bucket name not found in self.r2_config. Cannot upload input.")
             return None
@@ -589,7 +587,6 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
         object_key = f"inputs/{job_id}/initial_batch.pkl"
         
-        # Serialize the batch to bytes first
         # Serialize the batch to bytes first
         try:
             with io.BytesIO() as f:
@@ -719,25 +716,6 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         except Exception as e:
             logger.debug(f"[{job_id}] Error during multipart cleanup: {e}")
             # This is non-critical, so we don't re-raise
-                data_bytes = f.getvalue()
-                
-            data_size_mb = len(data_bytes) / (1024 * 1024)
-            logger.info(f"[{job_id}] Prepared batch for upload: {data_size_mb:.2f} MB")
-            
-            # Use robust upload with retry logic
-            success = await self._robust_upload_bytes_to_r2(
-                s3_client, bucket_name, object_key, data_bytes, job_id
-            )
-            
-            if success:
-                logger.info(f"[{job_id}] Successfully uploaded initial batch to R2: s3://{bucket_name}/{object_key}")
-                return object_key
-            else:
-                logger.error(f"[{job_id}] Failed to upload initial batch to R2 after retries")
-                return None
-                
-        except Exception as e:
-            logger.error(f"[{job_id}] Error preparing batch for upload: {e}", exc_info=True)
             return None
 
     async def _robust_upload_bytes_to_r2(
@@ -812,38 +790,6 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         
         return False
     
-    async def _cleanup_failed_multipart_uploads(
-        self, 
-        s3_client: boto3.client, 
-        bucket_name: str, 
-        object_key: str, 
-        job_id: str
-    ):
-        """Clean up any failed multipart uploads for the given object key."""
-        try:
-            # List multipart uploads
-            response = await asyncio.to_thread(
-                s3_client.list_multipart_uploads,
-                Bucket=bucket_name,
-                Prefix=object_key
-            )
-            
-            if 'Uploads' in response:
-                for upload in response['Uploads']:
-                    upload_id = upload['UploadId']
-                    logger.info(f"[{job_id}] Aborting failed multipart upload: {upload_id}")
-                    
-                    await asyncio.to_thread(
-                        s3_client.abort_multipart_upload,
-                        Bucket=bucket_name,
-                        Key=object_key,
-                        UploadId=upload_id
-                    )
-                    
-        except Exception as e:
-            logger.debug(f"[{job_id}] Error during multipart cleanup: {e}")
-            # This is non-critical, so we don't re-raise
-
     async def _invoke_inference_service(self, job_id: str, input_r2_key: str) -> Optional[str]:
         """
         Invokes the asynchronous inference service (e.g., RunPod) to START a job.

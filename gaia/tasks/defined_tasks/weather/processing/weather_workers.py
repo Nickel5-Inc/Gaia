@@ -149,31 +149,10 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
             logger.warning(f"[InferenceTask Job {job_id}] Job already in status '{current_status}'. Skipping duplicate inference.")
             return
         
-        # Check for duplicate processing of this specific job
-        # Check for duplicate processing of this specific job
         if gfs_init_time:
             # Check if THIS specific job is already in progress or completed
             current_job_check_query = """
-            # Check if THIS specific job is already in progress or completed
-            current_job_check_query = """
                 SELECT id, status FROM weather_miner_jobs 
-                WHERE id = :current_job_id 
-                AND status IN ('in_progress', 'completed')
-                LIMIT 1
-            """
-            current_job = await task_instance.db_manager.fetch_one(current_job_check_query, {
-                "current_job_id": job_id
-            })
-            
-            if current_job:
-                logger.warning(f"[InferenceTask Job {job_id}] This job is already in status '{current_job['status']}'. Aborting duplicate inference.")
-                return
-            
-            # Check if inference has already been completed for this GFS timestep by another job
-            # If so, reuse the existing files instead of running inference again
-            completed_inference_query = """
-                SELECT id, target_netcdf_path, verification_hash
-                FROM weather_miner_jobs 
                 WHERE id = :current_job_id 
                 AND status IN ('in_progress', 'completed')
                 LIMIT 1
@@ -198,13 +177,7 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                 AND verification_hash IS NOT NULL
                 ORDER BY processing_end_time DESC 
                 LIMIT 1
-                AND status = 'completed'
-                AND target_netcdf_path IS NOT NULL
-                AND verification_hash IS NOT NULL
-                ORDER BY processing_end_time DESC 
-                LIMIT 1
             """
-            completed_inference = await task_instance.db_manager.fetch_one(completed_inference_query, {
             completed_inference = await task_instance.db_manager.fetch_one(completed_inference_query, {
                 "gfs_time": gfs_init_time,
                 "current_job_id": job_id
@@ -228,26 +201,8 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
                 })
                 
                 logger.info(f"[InferenceTask Job {job_id}] Successfully reused inference files from job {completed_inference['id']}.")
-            if completed_inference:
-                logger.info(f"[InferenceTask Job {job_id}] Found completed inference for GFS time {gfs_init_time} from job {completed_inference['id']}. Reusing files instead of running new inference.")
-                
-                # Update current job to reuse the existing files
-                await update_job_status(task_instance, job_id, "completed", error_message="")
-                await task_instance.db_manager.execute("""
-                    UPDATE weather_miner_jobs 
-                    SET target_netcdf_path = :target_path,
-                        verification_hash = :hash,
-                        processing_end_time = NOW()
-                    WHERE id = :job_id
-                """, {
-                    "job_id": job_id,
-                    "target_path": completed_inference['target_netcdf_path'],
-                    "hash": completed_inference['verification_hash']
-                })
-                
-                logger.info(f"[InferenceTask Job {job_id}] Successfully reused inference files from job {completed_inference['id']}.")
                 return
-                
+
     except Exception as e:
         logger.error(f"[InferenceTask Job {job_id}] Error during duplicate check: {e}", exc_info=True)
         # Continue with inference if duplicate check fails to avoid blocking valid jobs
@@ -2063,53 +2018,7 @@ async def fetch_and_hash_gfs_task(
                 logger.info(f"[FetchHashTask Job {job_id}] Successfully reused input data from concurrent job {concurrent_input_job['id']}.")
                 return
 
-        # Double-check if input data was already fetched by another concurrent job
-        # This prevents redundant work when multiple jobs are queued for the same timestep
-        concurrent_check_query = """
-            SELECT id, input_data_hash, input_batch_pickle_path
-            FROM weather_miner_jobs 
-            WHERE gfs_init_time_utc = :gfs_init
-            AND gfs_t_minus_6_time_utc = :gfs_t_minus_6
-            AND id != :current_job_id
-            AND input_data_hash IS NOT NULL
-            AND input_batch_pickle_path IS NOT NULL
-            AND status IN ('input_hashed_awaiting_validation', 'in_progress', 'completed')
-            ORDER BY validator_request_time ASC
-            LIMIT 1
-        """
-        concurrent_input_job = await task_instance.db_manager.fetch_one(concurrent_check_query, {
-            "gfs_init": t0_run_time,
-            "gfs_t_minus_6": t_minus_6_run_time,
-            "current_job_id": job_id
-        })
-        
-        if concurrent_input_job:
-            # Validate that the batch file still exists before reusing
-            batch_file_path = Path(concurrent_input_job['input_batch_pickle_path'])
-            if not batch_file_path.exists():
-                logger.warning(f"[FetchHashTask Job {job_id}] Batch file {batch_file_path} from concurrent job {concurrent_input_job['id']} no longer exists. Proceeding with normal fetch/hash.")
-            else:
-                logger.info(f"[FetchHashTask Job {job_id}] Found concurrent job {concurrent_input_job['id']} with input data. Reusing instead of re-fetching.")
-                
-                # Update current job to use the existing input data
-                update_query = """
-                    UPDATE weather_miner_jobs
-                    SET input_data_hash = :hash,
-                        input_batch_pickle_path = :pickle_path,
-                        status = :status,
-                        updated_at = :now
-                    WHERE id = :job_id
-                """
-                await task_instance.db_manager.execute(update_query, {
-                    "job_id": job_id,
-                    "hash": concurrent_input_job['input_data_hash'],
-                    "pickle_path": concurrent_input_job['input_batch_pickle_path'],
-                    "status": "input_hashed_awaiting_validation",
-                    "now": datetime.now(timezone.utc)
-                })
-                
-                logger.info(f"[FetchHashTask Job {job_id}] Successfully reused input data from concurrent job {concurrent_input_job['id']}.")
-                return
+
 
         await update_job_status(task_instance, job_id, "fetching_gfs")
 
