@@ -7,7 +7,8 @@ import json
 
 import numpy as np
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import AsyncConnection
+
+from sqlalchemy.dialects import postgresql
 
 from gaia.database.validator_schema import (
     miner_performance_stats_table,
@@ -57,6 +58,33 @@ class MinerPerformance:
     soil_moisture: TaskMetrics = None
     geomagnetic: TaskMetrics = None
     
+    # === NEW WEIGHT CALCULATION PIPELINE FIELDS ===
+    submitted_weight: Optional[float] = None
+    raw_calculated_weight: Optional[float] = None
+    excellence_weight: Optional[float] = None
+    diversity_weight: Optional[float] = None
+    scoring_pathway: Optional[str] = None  # 'excellence', 'diversity', 'none'
+    pathway_details: Optional[Dict[str, Any]] = None
+    
+    # === NEW CHAIN CONSENSUS INTEGRATION FIELDS ===
+    incentive: Optional[float] = None
+    consensus_rank: Optional[int] = None
+    weight_submission_block: Optional[int] = None
+    consensus_block: Optional[int] = None
+    
+    # === NEW TASK WEIGHT CONTRIBUTIONS FIELDS ===
+    weather_weight_contribution: Optional[float] = None
+    geomagnetic_weight_contribution: Optional[float] = None
+    soil_weight_contribution: Optional[float] = None
+    multi_task_bonus: Optional[float] = None
+    
+    # === NEW PERFORMANCE ANALYSIS FIELDS ===
+    percentile_rank_weather: Optional[float] = None
+    percentile_rank_geomagnetic: Optional[float] = None
+    percentile_rank_soil: Optional[float] = None
+    excellence_qualified_tasks: Optional[List[str]] = None
+    validator_hotkey: Optional[str] = None
+    
     # Trend and status
     performance_trend: Optional[str] = None
     trend_confidence: Optional[float] = None
@@ -70,8 +98,78 @@ class MinerPerformance:
 class MinerPerformanceCalculator:
     """Calculates and manages comprehensive miner performance statistics."""
     
-    def __init__(self, db_connection: AsyncConnection):
-        self.db = db_connection
+    def __init__(self, db_manager):
+        """
+        Initialize with database manager instead of raw connection to handle connection lifecycle.
+        
+        Args:
+            db_manager: Database manager instance that handles connection lifecycle
+        """
+        self.db_manager = db_manager
+        self.validator_hotkey: Optional[str] = None  # Will be set by validator
+    
+    def set_validator_context(self, validator_hotkey: str):
+        """Set the validator hotkey for tracking which validator calculated the stats."""
+        self.validator_hotkey = validator_hotkey
+    
+    def _integrate_pathway_data(self, performance: MinerPerformance, miner_uid: str):
+        """Integrate pathway tracking data from weight calculations into performance stats."""
+        try:
+            # Check if we have pathway data for this miner
+            if (hasattr(self, '_current_pathway_data') and 
+                self._current_pathway_data and 
+                int(miner_uid) in self._current_pathway_data):
+                
+                pathway_data = self._current_pathway_data[int(miner_uid)]
+                
+                # Integrate weight calculation pipeline data
+                performance.submitted_weight = pathway_data.get('submitted_weight')
+                performance.raw_calculated_weight = pathway_data.get('raw_calculated_weight')
+                performance.excellence_weight = pathway_data.get('excellence_weight')
+                performance.diversity_weight = pathway_data.get('diversity_weight')
+                performance.scoring_pathway = pathway_data.get('scoring_pathway')
+                performance.pathway_details = pathway_data.get('pathway_details')
+                
+                # Integrate task weight contributions
+                performance.weather_weight_contribution = pathway_data.get('weather_weight_contribution')
+                performance.geomagnetic_weight_contribution = pathway_data.get('geomagnetic_weight_contribution')
+                performance.soil_weight_contribution = pathway_data.get('soil_weight_contribution')
+                performance.multi_task_bonus = pathway_data.get('multi_task_bonus')
+                
+                # Extract percentile ranks from pathway details if available
+                if pathway_data.get('pathway_details') and 'percentile_ranks' in pathway_data['pathway_details']:
+                    percentile_ranks = pathway_data['pathway_details']['percentile_ranks']
+                    performance.percentile_rank_weather = percentile_ranks.get('weather')
+                    performance.percentile_rank_geomagnetic = percentile_ranks.get('geomagnetic')
+                    performance.percentile_rank_soil = percentile_ranks.get('soil')
+                
+                # Extract excellence qualified tasks
+                if pathway_data.get('pathway_details') and 'excellence_qualified_tasks' in pathway_data['pathway_details']:
+                    performance.excellence_qualified_tasks = pathway_data['pathway_details']['excellence_qualified_tasks']
+                
+                logger.debug(f"Integrated pathway data for miner {miner_uid}: pathway={performance.scoring_pathway}, weight={performance.submitted_weight}")
+            
+            # === NEW: Integrate consensus data if available ===
+            if (hasattr(self, '_current_consensus_data') and 
+                self._current_consensus_data and 
+                int(miner_uid) in self._current_consensus_data):
+                
+                consensus_data = self._current_consensus_data[int(miner_uid)]
+                
+                # Integrate chain consensus integration data
+                performance.incentive = consensus_data.get('incentive')
+                performance.consensus_rank = consensus_data.get('consensus_rank')
+                performance.consensus_block = consensus_data.get('consensus_block')
+                
+                # Also capture validator hotkey from consensus data if not set
+                if not performance.validator_hotkey and consensus_data.get('validator_hotkey'):
+                    performance.validator_hotkey = consensus_data.get('validator_hotkey')
+                
+                logger.debug(f"Integrated consensus data for miner {miner_uid}: incentive={performance.incentive}, rank={performance.consensus_rank}")
+                
+        except Exception as e:
+            logger.warning(f"Error integrating pathway data for miner {miner_uid}: {e}")
+            # Continue without pathway data - the rest of the performance stats are still valid
         
     async def calculate_period_stats(
         self,
@@ -113,7 +211,8 @@ class MinerPerformanceCalculator:
                     miner_hotkey=miner_hotkey,
                     period_start=period_start,
                     period_end=period_end,
-                    period_type=period_type
+                    period_type=period_type,
+                    validator_hotkey=self.validator_hotkey  # Automatically set from calculator context
                 )
                 
                 # Calculate task-specific metrics
@@ -129,6 +228,9 @@ class MinerPerformanceCalculator:
                 
                 # Calculate overall metrics
                 self._calculate_overall_metrics(performance)
+                
+                # === NEW: Integrate pathway tracking data if available ===
+                self._integrate_pathway_data(performance, miner_uid)
                 
                 # Calculate trends and status
                 await self._calculate_trends_and_status(performance)
@@ -158,7 +260,7 @@ class MinerPerformanceCalculator:
             )
         )
         
-        result = await self.db.execute(registered_miners_query)
+        result = await self.db_manager.execute(registered_miners_query)
         registered_uids = {str(row[0]) for row in result.fetchall()}
         
         if not registered_uids:
@@ -183,7 +285,7 @@ class MinerPerformanceCalculator:
         # Combine all active miners and filter by registered status
         all_active_miners = set()
         for query in [weather_miners, soil_miners, geo_miners]:
-            result = await self.db.execute(query)
+            result = await self.db_manager.execute(query)
             all_active_miners.update([row[0] for row in result.fetchall()])
         
         # Only return miners that are both active AND currently registered
@@ -195,7 +297,7 @@ class MinerPerformanceCalculator:
     async def _get_miner_hotkey(self, miner_uid: str) -> Optional[str]:
         """Get miner hotkey from node table."""
         query = sa.select(node_table.c.hotkey).where(node_table.c.uid == int(miner_uid))
-        result = await self.db.execute(query)
+        result = await self.db_manager.execute(query)
         row = result.fetchone()
         return row[0] if row else None
     
@@ -233,7 +335,7 @@ class MinerPerformanceCalculator:
             )
         )
         
-        result = await self.db.execute(query)
+        result = await self.db_manager.execute(query)
         rows = result.fetchall()
         
         if not rows:
@@ -327,7 +429,7 @@ class MinerPerformanceCalculator:
             )
         )
         
-        result = await self.db.execute(query)
+        result = await self.db_manager.execute(query)
         rows = result.fetchall()
         
         if not rows:
@@ -409,7 +511,7 @@ class MinerPerformanceCalculator:
             )
         )
         
-        result = await self.db.execute(query)
+        result = await self.db_manager.execute(query)
         rows = result.fetchall()
         
         if not rows:
@@ -708,6 +810,33 @@ class MinerPerformanceCalculator:
                     if perf.geomagnetic and perf.geomagnetic.additional_metrics else None
                 ),
                 
+                # === NEW WEIGHT CALCULATION PIPELINE FIELDS ===
+                'submitted_weight': perf.submitted_weight,
+                'raw_calculated_weight': perf.raw_calculated_weight,
+                'excellence_weight': perf.excellence_weight,
+                'diversity_weight': perf.diversity_weight,
+                'scoring_pathway': perf.scoring_pathway,
+                'pathway_details': json.dumps(perf.pathway_details) if perf.pathway_details else None,
+                
+                # === NEW CHAIN CONSENSUS INTEGRATION FIELDS ===
+                'incentive': perf.incentive,
+                'consensus_rank': perf.consensus_rank,
+                'weight_submission_block': perf.weight_submission_block,
+                'consensus_block': perf.consensus_block,
+                
+                # === NEW TASK WEIGHT CONTRIBUTIONS FIELDS ===
+                'weather_weight_contribution': perf.weather_weight_contribution,
+                'geomagnetic_weight_contribution': perf.geomagnetic_weight_contribution,
+                'soil_weight_contribution': perf.soil_weight_contribution,
+                'multi_task_bonus': perf.multi_task_bonus,
+                
+                # === NEW PERFORMANCE ANALYSIS FIELDS ===
+                'percentile_rank_weather': perf.percentile_rank_weather,
+                'percentile_rank_geomagnetic': perf.percentile_rank_geomagnetic,
+                'percentile_rank_soil': perf.percentile_rank_soil,
+                'excellence_qualified_tasks': perf.excellence_qualified_tasks,
+                'validator_hotkey': perf.validator_hotkey,
+                
                 # Trend and status
                 'performance_trend': perf.performance_trend,
                 'trend_confidence': perf.trend_confidence,
@@ -717,12 +846,13 @@ class MinerPerformanceCalculator:
                 
                 'detailed_metrics': json.dumps(perf.detailed_metrics) if perf.detailed_metrics else None,
                 'score_distribution': json.dumps(perf.score_distribution) if perf.score_distribution else None,
+                # updated_at will be set automatically by the database server default
             }
             
             insert_data.append(row_data)
         
-        # Use upsert to handle existing records
-        stmt = sa.postgresql.insert(miner_performance_stats_table).values(insert_data)
+        # Execute upsert without creating new transaction (caller manages transactions)
+        stmt = postgresql.insert(miner_performance_stats_table).values(insert_data)
         upsert_stmt = stmt.on_conflict_do_update(
             constraint='uq_mps_miner_period',
             set_={
@@ -731,10 +861,8 @@ class MinerPerformanceCalculator:
                 if col.name not in ['id', 'calculated_at']
             }
         )
-        upsert_stmt = upsert_stmt.values(updated_at=sa.func.current_timestamp())
         
-        await self.db.execute(upsert_stmt)
-        await self.db.commit()
+        await self.db_manager.execute(upsert_stmt)
         
         logger.info(f"Successfully saved performance stats for {len(performances)} miners")
     
@@ -746,6 +874,7 @@ class MinerPerformanceCalculator:
             Number of records cleaned up
         """
         try:
+            # Execute queries without creating new transaction (caller manages transactions)
             # Get currently registered miners
             registered_miners_query = sa.select(node_table.c.uid).where(
                 sa.and_(
@@ -755,7 +884,7 @@ class MinerPerformanceCalculator:
                 )
             )
             
-            result = await self.db.execute(registered_miners_query)
+            result = await self.db_manager.execute(registered_miners_query)
             registered_uids = {str(row[0]) for row in result.fetchall()}
             
             if not registered_uids:
@@ -764,7 +893,7 @@ class MinerPerformanceCalculator:
             
             # Get all miners with performance stats
             stats_miners_query = sa.select(miner_performance_stats_table.c.miner_uid.distinct())
-            result = await self.db.execute(stats_miners_query)
+            result = await self.db_manager.execute(stats_miners_query)
             stats_uids = {row[0] for row in result.fetchall()}
             
             # Find miners in stats but not registered
@@ -779,10 +908,9 @@ class MinerPerformanceCalculator:
                 miner_performance_stats_table.c.miner_uid.in_(deregistered_uids)
             )
             
-            result = await self.db.execute(delete_query)
-            await self.db.commit()
-            
+            result = await self.db_manager.execute(delete_query)
             deleted_count = result.rowcount
+            
             logger.info(f"Cleaned up performance stats for {deleted_count} deregistered miners: {list(deregistered_uids)[:10]}...")
             
             return deleted_count
@@ -803,6 +931,7 @@ class MinerPerformanceCalculator:
             True if cleanup was successful, False otherwise
         """
         try:
+            # Execute queries without creating new transaction (caller manages transactions)
             # Build delete conditions
             conditions = [miner_performance_stats_table.c.miner_uid == miner_uid]
             
@@ -814,13 +943,12 @@ class MinerPerformanceCalculator:
                 sa.or_(*conditions)
             )
             
-            result = await self.db.execute(delete_query)
-            await self.db.commit()
-            
+            result = await self.db_manager.execute(delete_query)
             deleted_count = result.rowcount
+            
             if deleted_count > 0:
                 logger.info(f"Cleaned up {deleted_count} performance records for miner UID {miner_uid}")
-            
+        
             return True
             
         except Exception as e:
@@ -927,9 +1055,9 @@ class MinerPerformanceCalculator:
             return 0.0
         return np.mean(((data - mean) / std) ** 4) - 3  # Excess kurtosis
 
-async def calculate_daily_stats(db_connection: AsyncConnection, target_date: datetime):
+async def calculate_daily_stats(db_manager, target_date: datetime):
     """Calculate daily performance statistics for all miners."""
-    calculator = MinerPerformanceCalculator(db_connection)
+    calculator = MinerPerformanceCalculator(db_manager)
     
     period_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
     period_end = period_start + timedelta(days=1)
@@ -943,9 +1071,9 @@ async def calculate_daily_stats(db_connection: AsyncConnection, target_date: dat
     await calculator.save_performance_stats(performances)
     return performances
 
-async def calculate_weekly_stats(db_connection: AsyncConnection, week_start: datetime):
+async def calculate_weekly_stats(db_manager, week_start: datetime):
     """Calculate weekly performance statistics for all miners."""
-    calculator = MinerPerformanceCalculator(db_connection)
+    calculator = MinerPerformanceCalculator(db_manager)
     
     period_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
     period_end = period_start + timedelta(days=7)
@@ -959,9 +1087,9 @@ async def calculate_weekly_stats(db_connection: AsyncConnection, week_start: dat
     await calculator.save_performance_stats(performances)
     return performances
 
-async def calculate_monthly_stats(db_connection: AsyncConnection, month_start: datetime):
+async def calculate_monthly_stats(db_manager, month_start: datetime):
     """Calculate monthly performance statistics for all miners."""
-    calculator = MinerPerformanceCalculator(db_connection)
+    calculator = MinerPerformanceCalculator(db_manager)
     
     # Calculate end of month
     if month_start.month == 12:

@@ -75,11 +75,21 @@ async def evaluate_miner_forecast_day1(
     miner_forecast_ds: Optional[xr.Dataset] = None
 
     try:
-        from .processing.weather_logic import _request_fresh_token
+        from .processing.weather_logic import _request_fresh_token, _is_miner_registered
         
         token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, job_id)
         if token_data_tuple is None:
-            raise ValueError(f"Failed to get fresh access token/URL/manifest_hash for {miner_hotkey} job {job_id}")
+            # Check if miner is still registered before treating this as a critical error
+            is_registered = await _is_miner_registered(task_instance, miner_hotkey)
+            if not is_registered:
+                logger.warning(f"[Day1Score] Miner {miner_hotkey} failed token request and is not in current metagraph - likely deregistered. Skipping day1 scoring for this miner.")
+                day1_results["error_message"] = "Miner not in current metagraph (likely deregistered)"
+                day1_results["overall_day1_score"] = 0.0
+                day1_results["qc_passed_all_vars_leads"] = False
+                return day1_results  # Return graceful failure rather than exception
+            else:
+                logger.error(f"[Day1Score] Miner {miner_hotkey} failed token request but is still registered in metagraph. This may indicate a miner-side issue or network problem.")
+                raise ValueError(f"Failed to get fresh access token/URL/manifest_hash for {miner_hotkey} job {job_id}")
 
         access_token, zarr_store_url, claimed_manifest_content_hash = token_data_tuple
         
@@ -218,7 +228,6 @@ async def evaluate_miner_forecast_day1(
                     task.cancel()
             del timestep_tasks, tasks_only, timestep_results
             # Force immediate cleanup of completed task objects
-            import gc
             collected = gc.collect()
             logger.debug(f"[Day1Score] Miner {miner_hotkey}: Post-processing cleanup collected {collected} objects")
         except Exception as cleanup_err:
@@ -738,7 +747,6 @@ async def _process_single_variable_parallel(
             
             # Force garbage collection if we cleaned significant objects
             if cleaned_count > 3:
-                import gc
                 collected = gc.collect()
                 logger.debug(f"[Day1Score] Variable {var_key} cleanup: removed {cleaned_count} objects, GC collected {collected}")
                 
@@ -1350,7 +1358,6 @@ async def _process_single_timestep_parallel(
             
             # Force garbage collection for time step cleanup
             if cleaned_count > 0:
-                import gc
                 collected = gc.collect()
                 logger.debug(f"[Day1Score] Timestep {valid_time_dt} cleanup: removed {cleaned_count} objects, GC collected {collected}")
                 

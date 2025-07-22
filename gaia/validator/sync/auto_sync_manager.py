@@ -1763,6 +1763,21 @@ pg1-user={self.config['pguser']}
 
     async def _backup_scheduler(self):
         """Resilient backup scheduling with catch-up logic and multiple trigger opportunities."""
+        # Register this scheduler for global memory cleanup coordination
+        try:
+            from gaia.utils.global_memory_manager import register_thread_cleanup
+            
+            def cleanup_backup_caches():
+                # Clear any caches that accumulate during backup operations
+                import gc
+                collected = gc.collect()
+                logger.debug(f"[BackupScheduler] Performed cleanup, collected {collected} objects")
+            
+            register_thread_cleanup("backup_scheduler", cleanup_backup_caches)
+            logger.debug("[BackupScheduler] Registered for global memory cleanup")
+        except Exception as e:
+            logger.debug(f"[BackupScheduler] Failed to register cleanup: {e}")
+        
         last_full_backup = datetime.now().date()
         last_diff_backup = datetime.now()
         last_check = datetime.now()
@@ -1956,6 +1971,21 @@ pg1-user={self.config['pguser']}
 
     async def _replica_sync_scheduler(self):
         """Application-controlled replica sync scheduling coordinated with primary backups."""
+        # Register this scheduler for global memory cleanup coordination
+        try:
+            from gaia.utils.global_memory_manager import register_thread_cleanup
+            
+            def cleanup_replica_caches():
+                # Clear any caches that accumulate during replica sync operations
+                import gc
+                collected = gc.collect()
+                logger.debug(f"[ReplicaScheduler] Performed cleanup, collected {collected} objects")
+            
+            register_thread_cleanup("replica_sync_scheduler", cleanup_replica_caches)
+            logger.debug("[ReplicaScheduler] Registered for global memory cleanup")
+        except Exception as e:
+            logger.debug(f"[ReplicaScheduler] Failed to register cleanup: {e}")
+        
         # Initialize last_sync - if we just did a startup sync, we don't need to sync again immediately
         last_sync = datetime.now()
         last_check = datetime.now()

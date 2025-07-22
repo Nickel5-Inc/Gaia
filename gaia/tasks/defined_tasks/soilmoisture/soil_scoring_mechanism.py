@@ -18,6 +18,7 @@ from gaia.tasks.defined_tasks.soilmoisture.utils.evaluation_metrics import calcu
 from skimage.metrics import structural_similarity as ssim
 from pydantic import Field
 from fiber.logging_utils import get_logger
+from gaia.utils.global_memory_manager import register_thread_cleanup
 import os
 import traceback
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
@@ -71,6 +72,27 @@ class SoilScoringMechanism(ScoringMechanism):
         self.db_manager = db_manager
         self.task = task
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
+        
+        # Register cleanup for soil scoring caches that accumulate during processing
+        self._setup_memory_cleanup()
+
+    def _setup_memory_cleanup(self):
+        """Setup memory cleanup for soil scoring thread pools and caches."""
+        try:
+            def cleanup_soil_caches():
+                # Clear any accumulated caches in the scoring mechanism
+                if hasattr(torch, '_C') and hasattr(torch._C, '_clear_cublas_cache'):
+                    torch._C._clear_cublas_cache()
+                if hasattr(torch.cuda, 'empty_cache'):
+                    torch.cuda.empty_cache()
+                # Clear any local caches that might accumulate
+                logger.debug("Cleared soil scoring caches")
+            
+            register_thread_cleanup("soil_scoring_mechanism_caches", cleanup_soil_caches)
+            logger.debug("Registered global memory cleanup for soil scoring mechanism")
+            
+        except Exception as e:
+            logger.debug(f"Failed to setup global memory cleanup for soil scoring: {e}")
 
     def sigmoid_rmse(self, rmse: float) -> float:
         """Convert RMSE to score using sigmoid function. (higher is better)"""

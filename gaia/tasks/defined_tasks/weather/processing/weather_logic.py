@@ -26,6 +26,7 @@ except ImportError:
     def loads(s):
         return json.loads(s)
 from ..utils.remote_access import open_verified_remote_zarr_dataset
+from ..utils.json_sanitizer import safe_json_dumps_for_db
 from ..utils.era5_api import fetch_era5_data
 from ..utils.gfs_api import fetch_gfs_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
 from ..utils.variable_maps import AURORA_TO_GFS_VAR_MAP
@@ -35,6 +36,50 @@ from fiber.logging_utils import get_logger
 from ..weather_scoring.scoring import VARIABLE_WEIGHTS
 
 logger = get_logger(__name__)
+
+async def _is_miner_registered(task_instance, miner_hotkey: str) -> bool:
+    """
+    Check if a miner is still registered in the current metagraph.
+    
+    Args:
+        task_instance: WeatherTask instance with access to validator
+        miner_hotkey: The miner's hotkey to check
+        
+    Returns:
+        bool: True if miner is registered, False otherwise
+    """
+    try:
+        # Access validator's metagraph through the task instance
+        if not hasattr(task_instance, 'validator') or not task_instance.validator:
+            logger.warning(f"Cannot check miner registration for {miner_hotkey}: No validator instance available")
+            return True  # Default to True to avoid false positives
+            
+        validator = task_instance.validator
+        
+        # Check if metagraph is available
+        if not hasattr(validator, 'metagraph') or not validator.metagraph:
+            logger.warning(f"Cannot check miner registration for {miner_hotkey}: Metagraph not available")
+            return True  # Default to True to avoid false positives
+            
+        # Check if metagraph has nodes
+        if not hasattr(validator.metagraph, 'nodes') or not validator.metagraph.nodes:
+            logger.warning(f"Cannot check miner registration for {miner_hotkey}: Metagraph nodes not available")
+            return True  # Default to True to avoid false positives
+            
+        # Check if miner hotkey exists in current metagraph
+        is_registered = miner_hotkey in validator.metagraph.nodes
+        
+        if not is_registered:
+            logger.warning(f"Miner {miner_hotkey} not found in current metagraph (may be deregistered)")
+        else:
+            logger.debug(f"Miner {miner_hotkey} confirmed as registered in metagraph")
+            
+        return is_registered
+        
+    except Exception as e:
+        logger.error(f"Error checking miner registration for {miner_hotkey}: {e}")
+        return True  # Default to True to avoid false positives on errors
+
 async def _update_run_status(task_instance: 'WeatherTask', run_id: int, status: str, error_message: Optional[str] = None, gfs_metadata: Optional[dict] = None):
     """Helper to update the forecast run status and optionally other fields."""
     logger.info(f"[Run {run_id}] Updating run status to '{status}'.")
@@ -57,7 +102,9 @@ async def _update_run_status(task_instance: 'WeatherTask', run_id: int, status: 
         WHERE id = :run_id
     """
     try:
-        query_preview = query[:200].replace('\n', ' ')
+        # Safe query preview handling
+        query_str = str(query) if hasattr(query, '__str__') else query
+        query_preview = query_str[:200].replace('\n', ' ') if isinstance(query_str, str) else str(query)[:200]
         logger.info(f"[Run {run_id}] ABOUT TO EXECUTE update status to '{status}'. Query: {query_preview}")
         await task_instance.db_manager.execute(query, params)
         logger.info(f"[Run {run_id}] SUCCESSFULLY EXECUTED update status to '{status}'.")
@@ -724,7 +771,14 @@ async def calculate_era5_miner_score(
         stored_manifest_hash = stored_response_data['verification_hash_claimed']
         token_data_tuple = await _request_fresh_token(task_instance, miner_hotkey, job_id)
         if token_data_tuple is None:
-            raise ValueError(f"Failed to get fresh access token for {miner_hotkey} job {job_id}. Cannot ensure Zarr URL is current.")
+            # Check if miner is still registered before treating this as a critical error
+            is_registered = await _is_miner_registered(task_instance, miner_hotkey)
+            if not is_registered:
+                logger.warning(f"[FinalScore] Miner {miner_hotkey} failed token request and is not in current metagraph - likely deregistered. Skipping final scoring for this miner.")
+                return False  # Skip this miner gracefully rather than causing worker failure
+            else:
+                logger.error(f"[FinalScore] Miner {miner_hotkey} failed token request but is still registered in metagraph. This may indicate a miner-side issue or network problem.")
+                raise ValueError(f"Failed to get fresh access token for {miner_hotkey} job {job_id}. Cannot ensure Zarr URL is current.")
         
         access_token, current_zarr_store_url, _ = token_data_tuple
         
@@ -746,39 +800,13 @@ async def calculate_era5_miner_score(
         if miner_forecast_ds is None:
             raise ConnectionError(f"Failed to open verified Zarr dataset for miner {miner_hotkey}")
 
+        # Final scoring uses ERA5-based skill scores only (no GFS operational forecast)
+        # GFS data is typically unavailable by the time final scoring runs due to retention limits
         gfs_operational_fcst_ds = None
-        if gfs_init_time_of_run:
-            try:
-                unique_lead_hours_for_gfs_fetch = sorted(list(set([
-                    int((vt - gfs_init_time_of_run).total_seconds() / 3600) for vt in target_datetimes
-                ])))
-
-                gfs_vars_to_request = list(set(AURORA_TO_GFS_VAR_MAP.get(vc['name']) 
-                                               for vc in final_scoring_config["variables_levels_to_score"] 
-                                               if AURORA_TO_GFS_VAR_MAP.get(vc['name']))) # Get GFS names
-                
-                gfs_surface_vars_req = [v for v in gfs_vars_to_request if v in GFS_SURFACE_VARS]
-                gfs_atmos_vars_req = [v for v in gfs_vars_to_request if v in GFS_ATMOS_VARS]
-                pressure_levels_req = list(set(vc.get('level') 
-                                              for vc in final_scoring_config["variables_levels_to_score"] 
-                                              if vc.get('level') is not None))
-                if not pressure_levels_req:
-                    pressure_levels_req = None 
-
-                logger.info(f"[FinalScore] Fetching GFS operational reference: Init={gfs_init_time_of_run}, Leads={unique_lead_hours_for_gfs_fetch}, PSurf={gfs_surface_vars_req}, PAtm={gfs_atmos_vars_req}, PLevels={pressure_levels_req}")
-                gfs_operational_fcst_ds = await fetch_gfs_data(
-                    run_time=gfs_init_time_of_run,
-                    lead_hours=unique_lead_hours_for_gfs_fetch,
-                    target_surface_vars=gfs_surface_vars_req if gfs_surface_vars_req else None,
-                    target_atmos_vars=gfs_atmos_vars_req if gfs_atmos_vars_req else None,
-                    target_pressure_levels_hpa=pressure_levels_req
-                )
-            except Exception as e_fetch_gfs_ref:
-                logger.error(f"[FinalScore] Miner {miner_hotkey}: Error fetching GFS operational reference forecast: {e_fetch_gfs_ref}", exc_info=True)
-                gfs_operational_fcst_ds = None
+        logger.debug(f"[FinalScore] Miner {miner_hotkey}: Using ERA5-climatology skill scores (GFS operational not used for final scoring)")
 
         if gfs_operational_fcst_ds is None:
-            logger.warning(f"[FinalScore] Miner {miner_hotkey}: Failed to fetch/process GFS operational reference forecast. Skill score vs GFS will not be available.")
+            logger.debug(f"[FinalScore] Miner {miner_hotkey}: Using ERA5-climatology-based skill scores only (no GFS operational reference in final scoring)")
 
         for valid_time_dt in target_datetimes:
             logger.info(f"[FinalScore] Miner {miner_hotkey}: Processing Valid Time: {valid_time_dt}")
@@ -1143,7 +1171,7 @@ async def calculate_era5_miner_score(
                             logger.error(f"[FinalScore] UID {miner_uid} - Error calculating skill score for {var_key} L{lead_hours}h: {e_skill}", exc_info=True)
                             skill_score_val = None
                     else:
-                        logger.warning(f"[FinalScore] UID {miner_uid} - No GFS forecast data available for skill score calculation")
+                        logger.debug(f"[FinalScore] UID {miner_uid} - Using ERA5-climatology skill scores (GFS operational not available)")
                     
                     if skill_score_val is None:
                         try:
@@ -1239,7 +1267,9 @@ async def calculate_era5_miner_score(
         params.setdefault('metrics', {}) 
         params.setdefault('error_message', None)
 
-        params["metrics_json"] = dumps(params.pop("metrics"), default=str) 
+        # Use safe JSON serialization to handle infinity/NaN values
+        from ..utils.json_sanitizer import safe_json_dumps_for_db
+        params["metrics_json"] = safe_json_dumps_for_db(params.pop("metrics")) 
         
         try:
             await task_instance.db_manager.execute(insert_query, params)
@@ -1309,9 +1339,9 @@ async def _calculate_and_store_aggregated_era5_score(
                 )
                 if skill_rec_clim and skill_rec_clim['score'] is not None and np.isfinite(skill_rec_clim['score']):
                     skill_score_val = skill_rec_clim['score']
-                    logger.info(f"[AggFinalScore] UID {miner_uid} - Using CLIM-based skill for {var_key} L{lead_h}h: {skill_score_val:.4f} (GFS-based not found/valid)")
+                    logger.info(f"[AggFinalScore] UID {miner_uid} - Using CLIM-based skill for {var_key} L{lead_h}h: {skill_score_val:.4f} (ERA5-climatology skill scoring)")
                 else:
-                    logger.warning(f"[AggFinalScore] UID {miner_uid} - No valid GFS or CLIM skill score found for {var_key} L{lead_h}h.")
+                    logger.warning(f"[AggFinalScore] UID {miner_uid} - No valid climatology skill score found for {var_key} L{lead_h}h.")
             
             acc_score_type = f"era5_acc_{var_key}_{lead_h}h"
             acc_rec = await task_instance.db_manager.fetch_one(
@@ -1359,7 +1389,7 @@ async def _calculate_and_store_aggregated_era5_score(
         "response_id": response_id, "run_id": run_id, "miner_uid": miner_uid, "miner_hotkey": miner_hotkey,
         "score_type": agg_score_type, 
         "score": final_score_val if np.isfinite(final_score_val) else 0.0,
-        "metrics_json": dumps(metrics_for_agg_score, default=str),
+        "metrics_json": safe_json_dumps_for_db(metrics_for_agg_score),
         "calculation_time": calc_time,
         "error_message": None,
         "lead_hours": -1,  # Use -1 for aggregated scores to fix NULL unique constraint issue

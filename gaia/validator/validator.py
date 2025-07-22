@@ -44,7 +44,8 @@ try:
     root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root_dir not in sys.path:
         sys.path.insert(0, root_dir)
-    
+    # Enable PyTorch CUDA memory allocation configuration 
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     import runtime_weight_tracer
     print("🔍 [MAIN] Weight tracing available - enabling...")
     runtime_weight_tracer.enable_weight_tracing()
@@ -607,10 +608,10 @@ class GaiaValidator:
         self.memory_monitor_enabled = os.getenv('VALIDATOR_MEMORY_MONITORING_ENABLED', 'true').lower() in ['true', '1', 'yes']
         self.pm2_restart_enabled = os.getenv('VALIDATOR_PM2_RESTART_ENABLED', 'true').lower() in ['true', '1', 'yes']
         
-        # AGGRESSIVE MEMORY THRESHOLDS - Lower defaults for more aggressive restart behavior
-        self.memory_warning_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_WARNING_THRESHOLD_MB', '8000'))  # 8GB (reduced from 10GB)
-        self.memory_emergency_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB', '10000'))  # 10GB (reduced from 12GB)  
-        self.memory_critical_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB', '12000'))  # 12GB (reduced from 15GB)
+        # REALISTIC MEMORY THRESHOLDS - Appropriate for 32GB systems running weather scoring
+        self.memory_warning_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_WARNING_THRESHOLD_MB', '20000'))  # 20GB (62% of 32GB) - informational only
+        self.memory_emergency_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB', '25000'))  # 25GB (78% of 32GB) - light GC, close monitoring  
+        self.memory_critical_threshold_mb = int(os.getenv('VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB', '29000'))  # 29GB (90% of 32GB) - restart to avoid OOM
         
         # Memory monitoring state
         self.last_memory_log_time = 0
@@ -1016,9 +1017,9 @@ class GaiaValidator:
                     follow_redirects=True,
                     verify=False,
                     limits=httpx.Limits(
-                        max_connections=60,   # REDUCED: 100->60
-                        max_keepalive_connections=20,  # REDUCED: 50->20
-                        keepalive_expiry=60,  # REDUCED: 300->60 seconds
+                        max_connections=60,   # REDUCED: 100->60 to prevent resource exhaustion
+                        max_keepalive_connections=20,  # REDUCED: 50->20 to reduce memory pressure
+                        keepalive_expiry=60,  # REDUCED: 300->60 seconds for faster cleanup
                     ),
                     transport=httpx.AsyncHTTPTransport(
                         retries=2,  # INCREASED: Allow more retries for better reliability
@@ -1478,18 +1479,12 @@ class GaiaValidator:
                         f"{tracemalloc_info}"
                     )
                     
-                    # Trigger comprehensive cleanup for large memory increases (but not during startup)
-                    if (memory_change > 200 and 
-                        hasattr(self, 'last_metagraph_sync')):  # Only after validator is fully running
-                        logger.warning(f"Large memory increase detected ({memory_change:.1f}MB), forcing comprehensive cleanup")
-                        memory_freed = self._comprehensive_memory_cleanup(f"emergency_{context}")
-                        
-                        # Check memory again after comprehensive cleanup
-                        new_memory = process.memory_info().rss / (1024 * 1024)
-                        total_savings = current_memory - new_memory
-                        logger.info(f"Emergency comprehensive cleanup freed {memory_freed:.1f}MB (total reduction: {total_savings:.1f}MB)")
-                    elif memory_change > 200:
-                        logger.info(f"Large memory increase detected during startup ({memory_change:.1f}MB) - skipping cleanup until fully initialized")
+                    # Log large memory increases but let unified periodic cleanup handle them
+                    if memory_change > 200:
+                        if hasattr(self, 'last_metagraph_sync'):
+                            logger.info(f"Large memory increase detected ({memory_change:.1f}MB) - periodic cleanup will handle if needed")
+                        else:
+                            logger.info(f"Large memory increase detected during startup ({memory_change:.1f}MB) - normal for initialization")
                         
                 except Exception as e:
                     logger.info(f"Memory usage [{context}]: {current_memory:.1f}MB ({'+' if memory_change > 0 else ''}{memory_change:.1f}MB) - detailed info error: {e}")
@@ -1832,18 +1827,18 @@ class GaiaValidator:
     def _check_critical_operations_active(self):
         """Check if any critical operations are currently active that shouldn't be interrupted.
         
-        MEMORY LEAK FIX: Made much more restrictive - only weight_setting is truly critical.
-        All other operations can be safely interrupted and restarted to prevent OOM.
+        With higher memory thresholds, we can be more protective of important operations.
         """
         critical_ops = []
         
         for task_name, health in self.task_health.items():
             if health['status'] in ['processing'] and health.get('current_operation'):
-                # AGGRESSIVE RESTART: Only weight_setting is truly critical and cannot be interrupted
-                # All other operations (miner_query, scoring, data_fetch, db_sync) can be safely
-                # interrupted and restarted to prevent system death from OOM
+                # Critical operations that should have brief grace period before forced restart
                 critical_operation_patterns = [
-                    'weight_setting',  # ONLY weight setting is critical - blockchain integrity
+                    'weight_setting',  # Blockchain integrity - always critical
+                    'scoring',         # Weather scoring is expensive to restart
+                    'day1_scoring',    # Day1 scoring in progress
+                    'era5_scoring',    # ERA5 final scoring in progress
                 ]
                 
                 current_op = health.get('current_operation', '')
@@ -2842,11 +2837,16 @@ class GaiaValidator:
                 await self.database_manager.initialize_database()
                 logger.info("Database tables initialized.")
                 
-                # Initialize performance calculator with database connection
+                # Initialize performance calculator with database manager
                 try:
-                    db_connection = await self.database_manager.get_raw_connection()
-                    self.performance_calculator = MinerPerformanceCalculator(db_connection)
-                    logger.info("Performance calculator initialized.")
+                    self.performance_calculator = MinerPerformanceCalculator(self.database_manager)
+                    # Set validator context for pathway tracking
+                    if hasattr(self, 'config') and self.config and hasattr(self.config.wallet, 'hotkey'):
+                        validator_hotkey = self.config.wallet.hotkey.ss58_address
+                        self.performance_calculator.set_validator_context(validator_hotkey)
+                        logger.info(f"Performance calculator initialized with validator context: {validator_hotkey[:8]}...")
+                    else:
+                        logger.info("Performance calculator initialized (no validator hotkey available)")
                 except Exception as e:
                     logger.error(f"Failed to initialize performance calculator: {e}")
                     # Continue without performance calculator - it's not critical
@@ -3602,6 +3602,9 @@ class GaiaValidator:
                             if successful_adds > 0:
                                 logger.info(f"Added {successful_adds} new miners to the database (fallback)")
 
+                    # === NEW: Chain Integration - Update performance stats with consensus data ===
+                    await self._integrate_chain_consensus_data(chain_nodes_info)
+                    
                     logger.info("Miner state synchronization cycle completed.")
 
             except asyncio.CancelledError:
@@ -3896,6 +3899,9 @@ class GaiaValidator:
             excellence_count = {'weather': 0, 'geomagnetic': 0, 'soil': 0}
             diversity_count = {'1_task': 0, '2_task': 0, '3_task': 0}
             
+            # === NEW: Capture pathway tracking data for miner performance stats ===
+            pathway_tracking = {}  # UID -> pathway details
+            
             for idx in range(256):
                 # Get scores for this miner
                 w_s, g_s, sm_s = weather_scores[idx], geomagnetic_scores[idx], soil_scores[idx]
@@ -3955,12 +3961,50 @@ class GaiaValidator:
                 # FINAL WEIGHT: Maximum of excellence and diversity pathways
                 weights_final[idx] = max(excellence_weight, diversity_weight)
                 
+                # === NEW: Capture pathway tracking data ===
+                pathway_chosen = "excellence" if excellence_weight > diversity_weight else "diversity"
+                if excellence_weight == 0 and diversity_weight == 0:
+                    pathway_chosen = "none"
+                
+                # Calculate task percentile ranks for this miner
+                percentile_ranks = {}
+                qualified_tasks = []
+                for task_name, score in [('weather', w_s), ('geomagnetic', g_s), ('soil', sm_s)]:
+                    if not np.isnan(score):
+                        percentile_ranks[task_name] = get_percentile_rank(score, task_name)
+                        # Check if qualified for excellence in this task
+                        if (task_name in task_percentiles and 
+                            task_percentiles[task_name]['valid_count'] >= 10 and 
+                            score >= task_percentiles[task_name]['percentile_85']):
+                            qualified_tasks.append(task_name)
+                
+                # Store detailed pathway information
+                pathway_tracking[idx] = {
+                    'raw_calculated_weight': float(weights_final[idx]),
+                    'excellence_weight': float(excellence_weight),
+                    'diversity_weight': float(diversity_weight),
+                    'scoring_pathway': pathway_chosen,
+                    'pathway_details': {
+                        'weather_score': float(w_s) if not np.isnan(w_s) else None,
+                        'geomagnetic_score': float(g_s) if not np.isnan(g_s) else None,
+                        'soil_score': float(sm_s) if not np.isnan(sm_s) else None,
+                        'percentile_ranks': percentile_ranks,
+                        'excellence_qualified_tasks': qualified_tasks,
+                        'diversity_contributions': {k: float(v) for k, v in diversity_contributions.items()},
+                        'multi_task_bonus': float(multi_task_bonus) if num_tasks > 0 else None,
+                        'num_active_tasks': num_tasks
+                    },
+                    'weather_weight_contribution': float(diversity_contributions.get('weather', 0.0)),
+                    'geomagnetic_weight_contribution': float(diversity_contributions.get('geomagnetic', 0.0)),
+                    'soil_weight_contribution': float(diversity_contributions.get('soil', 0.0)),
+                    'multi_task_bonus': float(multi_task_bonus) if num_tasks > 0 else 0.0
+                }
+                
                 # Debug logging for significant weights or pathway switches
                 if weights_final[idx] > 0.1:
-                    pathway = "excellence" if excellence_weight > diversity_weight else "diversity"
                     node_obj = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None
                     hk_chain = node_obj.get('hotkey', 'N/A')[:8] if node_obj else 'N/A'
-                    logger.debug(f"UID {idx} ({hk_chain}): {pathway} pathway, "
+                    logger.debug(f"UID {idx} ({hk_chain}): {pathway_chosen} pathway, "
                                f"excellence={excellence_weight:.4f}, diversity={diversity_weight:.4f}, "
                                f"final={weights_final[idx]:.4f}")
             
@@ -4025,6 +4069,12 @@ class GaiaValidator:
                 logger.warning("Sum of weights is zero, cannot normalize! Returning None.")
                 final_weights_list = None
             
+            # === NEW: Update pathway tracking with final submitted weights ===
+            if final_weights_list:
+                for idx in range(256):
+                    if idx in pathway_tracking:
+                        pathway_tracking[idx]['submitted_weight'] = final_weights_list[idx]
+            
             # Clean up all intermediate arrays to prevent memory leaks
             try:
                 del weather_scores, geomagnetic_scores, soil_scores
@@ -4036,14 +4086,16 @@ class GaiaValidator:
                 if 'positives' in locals(): del positives
                 if 'trans_nz' in locals(): del trans_nz
                 if 'sorted_indices' in locals(): del sorted_indices
+                # DON'T delete pathway_tracking - we need to return it
             except Exception as cleanup_e:
                 logger.warning(f"Error during sync weight calculation cleanup: {cleanup_e}")
             
-            return final_weights_list
+            # Return both weights and pathway tracking data
+            return final_weights_list, pathway_tracking
         
         except Exception as calc_error:
             logger.error(f"Error in sync weight calculation: {calc_error}")
-            return None
+            return None, {}  # Return same structure: (weights, pathway_tracking)
 
     async def _calc_task_weights(self):
         """Calculate weights based on recent task scores. Async part fetches data."""
@@ -4062,14 +4114,26 @@ class GaiaValidator:
             FROM score_table 
             WHERE task_name = :task_name AND created_at >= :start_time ORDER BY created_at DESC
             """
-            # Modified weather query to capture delayed ERA5 final scores (80% of weather score weight)
+            # Modified weather query to handle run-specific naming and prioritize final over initial scores
             # Note: weather scores use GFS init time as created_at, not evaluation time
             # Day1 QC scores (20% weight) arrive quickly, ERA5 final scores (80% weight) arrive ~10 days later
             weather_query = """
-            SELECT score, created_at 
+            SELECT score, created_at, task_id
             FROM score_table 
             WHERE task_name = 'weather' AND created_at >= :weather_start_time 
-            ORDER BY created_at DESC LIMIT 100
+            AND (
+                task_id LIKE 'final_weather_scores%' OR 
+                task_id LIKE 'initial_weather_scores%' OR
+                task_id = 'final_weather_scores' OR
+                task_id = 'initial_weather_scores'
+            )
+            ORDER BY 
+                CASE 
+                    WHEN task_id LIKE 'final_weather_scores%' OR task_id = 'final_weather_scores' THEN 0 
+                    ELSE 1 
+                END,
+                created_at DESC 
+            LIMIT 100
             """
             # Get 24 hours of geomagnetic data for scoring
             geomagnetic_query = """
@@ -4099,6 +4163,12 @@ class GaiaValidator:
             # Fetch all data concurrently using regular async approach
             try:
                 self._log_memory_usage("calc_weights_before_db_fetch")
+                
+                # Debug weather query parameters
+                logger.info(f"Weather query debug - current time: {now}, lookback time: {weather_lookback}, days back: {(now - weather_lookback).days}")
+                logger.info(f"Weather query: {weather_query}")
+                logger.info(f"Weather params: {weather_params}")
+                
                 weather_results, geomagnetic_results, soil_results, validator_nodes_list = await asyncio.gather(
                     self.database_manager.fetch_all(weather_query, weather_params),
                     self.database_manager.fetch_all(geomagnetic_query, geo_params),
@@ -4117,6 +4187,22 @@ class GaiaValidator:
                         newest_score = max(row['created_at'] for row in weather_results) 
                         score_age_range = (now - oldest_score).days
                         logger.info(f"Weather scores age range: {score_age_range} days (newest: {(now - newest_score).days} days old)")
+                    else:
+                        logger.warning("Weather query returned empty results - checking manually...")
+                        # Debug query to check what weather scores exist
+                        debug_weather_query = "SELECT COUNT(*), MIN(created_at), MAX(created_at), array_agg(DISTINCT task_id) as task_ids FROM score_table WHERE task_name = 'weather'"
+                        debug_result = await self.database_manager.fetch_one(debug_weather_query)
+                        logger.info(f"Debug weather check: {debug_result}")
+                else:
+                    logger.warning(f"Weather query failed or returned no results: {type(weather_results)} - {weather_results if isinstance(weather_results, Exception) else 'Empty result'}")
+                    # Additional debug for empty weather results
+                    debug_weather_query = "SELECT COUNT(*), MIN(created_at), MAX(created_at), array_agg(DISTINCT task_id) as task_ids FROM score_table WHERE task_name = 'weather'"
+                    try:
+                        debug_result = await self.database_manager.fetch_one(debug_weather_query)
+                        logger.info(f"Debug weather check: {debug_result}")
+                    except Exception as debug_e:
+                        logger.error(f"Debug weather query failed: {debug_e}")
+                        
                 if geomagnetic_results and not isinstance(geomagnetic_results, Exception):
                     logger.info(f"Geomagnetic dataset: {len(geomagnetic_results)} records")
                 if soil_results and not isinstance(soil_results, Exception):
@@ -4172,6 +4258,14 @@ class GaiaValidator:
                     total_records = len(weather_results) + len(geomagnetic_results) + len(soil_results)
                     logger.info(f"Processing {total_records} total database records for weight calculation")
                     
+                    # Trigger performance statistics calculation after gathering all task scores
+                    # This ensures performance stats are updated when new scores are available
+                    try:
+                        logger.info("🔄 Triggering performance statistics calculation after score gathering...")
+                        await self._calculate_performance_statistics(force_calculation=False)
+                    except Exception as perf_err:
+                        logger.error(f"Error calculating performance statistics: {perf_err}")
+                    
                     # Force garbage collection before the heavy sync calculation
                     collected = gc.collect()
                     logger.debug(f"Pre-sync GC: collected {collected} objects before weight calculation")
@@ -4183,7 +4277,7 @@ class GaiaValidator:
                 # Perform CPU-bound weight calculation in thread pool to avoid blocking
                 self._log_memory_usage("calc_weights_before_sync_calc")
                 loop = asyncio.get_event_loop()
-                final_weights_list = await loop.run_in_executor(
+                weight_result = await loop.run_in_executor(
                     None,
                     self._perform_weight_calculations_sync,
                     weather_results,
@@ -4193,6 +4287,23 @@ class GaiaValidator:
                     validator_nodes_by_uid_list
                 )
                 self._log_memory_usage("calc_weights_after_sync_calc")
+                
+                # === NEW: Handle enhanced return structure with pathway tracking ===
+                if isinstance(weight_result, tuple) and len(weight_result) == 2:
+                    final_weights_list, pathway_tracking = weight_result
+                    logger.info(f"Captured pathway tracking data for {len(pathway_tracking)} miners")
+                    
+                    # Store pathway tracking in performance calculator for later integration
+                    if self.performance_calculator and pathway_tracking:
+                        # Store current pathway tracking data in the calculator
+                        if not hasattr(self.performance_calculator, '_current_pathway_data'):
+                            self.performance_calculator._current_pathway_data = {}
+                        self.performance_calculator._current_pathway_data.update(pathway_tracking)
+                        logger.debug("Pathway tracking data stored in performance calculator")
+                else:
+                    # Fallback for old return format or error cases
+                    final_weights_list = weight_result
+                    logger.warning("Weight calculation returned old format or failed - no pathway tracking available")
 
                 # MEMORY CLEANUP after sync calculation (scope-aware)
                 try:
@@ -4298,7 +4409,7 @@ class GaiaValidator:
         
         logger.info("DB Sync initialization completed (not active).")
 
-    async def _calculate_performance_statistics(self):
+    async def _calculate_performance_statistics(self, force_calculation: bool = False):
         """Calculate and store miner performance statistics periodically."""
         try:
             # Only calculate if performance calculator is initialized and enough time has passed
@@ -4307,8 +4418,8 @@ class GaiaValidator:
                 return
             
             current_time = time.time()
-            # Calculate daily stats once every 2 hours (7200 seconds)
-            if current_time - self.last_performance_calculation < 7200:
+            # Calculate daily stats once every 30 minutes (1800 seconds) - more frequent for better responsiveness
+            if not force_calculation and current_time - self.last_performance_calculation < 1800:
                 logger.debug(f"Skipping performance calculation - only {current_time - self.last_performance_calculation:.0f}s since last calculation")
                 return
             
@@ -4317,11 +4428,8 @@ class GaiaValidator:
             # Calculate daily statistics for today
             today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             
-            # Get database connection for the performance calculator
-            db_connection = await self.database_manager.get_raw_connection()
-            
-            # Use daily stats calculation function
-            daily_performances = await calculate_daily_stats(db_connection, today)
+            # Use daily stats calculation function with database manager
+            daily_performances = await calculate_daily_stats(self.database_manager, today)
             
             if daily_performances:
                 logger.info(f"✅ Calculated performance stats for {len(daily_performances)} miners")
@@ -4349,6 +4457,72 @@ class GaiaValidator:
         except Exception as e:
             logger.error(f"Error calculating performance statistics: {e}")
             logger.error(traceback.format_exc())
+    
+    async def _integrate_chain_consensus_data(self, chain_nodes_info: Dict[int, Any]):
+        """
+        Integrate chain consensus data (incentive values, block info) into performance statistics.
+        This method captures the final chain consensus results and stores them for analysis.
+        """
+        try:
+            if not self.performance_calculator:
+                logger.debug("Performance calculator not available for chain integration")
+                return
+            
+            # Get current block information using the existing cached method
+            current_block = None
+            try:
+                current_block = self._get_current_block_cached()
+            except Exception as block_err:
+                logger.debug(f"Could not get current block number: {block_err}")
+                # Fallback to current_block attribute if cache method fails
+                if hasattr(self, 'current_block'):
+                    current_block = self.current_block
+            
+            # Prepare consensus data for miners with incentive values
+            consensus_updates = {}
+            valid_miners = 0
+            
+            for uid, chain_node in chain_nodes_info.items():
+                try:
+                    if (hasattr(chain_node, 'incentive') and 
+                        chain_node.incentive is not None and 
+                        float(chain_node.incentive) > 0):
+                        
+                        consensus_updates[uid] = {
+                            'incentive': float(chain_node.incentive),
+                            'consensus_block': current_block,
+                            'validator_hotkey': self.validator_hotkey if hasattr(self, 'validator_hotkey') else None
+                        }
+                        valid_miners += 1
+                        
+                except Exception as miner_err:
+                    logger.debug(f"Error processing consensus data for UID {uid}: {miner_err}")
+                    continue
+            
+            if consensus_updates:
+                # Store consensus data in performance calculator for integration
+                if not hasattr(self.performance_calculator, '_current_consensus_data'):
+                    self.performance_calculator._current_consensus_data = {}
+                self.performance_calculator._current_consensus_data.update(consensus_updates)
+                
+                logger.info(f"📊 Captured chain consensus data for {valid_miners} miners (block: {current_block})")
+                
+                # Calculate consensus ranks based on incentive values
+                incentive_values = [(uid, data['incentive']) for uid, data in consensus_updates.items()]
+                incentive_values.sort(key=lambda x: x[1], reverse=True)  # Sort by incentive descending
+                
+                # Add consensus ranks
+                for rank, (uid, incentive) in enumerate(incentive_values, 1):
+                    consensus_updates[uid]['consensus_rank'] = rank
+                
+                logger.debug(f"Chain consensus integration: Top 5 miners by incentive: "
+                           f"{[(uid, f'{inc:.4f}') for uid, inc in incentive_values[:5]]}")
+            else:
+                logger.debug("No miners with valid incentive values found for consensus integration")
+                
+        except Exception as e:
+            logger.warning(f"Error during chain consensus integration: {e}")
+            # Don't let this break the main loop
 
     async def database_monitor(self):
         """Periodically query and log database statistics from a consistent snapshot."""
@@ -4728,6 +4902,21 @@ class GaiaValidator:
 
     async def memory_snapshot_taker(self):
         """Periodically takes memory snapshots and logs differences."""
+        # Register this task for global memory cleanup coordination
+        try:
+            from gaia.utils.global_memory_manager import register_thread_cleanup
+            
+            def cleanup_snapshot_caches():
+                # Clear any caches that accumulate during memory snapshot processing
+                import gc
+                collected = gc.collect()
+                logger.debug(f"[MemorySnapshotTaker] Performed cleanup, collected {collected} objects")
+            
+            register_thread_cleanup("memory_snapshot_taker", cleanup_snapshot_caches)
+            logger.debug("[MemorySnapshotTaker] Registered for global memory cleanup")
+        except Exception as e:
+            logger.debug(f"[MemorySnapshotTaker] Failed to register cleanup: {e}")
+        
         logger.info("Starting memory snapshot taker task...")
         
         snapshot_interval_seconds = 300 # 5 minutes
@@ -4782,24 +4971,27 @@ class GaiaValidator:
             logger.debug("🛡️  Isolated substrate interface prevents memory leaks - no cleanup needed")
 
     async def aggressive_memory_cleanup(self):
-        """Enhanced aggressive memory cleanup with pressure monitoring."""
+        """Regular memory cleanup to maintain equilibrium and prevent unbounded growth."""
         while True:
             try:
-                await asyncio.sleep(120)  # Run every 2 minutes
+                await asyncio.sleep(60)  # Run every 1 minute for better equilibrium
                 
                 # Get memory before cleanup
                 if PSUTIL_AVAILABLE:
                     process = psutil.Process()
                     memory_before = process.memory_info().rss / (1024 * 1024)
                     
-                    # Determine cleanup intensity based on memory pressure
-                    cleanup_level = "light"
-                    if memory_before > 8000:  # > 8GB
+                    # PERFORMANCE-FIRST: Only clear caches when memory pressure requires it
+                    cleanup_level = "none"
+                    if memory_before > 25000:  # > 25GB (78% of 32GB) - Emergency cleanup
                         cleanup_level = "aggressive"
-                    elif memory_before > 6000:  # > 6GB
+                    elif memory_before > 22000:  # > 22GB (69% of 32GB) - Moderate cleanup  
                         cleanup_level = "moderate"
+                    elif memory_before > 18000:  # > 18GB (56% of 32GB) - Light cleanup
+                        cleanup_level = "light"
+                    # Below 18GB: NO cache clearing - preserve performance for optimal operation
                         
-                    # Perform cleanup based on pressure level
+                    # Only perform cleanup when memory pressure actually requires it
                     collected = 0
                     comp_memory_freed = 0
                     
@@ -4845,17 +5037,41 @@ class GaiaValidator:
                         import gc
                         collected = gc.collect()
                         
-                    else:  # light cleanup
-                        # Just basic GC and cache clearing
+                    elif cleanup_level == "light":
+                        logger.info(f"LIGHT MEMORY PRESSURE: {memory_before:.1f}MB - performing minimal cleanup")
+                        
+                        # Light cache clearing - preserve most performance caches
+                        if hasattr(self, 'last_metagraph_sync'):
+                            comp_memory_freed = self._comprehensive_memory_cleanup("pressure_light")
+                        
+                        # Standard GC
                         import gc
                         collected = gc.collect()
                         
-                        # Clear basic module caches
+                    elif cleanup_level == "none":
+                        # NO CACHE CLEARING - optimal performance mode
+                        logger.debug(f"PERFORMANCE MODE: {memory_before:.1f}MB - no cache clearing needed")
+                        
+                        # Only minimal maintenance: basic GC and connection cleanup
+                        import gc
+                        collected = gc.collect()
+                        
+                        # Basic connection maintenance
                         try:
                             if hasattr(self, 'miner_client') and self.miner_client and not self.miner_client.is_closed:
                                 await self._cleanup_idle_connections()
                         except Exception:
                             pass
+                    
+                    # Trigger coordinated cleanup across all background threads (all cleanup levels)
+                    if cleanup_level != "none":
+                        try:
+                            from gaia.utils.global_memory_manager import trigger_global_cleanup
+                            global_stats = trigger_global_cleanup(cleanup_level)
+                            if global_stats.get("callbacks_attempted", 0) > 0:
+                                logger.debug(f"Global thread cleanup ({cleanup_level}): {global_stats['callbacks_succeeded']}/{global_stats['callbacks_attempted']} callbacks succeeded")
+                        except Exception as e:
+                            logger.debug(f"Global thread cleanup failed: {e}")
                     
                     # Get memory after cleanup
                     memory_after = process.memory_info().rss / (1024 * 1024)
@@ -4871,10 +5087,10 @@ class GaiaValidator:
                     else:
                         logger.debug(f"Memory cleanup ({cleanup_level}): minimal cleanup needed")
                         
-                    # Emergency action if memory is still very high
-                    if memory_after > 10000:  # > 10GB after cleanup
+                    # Emergency action if memory is still very high after cleanup
+                    if memory_after > 25000:  # > 25GB after cleanup (emergency threshold)
                         logger.error(f"🚨 CRITICAL: Memory still very high after cleanup: {memory_after:.1f}MB")
-                        # Could trigger more drastic measures here
+                        # Could trigger more drastic measures here if needed
                         
             except asyncio.CancelledError:
                 logger.info("Aggressive memory cleanup task cancelled")
@@ -4903,28 +5119,44 @@ class GaiaValidator:
             sys.last_type = None 
             sys.last_value = None
             
-            # 2. AGGRESSIVE MODULE CACHE CLEANUP - This is the major fix
-            try:
-                import sys
-                modules_cleared = 0
-                cache_objects_cleared = 0
-                
-                # Target problematic modules that accumulate caches (substrate/scalecodec are major offenders)
-                target_modules = [
-                    'substrate', 'scalecodec', 'scale_info', 'metadata', 'fiber', 'substrateinterface',
-                    'xarray', 'dask', 'numpy', 'pandas', 'fsspec', 'zarr', 
-                    'netcdf4', 'h5py', 'scipy', 'era5', 'gcsfs', 'cloudpickle',
-                    'numcodecs', 'blosc', 'lz4', 'snappy', 'zstd'
-                ]
-                
-                for module_name in list(sys.modules.keys()):
-                    if any(pattern in module_name.lower() for pattern in target_modules):
-                        module = sys.modules.get(module_name)
-                        if hasattr(module, '__dict__'):
+            # 2. CONTEXT-AWARE MODULE CACHE CLEANUP - Preserve performance caches when possible
+            
+            # Determine scope based on context - preserve performance caches in light pressure mode
+            skip_module_caches = context == "pressure_light"  # Don't clear module caches in light pressure
+            
+            if not skip_module_caches:
+                try:
+                    import sys
+                    import warnings
+                    modules_cleared = 0
+                    cache_objects_cleared = 0
+                    
+                    # Walk ALL modules with comprehensive warning suppression
+                    deprecated_patterns = [
+                        'basic', 'misc', 'special_matrices', 'helper', 'realtransforms',
+                        'isolve', 'distance', 'stats', 'distutils', 'testing', '_core',
+                        'deprecated', 'legacy', 'compat'
+                    ]
+                    
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore', category=DeprecationWarning)
+                        warnings.filterwarnings('ignore', category=PendingDeprecationWarning)
+                        warnings.filterwarnings('ignore', category=FutureWarning)
+                        warnings.filterwarnings('ignore', category=UserWarning)
+                        
+                        for module_name in list(sys.modules.keys()):
+                            module = sys.modules.get(module_name)
+                            if module is None or not hasattr(module, '__dict__'):
+                                continue
+                                
                             module_cleared = False
                             
-                            # Clear all cache-like attributes
+                            # Clear cache-like attributes, avoiding deprecated ones
                             for attr_name in list(module.__dict__.keys()):
+                                # Skip deprecated attributes that trigger warnings
+                                if any(dep_pattern in attr_name.lower() for dep_pattern in deprecated_patterns):
+                                    continue
+                                    
                                 if any(cache_pattern in attr_name.lower() for cache_pattern in 
                                        ['cache', 'registry', '_cached', '__pycache__', '_instance_cache', 
                                         '_memo', '_lru', '_registry', '_store', '_buffer']):
@@ -4951,14 +5183,72 @@ class GaiaValidator:
                             
                             if module_cleared:
                                 modules_cleared += 1
-                
-                if modules_cleared > 0:
-                    logger.info(f"Module cache cleanup: cleared {cache_objects_cleared} cache objects from {modules_cleared} modules")
                     
-            except Exception as e:
-                logger.debug(f"Error during module cache cleanup: {e}")
+                        if modules_cleared > 0:
+                            logger.info(f"Module cache cleanup: cleared {cache_objects_cleared} cache objects from {modules_cleared} modules")
+                            
+                except Exception as e:
+                    logger.debug(f"Error during module cache cleanup: {e}")
+            else:
+                logger.debug(f"Skipping module cache cleanup in {context} mode to preserve performance")
             
-            # 3. Clear specific library caches that are known problematic
+            # 3. Context-aware LRU cache cleanup (selective in light pressure mode)
+            skip_lru_caches = context == "pressure_light"  # Preserve LRU caches in light pressure
+            
+            if not skip_lru_caches:
+                try:
+                    import sys
+                    import warnings
+                    lru_caches_cleared = 0
+                    lru_modules_checked = 0
+                    
+                    # Deprecated attribute patterns to skip
+                    deprecated_patterns = [
+                        'basic', 'misc', 'special_matrices', 'helper', 'realtransforms',
+                        'isolve', 'distance', 'stats', 'distutils', 'testing', '_core',
+                        'deprecated', 'legacy', 'compat'
+                    ]
+                    
+                    # Temporarily suppress all deprecation warnings during cache clearing
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore', category=DeprecationWarning)
+                        warnings.filterwarnings('ignore', category=PendingDeprecationWarning)
+                        warnings.filterwarnings('ignore', category=FutureWarning)
+                        warnings.filterwarnings('ignore', category=UserWarning)
+                        
+                        for mod_name, mod in list(sys.modules.items()):
+                            if mod is None or not hasattr(mod, '__dict__'):
+                                continue
+                                
+                            lru_modules_checked += 1
+                            
+                            try:
+                                # Check all attributes for LRU cache decorators
+                                for attr_name in list(mod.__dict__.keys()):
+                                    # Skip deprecated attributes that trigger warnings
+                                    if any(dep_pattern in attr_name.lower() for dep_pattern in deprecated_patterns):
+                                        continue
+                                    
+                                    try:
+                                        attr = getattr(mod, attr_name)
+                                        # Check for LRU cache or functools cache decorators - use cache_clear()
+                                        if hasattr(attr, 'cache_clear') and callable(attr.cache_clear):
+                                            attr.cache_clear()
+                                            lru_caches_cleared += 1
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                continue
+                    
+                        if lru_caches_cleared > 0:
+                            logger.info(f"LRU cache cleanup: cleared {lru_caches_cleared} LRU caches from {lru_modules_checked} modules")
+                            
+                except Exception as e:
+                    logger.debug(f"Error during LRU cache cleanup: {e}")
+            else:
+                logger.debug(f"Skipping LRU cache cleanup in {context} mode to preserve performance")
+            
+            # 4. Clear specific library caches that are known problematic
             try:
                 # Clear NumPy caches
                 import numpy as np
@@ -5008,7 +5298,7 @@ class GaiaValidator:
             except Exception as e:
                 logger.debug(f"Error clearing specific library caches: {e}")
             
-            # 4. Clear HTTP client caches (only if they exist)
+            # 5. Clear HTTP client caches (only if they exist)
             try:
                 if hasattr(self, 'miner_client') and self.miner_client and not self.miner_client.is_closed:
                     if hasattr(self.miner_client, '_transport'):
@@ -5024,7 +5314,7 @@ class GaiaValidator:
             except Exception as e:
                 logger.debug(f"Error clearing HTTP client caches: {e}")
             
-            # 5. Clear database connection pool caches (only if fully initialized)
+            # 6. Clear database connection pool caches (only if fully initialized)
             try:
                 if hasattr(self, 'database_manager') and getattr(self, 'database_manager', None):
                     # Force database manager to clear any cached connections/results
@@ -5038,7 +5328,7 @@ class GaiaValidator:
             except Exception as e:
                 logger.debug(f"Error clearing database caches: {e}")
             
-            # 6. Force multiple garbage collection passes with different strategies
+            # 7. Force multiple garbage collection passes with different strategies
             import gc
             collected_total = 0
             
@@ -5080,6 +5370,21 @@ class GaiaValidator:
 
     async def abc_object_monitor(self):
         """Monitor and cleanup ABC (Abstract Base Class) object accumulation."""
+        # Register this monitor for global memory cleanup coordination
+        try:
+            from gaia.utils.global_memory_manager import register_thread_cleanup
+            
+            def cleanup_abc_caches():
+                # Clear any caches that accumulate during ABC monitoring
+                import gc
+                collected = gc.collect()
+                logger.debug(f"[ABCObjectMonitor] Performed cleanup, collected {collected} objects")
+            
+            register_thread_cleanup("abc_object_monitor", cleanup_abc_caches)
+            logger.debug("[ABCObjectMonitor] Registered for global memory cleanup")
+        except Exception as e:
+            logger.debug(f"[ABCObjectMonitor] Failed to register cleanup: {e}")
+        
         import weakref
         import gc
         from abc import ABC

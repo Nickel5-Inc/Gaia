@@ -83,8 +83,10 @@ from .processing.weather_miner_preprocessing import prepare_miner_batch_from_pay
 from .processing.weather_logic import (
     _update_run_status, build_score_row, get_ground_truth_data,
     _trigger_initial_scoring, _request_fresh_token, verify_miner_response,
-    get_job_by_gfs_init_time, update_job_status, update_job_paths
+    get_job_by_gfs_init_time, update_job_status, update_job_paths,
+    _trigger_final_scoring
 )
+from .hardening_integration import WeatherTaskHardeningMixin
 from .processing.weather_workers import (
     initial_scoring_worker, 
     finalize_scores_worker, 
@@ -221,7 +223,7 @@ def _load_config(self):
     logger.info(f"WeatherTask configuration loaded: {config}")
     return config
 
-class WeatherTask(Task):
+class WeatherTask(Task, WeatherTaskHardeningMixin):
     db_manager: Union[ValidatorDatabaseManager, MinerDatabaseManager]
     node_type: str = Field(default="validator")
     test_mode: bool = Field(default=False)
@@ -366,6 +368,13 @@ class WeatherTask(Task):
             logger.warning(f"Could not load async processing summary: {async_config_error}")
             logger.info("Weather task async processing optimizations may not be available")
         
+        # Initialize hardening system
+        try:
+            self.__init_hardening__()
+            logger.info("Weather task hardening system initialized successfully")
+        except Exception as hardening_error:
+            logger.warning(f"Could not initialize hardening system: {hardening_error}")
+            logger.info("Weather task will run without enhanced state consistency checks")
 
 
     _load_config = _load_config
@@ -1524,8 +1533,8 @@ sources:
                         await self._backfill_scoring_jobs_from_existing_data()
                         # Sequential recovery - process one run at a time
                         stale_run_processed = await self._check_and_recover_incomplete_runs_sequential(processed_runs_this_session, max_attempts_per_run)
-                        # Recover scoring jobs (these are quick operations)
-                        await self._recover_incomplete_scoring_jobs()
+                        # Enhanced recovery with state consistency checks (includes original recovery)
+                        await self.enhanced_recovery_check()
                         last_recovery_time = current_time
                     except Exception as recovery_err:
                         logger.warning(f"Error during periodic recovery: {recovery_err}")
@@ -2059,25 +2068,33 @@ sources:
             SELECT id, gfs_init_time_utc 
             FROM weather_forecast_runs
             WHERE id = :run_id
-            AND status = 'awaiting_inference_results'
+            AND (status = 'awaiting_inference_results' OR status = 'verifying_miner_forecasts')
             """
             forecast_runs = await self.db_manager.fetch_all(query, {"run_id": force_run_id})
         else:
-            # Normal processing
+            # Normal processing - look for runs awaiting inference results OR already verifying with verified responses
             cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=verification_wait_minutes_actual)
             
             query = """
-            SELECT id, gfs_init_time_utc 
-            FROM weather_forecast_runs
-            WHERE status = 'awaiting_inference_results' 
-            AND run_initiation_time < :cutoff_time 
-            ORDER BY run_initiation_time ASC
+            SELECT DISTINCT wfr.id, wfr.gfs_init_time_utc, wfr.status, wfr.run_initiation_time
+            FROM weather_forecast_runs wfr
+            WHERE (
+                (wfr.status = 'awaiting_inference_results' AND wfr.run_initiation_time < :cutoff_time)
+                OR 
+                (wfr.status = 'verifying_miner_forecasts' AND EXISTS (
+                    SELECT 1 FROM weather_miner_responses wmr 
+                    WHERE wmr.run_id = wfr.id 
+                    AND wmr.verification_passed = TRUE 
+                    AND wmr.status = 'verified_manifest_store_opened'
+                ))
+            )
+            ORDER BY wfr.run_initiation_time ASC
             LIMIT 10
             """
             forecast_runs = await self.db_manager.fetch_all(query, {"cutoff_time": cutoff_time})
         
         if not forecast_runs:
-            logger.debug(f"No runs found awaiting inference results within cutoff (test_mode active: {self.test_mode}, cutoff: {cutoff_time}).")
+            logger.debug(f"No runs found awaiting inference results or ready for scoring within cutoff (test_mode active: {self.test_mode}, cutoff: {cutoff_time}).")
             return
         
         for run_record in forecast_runs:
@@ -2088,36 +2105,45 @@ sources:
             
             if current_run_status == 'awaiting_inference_results':
                 await _update_run_status(self, run_id, "verifying_miner_forecasts") 
+            elif current_run_status == 'verifying_miner_forecasts':
+                logger.info(f"[Run {run_id}] Already in verifying_miner_forecasts status - checking for scoring readiness")
             else:
-                 logger.info(f"[Run {run_id}] Status is already '{current_run_status}' (expected 'awaiting_inference_results'), skipping verification trigger step.")
+                 logger.info(f"[Run {run_id}] Status is '{current_run_status}' (expected 'awaiting_inference_results' or 'verifying_miner_forecasts'), skipping verification trigger step.")
                  continue
             
-            responses_query = """
-            SELECT mr.id, mr.miner_hotkey, mr.status, mr.job_id
-            FROM weather_miner_responses mr
-            WHERE mr.run_id = :run_id
-              AND (
-                  mr.status = 'inference_triggered' OR
-                  (mr.status = 'retry_scheduled' AND mr.next_retry_time IS NOT NULL AND mr.next_retry_time <= :now)
-              )
-            """
-            query_params = {"run_id": run_id, "now": datetime.now(timezone.utc)}
-            miner_responses = await self.db_manager.fetch_all(responses_query, query_params)
-            
-            num_attempted_verification = len(miner_responses)
-            if not miner_responses:
-                logger.info(f"[Run {run_id}] No miner responses found with status 'inference_triggered'.")
-            else:
-                logger.info(f"[Run {run_id}] Found {num_attempted_verification} 'inference_triggered' responses to verify.")
+            # Handle verification logic for both awaiting_inference_results and verifying_miner_forecasts
+            if current_run_status == 'awaiting_inference_results':
+                # Standard verification flow for inference_triggered responses
+                responses_query = """
+                SELECT mr.id, mr.miner_hotkey, mr.status, mr.job_id
+                FROM weather_miner_responses mr
+                WHERE mr.run_id = :run_id
+                  AND (
+                      mr.status = 'inference_triggered' OR
+                      (mr.status = 'retry_scheduled' AND mr.next_retry_time IS NOT NULL AND mr.next_retry_time <= :now)
+                  )
+                """
+                query_params = {"run_id": run_id, "now": datetime.now(timezone.utc)}
+                miner_responses = await self.db_manager.fetch_all(responses_query, query_params)
+                
+                num_attempted_verification = len(miner_responses)
+                if not miner_responses:
+                    logger.info(f"[Run {run_id}] No miner responses found with status 'inference_triggered'.")
+                else:
+                    logger.info(f"[Run {run_id}] Found {num_attempted_verification} 'inference_triggered' responses to verify.")
 
-            verification_tasks = []
-            for response in miner_responses:
-                 verification_tasks.append(verify_miner_response(self, run_record, response))
-                 
-            if verification_tasks:
-                 await asyncio.gather(*verification_tasks)
-                 logger.info(f"[Run {run_id}] Completed verification attempts for {len(verification_tasks)} responses.")
-                 
+                verification_tasks = []
+                for response in miner_responses:
+                     verification_tasks.append(verify_miner_response(self, run_record, response))
+                     
+                if verification_tasks:
+                     await asyncio.gather(*verification_tasks)
+                     logger.info(f"[Run {run_id}] Completed verification attempts for {len(verification_tasks)} responses.")
+            else:
+                # For runs already in verifying_miner_forecasts, skip verification and go straight to scoring check
+                num_attempted_verification = 0
+                logger.info(f"[Run {run_id}] Run already in verifying_miner_forecasts - skipping verification, checking scoring readiness.")
+                     
             verified_responses_query = "SELECT COUNT(*) as count FROM weather_miner_responses WHERE run_id = :run_id AND verification_passed = TRUE"
             verified_count_result = await self.db_manager.fetch_one(verified_responses_query, {"run_id": run_id})
             verified_count = verified_count_result["count"] if verified_count_result else 0
@@ -2209,39 +2235,26 @@ sources:
         except Exception:
             pass
 
+        # Apply excellence bonuses (unchanged)
         miner_bonuses_applied = np.zeros(256)
-        bonus_value_add = self.config.get('weather_bonus_value_add', 0.05)
-        
-        # Bonus Definitions
-        bonus_metric_definitions = [
-            {"id": "best_z500_acc_120h", "metric_score_type": "era5_acc_z500_120h", "higher_is_better": True, "min_threshold": 0.5},
-            {"id": "lowest_t2m_rmse_120h", "metric_score_type": "era5_rmse_2t_120h", "higher_is_better": False, "min_threshold": 3.0},
-            {"id": "best_msl_skill_gfs_168h", "metric_score_type": "era5_skill_gfs_msl_168h", "higher_is_better": True, "min_threshold": 0.1},
+        bonus_categories = [
+            {"id": "top_weather", "score_field": "weather", "min_threshold": 0.7, "higher_is_better": True},
+            {"id": "top_geo", "score_field": "geomagnetic", "min_threshold": 0.8, "higher_is_better": True},
+            {"id": "top_soil", "score_field": "soil", "min_threshold": 0.6, "higher_is_better": True}
         ]
+        bonus_value_add = 0.05  # Small bonus for excellence
 
-        for category in bonus_metric_definitions:
-            metric_to_query = category["metric_score_type"]
+        for category in bonus_categories:
+            score_field = category["score_field"]
+            min_threshold = category["min_threshold"]
             higher_is_better = category["higher_is_better"]
-            min_thresh = category.get("min_threshold")
-
-            query_bonus_metric = """ 
-                SELECT miner_uid, score FROM weather_miner_scores
-                WHERE score_type = :score_type AND miner_uid = :miner_uid AND score IS NOT NULL
-                ORDER BY calculation_time DESC LIMIT 1
-            """
+            
             candidate_scores_for_category = []
-            for uid_val in active_uids:
-                metric_res = await self.db_manager.fetch_one(query_bonus_metric, {"score_type": metric_to_query, "miner_uid": uid_val})
-                if metric_res and metric_res['score'] is not None and np.isfinite(metric_res['score']):
-                    score = float(metric_res['score'])
-                    eligible = True
-                    if min_thresh is not None:
-                        if higher_is_better and score < min_thresh:
-                            eligible = False
-                        elif not higher_is_better and score > min_thresh:
-                            eligible = False
-                    if eligible:
-                        candidate_scores_for_category.append((score, uid_val))
+            if score_field == "weather":
+                for uid in active_uids:
+                    score = proportional_weather_scores[uid]
+                    if np.isfinite(score) and score >= min_threshold:
+                        candidate_scores_for_category.append((score, uid))
             
             if not candidate_scores_for_category:
                 logger.info(f"[CombinedWeatherScore] No eligible miners for bonus: {category['id']}")
@@ -2269,7 +2282,28 @@ sources:
                 "final_score_for_uid": final_weather_scores_for_table[uid_idx]
             })
         
-        id_for_combined_row = "final_weather_scores"
+        # Determine the appropriate score row ID based on available score types
+        has_era5_scores = np.any(latest_era5_composite_scores_array > 0)
+        has_day1_scores = np.any(proportional_weather_scores > 0)  # This includes day1 component
+        
+        if run_id_trigger:
+            # If triggered by a specific run, use run-specific naming
+            if has_era5_scores:
+                # If we have ERA5 scores, this run has completed final scoring
+                id_for_combined_row = f"final_weather_scores_{run_id_trigger}"
+                logger.info(f"[CombinedWeatherScore] Creating final weather scores for run {run_id_trigger}")
+            else:
+                # Only day1 scores available, this is initial scoring
+                id_for_combined_row = f"initial_weather_scores_{run_id_trigger}"
+                logger.info(f"[CombinedWeatherScore] Creating initial weather scores for run {run_id_trigger}")
+        else:
+            # Periodic/manual call - use generic naming for overall system state
+            if has_era5_scores:
+                id_for_combined_row = "final_weather_scores"
+            else:
+                id_for_combined_row = "initial_weather_scores"
+            logger.info(f"[CombinedWeatherScore] Creating combined weather scores (periodic): {id_for_combined_row}")
+        
         timestamp_for_combined_score_row = datetime.now(timezone.utc)
         
         await self.build_score_row(
@@ -2278,6 +2312,20 @@ sources:
             evaluation_results = mock_evaluation_results,
             task_name_prefix = "weather"
         )
+        
+        # Cleanup: If we just created a final score row for a specific run, remove the corresponding initial row
+        if run_id_trigger and has_era5_scores and id_for_combined_row.startswith("final_weather_scores_"):
+            initial_row_id = f"initial_weather_scores_{run_id_trigger}"
+            try:
+                cleanup_query = """
+                DELETE FROM score_table 
+                WHERE task_name = 'weather' AND task_id = :initial_task_id
+                """
+                await self.db_manager.execute(cleanup_query, {"initial_task_id": initial_row_id})
+                logger.info(f"[CombinedWeatherScore] Cleaned up initial score row: {initial_row_id}")
+            except Exception as e:
+                logger.warning(f"[CombinedWeatherScore] Failed to cleanup initial score row {initial_row_id}: {e}")
+        
         logger.info(f"[CombinedWeatherScore] Update completed for 'weather' (task_id: {id_for_combined_row}).")
 
     ############################################################
@@ -3697,7 +3745,9 @@ sources:
         # Look for one incomplete run at a time
         recoverable_states = [
             'sending_fetch_requests', 'awaiting_input_hashes', 'verifying_input_hashes', 
-            'triggering_inference', 'awaiting_inference_results', 'verifying_miner_forecasts'
+            'triggering_inference', 'awaiting_inference_results', 'verifying_miner_forecasts',
+            # INCLUDE SCORING STATES - can get stuck due to restarts during scoring
+            'day1_scoring_started', 'era5_final_scoring_started'
         ]
         
         # Also include failure states that might be recoverable with full workflow
@@ -3851,6 +3901,26 @@ sources:
                 logger.info(f"Recovering run {run_id}: processing ready for scoring")
                 await self._continue_run_workflow(run_id)
                 
+            elif status in ['day1_scoring_started', 'era5_final_scoring_started']:
+                logger.info(f"Recovering run {run_id}: resetting stuck scoring state '{status}' - likely interrupted by restart")
+                
+                # Reset run status to allow re-processing
+                await _update_run_status(self, run_id, "verifying_miner_forecasts")
+                
+                # Reset scoring jobs to queued status for retry with smart partial logic
+                scoring_type = 'day1_qc' if status == 'day1_scoring_started' else 'era5_final'
+                reset_job_query = """
+                UPDATE weather_scoring_jobs 
+                SET status = 'queued', started_at = NULL, error_message = 'Reset due to validator restart during scoring'
+                WHERE run_id = :run_id AND score_type = :score_type AND status IN ('in_progress', 'queued')
+                """
+                await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": scoring_type})
+                
+                logger.info(f"Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with '{scoring_type}' job queued for smart partial retry")
+                
+                # Trigger immediate scoring check
+                await self._continue_run_workflow(run_id)
+                
         except Exception as recovery_error:
             logger.error(f"Error recovering run {run_id}: {recovery_error}", exc_info=True)
             await _update_run_status(self, run_id, "recovery_failed", error_message=str(recovery_error))
@@ -3867,7 +3937,9 @@ sources:
         # Look for runs that are in intermediate states and could be continued
         recoverable_states = [
             'sending_fetch_requests', 'awaiting_input_hashes', 'verifying_input_hashes', 
-            'triggering_inference', 'awaiting_inference_results', 'verifying_miner_forecasts'
+            'triggering_inference', 'awaiting_inference_results', 'verifying_miner_forecasts',
+            # INCLUDE SCORING STATES - can get stuck due to restarts during scoring
+            'day1_scoring_started', 'era5_final_scoring_started'
         ]
         
         # Also check for runs that might be ready for scoring
@@ -3926,6 +3998,26 @@ sources:
                     
                 elif status in ['awaiting_inference_results', 'verifying_miner_forecasts']:
                     logger.info(f"  - Recovering run {run_id}: processing ready for scoring")
+                    asyncio.create_task(self._continue_run_workflow(run_id))
+                    
+                elif status in ['day1_scoring_started', 'era5_final_scoring_started']:
+                    logger.info(f"  - Recovering run {run_id}: resetting stuck scoring state '{status}' - likely interrupted by restart")
+                    
+                    # Reset run status to allow re-processing
+                    await _update_run_status(self, run_id, "verifying_miner_forecasts")
+                    
+                    # Reset scoring jobs to queued status for retry with smart partial logic
+                    scoring_type = 'day1_qc' if status == 'day1_scoring_started' else 'era5_final'
+                    reset_job_query = """
+                    UPDATE weather_scoring_jobs 
+                    SET status = 'queued', started_at = NULL, error_message = 'Reset due to validator restart during scoring'
+                    WHERE run_id = :run_id AND score_type = :score_type AND status IN ('in_progress', 'queued')
+                    """
+                    await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": scoring_type})
+                    
+                    logger.info(f"  - Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with '{scoring_type}' job queued for smart partial retry")
+                    
+                    # Trigger immediate scoring check
                     asyncio.create_task(self._continue_run_workflow(run_id))
                     
             except Exception as recovery_error:

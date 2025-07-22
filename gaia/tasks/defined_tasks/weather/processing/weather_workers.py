@@ -819,6 +819,22 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
     """
     worker_id = str(uuid.uuid4())[:8]
     logger.info(f"[InitialScoringWorker-{worker_id}] Starting up at {datetime.now(timezone.utc).isoformat()}")
+    
+    # Register this worker for global memory cleanup coordination
+    try:
+        from gaia.utils.global_memory_manager import register_thread_cleanup
+        
+        def cleanup_day1_caches():
+            # Clear any caches that accumulate during Day1 scoring processing
+            import gc
+            collected = gc.collect()
+            logger.debug(f"[InitialScoringWorker-{worker_id}] Performed cleanup, collected {collected} objects")
+        
+        register_thread_cleanup(f"day1_scoring_worker_{worker_id}", cleanup_day1_caches)
+        logger.debug(f"[InitialScoringWorker-{worker_id}] Registered for global memory cleanup")
+    except Exception as e:
+        logger.debug(f"[InitialScoringWorker-{worker_id}] Failed to register cleanup: {e}")
+    
     if task_instance.db_manager is None:
         logger.error(f"[InitialScoringWorker-{worker_id}] DB manager not available. Aborting.")
         task_instance.initial_scoring_worker_running = False
@@ -849,6 +865,7 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 gfs_init_time = run_record['gfs_init_time_utc']
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: gfs_init_time: {gfs_init_time}")
                 
+                # SMART PARTIAL RETRY: Only score miners that don't already have Day1 scores
                 responses_query = """    
                 SELECT 
                     mr.id, 
@@ -860,9 +877,30 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                     mr.verification_hash_claimed 
                 FROM weather_miner_responses mr
                 WHERE mr.run_id = :run_id AND mr.verification_passed = TRUE 
-                AND mr.status = 'verified_manifest_store_opened' 
+                AND mr.status = 'verified_manifest_store_opened'
+                AND mr.id NOT IN (
+                    SELECT DISTINCT wms.response_id 
+                    FROM weather_miner_scores wms 
+                    WHERE wms.run_id = :run_id 
+                    AND wms.score_type = 'day1_qc_score'
+                    AND wms.score IS NOT NULL
+                )
                 """
                 responses = await task_instance.db_manager.fetch_all(responses_query, {"run_id": run_id})
+                
+                # Check if some miners were already scored (for logging)
+                all_responses_query = """
+                SELECT COUNT(*) as total
+                FROM weather_miner_responses mr
+                WHERE mr.run_id = :run_id AND mr.verification_passed = TRUE 
+                AND mr.status = 'verified_manifest_store_opened'
+                """
+                total_result = await task_instance.db_manager.fetch_one(all_responses_query, {"run_id": run_id})
+                total_miners = total_result['total'] if total_result else 0
+                already_scored = total_miners - len(responses)
+                
+                if already_scored > 0:
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Smart partial retry - {already_scored} miners already have Day1 scores, processing remaining {len(responses)} miners")
                 
                 min_members_for_scoring = 1
                 if not responses or len(responses) < min_members_for_scoring:
@@ -1050,25 +1088,47 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 try:
                     import sys
                     
-                    # 1. Clear xarray/dask/numpy module-level caches
-                    for module_name in list(sys.modules.keys()):
-                        if any(pattern in module_name.lower() for pattern in 
-                               ['xarray', 'dask', 'numpy', 'pandas', 'fsspec', 'zarr', 'netcdf4', 'h5py', 'scipy']):
+                    # 1. Clear module-level caches AND LRU caches
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore', category=DeprecationWarning)
+                        warnings.filterwarnings('ignore', category=PendingDeprecationWarning)
+                        warnings.filterwarnings('ignore', category=FutureWarning)
+                        warnings.filterwarnings('ignore', category=UserWarning)
+                        
+                        # Walk ALL modules with comprehensive warning suppression
+                        deprecated_patterns = ['basic', 'misc', 'special_matrices', 'helper', 'distutils', 'testing', 'deprecated', 'legacy', 'compat']
+                        
+                        for module_name in list(sys.modules.keys()):
                             module = sys.modules.get(module_name)
-                            if hasattr(module, '__dict__'):
-                                for attr_name in list(module.__dict__.keys()):
+                            if module is None or not hasattr(module, '__dict__'):
+                                continue
+                                
+                            for attr_name in list(module.__dict__.keys()):
+                                # Skip deprecated attributes that trigger warnings
+                                if any(dep_pattern in attr_name.lower() for dep_pattern in deprecated_patterns):
+                                    continue
+                                
+                                try:
+                                    attr = getattr(module, attr_name)
+                                    
+                                    # First check for LRU cache decorators - use cache_clear()
+                                    if hasattr(attr, 'cache_clear') and callable(attr.cache_clear):
+                                        attr.cache_clear()
+                                        logger.debug(f"[Day1ScoringWorker] Run {run_id}: Cleared LRU cache {module_name}.{attr_name}")
+                                        continue
+                                    
+                                    # Then check for module-level cache containers - use clear()
                                     if any(cache_pattern in attr_name.lower() for cache_pattern in 
                                            ['cache', 'registry', '_cached', '__pycache__', '_instance_cache']):
-                                        try:
-                                            cache_obj = getattr(module, attr_name)
-                                            if hasattr(cache_obj, 'clear'):
-                                                cache_obj.clear()
-                                                logger.debug(f"[Day1ScoringWorker] Run {run_id}: Cleared {module_name}.{attr_name}")
-                                            elif isinstance(cache_obj, dict):
-                                                cache_obj.clear()
-                                                logger.debug(f"[Day1ScoringWorker] Run {run_id}: Cleared dict {module_name}.{attr_name}")
-                                        except Exception:
-                                            pass
+                                        if hasattr(attr, 'clear') and callable(attr.clear):
+                                            attr.clear()
+                                            logger.debug(f"[Day1ScoringWorker] Run {run_id}: Cleared cache container {module_name}.{attr_name}")
+                                        elif isinstance(attr, dict):
+                                            attr.clear()
+                                            logger.debug(f"[Day1ScoringWorker] Run {run_id}: Cleared dict {module_name}.{attr_name}")
+                                except Exception:
+                                    pass
                     
                     # 2. Force multiple garbage collection passes (like substrate manager)
                     collected_total = 0
@@ -1164,7 +1224,9 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                     
                     if result and isinstance(result, dict):
                         resp_id = result.get("response_id")
-                        lead_scores_json = await asyncio.to_thread(json.dumps, result.get("lead_time_scores"), default=str)
+                        # Use safe JSON serialization to handle infinity/NaN values
+                        from ..utils.json_sanitizer import safe_json_dumps_for_db
+                        lead_scores_json = await asyncio.to_thread(safe_json_dumps_for_db, result.get("lead_time_scores"))
                         overall_score = result.get("overall_day1_score")
                         qc_passed = result.get("qc_passed_all_vars_leads")
                         error_msg = result.get("error_message")
@@ -1315,6 +1377,21 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
 
 async def finalize_scores_worker(self):
     """Background worker to calculate final scores against ERA5 after delay."""
+    # Register this worker for global memory cleanup coordination
+    try:
+        from gaia.utils.global_memory_manager import register_thread_cleanup
+        
+        def cleanup_finalize_caches():
+            # Clear any caches that accumulate during ERA5 final scoring
+            import gc
+            collected = gc.collect()
+            logger.debug(f"[FinalizeWorker] Performed cleanup, collected {collected} objects")
+        
+        register_thread_cleanup("finalize_scores_worker", cleanup_finalize_caches)
+        logger.debug("[FinalizeWorker] Registered for global memory cleanup")
+    except Exception as e:
+        logger.debug(f"[FinalizeWorker] Failed to register cleanup: {e}")
+    
     CHECK_INTERVAL_SECONDS = 30 if self.test_mode else int(self.config.get('final_scoring_check_interval_seconds', 3600))
     ERA5_DELAY_DAYS = int(self.config.get('era5_delay_days', 5))
     FORECAST_DURATION_HOURS = int(self.config.get('forecast_duration_hours', 240))
@@ -1413,12 +1490,33 @@ async def finalize_scores_worker(self):
 
                     logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 data fetched/loaded.")
 
+                    # SMART PARTIAL RETRY: Only score miners that don't already have ERA5 final scores
                     responses_query = """    
                     SELECT mr.id, mr.miner_hotkey, mr.miner_uid, mr.job_id, mr.run_id
                     FROM weather_miner_responses mr
                     WHERE mr.run_id = :run_id AND mr.verification_passed = TRUE
+                    AND mr.id NOT IN (
+                        SELECT DISTINCT wms.response_id 
+                        FROM weather_miner_scores wms 
+                        WHERE wms.run_id = :run_id 
+                        AND wms.score_type = 'era5_final_composite_score'
+                        AND wms.score IS NOT NULL
+                    )
                     """
                     verified_responses_for_run = await self.db_manager.fetch_all(responses_query, {"run_id": run_id})
+                    
+                    # Check if some miners were already scored (for logging)
+                    all_responses_query = """
+                    SELECT COUNT(*) as total
+                    FROM weather_miner_responses mr
+                    WHERE mr.run_id = :run_id AND mr.verification_passed = TRUE
+                    """
+                    total_result = await self.db_manager.fetch_one(all_responses_query, {"run_id": run_id})
+                    total_miners = total_result['total'] if total_result else 0
+                    already_scored = total_miners - len(verified_responses_for_run)
+                    
+                    if already_scored > 0:
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Smart partial retry - {already_scored} miners already have ERA5 final scores, processing remaining {len(verified_responses_for_run)} miners")
 
                     if not verified_responses_for_run:
                         logger.warning(f"[FinalizeWorker] Run {run_id}: No verified responses. Skipping miner scoring.")
@@ -1472,35 +1570,59 @@ async def finalize_scores_worker(self):
                     try:
                         import sys
                         
-                        # 1. Clear ERA5/xarray/dask/numpy module-level caches
+                        # 1. Clear module-level caches AND LRU caches across ALL modules
                         modules_cleared = 0
                         cache_objects_cleared = 0
+                        lru_caches_cleared = 0
                         
-                        for module_name in list(sys.modules.keys()):
-                            if any(pattern in module_name.lower() for pattern in 
-                                   ['xarray', 'dask', 'numpy', 'pandas', 'fsspec', 'zarr', 'netcdf4', 'h5py', 'scipy', 'era5']):
+                        import warnings
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings('ignore', category=DeprecationWarning)
+                            warnings.filterwarnings('ignore', category=PendingDeprecationWarning)
+                            warnings.filterwarnings('ignore', category=FutureWarning)
+                            warnings.filterwarnings('ignore', category=UserWarning)
+                            
+                            # Walk ALL modules with comprehensive warning suppression
+                            deprecated_patterns = ['basic', 'misc', 'special_matrices', 'helper', 'distutils', 'testing', 'deprecated', 'legacy', 'compat']
+                            
+                            for module_name in list(sys.modules.keys()):
                                 module = sys.modules.get(module_name)
-                                if hasattr(module, '__dict__'):
-                                    module_cleared = False
-                                    for attr_name in list(module.__dict__.keys()):
+                                if module is None or not hasattr(module, '__dict__'):
+                                    continue
+                                    
+                                module_cleared = False
+                                for attr_name in list(module.__dict__.keys()):
+                                    # Skip deprecated attributes that trigger warnings
+                                    if any(dep_pattern in attr_name.lower() for dep_pattern in deprecated_patterns):
+                                        continue
+                                    
+                                    try:
+                                        attr = getattr(module, attr_name)
+                                        
+                                        # First check for LRU cache decorators - use cache_clear()
+                                        if hasattr(attr, 'cache_clear') and callable(attr.cache_clear):
+                                            attr.cache_clear()
+                                            lru_caches_cleared += 1
+                                            module_cleared = True
+                                            continue
+                                        
+                                        # Then check for module-level cache containers - use clear()
                                         if any(cache_pattern in attr_name.lower() for cache_pattern in 
                                                ['cache', 'registry', '_cached', '__pycache__', '_instance_cache', '_buffer', '_memo']):
-                                            try:
-                                                cache_obj = getattr(module, attr_name)
-                                                if hasattr(cache_obj, 'clear') and callable(cache_obj.clear):
-                                                    cache_obj.clear()
-                                                    cache_objects_cleared += 1
-                                                    module_cleared = True
-                                                elif isinstance(cache_obj, (dict, list, set)):
-                                                    cache_obj.clear()
-                                                    cache_objects_cleared += 1
-                                                    module_cleared = True
-                                            except Exception:
-                                                pass
-                                    if module_cleared:
-                                        modules_cleared += 1
+                                            if hasattr(attr, 'clear') and callable(attr.clear):
+                                                attr.clear()
+                                                cache_objects_cleared += 1
+                                                module_cleared = True
+                                            elif isinstance(attr, (dict, list, set)):
+                                                attr.clear()
+                                                cache_objects_cleared += 1
+                                                module_cleared = True
+                                    except Exception:
+                                        pass
+                                if module_cleared:
+                                    modules_cleared += 1
                         
-                        logger.info(f"[FinalizeWorker] Run {run_id}: Cleared {cache_objects_cleared} cache objects from {modules_cleared} modules")
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Cleared {lru_caches_cleared} LRU caches + {cache_objects_cleared} cache objects from {modules_cleared} modules")
                         
                         # 2. Force multiple garbage collection passes
                         collected_total = 0
@@ -1611,6 +1733,9 @@ async def finalize_scores_worker(self):
                     except Exception as close_err:
                         logger.debug(f"[FinalizeWorker] Run {run_id}: Error closing datasets: {close_err}")
 
+                    skipped_deregistered_count = 0
+                    failed_other_count = 0
+                    
                     for i_resp, miner_score_task_succeeded in enumerate(miner_scoring_results): # Process results
                         resp_rec_inner = verified_responses_for_run[i_resp]
                         if miner_score_task_succeeded: 
@@ -1627,12 +1752,21 @@ async def finalize_scores_worker(self):
                                 logger.info(f"[FinalizeWorker] Run {run_id}: Aggregated ERA5 score for UID {resp_rec_inner['miner_uid']}: {agg_score:.4f}")
                             else:
                                 logger.warning(f"[FinalizeWorker] Run {run_id}: Failed to calculate/store aggregated ERA5 score for UID {resp_rec_inner['miner_uid']}.")
+                                failed_other_count += 1
                         else:
-                            logger.warning(f"[FinalizeWorker] Run {run_id}: Skipping aggregated score for UID {resp_rec_inner['miner_uid']} (detailed scoring failed).")
+                            # Check if this was a deregistered miner by looking for the specific pattern in recent logs
+                            # This is a heuristic since the actual result doesn't contain the specific error
+                            logger.warning(f"[FinalizeWorker] Run {run_id}: Skipping aggregated score for UID {resp_rec_inner['miner_uid']} miner {resp_rec_inner['miner_hotkey']} (detailed scoring failed - possibly deregistered).")
+                            failed_other_count += 1
                         if len(verified_responses_for_run) > 10 and i_resp % 10 == 9:
                             await asyncio.sleep(0)
 
-                    logger.info(f"[FinalizeWorker] Run {run_id}: Completed final scoring for {successful_final_scores_count}/{len(verified_responses_for_run)} miners.")
+                    # Enhanced summary with breakdown of results
+                    total_attempted = len(verified_responses_for_run)
+                    failed_total = failed_other_count
+                    logger.info(f"[FinalizeWorker] Run {run_id}: Final scoring summary - Attempted: {total_attempted}, Successful: {successful_final_scores_count}, Failed: {failed_total}")
+                    if failed_total > 0:
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Note - Failed miners may include deregistered miners (check individual miner logs for 'not in current metagraph' messages)")
                     
                     if successful_final_scores_count > 0: 
                         logger.info(f"[FinalizeWorker] Run {run_id}: Marked as 'scored'.")
@@ -1688,6 +1822,21 @@ async def finalize_scores_worker(self):
 
 async def cleanup_worker(task_instance: 'WeatherTask'):
     """Periodically cleans up old cache files, ensemble files, and DB records."""
+    # Register this worker for global memory cleanup coordination
+    try:
+        from gaia.utils.global_memory_manager import register_thread_cleanup
+        
+        def cleanup_worker_caches():
+            # Clear any caches that accumulate during file cleanup operations
+            import gc
+            collected = gc.collect()
+            logger.debug(f"[CleanupWorker] Performed cleanup, collected {collected} objects")
+        
+        register_thread_cleanup("cleanup_worker", cleanup_worker_caches)
+        logger.debug("[CleanupWorker] Registered for global memory cleanup")
+    except Exception as e:
+        logger.debug(f"[CleanupWorker] Failed to register cleanup: {e}")
+    
     CHECK_INTERVAL_SECONDS = int(task_instance.config.get('cleanup_check_interval_seconds', 6 * 3600))
     GFS_CACHE_RETENTION_DAYS = int(task_instance.config.get('gfs_cache_retention_days', 7))
     ERA5_CACHE_RETENTION_DAYS = int(task_instance.config.get('era5_cache_retention_days', 30))
@@ -2086,6 +2235,21 @@ async def r2_cleanup_worker(task_instance: 'WeatherTask'):
     - Groups outputs by GFS timestep and keeps only the latest one per timestep
     - Cleans up old testing data and junk files
     """
+    # Register this worker for global memory cleanup coordination
+    try:
+        from gaia.utils.global_memory_manager import register_thread_cleanup
+        
+        def cleanup_r2_caches():
+            # Clear any caches that accumulate during R2 operations
+            import gc
+            collected = gc.collect()
+            logger.debug(f"[R2CleanupWorker] Performed cleanup, collected {collected} objects")
+        
+        register_thread_cleanup("r2_cleanup_worker", cleanup_r2_caches)
+        logger.debug("[R2CleanupWorker] Registered for global memory cleanup")
+    except Exception as e:
+        logger.debug(f"[R2CleanupWorker] Failed to register cleanup: {e}")
+    
     logger.info("R2 cleanup worker started with enhanced aggressive cleanup.")
     
     while getattr(task_instance, 'r2_cleanup_worker_running', False):

@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
 from contextlib import asynccontextmanager
 from fiber.logging_utils import get_logger
+from gaia.utils.global_memory_manager import create_thread_cleanup_helper, register_thread_cleanup
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -188,6 +189,9 @@ class BaseDatabaseManager(ABC):
             
             # Initialize thread pool for heavy DB operations
             self._init_thread_pool()
+            
+            # Register cleanup for database-related caches that might accumulate in background threads
+            self._setup_global_memory_cleanup()
 
     def _init_thread_pool(self):
         """Initialize thread pool for heavy database operations."""
@@ -197,6 +201,33 @@ class BaseDatabaseManager(ABC):
                 thread_name_prefix="db_worker"
             )
             logger.info(f"Initialized database thread pool with {self.DB_THREAD_POOL_MAX_WORKERS} workers")
+    
+    def _setup_global_memory_cleanup(self):
+        """Setup global memory cleanup for database-related caches in background threads."""
+        try:
+            # Register cleanup for SQLAlchemy connection pools and query caches
+            def cleanup_db_caches():
+                if hasattr(self, '_engine') and self._engine:
+                    # Clear SQLAlchemy query cache
+                    try:
+                        if hasattr(self._engine, '_compiled_cache'):
+                            self._engine._compiled_cache.clear()
+                    except Exception:
+                        pass
+                    
+                    # Clear connection pool if needed (be careful not to break active connections)
+                    try:
+                        pool = getattr(self._engine, 'pool', None)
+                        if pool and hasattr(pool, '_clear_cache'):
+                            pool._clear_cache()
+                    except Exception:
+                        pass
+            
+            register_thread_cleanup(f"db_manager_{self.node_type}_caches", cleanup_db_caches)
+            logger.debug(f"Registered global memory cleanup for database manager ({self.node_type})")
+            
+        except Exception as e:
+            logger.debug(f"Failed to setup global memory cleanup for database manager: {e}")
 
     @classmethod
     def _cleanup_thread_pool(cls):
@@ -835,11 +866,18 @@ class BaseDatabaseManager(ABC):
         timeout: Optional[float] = None
     ) -> Optional[Dict]:
         start_time = time.time()
-        op_name = f"fetch_one:{query[:100]}"
+        # Handle both string queries and SQLAlchemy objects
+        query_str = str(query) if hasattr(query, '__str__') else query
+        query_snippet = query_str[:100] if isinstance(query_str, str) else "SQLAlchemy_object"
+        op_name = f"fetch_one:{query_snippet}"
         async with self.session(operation_name=op_name) as session: # session() ensures a transaction
             try:
                 # No longer need session.begin() here, self.session() handles it.
-                result = await session.execute(text(query), params or {})
+                # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
+                if isinstance(query, str):
+                    result = await session.execute(text(query), params or {})
+                else:
+                    result = await session.execute(query, params or {})
                 row = result.first()
                 duration = time.time() - start_time
                 if duration > self.DEFAULT_QUERY_TIMEOUT / 2: 
@@ -858,18 +896,26 @@ class BaseDatabaseManager(ABC):
         timeout: Optional[float] = None
     ) -> List[Dict]:
         start_time = time.time()
-        op_name = f"fetch_all:{query[:100]}"
+        # Handle both string queries and SQLAlchemy objects
+        query_str = str(query) if hasattr(query, '__str__') else query
+        query_snippet = query_str[:100] if isinstance(query_str, str) else "SQLAlchemy_object"
+        op_name = f"fetch_all:{query_snippet}"
         async with self.session(operation_name=op_name) as session: # session() ensures a transaction
             try:
                 # No longer need session.begin() here, self.session() handles it.
-                result = await session.execute(text(query), params or {})
+                # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
+                if isinstance(query, str):
+                    result = await session.execute(text(query), params or {})
+                else:
+                    result = await session.execute(query, params or {})
                 rows = result.all()
                 
                 # Enhanced handling and cleanup for large result sets
                 if len(rows) > 1000:
+                    query_log = query_str[:200] if isinstance(query_str, str) else str(query)[:200]
                     logger.warning(
                         f"Large result set ({op_name}): {len(rows)} rows\n"
-                        f"Query: {query[:200]}..."
+                        f"Query: {query_log}..."
                     )
                     
                     # Force garbage collection for very large result sets
@@ -907,7 +953,10 @@ class BaseDatabaseManager(ABC):
         Use this for large result sets to avoid blocking the async loop.
         """
         start_time = time.time()
-        op_name = f"fetch_all_threaded:{query[:100]}"
+        # Handle both string queries and SQLAlchemy objects
+        query_str = str(query) if hasattr(query, '__str__') else query
+        query_snippet = query_str[:100] if isinstance(query_str, str) else "SQLAlchemy_object"
+        op_name = f"fetch_all_threaded:{query_snippet}"
         
         # Prepare the synchronous function to run in thread
         def sync_fetch_and_process():
@@ -942,7 +991,11 @@ class BaseDatabaseManager(ABC):
         """Helper method for threaded fetch operations."""
         async with self.session(operation_name=op_name) as session:
             try:
-                result = await session.execute(text(query), params or {})
+                # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
+                if isinstance(query, str):
+                    result = await session.execute(text(query), params or {})
+                else:
+                    result = await session.execute(query, params or {})
                 rows = result.all()
                 
                 # Process rows in the thread to avoid main loop blocking
@@ -976,11 +1029,18 @@ class BaseDatabaseManager(ABC):
         timeout: Optional[float] = None, # Allows per-call override
         session: Optional[AsyncSession] = None # Existing session to use
     ) -> Any:
-        op_name = f"execute:{query[:100]}"
+        # Handle both string queries and SQLAlchemy objects
+        query_str = str(query) if hasattr(query, '__str__') else query
+        query_snippet = query_str[:100] if isinstance(query_str, str) else "SQLAlchemy_object"
+        op_name = f"execute:{query_snippet}"
         if session is not None: 
             try:
                 # When a session is provided, we assume the caller manages the transaction.
-                result = await session.execute(text(query), params or {})
+                # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
+                if isinstance(query, str):
+                    result = await session.execute(text(query), params or {})
+                else:
+                    result = await session.execute(query, params or {})
                 return result
             except SQLAlchemyError as e:
                 logger.error(f"Database error in execute (with existing session, op: {op_name}): {str(e)}\nQuery: {query}")
@@ -989,7 +1049,11 @@ class BaseDatabaseManager(ABC):
             async with self.session(operation_name=op_name) as new_session: # session() ensures a transaction
                 try:
                     # No longer need new_session.begin() here, self.session() handles it.
-                    result = await new_session.execute(text(query), params or {})
+                    # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
+                    if isinstance(query, str):
+                        result = await new_session.execute(text(query), params or {})
+                    else:
+                        result = await new_session.execute(query, params or {})
                     return result 
                 except SQLAlchemyError as e:
                     logger.error(f"Database error in execute (new session, op: {op_name}): {str(e)}\nQuery: {query}")
@@ -1014,7 +1078,10 @@ class BaseDatabaseManager(ABC):
             batch_size = min(batch_size, 100)
         
         start_time = time.time()
-        op_name = f"execute_many:{query[:100]}"
+        # Handle both string queries and SQLAlchemy objects
+        query_str = str(query) if hasattr(query, '__str__') else query
+        query_snippet = query_str[:100] if isinstance(query_str, str) else "SQLAlchemy_object"
+        op_name = f"execute_many:{query_snippet}"
 
         # execute_many always manages its own transaction here
         async with self.session(operation_name=op_name) as session: # Pass operation_name
@@ -1025,7 +1092,11 @@ class BaseDatabaseManager(ABC):
                         batch = params_list[i:i + batch_size]
                         batch_start_time = time.time()
                         
-                        await session.execute(text(query), batch)
+                        # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
+                        if isinstance(query, str):
+                            await session.execute(text(query), batch)
+                        else:
+                            await session.execute(query, batch)
                         # Commit is handled by the outer session.begin() context manager
                         
                         batch_duration = time.time() - batch_start_time
@@ -1068,7 +1139,10 @@ class BaseDatabaseManager(ABC):
     ) -> Any:
         max_retries = max_retries or self.MAX_RETRIES
         last_error = None
-        op_name = f"execute_with_retry:{query[:80]}" # Shorter op_name for retry wrapper
+        # Handle both string queries and SQLAlchemy objects
+        query_str = str(query) if hasattr(query, '__str__') else query
+        query_snippet = query_str[:80] if isinstance(query_str, str) else "SQLAlchemy_object"
+        op_name = f"execute_with_retry:{query_snippet}" # Shorter op_name for retry wrapper
 
         for attempt in range(max_retries):
             try:

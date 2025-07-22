@@ -7,7 +7,7 @@ import requests
 from fiber.logging_utils import get_logger
 ######Temp Health Check to run on local
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def check_environment_variables(required_vars):

@@ -354,6 +354,33 @@ miner_performance_stats_table = sa.Table('miner_performance_stats', validator_me
     sa.Column('geomagnetic_latest_score', sa.Float, nullable=True),
     sa.Column('geomagnetic_avg_error', sa.Float, nullable=True, comment="Average prediction error magnitude"),
     
+    # === NEW WEIGHT CALCULATION PIPELINE COLUMNS ===
+    sa.Column('submitted_weight', sa.Float, nullable=True, comment="Final weight submitted to chain by this validator"),
+    sa.Column('raw_calculated_weight', sa.Float, nullable=True, comment="Pre-normalization weight from scoring algorithm"),
+    sa.Column('excellence_weight', sa.Float, nullable=True, comment="Weight from excellence pathway calculation"),
+    sa.Column('diversity_weight', sa.Float, nullable=True, comment="Weight from diversity pathway calculation"),
+    sa.Column('scoring_pathway', sa.VARCHAR(20), nullable=True, comment="Which pathway was selected: excellence, diversity, or none"),
+    sa.Column('pathway_details', postgresql.JSONB, nullable=True, comment="Detailed breakdown of pathway calculation"),
+    
+    # === NEW CHAIN CONSENSUS INTEGRATION COLUMNS ===
+    sa.Column('incentive', sa.Float, nullable=True, comment="Final incentive value from chain consensus"),
+    sa.Column('consensus_rank', sa.Integer, nullable=True, comment="Miner rank based on final incentive values"),
+    sa.Column('weight_submission_block', sa.BigInteger, nullable=True, comment="Block number when weights were submitted"),
+    sa.Column('consensus_block', sa.BigInteger, nullable=True, comment="Block number when consensus was calculated"),
+    
+    # === NEW TASK WEIGHT CONTRIBUTIONS COLUMNS ===
+    sa.Column('weather_weight_contribution', sa.Float, nullable=True, comment="Contribution of weather task to final weight"),
+    sa.Column('geomagnetic_weight_contribution', sa.Float, nullable=True, comment="Contribution of geomagnetic task to final weight"),
+    sa.Column('soil_weight_contribution', sa.Float, nullable=True, comment="Contribution of soil moisture task to final weight"),
+    sa.Column('multi_task_bonus', sa.Float, nullable=True, comment="Bonus for performing multiple tasks well"),
+    
+    # === NEW PERFORMANCE ANALYSIS COLUMNS ===
+    sa.Column('percentile_rank_weather', sa.Float, nullable=True, comment="Percentile rank in weather forecasting (0-100)"),
+    sa.Column('percentile_rank_geomagnetic', sa.Float, nullable=True, comment="Percentile rank in geomagnetic predictions (0-100)"),
+    sa.Column('percentile_rank_soil', sa.Float, nullable=True, comment="Percentile rank in soil moisture predictions (0-100)"),
+    sa.Column('excellence_qualified_tasks', postgresql.ARRAY(sa.Text), nullable=True, comment="Array of tasks where miner qualified for excellence pathway"),
+    sa.Column('validator_hotkey', sa.Text, nullable=True, comment="Which validator calculated these stats"),
+    
     # Performance trends and metadata
     sa.Column('performance_trend', sa.VARCHAR(20), nullable=True, comment="improving, declining, stable, insufficient_data"),
     sa.Column('trend_confidence', sa.Float, nullable=True, comment="Confidence in trend assessment (0-1)"),
@@ -372,6 +399,15 @@ miner_performance_stats_table = sa.Table('miner_performance_stats', validator_me
     # Ensure one record per miner per period
     sa.UniqueConstraint('miner_uid', 'period_start', 'period_end', 'period_type', name='uq_mps_miner_period'),
     
+    # Data integrity constraints
+    sa.CheckConstraint("scoring_pathway IN ('excellence', 'diversity', 'none') OR scoring_pathway IS NULL", name='chk_scoring_pathway'),
+    sa.CheckConstraint(
+        "(percentile_rank_weather IS NULL OR (percentile_rank_weather >= 0 AND percentile_rank_weather <= 100)) AND "
+        "(percentile_rank_geomagnetic IS NULL OR (percentile_rank_geomagnetic >= 0 AND percentile_rank_geomagnetic <= 100)) AND "
+        "(percentile_rank_soil IS NULL OR (percentile_rank_soil >= 0 AND percentile_rank_soil <= 100))",
+        name='chk_percentile_ranges'
+    ),
+    
     comment="Comprehensive miner performance statistics aggregated across all task types for visualization and analysis."
 )
 
@@ -386,6 +422,18 @@ sa.Index('idx_mps_calculated_at', miner_performance_stats_table.c.calculated_at.
 sa.Index('idx_mps_weather_rank', miner_performance_stats_table.c.weather_rank, miner_performance_stats_table.c.period_type)
 sa.Index('idx_mps_soil_rank', miner_performance_stats_table.c.soil_moisture_rank, miner_performance_stats_table.c.period_type)
 sa.Index('idx_mps_geomagnetic_rank', miner_performance_stats_table.c.geomagnetic_rank, miner_performance_stats_table.c.period_type)
+
+# === NEW INDEXES FOR WEIGHT TRACKING AND CHAIN INTEGRATION ===
+sa.Index('idx_mps_submitted_weight', miner_performance_stats_table.c.submitted_weight.desc(), postgresql_where=miner_performance_stats_table.c.submitted_weight.isnot(None))
+sa.Index('idx_mps_scoring_pathway', miner_performance_stats_table.c.scoring_pathway, miner_performance_stats_table.c.period_type)
+sa.Index('idx_mps_incentive', miner_performance_stats_table.c.incentive.desc(), postgresql_where=miner_performance_stats_table.c.incentive.isnot(None))
+sa.Index('idx_mps_consensus_rank', miner_performance_stats_table.c.consensus_rank, miner_performance_stats_table.c.period_type, postgresql_where=miner_performance_stats_table.c.consensus_rank.isnot(None))
+sa.Index('idx_mps_validator_hotkey', miner_performance_stats_table.c.validator_hotkey, miner_performance_stats_table.c.period_start.desc())
+sa.Index('idx_mps_weight_submission_block', miner_performance_stats_table.c.weight_submission_block.desc(), postgresql_where=miner_performance_stats_table.c.weight_submission_block.isnot(None))
+
+# === COMPOSITE INDEXES FOR COMMON QUERY PATTERNS ===
+sa.Index('idx_mps_pathway_performance', miner_performance_stats_table.c.scoring_pathway, miner_performance_stats_table.c.submitted_weight.desc(), miner_performance_stats_table.c.period_type)
+sa.Index('idx_mps_chain_integration', miner_performance_stats_table.c.weight_submission_block, miner_performance_stats_table.c.consensus_block, postgresql_where=miner_performance_stats_table.c.weight_submission_block.isnot(None))
 
 # Placeholder for trigger function/trigger definitions if we move them here or handle in Alembic only
 # For now, the check_node_table_size function and its trigger are defined in the first migration directly.
