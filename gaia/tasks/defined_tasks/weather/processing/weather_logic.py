@@ -364,6 +364,7 @@ async def _request_fresh_token(task_instance: 'WeatherTask', miner_hotkey: str, 
     return None
 
 async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_utc: datetime, validator_hotkey: str = None) -> Optional[Dict[str, Any]]:
+async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_utc: datetime, validator_hotkey: str = None) -> Optional[Dict[str, Any]]:
     """
     Check if a job exists for the given GFS initialization time and validator.
     With the new deterministic job ID system, we prioritize job reuse across validators.
@@ -373,6 +374,11 @@ async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_u
     All fallbacks require exact GFS timestep matches for weather data validity.
     
     (Intended for Miner-side usage)
+    
+    Args:
+        task_instance: WeatherTask instance
+        gfs_init_time_utc: GFS initialization time
+        validator_hotkey: Optional validator hotkey to filter by specific validator's jobs
     
     Args:
         task_instance: WeatherTask instance
@@ -424,6 +430,7 @@ async def get_job_by_gfs_init_time(task_instance: 'WeatherTask', gfs_init_time_u
             
         return None
     except Exception as e:
+        logger.error(f"Error checking for existing job with GFS init time {gfs_init_time_utc} and validator {validator_hotkey}: {e}")
         logger.error(f"Error checking for existing job with GFS init time {gfs_init_time_utc} and validator {validator_hotkey}: {e}")
         return None
 

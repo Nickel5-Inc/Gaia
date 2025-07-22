@@ -572,6 +572,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 aws_access_key_id=access_key_id,
                 aws_secret_access_key=secret_access_key,
                 config=config
+                config=config
             )
             return s3_client
         except Exception as e:
@@ -579,6 +580,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             return None
 
     async def _upload_input_to_r2(self, s3_client: boto3.client, job_id: str, initial_batch: 'Batch') -> Optional[str]:
+        """Uploads the initial batch pickle to R2 with robust retry logic."""
         """Uploads the initial batch pickle to R2 with robust retry logic."""
         if not self.r2_config or not self.r2_config.get("r2_bucket_name"):
             logger.error(f"[{job_id}] R2 bucket name not found in self.r2_config. Cannot upload input.")
@@ -588,10 +590,135 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         object_key = f"inputs/{job_id}/initial_batch.pkl"
         
         # Serialize the batch to bytes first
+        # Serialize the batch to bytes first
         try:
             with io.BytesIO() as f:
                 pickle.dump(initial_batch, f)
                 f.seek(0)
+                data_bytes = f.getvalue()
+                
+            data_size_mb = len(data_bytes) / (1024 * 1024)
+            logger.info(f"[{job_id}] Prepared batch for upload: {data_size_mb:.2f} MB")
+            
+            # Use robust upload with retry logic
+            success = await self._robust_upload_bytes_to_r2(
+                s3_client, bucket_name, object_key, data_bytes, job_id
+            )
+            
+            if success:
+                logger.info(f"[{job_id}] Successfully uploaded initial batch to R2: s3://{bucket_name}/{object_key}")
+                return object_key
+            else:
+                logger.error(f"[{job_id}] Failed to upload initial batch to R2 after retries")
+                return None
+                
+        except Exception as e:
+            logger.error(f"[{job_id}] Error preparing batch for upload: {e}", exc_info=True)
+            return None
+
+    async def _robust_upload_bytes_to_r2(
+        self, 
+        s3_client: boto3.client, 
+        bucket_name: str, 
+        object_key: str, 
+        data_bytes: bytes, 
+        job_id: str,
+        max_retries: int = 5
+    ) -> bool:
+        """
+        Robust upload to R2 with exponential backoff retry logic.
+        Handles multipart upload failures gracefully.
+        """
+        base_delay = 2.0  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Use TransferConfig for better multipart handling
+                from boto3.s3.transfer import TransferConfig
+                
+                transfer_config = TransferConfig(
+                    multipart_threshold=1024*1024*64,  # 64MB
+                    multipart_chunksize=1024*1024*8,   # 8MB chunks
+                    max_concurrency=5,  # Limit concurrency to prevent connection pool exhaustion
+                    use_threads=True,
+                    max_bandwidth=None
+                )
+                
+                # Upload with transfer config
+                with io.BytesIO(data_bytes) as f:
+                    await asyncio.to_thread(
+                        s3_client.upload_fileobj,
+                        f,
+                        bucket_name,
+                        object_key,
+                        Config=transfer_config
+                    )
+                
+                # Verify upload by checking object existence
+                try:
+                    await asyncio.to_thread(
+                        s3_client.head_object,
+                        Bucket=bucket_name,
+                        Key=object_key
+                    )
+                    logger.info(f"[{job_id}] Upload verified: s3://{bucket_name}/{object_key}")
+                    return True
+                except Exception as verify_error:
+                    logger.warning(f"[{job_id}] Upload verification failed: {verify_error}")
+                    # Continue to retry logic
+                    
+            except Exception as e:
+                error_msg = f"Attempt {attempt + 1}/{max_retries} failed: {type(e).__name__}: {str(e)}"
+                
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"[{job_id}] {error_msg}. Retrying in {delay:.1f}s...")
+                    await asyncio.sleep(delay)
+                    
+                    # Try to clean up any partial multipart uploads
+                    try:
+                        await self._cleanup_failed_multipart_uploads(s3_client, bucket_name, object_key, job_id)
+                    except Exception as cleanup_error:
+                        logger.debug(f"[{job_id}] Cleanup error (non-critical): {cleanup_error}")
+                    
+                    continue
+                else:
+                    logger.error(f"[{job_id}] All {max_retries} upload attempts failed. Final error: {e}")
+                    return False
+        
+        return False
+    
+    async def _cleanup_failed_multipart_uploads(
+        self, 
+        s3_client: boto3.client, 
+        bucket_name: str, 
+        object_key: str, 
+        job_id: str
+    ):
+        """Clean up any failed multipart uploads for the given object key."""
+        try:
+            # List multipart uploads
+            response = await asyncio.to_thread(
+                s3_client.list_multipart_uploads,
+                Bucket=bucket_name,
+                Prefix=object_key
+            )
+            
+            if 'Uploads' in response:
+                for upload in response['Uploads']:
+                    upload_id = upload['UploadId']
+                    logger.info(f"[{job_id}] Aborting failed multipart upload: {upload_id}")
+                    
+                    await asyncio.to_thread(
+                        s3_client.abort_multipart_upload,
+                        Bucket=bucket_name,
+                        Key=object_key,
+                        UploadId=upload_id
+                    )
+                    
+        except Exception as e:
+            logger.debug(f"[{job_id}] Error during multipart cleanup: {e}")
+            # This is non-critical, so we don't re-raise
                 data_bytes = f.getvalue()
                 
             data_size_mb = len(data_bytes) / (1024 * 1024)
