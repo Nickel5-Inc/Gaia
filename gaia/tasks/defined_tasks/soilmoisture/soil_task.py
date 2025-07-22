@@ -1114,6 +1114,40 @@ class SoilMoistureTask(Task):
                 temp_path = None
                 try:
                     logger.info(f"🌍 Processing tasks for target_time: {target_time} ({len(tasks_in_time_window)} regions)")
+                    
+                    # PRE-CHECK: Verify SMAP data is expected to be available before attempting download
+                    availability_status = await self.is_smap_data_expected_available(target_time)
+                    
+                    if not availability_status["available"]:
+                        logger.info(f"⏳ SMAP data not expected to be available yet for {target_time}")
+                        logger.info(f"   Reason: {availability_status['reason']}")
+                        logger.info(f"   Expected available: {availability_status['expected_available_time']}")
+                        logger.info(f"   Will check again: {availability_status['next_check_time']}")
+                        
+                        # Schedule tasks to check again later WITHOUT incrementing retry count
+                        for task in tasks_in_time_window:
+                            for prediction in task["predictions"]:
+                                update_query = """
+                                    UPDATE soil_moisture_predictions
+                                    SET next_retry_time = :next_retry_time,
+                                        retry_error_message = :error_message,
+                                        status = 'retry_scheduled'
+                                    WHERE region_id = :region_id
+                                    AND miner_uid = :miner_uid
+                                """
+                                params = {
+                                    "region_id": task["id"],
+                                    "miner_uid": prediction["miner_id"],
+                                    "next_retry_time": availability_status["next_check_time"],
+                                    "error_message": f"SMAP data not expected until {availability_status['expected_available_time']} - pre-check avoided retry count increment"
+                                }
+                                await self.db_manager.execute(update_query, params)
+                        
+                        logger.info(f"⏳ Scheduled {len(tasks_in_time_window)} regions for {target_time} to retry at {availability_status['next_check_time']} (NO retry count increment)")
+                        continue
+                    
+                    logger.info(f"✅ SMAP data expected to be available for {target_time}: {availability_status['reason']}")
+                    
                     # Transform tasks into the format expected by get_smap_data
                     regions_for_smap = []
                     for task in tasks_in_time_window:
@@ -1125,7 +1159,7 @@ class SoilMoistureTask(Task):
                     
                     if smap_data_result is None or not isinstance(smap_data_result, dict):
                         logger.error(f"Failed to download or process SMAP data for {target_time}")
-                        # Update retry information for failed tasks
+                        # Update retry information for failed tasks - NOW increment retry count for actual failures
                         for task in tasks_in_time_window:
                             for prediction in task["predictions"]:
                                 update_query = """
@@ -1140,8 +1174,8 @@ class SoilMoistureTask(Task):
                                 params = {
                                     "region_id": task["id"],
                                     "miner_uid": prediction["miner_id"],
-                                    "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=2),  # SMAP data availability issue
-                                    "error_message": "Failed to download SMAP data"
+                                    "next_retry_time": datetime.now(timezone.utc) + timedelta(hours=2),  # Actual failure - standard retry
+                                    "error_message": "Failed to download SMAP data (actual failure after pre-check passed)"
                                 }
                                 await self.db_manager.execute(update_query, params)
                         continue
@@ -1154,10 +1188,10 @@ class SoilMoistureTask(Task):
                         
                         # Determine retry timing based on error type
                         if error_type == "http_error" and status_code == 404:
-                            # Data not available yet - retry sooner since data might become available
+                            # Data not available yet - but this should be rare now with pre-check
                             retry_hours = 1  # Retry in 1 hour for 404 errors
-                            detailed_message = f"SMAP data not available yet (HTTP 404) for {target_time}"
-                            logger.warning(f"⏳ {detailed_message} - will retry in {retry_hours} hour(s)")
+                            detailed_message = f"SMAP data not available yet (HTTP 404) for {target_time} - unexpected after pre-check"
+                            logger.warning(f"⚠️  {detailed_message} - will retry in {retry_hours} hour(s)")
                         elif error_type == "http_error" and status_code in [401, 403]:
                             # Authentication issue - retry later but log as concerning
                             retry_hours = 4  # Longer retry for auth issues
@@ -1168,18 +1202,13 @@ class SoilMoistureTask(Task):
                             retry_hours = 2  # Standard retry for server errors
                             detailed_message = f"SMAP server error (HTTP {status_code}) for {target_time}"
                             logger.error(f"🔧 {detailed_message} - will retry in {retry_hours} hour(s)")
-                        elif error_type == "network_error":
-                            # Network issue - retry moderately soon
-                            retry_hours = 1.5  # Quick retry for network issues
-                            detailed_message = f"Network error accessing SMAP data for {target_time}: {error_message}"
-                            logger.warning(f"🌐 {detailed_message} - will retry in {retry_hours} hour(s)")
                         else:
-                            # Other errors - use default timing
+                            # Other errors - general retry
                             retry_hours = 2
-                            detailed_message = f"SMAP error ({error_type}) for {target_time}: {error_message}"
+                            detailed_message = f"SMAP error ({error_type}: {error_message}) for {target_time}"
                             logger.error(f"❌ {detailed_message} - will retry in {retry_hours} hour(s)")
                         
-                        # Update retry information with detailed error
+                        # Update retry information for tasks with actual errors - increment retry count
                         for task in tasks_in_time_window:
                             for prediction in task["predictions"]:
                                 update_query = """
@@ -1198,6 +1227,7 @@ class SoilMoistureTask(Task):
                                     "error_message": detailed_message
                                 }
                                 await self.db_manager.execute(update_query, params)
+                        
                         continue
                     
                     # Extract file path and processed data
@@ -3676,4 +3706,64 @@ class SoilMoistureTask(Task):
             logger.error(f"Error in force_score_stuck_predictions: {e}")
             logger.error(traceback.format_exc())
             return {"status": "error", "message": str(e)}
+
+    async def is_smap_data_expected_available(self, target_time: datetime) -> Dict[str, Any]:
+        """
+        Check if SMAP data is expected to be available for a given target time.
+        
+        Args:
+            target_time: The target time for which SMAP data is needed
+            
+        Returns:
+            Dict with keys:
+            - available: bool - True if data is expected to be available
+            - reason: str - Explanation of the availability status
+            - next_check_time: datetime - When to check again if not available
+            - expected_available_time: datetime - When data is expected to become available
+        """
+        current_time = datetime.now(timezone.utc)
+        
+        # SMAP data typically becomes available 3-5 days after the observation time
+        # Use conservative estimate of 5 days plus 6 hours buffer for processing/upload time
+        smap_availability_delay = timedelta(days=5, hours=6)
+        expected_available_time = target_time + smap_availability_delay
+        
+        # In test mode, use much shorter delay for faster testing
+        if self.test_mode:
+            smap_availability_delay = timedelta(hours=1)  # 1 hour delay in test mode
+            expected_available_time = target_time + smap_availability_delay
+        
+        # Check if enough time has passed for data to be available
+        time_since_target = current_time - target_time
+        is_available = time_since_target >= smap_availability_delay
+        
+        if is_available:
+            return {
+                "available": True,
+                "reason": f"Sufficient time ({time_since_target.days} days, {time_since_target.seconds//3600} hours) has passed since target time",
+                "next_check_time": None,
+                "expected_available_time": expected_available_time
+            }
+        else:
+            # Data not expected yet - schedule next check for when it should be available
+            time_until_available = expected_available_time - current_time
+            
+            # Check more frequently as we approach the expected availability time
+            if time_until_available <= timedelta(hours=6):
+                next_check_delay = timedelta(hours=1)  # Check hourly in final 6 hours
+            elif time_until_available <= timedelta(days=1):
+                next_check_delay = timedelta(hours=4)  # Check every 4 hours in final day
+            elif time_until_available <= timedelta(days=2):
+                next_check_delay = timedelta(hours=12)  # Check twice daily in final 2 days
+            else:
+                next_check_delay = timedelta(days=1)   # Check daily when far from availability
+            
+            next_check_time = current_time + next_check_delay
+            
+            return {
+                "available": False,
+                "reason": f"SMAP data not expected for {time_until_available.days} days, {time_until_available.seconds//3600} hours (needs {smap_availability_delay.days} days delay)",
+                "next_check_time": next_check_time,
+                "expected_available_time": expected_available_time
+            }
 

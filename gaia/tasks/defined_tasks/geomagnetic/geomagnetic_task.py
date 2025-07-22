@@ -2082,6 +2082,21 @@ class GeomagneticTask(Task):
         Background worker loop that checks for pending tasks every 10 minutes
         and attempts to score them if ground truth becomes available.
         """
+        # Register this worker for global memory cleanup coordination
+        try:
+            from gaia.utils.global_memory_manager import register_thread_cleanup
+            
+            def cleanup_geomag_caches():
+                # Clear any caches that accumulate during geomagnetic retry processing
+                import gc
+                collected = gc.collect()
+                logger.debug(f"[GeomagRetryWorker] Performed cleanup, collected {collected} objects")
+            
+            register_thread_cleanup("geomagnetic_retry_worker", cleanup_geomag_caches)
+            logger.debug("[GeomagRetryWorker] Registered for global memory cleanup")
+        except Exception as e:
+            logger.debug(f"[GeomagRetryWorker] Failed to register cleanup: {e}")
+        
         retry_interval = 600 if not self.test_mode else 60  # 10 minutes in production, 1 minute in test mode
         
         while self.pending_retry_worker_running:

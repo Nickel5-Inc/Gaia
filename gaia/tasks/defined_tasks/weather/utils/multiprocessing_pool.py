@@ -59,6 +59,21 @@ class MemoryAwareProcessPool:
         self.executor: Optional[ProcessPoolExecutor] = None
         self._is_initialized = False
         
+        # Register this pool for global memory cleanup coordination
+        try:
+            from gaia.utils.global_memory_manager import register_thread_cleanup
+            
+            def cleanup_process_pool_caches():
+                # Clear any caches that accumulate in the process pool management
+                import gc
+                collected = gc.collect()
+                logger.debug(f"[MemoryAwareProcessPool] Performed cleanup, collected {collected} objects")
+            
+            register_thread_cleanup("memory_aware_process_pool", cleanup_process_pool_caches)
+            logger.debug("[MemoryAwareProcessPool] Registered for global memory cleanup")
+        except Exception as e:
+            logger.debug(f"[MemoryAwareProcessPool] Failed to register cleanup: {e}")
+        
         logger.info(f"MemoryAwareProcessPool initialized: max_workers={self.max_workers}, "
                    f"memory_threshold={memory_threshold_mb}MB, current_workers={self.current_workers}")
     

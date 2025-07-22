@@ -733,6 +733,21 @@ class Miner:
             process = psutil.Process()
             last_log_time = 0
             
+            # Register this thread for global memory cleanup coordination
+            try:
+                from gaia.utils.global_memory_manager import create_thread_cleanup_helper
+                cleanup_helper = create_thread_cleanup_helper()
+                
+                # Register cleanup for any miner-specific caches that might accumulate
+                def miner_memory_cleanup():
+                    gc.collect()  # Basic GC
+                    self.logger.debug("Miner memory monitor performed cleanup")
+                
+                cleanup_helper.register_custom_cleanup("miner_memory_monitor", miner_memory_cleanup)
+                self.logger.debug("Registered miner memory monitor thread for global cleanup")
+            except Exception as e:
+                self.logger.debug(f"Failed to register miner memory monitor cleanup: {e}")
+            
             # Configurable thresholds with defaults tuned for miner systems
             warning_threshold_mb = int(os.getenv('MINER_MEMORY_WARNING_THRESHOLD_MB', '8000'))  # 8GB
             emergency_threshold_mb = int(os.getenv('MINER_MEMORY_EMERGENCY_THRESHOLD_MB', '12000'))  # 12GB

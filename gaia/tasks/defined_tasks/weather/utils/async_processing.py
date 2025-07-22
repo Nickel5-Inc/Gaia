@@ -32,6 +32,32 @@ class AsyncProcessingConfig:
     """Configuration for async processing operations."""
     
     def __init__(self):
+        # Register for global memory cleanup coordination
+        try:
+            from gaia.utils.global_memory_manager import register_thread_cleanup
+            
+            def cleanup_async_processing_caches():
+                # Clear dask caches that accumulate during weather processing
+                if DASK_AVAILABLE and dask:
+                    try:
+                        # Clear dask caches
+                        if hasattr(dask, 'delayed') and hasattr(dask.delayed, 'clear_cache'):
+                            dask.delayed.clear_cache()
+                        # Clear any dask array caches
+                        if hasattr(da, '_cached'):
+                            da._cached.clear()
+                    except Exception:
+                        pass
+                
+                import gc
+                collected = gc.collect()
+                logger.debug(f"[AsyncProcessing] Performed cleanup, collected {collected} objects")
+            
+            register_thread_cleanup("async_processing_config", cleanup_async_processing_caches)
+            logger.debug("[AsyncProcessing] Registered for global memory cleanup")
+        except Exception as e:
+            logger.debug(f"[AsyncProcessing] Failed to register cleanup: {e}")
+        
         # Set optimal dask configuration for weather operations
         if DASK_AVAILABLE:
             # Use threads for CPU-bound operations (better for numerical work)

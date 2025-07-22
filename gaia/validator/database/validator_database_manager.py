@@ -348,6 +348,12 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             logger.error(traceback.format_exc())
             raise DatabaseError(f"Failed to close database connections: {str(e)}")
 
+    async def get_raw_connection(self):
+        """Get a raw AsyncConnection for use with external libraries like MinerPerformanceCalculator."""
+        if not self._engine:
+            raise DatabaseError("Database engine not initialized")
+        return await self._engine.connect()
+
     @track_operation('write')
     async def update_miner_info(
         self,
@@ -946,24 +952,40 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 
             if session:
                 # If an external session is passed, assume the caller manages the transaction
-                result = await session.execute(text(query), params or {})
+                # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
+                if isinstance(query, str):
+                    result = await session.execute(text(query), params or {})
+                else:
+                    result = await session.execute(query, params or {})
                 return result
             else:
                 # Create a new session and manage the transaction explicitly
                 # BaseDatabaseManager.session() now ensures a transaction is started on new_session.
-                async with self.session(operation_name=f"execute_new_session_query_snippet_{query[:30]}") as new_session:
+                # Handle both string queries and SQLAlchemy objects
+                query_str = str(query) if hasattr(query, '__str__') else query
+                query_snippet = query_str[:30] if isinstance(query_str, str) else "SQLAlchemy_object"
+                
+                async with self.session(operation_name=f"execute_new_session_query_snippet_{query_snippet}") as new_session:
                     try:
                         # No longer need new_session.begin() here.
-                        result = await new_session.execute(text(query), params or {})
+                        # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
+                        if isinstance(query, str):
+                            result = await new_session.execute(text(query), params or {})
+                        else:
+                            # Query is already a SQLAlchemy object, execute directly
+                            result = await new_session.execute(query, params or {})
                         # BaseDatabaseManager.session() will handle the commit on successful exit.
-                        logger.debug(f"Query executed successfully within session {id(new_session)} for query: {query[:100]}...")
+                        query_log = query_str[:100] if isinstance(query_str, str) else str(query)[:100]
+                        logger.debug(f"Query executed successfully within session {id(new_session)} for query: {query_log}...")
                         return result
                     except asyncio.CancelledError:
-                        logger.warning(f"Execute operation cancelled for session {id(new_session)} query: {query[:100]}...")
+                        query_log = query_str[:100] if isinstance(query_str, str) else str(query)[:100]
+                        logger.warning(f"Execute operation cancelled for session {id(new_session)} query: {query_log}...")
                         # Rollback will be handled by BaseDatabaseManager.session's except block.
                         raise # Re-raise CancelledError to be caught by BaseDatabaseManager.session
                     except Exception as e_inner:
-                        logger.error(f"Error during query for session {id(new_session)} (query: {query[:100]}...): {e_inner}.")
+                        query_log = query_str[:100] if isinstance(query_str, str) else str(query)[:100]
+                        logger.error(f"Error during query for session {id(new_session)} (query: {query_log}...): {e_inner}.")
                         # Rollback will be handled by BaseDatabaseManager.session's except block.
                         raise # Re-raise the original query execution error to be caught by BaseDatabaseManager.session
         except Exception as e:

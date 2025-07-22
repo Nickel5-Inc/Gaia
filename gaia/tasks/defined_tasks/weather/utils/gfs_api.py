@@ -23,7 +23,7 @@ warnings.filterwarnings('ignore',
                        message='numpy.core.numeric is deprecated',
                        category=DeprecationWarning)
 
-DODS_BASE_URL = "https://nomads.ncep.noaa.gov/dods/gfs_0p25/gfs"
+DODS_BASE_URL = "http://nomads.ncep.noaa.gov/dods/gfs_0p25/gfs"
 AURORA_PRESSURE_LEVELS_HPA = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
 GFS_SURFACE_VARS = ["tmp2m", "ugrd10m", "vgrd10m", "prmslmsl"]
 GFS_ATMOS_VARS = ["tmpprs", "ugrdprs", "vgrdprs", "spfhprs", "hgtprs"]
@@ -77,7 +77,7 @@ async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: 
         date_str = run_time.strftime('%Y%m%d')
         cycle_str = f"{run_time.hour:02d}"
 
-        dods_base = "https://nomads.ncep.noaa.gov/dods/gfs_0p25/gfs"
+        dods_base = "http://nomads.ncep.noaa.gov/dods/gfs_0p25/gfs"
         base_url = f"{dods_base}{date_str}/gfs_0p25_{cycle_str}z"
         logger.info(f"Using OPeNDAP URL: {base_url}")
 

@@ -302,6 +302,139 @@ geomagnetic_history_table = sa.Table('geomagnetic_history', validator_metadata,
 sa.Index('idx_gh_query_time_miner_uid', geomagnetic_history_table.c.query_time, geomagnetic_history_table.c.miner_uid)
 sa.Index('idx_gh_miner_hotkey_scored_at', geomagnetic_history_table.c.miner_hotkey, geomagnetic_history_table.c.scored_at.desc())
 
+# --- Miner Performance Statistics Table ---
+miner_performance_stats_table = sa.Table('miner_performance_stats', validator_metadata,
+    sa.Column('id', sa.Integer, primary_key=True, autoincrement=True),
+    sa.Column('miner_uid', sa.Text, nullable=False, comment="Miner's UID"),
+    sa.Column('miner_hotkey', sa.Text, nullable=False, comment="Miner's hotkey"),
+    
+    # Time period for this statistics snapshot
+    sa.Column('period_start', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="Start of the performance period"),
+    sa.Column('period_end', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="End of the performance period"),
+    sa.Column('period_type', sa.VARCHAR(20), nullable=False, comment="Type of period: daily, weekly, monthly, all_time"),
+    
+    # Overall performance metrics
+    sa.Column('total_tasks_attempted', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Total tasks attempted across all types"),
+    sa.Column('total_tasks_completed', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Total tasks successfully completed"),
+    sa.Column('total_tasks_scored', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Total tasks that received scores"),
+    sa.Column('overall_success_rate', sa.Float, nullable=True, comment="Completion rate (completed/attempted)"),
+    sa.Column('overall_avg_score', sa.Float, nullable=True, comment="Weighted average score across all task types"),
+    sa.Column('overall_rank', sa.Integer, nullable=True, comment="Overall rank among all miners for this period"),
+    
+    # Weather-specific metrics
+    sa.Column('weather_tasks_attempted', sa.Integer, server_default=sa.text('0'), nullable=False),
+    sa.Column('weather_tasks_completed', sa.Integer, server_default=sa.text('0'), nullable=False),
+    sa.Column('weather_tasks_scored', sa.Integer, server_default=sa.text('0'), nullable=False),
+    sa.Column('weather_avg_score', sa.Float, nullable=True, comment="Average weather forecast score"),
+    sa.Column('weather_success_rate', sa.Float, nullable=True),
+    sa.Column('weather_rank', sa.Integer, nullable=True, comment="Rank in weather forecasting"),
+    sa.Column('weather_best_score', sa.Float, nullable=True, comment="Best weather score in period"),
+    sa.Column('weather_latest_score', sa.Float, nullable=True, comment="Most recent weather score"),
+    
+    # Soil moisture-specific metrics  
+    sa.Column('soil_moisture_tasks_attempted', sa.Integer, server_default=sa.text('0'), nullable=False),
+    sa.Column('soil_moisture_tasks_completed', sa.Integer, server_default=sa.text('0'), nullable=False),
+    sa.Column('soil_moisture_tasks_scored', sa.Integer, server_default=sa.text('0'), nullable=False),
+    sa.Column('soil_moisture_avg_score', sa.Float, nullable=True, comment="Average combined soil moisture score"),
+    sa.Column('soil_moisture_success_rate', sa.Float, nullable=True),
+    sa.Column('soil_moisture_rank', sa.Integer, nullable=True),
+    sa.Column('soil_moisture_surface_rmse_avg', sa.Float, nullable=True, comment="Average surface RMSE"),
+    sa.Column('soil_moisture_rootzone_rmse_avg', sa.Float, nullable=True, comment="Average rootzone RMSE"),
+    sa.Column('soil_moisture_best_score', sa.Float, nullable=True),
+    sa.Column('soil_moisture_latest_score', sa.Float, nullable=True),
+    
+    # Geomagnetic-specific metrics
+    sa.Column('geomagnetic_tasks_attempted', sa.Integer, server_default=sa.text('0'), nullable=False),
+    sa.Column('geomagnetic_tasks_completed', sa.Integer, server_default=sa.text('0'), nullable=False),
+    sa.Column('geomagnetic_tasks_scored', sa.Integer, server_default=sa.text('0'), nullable=False),
+    sa.Column('geomagnetic_avg_score', sa.Float, nullable=True, comment="Average geomagnetic prediction score"),
+    sa.Column('geomagnetic_success_rate', sa.Float, nullable=True),
+    sa.Column('geomagnetic_rank', sa.Integer, nullable=True),
+    sa.Column('geomagnetic_best_score', sa.Float, nullable=True),
+    sa.Column('geomagnetic_latest_score', sa.Float, nullable=True),
+    sa.Column('geomagnetic_avg_error', sa.Float, nullable=True, comment="Average prediction error magnitude"),
+    
+    # === NEW WEIGHT CALCULATION PIPELINE COLUMNS ===
+    sa.Column('submitted_weight', sa.Float, nullable=True, comment="Final weight submitted to chain by this validator"),
+    sa.Column('raw_calculated_weight', sa.Float, nullable=True, comment="Pre-normalization weight from scoring algorithm"),
+    sa.Column('excellence_weight', sa.Float, nullable=True, comment="Weight from excellence pathway calculation"),
+    sa.Column('diversity_weight', sa.Float, nullable=True, comment="Weight from diversity pathway calculation"),
+    sa.Column('scoring_pathway', sa.VARCHAR(20), nullable=True, comment="Which pathway was selected: excellence, diversity, or none"),
+    sa.Column('pathway_details', postgresql.JSONB, nullable=True, comment="Detailed breakdown of pathway calculation"),
+    
+    # === NEW CHAIN CONSENSUS INTEGRATION COLUMNS ===
+    sa.Column('incentive', sa.Float, nullable=True, comment="Final incentive value from chain consensus"),
+    sa.Column('consensus_rank', sa.Integer, nullable=True, comment="Miner rank based on final incentive values"),
+    sa.Column('weight_submission_block', sa.BigInteger, nullable=True, comment="Block number when weights were submitted"),
+    sa.Column('consensus_block', sa.BigInteger, nullable=True, comment="Block number when consensus was calculated"),
+    
+    # === NEW TASK WEIGHT CONTRIBUTIONS COLUMNS ===
+    sa.Column('weather_weight_contribution', sa.Float, nullable=True, comment="Contribution of weather task to final weight"),
+    sa.Column('geomagnetic_weight_contribution', sa.Float, nullable=True, comment="Contribution of geomagnetic task to final weight"),
+    sa.Column('soil_weight_contribution', sa.Float, nullable=True, comment="Contribution of soil moisture task to final weight"),
+    sa.Column('multi_task_bonus', sa.Float, nullable=True, comment="Bonus for performing multiple tasks well"),
+    
+    # === NEW PERFORMANCE ANALYSIS COLUMNS ===
+    sa.Column('percentile_rank_weather', sa.Float, nullable=True, comment="Percentile rank in weather forecasting (0-100)"),
+    sa.Column('percentile_rank_geomagnetic', sa.Float, nullable=True, comment="Percentile rank in geomagnetic predictions (0-100)"),
+    sa.Column('percentile_rank_soil', sa.Float, nullable=True, comment="Percentile rank in soil moisture predictions (0-100)"),
+    sa.Column('excellence_qualified_tasks', postgresql.ARRAY(sa.Text), nullable=True, comment="Array of tasks where miner qualified for excellence pathway"),
+    sa.Column('validator_hotkey', sa.Text, nullable=True, comment="Which validator calculated these stats"),
+    
+    # Performance trends and metadata
+    sa.Column('performance_trend', sa.VARCHAR(20), nullable=True, comment="improving, declining, stable, insufficient_data"),
+    sa.Column('trend_confidence', sa.Float, nullable=True, comment="Confidence in trend assessment (0-1)"),
+    sa.Column('last_active_time', postgresql.TIMESTAMP(timezone=True), nullable=True, comment="Last time miner submitted a task"),
+    sa.Column('consecutive_failures', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Number of consecutive failed tasks"),
+    sa.Column('uptime_percentage', sa.Float, nullable=True, comment="Percentage of time miner was responsive"),
+    
+    # Detailed metrics storage
+    sa.Column('detailed_metrics', postgresql.JSONB, nullable=True, comment="Additional detailed metrics and breakdowns"),
+    sa.Column('score_distribution', postgresql.JSONB, nullable=True, comment="Score percentiles and distribution stats"),
+    
+    # Metadata
+    sa.Column('calculated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    sa.Column('updated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    
+    # Ensure one record per miner per period
+    sa.UniqueConstraint('miner_uid', 'period_start', 'period_end', 'period_type', name='uq_mps_miner_period'),
+    
+    # Data integrity constraints
+    sa.CheckConstraint("scoring_pathway IN ('excellence', 'diversity', 'none') OR scoring_pathway IS NULL", name='chk_scoring_pathway'),
+    sa.CheckConstraint(
+        "(percentile_rank_weather IS NULL OR (percentile_rank_weather >= 0 AND percentile_rank_weather <= 100)) AND "
+        "(percentile_rank_geomagnetic IS NULL OR (percentile_rank_geomagnetic >= 0 AND percentile_rank_geomagnetic <= 100)) AND "
+        "(percentile_rank_soil IS NULL OR (percentile_rank_soil >= 0 AND percentile_rank_soil <= 100))",
+        name='chk_percentile_ranges'
+    ),
+    
+    comment="Comprehensive miner performance statistics aggregated across all task types for visualization and analysis."
+)
+
+# Indexes for the miner performance stats table
+sa.Index('idx_mps_miner_uid', miner_performance_stats_table.c.miner_uid)
+sa.Index('idx_mps_miner_hotkey', miner_performance_stats_table.c.miner_hotkey)
+sa.Index('idx_mps_period_type_start', miner_performance_stats_table.c.period_type, miner_performance_stats_table.c.period_start.desc())
+sa.Index('idx_mps_overall_rank', miner_performance_stats_table.c.overall_rank, miner_performance_stats_table.c.period_type)
+sa.Index('idx_mps_overall_score', miner_performance_stats_table.c.overall_avg_score.desc(), miner_performance_stats_table.c.period_type)
+sa.Index('idx_mps_last_active', miner_performance_stats_table.c.last_active_time.desc())
+sa.Index('idx_mps_calculated_at', miner_performance_stats_table.c.calculated_at.desc())
+sa.Index('idx_mps_weather_rank', miner_performance_stats_table.c.weather_rank, miner_performance_stats_table.c.period_type)
+sa.Index('idx_mps_soil_rank', miner_performance_stats_table.c.soil_moisture_rank, miner_performance_stats_table.c.period_type)
+sa.Index('idx_mps_geomagnetic_rank', miner_performance_stats_table.c.geomagnetic_rank, miner_performance_stats_table.c.period_type)
+
+# === NEW INDEXES FOR WEIGHT TRACKING AND CHAIN INTEGRATION ===
+sa.Index('idx_mps_submitted_weight', miner_performance_stats_table.c.submitted_weight.desc(), postgresql_where=miner_performance_stats_table.c.submitted_weight.isnot(None))
+sa.Index('idx_mps_scoring_pathway', miner_performance_stats_table.c.scoring_pathway, miner_performance_stats_table.c.period_type)
+sa.Index('idx_mps_incentive', miner_performance_stats_table.c.incentive.desc(), postgresql_where=miner_performance_stats_table.c.incentive.isnot(None))
+sa.Index('idx_mps_consensus_rank', miner_performance_stats_table.c.consensus_rank, miner_performance_stats_table.c.period_type, postgresql_where=miner_performance_stats_table.c.consensus_rank.isnot(None))
+sa.Index('idx_mps_validator_hotkey', miner_performance_stats_table.c.validator_hotkey, miner_performance_stats_table.c.period_start.desc())
+sa.Index('idx_mps_weight_submission_block', miner_performance_stats_table.c.weight_submission_block.desc(), postgresql_where=miner_performance_stats_table.c.weight_submission_block.isnot(None))
+
+# === COMPOSITE INDEXES FOR COMMON QUERY PATTERNS ===
+sa.Index('idx_mps_pathway_performance', miner_performance_stats_table.c.scoring_pathway, miner_performance_stats_table.c.submitted_weight.desc(), miner_performance_stats_table.c.period_type)
+sa.Index('idx_mps_chain_integration', miner_performance_stats_table.c.weight_submission_block, miner_performance_stats_table.c.consensus_block, postgresql_where=miner_performance_stats_table.c.weight_submission_block.isnot(None))
+
 # Placeholder for trigger function/trigger definitions if we move them here or handle in Alembic only
 # For now, the check_node_table_size function and its trigger are defined in the first migration directly.
 # If we make this validator_schema.py the *absolute* source, we might represent them here too,
