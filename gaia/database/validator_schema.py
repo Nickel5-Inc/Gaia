@@ -205,6 +205,29 @@ sa.Index('idx_wms_lead_hours', weather_miner_scores_table.c.lead_hours)
 sa.Index('idx_wms_variable_level', weather_miner_scores_table.c.variable_level)
 sa.Index('idx_wms_valid_time_utc', weather_miner_scores_table.c.valid_time_utc)
 
+weather_score_phases_table = sa.Table('weather_score_phases', validator_metadata,
+    sa.Column('id', sa.Integer, primary_key=True, autoincrement=True, comment="Serial ID for the score phase entry"),
+    sa.Column('run_id', sa.Integer, sa.ForeignKey('weather_forecast_runs.id', ondelete='CASCADE'), nullable=False, comment="ID of the forecast run being scored"),
+    sa.Column('miner_uid', sa.Integer, nullable=False, comment="Miner's UID"),
+    sa.Column('miner_hotkey', sa.VARCHAR(255), nullable=False, comment="Miner's hotkey"),
+    sa.Column('phase_type', sa.VARCHAR(20), nullable=False, comment="Scoring phase: 'initial' (Day-1 only) or 'final' (Day-1 + ERA5)"),
+    sa.Column('score_value', sa.Float, nullable=True, comment="Combined score for this phase"),
+    sa.Column('calculation_time', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="When this phase score was calculated"),
+    sa.Column('component_scores', postgresql.JSONB, nullable=True, comment="Breakdown of score components (day1_score, era5_score, weights used)"),
+    sa.Column('data_availability', postgresql.JSONB, nullable=True, comment="What data was available when scoring (for debugging/transparency)"),
+    sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False, comment="Timestamp of score creation"),
+    sa.UniqueConstraint('run_id', 'miner_uid', 'phase_type', name='uq_wsp_run_miner_phase'),
+    sa.CheckConstraint("phase_type IN ('initial', 'final')", name='chk_wsp_phase_type'),
+    comment="Tracks weather scoring phases - initial scores (Day-1 only) vs final scores (Day-1 + ERA5) for dual score tracking."
+)
+sa.Index('idx_wsp_run_id', weather_score_phases_table.c.run_id)
+sa.Index('idx_wsp_miner_uid', weather_score_phases_table.c.miner_uid)
+sa.Index('idx_wsp_miner_hotkey', weather_score_phases_table.c.miner_hotkey)
+sa.Index('idx_wsp_phase_type', weather_score_phases_table.c.phase_type)
+sa.Index('idx_wsp_calculation_time', weather_score_phases_table.c.calculation_time)
+sa.Index('idx_wsp_score_value', weather_score_phases_table.c.score_value.desc(), postgresql_where=weather_score_phases_table.c.score_value.isnot(None))
+sa.Index('idx_wsp_miner_phase_time', weather_score_phases_table.c.miner_uid, weather_score_phases_table.c.phase_type, weather_score_phases_table.c.calculation_time.desc())
+
 weather_scoring_jobs_table = sa.Table('weather_scoring_jobs', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True, comment="Serial ID for the scoring job"),
     sa.Column('run_id', sa.Integer, sa.ForeignKey('weather_forecast_runs.id', ondelete='CASCADE'), nullable=False, comment="ID of the forecast run being scored"),
@@ -304,14 +327,13 @@ sa.Index('idx_gh_miner_hotkey_scored_at', geomagnetic_history_table.c.miner_hotk
 
 # --- Miner Performance Statistics Table ---
 miner_performance_stats_table = sa.Table('miner_performance_stats', validator_metadata,
-    sa.Column('id', sa.Integer, primary_key=True, autoincrement=True),
-    sa.Column('miner_uid', sa.Text, nullable=False, comment="Miner's UID"),
+    sa.Column('miner_uid', sa.Text, primary_key=True, nullable=False, comment="Miner's UID"),
     sa.Column('miner_hotkey', sa.Text, nullable=False, comment="Miner's hotkey"),
     
-    # Time period for this statistics snapshot
-    sa.Column('period_start', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="Start of the performance period"),
-    sa.Column('period_end', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="End of the performance period"),
-    sa.Column('period_type', sa.VARCHAR(20), nullable=False, comment="Type of period: daily, weekly, monthly, all_time"),
+    # Time period for this statistics snapshot  
+    sa.Column('period_start', postgresql.TIMESTAMP(timezone=True), primary_key=True, comment="Start of the performance period - Part of Primary Key"),
+    sa.Column('period_end', postgresql.TIMESTAMP(timezone=True), primary_key=True, comment="End of the performance period - Part of Primary Key"),
+    sa.Column('period_type', sa.VARCHAR(20), primary_key=True, comment="Type of period: daily, weekly, monthly, all_time - Part of Primary Key"),
     
     # Overall performance metrics
     sa.Column('total_tasks_attempted', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Total tasks attempted across all types"),
@@ -379,7 +401,6 @@ miner_performance_stats_table = sa.Table('miner_performance_stats', validator_me
     sa.Column('percentile_rank_geomagnetic', sa.Float, nullable=True, comment="Percentile rank in geomagnetic predictions (0-100)"),
     sa.Column('percentile_rank_soil', sa.Float, nullable=True, comment="Percentile rank in soil moisture predictions (0-100)"),
     sa.Column('excellence_qualified_tasks', postgresql.ARRAY(sa.Text), nullable=True, comment="Array of tasks where miner qualified for excellence pathway"),
-    sa.Column('validator_hotkey', sa.Text, nullable=True, comment="Which validator calculated these stats"),
     
     # Performance trends and metadata
     sa.Column('performance_trend', sa.VARCHAR(20), nullable=True, comment="improving, declining, stable, insufficient_data"),
@@ -396,9 +417,6 @@ miner_performance_stats_table = sa.Table('miner_performance_stats', validator_me
     sa.Column('calculated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
     sa.Column('updated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
     
-    # Ensure one record per miner per period
-    sa.UniqueConstraint('miner_uid', 'period_start', 'period_end', 'period_type', name='uq_mps_miner_period'),
-    
     # Data integrity constraints
     sa.CheckConstraint("scoring_pathway IN ('excellence', 'diversity', 'none') OR scoring_pathway IS NULL", name='chk_scoring_pathway'),
     sa.CheckConstraint(
@@ -412,7 +430,6 @@ miner_performance_stats_table = sa.Table('miner_performance_stats', validator_me
 )
 
 # Indexes for the miner performance stats table
-sa.Index('idx_mps_miner_uid', miner_performance_stats_table.c.miner_uid)
 sa.Index('idx_mps_miner_hotkey', miner_performance_stats_table.c.miner_hotkey)
 sa.Index('idx_mps_period_type_start', miner_performance_stats_table.c.period_type, miner_performance_stats_table.c.period_start.desc())
 sa.Index('idx_mps_overall_rank', miner_performance_stats_table.c.overall_rank, miner_performance_stats_table.c.period_type)
@@ -428,12 +445,182 @@ sa.Index('idx_mps_submitted_weight', miner_performance_stats_table.c.submitted_w
 sa.Index('idx_mps_scoring_pathway', miner_performance_stats_table.c.scoring_pathway, miner_performance_stats_table.c.period_type)
 sa.Index('idx_mps_incentive', miner_performance_stats_table.c.incentive.desc(), postgresql_where=miner_performance_stats_table.c.incentive.isnot(None))
 sa.Index('idx_mps_consensus_rank', miner_performance_stats_table.c.consensus_rank, miner_performance_stats_table.c.period_type, postgresql_where=miner_performance_stats_table.c.consensus_rank.isnot(None))
-sa.Index('idx_mps_validator_hotkey', miner_performance_stats_table.c.validator_hotkey, miner_performance_stats_table.c.period_start.desc())
 sa.Index('idx_mps_weight_submission_block', miner_performance_stats_table.c.weight_submission_block.desc(), postgresql_where=miner_performance_stats_table.c.weight_submission_block.isnot(None))
 
 # === COMPOSITE INDEXES FOR COMMON QUERY PATTERNS ===
 sa.Index('idx_mps_pathway_performance', miner_performance_stats_table.c.scoring_pathway, miner_performance_stats_table.c.submitted_weight.desc(), miner_performance_stats_table.c.period_type)
 sa.Index('idx_mps_chain_integration', miner_performance_stats_table.c.weight_submission_block, miner_performance_stats_table.c.consensus_block, postgresql_where=miner_performance_stats_table.c.weight_submission_block.isnot(None))
+
+# === NORMALIZED MINER PERFORMANCE TABLES (NEW ARCHITECTURE) ===
+
+# Core miner metadata and overall performance
+miner_performance_summary_table = sa.Table('miner_performance_summary', validator_metadata,
+    sa.Column('miner_uid', sa.Text, nullable=False, comment="Miner's UID"),
+    sa.Column('period_start', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="Start of the performance period"),
+    sa.Column('period_end', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="End of the performance period"),
+    sa.Column('period_type', sa.VARCHAR(20), nullable=False, comment="Type of period: daily, weekly, monthly, all_time"),
+    sa.Column('miner_hotkey', sa.Text, nullable=False, comment="Miner's hotkey"),
+    sa.Column('calculated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    sa.Column('updated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    
+    # Overall aggregated metrics
+    sa.Column('total_tasks_attempted', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Total tasks attempted across all types"),
+    sa.Column('total_tasks_completed', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Total tasks successfully completed"),
+    sa.Column('overall_success_rate', sa.Float, nullable=True, comment="Completion rate (completed/attempted)"),
+    sa.Column('overall_avg_score', sa.Float, nullable=True, comment="Weighted average score across all task types"),
+    sa.Column('overall_rank', sa.Integer, nullable=True, comment="Overall rank among all miners for this period"),
+    
+    # Performance trends and metadata
+    sa.Column('performance_trend', sa.VARCHAR(20), nullable=True, comment="improving, declining, stable, insufficient_data"),
+    sa.Column('trend_confidence', sa.Float, nullable=True, comment="Confidence in trend assessment (0-1)"),
+    sa.Column('last_active_time', postgresql.TIMESTAMP(timezone=True), nullable=True, comment="Last time miner submitted a task"),
+    sa.Column('consecutive_failures', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Number of consecutive failed tasks"),
+    sa.Column('uptime_percentage', sa.Float, nullable=True, comment="Percentage of time miner was responsive"),
+    
+    sa.PrimaryKeyConstraint('miner_uid', 'period_start', 'period_end', 'period_type'),
+    comment="Core miner performance summary - aggregated metrics across all task types"
+)
+
+# Task-specific performance metrics (normalized)
+task_performance_metrics_table = sa.Table('task_performance_metrics', validator_metadata,
+    sa.Column('id', sa.Integer, primary_key=True, autoincrement=True, comment="Serial ID for the task performance entry"),
+    sa.Column('miner_uid', sa.Text, nullable=False, comment="Miner's UID"),
+    sa.Column('period_start', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="Start of the performance period"),
+    sa.Column('period_end', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="End of the performance period"),
+    sa.Column('period_type', sa.VARCHAR(20), nullable=False, comment="Type of period: daily, weekly, monthly, all_time"),
+    sa.Column('task_name', sa.VARCHAR(50), nullable=False, comment="Name of the task: weather, soil_moisture, geomagnetic"),
+    
+    # Core task metrics
+    sa.Column('tasks_attempted', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Tasks attempted for this task type"),
+    sa.Column('tasks_completed', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Tasks successfully completed"),
+    sa.Column('tasks_scored', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Tasks that received scores"),
+    sa.Column('avg_score', sa.Float, nullable=True, comment="Average score for this task type"),
+    sa.Column('success_rate', sa.Float, nullable=True, comment="Completion rate for this task type"),
+    sa.Column('rank', sa.Integer, nullable=True, comment="Rank among all miners for this task type"),
+    sa.Column('best_score', sa.Float, nullable=True, comment="Best score achieved in this period"),
+    sa.Column('latest_score', sa.Float, nullable=True, comment="Most recent score achieved"),
+    sa.Column('percentile_rank', sa.Float, nullable=True, comment="Percentile rank for this task (0-100)"),
+    sa.Column('weight_contribution', sa.Float, nullable=True, comment="Contribution of this task to final weight"),
+    
+    # Task-specific metrics (flexible storage for unique metrics per task)
+    sa.Column('task_specific_metrics', postgresql.JSONB, nullable=True, comment="Task-unique fields (e.g., RMSE for soil, prediction_error for geo)"),
+    
+    sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    sa.Column('updated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    
+    sa.ForeignKeyConstraint(['miner_uid', 'period_start', 'period_end', 'period_type'], 
+                           ['miner_performance_summary.miner_uid', 'miner_performance_summary.period_start', 
+                            'miner_performance_summary.period_end', 'miner_performance_summary.period_type'], 
+                           ondelete='CASCADE'),
+    sa.UniqueConstraint('miner_uid', 'period_start', 'period_end', 'period_type', 'task_name', name='uq_tpm_miner_period_task'),
+    sa.CheckConstraint("task_name IN ('weather', 'soil_moisture', 'geomagnetic')", name='chk_tpm_task_name'),
+    comment="Normalized task-specific performance metrics - one row per miner per period per task type"
+)
+
+# Weather phase-specific metrics (leverages our new weather_score_phases table)
+weather_performance_phases_table = sa.Table('weather_performance_phases', validator_metadata,
+    sa.Column('id', sa.Integer, primary_key=True, autoincrement=True, comment="Serial ID for the weather phase performance entry"),
+    sa.Column('miner_uid', sa.Text, nullable=False, comment="Miner's UID"),
+    sa.Column('period_start', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="Start of the performance period"),
+    sa.Column('period_end', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="End of the performance period"),
+    sa.Column('period_type', sa.VARCHAR(20), nullable=False, comment="Type of period: daily, weekly, monthly, all_time"),
+    sa.Column('phase_type', sa.VARCHAR(20), nullable=False, comment="Scoring phase: initial or final"),
+    
+    # Phase-specific metrics
+    sa.Column('runs_with_phase_scores', sa.Integer, server_default=sa.text('0'), nullable=False, comment="Number of runs with this phase type scored"),
+    sa.Column('avg_phase_score', sa.Float, nullable=True, comment="Average score for this phase"),
+    sa.Column('best_phase_score', sa.Float, nullable=True, comment="Best score for this phase"),
+    sa.Column('latest_phase_score', sa.Float, nullable=True, comment="Most recent score for this phase"),
+    sa.Column('phase_rank', sa.Integer, nullable=True, comment="Rank among all miners for this phase"),
+    
+    # Timing and availability metrics
+    sa.Column('avg_scoring_lag_days', sa.Float, nullable=True, comment="Average days between run initiation and phase score calculation"),
+    sa.Column('data_availability_summary', postgresql.JSONB, nullable=True, comment="Summary of data availability for this phase"),
+    
+    sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    sa.Column('updated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    
+    sa.ForeignKeyConstraint(['miner_uid', 'period_start', 'period_end', 'period_type'], 
+                           ['miner_performance_summary.miner_uid', 'miner_performance_summary.period_start', 
+                            'miner_performance_summary.period_end', 'miner_performance_summary.period_type'], 
+                           ondelete='CASCADE'),
+    sa.UniqueConstraint('miner_uid', 'period_start', 'period_end', 'period_type', 'phase_type', name='uq_wpp_miner_period_phase'),
+    sa.CheckConstraint("phase_type IN ('initial', 'final')", name='chk_wpp_phase_type'),
+    comment="Weather-specific phase performance metrics - tracks initial vs final scoring performance separately"
+)
+
+# Weight calculation and pathway tracking
+miner_weight_calculations_table = sa.Table('miner_weight_calculations', validator_metadata,
+    sa.Column('id', sa.Integer, primary_key=True, autoincrement=True, comment="Serial ID for the weight calculation entry"),
+    sa.Column('miner_uid', sa.Text, nullable=False, comment="Miner's UID"),
+    sa.Column('period_start', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="Start of the performance period"),
+    sa.Column('period_end', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="End of the performance period"),
+    sa.Column('period_type', sa.VARCHAR(20), nullable=False, comment="Type of period: daily, weekly, monthly, all_time"),
+    
+    # Weight calculation results
+    sa.Column('submitted_weight', sa.Float, nullable=True, comment="Final weight submitted to chain by this validator"),
+    sa.Column('raw_calculated_weight', sa.Float, nullable=True, comment="Pre-normalization weight from scoring algorithm"),
+    sa.Column('excellence_weight', sa.Float, nullable=True, comment="Weight from excellence pathway calculation"),
+    sa.Column('diversity_weight', sa.Float, nullable=True, comment="Weight from diversity pathway calculation"),
+    sa.Column('scoring_pathway', sa.VARCHAR(20), nullable=True, comment="Which pathway was selected: excellence, diversity, or none"),
+    sa.Column('pathway_details', postgresql.JSONB, nullable=True, comment="Detailed breakdown of pathway calculation"),
+    sa.Column('multi_task_bonus', sa.Float, nullable=True, comment="Bonus for performing multiple tasks well"),
+    
+    sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    sa.Column('updated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    
+    sa.ForeignKeyConstraint(['miner_uid', 'period_start', 'period_end', 'period_type'], 
+                           ['miner_performance_summary.miner_uid', 'miner_performance_summary.period_start', 
+                            'miner_performance_summary.period_end', 'miner_performance_summary.period_type'], 
+                           ondelete='CASCADE'),
+    sa.UniqueConstraint('miner_uid', 'period_start', 'period_end', 'period_type', name='uq_mwc_miner_period'),
+    sa.CheckConstraint("scoring_pathway IN ('excellence', 'diversity', 'none') OR scoring_pathway IS NULL", name='chk_mwc_scoring_pathway'),
+    comment="Weight calculation and pathway tracking - separated from core performance metrics"
+)
+
+# Chain consensus integration
+miner_consensus_data_table = sa.Table('miner_consensus_data', validator_metadata,
+    sa.Column('id', sa.Integer, primary_key=True, autoincrement=True, comment="Serial ID for the consensus data entry"),
+    sa.Column('miner_uid', sa.Text, nullable=False, comment="Miner's UID"),
+    sa.Column('period_start', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="Start of the performance period"),
+    sa.Column('period_end', postgresql.TIMESTAMP(timezone=True), nullable=False, comment="End of the performance period"),
+    sa.Column('period_type', sa.VARCHAR(20), nullable=False, comment="Type of period: daily, weekly, monthly, all_time"),
+    
+    # Chain consensus data
+    sa.Column('incentive', sa.Float, nullable=True, comment="Final incentive value from chain consensus"),
+    sa.Column('consensus_rank', sa.Integer, nullable=True, comment="Miner rank based on final incentive values"),
+    sa.Column('weight_submission_block', sa.BigInteger, nullable=True, comment="Block number when weights were submitted"),
+    sa.Column('consensus_block', sa.BigInteger, nullable=True, comment="Block number when consensus was calculated"),
+    
+    sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    sa.Column('updated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
+    
+    sa.ForeignKeyConstraint(['miner_uid', 'period_start', 'period_end', 'period_type'], 
+                           ['miner_performance_summary.miner_uid', 'miner_performance_summary.period_start', 
+                            'miner_performance_summary.period_end', 'miner_performance_summary.period_type'], 
+                           ondelete='CASCADE'),
+    sa.UniqueConstraint('miner_uid', 'period_start', 'period_end', 'period_type', name='uq_mcd_miner_period'),
+    comment="Chain consensus integration data - separated from core performance metrics"
+)
+
+# Indexes for the normalized tables
+sa.Index('idx_mps_summary_miner_period', miner_performance_summary_table.c.miner_uid, miner_performance_summary_table.c.period_type, miner_performance_summary_table.c.period_start.desc())
+sa.Index('idx_mps_summary_overall_rank', miner_performance_summary_table.c.overall_rank, miner_performance_summary_table.c.period_type)
+sa.Index('idx_mps_summary_calculated_at', miner_performance_summary_table.c.calculated_at.desc())
+
+sa.Index('idx_tpm_miner_task', task_performance_metrics_table.c.miner_uid, task_performance_metrics_table.c.task_name)
+sa.Index('idx_tpm_task_rank', task_performance_metrics_table.c.task_name, task_performance_metrics_table.c.rank, task_performance_metrics_table.c.period_type)
+sa.Index('idx_tpm_task_score', task_performance_metrics_table.c.task_name, task_performance_metrics_table.c.avg_score.desc(), task_performance_metrics_table.c.period_type)
+
+sa.Index('idx_wpp_miner_phase', weather_performance_phases_table.c.miner_uid, weather_performance_phases_table.c.phase_type)
+sa.Index('idx_wpp_phase_rank', weather_performance_phases_table.c.phase_type, weather_performance_phases_table.c.phase_rank, weather_performance_phases_table.c.period_type)
+sa.Index('idx_wpp_scoring_lag', weather_performance_phases_table.c.avg_scoring_lag_days, postgresql_where=weather_performance_phases_table.c.avg_scoring_lag_days.isnot(None))
+
+sa.Index('idx_mwc_pathway', miner_weight_calculations_table.c.scoring_pathway, miner_weight_calculations_table.c.submitted_weight.desc())
+sa.Index('idx_mwc_weight_submitted', miner_weight_calculations_table.c.submitted_weight.desc(), postgresql_where=miner_weight_calculations_table.c.submitted_weight.isnot(None))
+
+sa.Index('idx_mcd_incentive', miner_consensus_data_table.c.incentive.desc(), postgresql_where=miner_consensus_data_table.c.incentive.isnot(None))
+sa.Index('idx_mcd_consensus_rank', miner_consensus_data_table.c.consensus_rank, miner_consensus_data_table.c.period_type)
 
 # Placeholder for trigger function/trigger definitions if we move them here or handle in Alembic only
 # For now, the check_node_table_size function and its trigger are defined in the first migration directly.

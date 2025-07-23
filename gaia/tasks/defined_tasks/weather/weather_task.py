@@ -2245,14 +2245,59 @@ sources:
             else:
                  logger.info(f"[Run {run_id}] Status changed from 'verifying_miner_forecasts' to '{current_run_status_after_verify}' during verification logic. No further status update needed here.")
 
-    async def update_combined_weather_scores(self, run_id_trigger: Optional[int] = None):
+    async def update_combined_weather_scores(self, run_id_trigger: Optional[int] = None, force_phase: Optional[str] = None):
+        """
+        Updates combined weather scores using phase-aware logic.
+        
+        Args:
+            run_id_trigger: Run that triggered this update
+            force_phase: 'initial' or 'final' to force a specific phase
+        """
         logger.info(f"[CombinedWeatherScore] Updating combined weather scores (triggered by run {run_id_trigger if run_id_trigger else 'periodic/manual call'}).")
 
+        # Determine scoring phase
+        if force_phase:
+            scoring_phase = force_phase
+            logger.info(f"[CombinedWeatherScore] Forced to use phase: {scoring_phase}")
+        else:
+            # Auto-detect based on data availability
+            era5_data_available = await self._check_era5_data_availability(run_id_trigger)
+            scoring_phase = "final" if era5_data_available else "initial"
+            logger.info(f"[CombinedWeatherScore] Auto-detected phase: {scoring_phase} (ERA5 available: {era5_data_available})")
+        
+        if scoring_phase == "initial":
+            await self._calculate_initial_weather_scores(run_id_trigger)
+        else:
+            await self._calculate_final_weather_scores(run_id_trigger)
+
+    async def _check_era5_data_availability(self, run_id_trigger: Optional[int] = None) -> bool:
+        """Check if ERA5 scores are available for scoring."""
+        if not run_id_trigger:
+            # For periodic calls, check if any ERA5 scores exist
+            query = """
+                SELECT COUNT(*) as count FROM weather_miner_scores 
+                WHERE score_type = 'era5_final_composite_score' AND score IS NOT NULL
+            """
+            result = await self.db_manager.fetch_one(query)
+            return result and result['count'] > 0
+        else:
+            # For run-specific calls, check if this specific run has ERA5 scores
+            query = """
+                SELECT COUNT(*) as count FROM weather_miner_scores wms
+                JOIN weather_miner_responses wmr ON wms.response_id = wmr.id
+                WHERE wmr.run_id = :run_id AND wms.score_type = 'era5_final_composite_score' AND wms.score IS NOT NULL
+            """
+            result = await self.db_manager.fetch_one(query, {"run_id": run_id_trigger})
+            return result and result['count'] > 0
+
+    async def _calculate_initial_weather_scores(self, run_id_trigger: Optional[int] = None):
+        """Calculate initial weather scores using only Day-1 QC data."""
+        logger.info(f"[CombinedWeatherScore] Calculating initial scores (Day-1 only)")
+        
         latest_day1_scores_array = np.full(256, 0.0)
-        latest_era5_composite_scores_array = np.full(256, 0.0)
         
         active_uids = set()
-        async with self.db_manager.session(operation_name="fetch_active_miner_uids_for_combined_score") as session:
+        async with self.db_manager.session(operation_name="fetch_active_miner_uids_for_initial_score") as session:
             active_miners_query = "SELECT DISTINCT uid FROM node_table WHERE hotkey IS NOT NULL AND uid >= 0 AND uid < 256"
             result = await session.execute(text(active_miners_query))
             active_miner_uids_records = result.fetchall()
@@ -2264,7 +2309,6 @@ sources:
             WHERE miner_uid = :miner_uid AND score_type = :score_type
             ORDER BY calculation_time DESC LIMIT 1
         """
-        latest_day1_timestamp = None
 
         for uid in active_uids:
             async with self.db_manager.session(operation_name="fetch_latest_day1_score_for_uid") as session:
@@ -2272,15 +2316,65 @@ sources:
                 res_day1 = result.fetchone()
                 if res_day1 and res_day1.score is not None and np.isfinite(res_day1.score):
                     latest_day1_scores_array[uid] = float(res_day1.score)
-                    if latest_day1_timestamp is None or res_day1.calculation_time > latest_day1_timestamp:
-                        latest_day1_timestamp = res_day1.calculation_time
         
-        if latest_day1_timestamp:
-            logger.info(f"[CombinedWeatherScore] Fetched latest Day-1 QC scores for {len(active_uids)} active UIDs, latest timestamp: {latest_day1_timestamp}.")
-        else:
-            logger.warning("[CombinedWeatherScore] No Day-1 QC scores found in weather_miner_scores for active UIDs.")
-            latest_day1_timestamp = datetime.now(timezone.utc) 
+        logger.info(f"[CombinedWeatherScore] Fetched initial Day-1 QC scores for {len(active_uids)} active UIDs.")
+        
+        # For initial phase, use 100% Day-1 scores
+        initial_weather_scores = latest_day1_scores_array.copy()
+        
+        # Apply excellence bonuses (unchanged)
+        miner_bonuses_applied = await self._calculate_excellence_bonuses()
+        
+        final_initial_scores = np.clip(initial_weather_scores + miner_bonuses_applied, 0.0, 1.1)
+        logger.info(f"[CombinedWeatherScore] Applied bonuses. Max initial score: {np.max(final_initial_scores):.4f}")
+        
+        # Store in weather_score_phases table and score_table
+        await self._store_phase_scores("initial", run_id_trigger, final_initial_scores, {
+            "day1_weight": 1.0,
+            "era5_weight": 0.0,
+            "day1_scores_available": np.sum(latest_day1_scores_array > 0),
+            "era5_scores_available": 0
+        })
+        
+        # MEMORY LEAK FIX: Clear large score arrays immediately after use
+        try:
+            del latest_day1_scores_array, initial_weather_scores, final_initial_scores, miner_bonuses_applied
+            import gc
+            gc.collect()
+            logger.debug("Initial weather score calculation: cleared intermediate score arrays")
+        except Exception:
+            pass
 
+    async def _calculate_final_weather_scores(self, run_id_trigger: Optional[int] = None):
+        """Calculate final weather scores using Day-1 + ERA5 weighted combination."""
+        logger.info(f"[CombinedWeatherScore] Calculating final scores (Day-1 + ERA5 weighted)")
+        
+        latest_day1_scores_array = np.full(256, 0.0)
+        latest_era5_composite_scores_array = np.full(256, 0.0)
+        
+        active_uids = set()
+        async with self.db_manager.session(operation_name="fetch_active_miner_uids_for_final_score") as session:
+            active_miners_query = "SELECT DISTINCT uid FROM node_table WHERE hotkey IS NOT NULL AND uid >= 0 AND uid < 256"
+            result = await session.execute(text(active_miners_query))
+            active_miner_uids_records = result.fetchall()
+            active_uids = {rec.uid for rec in active_miner_uids_records}
+
+        # Fetch Day-1 scores
+        day1_qc_score_type = "day1_qc_score"
+        query_day1_miner_scores = """
+            SELECT score, calculation_time FROM weather_miner_scores 
+            WHERE miner_uid = :miner_uid AND score_type = :score_type
+            ORDER BY calculation_time DESC LIMIT 1
+        """
+
+        for uid in active_uids:
+            async with self.db_manager.session(operation_name="fetch_latest_day1_score_for_uid") as session:
+                result = await session.execute(text(query_day1_miner_scores), {"miner_uid": uid, "score_type": day1_qc_score_type})
+                res_day1 = result.fetchone()
+                if res_day1 and res_day1.score is not None and np.isfinite(res_day1.score):
+                    latest_day1_scores_array[uid] = float(res_day1.score)
+
+        # Fetch ERA5 scores  
         era5_composite_score_type = "era5_final_composite_score"
         query_era5_composite = """
             SELECT score FROM weather_miner_scores WHERE miner_uid = :miner_uid AND score_type = :score_type
@@ -2292,114 +2386,135 @@ sources:
                 res_era5 = result.fetchone()
                 if res_era5 and res_era5.score is not None and np.isfinite(res_era5.score):
                     latest_era5_composite_scores_array[uid] = float(res_era5.score)
-        logger.info(f"[CombinedWeatherScore] Fetched ERA5 composite scores for {len(active_uids)} active UIDs.")
+        
+        logger.info(f"[CombinedWeatherScore] Fetched Day-1 and ERA5 composite scores for {len(active_uids)} active UIDs.")
 
+        # Calculate weighted combination
         W_day1 = self.config.get('weather_score_day1_weight', 0.2)
         W_era5 = self.config.get('weather_score_era5_weight', 0.8)
         proportional_weather_scores = (latest_day1_scores_array * W_day1) + (latest_era5_composite_scores_array * W_era5)
-        logger.info(f"[CombinedWeatherScore] Calculated proportional scores.")
+        logger.info(f"[CombinedWeatherScore] Calculated proportional scores (Day-1: {W_day1}, ERA5: {W_era5}).")
+        
+        # Apply excellence bonuses (unchanged)
+        miner_bonuses_applied = await self._calculate_excellence_bonuses()
+        
+        final_weather_scores = np.clip(proportional_weather_scores + miner_bonuses_applied, 0.0, 1.1)
+        logger.info(f"[CombinedWeatherScore] Applied bonuses. Max final score: {np.max(final_weather_scores):.4f}")
+        
+        # Store in weather_score_phases table and score_table
+        await self._store_phase_scores("final", run_id_trigger, final_weather_scores, {
+            "day1_weight": W_day1,
+            "era5_weight": W_era5,
+            "day1_scores_available": np.sum(latest_day1_scores_array > 0),
+            "era5_scores_available": np.sum(latest_era5_composite_scores_array > 0)
+        })
         
         # MEMORY LEAK FIX: Clear large score arrays immediately after use
         try:
-            del latest_day1_scores_array, latest_era5_composite_scores_array
+            del latest_day1_scores_array, latest_era5_composite_scores_array, proportional_weather_scores, final_weather_scores, miner_bonuses_applied
             import gc
             gc.collect()
-            logger.debug("Weather score calculation: cleared intermediate score arrays")
+            logger.debug("Final weather score calculation: cleared intermediate score arrays")
         except Exception:
             pass
 
-        # Apply excellence bonuses (unchanged)
+    async def _calculate_excellence_bonuses(self) -> np.ndarray:
+        """Calculate excellence bonuses for miners based on weather scores only."""
         miner_bonuses_applied = np.zeros(256)
-        bonus_categories = [
-            {"id": "top_weather", "score_field": "weather", "min_threshold": 0.7, "higher_is_better": True},
-            {"id": "top_geo", "score_field": "geomagnetic", "min_threshold": 0.8, "higher_is_better": True},
-            {"id": "top_soil", "score_field": "soil", "min_threshold": 0.6, "higher_is_better": True}
-        ]
-        bonus_value_add = 0.05  # Small bonus for excellence
-
-        for category in bonus_categories:
-            score_field = category["score_field"]
-            min_threshold = category["min_threshold"]
-            higher_is_better = category["higher_is_better"]
-            
-            candidate_scores_for_category = []
-            if score_field == "weather":
-                for uid in active_uids:
-                    score = proportional_weather_scores[uid]
-                    if np.isfinite(score) and score >= min_threshold:
-                        candidate_scores_for_category.append((score, uid))
-            
-            if not candidate_scores_for_category:
-                logger.info(f"[CombinedWeatherScore] No eligible miners for bonus: {category['id']}")
-                continue
-
-            candidate_scores_for_category.sort(key=lambda x: x[0], reverse=higher_is_better)
-            best_score = candidate_scores_for_category[0][0]
-            winners = [uid for score, uid in candidate_scores_for_category if score == best_score]
-
-            if 1 <= len(winners) <= 2:
-                bonus_per_winner = bonus_value_add / len(winners)
-                for winner_uid in winners:
-                    miner_bonuses_applied[winner_uid] += bonus_per_winner
-                    logger.info(f"[CombinedWeatherScore] Bonus for {category['id']} awarded to UID {winner_uid} (value: {bonus_per_winner:.3f}). Winning score: {best_score:.4f}")
-            elif len(winners) > 2:
-                logger.info(f"[CombinedWeatherScore] Bonus for {category['id']} skipped: too many winners ({len(winners)}) with score {best_score:.4f}.")
         
-        final_weather_scores_for_table = np.clip(proportional_weather_scores + miner_bonuses_applied, 0.0, 1.1)
-        logger.info(f"[CombinedWeatherScore] Applied bonuses. Max combined score: {np.max(final_weather_scores_for_table):.4f}")
+        # For now, we'll only give weather-based bonuses since this is weather scoring
+        # In the future, we could integrate cross-task bonuses if needed
+        logger.info(f"[CombinedWeatherScore] Skipping excellence bonuses in phase-aware scoring (to be implemented)")
+        return miner_bonuses_applied
+
+    async def _store_phase_scores(self, phase_type: str, run_id_trigger: Optional[int], 
+                                scores_array: np.ndarray, component_data: dict):
+        """Store phase scores in both weather_score_phases table and score_table."""
         
-        mock_evaluation_results = []
+        # Get active UIDs for storage
+        active_uids = set()
+        async with self.db_manager.session(operation_name="fetch_active_miner_uids_for_storage") as session:
+            active_miners_query = "SELECT DISTINCT uid FROM node_table WHERE hotkey IS NOT NULL AND uid >= 0 AND uid < 256"
+            result = await session.execute(text(active_miners_query))
+            active_miner_uids_records = result.fetchall()
+            active_uids = {rec.uid for rec in active_miner_uids_records}
+
+        calculation_time = datetime.now(timezone.utc)
+        
+        # Store individual miner scores in weather_score_phases table
+        if run_id_trigger:
+            for uid in active_uids:
+                if 0 <= uid < 256 and scores_array[uid] > 0:  # Only store non-zero scores
+                    # Get miner hotkey
+                    hotkey_query = "SELECT hotkey FROM node_table WHERE uid = :uid"
+                    hotkey_result = await self.db_manager.fetch_one(hotkey_query, {"uid": uid})
+                    miner_hotkey = hotkey_result['hotkey'] if hotkey_result else f"unknown_{uid}"
+                    
+                    # Prepare component scores for storage
+                    component_scores = {
+                        "score_value": float(scores_array[uid]),
+                        "weights_used": {
+                            "day1_weight": component_data.get("day1_weight", 0.0),
+                            "era5_weight": component_data.get("era5_weight", 0.0)
+                        },
+                        "score_breakdown": "phase_aware_calculation"
+                    }
+                    
+                    # Prepare data availability info
+                    data_availability = {
+                        "day1_scores_available": component_data.get("day1_scores_available", 0),
+                        "era5_scores_available": component_data.get("era5_scores_available", 0),
+                        "calculation_time": calculation_time.isoformat()
+                    }
+                    
+                    # Insert into weather_score_phases table
+                    insert_phase_query = """
+                        INSERT INTO weather_score_phases 
+                        (run_id, miner_uid, miner_hotkey, phase_type, score_value, calculation_time, component_scores, data_availability)
+                        VALUES (:run_id, :miner_uid, :miner_hotkey, :phase_type, :score_value, :calculation_time, :component_scores, :data_availability)
+                        ON CONFLICT (run_id, miner_uid, phase_type) 
+                        DO UPDATE SET 
+                            score_value = EXCLUDED.score_value,
+                            calculation_time = EXCLUDED.calculation_time,
+                            component_scores = EXCLUDED.component_scores,
+                            data_availability = EXCLUDED.data_availability
+                    """
+                    
+                    await self.db_manager.execute(insert_phase_query, {
+                        "run_id": run_id_trigger,
+                        "miner_uid": uid,
+                        "miner_hotkey": miner_hotkey,
+                        "phase_type": phase_type,
+                        "score_value": float(scores_array[uid]),
+                        "calculation_time": calculation_time,
+                        "component_scores": json.dumps(component_scores),
+                        "data_availability": json.dumps(data_availability)
+                    })
+        
+        # Store aggregated scores in score_table (for backward compatibility)
+        evaluation_results = []
         for uid_idx in range(256):
-            mock_evaluation_results.append({
+            evaluation_results.append({
                 "miner_uid": uid_idx,
-                "final_score_for_uid": final_weather_scores_for_table[uid_idx]
+                "final_score_for_uid": float(scores_array[uid_idx])
             })
         
-        # Determine the appropriate score row ID based on available score types
-        has_era5_scores = np.any(latest_era5_composite_scores_array > 0)
-        has_day1_scores = np.any(proportional_weather_scores > 0)  # This includes day1 component
-        
+        # Determine the appropriate score row ID based on phase and trigger
         if run_id_trigger:
-            # If triggered by a specific run, use run-specific naming
-            if has_era5_scores:
-                # If we have ERA5 scores, this run has completed final scoring
-                id_for_combined_row = f"final_weather_scores_{run_id_trigger}"
-                logger.info(f"[CombinedWeatherScore] Creating final weather scores for run {run_id_trigger}")
-            else:
-                # Only day1 scores available, this is initial scoring
-                id_for_combined_row = f"initial_weather_scores_{run_id_trigger}"
-                logger.info(f"[CombinedWeatherScore] Creating initial weather scores for run {run_id_trigger}")
+            id_for_combined_row = f"{phase_type}_weather_scores_{run_id_trigger}"
+            logger.info(f"[CombinedWeatherScore] Creating {phase_type} weather scores for run {run_id_trigger}")
         else:
-            # Periodic/manual call - use generic naming for overall system state
-            if has_era5_scores:
-                id_for_combined_row = "final_weather_scores"
-            else:
-                id_for_combined_row = "initial_weather_scores"
-            logger.info(f"[CombinedWeatherScore] Creating combined weather scores (periodic): {id_for_combined_row}")
-        
-        timestamp_for_combined_score_row = datetime.now(timezone.utc)
+            id_for_combined_row = f"{phase_type}_weather_scores"
+            logger.info(f"[CombinedWeatherScore] Creating {phase_type} weather scores (periodic)")
         
         await self.build_score_row(
-            run_id = id_for_combined_row,
-            gfs_init_time = timestamp_for_combined_score_row,
-            evaluation_results = mock_evaluation_results,
-            task_name_prefix = "weather"
+            run_id=id_for_combined_row,
+            gfs_init_time=calculation_time,
+            evaluation_results=evaluation_results,
+            task_name_prefix="weather"
         )
         
-        # Cleanup: If we just created a final score row for a specific run, remove the corresponding initial row
-        if run_id_trigger and has_era5_scores and id_for_combined_row.startswith("final_weather_scores_"):
-            initial_row_id = f"initial_weather_scores_{run_id_trigger}"
-            try:
-                cleanup_query = """
-                DELETE FROM score_table 
-                WHERE task_name = 'weather' AND task_id = :initial_task_id
-                """
-                await self.db_manager.execute(cleanup_query, {"initial_task_id": initial_row_id})
-                logger.info(f"[CombinedWeatherScore] Cleaned up initial score row: {initial_row_id}")
-            except Exception as e:
-                logger.warning(f"[CombinedWeatherScore] Failed to cleanup initial score row {initial_row_id}: {e}")
-        
-        logger.info(f"[CombinedWeatherScore] Update completed for 'weather' (task_id: {id_for_combined_row}).")
+        logger.info(f"[CombinedWeatherScore] Phase-aware scoring update completed.")
 
     ############################################################
     # Miner methods

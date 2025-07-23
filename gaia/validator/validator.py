@@ -4074,24 +4074,19 @@ class GaiaValidator:
                 for idx in range(256):
                     if idx in pathway_tracking:
                         pathway_tracking[idx]['submitted_weight'] = final_weights_list[idx]
+                        # Add weight submission block if available
+                        if hasattr(self, 'current_block') and self.current_block:
+                            pathway_tracking[idx]['weight_submission_block'] = self.current_block
             
-            # Clean up all intermediate arrays to prevent memory leaks
-            try:
-                del weather_scores, geomagnetic_scores, soil_scores
-                del task_percentiles, task_valid_scores
-                del excellence_count, diversity_count
-                del weights_final, transformed_w
-                if 'nz_weights' in locals(): del nz_weights
-                if 'norm_weights' in locals(): del norm_weights
-                if 'positives' in locals(): del positives
-                if 'trans_nz' in locals(): del trans_nz
-                if 'sorted_indices' in locals(): del sorted_indices
-                # DON'T delete pathway_tracking - we need to return it
-            except Exception as cleanup_e:
-                logger.warning(f"Error during sync weight calculation cleanup: {cleanup_e}")
+            logger.info(f"Pathway tracking complete for {len(pathway_tracking)} miners")
             
-            # Return both weights and pathway tracking data
-            return final_weights_list, pathway_tracking
+            # DON'T delete pathway_tracking - we need to return it
+            if final_weights_list is not None:
+                logger.info(f"Weight calculation completed successfully. Returning {len(final_weights_list)} weights and {len(pathway_tracking)} pathway records.")
+                return final_weights_list, pathway_tracking
+            else:
+                logger.warning("Weight calculation failed - returning None")
+                return None, {}  # Return same structure: (weights, pathway_tracking)
         
         except Exception as calc_error:
             logger.error(f"Error in sync weight calculation: {calc_error}")

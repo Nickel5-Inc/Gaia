@@ -1279,10 +1279,10 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: Successfully processed Day-1 QC for {successful_scores}/{len(responses)} miner responses.")
                 
                 try:
-                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Triggering update of combined weather scores.")
-                    await task_instance.update_combined_weather_scores(run_id_trigger=run_id)
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Triggering update of initial weather scores (Day-1 only).")
+                    await task_instance.update_combined_weather_scores(run_id_trigger=run_id, force_phase="initial")
                 except Exception as e_comb_score:
-                    logger.error(f"[Day1ScoringWorker] Run {run_id}: Error triggering combined score update: {e_comb_score}", exc_info=True)
+                    logger.error(f"[Day1ScoringWorker] Run {run_id}: Error triggering initial score update: {e_comb_score}", exc_info=True)
 
                 await _update_run_status(task_instance, run_id, "day1_scoring_complete")
                 # Mark persistent scoring job as completed successfully
@@ -1773,10 +1773,10 @@ async def finalize_scores_worker(self):
                         # Mark scoring job as completed successfully
                         await self._complete_scoring_job(run_id, 'era5_final', success=True)
                         try:
-                            logger.info(f"[FinalizeWorker] Run {run_id}: Triggering update of combined weather scores.")
-                            await self.update_combined_weather_scores(run_id_trigger=run_id)
+                            logger.info(f"[FinalizeWorker] Run {run_id}: Triggering update of final weather scores (Day-1 + ERA5).")
+                            await self.update_combined_weather_scores(run_id_trigger=run_id, force_phase="final")
                         except Exception as e_comb_score:
-                            logger.error(f"[FinalizeWorker] Run {run_id}: Error triggering combined score update: {e_comb_score}", exc_info=True)
+                            logger.error(f"[FinalizeWorker] Run {run_id}: Error triggering final score update: {e_comb_score}", exc_info=True)
                     else:
                          logger.warning(f"[FinalizeWorker] Run {run_id}: No miners successfully scored against ERA5. Skipping combined score update.")
                          # Mark scoring job as completed but with limited success

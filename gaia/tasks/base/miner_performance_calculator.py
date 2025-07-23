@@ -15,6 +15,7 @@ from gaia.database.validator_schema import (
     weather_miner_scores_table,
     weather_miner_responses_table, 
     weather_forecast_runs_table,
+    weather_score_phases_table,
     soil_moisture_history_table,
     geomagnetic_history_table,
     node_table
@@ -83,7 +84,6 @@ class MinerPerformance:
     percentile_rank_geomagnetic: Optional[float] = None
     percentile_rank_soil: Optional[float] = None
     excellence_qualified_tasks: Optional[List[str]] = None
-    validator_hotkey: Optional[str] = None
     
     # Trend and status
     performance_trend: Optional[str] = None
@@ -161,10 +161,6 @@ class MinerPerformanceCalculator:
                 performance.consensus_rank = consensus_data.get('consensus_rank')
                 performance.consensus_block = consensus_data.get('consensus_block')
                 
-                # Also capture validator hotkey from consensus data if not set
-                if not performance.validator_hotkey and consensus_data.get('validator_hotkey'):
-                    performance.validator_hotkey = consensus_data.get('validator_hotkey')
-                
                 logger.debug(f"Integrated consensus data for miner {miner_uid}: incentive={performance.incentive}, rank={performance.consensus_rank}")
                 
         except Exception as e:
@@ -211,8 +207,7 @@ class MinerPerformanceCalculator:
                     miner_hotkey=miner_hotkey,
                     period_start=period_start,
                     period_end=period_end,
-                    period_type=period_type,
-                    validator_hotkey=self.validator_hotkey  # Automatically set from calculator context
+                    period_type=period_type
                 )
                 
                 # Calculate task-specific metrics
@@ -751,10 +746,40 @@ class MinerPerformanceCalculator:
         
         logger.info(f"Saving performance stats for {len(performances)} miners")
         
+        # Get currently registered miners to enforce 256 row limit
+        registered_miners_query = sa.select(node_table.c.uid).where(
+            sa.and_(
+                node_table.c.hotkey.isnot(None),
+                node_table.c.uid >= 0,
+                node_table.c.uid < 256
+            )
+        )
+        
+        result = await self.db_manager.execute(registered_miners_query)
+        registered_uids = {str(row[0]) for row in result.fetchall()}
+        
+        if not registered_uids:
+            logger.warning("No registered miners found - skipping performance stats save")
+            return
+        
+        # Filter performances to only include registered miners (enforces 256 max)
+        filtered_performances = [
+            perf for perf in performances 
+            if perf.miner_uid in registered_uids
+        ]
+        
+        if len(filtered_performances) < len(performances):
+            excluded_count = len(performances) - len(filtered_performances)
+            logger.info(f"Filtered out {excluded_count} performance records for unregistered miners")
+        
+        if not filtered_performances:
+            logger.warning("No performance stats to save after filtering for registered miners")
+            return
+        
         # Prepare batch insert data
         insert_data = []
         
-        for perf in performances:
+        for perf in filtered_performances:
             row_data = {
                 'miner_uid': perf.miner_uid,
                 'miner_hotkey': perf.miner_hotkey,
@@ -835,7 +860,6 @@ class MinerPerformanceCalculator:
                 'percentile_rank_geomagnetic': perf.percentile_rank_geomagnetic,
                 'percentile_rank_soil': perf.percentile_rank_soil,
                 'excellence_qualified_tasks': perf.excellence_qualified_tasks,
-                'validator_hotkey': perf.validator_hotkey,
                 
                 # Trend and status
                 'performance_trend': perf.performance_trend,
@@ -851,20 +875,21 @@ class MinerPerformanceCalculator:
             
             insert_data.append(row_data)
         
-        # Execute upsert without creating new transaction (caller manages transactions)
+        # Execute upsert with new primary key structure (no id column, no unique constraint name)
         stmt = postgresql.insert(miner_performance_stats_table).values(insert_data)
         upsert_stmt = stmt.on_conflict_do_update(
-            constraint='uq_mps_miner_period',
+            # Use the composite primary key columns for conflict detection
+            index_elements=['miner_uid', 'period_start', 'period_end', 'period_type'],
             set_={
                 col.name: stmt.excluded[col.name] 
                 for col in miner_performance_stats_table.columns 
-                if col.name not in ['id', 'calculated_at']
+                if col.name not in ['miner_uid', 'period_start', 'period_end', 'period_type', 'calculated_at']
             }
         )
         
         await self.db_manager.execute(upsert_stmt)
         
-        logger.info(f"Successfully saved performance stats for {len(performances)} miners")
+        logger.info(f"Successfully saved performance stats for {len(filtered_performances)} miners (max 256 enforced)")
     
     async def cleanup_deregistered_miners(self) -> int:
         """
