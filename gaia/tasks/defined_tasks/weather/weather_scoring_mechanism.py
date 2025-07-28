@@ -743,12 +743,26 @@ async def _process_single_variable_parallel(
                         del obj
                         cleaned_count += 1
                     except Exception:
-                        pass
+                                                  pass
             
             # Force garbage collection if we cleaned significant objects
             if cleaned_count > 3:
                 collected = gc.collect()
                 logger.debug(f"[Day1Score] Variable {var_key} cleanup: removed {cleaned_count} objects, GC collected {collected}")
+                
+                # Emergency memory check during variable processing
+                try:
+                    import psutil
+                    process = psutil.Process()
+                    current_memory_mb = process.memory_info().rss / (1024 * 1024)
+                    if current_memory_mb > 15000:  # 15GB emergency threshold
+                        logger.warning(f"[Day1Score] Variable {var_key}: EMERGENCY MEMORY WARNING - {current_memory_mb:.1f} MB")
+                        # Additional emergency cleanup
+                        import sys
+                        for _ in range(2):
+                            gc.collect()
+                except Exception:
+                    pass
                 
         except Exception as cleanup_err:
             logger.debug(f"[Day1Score] Variable {var_key} cleanup error: {cleanup_err}")

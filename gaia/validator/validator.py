@@ -122,8 +122,7 @@ from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
 from fiber.chain.interface import get_substrate
 from substrateinterface import SubstrateInterface
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
-from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
+# Geomagnetic and soil moisture tasks disabled
 from gaia.APIcalls.miner_score_sender import MinerScoreSender
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.base.miner_performance_calculator import (
@@ -422,16 +421,7 @@ class GaiaValidator:
         self._background_tasks = set()  # Track all background tasks
         self._task_cleanup_lock = asyncio.Lock()
         
-        self.soil_task = SoilMoistureTask(
-            db_manager=self.database_manager,
-            node_type="validator",
-            test_mode=args.test,
-        )
-        self.geomagnetic_task = GeomagneticTask(
-            node_type="validator",
-            db_manager=self.database_manager,
-            test_mode=args.test
-        )
+        # Only initialize weather task - geomagnetic and soil moisture tasks disabled
         self.weather_task = WeatherTask(
             db_manager=self.database_manager,
             node_type="validator",
@@ -2904,8 +2894,6 @@ class GaiaValidator:
                 logger.info("Auto-updater task started independently")
                 
                 tasks_lambdas = [ # Renamed to avoid conflict if tasks variable is used elsewhere
-                    lambda: self.geomagnetic_task.validator_execute(self),
-                    lambda: self.soil_task.validator_execute(self),
                     lambda: self.weather_task.validator_execute(self),
                     lambda: self.status_logger(),
                     lambda: self.main_scoring(),
@@ -3616,7 +3604,7 @@ class GaiaValidator:
             # Sleep at the end of the loop - runs immediately on first iteration, then every 15 minutes  
             await asyncio.sleep(900)  # Run every 15 minutes (reduced frequency)
 
-    def _perform_weight_calculations_sync(self, weather_results, geomagnetic_results, soil_results, now, validator_nodes_by_uid_list):
+    def _perform_weight_calculations_sync(self, weather_results, now, validator_nodes_by_uid_list):
         """
         Synchronous helper to perform CPU-bound weight calculations.
         Memory-optimized version with explicit cleanup.
@@ -3624,15 +3612,11 @@ class GaiaValidator:
         logger.info("Synchronous weight calculation: Processing fetched scores...")
         
         try:
-            # Initialize score arrays
+            # Initialize score arrays for weather task only
             weather_scores = np.full(256, np.nan)
-            geomagnetic_scores = np.full(256, np.nan)
-            soil_scores = np.full(256, np.nan)
 
             # Count raw scores per UID - use numpy for better memory efficiency
             weather_counts = np.zeros(256, dtype=int)
-            geo_counts = np.zeros(256, dtype=int)
-            soil_counts = np.zeros(256, dtype=int)
         
             if weather_results:
                 for result in weather_results:
@@ -3643,147 +3627,9 @@ class GaiaValidator:
                         if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
                             weather_counts[uid] += 1
             
-            if geomagnetic_results:
-                for result in geomagnetic_results:
-                    scores = result.get('score', [np.nan]*256)
-                    if not isinstance(scores, list) or len(scores) != 256: scores = [np.nan]*256 # Defensive
-                    for uid in range(256):
-                        if not isinstance(scores[uid], str) and not np.isnan(scores[uid]) and scores[uid] != 0.0:
-                            geo_counts[uid] += 1
 
-            if soil_results:
-                # MEMORY LEAK FIX: Process soil scores with aggressive memory management
-                logger.info(f"Processing {len(soil_results)} soil records with enhanced memory management")
-                zero_soil_scores = 0
-                
-                # Pre-allocate arrays to reduce memory allocations
-                num_results = len(soil_results)
-                scores_matrix = np.full((256, num_results), np.nan, dtype=np.float32)  # Use float32 to save memory
-                weights_matrix = np.full((256, num_results), 0.0, dtype=np.float32)
-                
-                # ENHANCED DEBUG LOGGING for soil score issue investigation
-                total_scores_processed = 0
-                total_valid_scores = 0
-                total_nan_scores = 0
-                sample_logged = False
-                
-                # Process all results in one pass to build the matrix
-                for result_idx, result in enumerate(soil_results):
-                    age_days = (now - result['created_at']).total_seconds() / (24 * 3600)
-                    decay = np.exp(-age_days * np.log(2))
-                    scores = result.get('score', [np.nan]*256)
-                    if not isinstance(scores, list) or len(scores) != 256: 
-                        scores = [np.nan]*256 # Defensive
-                        logger.warning(f"Applied defensive fallback for soil scores in result {result_idx}")
-                    
-                    # Enhanced logging for first result
-                    if result_idx == 0:
-                        logger.info(f"SOIL DEBUG: First result - created_at={result['created_at']}, age_days={age_days:.3f}, decay={decay:.6f}")
-                        logger.info(f"SOIL DEBUG: Scores type={type(scores)}, len={len(scores)}")
-                        logger.info(f"SOIL DEBUG: First 10 scores: {scores[:10]}")
-                        logger.info(f"SOIL DEBUG: Score types: {[type(x) for x in scores[:5]]}")
-                    
-                    # Process all UIDs for this result
-                    for uid in range(256):
-                        score_val = scores[uid]
-                        original_val = score_val
-                        total_scores_processed += 1
-                        
-                        # Enhanced validation logging
-                        is_string = isinstance(score_val, str)
-                        is_nan = False
-                        nan_check_failed = False
-                        
-                        try:
-                            is_nan = np.isnan(score_val)
-                        except Exception as e:
-                            is_nan = True
-                            nan_check_failed = True
-                            if not sample_logged:
-                                logger.error(f"SOIL DEBUG: np.isnan() failed for UID {uid}: {e}, score_val={score_val}, type={type(score_val)}")
-                                sample_logged = True
-                        
-                        if is_string or is_nan: 
-                            score_val = 0.0
-                            if is_string:
-                                logger.warning(f"SOIL DEBUG: String score at UID {uid}: '{original_val}'")
-                            elif nan_check_failed:
-                                logger.warning(f"SOIL DEBUG: NaN check failed for UID {uid}: {original_val}")
-                            else:
-                                total_nan_scores += 1
-                        else:
-                            total_valid_scores += 1
-                        
-                        if score_val == 0.0: 
-                            zero_soil_scores += 1
-                        
-                        scores_matrix[uid, result_idx] = score_val
-                        if score_val != 0.0:
-                            weights_matrix[uid, result_idx] = decay
-                            soil_counts[uid] += 1
-                
-                # Enhanced summary logging
-                logger.info(f"SOIL DEBUG: Processed {total_scores_processed} total scores")
-                logger.info(f"SOIL DEBUG: Valid scores: {total_valid_scores}, NaN scores: {total_nan_scores}")
-                logger.info(f"SOIL DEBUG: Zero scores counted: {zero_soil_scores}")
-                logger.info(f"SOIL DEBUG: UIDs with non-zero counts: {np.sum(soil_counts > 0)}")
-                
-                # Log concerning conditions
-                if zero_soil_scores == 256:
-                    logger.error(f"SOIL DEBUG: ALL 256 SCORES CONVERTED TO ZERO! This indicates a systematic conversion issue.")
-                elif zero_soil_scores > 200:
-                    logger.warning(f"SOIL DEBUG: High zero score count ({zero_soil_scores}/256) - possible data quality issue")
-                
-                # Vectorized calculation for all UIDs at once
-                for uid in range(256):
-                    uid_scores = scores_matrix[uid, :]
-                    uid_weights = weights_matrix[uid, :]
-                    
-                    # Find non-zero scores
-                    non_zero_mask = uid_scores != 0.0
-                    
-                    if np.any(non_zero_mask):
-                        masked_s = uid_scores[non_zero_mask]
-                        masked_w = uid_weights[non_zero_mask]
-                        weight_sum = np.sum(masked_w)
-                        if weight_sum > 0:
-                            base_score = np.sum(masked_s * masked_w) / weight_sum
-                            
-                            # Completeness factor: fair threshold-based approach for soil 
-                            num_predictions = np.sum(non_zero_mask)
-                            expected_predictions = len(soil_results)  # Number of available scoring periods
-                            completeness_ratio = num_predictions / max(expected_predictions, 1)
-                            
-                            # Consistent threshold with geomagnetic task
-                            completeness_threshold = 0.30  # 30% threshold for fair new miner treatment
-                            if completeness_ratio >= completeness_threshold:
-                                completeness_factor = 1.0  # Full weight for adequate participation
-                            else:
-                                # Gradual scaling below threshold, not linear penalty
-                                completeness_factor = (completeness_ratio / completeness_threshold) ** 0.5  # Square root for gentler penalty
-                            
-                            soil_scores[uid] = base_score * completeness_factor
-                            
-                            # Debug logging for transparency
-                            if num_predictions > 0:
-                                logger.debug(f"Soil UID {uid}: {num_predictions}/{expected_predictions} predictions "
-                                           f"({completeness_ratio:.2f}), factor={completeness_factor:.3f}, "
-                                           f"base={base_score:.4f}, final={soil_scores[uid]:.4f}")
-                        else:
-                            soil_scores[uid] = 0.0
-                    else:
-                        soil_scores[uid] = 0.0
-                
-                # Final validation logging
-                final_valid_soil_scores = np.sum(~np.isnan(soil_scores) & (soil_scores != 0.0))
-                logger.info(f"SOIL DEBUG: Final result - {final_valid_soil_scores} UIDs have valid soil scores")
-                
-                # IMMEDIATE cleanup of large matrices
-                del scores_matrix, weights_matrix
-                import gc
-                gc.collect()
-                
-                logger.info(f"Processed {len(soil_results)} soil records with {zero_soil_scores} zero scores (memory-optimized)")
+
+            # Soil moisture task disabled
 
             if weather_results:
                 latest_result = weather_results[0]
@@ -3796,86 +3642,36 @@ class GaiaValidator:
                     else: weather_scores[uid] = scores[uid]; weather_counts[uid] += (scores[uid] != 0.0)
                 logger.info(f"Weather scores: {sum(1 for s in weather_scores if s == 0.0)} UIDs have zero score")
 
-            # Process geomagnetic scores with 24-hour lookback
-            logger.info("Processing geomagnetic scores with 24-hour lookback...")
-            
-            if geomagnetic_results:
-                logger.info(f"Processing {len(geomagnetic_results)} geomagnetic score records from last 24 hours")
-                
-                # Calculate scores for each UID by averaging all scores from the 24-hour period
-                for uid in range(256):
-                    uid_scores = []
-                    
-                    # Collect all scores for this UID from the 24-hour period
-                    for result in geomagnetic_results:
-                        scores = result.get('score', [np.nan]*256)
-                        if not isinstance(scores, list) or len(scores) != 256:
-                            scores = [np.nan]*256  # Defensive
-                        
-                        score_val = scores[uid] if uid < len(scores) else 0.0
-                        if isinstance(score_val, str) or np.isnan(score_val):
-                            score_val = 0.0
-                        uid_scores.append(score_val)
-                    
-                    # Calculate average score for this UID (no completeness factor)
-                    if uid_scores:
-                        geomagnetic_scores[uid] = np.mean(uid_scores)
-                    else:
-                        geomagnetic_scores[uid] = 0.0
-                        
-                    # Debug logging for UIDs with scores
-                    if geomagnetic_scores[uid] > 0:
-                        logger.debug(f"Geo UID {uid}: averaged {len([s for s in uid_scores if s > 0])}/{len(uid_scores)} non-zero scores, "
-                                   f"final={geomagnetic_scores[uid]:.4f}")
-                
-                valid_geo_scores = [s for s in geomagnetic_scores if s > 0]
-                logger.info(f"Processed 24-hour geomagnetic scoring: "
-                           f"{len(geomagnetic_results)} score records, "
-                           f"{len(valid_geo_scores)} UIDs with positive scores")
-            else:
-                logger.info("No geomagnetic results in last 24 hours - all scores set to 0")
-                geomagnetic_scores.fill(0.0)
+            # Geomagnetic task disabled
 
             logger.info("Aggregate scores calculated. Implementing hybrid excellence/diversity pathway system...")
             
             # HYBRID PATHWAY SYSTEM: Calculate both excellence and diversity weights, use maximum
             
-            # Step 1: Batch calculate percentiles for all tasks (efficient single pass)
+            # Step 1: Calculate percentiles for weather task only (geomagnetic and soil disabled)
             task_percentiles = {}
             task_valid_scores = {}
             
-            for task_name, scores_array in [('weather', weather_scores), ('geomagnetic', geomagnetic_scores), ('soil', soil_scores)]:
-                valid_scores = scores_array[~np.isnan(scores_array) & (scores_array != 0.0)]
-                task_valid_scores[task_name] = valid_scores
-                
-                if len(valid_scores) >= 5:  # Minimum sample for percentiles
-                    # Pre-calculate percentile thresholds for efficiency
-                    percentiles = np.percentile(valid_scores, [15, 25, 35, 50, 65, 75, 85, 95])
-                    task_percentiles[task_name] = {
-                        'valid_count': len(valid_scores),
-                        'percentile_85': percentiles[6],  # Excellence threshold (top 15%)
-                        'sorted_scores': np.sort(valid_scores)  # For efficient rank calculation
-                    }
-                    logger.info(f"{task_name.capitalize()} task: {len(valid_scores)} vallid scores, 85th percentile: {percentiles[6]:.4f}")
-                else:
-                    task_percentiles[task_name] = {'valid_count': 0}
-                    logger.info(f"{task_name.capitalize()} task: insufficient scores ({len(valid_scores)}) for percentile calculation")
+            # Only process weather scores
+            task_name = 'weather'
+            scores_array = weather_scores
+            valid_scores = scores_array[~np.isnan(scores_array) & (scores_array != 0.0)]
+            task_valid_scores[task_name] = valid_scores
             
-            # Step 2: Calculate dynamic sigmoid for geomagnetic (existing logic)
-            valid_geo_scores = task_valid_scores['geomagnetic']
-            if len(valid_geo_scores) > 0:
-                geo_mean = np.mean(valid_geo_scores)
-                geo_std = np.std(valid_geo_scores)
-                sigmoid_x0 = geo_mean
-                sigmoid_k = max(10, min(30, 20 / max(geo_std, 0.01)))
-                logger.info(f"Dynamic sigmoid for geo: x0={sigmoid_x0:.4f} (mean), k={sigmoid_k:.1f}, std={geo_std:.4f}")
+            if len(valid_scores) >= 5:  # Minimum sample for percentiles
+                # Pre-calculate percentile thresholds for efficiency
+                percentiles = np.percentile(valid_scores, [15, 25, 35, 50, 65, 75, 85, 95])
+                task_percentiles[task_name] = {
+                    'valid_count': len(valid_scores),
+                    'percentile_85': percentiles[6],  # Excellence threshold (top 15%)
+                    'sorted_scores': np.sort(valid_scores)  # For efficient rank calculation
+                }
+                logger.info(f"{task_name.capitalize()} task: {len(valid_scores)} valid scores, 85th percentile: {percentiles[6]:.4f}")
             else:
-                sigmoid_x0 = 0.90
-                sigmoid_k = 15
-                logger.info(f"No valid geo scores, using fallback sigmoid: x0={sigmoid_x0}, k={sigmoid_k}")
+                task_percentiles[task_name] = {'valid_count': 0}
+                logger.info(f"{task_name.capitalize()} task: insufficient scores ({len(valid_scores)}) for percentile calculation")
             
-            def geo_sigmoid(x, k=sigmoid_k, x0=sigmoid_x0): 
-                return 1 / (1 + math.exp(-k * (x - x0)))
+            # Geomagnetic sigmoid calculation disabled (geomagnetic task removed)
             
             def diversity_sigmoid(percentile_rank):
                 """Sigmoid curve for diversity pathway performance scaling"""
@@ -3894,110 +3690,54 @@ class GaiaValidator:
                 percentile = (rank / len(sorted_scores)) * 100
                 return min(100, max(0, percentile))
             
-            # Step 3: Calculate weights for each miner using hybrid pathways
+            # Step 3: Calculate weights for each miner using weather scores only
             weights_final = np.zeros(256)
-            excellence_count = {'weather': 0, 'geomagnetic': 0, 'soil': 0}
-            diversity_count = {'1_task': 0, '2_task': 0, '3_task': 0}
+            excellence_count = {'weather': 0}
             
             # === NEW: Capture pathway tracking data for miner performance stats ===
             pathway_tracking = {}  # UID -> pathway details
             
             for idx in range(256):
-                # Get scores for this miner
-                w_s, g_s, sm_s = weather_scores[idx], geomagnetic_scores[idx], soil_scores[idx]
-                if np.isnan(w_s) or w_s == 0: w_s = np.nan
-                if np.isnan(g_s) or g_s == 0: g_s = np.nan  
-                if np.isnan(sm_s) or sm_s == 0: sm_s = np.nan
-                
-                # Skip if no valid scores
-                if np.isnan(w_s) and np.isnan(g_s) and np.isnan(sm_s):
+                # Get weather score for this miner
+                w_s = weather_scores[idx]
+                if np.isnan(w_s) or w_s == 0: 
                     weights_final[idx] = 0.0
                     continue
                 
-                # EXCELLENCE PATHWAY: Check for top 15% performance in any task
-                excellence_weight = 0.0
-                task_weights = {'weather': 0.70, 'geomagnetic': 0.15, 'soil': 0.15}
-                
-                for task_name, score in [('weather', w_s), ('geomagnetic', g_s), ('soil', sm_s)]:
-                    if not np.isnan(score) and task_name in task_percentiles:
-                        task_data = task_percentiles[task_name]
-                        if (task_data['valid_count'] >= 10 and 
-                            score >= task_data['percentile_85']):
-                            # Excellence achieved in this task
-                            task_excellence = score * task_weights[task_name]
-                            if task_excellence > excellence_weight:
-                                excellence_weight = task_excellence
-                                excellence_count[task_name] += 1
-                
-                # DIVERSITY PATHWAY: Multi-task performance with sigmoid scaling
-                diversity_contributions = {}
-                
-                for task_name, score in [('weather', w_s), ('geomagnetic', g_s), ('soil', sm_s)]:
-                    if not np.isnan(score):
-                        percentile_rank = get_percentile_rank(score, task_name)
-                        sigmoid_mult = diversity_sigmoid(percentile_rank)
-                        
-                        # Apply task-specific adjustments
-                        if task_name == 'geomagnetic':
-                            # Use dynamic sigmoid for geo scores
-                            final_score = geo_sigmoid(score)
-                        else:
-                            # Use raw score for weather/soil
-                            final_score = score
-                        
-                        diversity_contributions[task_name] = (
-                            final_score * task_weights[task_name] * sigmoid_mult
-                        )
-                
-                # Apply multi-task bonus to diversity pathway
-                num_tasks = len(diversity_contributions)
-                if num_tasks > 0:
-                    multi_task_bonus = 0.7 + (num_tasks * 0.15)  # 0.85, 1.0, 1.15
-                    diversity_weight = sum(diversity_contributions.values()) * multi_task_bonus
-                    diversity_count[f'{num_tasks}_task'] += 1
+                # With weather-only, we use the weather score directly (no multi-task pathways needed)
+                # Apply full weight (1.0) to weather since it's the only task
+                if 'weather' in task_percentiles:
+                    task_data = task_percentiles['weather']
+                    if (task_data['valid_count'] >= 10 and 
+                        w_s >= task_data['percentile_85']):
+                        # Excellence threshold: top 15% get excellence bonus
+                        weights_final[idx] = w_s * 1.0  # Full weight since weather is 100% of scoring
+                        excellence_count['weather'] += 1
+                    else:
+                        # Regular scoring: use raw weather score
+                        weights_final[idx] = w_s * 1.0
                 else:
-                    diversity_weight = 0.0
+                    # Fallback if insufficient data for percentiles
+                    weights_final[idx] = w_s * 1.0
                 
-                # FINAL WEIGHT: Maximum of excellence and diversity pathways
-                weights_final[idx] = max(excellence_weight, diversity_weight)
+                # === NEW: Capture pathway tracking data for weather-only scoring ===
+                qualified_for_excellence = (
+                    'weather' in task_percentiles and 
+                    task_percentiles['weather']['valid_count'] >= 10 and 
+                    w_s >= task_percentiles['weather']['percentile_85']
+                )
                 
-                # === NEW: Capture pathway tracking data ===
-                pathway_chosen = "excellence" if excellence_weight > diversity_weight else "diversity"
-                if excellence_weight == 0 and diversity_weight == 0:
-                    pathway_chosen = "none"
-                
-                # Calculate task percentile ranks for this miner
-                percentile_ranks = {}
-                qualified_tasks = []
-                for task_name, score in [('weather', w_s), ('geomagnetic', g_s), ('soil', sm_s)]:
-                    if not np.isnan(score):
-                        percentile_ranks[task_name] = get_percentile_rank(score, task_name)
-                        # Check if qualified for excellence in this task
-                        if (task_name in task_percentiles and 
-                            task_percentiles[task_name]['valid_count'] >= 10 and 
-                            score >= task_percentiles[task_name]['percentile_85']):
-                            qualified_tasks.append(task_name)
-                
-                # Store detailed pathway information
+                # Store simplified pathway information for weather-only
                 pathway_tracking[idx] = {
                     'raw_calculated_weight': float(weights_final[idx]),
-                    'excellence_weight': float(excellence_weight),
-                    'diversity_weight': float(diversity_weight),
-                    'scoring_pathway': pathway_chosen,
+                    'scoring_pathway': "weather_only",
                     'pathway_details': {
-                        'weather_score': float(w_s) if not np.isnan(w_s) else None,
-                        'geomagnetic_score': float(g_s) if not np.isnan(g_s) else None,
-                        'soil_score': float(sm_s) if not np.isnan(sm_s) else None,
-                        'percentile_ranks': percentile_ranks,
-                        'excellence_qualified_tasks': qualified_tasks,
-                        'diversity_contributions': {k: float(v) for k, v in diversity_contributions.items()},
-                        'multi_task_bonus': float(multi_task_bonus) if num_tasks > 0 else None,
-                        'num_active_tasks': num_tasks
+                        'weather_score': float(w_s),
+                        'percentile_rank': get_percentile_rank(w_s, 'weather') if 'weather' in task_percentiles else None,
+                        'excellence_qualified': qualified_for_excellence,
+                        'num_active_tasks': 1
                     },
-                    'weather_weight_contribution': float(diversity_contributions.get('weather', 0.0)),
-                    'geomagnetic_weight_contribution': float(diversity_contributions.get('geomagnetic', 0.0)),
-                    'soil_weight_contribution': float(diversity_contributions.get('soil', 0.0)),
-                    'multi_task_bonus': float(multi_task_bonus) if num_tasks > 0 else 0.0
+                    'weather_weight_contribution': float(weights_final[idx])
                 }
                 
                 # Debug logging for significant weights or pathway switches
@@ -4008,13 +3748,11 @@ class GaiaValidator:
                                f"excellence={excellence_weight:.4f}, diversity={diversity_weight:.4f}, "
                                f"final={weights_final[idx]:.4f}")
             
-            # Log pathway usage statistics
+            # Log pathway usage statistics (weather-only)
             total_excellence = sum(excellence_count.values())
-            total_diversity = sum(diversity_count.values())
-            logger.info(f"Pathway usage - Excellence: {total_excellence} miners "
-                       f"(W:{excellence_count['weather']}, G:{excellence_count['geomagnetic']}, S:{excellence_count['soil']})")
-            logger.info(f"Diversity: {total_diversity} miners "
-                       f"(1-task:{diversity_count['1_task']}, 2-task:{diversity_count['2_task']}, 3-task:{diversity_count['3_task']})")
+            logger.info(f"Weather-only scoring - Excellence miners: {total_excellence} "
+                       f"(Weather: {excellence_count['weather']})")
+            logger.info(f"Total miners with weather scores: {np.sum(weather_scores > 0)}")
             logger.info(f"Weights before normalization: Min={np.min(weights_final):.4f}, Max={np.max(weights_final):.4f}, Mean={np.mean(weights_final):.4f}")
             
             
@@ -4135,18 +3873,6 @@ class GaiaValidator:
                 created_at DESC 
             LIMIT 100
             """
-            # Get 24 hours of geomagnetic data for scoring
-            geomagnetic_query = """
-            SELECT score, created_at 
-            FROM score_table 
-            WHERE task_name = 'geomagnetic' AND created_at >= :geo_start_time ORDER BY created_at DESC
-            """
-            soil_query = """
-            SELECT score, created_at 
-            FROM score_table 
-            WHERE task_name LIKE 'soil_moisture_region_%' AND created_at >= :start_time ORDER BY created_at DESC LIMIT 200
-            """
-
             # Query node table for validator nodes with chunking to manage memory
             validator_nodes_query = """
             SELECT uid, hotkey, ip, port, incentive 
@@ -4155,10 +3881,7 @@ class GaiaValidator:
             ORDER BY uid
             """
 
-            params = {"start_time": one_day_ago}
-            weather_params = {"weather_start_time": weather_lookback}  # For weather 15-day lookback 
-            one_day_ago = now - timedelta(days=1)  # For geomagnetic 24-hour lookback
-            geo_params = {"geo_start_time": one_day_ago}  # For geomagnetic 24-hour lookback
+            weather_params = {"weather_start_time": weather_lookback}  # For weather 15-day lookback
             
             # Fetch all data concurrently using regular async approach
             try:
@@ -4169,10 +3892,8 @@ class GaiaValidator:
                 logger.info(f"Weather query: {weather_query}")
                 logger.info(f"Weather params: {weather_params}")
                 
-                weather_results, geomagnetic_results, soil_results, validator_nodes_list = await asyncio.gather(
+                weather_results, validator_nodes_list = await asyncio.gather(
                     self.database_manager.fetch_all(weather_query, weather_params),
-                    self.database_manager.fetch_all(geomagnetic_query, geo_params),
-                    self.database_manager.fetch_all(soil_query, params),
                     self.database_manager.fetch_all(validator_nodes_query),
                     return_exceptions=True
                 )
@@ -4203,22 +3924,13 @@ class GaiaValidator:
                     except Exception as debug_e:
                         logger.error(f"Debug weather query failed: {debug_e}")
                         
-                if geomagnetic_results and not isinstance(geomagnetic_results, Exception):
-                    logger.info(f"Geomagnetic dataset: {len(geomagnetic_results)} records")
-                if soil_results and not isinstance(soil_results, Exception):
-                    logger.info(f"Soil dataset: {len(soil_results)} records")
-                    # Check soil record size (they contain large score arrays)
-                    if soil_results:
-                        sample_soil = soil_results[0]
-                        if 'score' in sample_soil and isinstance(sample_soil['score'], list):
-                            logger.info(f"Soil score array size per record: {len(sample_soil['score'])} elements")
                 if validator_nodes_list and not isinstance(validator_nodes_list, Exception):
                     logger.info(f"Validator nodes dataset: {len(validator_nodes_list)} records")
                 
                 # Check for exceptions in results
-                for i, result in enumerate([weather_results, geomagnetic_results, soil_results, validator_nodes_list]):
+                for i, result in enumerate([weather_results, validator_nodes_list]):
                     if isinstance(result, Exception):
-                        task_names = ['weather', 'geomagnetic', 'soil', 'validator_nodes']
+                        task_names = ['weather', 'validator_nodes']
                         logger.error(f"Error fetching {task_names[i]} data: {result}")
                         return None
                 
@@ -4228,15 +3940,11 @@ class GaiaValidator:
                 # Defensive fallbacks for failed queries
                 if not weather_results:
                     weather_results = []
-                if not geomagnetic_results:
-                    geomagnetic_results = []
-                if not soil_results:
-                    soil_results = []
                 if not validator_nodes_list:
                     logger.error("Failed to fetch validator nodes - cannot calculate weights")
                     return None
 
-                logger.info(f"Fetched scores: Weather={len(weather_results)}, Geo={len(geomagnetic_results)}, Soil={len(soil_results)}")
+                logger.info(f"Fetched scores: Weather={len(weather_results)}")
                 
                 # Convert to list for the sync calculation
                 self._log_memory_usage("calc_weights_before_node_conversion")
@@ -4255,7 +3963,7 @@ class GaiaValidator:
                 try:
                     import gc
                     # Calculate total memory footprint before cleanup
-                    total_records = len(weather_results) + len(geomagnetic_results) + len(soil_results)
+                    total_records = len(weather_results)
                     logger.info(f"Processing {total_records} total database records for weight calculation")
                     
                     # Trigger performance statistics calculation after gathering all task scores
@@ -4281,8 +3989,6 @@ class GaiaValidator:
                     None,
                     self._perform_weight_calculations_sync,
                     weather_results,
-                    geomagnetic_results,
-                    soil_results,
                     now,
                     validator_nodes_by_uid_list
                 )

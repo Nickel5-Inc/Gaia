@@ -39,7 +39,7 @@ from .weather_logic import (
 )
 
 from ..utils.gfs_api import fetch_gfs_analysis_data, fetch_gfs_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
-from ..utils.era5_api import fetch_era5_data
+from ..utils.era5_api import fetch_era5_data, fetch_era5_data_progressive
 from ..utils.hashing import compute_verification_hash, compute_input_data_hash, CANONICAL_VARS_FOR_HASHING
 from ..weather_scoring.metrics import calculate_rmse
 from ..weather_scoring_mechanism import evaluate_miner_forecast_day1, precompute_climatology_cache
@@ -1070,7 +1070,29 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                         await asyncio.sleep(0) 
                 
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: Created {len(scoring_tasks)} scoring tasks.")
-                evaluation_results = await asyncio.gather(*scoring_tasks, return_exceptions=True)
+                
+                # Proactive memory cleanup before processing if we have many miners
+                if len(scoring_tasks) > 15:
+                    await _proactive_memory_cleanup(f"Day1Scoring-Run{run_id}-PreProcess", 6000)
+                
+                # Process miners in smaller batches to prevent memory buildup
+                batch_size = min(task_instance.config.get('scoring_batch_size', 20), len(scoring_tasks))
+                evaluation_results = []
+                
+                for batch_start in range(0, len(scoring_tasks), batch_size):
+                    batch_end = min(batch_start + batch_size, len(scoring_tasks))
+                    batch_tasks = scoring_tasks[batch_start:batch_end]
+                    
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Processing miner batch {batch_start//batch_size + 1}/{(len(scoring_tasks) + batch_size - 1)//batch_size} ({len(batch_tasks)} miners)")
+                    
+                    batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                    evaluation_results.extend(batch_results)
+                    
+                    # Memory cleanup between batches (but not on the last batch)
+                    if batch_end < len(scoring_tasks):
+                        cleanup_stats = await _proactive_memory_cleanup(f"Day1Scoring-Run{run_id}-Batch{batch_start//batch_size + 1}", 7000)
+                        if cleanup_stats.get("triggered", False):
+                            logger.info(f"[Day1ScoringWorker] Run {run_id}: Inter-batch cleanup freed {cleanup_stats['memory_freed_mb']:.1f} MB")
                 
                 # CRITICAL: Comprehensive cleanup after all miners processed
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: Starting comprehensive cleanup after scoring all miners...")
@@ -1419,36 +1441,70 @@ async def finalize_scores_worker(self):
                         continue
 
                 now_utc = datetime.now(timezone.utc)
-                sparse_lead_hours_config = self.config.get('final_scoring_lead_hours', [120, 168]) 
-                max_final_lead_hour = max(sparse_lead_hours_config) if sparse_lead_hours_config else 0
-
+                sparse_lead_hours_config = self.config.get('final_scoring_lead_hours', [24, 48, 72, 96, 120, 144, 168, 192, 216, 240]) 
+                
+                # Progressive scoring: check all runs that might have some lead hours ready
                 if self.test_mode:
-                    logger.info("[FinalizeWorker] TEST MODE: Ignoring ERA5 delay, checking all runs for final scoring")
-                    runs_to_score_query = """
+                    logger.info("[FinalizeWorker] TEST MODE: Ignoring ERA5 delay, checking all runs for progressive final scoring")
+                    candidate_runs_query = """
                     SELECT id, gfs_init_time_utc
                     FROM weather_forecast_runs
                     WHERE status IN ('day1_scoring_complete', 'ensemble_created', 'completed', 'all_forecasts_failed_verification', 'stalled_no_valid_forecasts', 'initial_scoring_failed', 'final_scoring_failed', 'scored')
-                    AND final_scoring_attempted_time IS NULL 
                     ORDER BY gfs_init_time_utc ASC
-                    LIMIT 10 
+                    LIMIT 20 
                     """
-                    ready_runs = await self.db_manager.fetch_all(runs_to_score_query, {})
+                    candidate_runs = await self.db_manager.fetch_all(candidate_runs_query, {})
                 else:
-                    init_time_cutoff = now_utc - timedelta(days=ERA5_DELAY_DAYS) - timedelta(hours=max_final_lead_hour) - timedelta(hours=ERA5_BUFFER_HOURS)
+                    # For progressive scoring, look at runs where the earliest lead hour might be ready
+                    # Use the shortest lead hour (24h = day 1) to determine the earliest possible scoring time
+                    min_lead_hour = min(sparse_lead_hours_config) if sparse_lead_hours_config else 24
+                    earliest_cutoff = now_utc - timedelta(days=ERA5_DELAY_DAYS) - timedelta(hours=min_lead_hour) - timedelta(hours=ERA5_BUFFER_HOURS)
                     retry_cutoff_time = now_utc - timedelta(hours=6)
-                    runs_to_score_query = """
+                    
+                    candidate_runs_query = """
                     SELECT id, gfs_init_time_utc
                     FROM weather_forecast_runs
                     WHERE status IN ('processing_ensemble', 'completed', 'initial_scoring_failed', 'ensemble_failed', 'final_scoring_failed', 'scored', 'day1_scoring_complete') 
-                    AND (final_scoring_attempted_time IS NULL OR final_scoring_attempted_time < :retry_cutoff)
-                    AND gfs_init_time_utc < :init_time_cutoff 
+                    AND gfs_init_time_utc < :earliest_cutoff 
                     ORDER BY gfs_init_time_utc ASC
-                    LIMIT 10 
+                    LIMIT 50
                     """
-                    ready_runs = await self.db_manager.fetch_all(runs_to_score_query, {
-                        "init_time_cutoff": init_time_cutoff,
-                        "retry_cutoff": retry_cutoff_time
+                    candidate_runs = await self.db_manager.fetch_all(candidate_runs_query, {
+                        "earliest_cutoff": earliest_cutoff
                     })
+                
+                # Determine which specific lead hours are ready for each run
+                ready_runs = []
+                for run in candidate_runs:
+                    run_id = run['id']
+                    gfs_init_time = run['gfs_init_time_utc']
+                    
+                    # Check which lead hours are ready for this specific run
+                    ready_lead_hours = []
+                    for lead_hour in sparse_lead_hours_config:
+                        forecast_target_time = gfs_init_time + timedelta(hours=lead_hour)
+                        era5_needed_time = forecast_target_time + timedelta(days=ERA5_DELAY_DAYS) + timedelta(hours=ERA5_BUFFER_HOURS)
+                        
+                        if now_utc >= era5_needed_time:
+                            # Check if this lead hour has already been scored
+                            existing_score_query = """
+                            SELECT COUNT(*) as count FROM weather_miner_scores 
+                            WHERE run_id = :run_id AND score_type LIKE '%era5%' AND lead_hours = :lead_hours
+                            """
+                            existing_count = await self.db_manager.fetch_one(existing_score_query, {
+                                "run_id": run_id, 
+                                "lead_hours": lead_hour
+                            })
+                            
+                            if existing_count['count'] == 0:
+                                ready_lead_hours.append(lead_hour)
+                    
+                    if ready_lead_hours:
+                        run['ready_lead_hours'] = ready_lead_hours
+                        ready_runs.append(run)
+                        logger.info(f"[FinalizeWorker] Run {run_id} (GFS: {gfs_init_time}): Ready lead hours: {ready_lead_hours}")
+                
+                logger.info(f"[FinalizeWorker] Found {len(ready_runs)} runs with progressive scoring opportunities")
 
                 if not ready_runs:
                     logger.debug("[FinalizeWorker] No runs ready for final scoring.")
@@ -1473,11 +1529,21 @@ async def finalize_scores_worker(self):
                             {"now": now_utc, "rid": run_id}
                     )
 
-                    target_datetimes_for_run = [gfs_init_time + timedelta(hours=h) for h in sparse_lead_hours_config]
+                    # Use only the ready lead hours for this specific run (progressive scoring)
+                    ready_lead_hours_for_run = run['ready_lead_hours']
+                    target_datetimes_for_run = [gfs_init_time + timedelta(hours=h) for h in ready_lead_hours_for_run]
 
-                    logger.info(f"[FinalizeWorker] Run {run_id}: Fetching ERA5 analysis for final scoring at lead hours: {sparse_lead_hours_config}.")
+                    logger.info(f"[FinalizeWorker] Run {run_id}: Fetching ERA5 analysis for progressive final scoring at ready lead hours: {ready_lead_hours_for_run}.")
                     era5_cache = Path(self.config.get('era5_cache_dir', './era5_cache'))
-                    era5_ds_for_run = await fetch_era5_data(target_times=target_datetimes_for_run, cache_dir=era5_cache) # Ensure fetch_era5_data is efficient
+                    
+                    # Use progressive ERA5 fetch for better data transfer efficiency
+                    use_progressive_fetch = self.config.get('progressive_era5_fetch', True)
+                    if use_progressive_fetch:
+                        logger.debug(f"[FinalizeWorker] Run {run_id}: Using progressive ERA5 fetch for {len(target_datetimes_for_run)} time points")
+                        era5_ds_for_run = await fetch_era5_data_progressive(target_times=target_datetimes_for_run, cache_dir=era5_cache)
+                    else:
+                        logger.debug(f"[FinalizeWorker] Run {run_id}: Using standard ERA5 fetch")
+                        era5_ds_for_run = await fetch_era5_data(target_times=target_datetimes_for_run, cache_dir=era5_cache)
 
                     if era5_ds_for_run is None:
                         logger.error(f"[FinalizeWorker] Run {run_id}: Failed to fetch ERA5 data. Aborting final scoring for this run.")
@@ -1488,6 +1554,9 @@ async def finalize_scores_worker(self):
                         continue
 
                     logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 data fetched/loaded.")
+                    
+                    # Proactive memory cleanup after ERA5 data loading (large datasets)
+                    await _proactive_memory_cleanup(f"ERA5Scoring-Run{run_id}-PostERA5Load", 10000)
 
                     # SMART PARTIAL RETRY: Only score miners that don't already have ERA5 final scores
                     responses_query = """    
@@ -1544,7 +1613,25 @@ async def finalize_scores_worker(self):
                          if len(verified_responses_for_run) > 5 and len(scoring_execution_tasks) % 5 == 0:
                              await asyncio.sleep(0)
 
-                    miner_scoring_results = await asyncio.gather(*scoring_execution_tasks)
+                    # Process miners in batches to prevent memory buildup during ERA5 scoring
+                    batch_size = min(self.config.get('era5_scoring_batch_size', 10), len(scoring_execution_tasks))
+                    miner_scoring_results = []
+                    
+                    for batch_start in range(0, len(scoring_execution_tasks), batch_size):
+                        batch_end = min(batch_start + batch_size, len(scoring_execution_tasks))
+                        batch_tasks = scoring_execution_tasks[batch_start:batch_end]
+                        
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Processing ERA5 batch {batch_start//batch_size + 1}/{(len(scoring_execution_tasks) + batch_size - 1)//batch_size} ({len(batch_tasks)} miners)")
+                        
+                        batch_results = await asyncio.gather(*batch_tasks)
+                        miner_scoring_results.extend(batch_results)
+                        
+                        # Memory cleanup between ERA5 batches (but not on the last batch)
+                        if batch_end < len(scoring_execution_tasks):
+                            cleanup_stats = await _proactive_memory_cleanup(f"ERA5Scoring-Run{run_id}-Batch{batch_start//batch_size + 1}", 9000)
+                            if cleanup_stats.get("triggered", False):
+                                logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 inter-batch cleanup freed {cleanup_stats['memory_freed_mb']:.1f} MB")
+                    
                     successful_final_scores_count = 0
                     
                                     # CRITICAL: Memory cleanup after ERA5 scoring - similar to initial scoring
@@ -1744,7 +1831,7 @@ async def finalize_scores_worker(self):
                             agg_score = await _calculate_and_store_aggregated_era5_score(
                                 task_instance=self, run_id=run_id, miner_uid=resp_rec_inner['miner_uid'],
                                 miner_hotkey=resp_rec_inner['miner_hotkey'], response_id=resp_rec_inner['id'], 
-                                lead_hours_scored=sparse_lead_hours_config, vars_levels_scored=final_vars_levels_cfg
+                                lead_hours_scored=ready_lead_hours_for_run, vars_levels_scored=final_vars_levels_cfg
                             )
                             if agg_score is not None:
                                 successful_final_scores_count += 1
@@ -1768,9 +1855,9 @@ async def finalize_scores_worker(self):
                         logger.info(f"[FinalizeWorker] Run {run_id}: Note - Failed miners may include deregistered miners (check individual miner logs for 'not in current metagraph' messages)")
                     
                     if successful_final_scores_count > 0: 
-                        logger.info(f"[FinalizeWorker] Run {run_id}: Marked as 'scored'.")
-                        await _update_run_status(self, run_id, "scored")
-                        # Mark scoring job as completed successfully
+                        # Track progressive scoring completion instead of simple status update
+                        await self._track_progressive_scoring_completion(run_id, ready_lead_hours_for_run)
+                        # Mark scoring job as completed successfully  
                         await self._complete_scoring_job(run_id, 'era5_final', success=True)
                         try:
                             logger.info(f"[FinalizeWorker] Run {run_id}: Triggering update of combined weather scores.")
@@ -3482,3 +3569,101 @@ async def _cleanup_failed_multipart_uploads_for_job(
 
     except Exception as e:
         logger.error(f"[{job_id}] Error during multipart upload cleanup: {e}", exc_info=True)
+
+async def _proactive_memory_cleanup(context: str, memory_threshold_mb: int = 8000, force: bool = False) -> dict:
+    """
+    Proactive memory cleanup to prevent OOM during scoring operations.
+    
+    Args:
+        context: Description of where cleanup is called from
+        memory_threshold_mb: Memory threshold in MB to trigger cleanup
+        force: Force cleanup regardless of memory usage
+    
+    Returns:
+        dict: Cleanup statistics
+    """
+    try:
+        process = psutil.Process()
+        current_memory_mb = process.memory_info().rss / (1024 * 1024)
+        
+        # Only clean if above threshold or forced
+        if not force and current_memory_mb < memory_threshold_mb:
+            return {
+                "triggered": False,
+                "memory_before_mb": current_memory_mb,
+                "memory_after_mb": current_memory_mb,
+                "memory_freed_mb": 0,
+                "lru_caches_cleared": 0,
+                "cache_objects_cleared": 0
+            }
+        
+        logger.info(f"[MemoryCleanup] {context}: Starting cleanup - Current memory: {current_memory_mb:.1f} MB")
+        
+        import sys
+        import warnings
+        
+        lru_caches_cleared = 0
+        cache_objects_cleared = 0
+        
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore')
+            
+            # Fast LRU cache clearing - focus on high-impact modules
+            priority_modules = [
+                'xarray', 'numpy', 'scipy', 'pandas', 'netCDF4', 'zarr',
+                'gaia.tasks.defined_tasks.weather', 'gaia.validator', 'gaia.miner'
+            ]
+            
+            # First pass: Clear priority modules
+            for module_pattern in priority_modules:
+                for module_name in list(sys.modules.keys()):
+                    if module_pattern in module_name:
+                        module = sys.modules.get(module_name)
+                        if module and hasattr(module, '__dict__'):
+                            for attr_name in list(module.__dict__.keys()):
+                                try:
+                                    attr = getattr(module, attr_name)
+                                    if hasattr(attr, 'cache_clear') and callable(attr.cache_clear):
+                                        attr.cache_clear()
+                                        lru_caches_cleared += 1
+                                    elif any(cache_pattern in attr_name.lower() for cache_pattern in 
+                                           ['cache', '_cached', '_memo', '_buffer']):
+                                        if hasattr(attr, 'clear') and callable(attr.clear):
+                                            attr.clear()
+                                            cache_objects_cleared += 1
+                                        elif isinstance(attr, (dict, list, set)):
+                                            attr.clear()
+                                            cache_objects_cleared += 1
+                                except Exception:
+                                    continue
+        
+        # Multiple GC passes for thorough cleanup
+        for gc_pass in range(3):
+            collected = gc.collect()
+            if collected == 0:
+                break
+        
+        # Check memory after cleanup
+        memory_after_mb = process.memory_info().rss / (1024 * 1024)
+        memory_freed_mb = current_memory_mb - memory_after_mb
+        
+        cleanup_stats = {
+            "triggered": True,
+            "memory_before_mb": current_memory_mb,
+            "memory_after_mb": memory_after_mb,
+            "memory_freed_mb": memory_freed_mb,
+            "lru_caches_cleared": lru_caches_cleared,
+            "cache_objects_cleared": cache_objects_cleared
+        }
+        
+        logger.info(f"[MemoryCleanup] {context}: Freed {memory_freed_mb:.1f} MB | "
+                   f"Cleared {lru_caches_cleared} LRU caches + {cache_objects_cleared} cache objects")
+        
+        return cleanup_stats
+        
+    except Exception as e:
+        logger.error(f"[MemoryCleanup] {context}: Error during cleanup: {e}")
+        return {
+            "triggered": False,
+            "error": str(e)
+        }

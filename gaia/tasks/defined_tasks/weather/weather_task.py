@@ -127,17 +127,34 @@ def _load_config(self):
     
     # Scoring Parameters
     config['initial_scoring_lead_hours'] = parse_int_list('WEATHER_INITIAL_SCORING_LEAD_HOURS', [6, 12]) # Day 0.25, 0.5
-    config['final_scoring_lead_hours'] = parse_int_list('WEATHER_FINAL_SCORING_LEAD_HOURS', [60,78,138]) # Day 2, 3, 5
+    # Progressive daily scoring: score each day from 1-10 as ERA5 data becomes available
+    config['final_scoring_lead_hours'] = parse_int_list('WEATHER_FINAL_SCORING_LEAD_HOURS', 
+                                                        [24, 48, 72, 96, 120, 144, 168, 192, 216, 240]) # Days 1-10
     config['verification_wait_minutes'] = int(os.getenv('WEATHER_VERIFICATION_WAIT_MINUTES', '60'))
     config['verification_timeout_seconds'] = int(os.getenv('WEATHER_VERIFICATION_TIMEOUT_SECONDS', '3600'))
-    config['final_scoring_check_interval_seconds'] = int(os.getenv('WEATHER_FINAL_SCORING_INTERVAL_S', '3600'))
-    config['era5_delay_days'] = int(os.getenv('WEATHER_ERA5_DELAY_DAYS', '5'))
+    # More frequent checking for progressive scoring (check every 30 minutes instead of 1 hour)
+    config['final_scoring_check_interval_seconds'] = int(os.getenv('WEATHER_FINAL_SCORING_INTERVAL_S', '1800'))
+    # Optimized for progressive scoring: reduce delay since we're scoring days individually
+    config['era5_delay_days'] = int(os.getenv('WEATHER_ERA5_DELAY_DAYS', '4'))  # Reduced from 5 to 4 days
     config['era5_buffer_hours'] = int(os.getenv('WEATHER_ERA5_BUFFER_HOURS', '6'))
     config['cleanup_check_interval_seconds'] = int(os.getenv('WEATHER_CLEANUP_INTERVAL_S', '21600')) # 6 hours
     config['gfs_analysis_cache_dir'] = os.getenv('WEATHER_GFS_CACHE_DIR', './gfs_analysis_cache')
     config['era5_cache_dir'] = os.getenv('WEATHER_ERA5_CACHE_DIR', './era5_cache')
     config['gfs_cache_retention_days'] = int(os.getenv('WEATHER_GFS_CACHE_RETENTION_DAYS', '7'))
     config['era5_cache_retention_days'] = int(os.getenv('WEATHER_ERA5_CACHE_RETENTION_DAYS', '30'))
+    # Progressive scoring optimization: enable more selective ERA5 data fetching
+    config['progressive_era5_fetch'] = os.getenv('WEATHER_PROGRESSIVE_ERA5_FETCH', 'true').lower() in ['true', '1', 'yes']
+    config['era5_fetch_chunk_hours'] = int(os.getenv('WEATHER_ERA5_FETCH_CHUNK_HOURS', '24'))  # Fetch daily chunks
+    
+    # Data transfer optimization: enable compressed miner-validator communication
+    config['enable_compression'] = os.getenv('WEATHER_ENABLE_COMPRESSION', 'true').lower() in ['true', '1', 'yes']
+    config['compression_level'] = int(os.getenv('WEATHER_COMPRESSION_LEVEL', '6'))  # gzip compression level (1-9)
+    
+    # Memory management thresholds and batch sizes for OOM prevention
+    config['memory_cleanup_threshold_mb'] = int(os.getenv('WEATHER_MEMORY_CLEANUP_THRESHOLD_MB', '8000'))  # Trigger proactive cleanup
+    config['memory_emergency_threshold_mb'] = int(os.getenv('WEATHER_MEMORY_EMERGENCY_THRESHOLD_MB', '15000'))  # Emergency warning threshold
+    config['scoring_batch_size'] = int(os.getenv('WEATHER_SCORING_BATCH_SIZE', '20'))  # Day-1 scoring batch size
+    config['era5_scoring_batch_size'] = int(os.getenv('WEATHER_ERA5_SCORING_BATCH_SIZE', '10'))  # ERA5 scoring batch size
     config['ensemble_retention_days'] = int(os.getenv('WEATHER_ENSEMBLE_RETENTION_DAYS', '14'))
     config['db_run_retention_days'] = int(os.getenv('WEATHER_DB_RUN_RETENTION_DAYS', '90'))
     config['input_batch_retention_days'] = int(os.getenv('WEATHER_INPUT_BATCH_RETENTION_DAYS', '3'))  # New: retention for input batch pickle files
@@ -2466,6 +2483,8 @@ sources:
             logger.warning("[CombinedWeatherScore] No Day-1 QC scores found in weather_miner_scores for active UIDs.")
             latest_day1_timestamp = datetime.now(timezone.utc) 
 
+        # Progressive scoring: ERA5 scores may come from multiple partial scoring runs
+        # This query will get the latest composite score regardless of progressive timing
         era5_composite_score_type = "era5_final_composite_score"
         query_era5_composite = """
             SELECT score FROM weather_miner_scores WHERE miner_uid = :miner_uid AND score_type = :score_type
@@ -4697,6 +4716,46 @@ sources:
             return True
         except Exception as e:
             logger.error(f"[Run {run_id}] Error completing {score_type} scoring job: {e}", exc_info=True)
+            return False
+
+    async def _track_progressive_scoring_completion(self, run_id: int, completed_lead_hours: List[int]) -> bool:
+        """Track completion of specific lead hours for progressive scoring."""
+        try:
+            # Update the final_scoring_attempted_time to track overall progress
+            # but don't mark as fully complete until all desired lead hours are done
+            all_configured_hours = self.config.get('final_scoring_lead_hours', [24, 48, 72, 96, 120, 144, 168, 192, 216, 240])
+            
+            # Check how many total lead hours have been scored for this run
+            scored_hours_query = """
+            SELECT DISTINCT lead_hours FROM weather_miner_scores 
+            WHERE run_id = :run_id AND score_type LIKE '%era5%'
+            ORDER BY lead_hours
+            """
+            scored_results = await self.db_manager.fetch_all(scored_hours_query, {"run_id": run_id})
+            already_scored_hours = [r['lead_hours'] for r in scored_results if r['lead_hours'] is not None]
+            
+            total_scored_hours = set(already_scored_hours + completed_lead_hours)
+            completion_ratio = len(total_scored_hours) / len(all_configured_hours)
+            
+            logger.info(f"[Run {run_id}] Progressive scoring status: {len(total_scored_hours)}/{len(all_configured_hours)} lead hours completed ({completion_ratio:.2%})")
+            
+            # Update run status based on completion ratio
+            if completion_ratio >= 0.8:  # 80% completion threshold
+                new_status = "scored"
+                logger.info(f"[Run {run_id}] Progressive scoring substantially complete, marking as scored")
+            elif completion_ratio >= 0.5:  # 50% completion threshold  
+                new_status = "era5_final_scoring_partial"
+            else:
+                new_status = "era5_final_scoring_started"
+            
+            await self.db_manager.execute(
+                "UPDATE weather_forecast_runs SET status = :status, final_scoring_attempted_time = :now WHERE id = :run_id",
+                {"status": new_status, "now": datetime.now(timezone.utc), "run_id": run_id}
+            )
+            
+            return True
+        except Exception as e:
+            logger.error(f"[Run {run_id}] Error tracking progressive scoring completion: {e}", exc_info=True)
             return False
 
     async def _recover_incomplete_scoring_jobs(self):

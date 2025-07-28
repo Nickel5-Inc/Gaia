@@ -467,3 +467,241 @@ if __name__ == "__main__":
     # Uncomment to test
     asyncio.run(_test_fetch())
     pass 
+
+import cdsapi
+import xarray as xr
+import numpy as np
+import os
+import tempfile
+import hashlib
+import asyncio
+import logging
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Set
+from copy import deepcopy
+
+logger = logging.getLogger(__name__)
+
+# ERA5 variable definitions and pressure levels
+ERA5_SINGLE_LEVEL_VARS = {
+    '2m_temperature': '2t',
+    '10m_u_component_of_wind': '10u',
+    '10m_v_component_of_wind': '10v',
+    'mean_sea_level_pressure': 'msl'
+}
+
+ERA5_PRESSURE_LEVEL_VARS = {
+    'temperature': 't',
+    'u_component_of_wind': 'u',
+    'v_component_of_wind': 'v',
+    'specific_humidity': 'q',
+    'geopotential': 'z'
+}
+
+AURORA_PRESSURE_LEVELS = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+
+async def fetch_era5_data_progressive(
+    target_times: List[datetime],
+    cache_dir: Path = Path("./era5_cache")
+) -> Optional[xr.Dataset]:
+    """
+    Optimized ERA5 fetch for progressive scoring.
+    Fetches and caches individual days, then combines only the requested times.
+    This minimizes data transfer and allows for efficient progressive scoring.
+    
+    Args:
+        target_times: List of datetime objects for which to fetch data
+        cache_dir: Directory for caching individual daily files
+        
+    Returns:
+        Combined xarray.Dataset for requested times, or None if fetch fails
+    """
+    if not target_times:
+        logger.warning("fetch_era5_data_progressive called with no target_times.")
+        return None
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target_times = sorted(list(set(target_times)))
+    
+    # Group target times by date for efficient daily fetching
+    daily_groups: Dict[str, List[datetime]] = {}
+    for dt in target_times:
+        date_key = dt.strftime("%Y-%m-%d")
+        if date_key not in daily_groups:
+            daily_groups[date_key] = []
+        daily_groups[date_key].append(dt)
+    
+    logger.info(f"Progressive ERA5 fetch: Processing {len(daily_groups)} unique dates")
+    
+    # Fetch individual daily datasets (cached per day)
+    daily_datasets = []
+    for date_key, times_for_date in daily_groups.items():
+        logger.debug(f"Processing date {date_key} with {len(times_for_date)} time points")
+        
+        daily_ds = await _fetch_single_day_era5(date_key, times_for_date, cache_dir)
+        if daily_ds is not None:
+            daily_datasets.append(daily_ds)
+        else:
+            logger.error(f"Failed to fetch ERA5 data for date {date_key}")
+            return None
+    
+    if not daily_datasets:
+        logger.error("No daily datasets successfully fetched")
+        return None
+    
+    # Combine daily datasets efficiently
+    try:
+        logger.info(f"Combining {len(daily_datasets)} daily datasets")
+        combined_ds = xr.concat(daily_datasets, dim='time')
+        combined_ds = combined_ds.sortby('time')
+        
+        # Select only the exact target times to minimize memory usage
+        target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
+        combined_ds = combined_ds.sel(time=target_times_np_ns, method='nearest')
+        
+        logger.info(f"Progressive ERA5 fetch completed: {len(target_times)} time points from {len(daily_groups)} days")
+        return combined_ds
+        
+    except Exception as e:
+        logger.error(f"Error combining daily ERA5 datasets: {e}")
+        return None
+    finally:
+        # Clean up individual daily datasets to free memory
+        for ds in daily_datasets:
+            if hasattr(ds, 'close'):
+                ds.close()
+
+async def _fetch_single_day_era5(
+    date_str: str,
+    times_for_date: List[datetime], 
+    cache_dir: Path
+) -> Optional[xr.Dataset]:
+    """
+    Fetch ERA5 data for a single day with per-day caching.
+    This enables efficient progressive scoring with minimal redundant downloads.
+    """
+    # Create cache filename based on date and times
+    times_str = "_".join([t.strftime("%H%M") for t in times_for_date])
+    cache_key = f"era5_{date_str}_{hashlib.md5(times_str.encode()).hexdigest()[:8]}"
+    cache_file = cache_dir / f"{cache_key}.nc"
+    
+    # Check for existing cache
+    if cache_file.exists():
+        try:
+            logger.debug(f"Loading cached ERA5 data for {date_str}: {cache_file}")
+            ds = xr.open_dataset(cache_file, engine='netcdf4')
+            
+            # Validate cache contains requested times
+            target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in times_for_date]
+            if all(t_np_ns in ds.time.values for t_np_ns in target_times_np_ns):
+                # Force data loading to prevent lazy-loading issues
+                for var_name in ds.data_vars:
+                    _ = ds[var_name].values
+                logger.debug(f"Cache hit for {date_str}")
+                return ds
+            else:
+                logger.warning(f"Cache miss: {date_str} cache doesn't contain all requested times")
+                ds.close()
+                cache_file.unlink()
+        except Exception as e:
+            logger.warning(f"Error loading cache for {date_str}: {e}")
+            if cache_file.exists():
+                cache_file.unlink()
+    
+    # Fetch data from CDS API for this specific day
+    logger.info(f"Fetching ERA5 data for {date_str} from CDS API")
+    
+    times = sorted(list(set(t.strftime("%H:%M") for t in times_for_date)))
+    
+    def _sync_fetch_single_day():
+        try:
+            c = cdsapi.Client(quiet=True)
+            
+            # Create temporary files for single and pressure level data
+            fd_sl, temp_sl_path = tempfile.mkstemp(suffix=f'_era5_sl_{date_str}.nc', dir=cache_dir)
+            fd_pl, temp_pl_path = tempfile.mkstemp(suffix=f'_era5_pl_{date_str}.nc', dir=cache_dir)
+            os.close(fd_sl)
+            os.close(fd_pl)
+            temp_sl_file = Path(temp_sl_path)
+            temp_pl_file = Path(temp_pl_path)
+            
+            common_request = {
+                'product_type': 'reanalysis',
+                'format': 'netcdf',
+                'date': [date_str],  # Single date
+                'time': times,
+                'grid': '0.25/0.25',
+            }
+            
+            # Fetch single level data
+            sl_request = common_request.copy()
+            sl_request['variable'] = ['2m_temperature', '10m_u_component_of_wind', '10m_v_component_of_wind', 'mean_sea_level_pressure']
+            
+            logger.debug(f"Requesting single level data for {date_str}")
+            c.retrieve('reanalysis-era5-single-levels', sl_request, str(temp_sl_file))
+            
+            # Fetch pressure level data  
+            pl_request = common_request.copy()
+            pl_request['variable'] = ['temperature', 'u_component_of_wind', 'v_component_of_wind', 'specific_humidity', 'geopotential']
+            pl_request['pressure_level'] = AURORA_PRESSURE_LEVELS
+            
+            logger.debug(f"Requesting pressure level data for {date_str}")
+            c.retrieve('reanalysis-era5-pressure-levels', pl_request, str(temp_pl_file))
+            
+            # Process and combine the downloaded data
+            logger.debug(f"Processing downloaded data for {date_str}")
+            
+            # Load with robust error handling
+            ds_sl = xr.open_dataset(temp_sl_file, engine='netcdf4')
+            ds_pl = xr.open_dataset(temp_pl_file, engine='netcdf4')
+            
+            # Rename variables to match expected names
+            var_mapping = {**ERA5_SINGLE_LEVEL_VARS, **ERA5_PRESSURE_LEVEL_VARS}
+            
+            for ds in [ds_sl, ds_pl]:
+                for old_name, new_name in var_mapping.items():
+                    if old_name in ds.data_vars:
+                        ds = ds.rename({old_name: new_name})
+            
+            # Combine datasets
+            ds_combined = xr.merge([ds_sl, ds_pl])
+            
+            # Coordinate adjustments
+            if 'lat' in ds_combined.coords and len(ds_combined.lat) > 1 and ds_combined.lat.values[0] < ds_combined.lat.values[-1]:
+                ds_combined = ds_combined.reindex(lat=ds_combined.lat[::-1])
+            
+            if 'lon' in ds_combined.coords and ds_combined.lon.values.min() < 0:
+                ds_combined.coords['lon'] = (ds_combined.coords['lon'] + 360) % 360
+                ds_combined = ds_combined.sortby(ds_combined.lon)
+            
+            # Force data loading before temp file cleanup
+            for var_name in ds_combined.data_vars:
+                _ = ds_combined[var_name].values
+            
+            # Save to cache
+            logger.debug(f"Saving processed data for {date_str} to cache: {cache_file}")
+            ds_combined.to_netcdf(cache_file, engine='netcdf4')
+            
+            # Cleanup temp files
+            temp_sl_file.unlink()
+            temp_pl_file.unlink()
+            
+            return ds_combined
+            
+        except Exception as e:
+            logger.error(f"Error in sync fetch for {date_str}: {e}")
+            # Cleanup on error
+            for temp_file in [temp_sl_file, temp_pl_file]:
+                if temp_file.exists():
+                    temp_file.unlink()
+            return None
+    
+    # Run the sync fetch in an executor to avoid blocking
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(None, _sync_fetch_single_day)
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching ERA5 data for {date_str}: {e}")
+        return None 

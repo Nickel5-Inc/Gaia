@@ -17,8 +17,7 @@ from fiber.encrypted.miner.middleware import configure_extra_logging_middleware
 from fiber.chain import chain_utils, fetch_nodes
 from gaia.miner.utils.subnet import factory_router
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
-from gaia.tasks.defined_tasks.geomagnetic.geomagnetic_task import GeomagneticTask
-from gaia.tasks.defined_tasks.soilmoisture.soil_task import SoilMoistureTask
+# Geomagnetic and soil moisture tasks disabled
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 import ssl
 import logging
@@ -149,14 +148,7 @@ class Miner:
         logger.info(f"Hotkey Name: {self.hotkey}")
 
         self.database_manager = MinerDatabaseManager()
-        self.geomagnetic_task = GeomagneticTask(
-            node_type="miner",
-            db_manager=self.database_manager
-        )
-        self.soil_task = SoilMoistureTask(
-            db_manager=self.database_manager,
-            node_type="miner"
-        )
+        # Geomagnetic and soil moisture tasks disabled
         
         # --- Initialize WeatherTask in __init__ ---
         self.weather_inference_service_url = None # Will be determined here
