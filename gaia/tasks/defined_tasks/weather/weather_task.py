@@ -1,6 +1,6 @@
 import asyncio
 import traceback
-from typing import Any, Dict, List, Optional, Union, Tuple
+from typing import Any, Dict, List, Optional, Union, Tuple, Set
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 import os
@@ -1530,29 +1530,210 @@ sources:
             "gfs_init_time_for_table": gfs_init_time
         }
 
-        try:
-            upsert_score_table_query = """
-                INSERT INTO score_table (task_name, task_id, score, status, created_at)
-                VALUES (:task_name, :task_id, :score, :status, :created_at_val)
-                ON CONFLICT (task_name, task_id) DO UPDATE SET
-                    score = EXCLUDED.score,
-                    status = EXCLUDED.status,
-                    created_at = EXCLUDED.created_at
-            """
+        from json import dumps
+        
+        query = """
+        INSERT INTO score_table 
+        (task_name, task_id, score, status, timestamp, round_duration_ms, round_duration_start, round_duration_end)
+        VALUES (:task_name, :task_id, :score, :status, :timestamp, :round_duration_ms, :round_duration_start, :round_duration_end)
+        ON CONFLICT (task_name, task_id)
+        DO UPDATE SET
+            score = EXCLUDED.score,
+            status = EXCLUDED.status,
+            timestamp = EXCLUDED.timestamp,
+            round_duration_ms = EXCLUDED.round_duration_ms,
+            round_duration_start = EXCLUDED.round_duration_start,
+            round_duration_end = EXCLUDED.round_duration_end
+        """
+        
+        db_params = {
+            "task_name": score_row_data["task_name"],
+            "task_id": score_row_data["task_id"],
+            "score": dumps(score_row_data["score"]),
+            "status": score_row_data["status"],
+            "timestamp": score_row_data["gfs_init_time_for_table"],
+            "round_duration_ms": 0,  # Placeholder
+            "round_duration_start": score_row_data["gfs_init_time_for_table"],  
+            "round_duration_end": score_row_data["gfs_init_time_for_table"]
+        }
+        
+        await self.db_manager.execute(query, db_params)
+        logger.info(f"[BuildScoreRow] Stored/updated score row for task '{task_name_prefix}' with task_id '{run_id}'")
+
+    async def check_and_build_missing_weather_scores(self, target_timestep: Optional[datetime] = None) -> Dict[str, Any]:
+        """
+        Check for missing weather score rows and build them if needed.
+        
+        Args:
+            target_timestep: Specific timestep to check (if None, checks recent timesteps)
             
-            db_params_score_table = {
-                "task_name": score_row_data["task_name"],
-                "task_id": score_row_data["task_id"],
-                "score": score_row_data["score"],
-                "status": score_row_data["status"],
-                "created_at_val": score_row_data["gfs_init_time_for_table"]
-            }
+        Returns:
+            Dict with status and details of operations performed
+        """
+        logger.info(f"[MissingScoresChecker] Checking for missing weather score rows{f' for timestep {target_timestep}' if target_timestep else ' for recent timesteps'}")
+        
+        result = {
+            "checked_timesteps": 0,
+            "missing_score_rows_found": 0,
+            "score_rows_created": 0,
+            "errors": [],
+            "details": []
+        }
+        
+        try:
+            # Get timesteps to check
+            if target_timestep:
+                timesteps_to_check = [target_timestep]
+            else:
+                # Check last 24 hours of timesteps
+                cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+                timestep_query = """
+                SELECT DISTINCT gfs_init_time_utc, id as run_id
+                FROM weather_forecast_runs 
+                WHERE gfs_init_time_utc >= :cutoff_time
+                AND status IN ('day1_scoring_complete', 'scored', 'final_scoring_complete')
+                ORDER BY gfs_init_time_utc DESC
+                """
+                timestep_records = await self.db_manager.fetch_all(timestep_query, {"cutoff_time": cutoff_time})
+                timesteps_to_check = [(rec['gfs_init_time_utc'], rec['run_id']) for rec in timestep_records]
+            
+            result["checked_timesteps"] = len(timesteps_to_check)
+            
+            for timestep_info in timesteps_to_check:
+                if target_timestep:
+                    gfs_init_time = target_timestep
+                    # Find run_id for this timestep
+                    run_query = """
+                    SELECT id FROM weather_forecast_runs 
+                    WHERE gfs_init_time_utc = :gfs_time
+                    ORDER BY id DESC LIMIT 1
+                    """
+                    run_result = await self.db_manager.fetch_one(run_query, {"gfs_time": gfs_init_time})
+                    if not run_result:
+                        result["errors"].append(f"No run found for timestep {gfs_init_time}")
+                        continue
+                    run_id = run_result['id']
+                else:
+                    gfs_init_time, run_id = timestep_info
+                
+                # Check if score row exists for this timestep
+                existing_scores = await self._check_existing_score_rows(gfs_init_time, run_id)
+                
+                # Determine what scores should exist based on run status
+                required_scores = await self._determine_required_score_rows(run_id)
+                
+                # Find missing scores
+                missing_scores = required_scores - existing_scores
+                
+                if missing_scores:
+                    result["missing_score_rows_found"] += len(missing_scores)
+                    result["details"].append(f"Timestep {gfs_init_time} (Run {run_id}): Missing {missing_scores}")
+                    
+                    # Build missing score rows
+                    for score_type in missing_scores:
+                        try:
+                            if await self._build_missing_score_row(gfs_init_time, run_id, score_type):
+                                result["score_rows_created"] += 1
+                                logger.info(f"[MissingScoresChecker] Built missing {score_type} score row for run {run_id}")
+                            else:
+                                result["errors"].append(f"Failed to build {score_type} score for run {run_id}")
+                        except Exception as e:
+                            error_msg = f"Error building {score_type} score for run {run_id}: {e}"
+                            result["errors"].append(error_msg)
+                            logger.error(f"[MissingScoresChecker] {error_msg}", exc_info=True)
+            
+            logger.info(f"[MissingScoresChecker] Completed check: {result['score_rows_created']}/{result['missing_score_rows_found']} missing scores built from {result['checked_timesteps']} timesteps")
+            
+        except Exception as e:
+            error_msg = f"Error in missing scores checker: {e}"
+            result["errors"].append(error_msg)
+            logger.error(f"[MissingScoresChecker] {error_msg}", exc_info=True)
+        
+        return result
 
-            await self.db_manager.execute(upsert_score_table_query, db_params_score_table)
-            logger.info(f"[BuildScoreRow] Upserted score_table entry for {task_name_prefix}, task_id (run_id): {run_id}")
+    async def _check_existing_score_rows(self, gfs_init_time: datetime, run_id: int) -> Set[str]:
+        """Check what score rows already exist for a given timestep/run."""
+        existing_query = """
+        SELECT task_id FROM score_table 
+        WHERE task_name = 'weather' 
+        AND (task_id LIKE :run_pattern OR task_id IN ('initial_weather_scores', 'final_weather_scores'))
+        """
+        existing_records = await self.db_manager.fetch_all(existing_query, {
+            "run_pattern": f"%_{run_id}"
+        })
+        
+        existing_scores = set()
+        for record in existing_records:
+            task_id = record['task_id']
+            if task_id == 'initial_weather_scores':
+                existing_scores.add('initial_combined')
+            elif task_id == 'final_weather_scores':
+                existing_scores.add('final_combined')
+            elif task_id.startswith('initial_weather_scores_'):
+                existing_scores.add('initial_run_specific')
+            elif task_id.startswith('final_weather_scores_'):
+                existing_scores.add('final_run_specific')
+        
+        return existing_scores
 
-        except Exception as e_db_score_table:
-            logger.error(f"[BuildScoreRow] DB error storing {task_name_prefix} score row for run {run_id}: {e_db_score_table}", exc_info=True)
+    async def _determine_required_score_rows(self, run_id: int) -> Set[str]:
+        """Determine what score rows should exist based on run status and data availability."""
+        run_query = """
+        SELECT status, gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id
+        """
+        run_info = await self.db_manager.fetch_one(run_query, {"run_id": run_id})
+        
+        if not run_info:
+            return set()
+        
+        status = run_info['status']
+        required_scores = set()
+        
+        # Check if day1 scores exist
+        day1_scores_query = """
+        SELECT COUNT(*) as count FROM weather_miner_scores 
+        WHERE run_id = :run_id AND score_type = 'day1_qc_score'
+        """
+        day1_result = await self.db_manager.fetch_one(day1_scores_query, {"run_id": run_id})
+        has_day1_scores = day1_result and day1_result['count'] > 0
+        
+        # Check if ERA5 scores exist
+        era5_scores_query = """
+        SELECT COUNT(*) as count FROM weather_miner_scores 
+        WHERE run_id = :run_id AND score_type = 'era5_final_composite_score'
+        """
+        era5_result = await self.db_manager.fetch_one(era5_scores_query, {"run_id": run_id})
+        has_era5_scores = era5_result and era5_result['count'] > 0
+        
+        # Determine required scores based on status and available data
+        if status in ['day1_scoring_complete', 'scored', 'final_scoring_complete'] and has_day1_scores:
+            if has_era5_scores:
+                required_scores.add('final_run_specific')  # Should have final scores
+            else:
+                required_scores.add('initial_run_specific')  # Should have initial scores
+        
+        return required_scores
+
+    async def _build_missing_score_row(self, gfs_init_time: datetime, run_id: int, score_type: str) -> bool:
+        """Build a specific missing score row."""
+        try:
+            logger.info(f"[MissingScoresChecker] Building {score_type} score row for run {run_id}")
+            
+            if score_type in ['initial_run_specific', 'final_run_specific']:
+                # Use the existing update_combined_weather_scores method with run_id trigger
+                force_phase = "initial" if score_type == 'initial_run_specific' else "final"
+                
+                # Call update_combined_weather_scores with the specific run_id to rebuild the score
+                await self.update_combined_weather_scores(run_id_trigger=run_id, force_phase=force_phase)
+                
+                return True
+            else:
+                logger.warning(f"[MissingScoresChecker] Unknown score type: {score_type}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"[MissingScoresChecker] Error building {score_type} score for run {run_id}: {e}", exc_info=True)
+            return False
 
     async def validator_prepare_subtasks(self):
         """
@@ -1608,6 +1789,10 @@ sources:
                         stale_run_processed = await self._check_and_recover_incomplete_runs_sequential(processed_runs_this_session, max_attempts_per_run)
                         # Enhanced recovery with state consistency checks (includes original recovery)
                         await self.enhanced_recovery_check()
+                        # Check for missing weather score rows
+                        missing_scores_result = await self.check_and_build_missing_weather_scores()
+                        if missing_scores_result["score_rows_created"] > 0:
+                            logger.info(f"Recovery: Built {missing_scores_result['score_rows_created']} missing weather score rows")
                         last_recovery_time = current_time
                     except Exception as recovery_err:
                         logger.warning(f"Error during periodic recovery: {recovery_err}")
@@ -2245,7 +2430,7 @@ sources:
             else:
                  logger.info(f"[Run {run_id}] Status changed from 'verifying_miner_forecasts' to '{current_run_status_after_verify}' during verification logic. No further status update needed here.")
 
-    async def update_combined_weather_scores(self, run_id_trigger: Optional[int] = None):
+    async def update_combined_weather_scores(self, run_id_trigger: Optional[int] = None, force_phase: Optional[str] = None):
         logger.info(f"[CombinedWeatherScore] Updating combined weather scores (triggered by run {run_id_trigger if run_id_trigger else 'periodic/manual call'}).")
 
         latest_day1_scores_array = np.full(256, 0.0)
