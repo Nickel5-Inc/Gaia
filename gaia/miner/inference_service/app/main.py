@@ -1031,18 +1031,8 @@ async def initialize_app_for_runpod():
                         },
                         tcp_keepalive=True,
                         region_name='auto',
-                        multipart_threshold=1024*1024*64,  # 64MB threshold for multipart
-                        multipart_chunksize=1024*1024*8,   # 8MB chunk size
                         connect_timeout=10,
-                        read_timeout=60,
-                        # Use S3 Transfer configuration for better multipart handling
-                        s3={
-                            'multipart_threshold': 1024*1024*64,
-                            'multipart_chunksize': 1024*1024*8,
-                            'max_concurrency': 10,
-                            'use_threads': True,
-                            'max_bandwidth': None
-                        }
+                        read_timeout=60
                     )
                     
                     S3_CLIENT = boto3.client(
