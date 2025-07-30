@@ -28,6 +28,12 @@ from aurora import Batch
 from ..utils.data_prep import create_aurora_batch_from_gfs
 from ..utils.variable_maps import AURORA_TO_GFS_VAR_MAP
 
+# Import WeatherTask for type annotations
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..weather_task import WeatherTask
+    from ....miner.inference_service.app.inference_runner import BatchType
+
 from .weather_logic import (
     _request_fresh_token,
     _update_run_status,

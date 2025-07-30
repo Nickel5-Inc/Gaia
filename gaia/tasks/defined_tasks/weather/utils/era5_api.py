@@ -175,14 +175,16 @@ async def fetch_era5_data(
             import xarray as xr
             
             # Force re-registration of netcdf4 backend in this thread
-            if hasattr(xr.backends, 'NetCDF4BackendEntrypoint'):
-                try:
-                    # Manually register the netcdf4 backend in this thread context
-                    backend = xr.backends.NetCDF4BackendEntrypoint()
-                    xr.backends.backends.BACKENDS['netcdf4'] = backend
-                    logger.debug("Successfully re-registered netcdf4 backend in thread context")
-                except Exception as backend_reg_err:
-                    logger.warning(f"Could not manually register netcdf4 backend: {backend_reg_err}")
+            try:
+                # In modern xarray versions, backends are automatically registered
+                # Just verify that netcdf4 is available
+                available_engines = list(xr.backends.list_engines())
+                if 'netcdf4' in available_engines:
+                    logger.debug("netcdf4 backend is available in thread context")
+                else:
+                    logger.warning("netcdf4 backend not found in available engines")
+            except Exception as backend_check_err:
+                logger.warning(f"Could not check netcdf4 backend availability: {backend_check_err}")
             
             logger.debug(f"Thread context - Available engines: {list(xr.backends.list_engines())}")
         except ImportError as netcdf_err:
