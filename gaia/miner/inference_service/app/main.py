@@ -1026,8 +1026,7 @@ async def initialize_app_for_runpod():
                         max_pool_connections=200,  # Increased from 50 to prevent connection pool exhaustion
                         retries={
                             'max_attempts': 5,
-                            'mode': 'adaptive',
-                            'timeout': 30
+                            'mode': 'adaptive'
                         },
                         tcp_keepalive=True,
                         region_name='auto',
