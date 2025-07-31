@@ -1552,12 +1552,38 @@ async def finalize_scores_worker(self):
                         era5_ds_for_run = await fetch_era5_data(target_times=target_datetimes_for_run, cache_dir=era5_cache)
 
                     if era5_ds_for_run is None:
-                        logger.error(f"[FinalizeWorker] Run {run_id}: Failed to fetch ERA5 data. Aborting final scoring for this run.")
-                        await _update_run_status(self, run_id, "final_scoring_failed", error_message="ERA5 fetch failed")
-                        # Mark scoring job as failed
-                        await self._complete_scoring_job(run_id, 'era5_final', success=False, error_message="ERA5 fetch failed")
-                        processed_run_ids.add(run_id)
-                        continue
+                        logger.warning(f"[FinalizeWorker] Run {run_id}: Failed to fetch ERA5 data for requested times. Checking for partial data availability...")
+                        
+                        # Try to get whatever ERA5 data IS available
+                        available_times = []
+                        for target_dt in target_datetimes_for_run:
+                            try:
+                                # Test individual date availability
+                                single_time_data = await fetch_era5_data_progressive(target_times=[target_dt], cache_dir=era5_cache)
+                                if single_time_data is not None:
+                                    available_times.append(target_dt)
+                                    logger.debug(f"[FinalizeWorker] Run {run_id}: ERA5 data available for {target_dt}")
+                                else:
+                                    logger.debug(f"[FinalizeWorker] Run {run_id}: ERA5 data NOT available for {target_dt}")
+                            except Exception as e:
+                                logger.debug(f"[FinalizeWorker] Run {run_id}: ERA5 check failed for {target_dt}: {e}")
+                        
+                        if available_times:
+                            logger.info(f"[FinalizeWorker] Run {run_id}: Found ERA5 data for {len(available_times)}/{len(target_datetimes_for_run)} requested times")
+                            # Fetch data for available times only
+                            era5_ds_for_run = await fetch_era5_data_progressive(target_times=available_times, cache_dir=era5_cache)
+                            
+                            # Update target times to only include what we can actually score
+                            available_lead_hours = [(dt - gfs_init_time).total_seconds() / 3600 for dt in available_times]
+                            target_datetimes_for_run = available_times
+                            ready_lead_hours_for_run = [int(h) for h in available_lead_hours]
+                            
+                            logger.info(f"[FinalizeWorker] Run {run_id}: Proceeding with partial scoring for lead hours: {ready_lead_hours_for_run}")
+                        else:
+                            logger.error(f"[FinalizeWorker] Run {run_id}: No ERA5 data available for any requested times. Skipping for now.")
+                            await _update_run_status(self, run_id, "initial_scoring_completed", error_message="ERA5 data not yet available - will retry")
+                            processed_run_ids.add(run_id)
+                            continue
 
                     logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 data fetched/loaded.")
                     

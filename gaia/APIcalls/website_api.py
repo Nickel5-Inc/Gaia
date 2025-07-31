@@ -112,68 +112,9 @@ class GaiaCommunicator:
     def _validate_predictions(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Validate and clean prediction data."""
         try:
-            # Handle geomagnetic predictions
-            if data.get("geomagneticPredictions"):
-                valid_predictions = []
-                for prediction in data["geomagneticPredictions"]:
-                    try:
-                        numeric_fields = [
-                            "geomagneticPredictedValue",
-                            "geomagneticGroundTruthValue",
-                            "geomagneticScore"
-                        ]
-                        
-                        is_valid = True
-                        for field in numeric_fields:
-                            value = prediction.get(field)
-                            try:
-                                float_value = float(value)
-                                if math.isnan(float_value) or math.isinf(float_value):
-                                    is_valid = False
-                                    break
-                                prediction[field] = float_value
-                            except (ValueError, TypeError):
-                                is_valid = False
-                                break
-                        
-                        if is_valid:
-                            valid_predictions.append(prediction)
-                        
-                    except Exception as e:
-                        logger.error(f"Error validating prediction: {e}")
-                        continue
-                
-                data["geomagneticPredictions"] = valid_predictions
+            # Geomagnetic predictions processing removed (task disabled)
 
-            # Handle soil moisture predictions
-            if data.get("soilMoisturePredictions"):
-                for prediction in data["soilMoisturePredictions"]:
-                    # Validate and format bounds
-                    bounds = prediction.get("sentinelRegionBounds")
-                    if isinstance(bounds, list) and len(bounds) == 4:
-                        prediction["sentinelRegionBounds"] = f"[{','.join(map(str, bounds))}]"
-                    elif not isinstance(bounds, str) or not bounds:
-                        prediction["sentinelRegionBounds"] = "[]"
-                    
-                    # Validate CRS
-                    crs = prediction.get("sentinelRegionCrs")
-                    if not isinstance(crs, int):
-                        prediction["sentinelRegionCrs"] = 4326
-
-                    # Validate array fields
-                    array_fields = [
-                        "soilSurfacePredictedValues",
-                        "soilRootzonePredictedValues",
-                        "soilSurfaceGroundTruthValues",
-                        "soilRootzoneGroundTruthValues"
-                    ]
-                    
-                    for field in array_fields:
-                        value = prediction.get(field)
-                        if isinstance(value, (list, np.ndarray)):
-                            prediction[field] = str(value).replace('array(', '').replace(')', '')
-                        elif not isinstance(value, str):
-                            prediction[field] = "[]"
+            # Soil moisture predictions processing removed (task disabled)
 
             return data
 
@@ -183,7 +124,7 @@ class GaiaCommunicator:
 
     def _validate_payload(self, data: Dict[str, Any]) -> bool:
         """Validate the payload structure."""
-        required_fields = ["minerHotKey", "minerColdKey", "geomagneticPredictions", "soilMoisturePredictions"]
+        required_fields = ["minerHotKey", "minerColdKey"]  # Geomagnetic and soil moisture predictions removed (tasks disabled)
         
         # Check required fields
         for field in required_fields:
@@ -192,12 +133,8 @@ class GaiaCommunicator:
                 return False
 
         # Validate prediction arrays
-        if not isinstance(data.get("geomagneticPredictions", []), list):
-            logger.error("Invalid data type for geomagneticPredictions: Must be a list")
-            return False
-        if not isinstance(data.get("soilMoisturePredictions", []), list):
-            logger.error("Invalid data type for soilMoisturePredictions: Must be a list")
-            return False
+            # Geomagnetic predictions validation removed (task disabled)
+            # Soil moisture predictions validation removed (task disabled)
 
         return True
 

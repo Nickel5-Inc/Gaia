@@ -528,48 +528,8 @@ class GaiaValidator:
                     'threads': 0,
                     'last_update': None
                 }
-            },
-            'geomagnetic': {
-                'last_success': time.time(),
-                'errors': 0,
-                'status': 'idle',
-                'current_operation': None,
-                'operation_start': None,
-                'timeouts': {
-                    'default': 1800,  # 30 minutes
-                    'data_fetch': 300,  # 5 minutes
-                    'miner_query': 600,  # 10 minutes
-                },
-                'resources': {
-                    'memory_start': 0,
-                    'memory_peak': 0,
-                    'cpu_percent': 0,
-                    'open_files': 0,
-                    'threads': 0,
-                    'last_update': None
-                }
-            },
-            'soil': {
-                'last_success': time.time(),
-                'errors': 0,
-                'status': 'idle',
-                'current_operation': None,
-                'operation_start': None,
-                'timeouts': {
-                    'default': 3600,  # 1 hour
-                    'data_download': 1800,  # 30 minutes
-                    'miner_query': 1800,  # 30 minutes
-                    'region_processing': 900,  # 15 minutes
-                },
-                'resources': {
-                    'memory_start': 0,
-                    'memory_peak': 0,
-                    'cpu_percent': 0,
-                    'open_files': 0,
-                    'threads': 0,
-                    'last_update': None
-                }
             }
+            # Geomagnetic and soil tasks disabled - monitoring removed
         }
         
         self.watchdog_timeout = 3600  # 1 hour default timeout
@@ -639,18 +599,18 @@ class GaiaValidator:
 
         self.validator_uid = None
 
-        # --- Stepped Task Weight ---
+        # --- Weather-Only Task Weight (geomagnetic and soil tasks disabled) ---
         self.task_weight_schedule = [
             (datetime(2025, 5, 28, 0, 0, 0, tzinfo=timezone.utc), 
-             {"weather": 0.50, "geomagnetic": 0.25, "soil": 0.25}),
+             {"weather": 1.0}),
             
-            # Transition Point 1: June 1st, 2025, 00:00:00 UTC
+            # Consistent weather-only approach since other tasks are disabled
             (datetime(2025, 6, 1, 0, 0, 0, tzinfo=timezone.utc), 
-             {"weather": 0.65, "geomagnetic": 0.175, "soil": 0.175}), 
+             {"weather": 1.0}), 
             
-            # Target Weights: June 5th, 2025, 00:00:00 UTC
+            # Weather-only continues
             (datetime(2025, 6, 5, 0, 0, 0, tzinfo=timezone.utc), 
-             {"weather": 0.80, "geomagnetic": 0.10, "soil": 0.10})
+             {"weather": 1.0})
         ]
 
         self.tracemalloc_snapshot1: Optional[tracemalloc.Snapshot] = None # Initialize for the snapshot taker task
@@ -716,7 +676,7 @@ class GaiaValidator:
                 logger.error(f"Failed to create cleanup completion file: {e_cleanup_file}")
             
             logger.info("Updating task statuses to 'stopping'...")
-            for task_name in ['soil', 'geomagnetic', 'weather', 'scoring', 'deregistration', 'status_logger', 'db_sync_backup', 'db_sync_restore', 'miner_score_sender', 'earthdata_token', 'db_monitor', 'plot_db_metrics']:
+            for task_name in ['weather', 'scoring', 'deregistration', 'status_logger', 'db_sync_backup', 'db_sync_restore', 'miner_score_sender', 'earthdata_token', 'db_monitor', 'plot_db_metrics']:
                 try:
                     # Check if task exists in health tracking before updating
                     if task_name in self.task_health or hasattr(self, f"{task_name}_task") or (task_name.startswith("db_sync") and self.auto_sync_manager):
@@ -2527,10 +2487,9 @@ class GaiaValidator:
             await self.cleanup_resources()
             
             # Task-specific recovery
-            if task_name == "soil":
-                await self.soil_task.cleanup_resources()
-            elif task_name == "geomagnetic":
-                await self.geomagnetic_task.cleanup_resources()
+            # Soil and geomagnetic tasks disabled - no cleanup needed
+            if task_name == "soil" or task_name == "geomagnetic":
+                logger.info(f"Task {task_name} is disabled - skipping cleanup")
             elif task_name == "scoring":
                 self.substrate = get_fresh_substrate_connection(
                     subtensor_network=self.subtensor_network,
@@ -2715,20 +2674,8 @@ class GaiaValidator:
 
                         # 4.2 Delete historical predictions associated with this specific stale hotkey
                         logger.info(f"  Deleting history entries for ({uid}, {stale_hk})")
-                        try:
-                            await self.database_manager.execute(
-                                "DELETE FROM geomagnetic_history WHERE miner_uid = :uid_str AND miner_hotkey = :stale_hk",
-                                {"uid_str": str(uid), "stale_hk": stale_hk}
-                            )
-                        except Exception as e_del_geo:
-                             logger.warning(f"  Could not delete from geomagnetic_history for miner_uid {uid}, Hotkey {stale_hk}: {e_del_geo}")
-                        try:
-                            await self.database_manager.execute(
-                                "DELETE FROM soil_moisture_history WHERE miner_uid = :uid_str AND miner_hotkey = :stale_hk",
-                                {"uid_str": str(uid), "stale_hk": stale_hk}
-                            )
-                        except Exception as e_del_soil:
-                            logger.warning(f"  Could not delete from soil_moisture_history for miner_uid {uid}, Hotkey {stale_hk}: {e_del_soil}")
+                        # Geomagnetic and soil moisture history deletion skipped (tasks disabled)
+                        logger.debug(f"  History cleanup for disabled tasks skipped for miner_uid {uid}, hotkey {stale_hk}")
                         
                         # 4.3 Zero out scores in score_table *only for the determined time window*
                         if tasks_for_score_cleanup and timestamps_found and min_ts and max_ts:
@@ -3424,7 +3371,7 @@ class GaiaValidator:
                             logger.info(f"Processing hotkey change for UID {uid_to_process}: Old={original_hotkey}, New={new_chain_node_data.hotkey}")
                             try:
                                 # 1. Delete from prediction tables by UID
-                                prediction_tables_by_uid = ["geomagnetic_predictions", "soil_moisture_predictions"]
+                                prediction_tables_by_uid = []  # Geomagnetic and soil moisture predictions disabled
                                 for table_name in prediction_tables_by_uid:
                                     try:
                                         table_exists_res = await self.database_manager.fetch_one(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{table_name}')")
@@ -3437,7 +3384,7 @@ class GaiaValidator:
                                         logger.warning(f"  Could not clear {table_name} for UID {uid_to_process}: {e_pred_del}")
 
                                 # 2. Delete from history tables by OLD hotkey
-                                history_tables_by_hotkey = ["geomagnetic_history", "soil_moisture_history"]
+                                history_tables_by_hotkey = []  # Geomagnetic and soil moisture history disabled
                                 for table_name in history_tables_by_hotkey:
                                     try:
                                         table_exists_res = await self.database_manager.fetch_one(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{table_name}')")
@@ -3744,8 +3691,7 @@ class GaiaValidator:
                 if weights_final[idx] > 0.1:
                     node_obj = validator_nodes_by_uid_list[idx] if idx < len(validator_nodes_by_uid_list) else None
                     hk_chain = node_obj.get('hotkey', 'N/A')[:8] if node_obj else 'N/A'
-                    logger.debug(f"UID {idx} ({hk_chain}): {pathway_chosen} pathway, "
-                               f"excellence={excellence_weight:.4f}, diversity={diversity_weight:.4f}, "
+                    logger.debug(f"UID {idx} ({hk_chain}): weather-only pathway, "
                                f"final={weights_final[idx]:.4f}")
             
             # Log pathway usage statistics (weather-only)
@@ -3815,7 +3761,7 @@ class GaiaValidator:
             
             # Clean up all intermediate arrays to prevent memory leaks
             try:
-                del weather_scores, geomagnetic_scores, soil_scores
+                del weather_scores  # Only weather scores exist now
                 del task_percentiles, task_valid_scores
                 del excellence_count, diversity_count
                 del weights_final, transformed_w
@@ -4015,8 +3961,7 @@ class GaiaValidator:
                 try:
                     # Clear all large data structures that exist in this scope
                     del weather_results
-                    del geomagnetic_results  
-                    del soil_results
+                                # Geomagnetic and soil results cleanup skipped (tasks disabled)
                     del validator_nodes_by_uid_list
                     
                     # Force immediate garbage collection

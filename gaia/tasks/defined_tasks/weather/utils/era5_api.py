@@ -11,6 +11,13 @@ import traceback
 import numpy as np
 import pandas as pd
 
+# Import netCDF4 at module level to ensure availability in threaded contexts
+try:
+    import netCDF4
+    NETCDF4_AVAILABLE = True
+except ImportError:
+    NETCDF4_AVAILABLE = False
+
 from fiber.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -98,7 +105,7 @@ async def fetch_era5_data(
                         # 2. Try explicit netcdf4 engine
                         try:
                             logger.debug("Attempting to load cache with netcdf4 engine...")
-                            ds_combined = xr.open_dataset(potential_cache_file, engine='netcdf4')
+                            ds_combined = xr.open_dataset(potential_cache_file)
                             logger.info("Successfully loaded cached data with netcdf4 engine")
                             load_successful = True
                         except Exception as netcdf4_load_err:
@@ -118,24 +125,30 @@ async def fetch_era5_data(
                         continue
                 
                 # Validate cache content
-                target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
-                if all(t_np_ns in ds_combined.time.values for t_np_ns in target_times_np_ns):
-                    logger.info("Cache hit is valid.")
-                    
-                    # CRITICAL FIX: Force data loading for cached datasets too
-                    # This prevents lazy-loading issues when cache files might be moved/deleted
-                    try:
-                        logger.debug("Loading cached data into memory to prevent file access issues...")
-                        for var_name in ds_combined.data_vars:
-                            _ = ds_combined[var_name].values  # Force loading
-                        logger.debug("Successfully loaded cached data into memory")
-                    except Exception as load_err:
-                        logger.warning(f"Error during cached data loading: {load_err}")
-                        # Continue - the data might still be accessible
-                    
-                    return ds_combined
+                if 'time' in ds_combined.coords:
+                    target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
+                    if all(t_np_ns in ds_combined.time.values for t_np_ns in target_times_np_ns):
+                        logger.info("Cache hit is valid.")
+                        
+                        # CRITICAL FIX: Force data loading for cached datasets too
+                        # This prevents lazy-loading issues when cache files might be moved/deleted
+                        try:
+                            logger.debug("Loading cached data into memory to prevent file access issues...")
+                            for var_name in ds_combined.data_vars:
+                                _ = ds_combined[var_name].values  # Force loading
+                            logger.debug("Successfully loaded cached data into memory")
+                        except Exception as load_err:
+                            logger.warning(f"Error during cached data loading: {load_err}")
+                            # Continue - the data might still be accessible
+                        
+                        return ds_combined
+                    else:
+                        logger.warning("Cached file exists but missing requested times. Re-fetching.")
+                        if hasattr(ds_combined, 'close'):
+                            ds_combined.close()
+                        potential_cache_file.unlink()
                 else:
-                    logger.warning("Cached file exists but missing requested times. Re-fetching.")
+                    logger.warning("Cached file exists but missing 'time' coordinate. Re-fetching.")
                     if hasattr(ds_combined, 'close'):
                         ds_combined.close()
                     potential_cache_file.unlink()
@@ -244,7 +257,7 @@ async def fetch_era5_data(
                 # Try explicit netcdf4 engine
                 try:
                     logger.debug("Loading single level file with netcdf4 engine...")
-                    ds_sl = xr.open_dataset(temp_sl_file, engine='netcdf4')
+                    ds_sl = xr.open_dataset(temp_sl_file)
                     logger.debug("✅ Successfully loaded single level file with netcdf4 engine")
                 except Exception as netcdf4_err:
                     logger.debug(f"netcdf4 load failed for single level: {netcdf4_err}")
@@ -272,7 +285,7 @@ async def fetch_era5_data(
                 # Try explicit netcdf4 engine
                 try:
                     logger.debug("Loading pressure level file with netcdf4 engine...")
-                    ds_pl = xr.open_dataset(temp_pl_file, engine='netcdf4')
+                    ds_pl = xr.open_dataset(temp_pl_file)
                     logger.debug("✅ Successfully loaded pressure level file with netcdf4 engine")
                 except Exception as netcdf4_err:
                     logger.debug(f"netcdf4 load failed for pressure level: {netcdf4_err}")
@@ -321,8 +334,18 @@ async def fetch_era5_data(
             if 'longitude' in ds_combined.coords: rename_coords['longitude'] = 'lon'
             if 'valid_time' in ds_combined.coords: rename_coords['valid_time'] = 'time'
             if rename_coords:
+                logger.debug(f"About to rename coordinates: {rename_coords}")
+                logger.debug(f"Before rename - coords: {list(ds_combined.coords.keys())}")
                 ds_combined = ds_combined.rename(rename_coords)
                 logger.info(f"Renamed coordinates: {list(rename_coords.keys())} -> {list(rename_coords.values())}")
+                logger.debug(f"After rename - coords: {list(ds_combined.coords.keys())}")
+                
+                # Verify time coordinate still exists after rename
+                if 'time' not in ds_combined.coords:
+                    logger.error(f"CRITICAL: Lost time coordinate during rename!")
+                    logger.error(f"Rename mapping was: {rename_coords}")
+                    logger.error(f"Current coordinates: {list(ds_combined.coords.keys())}")
+                    raise ValueError("Lost time coordinate during coordinate renaming")
 
             if 'z' in ds_combined:
                 logger.info("Ensuring Geopotential (z) units and attributes...")
@@ -361,61 +384,27 @@ async def fetch_era5_data(
             
             logger.info(f"Saving processed data to cache: {cache_filename}")
             
-            # IMPROVED SAVE APPROACH: Use auto-detection first, then available engines
+            # Simple thread-safe netcdf save (default engine works in all contexts)
             save_successful = False
             
-            # FIXED: Robust save approach with correct xarray engine usage
-            save_successful = False
-            
-            # 1. Try default netcdf4 (most common and reliable)
             try:
-                logger.debug("Attempting to save with default netcdf4 engine...")
-                ds_combined.to_netcdf(cache_filename)  # Default engine
-                logger.info(f"✅ Successfully saved processed data with default engine: {cache_filename}")
+                # Strategy 1: Force engine auto-detection
+                logger.debug("Saving with auto-detected engine...")
+                ds_combined.to_netcdf(cache_filename, engine=None)
+                logger.info(f"✅ Successfully saved with auto-detected engine: {cache_filename}")
                 save_successful = True
-            except Exception as default_save_err:
-                logger.debug(f"Default save failed: {default_save_err}")
+            except Exception as auto_err:
+                logger.debug(f"Auto-detected engine failed: {auto_err}")
                 
-                # 2. Try explicit netcdf4 engine
                 try:
-                    logger.debug("Attempting to save with explicit netcdf4 engine...")
-                    ds_combined.to_netcdf(cache_filename, engine='netcdf4')
-                    logger.info(f"✅ Successfully saved with netcdf4 engine: {cache_filename}")
+                    # Strategy 2: Compute first and save
+                    logger.debug("Computing dataset and saving...")
+                    ds_computed = ds_combined.compute()
+                    ds_computed.to_netcdf(cache_filename)
+                    logger.info(f"✅ Successfully saved computed dataset: {cache_filename}")
                     save_successful = True
-                except Exception as netcdf4_save_err:
-                    logger.debug(f"netcdf4 save failed: {netcdf4_save_err}")
-                    
-                    # 3. Try with computed dataset (resolve lazy operations)
-                    try:
-                        logger.debug("Computing dataset and saving with default engine...")
-                        ds_computed = ds_combined.compute()
-                        ds_computed.to_netcdf(cache_filename)
-                        logger.info(f"✅ Successfully saved computed dataset: {cache_filename}")
-                        save_successful = True
-                    except Exception as computed_save_err:
-                        logger.debug(f"Computed dataset save failed: {computed_save_err}")
-                        
-                        # 4. Try NETCDF4 format explicitly
-                        try:
-                            logger.debug("Attempting to save with NETCDF4 format...")
-                            if 'ds_computed' not in locals():
-                                ds_computed = ds_combined.compute()
-                            ds_computed.to_netcdf(cache_filename, format='NETCDF4')
-                            logger.info(f"✅ Successfully saved with NETCDF4 format: {cache_filename}")
-                            save_successful = True
-                        except Exception as netcdf4_format_save_err:
-                            logger.debug(f"NETCDF4 format save failed: {netcdf4_format_save_err}")
-                            
-                            # 5. Try NETCDF3_64BIT format (most compatible)
-                            try:
-                                logger.debug("Attempting to save with NETCDF3_64BIT format...")
-                                if 'ds_computed' not in locals():
-                                    ds_computed = ds_combined.compute()
-                                ds_computed.to_netcdf(cache_filename, format='NETCDF3_64BIT')
-                                logger.info(f"✅ Successfully saved with NETCDF3_64BIT format: {cache_filename}")
-                                save_successful = True
-                            except Exception as netcdf3_save_err:
-                                logger.debug(f"NETCDF3_64BIT save failed: {netcdf3_save_err}")
+                except Exception as computed_save_err:
+                    logger.debug(f"Computed dataset save failed: {computed_save_err}")
             
             if not save_successful:
                 logger.error("Failed to save with all netCDF engines, using pickle fallback...")
@@ -536,21 +525,32 @@ async def fetch_era5_data_progressive(
     
     logger.info(f"Progressive ERA5 fetch: Processing {len(daily_groups)} unique dates")
     
-    # Fetch individual daily datasets (cached per day)
+    # Fetch individual daily datasets (cached per day) with partial failure tolerance
     daily_datasets = []
+    failed_dates = []
+    successful_times = []
+    
     for date_key, times_for_date in daily_groups.items():
         logger.debug(f"Processing date {date_key} with {len(times_for_date)} time points")
         
         daily_ds = await _fetch_single_day_era5(date_key, times_for_date, cache_dir)
         if daily_ds is not None:
             daily_datasets.append(daily_ds)
+            successful_times.extend(times_for_date)
+            logger.debug(f"✅ Successfully fetched ERA5 data for date {date_key}")
         else:
-            logger.error(f"Failed to fetch ERA5 data for date {date_key}")
-            return None
+            failed_dates.append(date_key)
+            logger.warning(f"❌ Failed to fetch ERA5 data for date {date_key} - data may not be available yet")
     
+    if failed_dates:
+        logger.warning(f"ERA5 fetch partial failure: {len(failed_dates)} dates failed ({failed_dates}), {len(daily_datasets)} succeeded")
+    
+    # If we have some successful datasets, continue with partial data
     if not daily_datasets:
-        logger.error("No daily datasets successfully fetched")
+        logger.error("No ERA5 data could be fetched for any requested dates")
         return None
+    
+    # Combine daily datasets efficiently
     
     # Combine daily datasets efficiently
     try:
@@ -592,18 +592,23 @@ async def _fetch_single_day_era5(
     if cache_file.exists():
         try:
             logger.debug(f"Loading cached ERA5 data for {date_str}: {cache_file}")
-            ds = xr.open_dataset(cache_file, engine='netcdf4')
+            ds = xr.open_dataset(cache_file)
             
-            # Validate cache contains requested times
-            target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in times_for_date]
-            if all(t_np_ns in ds.time.values for t_np_ns in target_times_np_ns):
-                # Force data loading to prevent lazy-loading issues
-                for var_name in ds.data_vars:
-                    _ = ds[var_name].values
-                logger.debug(f"Cache hit for {date_str}")
-                return ds
+            # Validate cache contains time coordinate and requested times
+            if 'time' in ds.coords:
+                target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in times_for_date]
+                if all(t_np_ns in ds.time.values for t_np_ns in target_times_np_ns):
+                    # Force data loading to prevent lazy-loading issues
+                    for var_name in ds.data_vars:
+                        _ = ds[var_name].values
+                    logger.debug(f"Cache hit for {date_str}")
+                    return ds
+                else:
+                    logger.warning(f"Cache miss: {date_str} cache doesn't contain all requested times")
+                    ds.close()
+                    cache_file.unlink()
             else:
-                logger.warning(f"Cache miss: {date_str} cache doesn't contain all requested times")
+                logger.warning(f"Cache invalid: {date_str} cache missing 'time' coordinate")
                 ds.close()
                 cache_file.unlink()
         except Exception as e:
@@ -654,9 +659,19 @@ async def _fetch_single_day_era5(
             # Process and combine the downloaded data
             logger.debug(f"Processing downloaded data for {date_str}")
             
-            # Load with robust error handling
-            ds_sl = xr.open_dataset(temp_sl_file, engine='netcdf4')
-            ds_pl = xr.open_dataset(temp_pl_file, engine='netcdf4')
+            # Load with robust error handling and coordinate validation
+            ds_sl = xr.open_dataset(temp_sl_file)
+            ds_pl = xr.open_dataset(temp_pl_file)
+            
+            # Debug coordinate information
+            logger.debug(f"Single level dataset coordinates: {list(ds_sl.coords.keys())}")
+            logger.debug(f"Pressure level dataset coordinates: {list(ds_pl.coords.keys())}")
+            
+            # Check for time coordinate in source files
+            if 'time' not in ds_sl.coords and 'valid_time' not in ds_sl.coords:
+                logger.error(f"Single level dataset missing time coordinate! Available coords: {list(ds_sl.coords.keys())}")
+            if 'time' not in ds_pl.coords and 'valid_time' not in ds_pl.coords:
+                logger.error(f"Pressure level dataset missing time coordinate! Available coords: {list(ds_pl.coords.keys())}")
             
             # Rename variables to match expected names
             var_mapping = {**ERA5_SINGLE_LEVEL_VARS, **ERA5_PRESSURE_LEVEL_VARS}
@@ -666,24 +681,113 @@ async def _fetch_single_day_era5(
                     if old_name in ds.data_vars:
                         ds = ds.rename({old_name: new_name})
             
-            # Combine datasets
+            # Combine datasets with coordinate validation
+            logger.debug(f"Before merge - ds_sl coords: {list(ds_sl.coords.keys())}")
+            logger.debug(f"Before merge - ds_pl coords: {list(ds_pl.coords.keys())}")
+            
             ds_combined = xr.merge([ds_sl, ds_pl])
             
-            # Coordinate adjustments
+            logger.debug(f"After merge - combined coords: {list(ds_combined.coords.keys())}")
+            logger.debug(f"After merge - combined dimensions: {dict(ds_combined.dims)}")
+            
+            # Verify time coordinate exists after merge
+            if 'time' not in ds_combined.coords and 'valid_time' not in ds_combined.coords:
+                logger.error(f"CRITICAL: Combined dataset missing time coordinate after merge!")
+                logger.error(f"Available coordinates: {list(ds_combined.coords.keys())}")
+                logger.error(f"Available dimensions: {dict(ds_combined.dims)}")
+                raise ValueError("Missing time coordinate in merged dataset")
+            
+            # Coordinate adjustments with validation
+            logger.debug(f"Before coordinate adjustments - coords: {list(ds_combined.coords.keys())}")
+            
+            # Handle coordinate renaming first
+            rename_coords = {}
+            if 'latitude' in ds_combined.coords: 
+                rename_coords['latitude'] = 'lat'
+            if 'longitude' in ds_combined.coords: 
+                rename_coords['longitude'] = 'lon'
+            if 'valid_time' in ds_combined.coords: 
+                rename_coords['valid_time'] = 'time'
+                
+            if rename_coords:
+                logger.debug(f"About to rename coordinates: {rename_coords}")
+                ds_combined = ds_combined.rename(rename_coords)
+                logger.debug(f"After coordinate rename - coords: {list(ds_combined.coords.keys())}")
+                
+                # Verify time coordinate still exists after rename
+                if 'time' not in ds_combined.coords:
+                    logger.error(f"CRITICAL: Lost time coordinate during rename in _fetch_single_day_era5!")
+                    logger.error(f"Rename mapping was: {rename_coords}")
+                    logger.error(f"Current coordinates: {list(ds_combined.coords.keys())}")
+                    raise ValueError("Lost time coordinate during coordinate renaming")
+            
+            # Standard coordinate adjustments
             if 'lat' in ds_combined.coords and len(ds_combined.lat) > 1 and ds_combined.lat.values[0] < ds_combined.lat.values[-1]:
                 ds_combined = ds_combined.reindex(lat=ds_combined.lat[::-1])
             
             if 'lon' in ds_combined.coords and ds_combined.lon.values.min() < 0:
                 ds_combined.coords['lon'] = (ds_combined.coords['lon'] + 360) % 360
                 ds_combined = ds_combined.sortby(ds_combined.lon)
+                
+            logger.debug(f"After all coordinate adjustments - coords: {list(ds_combined.coords.keys())}")
             
             # Force data loading before temp file cleanup
+            logger.debug(f"Before force loading - coords: {list(ds_combined.coords.keys())}")
             for var_name in ds_combined.data_vars:
                 _ = ds_combined[var_name].values
+            logger.debug(f"After force loading - coords: {list(ds_combined.coords.keys())}")
             
-            # Save to cache
+            # Final validation before saving
+            if 'time' not in ds_combined.coords:
+                logger.error(f"CRITICAL: Missing time coordinate before saving!")
+                logger.error(f"Available coordinates: {list(ds_combined.coords.keys())}")
+                logger.error(f"Available dimensions: {dict(ds_combined.dims)}")
+                raise ValueError("Missing time coordinate before cache save")
+            
+            # Save to cache with thread-safe netcdf handling
             logger.debug(f"Saving processed data for {date_str} to cache: {cache_file}")
-            ds_combined.to_netcdf(cache_file, engine='netcdf4')
+            save_successful = False
+            
+            # Thread-safe save with multiple fallback strategies
+            try:
+                # Strategy 1: Try with explicit engine=None (force auto-detection)
+                logger.debug("Attempting save with auto-detected engine...")
+                ds_combined.to_netcdf(cache_file, engine=None)
+                save_successful = True
+                logger.debug(f"✅ Successfully saved with auto-detected engine: {cache_file}")
+            except Exception as auto_err:
+                logger.debug(f"Auto-detected engine failed: {auto_err}")
+                
+                try:
+                    # Strategy 2: Force computation and try default save
+                    logger.debug("Computing dataset and saving...")
+                    ds_computed = ds_combined.compute()
+                    ds_computed.to_netcdf(cache_file)
+                    save_successful = True
+                    logger.debug(f"✅ Successfully saved computed dataset: {cache_file}")
+                except Exception as computed_err:
+                    logger.debug(f"Computed dataset save failed: {computed_err}")
+                    
+                    try:
+                        # Strategy 3: Use pickle as ultimate fallback for threading issues
+                        logger.debug("Using pickle fallback for thread safety...")
+                        pickle_file = cache_file.with_suffix('.pkl')
+                        import pickle
+                        with open(pickle_file, 'wb') as f:
+                            pickle.dump(ds_computed if 'ds_computed' in locals() else ds_combined.compute(), f)
+                        save_successful = True
+                        logger.debug(f"✅ Successfully saved with pickle fallback: {pickle_file}")
+                        
+                        # Also try to create a simple marker file indicating pickle format
+                        marker_file = cache_file.with_suffix('.pkl_marker')
+                        marker_file.write_text(str(pickle_file))
+                        
+                    except Exception as pickle_err:
+                        logger.error(f"All save strategies failed: {pickle_err}")
+                        raise RuntimeError(f"Failed to save ERA5 data in thread context: {pickle_err}")
+            
+            if not save_successful:
+                raise RuntimeError("Failed to save ERA5 data to cache with any available engine")
             
             # Cleanup temp files
             temp_sl_file.unlink()

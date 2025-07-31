@@ -993,501 +993,85 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
     ############################################################
 
     def _load_era5_climatology_sync(self, climatology_path: str) -> Optional[xr.Dataset]:
-        """Synchronous helper to load ERA5 climatology with enhanced blosc support."""
-        # CRITICAL: Ensure blosc is available - try installation if needed
-        try:
-            import blosc
-        except ImportError:
-            logger.warning("ERA5 climatology: blosc not found, attempting pip install...")
-            try:
-                import subprocess
-                import sys
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "blosc"], 
-                    capture_output=True, 
-                    text=True, 
-                    timeout=60
-                )
-                if result.returncode == 0:
-                    logger.info("ERA5 climatology: Successfully installed blosc")
-                    import blosc  # Try import again
-                else:
-                    logger.warning(f"ERA5 climatology: Failed to install blosc: {result.stderr}")
-                    # Try installing specific version known to work
-                    try:
-                        result2 = subprocess.run(
-                            [sys.executable, "-m", "pip", "install", "blosc==1.11.1"], 
-                            capture_output=True, 
-                            text=True, 
-                            timeout=60
-                        )
-                        if result2.returncode == 0:
-                            logger.info("ERA5 climatology: Successfully installed blosc 1.11.1")
-                            import blosc  # Try import again
-                    except Exception as install2_err:
-                        logger.warning(f"ERA5 climatology: Error installing specific blosc version: {install2_err}")
-            except Exception as install_err:
-                logger.warning(f"ERA5 climatology: Error installing blosc: {install_err}")
-        
-        # CRITICAL: Comprehensive blosc codec setup in this executor thread
-        try:
-            import blosc
-            import numcodecs
-            import numcodecs.blosc
-            import zarr
-            import numpy as np
-            import importlib
-            import os
-            import sys
-            
-            # Force reload of critical modules in this thread
-            importlib.reload(numcodecs.blosc)
-            importlib.reload(numcodecs.registry)
-            
-            # Ensure all compression codecs are available
-            from numcodecs import Blosc, LZ4, Zstd, Zlib, BZ2, GZip
-            
-            # Create codec instances to ensure they're properly initialized
-            codecs_to_register = [
-                ('blosc', Blosc()),
-                ('lz4', LZ4()),
-                ('zstd', Zstd()),
-                ('zlib', Zlib()),
-                ('bz2', BZ2()),
-                ('gzip', GZip())
-            ]
-            
-            # Register each codec explicitly
-            for codec_name, codec_instance in codecs_to_register:
-                try:
-                    # Register with numcodecs registry (it's a dictionary)
-                    codec_id = codec_instance.codec_id
-                    numcodecs.registry.codec_registry[codec_id] = codec_instance
-                    
-                    # Also try the proper registration method if available
-                    if hasattr(numcodecs, 'register_codec'):
-                        numcodecs.register_codec(codec_instance)
-                    
-                    # Register with zarr if it has its own registry
-                    if hasattr(zarr, 'codec_registry') and hasattr(zarr.codec_registry, 'register_codec'):
-                        zarr.codec_registry.register_codec(codec_instance)
-                    
-                    logger.debug(f"ERA5 climatology: Successfully registered {codec_name} codec (ID: {codec_id})")
-                except Exception as reg_err:
-                    logger.warning(f"ERA5 climatology: Failed to register {codec_name} codec: {reg_err}")
-            
-            # Test blosc codec functionality with more comprehensive test
-            try:
-                blosc_codec = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
-                test_data = np.array([1, 2, 3, 4, 5], dtype='f4')
-                compressed = blosc_codec.encode(test_data)
-                decompressed = blosc_codec.decode(compressed)
-                decompressed_array = np.frombuffer(decompressed, dtype=test_data.dtype).reshape(test_data.shape)
-                
-                # Verify the data is correct
-                if np.array_equal(test_data, decompressed_array):
-                    logger.debug(f"ERA5 climatology: Blosc codec test successful - data integrity verified")
-                else:
-                    logger.warning(f"ERA5 climatology: Blosc codec test failed - data integrity check failed")
-                    
-            except Exception as codec_test_err:
-                logger.warning(f"ERA5 climatology: Codec test failed: {codec_test_err}")
-            
-            # Set environment variables that might help with codec detection
-            import os
-            os.environ['BLOSC_NTHREADS'] = '1'  # Use single thread to avoid issues
-            
-            logger.debug(f"ERA5 climatology: Comprehensive codec registration completed")
-            
-        except Exception as e:
-            logger.warning(f"Failed to ensure blosc codec in ERA5 climatology executor thread: {e}")
-        
-        # Import xarray for use in opening strategies
+        """Synchronous helper to load ERA5 climatology with thread-safe blosc support."""
         import xarray as xr
+        import os
         
-        # Multiple zarr opening strategies with different configurations
-        def ensure_codec_before_opening():
-            """Re-register codecs immediately before each opening attempt."""
+        # THREADING FIX: Simple blosc codec registration in this executor thread
+        def ensure_blosc_in_thread():
+            """Ensure blosc codec is available in this thread context."""
             try:
-                # FIXED: Robust blosc codec registration 
-                
-                # 1. Set environment variables to ensure blosc availability
-                os.environ['ZARR_V3_EXPERIMENTAL_API'] = '0'  # Use v2 API for better codec support
-                os.environ['BLOSC_NTHREADS'] = '1'  # Single thread to avoid threading issues
-                
-                # 2. Force import and re-registration of blosc codec
                 import numcodecs
                 from numcodecs import Blosc
                 
-                # 3. Create and register the main blosc codec (default zstd)
-                try:
-                    # Create the primary blosc codec that zarr expects (ID: 'blosc')
-                    blosc_codec = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
-                    
-                    # Register with the standard 'blosc' ID that zarr looks for
-                    if hasattr(numcodecs.registry, 'codec_registry'):
-                        numcodecs.registry.codec_registry['blosc'] = blosc_codec
-                    
-                    # Alternative registration method
-                    if hasattr(numcodecs, 'register_codec'):
-                        numcodecs.register_codec(blosc_codec, codec_id='blosc')
-                    
-                    # CRITICAL FIX: Force module reload to pick up new codec registration
-                    import importlib
-                    if 'numcodecs.blosc' in sys.modules:
-                        importlib.reload(sys.modules['numcodecs.blosc'])
-                    if 'zarr.codecs' in sys.modules:
-                        importlib.reload(sys.modules['zarr.codecs'])
-                    
-                    logger.debug("Registered blosc codec with standard 'blosc' ID")
-                    
-                    # Also register alternative compression methods
-                    blosc_configs = [
-                        {'cname': 'zstd', 'clevel': 3, 'shuffle': Blosc.BITSHUFFLE, 'id': 'blosc_zstd'},
-                        {'cname': 'lz4', 'clevel': 1, 'shuffle': Blosc.SHUFFLE, 'id': 'blosc_lz4'},
-                        {'cname': 'zlib', 'clevel': 1, 'shuffle': Blosc.NOSHUFFLE, 'id': 'blosc_zlib'}
-                    ]
-                    
-                    for config in blosc_configs:
-                        try:
-                            config_copy = config.copy()  # Don't modify the original
-                            codec_id = config_copy.pop('id')
-                            alt_blosc_codec = Blosc(**config_copy)
-                            
-                            # Register alternative versions
-                            if hasattr(numcodecs.registry, 'codec_registry'):
-                                numcodecs.registry.codec_registry[codec_id] = alt_blosc_codec
-                            
-                            if hasattr(numcodecs, 'register_codec'):
-                                numcodecs.register_codec(alt_blosc_codec, codec_id=codec_id)
-                            
-                            logger.debug(f"Registered alternative blosc codec: {codec_id}")
-                            
-                        except Exception as config_err:
-                            logger.debug(f"Failed to register blosc config {config}: {config_err}")
-                            continue
-                            
-                except Exception as main_codec_err:
-                    logger.warning(f"Failed to register main blosc codec: {main_codec_err}")
-                    return False
+                # Create and register blosc codec in this thread
+                blosc_codec = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
                 
-                # 4. Try to register with zarr if available
-                try:
-                    import zarr
-                    # Force reimport to pick up new codecs
-                    import importlib
-                    if 'zarr.codecs' in sys.modules:
-                        importlib.reload(sys.modules['zarr.codecs'])
-                    
-                    # Ensure zarr can see numcodecs
-                    if hasattr(zarr, 'codecs') and hasattr(zarr.codecs, 'get_codec'):
-                        # Test if blosc is available in zarr
-                        try:
-                            test_codec = zarr.codecs.get_codec({'id': 'blosc', 'cname': 'zstd', 'clevel': 1})
-                            logger.debug("Zarr blosc codec test successful")
-                        except Exception as test_err:
-                            logger.debug(f"Zarr blosc codec test failed: {test_err}")
-                            
-                except Exception as zarr_err:
-                    logger.debug(f"Zarr codec registration failed: {zarr_err}")
+                # Register with numcodecs in this thread
+                if hasattr(numcodecs, 'register_codec'):
+                    numcodecs.register_codec(blosc_codec)
                 
-                # 5. Test codec availability with a simple compression test
-                try:
-                    test_data = b"test_compression_data" * 100
-                    blosc_test = Blosc(cname='zstd', clevel=1, shuffle=Blosc.NOSHUFFLE)
-                    compressed = blosc_test.encode(test_data)
-                    decompressed = blosc_test.decode(compressed)
-                    
-                    if decompressed == test_data:
-                        logger.debug("Blosc codec test successful - compression/decompression working")
-                        return True
-                    else:
-                        logger.warning("Blosc codec test failed - data mismatch after compression")
-                        return False
-                        
-                except Exception as test_err:
-                    logger.debug(f"Blosc codec test failed: {test_err}")
-                    return False
+                # Also register in the registry dictionary directly
+                if hasattr(numcodecs.registry, 'codec_registry'):
+                    numcodecs.registry.codec_registry['blosc'] = blosc_codec
                 
-            except Exception as codec_err:
-                logger.warning(f"Failed to ensure codec before opening: {codec_err}")
+                logger.debug("ERA5 climatology: Blosc codec registered in thread")
+                return True
+                
+            except Exception as e:
+                logger.debug(f"ERA5 climatology: Failed to register blosc in thread: {e}")
                 return False
 
-        opening_strategies = [
-            # Strategy 1: Standard consolidated opening
-            {
-                'name': 'consolidated',
-                'kwargs': {'consolidated': True, 'chunks': None}
-            },
-            # Strategy 2: Non-consolidated opening
-            {
-                'name': 'non-consolidated', 
-                'kwargs': {'consolidated': False, 'chunks': None}
-            },
-            # Strategy 3: With explicit chunking disabled
-            {
-                'name': 'no-chunking',
-                'kwargs': {'consolidated': True, 'chunks': None, 'decode_times': False}
-            },
-            # Strategy 4: Using fsspec mapper with gcs
-            {
-                'name': 'fsspec-gcs-mapper',
-                'kwargs': {'consolidated': False, 'decode_times': False, 'chunks': None},
-                'use_fsspec': True,
-                'filesystem': 'gcs'
-            },
-            # Strategy 5: Using fsspec mapper with http
-            {
-                'name': 'fsspec-http-mapper', 
-                'kwargs': {'consolidated': False, 'decode_times': False, 'chunks': None},
-                'use_fsspec': True,
-                'filesystem': 'http'
-            }
+        # Try multiple opening strategies with thread-safe codec registration
+        strategies = [
+            ('consolidated', {'consolidated': True}),
+            ('non-consolidated', {'consolidated': False}),
+            ('no-decode', {'consolidated': False, 'decode_times': False}),
         ]
         
-        for strategy in opening_strategies:
+        for strategy_name, kwargs in strategies:
             try:
-                strategy_name = strategy['name']
-                kwargs = strategy['kwargs']
-                use_fsspec = strategy.get('use_fsspec', False)
+                logger.info(f"ERA5 climatology: Trying {strategy_name} strategy...")
                 
-                logger.info(f"ERA5 climatology: Attempting {strategy_name} opening strategy...")
+                # Register blosc codec in this thread before each attempt
+                ensure_blosc_in_thread()
                 
-                # Re-register codec immediately before each attempt
-                ensure_codec_before_opening()
-                
-                if use_fsspec:
-                    # Use fsspec mapper for this strategy
-                    import fsspec
-                    filesystem_type = strategy.get('filesystem', 'gcs')
-                    
-                    if filesystem_type == 'gcs':
-                        fs = fsspec.filesystem('gcs', token='anon')  # Anonymous access for public bucket
-                    else:  # http
-                        fs = fsspec.filesystem('http')
-                        
-                    store = fs.get_mapper(climatology_path)
-                    
-                    # Re-register codec one more time right before opening
-                    ensure_codec_before_opening()
-                    dataset = xr.open_zarr(store, **kwargs)
-                else:
-                    # Direct opening - re-register codec right before
-                    ensure_codec_before_opening()
-                    dataset = xr.open_zarr(climatology_path, **kwargs)
+                # Attempt to open with current strategy
+                dataset = xr.open_zarr(climatology_path, **kwargs)
                 
                 if dataset is not None:
                     logger.info(f"ERA5 climatology: Successfully loaded using {strategy_name} strategy")
                     return dataset
                     
             except Exception as strategy_err:
-                logger.warning(f"ERA5 climatology: {strategy_name} strategy failed: {strategy_err}")
+                if strategy_name == 'consolidated' and 'codec not available' in str(strategy_err):
+                    logger.info(f"ERA5 climatology: {strategy_name} strategy unavailable (blosc codec not found), trying next strategy...")
+                else:
+                    logger.warning(f"ERA5 climatology: {strategy_name} strategy failed: {strategy_err}")
                 continue
         
-        # Final fallback attempt with manual zarr opening
+        # Simple fallback: try fsspec mapper directly
         try:
-            logger.info("ERA5 climatology: Attempting final fallback with manual zarr handling...")
-            ensure_codec_before_opening()
-            
-            # Try opening with zarr directly and then converting to xarray
-            import zarr
+            logger.info("ERA5 climatology: Attempting fsspec fallback...")
             import fsspec
-            import xarray as xr  # Add the missing import
             
-            # Use gcs filesystem
+            # Register blosc one more time
+            ensure_blosc_in_thread()
+            
+            # Simple fsspec approach
             fs = fsspec.filesystem('gcs', token='anon')
             mapper = fs.get_mapper(climatology_path)
-            
-            # Open with zarr first to verify codec availability
-            zarr_group = zarr.open_group(mapper, mode='r')
-            logger.info(f"ERA5 climatology: Successfully opened zarr group. Variables: {list(zarr_group.keys())}")
-            
-            # Now convert to xarray
-            ensure_codec_before_opening()  # One more time before xarray
-            dataset = xr.open_zarr(mapper, consolidated=False, decode_times=False)
+            dataset = xr.open_zarr(mapper, consolidated=False)
             
             if dataset is not None:
-                logger.info("ERA5 climatology: Successfully loaded using manual zarr fallback")
+                logger.info("ERA5 climatology: Successfully loaded using fsspec fallback")
                 return dataset
                 
-        except Exception as final_err:
-            logger.error(f"ERA5 climatology: Final fallback also failed: {final_err}")
-        
-        # Ultimate fallback: try alternative access methods that avoid blosc entirely
-        try:
-            logger.info("ERA5 climatology: Attempting ultimate fallback - bypassing blosc codec...")
-            
-            # Try using intake-xarray if available (might handle codec issues better)
-            try:
-                import intake
-                import intake_xarray  # This might handle the codec registration automatically
-                
-                # Create intake catalog entry for the dataset
-                catalog_entry = f"""
-sources:
-  era5_climatology:
-    driver: zarr
-    args:
-      urlpath: "{climatology_path}"
-      consolidated: false
-      storage_options:
-        token: anon
-"""
-                
-                # Try to load via intake
-                import yaml
-                catalog_dict = yaml.safe_load(catalog_entry)
-                cat = intake.open_catalog(catalog_dict)
-                dataset = cat.era5_climatology.to_dask()
-                
-                if dataset is not None:
-                    logger.info("ERA5 climatology: Successfully loaded using intake-xarray bypass")
-                    return dataset
-                    
-            except ImportError:
-                logger.debug("ERA5 climatology: intake-xarray not available")
-            except Exception as intake_err:
-                logger.debug(f"ERA5 climatology: intake approach failed: {intake_err}")
-            
-            # Try direct HTTP access to individual files (bypass zarr entirely)
-            try:
-                logger.info("ERA5 climatology: Trying HTTP access to individual files...")
-                import requests
-                import tempfile
-                
-                # Check if we can access the zarr metadata via HTTP
-                base_url = climatology_path.replace('gs://', 'https://storage.googleapis.com/')
-                metadata_url = f"{base_url}/.zattrs"
-                
-                response = requests.get(metadata_url, timeout=30)
-                if response.status_code == 200:
-                    logger.info("ERA5 climatology: HTTP access successful, but full dataset too large for direct download")
-                    # For now, we'll skip the full download approach as the dataset is very large
-                    
-            except Exception as http_err:
-                logger.debug(f"ERA5 climatology: HTTP approach failed: {http_err}")
-            
-            # Try using xarray with explicit backend specification
-            try:
-                logger.info("ERA5 climatology: Trying xarray with explicit backend...")
-                
-                import fsspec
-                fs = fsspec.filesystem('gcs', token='anon')
-                clean_path = climatology_path.replace('gs://', '')
-                
-                # Create a custom backend that might handle codecs better
-                from xarray.backends import ZarrBackendEntrypoint
-                
-                # Try opening with different chunk configurations
-                for chunks_config in [None, {}, 'auto', -1]:
-                    try:
-                        ensure_codec_before_opening()
-                        dataset = xr.open_dataset(
-                            f"gcs://{clean_path}",
-                            engine='zarr',
-                            chunks=chunks_config,
-                            consolidated=False,
-                            decode_times=False,
-                            backend_kwargs={'storage_options': {'token': 'anon'}}
-                        )
-                        if dataset is not None:
-                            logger.info(f"ERA5 climatology: Successfully loaded with chunks={chunks_config}")
-                            return dataset
-                    except Exception as chunk_err:
-                        logger.debug(f"ERA5 climatology: chunks={chunks_config} failed: {chunk_err}")
-                        continue
-                        
-            except Exception as backend_err:
-                logger.debug(f"ERA5 climatology: Backend approach failed: {backend_err}")
-            
-            # Final attempt: Try with environment variable overrides
-            try:
-                logger.info("ERA5 climatology: Final attempt with environment overrides...")
-                
-                # Set environment variables that might help
-                old_env = {}
-                env_overrides = {
-                    'ZARR_V3_EXPERIMENTAL_API': '0',
-                    'BLOSC_NTHREADS': '1',
-                    'NUMCODECS_DISABLE_CACHE': '1',
-                    'OMP_NUM_THREADS': '1'
-                }
-                
-                for key, value in env_overrides.items():
-                    old_env[key] = os.environ.get(key)
-                    os.environ[key] = value
-                
-                try:
-                    # Force complete re-import of zarr/numcodecs with new environment
-                    import importlib
-                    if 'zarr' in sys.modules:
-                        importlib.reload(sys.modules['zarr'])
-                    if 'numcodecs' in sys.modules:
-                        importlib.reload(sys.modules['numcodecs'])
-                    
-                    ensure_codec_before_opening()
-                    
-                    # Try the simplest possible opening
-                    fs = fsspec.filesystem('gcs', token='anon')
-                    clean_path = climatology_path.replace('gs://', '')
-                    mapper = fs.get_mapper(clean_path)
-                    
-                    dataset = xr.open_zarr(mapper, consolidated=False, decode_times=False)
-                    
-                    if dataset is not None:
-                        logger.info("ERA5 climatology: Successfully loaded with environment overrides")
-                        return dataset
-                        
-                finally:
-                    # Restore original environment
-                    for key, old_value in old_env.items():
-                        if old_value is None:
-                            os.environ.pop(key, None)
-                        else:
-                            os.environ[key] = old_value
-                            
-            except Exception as env_err:
-                logger.debug(f"ERA5 climatology: Environment override approach failed: {env_err}")
-            
-            # Truly final attempt: Try to create a minimal version of climatology data
-            try:
-                logger.info("ERA5 climatology: Creating minimal fallback climatology...")
-                
-                # Create a minimal fake climatology dataset for basic functionality
-                # This allows the system to continue working even if the real climatology fails
-                import numpy as np
-                import xarray as xr
-                
-                # Create minimal climatology with basic temperature field
-                fake_data = np.random.normal(273.15, 15, (12, 4, 721, 1440))  # Monthly, 6-hourly, lat, lon
-                
-                # Create time coordinates (monthly for a year, 6-hourly steps)
-                times = []
-                for month in range(1, 13):
-                    for hour in [0, 6, 12, 18]:
-                        times.append(f"2020-{month:02d}-15T{hour:02d}:00:00")
-                
-                coords = {
-                    'time': times,
-                    'latitude': np.linspace(90, -90, 721),
-                    'longitude': np.linspace(0, 359.75, 1440)
-                }
-                
-                minimal_climatology = xr.Dataset({
-                    '2m_temperature': (['time', 'latitude', 'longitude'], fake_data.reshape(48, 721, 1440))
-                }, coords=coords)
-                
-                logger.warning("ERA5 climatology: Created minimal fallback climatology - this will provide basic functionality but reduced accuracy")
-                return minimal_climatology
-                
-            except Exception as minimal_err:
-                logger.debug(f"ERA5 climatology: Even minimal fallback failed: {minimal_err}")
-        
-        except Exception as ultimate_err:
-            logger.error(f"ERA5 climatology: Ultimate fallback failed: {ultimate_err}")
+        except Exception as fallback_err:
+            logger.warning(f"ERA5 climatology: fsspec fallback failed: {fallback_err}")
         
         # If all strategies failed, return None
-        logger.error("ERA5 climatology: All opening strategies failed - returning None")
+        logger.warning("ERA5 climatology: All opening strategies failed - returning None")
         return None
 
     async def _get_or_load_era5_climatology(self) -> Optional[xr.Dataset]:

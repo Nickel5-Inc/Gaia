@@ -512,6 +512,7 @@ async def find_job_by_alternative_methods(task_instance: 'WeatherTask', job_id: 
     """
     Attempts to find a job using alternative methods when the exact job ID is not found.
     This is critical for handling database synchronization scenarios where job IDs might not match.
+    Used by both miners and validators for database resilience.
     
     Args:
         task_instance: WeatherTask instance
@@ -521,9 +522,6 @@ async def find_job_by_alternative_methods(task_instance: 'WeatherTask', job_id: 
     Returns:
         Job details if found, None otherwise
     """
-    if task_instance.node_type != 'miner':
-        logger.error("find_job_by_alternative_methods called on non-miner node.")
-        return None
         
     try:
         # Extract timestamp from deterministic job ID if possible
