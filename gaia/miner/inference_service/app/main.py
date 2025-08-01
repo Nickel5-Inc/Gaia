@@ -18,6 +18,8 @@ from fastapi.responses import StreamingResponse, Response
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 import pandas as pd
+
+
 from pathlib import Path
 import uuid
 import tarfile
@@ -535,10 +537,7 @@ async def _process_and_upload_steps(
                 for var_name in list(step_batch.surf_vars.keys()):
                     if hasattr(step_batch.surf_vars[var_name], 'cpu'):
                         step_batch.surf_vars[var_name] = step_batch.surf_vars[var_name].cpu()
-            # Force garbage collection every 10 steps to prevent memory buildup
-            if i % 10 == 0:
-                import gc
-                gc.collect()
+
 
     if processing_errors:
         _logger.warning(f"[{job_run_uuid}] Encountered {len(processing_errors)} errors during processing steps. Will attempt to upload successfully processed steps.")
@@ -904,14 +903,6 @@ async def combined_runpod_handler(job: Dict[str, Any]):
         except Exception as e_final_cleanup:
             _logger.debug(f"Job {job_id}: Error during final runpod_jobs directory cleanup: {e_final_cleanup}")
         
-        # Memory cleanup: Force garbage collection to free up inference artifacts
-        try:
-            import gc
-            collected = gc.collect()
-            _logger.debug(f"Job {job_id}: Garbage collection freed {collected} objects")
-        except Exception as e_gc:
-            _logger.debug(f"Job {job_id}: Error during garbage collection: {e_gc}")
-        
         _logger.info(f"Job {job_id}: Cleanup completed successfully")
         
         # Note: The downloaded input files and any intermediate processing files are inside 
@@ -1056,7 +1047,7 @@ async def initialize_app_for_runpod():
 
     _logger.info("Attempting to initialize inference runner for RunPod...")
     try:
-        await initialize_inference_runner(APP_CONFIG) 
+        await initialize_inference_runner(APP_CONFIG)
         if ir_module.INFERENCE_RUNNER and ir_module.INFERENCE_RUNNER.model:
             _logger.info("Inference runner initialized successfully with model for RunPod.")
         else:
@@ -1064,8 +1055,9 @@ async def initialize_app_for_runpod():
     except Exception as e:
         _logger.critical(f"CRITICAL EXCEPTION during initialize_inference_runner for RunPod: {e}", exc_info=True)
         if ir_module:
-            ir_module.INFERENCE_RUNNER = None 
-        # Consider whether to raise an exception here to halt startup if model is essential
+            ir_module.INFERENCE_RUNNER = None
+
+
 
 if __name__ == "__main__":
     # The __main__ block will now primarily just start the runpod handler.

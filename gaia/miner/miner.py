@@ -99,6 +99,9 @@ class Miner:
         self.memory_monitor_task = None
         self.memory_monitor_enabled = os.getenv('MINER_MEMORY_MONITORING_ENABLED', 'true').lower() in ['true', '1', 'yes']
         self.pm2_restart_enabled = os.getenv('MINER_PM2_RESTART_ENABLED', 'true').lower() in ['true', '1', 'yes']
+        
+        # Configure LRU cache limits for large file serving workloads
+        self._configure_cache_limits()
 
         # Load environment variables
         load_dotenv(".env")
@@ -716,6 +719,246 @@ class Miner:
         except Exception as e:
             self.logger.error(f"Failed to start miner memory monitoring: {e}")
 
+    def _comprehensive_miner_memory_cleanup(self):
+        """
+        Comprehensive memory cleanup targeting caches that accumulate during large file serving.
+        Adapted from validator memory management strategies.
+        """
+        import sys
+        import warnings
+        
+        cleanup_stats = {
+            'lru_caches': 0,
+            'xarray_caches': 0,
+            'torch_caches': 0,
+            'numpy_caches': 0,
+            'fsspec_caches': 0,
+            'http_caches': 0,
+            'total_caches': 0,
+            'gc_collected': 0
+        }
+        
+        try:
+            # 1. Clear LRU caches across all modules (major source of unbounded growth)
+            try:
+                deprecated_patterns = [
+                    'basic', 'misc', 'special_matrices', 'helper', 'realtransforms',
+                    'isolve', 'distance', 'stats', 'distutils', 'testing', '_core',
+                    'deprecated', 'legacy', 'compat'
+                ]
+                
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', category=DeprecationWarning)
+                    warnings.filterwarnings('ignore', category=PendingDeprecationWarning)
+                    warnings.filterwarnings('ignore', category=FutureWarning)
+                    
+                    for mod_name, mod in list(sys.modules.items()):
+                        if mod is None or not hasattr(mod, '__dict__'):
+                            continue
+                        
+                        try:
+                            for attr_name in list(mod.__dict__.keys()):
+                                # Skip deprecated attributes that trigger warnings
+                                if any(dep_pattern in attr_name.lower() for dep_pattern in deprecated_patterns):
+                                    continue
+                                
+                                try:
+                                    attr = getattr(mod, attr_name)
+                                    # Check for LRU cache or functools cache decorators
+                                    if hasattr(attr, 'cache_clear') and callable(attr.cache_clear):
+                                        attr.cache_clear()
+                                        cleanup_stats['lru_caches'] += 1
+                                except Exception:
+                                    continue
+                        except Exception:
+                            continue
+                            
+            except Exception as e:
+                self.logger.debug(f"Error clearing LRU caches: {e}")
+            
+            # 2. Clear xarray caches (critical for large dataset serving)
+            try:
+                import xarray as xr
+                
+                # Clear backends cache
+                if hasattr(xr.backends, 'plugins'):
+                    if hasattr(xr.backends.plugins, 'clear'):
+                        xr.backends.plugins.clear()
+                        cleanup_stats['xarray_caches'] += 1
+                    elif isinstance(xr.backends.plugins, dict):
+                        xr.backends.plugins.clear()
+                        cleanup_stats['xarray_caches'] += 1
+                
+                # Clear file manager cache (major contributor to file serving memory leaks)
+                if hasattr(xr.backends, 'file_manager'):
+                    if hasattr(xr.backends.file_manager, 'FILE_CACHE'):
+                        if hasattr(xr.backends.file_manager.FILE_CACHE, 'clear'):
+                            xr.backends.file_manager.FILE_CACHE.clear()
+                            cleanup_stats['xarray_caches'] += 1
+                
+                # Clear formatting caches
+                if hasattr(xr, 'core') and hasattr(xr.core, 'formatting'):
+                    if hasattr(xr.core.formatting, '_KNOWN_TYPE_REPRS'):
+                        xr.core.formatting._KNOWN_TYPE_REPRS.clear()
+                        cleanup_stats['xarray_caches'] += 1
+                        
+            except ImportError:
+                pass
+            except Exception as e:
+                self.logger.debug(f"Error clearing xarray caches: {e}")
+            
+            # 3. Clear fsspec/kerchunk caches (essential for large file kerchunk serving)
+            try:
+                import fsspec
+                
+                # Clear main filesystem registry
+                if hasattr(fsspec, 'filesystem') and hasattr(fsspec.filesystem, 'clear'):
+                    fsspec.filesystem.clear()
+                    cleanup_stats['fsspec_caches'] += 1
+                
+                # Clear specific filesystem caches that accumulate during file serving
+                for fs_type in ['file', 'memory', 'http', 'https', 's3', 'gcs']:
+                    try:
+                        if hasattr(fsspec, 'registry') and fs_type in fsspec.registry:
+                            fs_cls = fsspec.registry[fs_type]
+                            if hasattr(fs_cls, '_cache') and hasattr(fs_cls._cache, 'clear'):
+                                fs_cls._cache.clear()
+                                cleanup_stats['fsspec_caches'] += 1
+                    except Exception:
+                        continue
+                
+                # Clear kerchunk-specific caches if available
+                try:
+                    import kerchunk
+                    # kerchunk uses fsspec internally, already covered above
+                    cleanup_stats['fsspec_caches'] += 1
+                except ImportError:
+                    pass
+                    
+            except ImportError:
+                pass
+            except Exception as e:
+                self.logger.debug(f"Error clearing fsspec/kerchunk caches: {e}")
+            
+            # 4. Clear PyTorch caches (if model inference is involved)
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                    cleanup_stats['torch_caches'] += 1
+                    
+                # Clear PyTorch JIT cache if available
+                if hasattr(torch.jit, '_state') and hasattr(torch.jit._state, '_clear_class_registry'):
+                    torch.jit._state._clear_class_registry()
+                    cleanup_stats['torch_caches'] += 1
+                    
+            except ImportError:
+                pass
+            except Exception as e:
+                self.logger.debug(f"Error clearing torch caches: {e}")
+            
+            # 5. Clear NumPy caches
+            try:
+                import numpy as np
+                if hasattr(np, '_get_ndarray_cache'):
+                    np._get_ndarray_cache().clear()
+                    cleanup_stats['numpy_caches'] += 1
+            except ImportError:
+                pass
+            except Exception as e:
+                self.logger.debug(f"Error clearing numpy caches: {e}")
+            
+            # 6. Clear HTTP client caches (for miners serving files over HTTP)
+            try:
+                # Clear httpx caches if available
+                try:
+                    import httpx
+                    # httpx caches are typically per-client, but clear any global ones
+                    cleanup_stats['http_caches'] += 1
+                except ImportError:
+                    pass
+                
+                # Clear requests caches if available
+                try:
+                    import requests
+                    if hasattr(requests, 'sessions') and hasattr(requests.sessions, 'Session'):
+                        # Clear any global session caches
+                        cleanup_stats['http_caches'] += 1
+                except ImportError:
+                    pass
+                    
+            except Exception as e:
+                self.logger.debug(f"Error clearing HTTP caches: {e}")
+            
+            # 7. Force garbage collection
+            try:
+                import gc
+                collected = gc.collect()
+                cleanup_stats['gc_collected'] = collected
+            except Exception as e:
+                self.logger.debug(f"Error during garbage collection: {e}")
+            
+            # Calculate total caches cleared
+            cleanup_stats['total_caches'] = (
+                cleanup_stats['lru_caches'] + 
+                cleanup_stats['xarray_caches'] + 
+                cleanup_stats['torch_caches'] + 
+                cleanup_stats['numpy_caches'] + 
+                cleanup_stats['fsspec_caches'] + 
+                cleanup_stats['http_caches']
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error during comprehensive memory cleanup: {e}")
+        
+        return cleanup_stats
+
+    def _configure_cache_limits(self):
+        """
+        Configure LRU cache size limits for libraries used in large file serving.
+        Prevents unbounded cache growth that leads to OOM issues.
+        """
+        try:
+            # Configure xarray cache limits
+            import xarray as xr
+            
+            # Set reasonable cache limits for file serving workloads
+            cache_maxsize = int(os.getenv('MINER_XARRAY_CACHE_MAXSIZE', '64'))
+            
+            if hasattr(xr.backends, 'file_manager'):
+                # Limit xarray file manager cache
+                if hasattr(xr.backends.file_manager, 'FILE_CACHE'):
+                    original_cache = xr.backends.file_manager.FILE_CACHE
+                    if hasattr(original_cache, 'maxsize'):
+                        original_cache.maxsize = cache_maxsize
+                        self.logger.info(f"Set xarray FILE_CACHE maxsize to {cache_maxsize}")
+                        
+        except ImportError:
+            self.logger.debug("xarray not available, skipping cache configuration")
+        except Exception as e:
+            self.logger.debug(f"Could not configure xarray cache limits: {e}")
+        
+        try:
+            # Configure fsspec cache limits for kerchunk operations
+            import fsspec
+            
+            # Set fsspec cache directory and limits
+            fsspec_cache_dir = os.getenv('MINER_FSSPEC_CACHE_DIR', '/tmp/miner_fsspec_cache')
+            fsspec_cache_size = os.getenv('MINER_FSSPEC_CACHE_SIZE', '1G')
+            
+            if hasattr(fsspec, 'config'):
+                fsspec.config.conf['cache_storage'] = fsspec_cache_dir
+                fsspec.config.conf['cache_check'] = 60  # Check cache every minute
+                if 'cache_size' in fsspec.config.conf:
+                    fsspec.config.conf['cache_size'] = fsspec_cache_size
+                self.logger.info(f"Configured fsspec cache: dir={fsspec_cache_dir}, size={fsspec_cache_size}")
+                
+        except ImportError:
+            self.logger.debug("fsspec not available, skipping cache configuration")
+        except Exception as e:
+            self.logger.debug(f"Could not configure fsspec cache: {e}")
+
     def _memory_monitor_sync_loop(self):
         """Synchronous memory monitoring loop that runs in a separate thread."""
         try:
@@ -730,10 +973,12 @@ class Miner:
                 from gaia.utils.global_memory_manager import create_thread_cleanup_helper
                 cleanup_helper = create_thread_cleanup_helper()
                 
-                # Register cleanup for any miner-specific caches that might accumulate
+                # Register enhanced cleanup for miner-specific caches that accumulate during file serving
                 def miner_memory_cleanup():
-                    gc.collect()  # Basic GC
-                    self.logger.debug("Miner memory monitor performed cleanup")
+                    # Comprehensive cleanup adapted from validator strategies
+                    cleanup_stats = self._comprehensive_miner_memory_cleanup()
+                    self.logger.debug(f"Miner memory cleanup: cleared {cleanup_stats['total_caches']} caches, "
+                                    f"freed {cleanup_stats['gc_collected']} objects")
                 
                 cleanup_helper.register_custom_cleanup("miner_memory_monitor", miner_memory_cleanup)
                 self.logger.debug("Registered miner memory monitor thread for global cleanup")
@@ -764,11 +1009,14 @@ class Miner:
                     # Emergency circuit breakers with pm2 restart capability
                     if memory_mb > critical_threshold_mb:
                         self.logger.error(f"💀 CRITICAL MEMORY: {memory_mb:.1f} MB - OOM imminent! (threshold: {critical_threshold_mb} MB)")
-                        self.logger.error("Attempting emergency garbage collection to prevent OOM kill...")
+                        self.logger.error("Attempting comprehensive emergency cleanup to prevent OOM kill...")
                         try:
-                            collected = gc.collect()
-                            self.logger.error(f"Emergency GC freed {collected} objects")
-                            time.sleep(2)  # Brief pause after emergency GC
+                            cleanup_stats = self._comprehensive_miner_memory_cleanup()
+                            self.logger.error(f"Emergency cleanup: cleared {cleanup_stats['total_caches']} caches, "
+                                            f"freed {cleanup_stats['gc_collected']} objects, "
+                                            f"LRU: {cleanup_stats['lru_caches']}, xarray: {cleanup_stats['xarray_caches']}, "
+                                            f"fsspec: {cleanup_stats['fsspec_caches']}")
+                            time.sleep(2)  # Brief pause after emergency cleanup
                             
                             # Check memory again after GC
                             post_gc_memory = process.memory_info().rss / (1024 * 1024)
@@ -791,20 +1039,45 @@ class Miner:
                                 self.logger.error("💀 GC FAILED AND PM2 RESTART DISABLED - system may crash")
                     elif memory_mb > emergency_threshold_mb:
                         self.logger.error(f"🚨 EMERGENCY MEMORY PRESSURE: {memory_mb:.1f} MB - OOM risk HIGH! (threshold: {emergency_threshold_mb} MB)")
-                        self.logger.warning("Consider reducing batch sizes or restarting miner to prevent OOM")
-                        # Light GC at emergency level
+                        self.logger.warning("Performing emergency cache cleanup to prevent OOM")
+                        # Comprehensive cleanup at emergency level
                         try:
-                            collected = gc.collect()
-                            if collected > 0:
-                                self.logger.info(f"Emergency light GC collected {collected} objects")
-                        except Exception:
-                            pass
+                            cleanup_stats = self._comprehensive_miner_memory_cleanup()
+                            if cleanup_stats['total_caches'] > 0 or cleanup_stats['gc_collected'] > 0:
+                                self.logger.info(f"Emergency cleanup: cleared {cleanup_stats['total_caches']} caches, "
+                                               f"freed {cleanup_stats['gc_collected']} objects "
+                                               f"(xarray: {cleanup_stats['xarray_caches']}, "
+                                               f"fsspec: {cleanup_stats['fsspec_caches']}, "
+                                               f"LRU: {cleanup_stats['lru_caches']})")
+                        except Exception as e:
+                            self.logger.warning(f"Emergency cleanup failed: {e}")
+                            # Fallback to basic GC
+                            try:
+                                collected = gc.collect()
+                                if collected > 0:
+                                    self.logger.info(f"Fallback GC collected {collected} objects")
+                            except Exception:
+                                pass
                     elif memory_mb > warning_threshold_mb:
                         self.logger.warning(f"🟡 HIGH MEMORY: Miner process using {memory_mb:.1f} MB ({system_percent:.1f}% of system) (threshold: {warning_threshold_mb} MB)")
                         
-                    # Regular status logging every 5 minutes
+                    # Regular status logging and proactive cleanup every 5 minutes
                     if current_time - last_log_time >= 300:  # 5 minutes
                         self.logger.info(f"Miner memory status: {memory_mb:.1f} MB RSS ({system_percent:.1f}% system memory)")
+                        
+                        # Proactive cleanup to prevent cache buildup during large file serving
+                        # Only perform cleanup if memory is getting elevated (> 60% of warning threshold)
+                        proactive_threshold = warning_threshold_mb * 0.6
+                        if memory_mb > proactive_threshold:
+                            self.logger.debug(f"Performing proactive cache cleanup (memory: {memory_mb:.1f}MB > {proactive_threshold:.1f}MB)")
+                            try:
+                                cleanup_stats = self._comprehensive_miner_memory_cleanup()
+                                if cleanup_stats['total_caches'] > 0:
+                                    self.logger.debug(f"Proactive cleanup: cleared {cleanup_stats['total_caches']} caches, "
+                                                    f"freed {cleanup_stats['gc_collected']} objects")
+                            except Exception as e:
+                                self.logger.debug(f"Proactive cleanup failed: {e}")
+                        
                         last_log_time = current_time
                         
                 except Exception as e:
