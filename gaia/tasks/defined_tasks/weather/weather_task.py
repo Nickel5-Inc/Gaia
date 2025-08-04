@@ -131,6 +131,12 @@ def _load_config(self):
     config['final_scoring_lead_hours'] = parse_int_list('WEATHER_FINAL_SCORING_LEAD_HOURS', 
                                                         [24, 48, 72, 96, 120, 144, 168, 192, 216, 240]) # Days 1-10
     config['verification_wait_minutes'] = int(os.getenv('WEATHER_VERIFICATION_WAIT_MINUTES', '60'))
+    
+    # Optional scoring timeout configuration - disabled by default for long-running operations
+    # Set WEATHER_SCORING_TIMEOUT_ENABLED=true to enable safety timeouts
+    config['scoring_timeout_enabled'] = os.getenv('WEATHER_SCORING_TIMEOUT_ENABLED', 'false').lower() == 'true'
+    config['scoring_timeout_safety_hours'] = float(os.getenv('WEATHER_SCORING_TIMEOUT_SAFETY_HOURS', '2.0'))  # Safety timeout in hours
+    config['scoring_progress_log_interval'] = int(os.getenv('WEATHER_SCORING_PROGRESS_LOG_INTERVAL', '300'))  # Progress logging every 5 minutes
     config['verification_timeout_seconds'] = int(os.getenv('WEATHER_VERIFICATION_TIMEOUT_SECONDS', '3600'))
     # More frequent checking for progressive scoring (check every 30 minutes instead of 1 hour)
     config['final_scoring_check_interval_seconds'] = int(os.getenv('WEATHER_FINAL_SCORING_INTERVAL_S', '1800'))
@@ -1131,31 +1137,23 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             "gfs_init_time_for_table": gfs_init_time
         }
 
-        from json import dumps
-        
         query = """
         INSERT INTO score_table 
-        (task_name, task_id, score, status, timestamp, round_duration_ms, round_duration_start, round_duration_end)
-        VALUES (:task_name, :task_id, :score, :status, :timestamp, :round_duration_ms, :round_duration_start, :round_duration_end)
+        (task_name, task_id, score, status, created_at)
+        VALUES (:task_name, :task_id, :score, :status, :timestamp)
         ON CONFLICT (task_name, task_id)
         DO UPDATE SET
             score = EXCLUDED.score,
             status = EXCLUDED.status,
-            timestamp = EXCLUDED.timestamp,
-            round_duration_ms = EXCLUDED.round_duration_ms,
-            round_duration_start = EXCLUDED.round_duration_start,
-            round_duration_end = EXCLUDED.round_duration_end
+            created_at = EXCLUDED.created_at
         """
         
         db_params = {
             "task_name": score_row_data["task_name"],
             "task_id": score_row_data["task_id"],
-            "score": dumps(score_row_data["score"]),
+            "score": score_row_data["score"],  # Pass list directly, not JSON string
             "status": score_row_data["status"],
-            "timestamp": score_row_data["gfs_init_time_for_table"],
-            "round_duration_ms": 0,  # Placeholder
-            "round_duration_start": score_row_data["gfs_init_time_for_table"],  
-            "round_duration_end": score_row_data["gfs_init_time_for_table"]
+            "timestamp": score_row_data["gfs_init_time_for_table"]
         }
         
         await self.db_manager.execute(query, db_params)
@@ -1877,11 +1875,24 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         logger.info(f"TEST MODE: validator_execute iteration for run {run_id} complete.")
                         if hasattr(self, 'last_test_mode_run_id') and self.last_test_mode_run_id == run_id: 
                             logger.info(f"TEST MODE: Waiting for Day-1 scoring of run {run_id} to complete...")
+                            
+                            # Use optional timeout or wait indefinitely for long-running scoring
+                            timeout = await self._get_scoring_timeout_if_enabled()
+                            if timeout:
+                                logger.info(f"TEST MODE: Using safety timeout of {timeout:.0f} seconds for Day-1 scoring")
+                            else:
+                                logger.info("TEST MODE: No timeout - waiting indefinitely for Day-1 scoring to complete (long-running operation)")
+                            
                             try:
-                                await asyncio.wait_for(self.test_mode_run_scored_event.wait(), timeout=600.0) # 10 min timeout
-                                logger.info(f"TEST MODE: Day-1 scoring for run {run_id} event received.")
+                                if timeout:
+                                    # Use timeout with periodic progress logging
+                                    await self._wait_for_scoring_with_progress(self.test_mode_run_scored_event, timeout, run_id)
+                                else:
+                                    # Wait indefinitely with periodic progress logging
+                                    await self._wait_for_scoring_with_progress(self.test_mode_run_scored_event, None, run_id)
+                                logger.info(f"TEST MODE: Day-1 scoring for run {run_id} completed successfully.")
                             except asyncio.TimeoutError:
-                                logger.error(f"TEST MODE: Timeout waiting for Day-1 scoring of run {run_id}.")
+                                logger.error(f"TEST MODE: Safety timeout reached waiting for Day-1 scoring of run {run_id} after {timeout:.0f} seconds.")
                             self.test_mode_run_scored_event.clear() 
                         else:
                             logger.info(f"TEST MODE: Not waiting for scoring event as run_id ({run_id}) doesn't match last_test_mode_run_id ({getattr(self, 'last_test_mode_run_id', None)}).")
@@ -2087,6 +2098,10 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         proportional_weather_scores = (latest_day1_scores_array * W_day1) + (latest_era5_composite_scores_array * W_era5)
         logger.info(f"[CombinedWeatherScore] Calculated proportional scores.")
         
+        # Calculate availability flags before clearing arrays
+        has_era5_scores = np.any(latest_era5_composite_scores_array > 0)
+        has_day1_scores = np.any(proportional_weather_scores > 0)  # This includes day1 component
+        
         # MEMORY LEAK FIX: Clear large score arrays immediately after use
         try:
             del latest_day1_scores_array, latest_era5_composite_scores_array
@@ -2144,8 +2159,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             })
         
         # Determine the appropriate score row ID based on available score types
-        has_era5_scores = np.any(latest_era5_composite_scores_array > 0)
-        has_day1_scores = np.any(proportional_weather_scores > 0)  # This includes day1 component
+        # (has_era5_scores and has_day1_scores calculated earlier before array cleanup)
         
         if run_id_trigger:
             # If triggered by a specific run, use run-specific naming
@@ -3608,7 +3622,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             'sending_fetch_requests', 'awaiting_input_hashes', 'verifying_input_hashes', 
             'triggering_inference', 'awaiting_inference_results', 'verifying_miner_forecasts',
             # INCLUDE SCORING STATES - can get stuck due to restarts during scoring
-            'day1_scoring_started', 'era5_final_scoring_started'
+            'day1_scoring_started', 'era5_final_scoring_started', 'era5_final_scoring_partial'
         ]
         
         # Also include failure states that might be recoverable with full workflow
@@ -3800,7 +3814,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             'sending_fetch_requests', 'awaiting_input_hashes', 'verifying_input_hashes', 
             'triggering_inference', 'awaiting_inference_results', 'verifying_miner_forecasts',
             # INCLUDE SCORING STATES - can get stuck due to restarts during scoring
-            'day1_scoring_started', 'era5_final_scoring_started'
+            'day1_scoring_started', 'era5_final_scoring_started', 'era5_final_scoring_partial'
         ]
         
         # Also check for runs that might be ready for scoring
@@ -3861,25 +3875,32 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     logger.info(f"  - Recovering run {run_id}: processing ready for scoring")
                     asyncio.create_task(self._continue_run_workflow(run_id))
                     
-                elif status in ['day1_scoring_started', 'era5_final_scoring_started']:
+                elif status in ['day1_scoring_started', 'era5_final_scoring_started', 'era5_final_scoring_partial']:
                     logger.info(f"  - Recovering run {run_id}: resetting stuck scoring state '{status}' - likely interrupted by restart")
                     
-                    # Reset run status to allow re-processing
-                    await _update_run_status(self, run_id, "verifying_miner_forecasts")
-                    
-                    # Reset scoring jobs to queued status for retry with smart partial logic
-                    scoring_type = 'day1_qc' if status == 'day1_scoring_started' else 'era5_final'
-                    reset_job_query = """
-                    UPDATE weather_scoring_jobs 
-                    SET status = 'queued', started_at = NULL, error_message = 'Reset due to validator restart during scoring'
-                    WHERE run_id = :run_id AND score_type = :score_type AND status IN ('in_progress', 'queued')
-                    """
-                    await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": scoring_type})
-                    
-                    logger.info(f"  - Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with '{scoring_type}' job queued for smart partial retry")
-                    
-                    # Trigger immediate scoring check
-                    asyncio.create_task(self._continue_run_workflow(run_id))
+                    # For partial scoring, don't reset status - let it continue from where it left off
+                    if status == 'era5_final_scoring_partial':
+                        logger.info(f"  - Run {run_id}: Partial scoring state - will continue progressive scoring from existing progress")
+                        # Don't reset status for partial scoring - it should continue as-is
+                        # Just trigger scoring check to resume where it left off
+                        asyncio.create_task(self._continue_run_workflow(run_id))
+                    else:
+                        # For started states, reset to allow re-processing
+                        await _update_run_status(self, run_id, "verifying_miner_forecasts")
+                        
+                        # Reset scoring jobs to queued status for retry with smart partial logic
+                        scoring_type = 'day1_qc' if status == 'day1_scoring_started' else 'era5_final'
+                        reset_job_query = """
+                        UPDATE weather_scoring_jobs 
+                        SET status = 'queued', started_at = NULL, error_message = 'Reset due to validator restart during scoring'
+                        WHERE run_id = :run_id AND score_type = :score_type AND status IN ('in_progress', 'queued')
+                        """
+                        await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": scoring_type})
+                        
+                        logger.info(f"  - Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with '{scoring_type}' job queued for smart partial retry")
+                        
+                        # Trigger immediate scoring check
+                        asyncio.create_task(self._continue_run_workflow(run_id))
                     
             except Exception as recovery_error:
                 logger.error(f"  - Error recovering run {run_id}: {recovery_error}", exc_info=True)
@@ -4342,6 +4363,48 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             logger.error(f"[Run {run_id}] Error tracking progressive scoring completion: {e}", exc_info=True)
             return False
 
+    async def _get_scoring_timeout_if_enabled(self) -> Optional[float]:
+        """Get timeout for scoring operations if enabled, otherwise return None for no timeout."""
+        if not self.config.get('scoring_timeout_enabled', False):
+            return None
+        
+        # Return safety timeout in seconds
+        timeout_hours = self.config.get('scoring_timeout_safety_hours', 2.0)
+        return timeout_hours * 3600.0
+
+    async def _wait_for_scoring_with_progress(self, event: asyncio.Event, timeout: Optional[float], run_id: int):
+        """Wait for scoring event with periodic progress logging."""
+        start_time = time.time()
+        progress_interval = self.config.get('scoring_progress_log_interval', 300)  # 5 minutes
+        last_progress_log = start_time
+        
+        while True:
+            try:
+                # Wait for either the event or the progress interval
+                wait_time = min(progress_interval, timeout - (time.time() - start_time)) if timeout else progress_interval
+                
+                if wait_time <= 0 and timeout:
+                    # Timeout reached
+                    raise asyncio.TimeoutError()
+                
+                await asyncio.wait_for(event.wait(), timeout=wait_time)
+                # Event was set - scoring completed
+                return
+                
+            except asyncio.TimeoutError:
+                current_time = time.time()
+                elapsed = current_time - start_time
+                
+                # Check if this is a progress log timeout or actual timeout
+                if timeout and elapsed >= timeout:
+                    # Actual timeout reached
+                    raise asyncio.TimeoutError()
+                
+                # Progress log timeout - log progress and continue waiting
+                if current_time - last_progress_log >= progress_interval:
+                    logger.info(f"TEST MODE: Still waiting for Day-1 scoring of run {run_id} - elapsed: {elapsed/60:.1f} minutes")
+                    last_progress_log = current_time
+
     async def _recover_incomplete_scoring_jobs(self):
         """Recover scoring jobs that were interrupted by restarts."""
         try:
@@ -4355,22 +4418,57 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             """
             incomplete_jobs = await self.db_manager.fetch_all(query)
             
-            if not incomplete_jobs:
-                logger.info("No incomplete scoring jobs found to recover")
+            # Also find runs that are in partial scoring states but might have stalled
+            stalled_partial_query = """
+            SELECT id as run_id, status, final_scoring_attempted_time
+            FROM weather_forecast_runs 
+            WHERE status IN ('era5_final_scoring_partial', 'era5_final_scoring_started')
+            AND (
+                final_scoring_attempted_time IS NULL 
+                OR final_scoring_attempted_time < (CURRENT_TIMESTAMP - INTERVAL '2 hours')
+            )
+            ORDER BY final_scoring_attempted_time ASC NULLS FIRST
+            LIMIT 10
+            """
+            stalled_runs = await self.db_manager.fetch_all(stalled_partial_query)
+            
+            total_recoveries = len(incomplete_jobs) + len(stalled_runs)
+            if total_recoveries == 0:
+                logger.info("No incomplete scoring jobs or stalled runs found to recover")
                 return
             
-            logger.info(f"Found {len(incomplete_jobs)} incomplete scoring job(s) to recover:")
+            logger.info(f"Found {len(incomplete_jobs)} incomplete scoring job(s) and {len(stalled_runs)} stalled partial run(s) to recover:")
             
+            # Recover incomplete scoring jobs
             for job in incomplete_jobs:
                 run_id = job['run_id']
                 score_type = job['score_type']
                 started_at = job['started_at']
                 
-                logger.info(f"  - Run {run_id}: {score_type} scoring (started: {started_at})")
+                logger.info(f"  - Run {run_id}: {score_type} scoring job (started: {started_at}) - resetting and retrying")
                 
                 # Reset to queued status and re-trigger
                 await self._reset_scoring_job(run_id, score_type)
                 await self._trigger_scoring_job(run_id, score_type)
+            
+            # Recover stalled partial runs
+            for run in stalled_runs:
+                run_id = run['run_id']
+                status = run['status']
+                last_attempt = run['final_scoring_attempted_time']
+                
+                logger.info(f"  - Run {run_id}: stalled in '{status}' (last attempt: {last_attempt}) - resuming progressive scoring")
+                
+                # Create a new era5_final scoring job to resume progressive scoring
+                if await self._create_scoring_job(run_id, 'era5_final'):
+                    # Update the attempted time to mark it as actively being retried
+                    await self.db_manager.execute(
+                        "UPDATE weather_forecast_runs SET final_scoring_attempted_time = :now WHERE id = :run_id",
+                        {"now": datetime.now(timezone.utc), "run_id": run_id}
+                    )
+                    logger.info(f"  - Run {run_id}: created new era5_final scoring job for progressive resume")
+                else:
+                    logger.warning(f"  - Run {run_id}: failed to create scoring job for recovery")
                 
         except Exception as e:
             logger.error(f"Error recovering incomplete scoring jobs: {e}", exc_info=True)

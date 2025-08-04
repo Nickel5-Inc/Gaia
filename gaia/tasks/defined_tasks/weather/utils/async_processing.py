@@ -235,9 +235,25 @@ async def compute_statistical_metrics_async(
             forecast = np.asarray(forecast_data, dtype=np.float32)
             truth = np.asarray(truth_data, dtype=np.float32)
             
+            # Handle shape mismatches (only for legitimate mismatches, not systematic dimension order issues)
             if forecast.shape != truth.shape:
-                logger.error(f"Async: Shape mismatch - forecast: {forecast.shape}, truth: {truth.shape}")
-                return {metric: np.nan for metric in metrics}
+                logger.warning(f"Async: Shape mismatch detected - forecast: {forecast.shape}, truth: {truth.shape}")
+                
+                # Case 1: Surface vs pressure level mismatch (2D vs 3D)
+                if forecast.ndim == 2 and truth.ndim == 3:
+                    # Surface forecast vs pressure level truth - use first pressure level of truth
+                    logger.info(f"Async: Surface forecast vs pressure level truth, using surface level")
+                    truth = truth[0]  # Take first pressure level
+                elif forecast.ndim == 3 and truth.ndim == 2:
+                    # Pressure level forecast vs surface truth - this shouldn't happen but handle it
+                    logger.warning(f"Async: Pressure level forecast vs surface truth - using first level")
+                    forecast = forecast[:, :, 0] if forecast.shape[-1] < forecast.shape[0] else forecast[0]
+                
+                # Final check
+                if forecast.shape != truth.shape:
+                    logger.error(f"Async: Unresolvable shape mismatch - forecast: {forecast.shape}, truth: {truth.shape}")
+                    logger.error(f"Async: This should not happen with standardized dimension order. Check data loading.")
+                    return {metric: np.nan for metric in metrics}
             
             # Use dask arrays for large datasets
             use_dask = DASK_AVAILABLE and forecast.size > 50000
@@ -262,8 +278,14 @@ async def compute_statistical_metrics_async(
                 
                 # Apply weights if provided
                 if lat_weights is not None:
-                    weights_da = da.from_array(lat_weights, chunks=chunk_size)[valid_mask_da]
-                    weights_da = weights_da / da.sum(weights_da)
+                    try:
+                        weights_da = da.from_array(lat_weights, chunks=chunk_size)
+                        # Apply the same mask that was applied to forecast/truth
+                        weights_valid_da = weights_da[valid_mask_da]
+                        weights_da = weights_valid_da / da.sum(weights_valid_da)
+                    except Exception as weights_err:
+                        logger.warning(f"Async: Failed to apply weights: {weights_err}. Computing unweighted metrics.")
+                        weights_da = None
                 else:
                     weights_da = None
                 
@@ -390,7 +412,7 @@ async def compute_statistical_metrics_async(
                 forecast_valid_np = forecast_valid_da.compute()
                 truth_valid_np = truth_valid_da.compute()
                 valid_mask_np = valid_mask_da.compute()
-                if lat_weights is not None:
+                if weights_da is not None:
                     weights_np = weights_da.compute()
                 else:
                     weights_np = None

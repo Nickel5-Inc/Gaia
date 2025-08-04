@@ -3763,7 +3763,8 @@ class GaiaValidator:
             try:
                 del weather_scores  # Only weather scores exist now
                 del task_percentiles, task_valid_scores
-                del excellence_count, diversity_count
+                if 'excellence_count' in locals(): del excellence_count
+                if 'diversity_count' in locals(): del diversity_count
                 del weights_final, transformed_w
                 if 'nz_weights' in locals(): del nz_weights
                 if 'norm_weights' in locals(): del norm_weights
@@ -3940,10 +3941,10 @@ class GaiaValidator:
                 )
                 self._log_memory_usage("calc_weights_after_sync_calc")
                 
-                # === NEW: Handle enhanced return structure with pathway tracking ===
+                # === Weather-only scoring: Handle weight calculation results ===
                 if isinstance(weight_result, tuple) and len(weight_result) == 2:
                     final_weights_list, pathway_tracking = weight_result
-                    logger.info(f"Captured pathway tracking data for {len(pathway_tracking)} miners")
+                    logger.debug(f"Weather-only scoring: captured pathway tracking for {len(pathway_tracking)} miners")
                     
                     # Store pathway tracking in performance calculator for later integration
                     if self.performance_calculator and pathway_tracking:
@@ -3952,10 +3953,14 @@ class GaiaValidator:
                             self.performance_calculator._current_pathway_data = {}
                         self.performance_calculator._current_pathway_data.update(pathway_tracking)
                         logger.debug("Pathway tracking data stored in performance calculator")
+                elif weight_result is None:
+                    # Expected when no scores exist - not an error for weather-only subnet
+                    final_weights_list = None
+                    logger.info("No weather scores available - validator will use zero weights until scoring begins")
                 else:
-                    # Fallback for old return format or error cases
+                    # Unexpected return format
                     final_weights_list = weight_result
-                    logger.warning("Weight calculation returned old format or failed - no pathway tracking available")
+                    logger.warning(f"Weight calculation returned unexpected format: {type(weight_result)} - using as-is")
 
                 # MEMORY CLEANUP after sync calculation (scope-aware)
                 try:

@@ -329,6 +329,35 @@ async def fetch_era5_data(
             
             ds_combined = xr.merge([ds_sl_renamed, ds_pl_renamed])
 
+            # STANDARDIZE DIMENSION ORDER: Transpose pressure level variables to match Aurora/miner format
+            # ERA5 CDS format: (time, pressure_level, lat, lon)
+            # Aurora/Miner format: (time, lat, lon, pressure_level)
+            pressure_level_vars = ['t', 'u', 'v', 'q', 'z']  # Variables that have pressure levels
+            
+            for var_name in pressure_level_vars:
+                if var_name in ds_combined.data_vars:
+                    var_data = ds_combined[var_name]
+                    if 'pressure_level' in var_data.dims:
+                        # Check current dimension order
+                        current_dims = list(var_data.dims)
+                        logger.debug(f"ERA5 variable '{var_name}' current dimensions: {current_dims}")
+                        
+                        # Expected order: (time, lat, lon, pressure_level)
+                        expected_dims = ['time', 'lat', 'lon', 'pressure_level']
+                        
+                        # Only transpose if dimensions don't match expected order
+                        if current_dims != expected_dims and all(dim in current_dims for dim in expected_dims):
+                            logger.info(f"ERA5: Standardizing '{var_name}' dimensions from {current_dims} to {expected_dims}")
+                            ds_combined[var_name] = var_data.transpose(*expected_dims)
+                        elif 'latitude' in current_dims or 'longitude' in current_dims:
+                            # Handle coordinate renaming case - dimensions might use 'latitude'/'longitude'
+                            expected_dims_alt = ['time', 'latitude', 'longitude', 'pressure_level']
+                            if current_dims != expected_dims_alt and all(dim in current_dims for dim in expected_dims_alt):
+                                logger.info(f"ERA5: Standardizing '{var_name}' dimensions from {current_dims} to {expected_dims_alt}")
+                                ds_combined[var_name] = var_data.transpose(*expected_dims_alt)
+                        else:
+                            logger.debug(f"ERA5: Variable '{var_name}' dimensions already in correct order: {current_dims}")
+
             rename_coords = {}
             if 'latitude' in ds_combined.coords: rename_coords['latitude'] = 'lat'
             if 'longitude' in ds_combined.coords: rename_coords['longitude'] = 'lon'
@@ -558,9 +587,38 @@ async def fetch_era5_data_progressive(
         combined_ds = xr.concat(daily_datasets, dim='time')
         combined_ds = combined_ds.sortby('time')
         
+        # Remove duplicate time indices (can occur at day boundaries)
+        _, unique_indices = np.unique(combined_ds.time.values, return_index=True)
+        if len(unique_indices) < len(combined_ds.time):
+            logger.info(f"Removing {len(combined_ds.time) - len(unique_indices)} duplicate time indices")
+            combined_ds = combined_ds.isel(time=sorted(unique_indices))
+        
         # Select only the exact target times to minimize memory usage
         target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
         combined_ds = combined_ds.sel(time=target_times_np_ns, method='nearest')
+        
+        # STANDARDIZE DIMENSION ORDER: Ensure consistent dimensions after combining datasets
+        # ERA5 CDS format: (time, pressure_level, lat, lon)
+        # Aurora/Miner format: (time, lat, lon, pressure_level)
+        pressure_level_vars = ['t', 'u', 'v', 'q', 'z']  # Variables that have pressure levels
+        
+        for var_name in pressure_level_vars:
+            if var_name in combined_ds.data_vars:
+                var_data = combined_ds[var_name]
+                if 'pressure_level' in var_data.dims:
+                    # Check current dimension order
+                    current_dims = list(var_data.dims)
+                    logger.debug(f"Progressive ERA5 variable '{var_name}' current dimensions: {current_dims}")
+                    
+                    # Expected order: (time, lat, lon, pressure_level)
+                    expected_dims = ['time', 'lat', 'lon', 'pressure_level']
+                    
+                    # Only transpose if dimensions don't match expected order
+                    if current_dims != expected_dims and all(dim in current_dims for dim in expected_dims):
+                        logger.info(f"Progressive ERA5: Standardizing '{var_name}' dimensions from {current_dims} to {expected_dims}")
+                        combined_ds[var_name] = var_data.transpose(*expected_dims)
+                    else:
+                        logger.debug(f"Progressive ERA5: Variable '{var_name}' dimensions already in correct order: {current_dims}")
         
         logger.info(f"Progressive ERA5 fetch completed: {len(target_times)} time points from {len(daily_groups)} days")
         return combined_ds
@@ -688,13 +746,36 @@ async def _fetch_single_day_era5(
             ds_combined = xr.merge([ds_sl, ds_pl])
             
             logger.debug(f"After merge - combined coords: {list(ds_combined.coords.keys())}")
-            logger.debug(f"After merge - combined dimensions: {dict(ds_combined.dims)}")
+            logger.debug(f"After merge - combined dimensions: {dict(ds_combined.sizes)}")
+            
+            # STANDARDIZE DIMENSION ORDER: Transpose pressure level variables to match Aurora/miner format
+            # ERA5 CDS format: (time, pressure_level, lat, lon)
+            # Aurora/Miner format: (time, lat, lon, pressure_level)
+            pressure_level_vars = ['t', 'u', 'v', 'q', 'z']  # Variables that have pressure levels
+            
+            for var_name in pressure_level_vars:
+                if var_name in ds_combined.data_vars:
+                    var_data = ds_combined[var_name]
+                    if 'pressure_level' in var_data.dims:
+                        # Check current dimension order
+                        current_dims = list(var_data.dims)
+                        logger.debug(f"ERA5 variable '{var_name}' current dimensions: {current_dims}")
+                        
+                        # Expected order: (time, lat, lon, pressure_level)
+                        expected_dims = ['time', 'lat', 'lon', 'pressure_level']
+                        
+                        # Only transpose if dimensions don't match expected order
+                        if current_dims != expected_dims and all(dim in current_dims for dim in expected_dims):
+                            logger.info(f"ERA5: Standardizing '{var_name}' dimensions from {current_dims} to {expected_dims}")
+                            ds_combined[var_name] = var_data.transpose(*expected_dims)
+                        else:
+                            logger.debug(f"ERA5: Variable '{var_name}' dimensions already in correct order: {current_dims}")
             
             # Verify time coordinate exists after merge
             if 'time' not in ds_combined.coords and 'valid_time' not in ds_combined.coords:
                 logger.error(f"CRITICAL: Combined dataset missing time coordinate after merge!")
                 logger.error(f"Available coordinates: {list(ds_combined.coords.keys())}")
-                logger.error(f"Available dimensions: {dict(ds_combined.dims)}")
+                logger.error(f"Available dimensions: {dict(ds_combined.sizes)}")
                 raise ValueError("Missing time coordinate in merged dataset")
             
             # Coordinate adjustments with validation
@@ -741,7 +822,7 @@ async def _fetch_single_day_era5(
             if 'time' not in ds_combined.coords:
                 logger.error(f"CRITICAL: Missing time coordinate before saving!")
                 logger.error(f"Available coordinates: {list(ds_combined.coords.keys())}")
-                logger.error(f"Available dimensions: {dict(ds_combined.dims)}")
+                logger.error(f"Available dimensions: {dict(ds_combined.sizes)}")
                 raise ValueError("Missing time coordinate before cache save")
             
             # Save to cache with thread-safe netcdf handling

@@ -304,9 +304,9 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
             
             logger.info(f"[InferenceTask Job {job_id}] DIAGNOSTIC - LOCAL MODEL - Raw GFS data loaded:")
             logger.info(f"[InferenceTask Job {job_id}]   - ds_t0 variables: {list(ds_t0.data_vars.keys())}")
-            logger.info(f"[InferenceTask Job {job_id}]   - ds_t0 dims: {dict(ds_t0.dims)}")
+            logger.info(f"[InferenceTask Job {job_id}]   - ds_t0 dims: {dict(ds_t0.sizes)}")
             logger.info(f"[InferenceTask Job {job_id}]   - ds_t_minus_6 variables: {list(ds_t_minus_6.data_vars.keys())}")
-            logger.info(f"[InferenceTask Job {job_id}]   - ds_t_minus_6 dims: {dict(ds_t_minus_6.dims)}")
+            logger.info(f"[InferenceTask Job {job_id}]   - ds_t_minus_6 dims: {dict(ds_t_minus_6.sizes)}")
             
             logger.info(f"[InferenceTask Job {job_id}] Preparing Aurora batch from GFS data for local model...")
             gfs_concat_data_for_batch_prep = xr.concat([ds_t0, ds_t_minus_6], dim='time').sortby('time')
@@ -314,7 +314,7 @@ async def run_inference_background(task_instance: 'WeatherTask', job_id: str):
             # DIAGNOSTIC: Log combined dataset details
             logger.info(f"[InferenceTask Job {job_id}] DIAGNOSTIC - LOCAL MODEL - Combined GFS data:")
             logger.info(f"[InferenceTask Job {job_id}]   - Combined variables: {list(gfs_concat_data_for_batch_prep.data_vars.keys())}")
-            logger.info(f"[InferenceTask Job {job_id}]   - Combined dims: {dict(gfs_concat_data_for_batch_prep.dims)}")
+            logger.info(f"[InferenceTask Job {job_id}]   - Combined dims: {dict(gfs_concat_data_for_batch_prep.sizes)}")
             logger.info(f"[InferenceTask Job {job_id}]   - Time values: {gfs_concat_data_for_batch_prep.time.values}")
             if 'lat' in gfs_concat_data_for_batch_prep.coords:
                 lat_vals = gfs_concat_data_for_batch_prep.lat.values
@@ -1451,15 +1451,18 @@ async def finalize_scores_worker(self):
                 
                 # Progressive scoring: check all runs that might have some lead hours ready
                 if self.test_mode:
-                    logger.info("[FinalizeWorker] TEST MODE: Ignoring ERA5 delay, checking all runs for progressive final scoring")
+                    logger.info("[FinalizeWorker] TEST MODE: Ignoring ERA5 delay, checking recent runs for progressive final scoring")
+                    # Add time constraint even in test mode to prevent scanning too much historical data
+                    test_cutoff = now_utc - timedelta(days=30)  # Only look at runs from last 30 days
                     candidate_runs_query = """
                     SELECT id, gfs_init_time_utc
                     FROM weather_forecast_runs
-                    WHERE status IN ('day1_scoring_complete', 'ensemble_created', 'completed', 'all_forecasts_failed_verification', 'stalled_no_valid_forecasts', 'initial_scoring_failed', 'final_scoring_failed', 'scored')
-                    ORDER BY gfs_init_time_utc ASC
+                    WHERE gfs_init_time_utc > :test_cutoff
+                    AND status IN ('day1_scoring_complete', 'ensemble_created', 'completed', 'all_forecasts_failed_verification', 'stalled_no_valid_forecasts', 'initial_scoring_failed', 'final_scoring_failed', 'scored')
+                    ORDER BY gfs_init_time_utc DESC
                     LIMIT 20 
                     """
-                    candidate_runs = await self.db_manager.fetch_all(candidate_runs_query, {})
+                    candidate_runs = await self.db_manager.fetch_all(candidate_runs_query, {"test_cutoff": test_cutoff})
                 else:
                     # For progressive scoring, look at runs where the earliest lead hour might be ready
                     # Use the shortest lead hour (24h = day 1) to determine the earliest possible scoring time
@@ -1470,7 +1473,7 @@ async def finalize_scores_worker(self):
                     candidate_runs_query = """
                     SELECT id, gfs_init_time_utc
                     FROM weather_forecast_runs
-                    WHERE status IN ('processing_ensemble', 'completed', 'initial_scoring_failed', 'ensemble_failed', 'final_scoring_failed', 'scored', 'day1_scoring_complete') 
+                    WHERE status IN ('processing_ensemble', 'completed', 'initial_scoring_failed', 'ensemble_failed', 'final_scoring_failed', 'scored', 'day1_scoring_complete', 'era5_final_scoring_started', 'era5_final_scoring_partial') 
                     AND gfs_init_time_utc < :earliest_cutoff 
                     ORDER BY gfs_init_time_utc ASC
                     LIMIT 50
@@ -1512,10 +1515,38 @@ async def finalize_scores_worker(self):
                 
                 logger.info(f"[FinalizeWorker] Found {len(ready_runs)} runs with progressive scoring opportunities")
 
-                if not ready_runs:
-                    logger.debug("[FinalizeWorker] No runs ready for final scoring.")
+                # PROGRESSIVE COMPOSITE SCORING: Always check for missing composite scores (independent of individual scoring)
+                logger.info("[FinalizeWorker] Checking for runs with ERA5 scores but missing composite scores...")
+                composite_update_runs = []
+                
+                # Find runs that have individual ERA5 scores but are missing composite scores
+                missing_composite_query = """
+                    SELECT DISTINCT wfr.id, wfr.gfs_init_time_utc
+                    FROM weather_forecast_runs wfr
+                    INNER JOIN weather_miner_responses wmr ON wfr.id = wmr.run_id
+                    INNER JOIN weather_miner_scores wms ON wmr.id = wms.response_id
+                    WHERE wms.score_type LIKE '%era5%' 
+                    AND wms.score_type != 'era5_final_composite_score'
+                    AND wfr.gfs_init_time_utc > :cutoff_time
+                    AND wfr.id NOT IN (
+                        SELECT DISTINCT run_id FROM weather_miner_scores 
+                        WHERE score_type = 'era5_final_composite_score'
+                    )
+                    ORDER BY wfr.gfs_init_time_utc DESC
+                    LIMIT 50
+                """
+                cutoff_time = now_utc - timedelta(days=15)  # Look at runs from last 15 days
+                composite_update_runs = await self.db_manager.fetch_all(missing_composite_query, {"cutoff_time": cutoff_time})
+                
+                logger.info(f"[FinalizeWorker] Found {len(composite_update_runs)} runs with missing composite scores")
+                
+                if not ready_runs and not composite_update_runs:
+                    logger.debug("[FinalizeWorker] No runs ready for final scoring or composite updates.")
                 else:
-                    logger.info(f"[FinalizeWorker] Found {len(ready_runs)} runs potentially ready for final scoring.")
+                    if ready_runs:
+                        logger.info(f"[FinalizeWorker] Found {len(ready_runs)} runs potentially ready for final scoring.")
+                    if composite_update_runs:
+                        logger.info(f"[FinalizeWorker] Found {len(composite_update_runs)} runs needing composite score updates.")
                     work_done = True
 
                 for run in ready_runs:
@@ -1580,8 +1611,8 @@ async def finalize_scores_worker(self):
                             
                             logger.info(f"[FinalizeWorker] Run {run_id}: Proceeding with partial scoring for lead hours: {ready_lead_hours_for_run}")
                         else:
-                            logger.error(f"[FinalizeWorker] Run {run_id}: No ERA5 data available for any requested times. Skipping for now.")
-                            await _update_run_status(self, run_id, "initial_scoring_completed", error_message="ERA5 data not yet available - will retry")
+                            logger.info(f"[FinalizeWorker] Run {run_id}: No ERA5 data available for any requested times. Will retry when data becomes available.")
+                            await _update_run_status(self, run_id, "era5_final_scoring_started", error_message="ERA5 data not yet available - will retry when published")
                             processed_run_ids.add(run_id)
                             continue
 
@@ -1879,6 +1910,56 @@ async def finalize_scores_worker(self):
                         if len(verified_responses_for_run) > 10 and i_resp % 10 == 9:
                             await asyncio.sleep(0)
 
+                    # PROGRESSIVE COMPOSITE SCORING: Calculate/update composite scores for all miners with any ERA5 data
+                    logger.info(f"[FinalizeWorker] Run {run_id}: Calculating progressive composite scores for all miners with ERA5 data...")
+                    final_vars_levels_cfg = self.config.get('final_scoring_variables_levels', self.config.get('day1_variables_levels_to_score'))
+                    progressive_composite_count = 0
+                    
+                    for resp_rec in verified_responses_for_run:
+                        miner_uid = resp_rec['miner_uid']
+                        miner_hotkey = resp_rec['miner_hotkey']
+                        response_id = resp_rec['id']
+                        
+                        # Check if this miner has ANY ERA5 scores for this run (regardless of individual scoring success)
+                        has_era5_data_query = """
+                            SELECT COUNT(*) as score_count FROM weather_miner_scores 
+                            WHERE response_id = :resp_id AND score_type LIKE '%era5%' AND score_type != 'era5_final_composite_score'
+                        """
+                        era5_score_check = await self.db_manager.fetch_one(has_era5_data_query, {"resp_id": response_id})
+                        
+                        if era5_score_check and era5_score_check['score_count'] > 0:
+                            logger.debug(f"[FinalizeWorker] Run {run_id}: UID {miner_uid} has {era5_score_check['score_count']} ERA5 scores, calculating progressive composite...")
+                            
+                            # Get all lead hours that have been scored for this miner/run 
+                            scored_lead_hours_query = """
+                                SELECT DISTINCT lead_hours FROM weather_miner_scores 
+                                WHERE response_id = :resp_id AND score_type LIKE '%era5%' AND score_type != 'era5_final_composite_score'
+                                AND lead_hours IS NOT NULL AND lead_hours >= 0
+                            """
+                            scored_hours_result = await self.db_manager.fetch_all(scored_lead_hours_query, {"resp_id": response_id})
+                            scored_lead_hours = [r['lead_hours'] for r in scored_hours_result]
+                            
+                            if scored_lead_hours:
+                                try:
+                                    progressive_composite_score = await _calculate_and_store_aggregated_era5_score(
+                                        task_instance=self, run_id=run_id, miner_uid=miner_uid,
+                                        miner_hotkey=miner_hotkey, response_id=response_id,
+                                        lead_hours_scored=scored_lead_hours, vars_levels_scored=final_vars_levels_cfg
+                                    )
+                                    if progressive_composite_score is not None:
+                                        progressive_composite_count += 1
+                                        logger.info(f"[FinalizeWorker] Run {run_id}: Progressive composite score for UID {miner_uid}: {progressive_composite_score:.4f} (from {len(scored_lead_hours)} lead hours)")
+                                    else:
+                                        logger.warning(f"[FinalizeWorker] Run {run_id}: Failed to calculate progressive composite score for UID {miner_uid}")
+                                except Exception as e_prog_comp:
+                                    logger.error(f"[FinalizeWorker] Run {run_id}: Error calculating progressive composite for UID {miner_uid}: {e_prog_comp}")
+                            else:
+                                logger.debug(f"[FinalizeWorker] Run {run_id}: UID {miner_uid} has ERA5 scores but no valid lead_hours found")
+                        else:
+                            logger.debug(f"[FinalizeWorker] Run {run_id}: UID {miner_uid} has no ERA5 scores yet, skipping composite calculation")
+                    
+                    logger.info(f"[FinalizeWorker] Run {run_id}: Progressive composite scoring completed - {progressive_composite_count}/{len(verified_responses_for_run)} miners have composite scores")
+
                     # Enhanced summary with breakdown of results
                     total_attempted = len(verified_responses_for_run)
                     failed_total = failed_other_count
@@ -1911,6 +1992,77 @@ async def finalize_scores_worker(self):
                                 logger.debug(f"[FinalizeWorker] Run {run_id}: Final cleanup closed {ds_name}")
                             except Exception: 
                                 pass
+
+                # PROCESS COMPOSITE UPDATE RUNS: Handle runs that need composite score updates (independent of individual scoring)
+                for composite_run in composite_update_runs:
+                    comp_run_id = composite_run['id']
+                    if comp_run_id in processed_run_ids:
+                        continue  # Already processed in main loop
+                    
+                    logger.info(f"[FinalizeWorker] Processing composite score updates for run {comp_run_id}")
+                    
+                    # Get all verified miner responses for this run
+                    verified_responses_query = """
+                        SELECT * FROM weather_miner_responses 
+                        WHERE run_id = :run_id AND verification_passed = TRUE
+                    """
+                    composite_verified_responses = await self.db_manager.fetch_all(verified_responses_query, {"run_id": comp_run_id})
+                    
+                    if not composite_verified_responses:
+                        logger.debug(f"[FinalizeWorker] Run {comp_run_id}: No verified responses for composite updates")
+                        continue
+                    
+                    final_vars_levels_cfg = self.config.get('final_scoring_variables_levels', self.config.get('day1_variables_levels_to_score'))
+                    composite_count = 0
+                    
+                    for resp_rec in composite_verified_responses:
+                        miner_uid = resp_rec['miner_uid']
+                        miner_hotkey = resp_rec['miner_hotkey']
+                        response_id = resp_rec['id']
+                        
+                        # Check if this miner has ERA5 scores but missing composite
+                        era5_scores_query = """
+                            SELECT COUNT(*) as score_count FROM weather_miner_scores 
+                            WHERE response_id = :resp_id AND score_type LIKE '%era5%' AND score_type != 'era5_final_composite_score'
+                        """
+                        era5_check = await self.db_manager.fetch_one(era5_scores_query, {"resp_id": response_id})
+                        
+                        composite_exists_query = """
+                            SELECT COUNT(*) as composite_count FROM weather_miner_scores 
+                            WHERE response_id = :resp_id AND score_type = 'era5_final_composite_score'
+                        """
+                        composite_check = await self.db_manager.fetch_one(composite_exists_query, {"resp_id": response_id})
+                        
+                        if era5_check['score_count'] > 0 and composite_check['composite_count'] == 0:
+                            logger.info(f"[FinalizeWorker] Run {comp_run_id}: UID {miner_uid} has {era5_check['score_count']} ERA5 scores but no composite - calculating...")
+                            
+                            # Get all lead hours scored for this miner
+                            scored_lead_hours_query = """
+                                SELECT DISTINCT lead_hours FROM weather_miner_scores 
+                                WHERE response_id = :resp_id AND score_type LIKE '%era5%' AND score_type != 'era5_final_composite_score'
+                                AND lead_hours IS NOT NULL AND lead_hours >= 0
+                            """
+                            scored_hours_result = await self.db_manager.fetch_all(scored_lead_hours_query, {"resp_id": response_id})
+                            scored_lead_hours = [r['lead_hours'] for r in scored_hours_result]
+                            
+                            if scored_lead_hours:
+                                try:
+                                    composite_score = await _calculate_and_store_aggregated_era5_score(
+                                        task_instance=self, run_id=comp_run_id, miner_uid=miner_uid,
+                                        miner_hotkey=miner_hotkey, response_id=response_id,
+                                        lead_hours_scored=scored_lead_hours, vars_levels_scored=final_vars_levels_cfg
+                                    )
+                                    if composite_score is not None:
+                                        composite_count += 1
+                                        logger.info(f"[FinalizeWorker] Run {comp_run_id}: Created composite score for UID {miner_uid}: {composite_score:.4f}")
+                                    else:
+                                        logger.warning(f"[FinalizeWorker] Run {comp_run_id}: Failed to create composite score for UID {miner_uid}")
+                                except Exception as e_comp:
+                                    logger.error(f"[FinalizeWorker] Run {comp_run_id}: Error creating composite for UID {miner_uid}: {e_comp}")
+                    
+                    logger.info(f"[FinalizeWorker] Run {comp_run_id}: Composite update completed - {composite_count} new composite scores created")
+                    processed_run_ids.add(comp_run_id)
+                    work_done = True
 
                 if work_done:
                     gc.collect()

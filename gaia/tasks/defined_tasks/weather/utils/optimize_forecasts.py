@@ -149,7 +149,7 @@ def remove_singleton_dims(ds: xr.Dataset) -> xr.Dataset:
     Returns:
         Dataset with singleton dimensions removed
     """
-    singleton_dims = [dim for dim, size in ds.dims.items() if size == 1]
+    singleton_dims = [dim for dim, size in ds.sizes.items() if size == 1]
     
     if singleton_dims:
         ds = ds.squeeze(singleton_dims)
