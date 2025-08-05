@@ -1,7 +1,6 @@
 import asyncio
 import traceback
 import logging
-from json import load
 from typing import Any, Dict, Optional, List
 from pathlib import Path
 
@@ -46,8 +45,6 @@ class InferenceModel:
         _checkpoint = self.model_config.get('checkpoint', "aurora-0.25-pretrained.ckpt")
         self.model_name: str = f"{_model_repo}/{_checkpoint}"
         self._load_model_and_device()
-        _new_stats = self._load_surf_stats_from_json(f"{_model_repo}/norm_all.json")
-        self._override_model_surf_stats(self.model, _new_stats)
 
     def _load_model_and_device(self):
         """
@@ -126,24 +123,6 @@ class InferenceModel:
         except Exception as e:
             logger.error(f"CRITICAL (General Exception) failed to load Aurora model '{model_repo_path_or_name}/{checkpoint_filename}': {e}", exc_info=True)
             self.model = None
-
-    def _load_surf_stats_from_json(json_path: str):
-        LEVELS = [50,100,150,200,250,300,400,500,600,700,850,925,1000]
-        with open(json_path) as f:
-            data = load(f)
-        surf_stats = {}
-        for var in ["2t","10u","10v","msl"]:
-            if var in data["locations"]:
-                surf_stats[(var, None)] = (data["locations"][var], data["scales"][var])
-        for lvl in LEVELS:
-            for var in ["t","u","v","q","z"]:
-                key = f"{var}_{lvl}"
-                if key in data["locations"]:
-                    surf_stats[(var, lvl)] = (data["locations"][key], data["scales"][key])
-        return surf_stats
-
-    def _override_model_surf_stats(model: AuroraModelType, new_stats: dict):
-        model.surf_stats = new_stats
 
     async def run_inference(self, input_batch: BatchType, steps: int) -> Optional[List[BatchType]]:
         """
