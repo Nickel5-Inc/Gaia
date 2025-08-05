@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: gaia
-Version: 2.4.1
+Version: 2.4.3
 Summary: This project implements the Gaia subnet for Bittensor
 Author: geardici, oneandahalfcats, qucat, gabby
 Requires-Python: >=3.10
@@ -37,6 +37,7 @@ Requires-Dist: cchardet==2.1.7
 Requires-Dist: cdsapi==0.7.6
 Requires-Dist: certifi==2025.4.26
 Requires-Dist: cffi==1.17.1
+Requires-Dist: cfgrib==0.9.15.0
 Requires-Dist: cftime==1.6.4.post1
 Requires-Dist: charset-normalizer==3.4.2
 Requires-Dist: click==8.2.0
@@ -51,6 +52,7 @@ Requires-Dist: cycler==0.12.1
 Requires-Dist: cytoolz==1.0.1
 Requires-Dist: dask[array]==2025.5.1
 Requires-Dist: decorator==5.2.1
+Requires-Dist: eccodes==2.42.0
 Requires-Dist: ecdsa==0.19.1
 Requires-Dist: ecmwf-datastores-client==0.1.0
 Requires-Dist: einops==0.8.1
@@ -63,6 +65,7 @@ Requires-Dist: fastapi==0.112.0
 Requires-Dist: fasteners==0.19
 Requires-Dist: fiber[full]@ git+https://github.com/rayonlabs/fiber.git@production
 Requires-Dist: filelock==3.18.0
+Requires-Dist: findlibs==0.1.1
 Requires-Dist: flexcache==0.3
 Requires-Dist: flexparser==0.4
 Requires-Dist: fonttools==4.58.0
@@ -84,7 +87,7 @@ Requires-Dist: h5netcdf==1.6.1
 Requires-Dist: h5py==3.13.0
 Requires-Dist: holidays==0.72
 Requires-Dist: httpcore==1.0.9
-Requires-Dist: httpx==0.27.0
+Requires-Dist: httpx==0.27.2
 Requires-Dist: huggingface-hub==0.31.2
 Requires-Dist: idna==3.10
 Requires-Dist: imageio==2.37.0
@@ -110,7 +113,7 @@ Requires-Dist: mdit-py-plugins==0.4.2
 Requires-Dist: mdurl==0.1.2
 Requires-Dist: memray==1.17.2
 Requires-Dist: metpy==1.7.0
-Requires-Dist: microsoft-aurora==1.5.2
+Requires-Dist: microsoft-aurora==1.7.0
 Requires-Dist: more-itertools==10.7.0
 Requires-Dist: mpmath==1.3.0
 Requires-Dist: msgpack==1.1.1
@@ -196,7 +199,7 @@ Requires-Dist: sympy==1.14.0
 Requires-Dist: tenacity==9.0.0
 Requires-Dist: textual==3.4.0
 Requires-Dist: tifffile==2025.5.10
-Requires-Dist: timm==0.6.13
+Requires-Dist: timm==1.0.19
 Requires-Dist: toml==0.10.0
 Requires-Dist: tomli==2.2.1
 Requires-Dist: toolz==1.0.0
