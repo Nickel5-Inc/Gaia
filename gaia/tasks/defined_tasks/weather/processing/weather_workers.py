@@ -1424,6 +1424,14 @@ async def finalize_scores_worker(self):
     FORECAST_DURATION_HOURS = int(self.config.get('forecast_duration_hours', 240))
     ERA5_BUFFER_HOURS = int(self.config.get('era5_buffer_hours', 6))
 
+    # ERA5 availability tracking to prevent redundant API calls for unavailable data
+    # PERSISTENT across worker cycles to maintain backoff state
+    if not hasattr(self, 'era5_failed_attempts'):
+        self.era5_failed_attempts = {}  # date_str -> {"last_attempt": datetime, "retry_after": datetime}
+    era5_failed_attempts = self.era5_failed_attempts  # Local reference for easier access
+    era5_retry_backoff_hours = self.config.get('era5_retry_backoff_hours', 6)  # Don't retry failed dates for 6 hours
+    logger.info(f"[FinalizeWorker] Using ERA5 retry backoff: {era5_retry_backoff_hours} hours for failed fetch attempts. Current backoff entries: {len(era5_failed_attempts)}")
+
     era5_climatology_ds_for_cycle = await self._get_or_load_era5_climatology()
     if era5_climatology_ds_for_cycle is None:
         logger.error("[FinalizeWorker] ERA5 Climatology not available at worker startup. Worker will not be effective. Please check config.")
@@ -1458,7 +1466,7 @@ async def finalize_scores_worker(self):
                     SELECT id, gfs_init_time_utc
                     FROM weather_forecast_runs
                     WHERE gfs_init_time_utc > :test_cutoff
-                    AND status IN ('day1_scoring_complete', 'ensemble_created', 'completed', 'all_forecasts_failed_verification', 'stalled_no_valid_forecasts', 'initial_scoring_failed', 'final_scoring_failed', 'scored')
+                    AND status IN ('day1_scoring_complete', 'ensemble_created', 'completed', 'all_forecasts_failed_verification', 'stalled_no_valid_forecasts', 'initial_scoring_failed', 'final_scoring_failed', 'scored', 'era5_final_scoring_started', 'era5_final_scoring_partial')
                     ORDER BY gfs_init_time_utc DESC
                     LIMIT 20 
                     """
@@ -1490,6 +1498,9 @@ async def finalize_scores_worker(self):
                     
                     # Check which lead hours are ready for this specific run
                     ready_lead_hours = []
+                    backoff_lead_hours = []
+                    already_scored_lead_hours = []
+                    
                     for lead_hour in sparse_lead_hours_config:
                         forecast_target_time = gfs_init_time + timedelta(hours=lead_hour)
                         era5_needed_time = forecast_target_time + timedelta(days=ERA5_DELAY_DAYS) + timedelta(hours=ERA5_BUFFER_HOURS)
@@ -1506,12 +1517,39 @@ async def finalize_scores_worker(self):
                             })
                             
                             if existing_count['count'] == 0:
+                                # Also check if this date is in backoff and if backoff has expired
+                                date_str = forecast_target_time.strftime('%Y-%m-%d')
+                                if date_str in self.era5_failed_attempts:
+                                    retry_after = self.era5_failed_attempts[date_str].get('retry_after')
+                                    if retry_after and now_utc < retry_after:
+                                        backoff_lead_hours.append(lead_hour)
+                                        logger.info(f"[FinalizeWorker] Run {run_id}: Lead hour {lead_hour}h (date {date_str}) in ERA5 backoff until {retry_after}")
+                                        continue  # Skip this lead hour, still in backoff
+                                    else:
+                                        logger.info(f"[FinalizeWorker] Run {run_id}: Lead hour {lead_hour}h (date {date_str}) backoff expired, will retry")
+                                        # Remove expired backoff record
+                                        del self.era5_failed_attempts[date_str]
+                                
                                 ready_lead_hours.append(lead_hour)
+                            else:
+                                already_scored_lead_hours.append(lead_hour)
                     
                     if ready_lead_hours:
                         run['ready_lead_hours'] = ready_lead_hours
                         ready_runs.append(run)
                         logger.info(f"[FinalizeWorker] Run {run_id} (GFS: {gfs_init_time}): Ready lead hours: {ready_lead_hours}")
+                    else:
+                        # Log why this run was skipped
+                        skip_reasons = []
+                        if backoff_lead_hours:
+                            skip_reasons.append(f"{len(backoff_lead_hours)} in ERA5 backoff")
+                        if already_scored_lead_hours:
+                            skip_reasons.append(f"{len(already_scored_lead_hours)} already scored")
+                        
+                        if skip_reasons:
+                            logger.info(f"[FinalizeWorker] Run {run_id} (GFS: {gfs_init_time}): Skipped - {', '.join(skip_reasons)}")
+                        else:
+                            logger.info(f"[FinalizeWorker] Run {run_id} (GFS: {gfs_init_time}): Skipped - no lead hours ready for ERA5 scoring yet")
                 
                 logger.info(f"[FinalizeWorker] Found {len(ready_runs)} runs with progressive scoring opportunities")
 
@@ -1570,22 +1608,74 @@ async def finalize_scores_worker(self):
                     ready_lead_hours_for_run = run['ready_lead_hours']
                     target_datetimes_for_run = [gfs_init_time + timedelta(hours=h) for h in ready_lead_hours_for_run]
 
-                    logger.info(f"[FinalizeWorker] Run {run_id}: Fetching ERA5 analysis for progressive final scoring at ready lead hours: {ready_lead_hours_for_run}.")
+                    # SMART RETRY BACKOFF: Check if any target dates have recent failed attempts
+                    now_utc = datetime.now(timezone.utc)
+                    target_dates_to_fetch = []
+                    skipped_dates = []
+                    
+                    for target_dt in target_datetimes_for_run:
+                        date_str = target_dt.strftime('%Y-%m-%d')
+                        if date_str in self.era5_failed_attempts:
+                            retry_after = self.era5_failed_attempts[date_str].get('retry_after')
+                            if retry_after and now_utc < retry_after:
+                                skipped_dates.append(date_str)
+                                logger.debug(f"[FinalizeWorker] Run {run_id}: Skipping ERA5 fetch for {date_str} (retry backoff until {retry_after})")
+                                continue
+                        target_dates_to_fetch.append(target_dt)
+                    
+                    if skipped_dates:
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Skipping {len(skipped_dates)} dates due to retry backoff: {skipped_dates}")
+                    
+                    if not target_dates_to_fetch:
+                        logger.info(f"[FinalizeWorker] Run {run_id}: All target dates are in retry backoff. Will retry later.")
+                        
+                        # Check if this run has any existing scores and update status accordingly
+                        existing_scores_query = """
+                            SELECT COUNT(DISTINCT lead_hours) as scored_count FROM weather_miner_scores 
+                            WHERE run_id = :run_id AND score_type LIKE '%era5%' AND score_type != 'era5_final_composite_score'
+                            AND lead_hours IS NOT NULL AND lead_hours >= 0
+                        """
+                        existing_scores_result = await self.db_manager.fetch_one(existing_scores_query, {"run_id": run_id})
+                        scored_count = existing_scores_result['scored_count'] if existing_scores_result else 0
+                        
+                        if scored_count > 0:
+                            # Run has partial scores, mark as partial
+                            await _update_run_status(self, run_id, "era5_final_scoring_partial", 
+                                                    error_message=f"Partial scoring complete ({scored_count} lead hours), remaining dates in retry backoff")
+                            logger.info(f"[FinalizeWorker] Run {run_id}: Updated status to partial (has {scored_count} lead hours scored)")
+                        else:
+                            # No scores yet, keep in started state
+                            await _update_run_status(self, run_id, "era5_final_scoring_started", 
+                                                    error_message="ERA5 data not yet available - in retry backoff")
+                        
+                        processed_run_ids.add(run_id)
+                        continue
+
+                    logger.info(f"[FinalizeWorker] Run {run_id}: Fetching ERA5 analysis for {len(target_dates_to_fetch)} dates (skipped {len(skipped_dates)} in backoff).")
                     era5_cache = Path(self.config.get('era5_cache_dir', './era5_cache'))
                     
                     # Use progressive ERA5 fetch for better data transfer efficiency
                     use_progressive_fetch = self.config.get('progressive_era5_fetch', True)
                     if use_progressive_fetch:
-                        logger.debug(f"[FinalizeWorker] Run {run_id}: Using progressive ERA5 fetch for {len(target_datetimes_for_run)} time points")
-                        era5_ds_for_run = await fetch_era5_data_progressive(target_times=target_datetimes_for_run, cache_dir=era5_cache)
+                        logger.debug(f"[FinalizeWorker] Run {run_id}: Using progressive ERA5 fetch for {len(target_dates_to_fetch)} time points")
+                        era5_ds_for_run = await fetch_era5_data_progressive(target_times=target_dates_to_fetch, cache_dir=era5_cache)
                     else:
                         logger.debug(f"[FinalizeWorker] Run {run_id}: Using standard ERA5 fetch")
-                        era5_ds_for_run = await fetch_era5_data(target_times=target_datetimes_for_run, cache_dir=era5_cache)
+                        era5_ds_for_run = await fetch_era5_data(target_times=target_dates_to_fetch, cache_dir=era5_cache)
 
                     if era5_ds_for_run is None:
                         logger.warning(f"[FinalizeWorker] Run {run_id}: Failed to fetch ERA5 data for requested times. Checking for partial data availability...")
                         
-                        # Try to get whatever ERA5 data IS available
+                        # Record failed fetch attempts for backoff tracking
+                        for failed_dt in target_dates_to_fetch:
+                            date_str = failed_dt.strftime('%Y-%m-%d')
+                            self.era5_failed_attempts[date_str] = {
+                                "last_attempt": now_utc,
+                                "retry_after": now_utc + timedelta(hours=era5_retry_backoff_hours)
+                            }
+                            logger.debug(f"[FinalizeWorker] Run {run_id}: Recorded ERA5 failure for {date_str}, retry after {self.era5_failed_attempts[date_str]['retry_after']}")
+                        
+                        # Try to get whatever ERA5 data IS available (including dates not in backoff)
                         available_times = []
                         for target_dt in target_datetimes_for_run:
                             try:
@@ -1594,10 +1684,27 @@ async def finalize_scores_worker(self):
                                 if single_time_data is not None:
                                     available_times.append(target_dt)
                                     logger.debug(f"[FinalizeWorker] Run {run_id}: ERA5 data available for {target_dt}")
+                                    # Clear any previous failure record for successful fetches
+                                    date_str = target_dt.strftime('%Y-%m-%d')
+                                    if date_str in self.era5_failed_attempts:
+                                        del self.era5_failed_attempts[date_str]
+                                        logger.debug(f"[FinalizeWorker] Run {run_id}: Cleared failure record for {date_str} (now available)")
                                 else:
                                     logger.debug(f"[FinalizeWorker] Run {run_id}: ERA5 data NOT available for {target_dt}")
+                                    # Record individual date failure
+                                    date_str = target_dt.strftime('%Y-%m-%d')
+                                    self.era5_failed_attempts[date_str] = {
+                                        "last_attempt": now_utc,
+                                        "retry_after": now_utc + timedelta(hours=era5_retry_backoff_hours)
+                                    }
                             except Exception as e:
                                 logger.debug(f"[FinalizeWorker] Run {run_id}: ERA5 check failed for {target_dt}: {e}")
+                                # Record exception as failure too
+                                date_str = target_dt.strftime('%Y-%m-%d')
+                                self.era5_failed_attempts[date_str] = {
+                                    "last_attempt": now_utc,
+                                    "retry_after": now_utc + timedelta(hours=era5_retry_backoff_hours)
+                                }
                         
                         if available_times:
                             logger.info(f"[FinalizeWorker] Run {run_id}: Found ERA5 data for {len(available_times)}/{len(target_datetimes_for_run)} requested times")
@@ -2061,11 +2168,40 @@ async def finalize_scores_worker(self):
                                     logger.error(f"[FinalizeWorker] Run {comp_run_id}: Error creating composite for UID {miner_uid}: {e_comp}")
                     
                     logger.info(f"[FinalizeWorker] Run {comp_run_id}: Composite update completed - {composite_count} new composite scores created")
+                    
+                    # Update run status to reflect composite scoring progress
+                    if composite_count > 0:
+                        # Check if this run has made significant progress and should be marked as partial/complete
+                        all_lead_hours = self.config.get('final_scoring_lead_hours', [24, 48, 72, 96, 120, 144, 168, 192, 216, 240])
+                        scored_hours_for_status_query = """
+                            SELECT DISTINCT lead_hours FROM weather_miner_scores 
+                            WHERE run_id = :run_id AND score_type LIKE '%era5%' AND score_type != 'era5_final_composite_score'
+                            AND lead_hours IS NOT NULL AND lead_hours >= 0
+                        """
+                        status_scored_result = await self.db_manager.fetch_all(scored_hours_for_status_query, {"run_id": comp_run_id})
+                        scored_lead_hours_for_status = [r['lead_hours'] for r in status_scored_result]
+                        
+                        if scored_lead_hours_for_status:
+                            completion_ratio = len(scored_lead_hours_for_status) / len(all_lead_hours)
+                            logger.info(f"[FinalizeWorker] Run {comp_run_id}: Completion ratio: {completion_ratio:.2%} ({len(scored_lead_hours_for_status)}/{len(all_lead_hours)} lead hours)")
+                            
+                            # Update status based on completion and track progress
+                            await self._track_progressive_scoring_completion(comp_run_id, scored_lead_hours_for_status)
+                    
                     processed_run_ids.add(comp_run_id)
                     work_done = True
 
                 if work_done:
                     gc.collect()
+                    
+                    # Periodic cleanup of old ERA5 failed attempts (prevent memory bloat)
+                    cleanup_cutoff = now_utc - timedelta(hours=24)  # Remove failures older than 24 hours
+                    old_dates = [date_str for date_str, failure_info in self.era5_failed_attempts.items() 
+                                if failure_info.get('last_attempt', now_utc) < cleanup_cutoff]
+                    for old_date in old_dates:
+                        del self.era5_failed_attempts[old_date]
+                    if old_dates:
+                        logger.debug(f"[FinalizeWorker] Cleaned up {len(old_dates)} old ERA5 failure records: {old_dates}")
 
             except Exception as e:
                 logger.error(f"[FinalizeWorker] Unexpected error (Last run_id: {run_id}): {e}", exc_info=True)

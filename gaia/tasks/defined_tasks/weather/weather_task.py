@@ -143,6 +143,8 @@ def _load_config(self):
     # Optimized for progressive scoring: reduce delay since we're scoring days individually
     config['era5_delay_days'] = int(os.getenv('WEATHER_ERA5_DELAY_DAYS', '4'))  # Reduced from 5 to 4 days
     config['era5_buffer_hours'] = int(os.getenv('WEATHER_ERA5_BUFFER_HOURS', '6'))
+    # Smart retry backoff: avoid redundant API calls for known-unavailable ERA5 dates
+    config['era5_retry_backoff_hours'] = int(os.getenv('WEATHER_ERA5_RETRY_BACKOFF_HOURS', '6'))  # Don't retry failed dates for 6 hours
     config['cleanup_check_interval_seconds'] = int(os.getenv('WEATHER_CLEANUP_INTERVAL_S', '21600')) # 6 hours
     config['gfs_analysis_cache_dir'] = os.getenv('WEATHER_GFS_CACHE_DIR', './gfs_analysis_cache')
     config['era5_cache_dir'] = os.getenv('WEATHER_ERA5_CACHE_DIR', './era5_cache')
@@ -3607,6 +3609,76 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         
         return storage_info
 
+    async def _is_run_stale(self, run_id: int, status: str, run_age_hours: float) -> Tuple[bool, str]:
+        """
+        Intelligent stale detection that considers run status, test mode, and ERA5 backoff states.
+        Returns (is_stale, reason_string)
+        """
+        now_utc = datetime.now(timezone.utc)
+        
+        # Different timeout thresholds based on status and mode
+        if self.test_mode:
+            # Much more generous in test mode
+            general_timeout_hours = 240  # 10 days
+            era5_timeout_hours = 480    # 20 days
+        else:
+            # Production timeouts
+            general_timeout_hours = 48   # 2 days
+            era5_timeout_hours = 168    # 7 days for ERA5 states (data availability can take time)
+        
+        # ERA5 final scoring states need special handling
+        if status in ['era5_final_scoring_started', 'era5_final_scoring_partial']:
+            # Check if this run might be in ERA5 backoff
+            if hasattr(self, 'era5_failed_attempts') and self.era5_failed_attempts:
+                # Get the GFS init time to check relevant dates
+                gfs_query = "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id"
+                gfs_result = await self.db_manager.fetch_one(gfs_query, {"run_id": run_id})
+                
+                if gfs_result:
+                    gfs_init_time = gfs_result['gfs_init_time_utc']
+                    sparse_lead_hours = self.config.get('final_scoring_lead_hours', [24, 48, 72, 96, 120, 144, 168, 192, 216, 240])
+                    
+                    # Check if any dates for this run are in backoff
+                    dates_in_backoff = []
+                    latest_backoff_expiry = None
+                    
+                    for lead_hour in sparse_lead_hours:
+                        forecast_target_time = gfs_init_time + timedelta(hours=lead_hour)
+                        date_str = forecast_target_time.strftime('%Y-%m-%d')
+                        
+                        if date_str in self.era5_failed_attempts:
+                            retry_after = self.era5_failed_attempts[date_str].get('retry_after')
+                            if retry_after and now_utc < retry_after:
+                                dates_in_backoff.append(date_str)
+                                if latest_backoff_expiry is None or retry_after > latest_backoff_expiry:
+                                    latest_backoff_expiry = retry_after
+                    
+                    # If dates are still in backoff, don't mark as stale
+                    if dates_in_backoff:
+                        time_until_backoff_expires = (latest_backoff_expiry - now_utc).total_seconds() / 3600
+                        logger.debug(f"Run {run_id}: {len(dates_in_backoff)} dates in ERA5 backoff, expires in {time_until_backoff_expires:.1f}h")
+                        return False, f"waiting for ERA5 backoff to expire"
+                    
+                    # If backoff expired recently, give extra time before marking stale
+                    if latest_backoff_expiry and (now_utc - latest_backoff_expiry).total_seconds() < 12 * 3600:  # 12 hours grace period
+                        return False, f"ERA5 backoff recently expired, allowing retry"
+            
+            # Use ERA5-specific timeout
+            if run_age_hours > era5_timeout_hours:
+                logger.debug(f"Run {run_id}: marking as stale - ERA5 age {run_age_hours:.1f}h > {era5_timeout_hours}h threshold")
+                return True, f"age {run_age_hours:.1f}h > {era5_timeout_hours}h threshold for ERA5 scoring"
+            else:
+                logger.debug(f"Run {run_id}: not stale - ERA5 age {run_age_hours:.1f}h within {era5_timeout_hours}h threshold")
+                return False, f"within ERA5 timeout ({run_age_hours:.1f}h < {era5_timeout_hours}h)"
+        
+        # General timeout for other statuses
+        if run_age_hours > general_timeout_hours:
+            logger.debug(f"Run {run_id}: marking as stale - age {run_age_hours:.1f}h > {general_timeout_hours}h threshold")
+            return True, f"age {run_age_hours:.1f}h > {general_timeout_hours}h threshold"
+        else:
+            logger.debug(f"Run {run_id}: not stale - age {run_age_hours:.1f}h within {general_timeout_hours}h threshold")
+            return False, f"within timeout ({run_age_hours:.1f}h < {general_timeout_hours}h)"
+
     async def _check_and_recover_incomplete_runs_sequential(self, processed_runs_this_session=None, max_attempts_per_run=3):
         """
         Sequential version of run recovery that processes one run at a time to avoid system overload.
@@ -3684,10 +3756,12 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             if attempt_count >= max_attempts_per_run:
                 continue
                 
-            # Skip if run is too old (older than 48 hours)
+            # Smart stale detection - different logic for different statuses
             run_age_hours = (datetime.now(timezone.utc) - run['run_initiation_time']).total_seconds() / 3600
-            if run_age_hours > 48:
-                logger.warning(f"Run {run_id} is too old ({run_age_hours:.1f}h), marking as stale")
+            is_stale, stale_reason = await self._is_run_stale(run_id, status, run_age_hours)
+            
+            if is_stale:
+                logger.warning(f"Run {run_id} is stale ({stale_reason}), marking as abandoned")
                 await _update_run_status(self, run_id, "stale_abandoned")
                 logger.info(f"Stale run {run_id} marked as abandoned - validator will immediately proceed to check for new run creation")
                 return "stale_processed"  # Special return value for stale runs
@@ -4333,7 +4407,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             # Check how many total lead hours have been scored for this run
             scored_hours_query = """
             SELECT DISTINCT lead_hours FROM weather_miner_scores 
-            WHERE run_id = :run_id AND score_type LIKE '%era5%'
+            WHERE run_id = :run_id AND score_type LIKE '%era5%' AND score_type != 'era5_final_composite_score'
+            AND lead_hours IS NOT NULL AND lead_hours >= 0
             ORDER BY lead_hours
             """
             scored_results = await self.db_manager.fetch_all(scored_hours_query, {"run_id": run_id})

@@ -319,7 +319,7 @@ memray==1.17.2
     # via -r requirements.in
 metpy==1.7.0
     # via -r requirements.in
-microsoft-aurora==1.5.2
+microsoft-aurora
     # via -r requirements.in
 more-itertools==10.7.0
     # via scalecodec
