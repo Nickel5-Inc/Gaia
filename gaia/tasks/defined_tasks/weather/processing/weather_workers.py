@@ -874,6 +874,20 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                     task_instance.initial_scoring_queue.task_done()
                     continue
 
+                # Additional defensive check: If run has ERA5-related status, it likely already has Day-1 scores
+                if run_record['status'].startswith('era5_'):
+                    # Double-check by looking for existing Day-1 scores
+                    existing_day1_scores = await task_instance.db_manager.fetch_one(
+                        "SELECT COUNT(*) as count FROM weather_miner_scores WHERE run_id = :run_id AND score_type = 'day1_qc_score'",
+                        {"run_id": run_id}
+                    )
+                    
+                    if existing_day1_scores and existing_day1_scores['count'] > 0:
+                        logger.info(f"[Day1ScoringWorker] Run {run_id}: Has ERA5 status '{run_record['status']}' and existing Day-1 scores. Skipping duplicate Day-1 scoring.")
+                        await task_instance._complete_scoring_job(run_id, 'day1_qc', success=True, error_message="ERA5 status with existing Day-1 scores - duplicate avoided")
+                        task_instance.initial_scoring_queue.task_done()
+                        continue
+
                 gfs_init_time = run_record['gfs_init_time_utc']
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: gfs_init_time: {gfs_init_time}")
                 
@@ -912,7 +926,15 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 already_scored = total_miners - len(responses)
                 
                 if already_scored > 0:
-                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Smart partial retry - {already_scored} miners already have Day1 scores, processing remaining {len(responses)} miners")
+                    # Use comprehensive partial recovery progress logging
+                    progress_stats = await _log_partial_recovery_progress(
+                        worker_name="Day1ScoringWorker",
+                        run_id=run_id,
+                        score_type="day1_qc",
+                        completed_count=already_scored,
+                        remaining_count=len(responses),
+                        additional_context="Resuming Day-1 QC scoring from previous progress"
+                    )
                 
                 min_members_for_scoring = 1
                 if not responses or len(responses) < min_members_for_scoring:
@@ -1810,7 +1832,15 @@ async def finalize_scores_worker(self):
                     already_scored = total_miners - len(verified_responses_for_run)
                     
                     if already_scored > 0:
-                        logger.info(f"[FinalizeWorker] Run {run_id}: Smart partial retry - {already_scored} miners already have ERA5 final scores, processing remaining {len(verified_responses_for_run)} miners")
+                        # Use comprehensive partial recovery progress logging
+                        progress_stats = await _log_partial_recovery_progress(
+                            worker_name="FinalizeWorker",
+                            run_id=run_id,
+                            score_type="era5_final",
+                            completed_count=already_scored,
+                            remaining_count=len(verified_responses_for_run),
+                            additional_context="Resuming ERA5 final scoring from previous progress"
+                        )
 
                     if not verified_responses_for_run:
                         logger.warning(f"[FinalizeWorker] Run {run_id}: No verified responses. Skipping miner scoring.")
@@ -3994,6 +4024,70 @@ async def _cleanup_failed_multipart_uploads_for_job(
 
     except Exception as e:
         logger.error(f"[{job_id}] Error during multipart upload cleanup: {e}", exc_info=True)
+
+async def _log_partial_recovery_progress(
+    worker_name: str, 
+    run_id: int, 
+    score_type: str, 
+    completed_count: int, 
+    remaining_count: int,
+    additional_context: str = ""
+) -> dict:
+    """
+    Log detailed progress information for partial scoring recovery.
+    
+    Args:
+        worker_name: Name of the scoring worker (e.g., "Day1ScoringWorker", "FinalizeWorker")
+        run_id: Run ID being recovered
+        score_type: Type of scoring (e.g., "day1_qc", "era5_final") 
+        completed_count: Number of miners already scored
+        remaining_count: Number of miners still to be scored
+        additional_context: Additional context for logging
+        
+    Returns:
+        Dictionary with recovery progress stats
+    """
+    
+    total_miners = completed_count + remaining_count
+    completion_percent = (completed_count / total_miners * 100) if total_miners > 0 else 0
+    
+    # Determine recovery efficiency message
+    if completion_percent == 0:
+        efficiency_msg = "Starting fresh scoring"
+    elif completion_percent < 25:
+        efficiency_msg = "Early stage recovery"
+    elif completion_percent < 50:
+        efficiency_msg = "Mid-stage recovery" 
+    elif completion_percent < 80:
+        efficiency_msg = "Advanced recovery"
+    elif completion_percent < 100:
+        efficiency_msg = "Near-completion recovery (very efficient!)"
+    else:
+        efficiency_msg = "Full completion detected"
+    
+    # Main progress log
+    logger.info(f"[{worker_name}] Run {run_id}: 📊 Partial {score_type} recovery progress: "
+               f"{completed_count}/{total_miners} miners complete ({completion_percent:.1f}%) - {efficiency_msg}")
+    
+    # Additional context if provided
+    if additional_context:
+        logger.info(f"[{worker_name}] Run {run_id}: {additional_context}")
+        
+    # Recovery efficiency insights
+    if completion_percent >= 50:
+        time_saved_estimate = completion_percent  # Rough estimate: % complete = % time saved
+        logger.info(f"[{worker_name}] Run {run_id}: ⚡ Partial recovery efficiency: ~{time_saved_estimate:.0f}% time saved vs full re-scoring")
+    
+    # Return progress stats for further use
+    return {
+        "total_miners": total_miners,
+        "completed_count": completed_count,
+        "remaining_count": remaining_count,
+        "completion_percent": completion_percent,
+        "efficiency_category": efficiency_msg,
+        "is_efficient_recovery": completion_percent >= 25
+    }
+
 
 async def _proactive_memory_cleanup(context: str, memory_threshold_mb: int = 8000, force: bool = False) -> dict:
     """

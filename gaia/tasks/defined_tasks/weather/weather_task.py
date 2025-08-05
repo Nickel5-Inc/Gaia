@@ -167,6 +167,10 @@ def _load_config(self):
     # Memory management configuration for handling many miners
     config['per_miner_cleanup_threshold'] = int(os.getenv('WEATHER_PER_MINER_CLEANUP_THRESHOLD', '15'))  # Switch to per-miner cleanup above this many miners
     config['era5_per_miner_cleanup_threshold'] = int(os.getenv('WEATHER_ERA5_PER_MINER_CLEANUP_THRESHOLD', '10'))  # ERA5 per-miner cleanup threshold
+    
+    # Partial recovery configuration
+    config['partial_recovery_log_threshold'] = int(os.getenv('WEATHER_PARTIAL_RECOVERY_LOG_THRESHOLD', '25'))  # Log efficiency gains above this % completion
+    config['efficient_recovery_threshold'] = int(os.getenv('WEATHER_EFFICIENT_RECOVERY_THRESHOLD', '50'))  # Consider "efficient" above this % completion
     config['ensemble_retention_days'] = int(os.getenv('WEATHER_ENSEMBLE_RETENTION_DAYS', '14'))
     config['db_run_retention_days'] = int(os.getenv('WEATHER_DB_RUN_RETENTION_DAYS', '90'))
     config['input_batch_retention_days'] = int(os.getenv('WEATHER_INPUT_BATCH_RETENTION_DAYS', '3'))  # New: retention for input batch pickle files
@@ -3861,22 +3865,67 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 logger.info(f"Recovering run {run_id}: processing ready for scoring")
                 await self._continue_run_workflow(run_id)
                 
-            elif status in ['day1_scoring_started', 'era5_final_scoring_started']:
-                logger.info(f"Recovering run {run_id}: resetting stuck scoring state '{status}' - likely interrupted by restart")
+            elif status == 'day1_scoring_started':
+                logger.info(f"Recovering run {run_id}: resetting stuck Day-1 scoring state '{status}' - likely interrupted by restart")
                 
                 # Reset run status to allow re-processing
                 await _update_run_status(self, run_id, "verifying_miner_forecasts")
                 
-                # Reset scoring jobs to queued status for retry with smart partial logic
-                scoring_type = 'day1_qc' if status == 'day1_scoring_started' else 'era5_final'
+                # Reset Day-1 scoring job to queued status for retry with smart partial logic
                 reset_job_query = """
                 UPDATE weather_scoring_jobs 
                 SET status = 'queued', started_at = NULL, error_message = 'Reset due to validator restart during scoring'
-                WHERE run_id = :run_id AND score_type = :score_type AND status IN ('in_progress', 'queued')
+                WHERE run_id = :run_id AND score_type = 'day1_qc' AND status IN ('in_progress', 'queued')
                 """
-                await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": scoring_type})
+                await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": 'day1_qc'})
                 
-                logger.info(f"Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with '{scoring_type}' job queued for smart partial retry")
+                logger.info(f"Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with 'day1_qc' job queued for smart partial retry")
+                
+                # Trigger immediate scoring check
+                await self._continue_run_workflow(run_id)
+                
+            elif status == 'era5_final_scoring_started':
+                logger.info(f"Recovering run {run_id}: resetting stuck ERA5 scoring state '{status}' - likely interrupted by restart")
+                
+                # Check progress of both Day-1 and ERA5 scoring for smart recovery
+                day1_complete_check = await self.db_manager.fetch_one(
+                    "SELECT COUNT(*) as count FROM weather_miner_scores WHERE run_id = :run_id AND score_type = 'day1_qc_score'",
+                    {"run_id": run_id}
+                )
+                
+                era5_partial_check = await self.db_manager.fetch_one(
+                    "SELECT COUNT(*) as era5_count FROM weather_miner_scores WHERE run_id = :run_id AND score_type = 'era5_final_composite_score'",
+                    {"run_id": run_id}
+                )
+                
+                day1_count = day1_complete_check['count'] if day1_complete_check else 0
+                era5_count = era5_partial_check['era5_count'] if era5_partial_check else 0
+                
+                # Log partial recovery information
+                if era5_count > 0:
+                    logger.info(f"Run {run_id}: ERA5 partial progress detected - {era5_count} miners already have ERA5 scores")
+                
+                if day1_count > 0:
+                    # Day-1 scoring is complete, reset to day1_scoring_complete to trigger ERA5 scoring
+                    await _update_run_status(self, run_id, "day1_scoring_complete")
+                    logger.info(f"Run {run_id}: Reset from '{status}' to 'day1_scoring_complete' (Day-1 complete: {day1_count} miners) for ERA5 partial recovery")
+                else:
+                    # Day-1 scoring not complete, reset to earlier state
+                    await _update_run_status(self, run_id, "verifying_miner_forecasts")
+                    logger.info(f"Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' (Day-1 not complete)")
+                
+                # Reset ERA5 scoring job to queued status for smart partial recovery
+                reset_job_query = """
+                UPDATE weather_scoring_jobs 
+                SET status = 'queued', started_at = NULL, error_message = 'Reset for partial recovery after validator restart'
+                WHERE run_id = :run_id AND score_type = 'era5_final' AND status IN ('in_progress', 'queued')
+                """
+                await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": 'era5_final'})
+                
+                if era5_count > 0:
+                    logger.info(f"Run {run_id}: Reset ERA5 scoring job for smart partial recovery (will resume from {era5_count} completed miners)")
+                else:
+                    logger.info(f"Run {run_id}: Reset ERA5 scoring job for full scoring")
                 
                 # Trigger immediate scoring check
                 await self._continue_run_workflow(run_id)
@@ -4504,11 +4553,35 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             AND wj.started_at > (CURRENT_TIMESTAMP - INTERVAL '24 hours')
             AND NOT (
                 (wj.score_type = 'day1_qc' AND wfr.status IN ('day1_scoring_complete', 'completed', 'scored')) OR
-                (wj.score_type = 'era5_final' AND wfr.status IN ('completed', 'scored'))
+                (wj.score_type = 'era5_final' AND wfr.status IN ('completed', 'scored')) OR
+                (wj.score_type = 'day1_qc' AND wfr.status LIKE 'era5_%')  -- Don't re-trigger Day-1 if already in ERA5 phases
             )
             ORDER BY wj.started_at ASC
             """
             incomplete_jobs = await self.db_manager.fetch_all(query)
+            
+            # Additional filtering to prevent Day-1 jobs from being re-triggered for runs with existing Day-1 scores
+            filtered_jobs = []
+            for job in incomplete_jobs:
+                if job['score_type'] == 'day1_qc':
+                    # Check if this run already has Day-1 scores
+                    existing_scores = await self.db_manager.fetch_one(
+                        "SELECT COUNT(*) as count FROM weather_miner_scores WHERE run_id = :run_id AND score_type = 'day1_qc_score'",
+                        {"run_id": job['run_id']}
+                    )
+                    
+                    if existing_scores and existing_scores['count'] > 0:
+                        logger.info(f"Run {job['run_id']}: Skipping Day-1 job recovery - already has {existing_scores['count']} Day-1 scores")
+                        # Mark the job as completed to clear the in_progress status
+                        await self.db_manager.execute(
+                            "UPDATE weather_scoring_jobs SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE run_id = :run_id AND score_type = 'day1_qc'",
+                            {"run_id": job['run_id']}
+                        )
+                        continue
+                
+                filtered_jobs.append(job)
+            
+            incomplete_jobs = filtered_jobs
             
             # Also find runs that are in partial scoring states but might have stalled
             stalled_partial_query = """
