@@ -935,6 +935,14 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                         remaining_count=len(responses),
                         additional_context="Resuming Day-1 QC scoring from previous progress"
                     )
+                    
+                    # CRITICAL FIX: If 100% complete (no remaining work), mark as successful completion
+                    if len(responses) == 0 and already_scored > 0:
+                        logger.info(f"[Day1ScoringWorker] Run {run_id}: ✅ Day-1 scoring already 100% complete ({already_scored} miners). Marking as successful.")
+                        await _update_run_status(task_instance, run_id, "day1_scoring_complete")
+                        await task_instance._complete_scoring_job(run_id, 'day1_qc', success=True, error_message="Already 100% complete - no additional work needed")
+                        task_instance.initial_scoring_queue.task_done()
+                        continue
                 
                 min_members_for_scoring = 1
                 if not responses or len(responses) < min_members_for_scoring:
@@ -1841,6 +1849,17 @@ async def finalize_scores_worker(self):
                             remaining_count=len(verified_responses_for_run),
                             additional_context="Resuming ERA5 final scoring from previous progress"
                         )
+                        
+                        # CRITICAL FIX: If 100% complete (no remaining work), mark as successful completion
+                        if len(verified_responses_for_run) == 0 and already_scored > 0:
+                            logger.info(f"[FinalizeWorker] Run {run_id}: ✅ ERA5 scoring already 100% complete ({already_scored} miners). Marking as successful.")
+                            await _update_run_status(self, run_id, "completed")
+                            await self._complete_scoring_job(run_id, 'era5_final', success=True, error_message="Already 100% complete - no additional work needed")
+                            processed_run_ids.add(run_id)
+                            if era5_ds_for_run: era5_ds_for_run.close()
+                            if 'era5_climatology_ds_for_cycle' in locals() and era5_climatology_ds_for_cycle: 
+                                era5_climatology_ds_for_cycle.close()
+                            continue
 
                     if not verified_responses_for_run:
                         logger.warning(f"[FinalizeWorker] Run {run_id}: No verified responses. Skipping miner scoring.")
