@@ -860,10 +860,17 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 await task_instance._start_scoring_job(run_id, 'day1_qc')
                 await _update_run_status(task_instance, run_id, "day1_scoring_started")
                 
-                run_details_query = "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id"
+                run_details_query = "SELECT gfs_init_time_utc, status FROM weather_forecast_runs WHERE id = :run_id"
                 run_record = await task_instance.db_manager.fetch_one(run_details_query, {"run_id": run_id})
                 if not run_record:
                     logger.error(f"[Day1ScoringWorker] Run {run_id}: Details not found. Skipping.")
+                    task_instance.initial_scoring_queue.task_done()
+                    continue
+
+                # Defensive check: Skip if run is already completed to avoid race conditions with recovery
+                if run_record['status'] in ('day1_scoring_complete', 'completed', 'scored'):
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Already completed (status: {run_record['status']}). Skipping duplicate scoring.")
+                    await task_instance._complete_scoring_job(run_id, 'day1_qc', success=True, error_message="Already completed - duplicate avoided")
                     task_instance.initial_scoring_queue.task_done()
                     continue
 
@@ -1081,24 +1088,73 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 if len(scoring_tasks) > 15:
                     await _proactive_memory_cleanup(f"Day1Scoring-Run{run_id}-PreProcess", 6000)
                 
-                # Process miners in smaller batches to prevent memory buildup
-                batch_size = min(task_instance.config.get('scoring_batch_size', 20), len(scoring_tasks))
-                evaluation_results = []
+                # Process miners individually with per-miner memory cleanup to handle many miners
+                from ..utils.memory_management import PerMinerMemoryManager
                 
-                for batch_start in range(0, len(scoring_tasks), batch_size):
-                    batch_end = min(batch_start + batch_size, len(scoring_tasks))
-                    batch_tasks = scoring_tasks[batch_start:batch_end]
+                # Initialize per-miner memory manager
+                memory_manager = PerMinerMemoryManager("Day1ScoringWorker")
+                
+                # Check if we should use per-miner cleanup (for runs with many miners)
+                use_per_miner_cleanup = len(scoring_tasks) > task_instance.config.get('per_miner_cleanup_threshold', 15)
+                batch_size = min(task_instance.config.get('scoring_batch_size', 20), len(scoring_tasks))
+                
+                if use_per_miner_cleanup:
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Using per-miner memory cleanup for {len(scoring_tasks)} miners")
+                    # Process miners individually with memory cleanup between each
+                    evaluation_results = []
                     
-                    logger.info(f"[Day1ScoringWorker] Run {run_id}: Processing miner batch {batch_start//batch_size + 1}/{(len(scoring_tasks) + batch_size - 1)//batch_size} ({len(batch_tasks)} miners)")
+                    for i, scoring_task in enumerate(scoring_tasks):
+                        logger.debug(f"[Day1ScoringWorker] Run {run_id}: Processing miner {i+1}/{len(scoring_tasks)}")
+                        
+                        # Execute single miner scoring
+                        miner_result = await scoring_task
+                        evaluation_results.append(miner_result)
+                        
+                        # Get miner hotkey for cleanup logging
+                        miner_hotkey = "unknown"
+                        try:
+                            if hasattr(scoring_task, '__name__'):
+                                # Try to extract miner info from task context if possible
+                                miner_response_rec = responses[i] if i < len(responses) else {}
+                                miner_hotkey = miner_response_rec.get('miner_hotkey', f'miner_{i}')
+                        except Exception:
+                            miner_hotkey = f'miner_{i}'
+                        
+                        # Per-miner memory cleanup (skip for last miner to avoid redundant cleanup)
+                        if i < len(scoring_tasks) - 1:
+                            cleanup_stats = memory_manager.cleanup_between_miners(
+                                miner_hotkey=miner_hotkey,
+                                run_id=run_id,
+                                force_aggressive=(i % 20 == 19)  # Aggressive cleanup every 20 miners
+                            )
+                            
+                            if cleanup_stats["lru_caches_cleared"] > 0 or cleanup_stats["gc_objects_collected"] > 50:
+                                logger.debug(f"[Day1ScoringWorker] Run {run_id}: Per-miner cleanup after {miner_hotkey}: "
+                                           f"LRU caches: {cleanup_stats['lru_caches_cleared']}, "
+                                           f"GC objects: {cleanup_stats['gc_objects_collected']}")
+                        
+                        # Yield control periodically for large runs
+                        if i % 5 == 0:
+                            await asyncio.sleep(0)
                     
-                    batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-                    evaluation_results.extend(batch_results)
+                else:
+                    # Use original batch processing for smaller runs
+                    evaluation_results = []
                     
-                    # Memory cleanup between batches (but not on the last batch)
-                    if batch_end < len(scoring_tasks):
-                        cleanup_stats = await _proactive_memory_cleanup(f"Day1Scoring-Run{run_id}-Batch{batch_start//batch_size + 1}", 7000)
-                        if cleanup_stats.get("triggered", False):
-                            logger.info(f"[Day1ScoringWorker] Run {run_id}: Inter-batch cleanup freed {cleanup_stats['memory_freed_mb']:.1f} MB")
+                    for batch_start in range(0, len(scoring_tasks), batch_size):
+                        batch_end = min(batch_start + batch_size, len(scoring_tasks))
+                        batch_tasks = scoring_tasks[batch_start:batch_end]
+                        
+                        logger.info(f"[Day1ScoringWorker] Run {run_id}: Processing miner batch {batch_start//batch_size + 1}/{(len(scoring_tasks) + batch_size - 1)//batch_size} ({len(batch_tasks)} miners)")
+                        
+                        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                        evaluation_results.extend(batch_results)
+                        
+                        # Memory cleanup between batches (but not on the last batch)
+                        if batch_end < len(scoring_tasks):
+                            cleanup_stats = await _proactive_memory_cleanup(f"Day1Scoring-Run{run_id}-Batch{batch_start//batch_size + 1}", 7000)
+                            if cleanup_stats.get("triggered", False):
+                                logger.info(f"[Day1ScoringWorker] Run {run_id}: Inter-batch cleanup freed {cleanup_stats['memory_freed_mb']:.1f} MB")
                 
                 # CRITICAL: Comprehensive cleanup after all miners processed
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: Starting comprehensive cleanup after scoring all miners...")
@@ -1783,24 +1839,73 @@ async def finalize_scores_worker(self):
                          if len(verified_responses_for_run) > 5 and len(scoring_execution_tasks) % 5 == 0:
                              await asyncio.sleep(0)
 
-                    # Process miners in batches to prevent memory buildup during ERA5 scoring
-                    batch_size = min(self.config.get('era5_scoring_batch_size', 10), len(scoring_execution_tasks))
-                    miner_scoring_results = []
+                    # Process miners with per-miner memory cleanup for ERA5 scoring
+                    from ..utils.memory_management import PerMinerMemoryManager
                     
-                    for batch_start in range(0, len(scoring_execution_tasks), batch_size):
-                        batch_end = min(batch_start + batch_size, len(scoring_execution_tasks))
-                        batch_tasks = scoring_execution_tasks[batch_start:batch_end]
+                    # Initialize per-miner memory manager for ERA5 scoring
+                    era5_memory_manager = PerMinerMemoryManager("FinalizeWorker")
+                    
+                    # Check if we should use per-miner cleanup (for runs with many miners)
+                    use_per_miner_cleanup = len(scoring_execution_tasks) > self.config.get('era5_per_miner_cleanup_threshold', 10)
+                    batch_size = min(self.config.get('era5_scoring_batch_size', 10), len(scoring_execution_tasks))
+                    
+                    if use_per_miner_cleanup:
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Using per-miner memory cleanup for ERA5 scoring of {len(scoring_execution_tasks)} miners")
+                        # Process miners individually with memory cleanup between each
+                        miner_scoring_results = []
                         
-                        logger.info(f"[FinalizeWorker] Run {run_id}: Processing ERA5 batch {batch_start//batch_size + 1}/{(len(scoring_execution_tasks) + batch_size - 1)//batch_size} ({len(batch_tasks)} miners)")
+                        for i, scoring_task in enumerate(scoring_execution_tasks):
+                            logger.debug(f"[FinalizeWorker] Run {run_id}: Processing ERA5 miner {i+1}/{len(scoring_execution_tasks)}")
+                            
+                            # Execute single miner ERA5 scoring
+                            miner_result = await scoring_task
+                            miner_scoring_results.append(miner_result)
+                            
+                            # Get miner hotkey for cleanup logging
+                            miner_hotkey = "unknown"
+                            try:
+                                if i < len(verified_responses_for_run):
+                                    miner_hotkey = verified_responses_for_run[i].get('miner_hotkey', f'era5_miner_{i}')
+                                else:
+                                    miner_hotkey = f'era5_miner_{i}'
+                            except Exception:
+                                miner_hotkey = f'era5_miner_{i}'
+                            
+                            # Per-miner memory cleanup (skip for last miner to avoid redundant cleanup)
+                            if i < len(scoring_execution_tasks) - 1:
+                                cleanup_stats = era5_memory_manager.cleanup_between_miners(
+                                    miner_hotkey=miner_hotkey,
+                                    run_id=run_id,
+                                    force_aggressive=(i % 15 == 14)  # Aggressive cleanup every 15 miners for ERA5
+                                )
+                                
+                                if cleanup_stats["lru_caches_cleared"] > 0 or cleanup_stats["gc_objects_collected"] > 50:
+                                    logger.debug(f"[FinalizeWorker] Run {run_id}: ERA5 per-miner cleanup after {miner_hotkey}: "
+                                               f"LRU caches: {cleanup_stats['lru_caches_cleared']}, "
+                                               f"GC objects: {cleanup_stats['gc_objects_collected']}")
+                            
+                            # Yield control periodically for large runs
+                            if i % 3 == 0:  # More frequent yielding for ERA5 (heavier operations)
+                                await asyncio.sleep(0)
                         
-                        batch_results = await asyncio.gather(*batch_tasks)
-                        miner_scoring_results.extend(batch_results)
+                    else:
+                        # Use original batch processing for smaller runs
+                        miner_scoring_results = []
                         
-                        # Memory cleanup between ERA5 batches (but not on the last batch)
-                        if batch_end < len(scoring_execution_tasks):
-                            cleanup_stats = await _proactive_memory_cleanup(f"ERA5Scoring-Run{run_id}-Batch{batch_start//batch_size + 1}", 9000)
-                            if cleanup_stats.get("triggered", False):
-                                logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 inter-batch cleanup freed {cleanup_stats['memory_freed_mb']:.1f} MB")
+                        for batch_start in range(0, len(scoring_execution_tasks), batch_size):
+                            batch_end = min(batch_start + batch_size, len(scoring_execution_tasks))
+                            batch_tasks = scoring_execution_tasks[batch_start:batch_end]
+                            
+                            logger.info(f"[FinalizeWorker] Run {run_id}: Processing ERA5 batch {batch_start//batch_size + 1}/{(len(scoring_execution_tasks) + batch_size - 1)//batch_size} ({len(batch_tasks)} miners)")
+                            
+                            batch_results = await asyncio.gather(*batch_tasks)
+                            miner_scoring_results.extend(batch_results)
+                            
+                            # Memory cleanup between ERA5 batches (but not on the last batch)
+                            if batch_end < len(scoring_execution_tasks):
+                                cleanup_stats = await _proactive_memory_cleanup(f"ERA5Scoring-Run{run_id}-Batch{batch_start//batch_size + 1}", 9000)
+                                if cleanup_stats.get("triggered", False):
+                                    logger.info(f"[FinalizeWorker] Run {run_id}: ERA5 inter-batch cleanup freed {cleanup_stats['memory_freed_mb']:.1f} MB")
                     
                     successful_final_scores_count = 0
                     

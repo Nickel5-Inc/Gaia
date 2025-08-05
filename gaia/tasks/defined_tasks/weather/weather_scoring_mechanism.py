@@ -28,6 +28,9 @@ from .weather_scoring.metrics import (
     _calculate_latitude_weights,
 )
 
+# Import memory-aware caching to prevent unlimited cache growth during scoring
+from .utils.memory_management import memory_aware_cache
+
 logger = get_logger(__name__)
 
 # Constants for Day-1 Scoring

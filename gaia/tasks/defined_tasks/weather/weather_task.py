@@ -163,6 +163,10 @@ def _load_config(self):
     config['memory_emergency_threshold_mb'] = int(os.getenv('WEATHER_MEMORY_EMERGENCY_THRESHOLD_MB', '15000'))  # Emergency warning threshold
     config['scoring_batch_size'] = int(os.getenv('WEATHER_SCORING_BATCH_SIZE', '20'))  # Day-1 scoring batch size
     config['era5_scoring_batch_size'] = int(os.getenv('WEATHER_ERA5_SCORING_BATCH_SIZE', '10'))  # ERA5 scoring batch size
+    
+    # Memory management configuration for handling many miners
+    config['per_miner_cleanup_threshold'] = int(os.getenv('WEATHER_PER_MINER_CLEANUP_THRESHOLD', '15'))  # Switch to per-miner cleanup above this many miners
+    config['era5_per_miner_cleanup_threshold'] = int(os.getenv('WEATHER_ERA5_PER_MINER_CLEANUP_THRESHOLD', '10'))  # ERA5 per-miner cleanup threshold
     config['ensemble_retention_days'] = int(os.getenv('WEATHER_ENSEMBLE_RETENTION_DAYS', '14'))
     config['db_run_retention_days'] = int(os.getenv('WEATHER_DB_RUN_RETENTION_DAYS', '90'))
     config['input_batch_retention_days'] = int(os.getenv('WEATHER_INPUT_BATCH_RETENTION_DAYS', '3'))  # New: retention for input batch pickle files
@@ -1357,6 +1361,13 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         logger.info("Starting WeatherTask validator execution loop...")
         
         if not self.initial_scoring_worker_running:
+            # Apply global LRU cache limits to prevent unlimited memory growth during scoring
+            try:
+                from .utils.memory_management import apply_global_lru_limits
+                apply_global_lru_limits()
+            except Exception as e:
+                logger.warning(f"Failed to apply global LRU cache limits: {e}")
+            
             await self.start_background_workers(num_initial_scoring_workers=1, num_final_scoring_workers=1, num_cleanup_workers=1)
             logger.info("Started background workers for scoring and cleanup.")
 
@@ -4484,12 +4495,18 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         """Recover scoring jobs that were interrupted by restarts."""
         try:
             # Find jobs that were in progress when restart happened
+            # Exclude runs that have already completed their scoring to avoid race conditions
             query = """
-            SELECT run_id, score_type, started_at
-            FROM weather_scoring_jobs 
-            WHERE status = 'in_progress'
-            AND started_at > (CURRENT_TIMESTAMP - INTERVAL '24 hours')
-            ORDER BY started_at ASC
+            SELECT wj.run_id, wj.score_type, wj.started_at
+            FROM weather_scoring_jobs wj
+            JOIN weather_forecast_runs wfr ON wj.run_id = wfr.id
+            WHERE wj.status = 'in_progress'
+            AND wj.started_at > (CURRENT_TIMESTAMP - INTERVAL '24 hours')
+            AND NOT (
+                (wj.score_type = 'day1_qc' AND wfr.status IN ('day1_scoring_complete', 'completed', 'scored')) OR
+                (wj.score_type = 'era5_final' AND wfr.status IN ('completed', 'scored'))
+            )
+            ORDER BY wj.started_at ASC
             """
             incomplete_jobs = await self.db_manager.fetch_all(query)
             
