@@ -45,142 +45,17 @@ class MinerScoreSender:
         results = await self.db_manager.fetch_all(query)
         return [{"uid": row["uid"], "hotkey": row["hotkey"], "coldkey": row["coldkey"]} for row in results]
 
-    def _process_geomagnetic_row_sync(self, row: Dict) -> Optional[Dict]:
-        """Synchronous helper to process a single geomagnetic history row."""
-        try:
-            # Convert to float and check for NaN/Inf
-            pred_value = float(row["predicted_value"])
-            truth_value = float(row["ground_truth_value"])
-            score_value = float(row["score"])
-
-            if all(not math.isnan(v) and not math.isinf(v) for v in [pred_value, truth_value, score_value]):
-                # query_time is when the prediction was made and the input data timestamp
-                query_time = row["query_time"]
-                
-                # Geomagnetic predictions target 1 hour into the future
-                from datetime import timedelta
-                target_time = query_time + timedelta(hours=1)
-                
-                return {
-                    "predictionId": row["id"],
-                    "predictionDate": query_time.isoformat(),                    # When prediction was made
-                    "geomagneticPredictionTargetDate": target_time.isoformat(), # What time was predicted (query_time + 1hr)
-                    "geomagneticPredictionInputDate": query_time.isoformat(),   # Input data timestamp
-                    "geomagneticPredictedValue": pred_value,
-                    "geomagneticGroundTruthValue": truth_value,
-                    "geomagneticScore": score_value,
-                    "scoreGenerationDate": row["scored_at"].isoformat()
-                }
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Invalid numeric value in geo row {row.get('id', 'N/A')}, skipping: {e}")
-        return None
+    # Geomagnetic processing removed (task disabled)
 
     async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
-        # First clean up NaN values from history
-        # cleanup_query = """
-        #     DELETE FROM geomagnetic_history 
-        #     WHERE miner_hotkey = :miner_hotkey 
-        #     AND (
-        #         predicted_value IS NULL 
-        #         OR ground_truth_value IS NULL 
-        #         OR score IS NULL
-        #         OR predicted_value::text = 'NaN'
-        #         OR ground_truth_value::text = 'NaN'
-        #         OR score::text = 'NaN'
-        #     )
-        # """
-        # await self.db_manager.execute(cleanup_query, {"miner_hotkey": miner_hotkey})
+        """Geomagnetic task disabled - return empty list."""
+        return []
 
-        # Then fetch valid records
-        query = """
-            SELECT id, query_time, predicted_value, ground_truth_value, score, scored_at
-            FROM geomagnetic_history
-            WHERE miner_hotkey = :miner_hotkey
-            AND predicted_value IS NOT NULL 
-            AND ground_truth_value IS NOT NULL 
-            AND score IS NOT NULL
-            AND predicted_value::text != 'NaN'
-            AND ground_truth_value::text != 'NaN'
-            AND score::text != 'NaN'
-            ORDER BY scored_at DESC
-            LIMIT 10
-        """
-        results = await self.db_manager.fetch_all(query, {"miner_hotkey": miner_hotkey})
-
-        if not results:
-            return []
-
-        loop = asyncio.get_event_loop()
-        # Offload row processing
-        processed_rows = await loop.run_in_executor(
-            None, 
-            lambda rows: [self._process_geomagnetic_row_sync(r) for r in rows], 
-            results
-        )
-        
-        # Filter out None results (from rows that failed processing)
-        valid_predictions = [p for p in processed_rows if p is not None]
-        return valid_predictions
-
-    def _process_soil_row_sync(self, row: Dict) -> Dict:
-        """Synchronous helper to process a single soil moisture history row."""
-        # Ensure json is imported within the sync function if not globally available in the executor's context
-        # import json # Not strictly needed if json is a built-in and standard library.
-        return {
-            "predictionId": row["id"],
-            "predictionDate": row["target_time"].isoformat(),
-            "soilPredictionRegionId": row["region_id"],
-            "sentinelRegionBounds": json.dumps(row["sentinel_bounds"]) if row["sentinel_bounds"] else "[]",
-            "sentinelRegionCrs": row["sentinel_crs"] if row["sentinel_crs"] else 4326,
-            "soilPredictionTargetDate": row["target_time"].isoformat(),
-            "soilSurfaceRmse": row["surface_rmse"],
-            "soilRootzoneRmse": row["rootzone_rmse"],
-            "soilSurfacePredictedValues": json.dumps(row["surface_sm_pred"]) if row["surface_sm_pred"] else "[]",
-            "soilRootzonePredictedValues": json.dumps(row["rootzone_sm_pred"]) if row["rootzone_sm_pred"] else "[]",
-            "soilSurfaceGroundTruthValues": json.dumps(row["surface_sm_truth"]) if row["surface_sm_truth"] else "[]",
-            "soilRootzoneGroundTruthValues": json.dumps(row["rootzone_sm_truth"]) if row["rootzone_sm_truth"] else "[]",
-            "soilSurfaceStructureScore": row["surface_structure_score"],
-            "soilRootzoneStructureScore": row["rootzone_structure_score"],
-            "scoreGenerationDate": row["scored_at"].isoformat(),
-        }
+    # Soil moisture processing removed (task disabled)
 
     async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
-        query = """
-            SELECT soil_moisture_history.id, 
-                   soil_moisture_history.target_time,
-                   soil_moisture_history.region_id, 
-                   COALESCE(soil_moisture_history.sentinel_bounds, soil_moisture_regions.sentinel_bounds) as sentinel_bounds,
-                   COALESCE(soil_moisture_history.sentinel_crs, soil_moisture_regions.sentinel_crs) as sentinel_crs,
-                   soil_moisture_history.surface_rmse, 
-                   soil_moisture_history.rootzone_rmse, 
-                   soil_moisture_history.surface_sm_pred,
-                   soil_moisture_history.rootzone_sm_pred, 
-                   soil_moisture_history.surface_sm_truth,
-                   soil_moisture_history.rootzone_sm_truth, 
-                   soil_moisture_history.surface_structure_score,
-                   soil_moisture_history.rootzone_structure_score, 
-                   soil_moisture_history.scored_at
-            FROM soil_moisture_history
-            LEFT JOIN soil_moisture_regions 
-            ON soil_moisture_history.region_id = soil_moisture_regions.id
-            WHERE soil_moisture_history.miner_hotkey = :miner_hotkey
-            ORDER BY soil_moisture_history.scored_at DESC
-            LIMIT 10
-        """
-        results = await self.db_manager.fetch_all(query, {"miner_hotkey": miner_hotkey})
-        
-        if not results:
-            return []
-            
-        # import json # Moved to _process_soil_row_sync if strictly needed there.
-        loop = asyncio.get_event_loop()
-        # Offload row processing (list comprehension equivalent)
-        processed_rows = await loop.run_in_executor(
-            None,
-            lambda rows: [self._process_soil_row_sync(r) for r in rows],
-            results
-        )
-        return processed_rows # Assuming _process_soil_row_sync never returns None, or they are acceptable
+        """Soil moisture task disabled - return empty list."""
+        return []
 
     async def send_to_gaia(self):
         try:
@@ -210,16 +85,15 @@ class MinerScoreSender:
                     async with miner_processing_semaphore:
                         try:
                             logger.debug(f"Processing miner {miner['hotkey']} under semaphore")
-                            geo_history, soil_history = await asyncio.gather(
-                                self.fetch_geomagnetic_history(miner["hotkey"]),
-                                self.fetch_soil_moisture_history(miner["hotkey"])
-                            )
+                            # Only fetch weather data (other tasks disabled)
+                            geo_history = []  # Geomagnetic disabled
+                            soil_history = []  # Soil moisture disabled
                             logger.debug(f"Fetched history for miner {miner['hotkey']}")
                             return {
                                 "minerHotKey": miner["hotkey"],
                                 "minerColdKey": miner["coldkey"],
-                                "geomagneticPredictions": geo_history or [],
-                                "soilMoisturePredictions": soil_history or []
+                                "geomagneticPredictions": [],  # Geomagnetic task disabled
+                                "soilMoisturePredictions": []  # Soil moisture task disabled
                             }
                         except Exception as e:
                             logger.error(f"Error processing miner {miner['hotkey']} under semaphore: {str(e)}\n{traceback.format_exc()}")

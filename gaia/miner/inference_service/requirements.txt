@@ -31,4 +31,5 @@ microsoft_aurora
 # Potentially aurora-weather (or the correct package name for the Aurora SDK)
 # If Aurora requires specific system libraries, they need to be in the Dockerfile 
 
-boto3 
+boto3
+

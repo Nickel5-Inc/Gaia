@@ -22,13 +22,13 @@ gaia/miner/utils/generate_jwt_secret.py
 gaia/miner/utils/health_check_miner.py
 gaia/miner/utils/subnet.py
 gaia/models/__init__.py
-gaia/models/geomag_basemodel.py
-gaia/models/soil_moisture_basemodel.py
 gaia/models/weather_basemodel.py
 gaia/tasks/__init__.py
 gaia/tasks/base/__init__.py
 gaia/tasks/base/decorators.py
 gaia/tasks/base/deterministic_job_id.py
+gaia/tasks/base/miner_performance_calculator.py
+gaia/tasks/base/performance_stats_example.py
 gaia/tasks/base/task.py
 gaia/tasks/base/components/__init__.py
 gaia/tasks/base/components/inputs.py
@@ -41,5 +41,6 @@ gaia/validator/__init__.py
 gaia/validator/basemodel_evaluator.py
 gaia/validator/validator.py
 gaia/validator/database/__init__.py
+gaia/validator/database/alembic_corruption_repair.py
 gaia/validator/database/comprehensive_db_setup.py
 gaia/validator/database/validator_database_manager.py

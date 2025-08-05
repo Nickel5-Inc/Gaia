@@ -1,6 +1,6 @@
 import asyncio
 import traceback
-from typing import Any, Dict, List, Optional, Union, Tuple
+from typing import Any, Dict, List, Optional, Union, Tuple, Set
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 import os
@@ -127,17 +127,50 @@ def _load_config(self):
     
     # Scoring Parameters
     config['initial_scoring_lead_hours'] = parse_int_list('WEATHER_INITIAL_SCORING_LEAD_HOURS', [6, 12]) # Day 0.25, 0.5
-    config['final_scoring_lead_hours'] = parse_int_list('WEATHER_FINAL_SCORING_LEAD_HOURS', [60,78,138]) # Day 2, 3, 5
+    # Progressive daily scoring: score each day from 1-10 as ERA5 data becomes available
+    config['final_scoring_lead_hours'] = parse_int_list('WEATHER_FINAL_SCORING_LEAD_HOURS', 
+                                                        [24, 48, 72, 96, 120, 144, 168, 192, 216, 240]) # Days 1-10
     config['verification_wait_minutes'] = int(os.getenv('WEATHER_VERIFICATION_WAIT_MINUTES', '60'))
+    
+    # Optional scoring timeout configuration - disabled by default for long-running operations
+    # Set WEATHER_SCORING_TIMEOUT_ENABLED=true to enable safety timeouts
+    config['scoring_timeout_enabled'] = os.getenv('WEATHER_SCORING_TIMEOUT_ENABLED', 'false').lower() == 'true'
+    config['scoring_timeout_safety_hours'] = float(os.getenv('WEATHER_SCORING_TIMEOUT_SAFETY_HOURS', '2.0'))  # Safety timeout in hours
+    config['scoring_progress_log_interval'] = int(os.getenv('WEATHER_SCORING_PROGRESS_LOG_INTERVAL', '300'))  # Progress logging every 5 minutes
     config['verification_timeout_seconds'] = int(os.getenv('WEATHER_VERIFICATION_TIMEOUT_SECONDS', '3600'))
-    config['final_scoring_check_interval_seconds'] = int(os.getenv('WEATHER_FINAL_SCORING_INTERVAL_S', '3600'))
-    config['era5_delay_days'] = int(os.getenv('WEATHER_ERA5_DELAY_DAYS', '5'))
+    # More frequent checking for progressive scoring (check every 30 minutes instead of 1 hour)
+    config['final_scoring_check_interval_seconds'] = int(os.getenv('WEATHER_FINAL_SCORING_INTERVAL_S', '1800'))
+    # Optimized for progressive scoring: reduce delay since we're scoring days individually
+    config['era5_delay_days'] = int(os.getenv('WEATHER_ERA5_DELAY_DAYS', '4'))  # Reduced from 5 to 4 days
     config['era5_buffer_hours'] = int(os.getenv('WEATHER_ERA5_BUFFER_HOURS', '6'))
+    # Smart retry backoff: avoid redundant API calls for known-unavailable ERA5 dates
+    config['era5_retry_backoff_hours'] = int(os.getenv('WEATHER_ERA5_RETRY_BACKOFF_HOURS', '6'))  # Don't retry failed dates for 6 hours
     config['cleanup_check_interval_seconds'] = int(os.getenv('WEATHER_CLEANUP_INTERVAL_S', '21600')) # 6 hours
     config['gfs_analysis_cache_dir'] = os.getenv('WEATHER_GFS_CACHE_DIR', './gfs_analysis_cache')
     config['era5_cache_dir'] = os.getenv('WEATHER_ERA5_CACHE_DIR', './era5_cache')
     config['gfs_cache_retention_days'] = int(os.getenv('WEATHER_GFS_CACHE_RETENTION_DAYS', '7'))
     config['era5_cache_retention_days'] = int(os.getenv('WEATHER_ERA5_CACHE_RETENTION_DAYS', '30'))
+    # Progressive scoring optimization: enable more selective ERA5 data fetching
+    config['progressive_era5_fetch'] = os.getenv('WEATHER_PROGRESSIVE_ERA5_FETCH', 'true').lower() in ['true', '1', 'yes']
+    config['era5_fetch_chunk_hours'] = int(os.getenv('WEATHER_ERA5_FETCH_CHUNK_HOURS', '24'))  # Fetch daily chunks
+    
+    # Data transfer optimization: enable compressed miner-validator communication
+    config['enable_compression'] = os.getenv('WEATHER_ENABLE_COMPRESSION', 'true').lower() in ['true', '1', 'yes']
+    config['compression_level'] = int(os.getenv('WEATHER_COMPRESSION_LEVEL', '6'))  # gzip compression level (1-9)
+    
+    # Memory management thresholds and batch sizes for OOM prevention
+    config['memory_cleanup_threshold_mb'] = int(os.getenv('WEATHER_MEMORY_CLEANUP_THRESHOLD_MB', '8000'))  # Trigger proactive cleanup
+    config['memory_emergency_threshold_mb'] = int(os.getenv('WEATHER_MEMORY_EMERGENCY_THRESHOLD_MB', '15000'))  # Emergency warning threshold
+    config['scoring_batch_size'] = int(os.getenv('WEATHER_SCORING_BATCH_SIZE', '20'))  # Day-1 scoring batch size
+    config['era5_scoring_batch_size'] = int(os.getenv('WEATHER_ERA5_SCORING_BATCH_SIZE', '10'))  # ERA5 scoring batch size
+    
+    # Memory management configuration for handling many miners
+    config['per_miner_cleanup_threshold'] = int(os.getenv('WEATHER_PER_MINER_CLEANUP_THRESHOLD', '15'))  # Switch to per-miner cleanup above this many miners
+    config['era5_per_miner_cleanup_threshold'] = int(os.getenv('WEATHER_ERA5_PER_MINER_CLEANUP_THRESHOLD', '10'))  # ERA5 per-miner cleanup threshold
+    
+    # Partial recovery configuration
+    config['partial_recovery_log_threshold'] = int(os.getenv('WEATHER_PARTIAL_RECOVERY_LOG_THRESHOLD', '25'))  # Log efficiency gains above this % completion
+    config['efficient_recovery_threshold'] = int(os.getenv('WEATHER_EFFICIENT_RECOVERY_THRESHOLD', '50'))  # Consider "efficient" above this % completion
     config['ensemble_retention_days'] = int(os.getenv('WEATHER_ENSEMBLE_RETENTION_DAYS', '14'))
     config['db_run_retention_days'] = int(os.getenv('WEATHER_DB_RUN_RETENTION_DAYS', '90'))
     config['input_batch_retention_days'] = int(os.getenv('WEATHER_INPUT_BATCH_RETENTION_DAYS', '3'))  # New: retention for input batch pickle files
@@ -976,501 +1009,85 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
     ############################################################
 
     def _load_era5_climatology_sync(self, climatology_path: str) -> Optional[xr.Dataset]:
-        """Synchronous helper to load ERA5 climatology with enhanced blosc support."""
-        # CRITICAL: Ensure blosc is available - try installation if needed
-        try:
-            import blosc
-        except ImportError:
-            logger.warning("ERA5 climatology: blosc not found, attempting pip install...")
-            try:
-                import subprocess
-                import sys
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "blosc"], 
-                    capture_output=True, 
-                    text=True, 
-                    timeout=60
-                )
-                if result.returncode == 0:
-                    logger.info("ERA5 climatology: Successfully installed blosc")
-                    import blosc  # Try import again
-                else:
-                    logger.warning(f"ERA5 climatology: Failed to install blosc: {result.stderr}")
-                    # Try installing specific version known to work
-                    try:
-                        result2 = subprocess.run(
-                            [sys.executable, "-m", "pip", "install", "blosc==1.11.1"], 
-                            capture_output=True, 
-                            text=True, 
-                            timeout=60
-                        )
-                        if result2.returncode == 0:
-                            logger.info("ERA5 climatology: Successfully installed blosc 1.11.1")
-                            import blosc  # Try import again
-                    except Exception as install2_err:
-                        logger.warning(f"ERA5 climatology: Error installing specific blosc version: {install2_err}")
-            except Exception as install_err:
-                logger.warning(f"ERA5 climatology: Error installing blosc: {install_err}")
-        
-        # CRITICAL: Comprehensive blosc codec setup in this executor thread
-        try:
-            import blosc
-            import numcodecs
-            import numcodecs.blosc
-            import zarr
-            import numpy as np
-            import importlib
-            import os
-            import sys
-            
-            # Force reload of critical modules in this thread
-            importlib.reload(numcodecs.blosc)
-            importlib.reload(numcodecs.registry)
-            
-            # Ensure all compression codecs are available
-            from numcodecs import Blosc, LZ4, Zstd, Zlib, BZ2, GZip
-            
-            # Create codec instances to ensure they're properly initialized
-            codecs_to_register = [
-                ('blosc', Blosc()),
-                ('lz4', LZ4()),
-                ('zstd', Zstd()),
-                ('zlib', Zlib()),
-                ('bz2', BZ2()),
-                ('gzip', GZip())
-            ]
-            
-            # Register each codec explicitly
-            for codec_name, codec_instance in codecs_to_register:
-                try:
-                    # Register with numcodecs registry (it's a dictionary)
-                    codec_id = codec_instance.codec_id
-                    numcodecs.registry.codec_registry[codec_id] = codec_instance
-                    
-                    # Also try the proper registration method if available
-                    if hasattr(numcodecs, 'register_codec'):
-                        numcodecs.register_codec(codec_instance)
-                    
-                    # Register with zarr if it has its own registry
-                    if hasattr(zarr, 'codec_registry') and hasattr(zarr.codec_registry, 'register_codec'):
-                        zarr.codec_registry.register_codec(codec_instance)
-                    
-                    logger.debug(f"ERA5 climatology: Successfully registered {codec_name} codec (ID: {codec_id})")
-                except Exception as reg_err:
-                    logger.warning(f"ERA5 climatology: Failed to register {codec_name} codec: {reg_err}")
-            
-            # Test blosc codec functionality with more comprehensive test
-            try:
-                blosc_codec = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
-                test_data = np.array([1, 2, 3, 4, 5], dtype='f4')
-                compressed = blosc_codec.encode(test_data)
-                decompressed = blosc_codec.decode(compressed)
-                decompressed_array = np.frombuffer(decompressed, dtype=test_data.dtype).reshape(test_data.shape)
-                
-                # Verify the data is correct
-                if np.array_equal(test_data, decompressed_array):
-                    logger.debug(f"ERA5 climatology: Blosc codec test successful - data integrity verified")
-                else:
-                    logger.warning(f"ERA5 climatology: Blosc codec test failed - data integrity check failed")
-                    
-            except Exception as codec_test_err:
-                logger.warning(f"ERA5 climatology: Codec test failed: {codec_test_err}")
-            
-            # Set environment variables that might help with codec detection
-            import os
-            os.environ['BLOSC_NTHREADS'] = '1'  # Use single thread to avoid issues
-            
-            logger.debug(f"ERA5 climatology: Comprehensive codec registration completed")
-            
-        except Exception as e:
-            logger.warning(f"Failed to ensure blosc codec in ERA5 climatology executor thread: {e}")
-        
-        # Import xarray for use in opening strategies
+        """Synchronous helper to load ERA5 climatology with thread-safe blosc support."""
         import xarray as xr
+        import os
         
-        # Multiple zarr opening strategies with different configurations
-        def ensure_codec_before_opening():
-            """Re-register codecs immediately before each opening attempt."""
+        # THREADING FIX: Simple blosc codec registration in this executor thread
+        def ensure_blosc_in_thread():
+            """Ensure blosc codec is available in this thread context."""
             try:
-                # FIXED: Robust blosc codec registration 
-                
-                # 1. Set environment variables to ensure blosc availability
-                os.environ['ZARR_V3_EXPERIMENTAL_API'] = '0'  # Use v2 API for better codec support
-                os.environ['BLOSC_NTHREADS'] = '1'  # Single thread to avoid threading issues
-                
-                # 2. Force import and re-registration of blosc codec
                 import numcodecs
                 from numcodecs import Blosc
                 
-                # 3. Create and register the main blosc codec (default zstd)
-                try:
-                    # Create the primary blosc codec that zarr expects (ID: 'blosc')
-                    blosc_codec = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
-                    
-                    # Register with the standard 'blosc' ID that zarr looks for
-                    if hasattr(numcodecs.registry, 'codec_registry'):
-                        numcodecs.registry.codec_registry['blosc'] = blosc_codec
-                    
-                    # Alternative registration method
-                    if hasattr(numcodecs, 'register_codec'):
-                        numcodecs.register_codec(blosc_codec, codec_id='blosc')
-                    
-                    # CRITICAL FIX: Force module reload to pick up new codec registration
-                    import importlib
-                    if 'numcodecs.blosc' in sys.modules:
-                        importlib.reload(sys.modules['numcodecs.blosc'])
-                    if 'zarr.codecs' in sys.modules:
-                        importlib.reload(sys.modules['zarr.codecs'])
-                    
-                    logger.debug("Registered blosc codec with standard 'blosc' ID")
-                    
-                    # Also register alternative compression methods
-                    blosc_configs = [
-                        {'cname': 'zstd', 'clevel': 3, 'shuffle': Blosc.BITSHUFFLE, 'id': 'blosc_zstd'},
-                        {'cname': 'lz4', 'clevel': 1, 'shuffle': Blosc.SHUFFLE, 'id': 'blosc_lz4'},
-                        {'cname': 'zlib', 'clevel': 1, 'shuffle': Blosc.NOSHUFFLE, 'id': 'blosc_zlib'}
-                    ]
-                    
-                    for config in blosc_configs:
-                        try:
-                            config_copy = config.copy()  # Don't modify the original
-                            codec_id = config_copy.pop('id')
-                            alt_blosc_codec = Blosc(**config_copy)
-                            
-                            # Register alternative versions
-                            if hasattr(numcodecs.registry, 'codec_registry'):
-                                numcodecs.registry.codec_registry[codec_id] = alt_blosc_codec
-                            
-                            if hasattr(numcodecs, 'register_codec'):
-                                numcodecs.register_codec(alt_blosc_codec, codec_id=codec_id)
-                            
-                            logger.debug(f"Registered alternative blosc codec: {codec_id}")
-                            
-                        except Exception as config_err:
-                            logger.debug(f"Failed to register blosc config {config}: {config_err}")
-                            continue
-                            
-                except Exception as main_codec_err:
-                    logger.warning(f"Failed to register main blosc codec: {main_codec_err}")
-                    return False
+                # Create and register blosc codec in this thread
+                blosc_codec = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
                 
-                # 4. Try to register with zarr if available
-                try:
-                    import zarr
-                    # Force reimport to pick up new codecs
-                    import importlib
-                    if 'zarr.codecs' in sys.modules:
-                        importlib.reload(sys.modules['zarr.codecs'])
-                    
-                    # Ensure zarr can see numcodecs
-                    if hasattr(zarr, 'codecs') and hasattr(zarr.codecs, 'get_codec'):
-                        # Test if blosc is available in zarr
-                        try:
-                            test_codec = zarr.codecs.get_codec({'id': 'blosc', 'cname': 'zstd', 'clevel': 1})
-                            logger.debug("Zarr blosc codec test successful")
-                        except Exception as test_err:
-                            logger.debug(f"Zarr blosc codec test failed: {test_err}")
-                            
-                except Exception as zarr_err:
-                    logger.debug(f"Zarr codec registration failed: {zarr_err}")
+                # Register with numcodecs in this thread
+                if hasattr(numcodecs, 'register_codec'):
+                    numcodecs.register_codec(blosc_codec)
                 
-                # 5. Test codec availability with a simple compression test
-                try:
-                    test_data = b"test_compression_data" * 100
-                    blosc_test = Blosc(cname='zstd', clevel=1, shuffle=Blosc.NOSHUFFLE)
-                    compressed = blosc_test.encode(test_data)
-                    decompressed = blosc_test.decode(compressed)
-                    
-                    if decompressed == test_data:
-                        logger.debug("Blosc codec test successful - compression/decompression working")
-                        return True
-                    else:
-                        logger.warning("Blosc codec test failed - data mismatch after compression")
-                        return False
-                        
-                except Exception as test_err:
-                    logger.debug(f"Blosc codec test failed: {test_err}")
-                    return False
+                # Also register in the registry dictionary directly
+                if hasattr(numcodecs.registry, 'codec_registry'):
+                    numcodecs.registry.codec_registry['blosc'] = blosc_codec
                 
-            except Exception as codec_err:
-                logger.warning(f"Failed to ensure codec before opening: {codec_err}")
+                logger.debug("ERA5 climatology: Blosc codec registered in thread")
+                return True
+                
+            except Exception as e:
+                logger.debug(f"ERA5 climatology: Failed to register blosc in thread: {e}")
                 return False
 
-        opening_strategies = [
-            # Strategy 1: Standard consolidated opening
-            {
-                'name': 'consolidated',
-                'kwargs': {'consolidated': True, 'chunks': None}
-            },
-            # Strategy 2: Non-consolidated opening
-            {
-                'name': 'non-consolidated', 
-                'kwargs': {'consolidated': False, 'chunks': None}
-            },
-            # Strategy 3: With explicit chunking disabled
-            {
-                'name': 'no-chunking',
-                'kwargs': {'consolidated': True, 'chunks': None, 'decode_times': False}
-            },
-            # Strategy 4: Using fsspec mapper with gcs
-            {
-                'name': 'fsspec-gcs-mapper',
-                'kwargs': {'consolidated': False, 'decode_times': False, 'chunks': None},
-                'use_fsspec': True,
-                'filesystem': 'gcs'
-            },
-            # Strategy 5: Using fsspec mapper with http
-            {
-                'name': 'fsspec-http-mapper', 
-                'kwargs': {'consolidated': False, 'decode_times': False, 'chunks': None},
-                'use_fsspec': True,
-                'filesystem': 'http'
-            }
+        # Try multiple opening strategies with thread-safe codec registration
+        strategies = [
+            ('consolidated', {'consolidated': True}),
+            ('non-consolidated', {'consolidated': False}),
+            ('no-decode', {'consolidated': False, 'decode_times': False}),
         ]
         
-        for strategy in opening_strategies:
+        for strategy_name, kwargs in strategies:
             try:
-                strategy_name = strategy['name']
-                kwargs = strategy['kwargs']
-                use_fsspec = strategy.get('use_fsspec', False)
+                logger.info(f"ERA5 climatology: Trying {strategy_name} strategy...")
                 
-                logger.info(f"ERA5 climatology: Attempting {strategy_name} opening strategy...")
+                # Register blosc codec in this thread before each attempt
+                ensure_blosc_in_thread()
                 
-                # Re-register codec immediately before each attempt
-                ensure_codec_before_opening()
-                
-                if use_fsspec:
-                    # Use fsspec mapper for this strategy
-                    import fsspec
-                    filesystem_type = strategy.get('filesystem', 'gcs')
-                    
-                    if filesystem_type == 'gcs':
-                        fs = fsspec.filesystem('gcs', token='anon')  # Anonymous access for public bucket
-                    else:  # http
-                        fs = fsspec.filesystem('http')
-                        
-                    store = fs.get_mapper(climatology_path)
-                    
-                    # Re-register codec one more time right before opening
-                    ensure_codec_before_opening()
-                    dataset = xr.open_zarr(store, **kwargs)
-                else:
-                    # Direct opening - re-register codec right before
-                    ensure_codec_before_opening()
-                    dataset = xr.open_zarr(climatology_path, **kwargs)
+                # Attempt to open with current strategy
+                dataset = xr.open_zarr(climatology_path, **kwargs)
                 
                 if dataset is not None:
                     logger.info(f"ERA5 climatology: Successfully loaded using {strategy_name} strategy")
                     return dataset
                     
             except Exception as strategy_err:
-                logger.warning(f"ERA5 climatology: {strategy_name} strategy failed: {strategy_err}")
+                if strategy_name == 'consolidated' and 'codec not available' in str(strategy_err):
+                    logger.info(f"ERA5 climatology: {strategy_name} strategy unavailable (blosc codec not found), trying next strategy...")
+                else:
+                    logger.warning(f"ERA5 climatology: {strategy_name} strategy failed: {strategy_err}")
                 continue
         
-        # Final fallback attempt with manual zarr opening
+        # Simple fallback: try fsspec mapper directly
         try:
-            logger.info("ERA5 climatology: Attempting final fallback with manual zarr handling...")
-            ensure_codec_before_opening()
-            
-            # Try opening with zarr directly and then converting to xarray
-            import zarr
+            logger.info("ERA5 climatology: Attempting fsspec fallback...")
             import fsspec
-            import xarray as xr  # Add the missing import
             
-            # Use gcs filesystem
+            # Register blosc one more time
+            ensure_blosc_in_thread()
+            
+            # Simple fsspec approach
             fs = fsspec.filesystem('gcs', token='anon')
             mapper = fs.get_mapper(climatology_path)
-            
-            # Open with zarr first to verify codec availability
-            zarr_group = zarr.open_group(mapper, mode='r')
-            logger.info(f"ERA5 climatology: Successfully opened zarr group. Variables: {list(zarr_group.keys())}")
-            
-            # Now convert to xarray
-            ensure_codec_before_opening()  # One more time before xarray
-            dataset = xr.open_zarr(mapper, consolidated=False, decode_times=False)
+            dataset = xr.open_zarr(mapper, consolidated=False)
             
             if dataset is not None:
-                logger.info("ERA5 climatology: Successfully loaded using manual zarr fallback")
+                logger.info("ERA5 climatology: Successfully loaded using fsspec fallback")
                 return dataset
                 
-        except Exception as final_err:
-            logger.error(f"ERA5 climatology: Final fallback also failed: {final_err}")
-        
-        # Ultimate fallback: try alternative access methods that avoid blosc entirely
-        try:
-            logger.info("ERA5 climatology: Attempting ultimate fallback - bypassing blosc codec...")
-            
-            # Try using intake-xarray if available (might handle codec issues better)
-            try:
-                import intake
-                import intake_xarray  # This might handle the codec registration automatically
-                
-                # Create intake catalog entry for the dataset
-                catalog_entry = f"""
-sources:
-  era5_climatology:
-    driver: zarr
-    args:
-      urlpath: "{climatology_path}"
-      consolidated: false
-      storage_options:
-        token: anon
-"""
-                
-                # Try to load via intake
-                import yaml
-                catalog_dict = yaml.safe_load(catalog_entry)
-                cat = intake.open_catalog(catalog_dict)
-                dataset = cat.era5_climatology.to_dask()
-                
-                if dataset is not None:
-                    logger.info("ERA5 climatology: Successfully loaded using intake-xarray bypass")
-                    return dataset
-                    
-            except ImportError:
-                logger.debug("ERA5 climatology: intake-xarray not available")
-            except Exception as intake_err:
-                logger.debug(f"ERA5 climatology: intake approach failed: {intake_err}")
-            
-            # Try direct HTTP access to individual files (bypass zarr entirely)
-            try:
-                logger.info("ERA5 climatology: Trying HTTP access to individual files...")
-                import requests
-                import tempfile
-                
-                # Check if we can access the zarr metadata via HTTP
-                base_url = climatology_path.replace('gs://', 'https://storage.googleapis.com/')
-                metadata_url = f"{base_url}/.zattrs"
-                
-                response = requests.get(metadata_url, timeout=30)
-                if response.status_code == 200:
-                    logger.info("ERA5 climatology: HTTP access successful, but full dataset too large for direct download")
-                    # For now, we'll skip the full download approach as the dataset is very large
-                    
-            except Exception as http_err:
-                logger.debug(f"ERA5 climatology: HTTP approach failed: {http_err}")
-            
-            # Try using xarray with explicit backend specification
-            try:
-                logger.info("ERA5 climatology: Trying xarray with explicit backend...")
-                
-                import fsspec
-                fs = fsspec.filesystem('gcs', token='anon')
-                clean_path = climatology_path.replace('gs://', '')
-                
-                # Create a custom backend that might handle codecs better
-                from xarray.backends import ZarrBackendEntrypoint
-                
-                # Try opening with different chunk configurations
-                for chunks_config in [None, {}, 'auto', -1]:
-                    try:
-                        ensure_codec_before_opening()
-                        dataset = xr.open_dataset(
-                            f"gcs://{clean_path}",
-                            engine='zarr',
-                            chunks=chunks_config,
-                            consolidated=False,
-                            decode_times=False,
-                            backend_kwargs={'storage_options': {'token': 'anon'}}
-                        )
-                        if dataset is not None:
-                            logger.info(f"ERA5 climatology: Successfully loaded with chunks={chunks_config}")
-                            return dataset
-                    except Exception as chunk_err:
-                        logger.debug(f"ERA5 climatology: chunks={chunks_config} failed: {chunk_err}")
-                        continue
-                        
-            except Exception as backend_err:
-                logger.debug(f"ERA5 climatology: Backend approach failed: {backend_err}")
-            
-            # Final attempt: Try with environment variable overrides
-            try:
-                logger.info("ERA5 climatology: Final attempt with environment overrides...")
-                
-                # Set environment variables that might help
-                old_env = {}
-                env_overrides = {
-                    'ZARR_V3_EXPERIMENTAL_API': '0',
-                    'BLOSC_NTHREADS': '1',
-                    'NUMCODECS_DISABLE_CACHE': '1',
-                    'OMP_NUM_THREADS': '1'
-                }
-                
-                for key, value in env_overrides.items():
-                    old_env[key] = os.environ.get(key)
-                    os.environ[key] = value
-                
-                try:
-                    # Force complete re-import of zarr/numcodecs with new environment
-                    import importlib
-                    if 'zarr' in sys.modules:
-                        importlib.reload(sys.modules['zarr'])
-                    if 'numcodecs' in sys.modules:
-                        importlib.reload(sys.modules['numcodecs'])
-                    
-                    ensure_codec_before_opening()
-                    
-                    # Try the simplest possible opening
-                    fs = fsspec.filesystem('gcs', token='anon')
-                    clean_path = climatology_path.replace('gs://', '')
-                    mapper = fs.get_mapper(clean_path)
-                    
-                    dataset = xr.open_zarr(mapper, consolidated=False, decode_times=False)
-                    
-                    if dataset is not None:
-                        logger.info("ERA5 climatology: Successfully loaded with environment overrides")
-                        return dataset
-                        
-                finally:
-                    # Restore original environment
-                    for key, old_value in old_env.items():
-                        if old_value is None:
-                            os.environ.pop(key, None)
-                        else:
-                            os.environ[key] = old_value
-                            
-            except Exception as env_err:
-                logger.debug(f"ERA5 climatology: Environment override approach failed: {env_err}")
-            
-            # Truly final attempt: Try to create a minimal version of climatology data
-            try:
-                logger.info("ERA5 climatology: Creating minimal fallback climatology...")
-                
-                # Create a minimal fake climatology dataset for basic functionality
-                # This allows the system to continue working even if the real climatology fails
-                import numpy as np
-                import xarray as xr
-                
-                # Create minimal climatology with basic temperature field
-                fake_data = np.random.normal(273.15, 15, (12, 4, 721, 1440))  # Monthly, 6-hourly, lat, lon
-                
-                # Create time coordinates (monthly for a year, 6-hourly steps)
-                times = []
-                for month in range(1, 13):
-                    for hour in [0, 6, 12, 18]:
-                        times.append(f"2020-{month:02d}-15T{hour:02d}:00:00")
-                
-                coords = {
-                    'time': times,
-                    'latitude': np.linspace(90, -90, 721),
-                    'longitude': np.linspace(0, 359.75, 1440)
-                }
-                
-                minimal_climatology = xr.Dataset({
-                    '2m_temperature': (['time', 'latitude', 'longitude'], fake_data.reshape(48, 721, 1440))
-                }, coords=coords)
-                
-                logger.warning("ERA5 climatology: Created minimal fallback climatology - this will provide basic functionality but reduced accuracy")
-                return minimal_climatology
-                
-            except Exception as minimal_err:
-                logger.debug(f"ERA5 climatology: Even minimal fallback failed: {minimal_err}")
-        
-        except Exception as ultimate_err:
-            logger.error(f"ERA5 climatology: Ultimate fallback failed: {ultimate_err}")
+        except Exception as fallback_err:
+            logger.warning(f"ERA5 climatology: fsspec fallback failed: {fallback_err}")
         
         # If all strategies failed, return None
-        logger.error("ERA5 climatology: All opening strategies failed - returning None")
+        logger.warning("ERA5 climatology: All opening strategies failed - returning None")
         return None
 
     async def _get_or_load_era5_climatology(self) -> Optional[xr.Dataset]:
@@ -1530,29 +1147,202 @@ sources:
             "gfs_init_time_for_table": gfs_init_time
         }
 
-        try:
-            upsert_score_table_query = """
-                INSERT INTO score_table (task_name, task_id, score, status, created_at)
-                VALUES (:task_name, :task_id, :score, :status, :created_at_val)
-                ON CONFLICT (task_name, task_id) DO UPDATE SET
-                    score = EXCLUDED.score,
-                    status = EXCLUDED.status,
-                    created_at = EXCLUDED.created_at
-            """
+        query = """
+        INSERT INTO score_table 
+        (task_name, task_id, score, status, created_at)
+        VALUES (:task_name, :task_id, :score, :status, :timestamp)
+        ON CONFLICT (task_name, task_id)
+        DO UPDATE SET
+            score = EXCLUDED.score,
+            status = EXCLUDED.status,
+            created_at = EXCLUDED.created_at
+        """
+        
+        db_params = {
+            "task_name": score_row_data["task_name"],
+            "task_id": score_row_data["task_id"],
+            "score": score_row_data["score"],  # Pass list directly, not JSON string
+            "status": score_row_data["status"],
+            "timestamp": score_row_data["gfs_init_time_for_table"]
+        }
+        
+        await self.db_manager.execute(query, db_params)
+        logger.info(f"[BuildScoreRow] Stored/updated score row for task '{task_name_prefix}' with task_id '{run_id}'")
+
+    async def check_and_build_missing_weather_scores(self, target_timestep: Optional[datetime] = None) -> Dict[str, Any]:
+        """
+        Check for missing weather score rows and build them if needed.
+        
+        Args:
+            target_timestep: Specific timestep to check (if None, checks recent timesteps)
             
-            db_params_score_table = {
-                "task_name": score_row_data["task_name"],
-                "task_id": score_row_data["task_id"],
-                "score": score_row_data["score"],
-                "status": score_row_data["status"],
-                "created_at_val": score_row_data["gfs_init_time_for_table"]
-            }
+        Returns:
+            Dict with status and details of operations performed
+        """
+        logger.info(f"[MissingScoresChecker] Checking for missing weather score rows{f' for timestep {target_timestep}' if target_timestep else ' for recent timesteps'}")
+        
+        result = {
+            "checked_timesteps": 0,
+            "missing_score_rows_found": 0,
+            "score_rows_created": 0,
+            "errors": [],
+            "details": []
+        }
+        
+        try:
+            # Get timesteps to check
+            if target_timestep:
+                timesteps_to_check = [target_timestep]
+            else:
+                # Check last 24 hours of timesteps
+                cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+                timestep_query = """
+                SELECT DISTINCT gfs_init_time_utc, id as run_id
+                FROM weather_forecast_runs 
+                WHERE gfs_init_time_utc >= :cutoff_time
+                AND status IN ('day1_scoring_complete', 'scored', 'final_scoring_complete')
+                ORDER BY gfs_init_time_utc DESC
+                """
+                timestep_records = await self.db_manager.fetch_all(timestep_query, {"cutoff_time": cutoff_time})
+                timesteps_to_check = [(rec['gfs_init_time_utc'], rec['run_id']) for rec in timestep_records]
+            
+            result["checked_timesteps"] = len(timesteps_to_check)
+            
+            for timestep_info in timesteps_to_check:
+                if target_timestep:
+                    gfs_init_time = target_timestep
+                    # Find run_id for this timestep
+                    run_query = """
+                    SELECT id FROM weather_forecast_runs 
+                    WHERE gfs_init_time_utc = :gfs_time
+                    ORDER BY id DESC LIMIT 1
+                    """
+                    run_result = await self.db_manager.fetch_one(run_query, {"gfs_time": gfs_init_time})
+                    if not run_result:
+                        result["errors"].append(f"No run found for timestep {gfs_init_time}")
+                        continue
+                    run_id = run_result['id']
+                else:
+                    gfs_init_time, run_id = timestep_info
+                
+                # Check if score row exists for this timestep
+                existing_scores = await self._check_existing_score_rows(gfs_init_time, run_id)
+                
+                # Determine what scores should exist based on run status
+                required_scores = await self._determine_required_score_rows(run_id)
+                
+                # Find missing scores
+                missing_scores = required_scores - existing_scores
+                
+                if missing_scores:
+                    result["missing_score_rows_found"] += len(missing_scores)
+                    result["details"].append(f"Timestep {gfs_init_time} (Run {run_id}): Missing {missing_scores}")
+                    
+                    # Build missing score rows
+                    for score_type in missing_scores:
+                        try:
+                            if await self._build_missing_score_row(gfs_init_time, run_id, score_type):
+                                result["score_rows_created"] += 1
+                                logger.info(f"[MissingScoresChecker] Built missing {score_type} score row for run {run_id}")
+                            else:
+                                result["errors"].append(f"Failed to build {score_type} score for run {run_id}")
+                        except Exception as e:
+                            error_msg = f"Error building {score_type} score for run {run_id}: {e}"
+                            result["errors"].append(error_msg)
+                            logger.error(f"[MissingScoresChecker] {error_msg}", exc_info=True)
+            
+            logger.info(f"[MissingScoresChecker] Completed check: {result['score_rows_created']}/{result['missing_score_rows_found']} missing scores built from {result['checked_timesteps']} timesteps")
+            
+        except Exception as e:
+            error_msg = f"Error in missing scores checker: {e}"
+            result["errors"].append(error_msg)
+            logger.error(f"[MissingScoresChecker] {error_msg}", exc_info=True)
+        
+        return result
 
-            await self.db_manager.execute(upsert_score_table_query, db_params_score_table)
-            logger.info(f"[BuildScoreRow] Upserted score_table entry for {task_name_prefix}, task_id (run_id): {run_id}")
+    async def _check_existing_score_rows(self, gfs_init_time: datetime, run_id: int) -> Set[str]:
+        """Check what score rows already exist for a given timestep/run."""
+        existing_query = """
+        SELECT task_id FROM score_table 
+        WHERE task_name = 'weather' 
+        AND (task_id LIKE :run_pattern OR task_id IN ('initial_weather_scores', 'final_weather_scores'))
+        """
+        existing_records = await self.db_manager.fetch_all(existing_query, {
+            "run_pattern": f"%_{run_id}"
+        })
+        
+        existing_scores = set()
+        for record in existing_records:
+            task_id = record['task_id']
+            if task_id == 'initial_weather_scores':
+                existing_scores.add('initial_combined')
+            elif task_id == 'final_weather_scores':
+                existing_scores.add('final_combined')
+            elif task_id.startswith('initial_weather_scores_'):
+                existing_scores.add('initial_run_specific')
+            elif task_id.startswith('final_weather_scores_'):
+                existing_scores.add('final_run_specific')
+        
+        return existing_scores
 
-        except Exception as e_db_score_table:
-            logger.error(f"[BuildScoreRow] DB error storing {task_name_prefix} score row for run {run_id}: {e_db_score_table}", exc_info=True)
+    async def _determine_required_score_rows(self, run_id: int) -> Set[str]:
+        """Determine what score rows should exist based on run status and data availability."""
+        run_query = """
+        SELECT status, gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id
+        """
+        run_info = await self.db_manager.fetch_one(run_query, {"run_id": run_id})
+        
+        if not run_info:
+            return set()
+        
+        status = run_info['status']
+        required_scores = set()
+        
+        # Check if day1 scores exist
+        day1_scores_query = """
+        SELECT COUNT(*) as count FROM weather_miner_scores 
+        WHERE run_id = :run_id AND score_type = 'day1_qc_score'
+        """
+        day1_result = await self.db_manager.fetch_one(day1_scores_query, {"run_id": run_id})
+        has_day1_scores = day1_result and day1_result['count'] > 0
+        
+        # Check if ERA5 scores exist
+        era5_scores_query = """
+        SELECT COUNT(*) as count FROM weather_miner_scores 
+        WHERE run_id = :run_id AND score_type = 'era5_final_composite_score'
+        """
+        era5_result = await self.db_manager.fetch_one(era5_scores_query, {"run_id": run_id})
+        has_era5_scores = era5_result and era5_result['count'] > 0
+        
+        # Determine required scores based on status and available data
+        if status in ['day1_scoring_complete', 'scored', 'final_scoring_complete'] and has_day1_scores:
+            if has_era5_scores:
+                required_scores.add('final_run_specific')  # Should have final scores
+            else:
+                required_scores.add('initial_run_specific')  # Should have initial scores
+        
+        return required_scores
+
+    async def _build_missing_score_row(self, gfs_init_time: datetime, run_id: int, score_type: str) -> bool:
+        """Build a specific missing score row."""
+        try:
+            logger.info(f"[MissingScoresChecker] Building {score_type} score row for run {run_id}")
+            
+            if score_type in ['initial_run_specific', 'final_run_specific']:
+                # Use the existing update_combined_weather_scores method with run_id trigger
+                force_phase = "initial" if score_type == 'initial_run_specific' else "final"
+                
+                # Call update_combined_weather_scores with the specific run_id to rebuild the score
+                await self.update_combined_weather_scores(run_id_trigger=run_id, force_phase=force_phase)
+                
+                return True
+            else:
+                logger.warning(f"[MissingScoresChecker] Unknown score type: {score_type}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"[MissingScoresChecker] Error building {score_type} score for run {run_id}: {e}", exc_info=True)
+            return False
 
     async def validator_prepare_subtasks(self):
         """
@@ -1575,6 +1365,13 @@ sources:
         logger.info("Starting WeatherTask validator execution loop...")
         
         if not self.initial_scoring_worker_running:
+            # Apply global LRU cache limits to prevent unlimited memory growth during scoring
+            try:
+                from .utils.memory_management import apply_global_lru_limits
+                apply_global_lru_limits()
+            except Exception as e:
+                logger.warning(f"Failed to apply global LRU cache limits: {e}")
+            
             await self.start_background_workers(num_initial_scoring_workers=1, num_final_scoring_workers=1, num_cleanup_workers=1)
             logger.info("Started background workers for scoring and cleanup.")
 
@@ -1608,6 +1405,10 @@ sources:
                         stale_run_processed = await self._check_and_recover_incomplete_runs_sequential(processed_runs_this_session, max_attempts_per_run)
                         # Enhanced recovery with state consistency checks (includes original recovery)
                         await self.enhanced_recovery_check()
+                        # Check for missing weather score rows
+                        missing_scores_result = await self.check_and_build_missing_weather_scores()
+                        if missing_scores_result["score_rows_created"] > 0:
+                            logger.info(f"Recovery: Built {missing_scores_result['score_rows_created']} missing weather score rows")
                         last_recovery_time = current_time
                     except Exception as recovery_err:
                         logger.warning(f"Error during periodic recovery: {recovery_err}")
@@ -2091,11 +1892,24 @@ sources:
                         logger.info(f"TEST MODE: validator_execute iteration for run {run_id} complete.")
                         if hasattr(self, 'last_test_mode_run_id') and self.last_test_mode_run_id == run_id: 
                             logger.info(f"TEST MODE: Waiting for Day-1 scoring of run {run_id} to complete...")
+                            
+                            # Use optional timeout or wait indefinitely for long-running scoring
+                            timeout = await self._get_scoring_timeout_if_enabled()
+                            if timeout:
+                                logger.info(f"TEST MODE: Using safety timeout of {timeout:.0f} seconds for Day-1 scoring")
+                            else:
+                                logger.info("TEST MODE: No timeout - waiting indefinitely for Day-1 scoring to complete (long-running operation)")
+                            
                             try:
-                                await asyncio.wait_for(self.test_mode_run_scored_event.wait(), timeout=600.0) # 10 min timeout
-                                logger.info(f"TEST MODE: Day-1 scoring for run {run_id} event received.")
+                                if timeout:
+                                    # Use timeout with periodic progress logging
+                                    await self._wait_for_scoring_with_progress(self.test_mode_run_scored_event, timeout, run_id)
+                                else:
+                                    # Wait indefinitely with periodic progress logging
+                                    await self._wait_for_scoring_with_progress(self.test_mode_run_scored_event, None, run_id)
+                                logger.info(f"TEST MODE: Day-1 scoring for run {run_id} completed successfully.")
                             except asyncio.TimeoutError:
-                                logger.error(f"TEST MODE: Timeout waiting for Day-1 scoring of run {run_id}.")
+                                logger.error(f"TEST MODE: Safety timeout reached waiting for Day-1 scoring of run {run_id} after {timeout:.0f} seconds.")
                             self.test_mode_run_scored_event.clear() 
                         else:
                             logger.info(f"TEST MODE: Not waiting for scoring event as run_id ({run_id}) doesn't match last_test_mode_run_id ({getattr(self, 'last_test_mode_run_id', None)}).")
@@ -2245,7 +2059,7 @@ sources:
             else:
                  logger.info(f"[Run {run_id}] Status changed from 'verifying_miner_forecasts' to '{current_run_status_after_verify}' during verification logic. No further status update needed here.")
 
-    async def update_combined_weather_scores(self, run_id_trigger: Optional[int] = None):
+    async def update_combined_weather_scores(self, run_id_trigger: Optional[int] = None, force_phase: Optional[str] = None):
         logger.info(f"[CombinedWeatherScore] Updating combined weather scores (triggered by run {run_id_trigger if run_id_trigger else 'periodic/manual call'}).")
 
         latest_day1_scores_array = np.full(256, 0.0)
@@ -2281,6 +2095,8 @@ sources:
             logger.warning("[CombinedWeatherScore] No Day-1 QC scores found in weather_miner_scores for active UIDs.")
             latest_day1_timestamp = datetime.now(timezone.utc) 
 
+        # Progressive scoring: ERA5 scores may come from multiple partial scoring runs
+        # This query will get the latest composite score regardless of progressive timing
         era5_composite_score_type = "era5_final_composite_score"
         query_era5_composite = """
             SELECT score FROM weather_miner_scores WHERE miner_uid = :miner_uid AND score_type = :score_type
@@ -2298,6 +2114,10 @@ sources:
         W_era5 = self.config.get('weather_score_era5_weight', 0.8)
         proportional_weather_scores = (latest_day1_scores_array * W_day1) + (latest_era5_composite_scores_array * W_era5)
         logger.info(f"[CombinedWeatherScore] Calculated proportional scores.")
+        
+        # Calculate availability flags before clearing arrays
+        has_era5_scores = np.any(latest_era5_composite_scores_array > 0)
+        has_day1_scores = np.any(proportional_weather_scores > 0)  # This includes day1 component
         
         # MEMORY LEAK FIX: Clear large score arrays immediately after use
         try:
@@ -2356,8 +2176,7 @@ sources:
             })
         
         # Determine the appropriate score row ID based on available score types
-        has_era5_scores = np.any(latest_era5_composite_scores_array > 0)
-        has_day1_scores = np.any(proportional_weather_scores > 0)  # This includes day1 component
+        # (has_era5_scores and has_day1_scores calculated earlier before array cleanup)
         
         if run_id_trigger:
             # If triggered by a specific run, use run-specific naming
@@ -3805,6 +3624,76 @@ sources:
         
         return storage_info
 
+    async def _is_run_stale(self, run_id: int, status: str, run_age_hours: float) -> Tuple[bool, str]:
+        """
+        Intelligent stale detection that considers run status, test mode, and ERA5 backoff states.
+        Returns (is_stale, reason_string)
+        """
+        now_utc = datetime.now(timezone.utc)
+        
+        # Different timeout thresholds based on status and mode
+        if self.test_mode:
+            # Much more generous in test mode
+            general_timeout_hours = 240  # 10 days
+            era5_timeout_hours = 480    # 20 days
+        else:
+            # Production timeouts
+            general_timeout_hours = 48   # 2 days
+            era5_timeout_hours = 168    # 7 days for ERA5 states (data availability can take time)
+        
+        # ERA5 final scoring states need special handling
+        if status in ['era5_final_scoring_started', 'era5_final_scoring_partial']:
+            # Check if this run might be in ERA5 backoff
+            if hasattr(self, 'era5_failed_attempts') and self.era5_failed_attempts:
+                # Get the GFS init time to check relevant dates
+                gfs_query = "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id"
+                gfs_result = await self.db_manager.fetch_one(gfs_query, {"run_id": run_id})
+                
+                if gfs_result:
+                    gfs_init_time = gfs_result['gfs_init_time_utc']
+                    sparse_lead_hours = self.config.get('final_scoring_lead_hours', [24, 48, 72, 96, 120, 144, 168, 192, 216, 240])
+                    
+                    # Check if any dates for this run are in backoff
+                    dates_in_backoff = []
+                    latest_backoff_expiry = None
+                    
+                    for lead_hour in sparse_lead_hours:
+                        forecast_target_time = gfs_init_time + timedelta(hours=lead_hour)
+                        date_str = forecast_target_time.strftime('%Y-%m-%d')
+                        
+                        if date_str in self.era5_failed_attempts:
+                            retry_after = self.era5_failed_attempts[date_str].get('retry_after')
+                            if retry_after and now_utc < retry_after:
+                                dates_in_backoff.append(date_str)
+                                if latest_backoff_expiry is None or retry_after > latest_backoff_expiry:
+                                    latest_backoff_expiry = retry_after
+                    
+                    # If dates are still in backoff, don't mark as stale
+                    if dates_in_backoff:
+                        time_until_backoff_expires = (latest_backoff_expiry - now_utc).total_seconds() / 3600
+                        logger.debug(f"Run {run_id}: {len(dates_in_backoff)} dates in ERA5 backoff, expires in {time_until_backoff_expires:.1f}h")
+                        return False, f"waiting for ERA5 backoff to expire"
+                    
+                    # If backoff expired recently, give extra time before marking stale
+                    if latest_backoff_expiry and (now_utc - latest_backoff_expiry).total_seconds() < 12 * 3600:  # 12 hours grace period
+                        return False, f"ERA5 backoff recently expired, allowing retry"
+            
+            # Use ERA5-specific timeout
+            if run_age_hours > era5_timeout_hours:
+                logger.debug(f"Run {run_id}: marking as stale - ERA5 age {run_age_hours:.1f}h > {era5_timeout_hours}h threshold")
+                return True, f"age {run_age_hours:.1f}h > {era5_timeout_hours}h threshold for ERA5 scoring"
+            else:
+                logger.debug(f"Run {run_id}: not stale - ERA5 age {run_age_hours:.1f}h within {era5_timeout_hours}h threshold")
+                return False, f"within ERA5 timeout ({run_age_hours:.1f}h < {era5_timeout_hours}h)"
+        
+        # General timeout for other statuses
+        if run_age_hours > general_timeout_hours:
+            logger.debug(f"Run {run_id}: marking as stale - age {run_age_hours:.1f}h > {general_timeout_hours}h threshold")
+            return True, f"age {run_age_hours:.1f}h > {general_timeout_hours}h threshold"
+        else:
+            logger.debug(f"Run {run_id}: not stale - age {run_age_hours:.1f}h within {general_timeout_hours}h threshold")
+            return False, f"within timeout ({run_age_hours:.1f}h < {general_timeout_hours}h)"
+
     async def _check_and_recover_incomplete_runs_sequential(self, processed_runs_this_session=None, max_attempts_per_run=3):
         """
         Sequential version of run recovery that processes one run at a time to avoid system overload.
@@ -3820,7 +3709,7 @@ sources:
             'sending_fetch_requests', 'awaiting_input_hashes', 'verifying_input_hashes', 
             'triggering_inference', 'awaiting_inference_results', 'verifying_miner_forecasts',
             # INCLUDE SCORING STATES - can get stuck due to restarts during scoring
-            'day1_scoring_started', 'era5_final_scoring_started'
+            'day1_scoring_started', 'era5_final_scoring_started', 'era5_final_scoring_partial'
         ]
         
         # Also include failure states that might be recoverable with full workflow
@@ -3882,10 +3771,12 @@ sources:
             if attempt_count >= max_attempts_per_run:
                 continue
                 
-            # Skip if run is too old (older than 48 hours)
+            # Smart stale detection - different logic for different statuses
             run_age_hours = (datetime.now(timezone.utc) - run['run_initiation_time']).total_seconds() / 3600
-            if run_age_hours > 48:
-                logger.warning(f"Run {run_id} is too old ({run_age_hours:.1f}h), marking as stale")
+            is_stale, stale_reason = await self._is_run_stale(run_id, status, run_age_hours)
+            
+            if is_stale:
+                logger.warning(f"Run {run_id} is stale ({stale_reason}), marking as abandoned")
                 await _update_run_status(self, run_id, "stale_abandoned")
                 logger.info(f"Stale run {run_id} marked as abandoned - validator will immediately proceed to check for new run creation")
                 return "stale_processed"  # Special return value for stale runs
@@ -3974,22 +3865,67 @@ sources:
                 logger.info(f"Recovering run {run_id}: processing ready for scoring")
                 await self._continue_run_workflow(run_id)
                 
-            elif status in ['day1_scoring_started', 'era5_final_scoring_started']:
-                logger.info(f"Recovering run {run_id}: resetting stuck scoring state '{status}' - likely interrupted by restart")
+            elif status == 'day1_scoring_started':
+                logger.info(f"Recovering run {run_id}: resetting stuck Day-1 scoring state '{status}' - likely interrupted by restart")
                 
                 # Reset run status to allow re-processing
                 await _update_run_status(self, run_id, "verifying_miner_forecasts")
                 
-                # Reset scoring jobs to queued status for retry with smart partial logic
-                scoring_type = 'day1_qc' if status == 'day1_scoring_started' else 'era5_final'
+                # Reset Day-1 scoring job to queued status for retry with smart partial logic
                 reset_job_query = """
                 UPDATE weather_scoring_jobs 
                 SET status = 'queued', started_at = NULL, error_message = 'Reset due to validator restart during scoring'
-                WHERE run_id = :run_id AND score_type = :score_type AND status IN ('in_progress', 'queued')
+                WHERE run_id = :run_id AND score_type = 'day1_qc' AND status IN ('in_progress', 'queued')
                 """
-                await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": scoring_type})
+                await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": 'day1_qc'})
                 
-                logger.info(f"Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with '{scoring_type}' job queued for smart partial retry")
+                logger.info(f"Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with 'day1_qc' job queued for smart partial retry")
+                
+                # Trigger immediate scoring check
+                await self._continue_run_workflow(run_id)
+                
+            elif status == 'era5_final_scoring_started':
+                logger.info(f"Recovering run {run_id}: resetting stuck ERA5 scoring state '{status}' - likely interrupted by restart")
+                
+                # Check progress of both Day-1 and ERA5 scoring for smart recovery
+                day1_complete_check = await self.db_manager.fetch_one(
+                    "SELECT COUNT(*) as count FROM weather_miner_scores WHERE run_id = :run_id AND score_type = 'day1_qc_score'",
+                    {"run_id": run_id}
+                )
+                
+                era5_partial_check = await self.db_manager.fetch_one(
+                    "SELECT COUNT(*) as era5_count FROM weather_miner_scores WHERE run_id = :run_id AND score_type = 'era5_final_composite_score'",
+                    {"run_id": run_id}
+                )
+                
+                day1_count = day1_complete_check['count'] if day1_complete_check else 0
+                era5_count = era5_partial_check['era5_count'] if era5_partial_check else 0
+                
+                # Log partial recovery information
+                if era5_count > 0:
+                    logger.info(f"Run {run_id}: ERA5 partial progress detected - {era5_count} miners already have ERA5 scores")
+                
+                if day1_count > 0:
+                    # Day-1 scoring is complete, reset to day1_scoring_complete to trigger ERA5 scoring
+                    await _update_run_status(self, run_id, "day1_scoring_complete")
+                    logger.info(f"Run {run_id}: Reset from '{status}' to 'day1_scoring_complete' (Day-1 complete: {day1_count} miners) for ERA5 partial recovery")
+                else:
+                    # Day-1 scoring not complete, reset to earlier state
+                    await _update_run_status(self, run_id, "verifying_miner_forecasts")
+                    logger.info(f"Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' (Day-1 not complete)")
+                
+                # Reset ERA5 scoring job to queued status for smart partial recovery
+                reset_job_query = """
+                UPDATE weather_scoring_jobs 
+                SET status = 'queued', started_at = NULL, error_message = 'Reset for partial recovery after validator restart'
+                WHERE run_id = :run_id AND score_type = 'era5_final' AND status IN ('in_progress', 'queued')
+                """
+                await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": 'era5_final'})
+                
+                if era5_count > 0:
+                    logger.info(f"Run {run_id}: Reset ERA5 scoring job for smart partial recovery (will resume from {era5_count} completed miners)")
+                else:
+                    logger.info(f"Run {run_id}: Reset ERA5 scoring job for full scoring")
                 
                 # Trigger immediate scoring check
                 await self._continue_run_workflow(run_id)
@@ -4012,7 +3948,7 @@ sources:
             'sending_fetch_requests', 'awaiting_input_hashes', 'verifying_input_hashes', 
             'triggering_inference', 'awaiting_inference_results', 'verifying_miner_forecasts',
             # INCLUDE SCORING STATES - can get stuck due to restarts during scoring
-            'day1_scoring_started', 'era5_final_scoring_started'
+            'day1_scoring_started', 'era5_final_scoring_started', 'era5_final_scoring_partial'
         ]
         
         # Also check for runs that might be ready for scoring
@@ -4073,25 +4009,32 @@ sources:
                     logger.info(f"  - Recovering run {run_id}: processing ready for scoring")
                     asyncio.create_task(self._continue_run_workflow(run_id))
                     
-                elif status in ['day1_scoring_started', 'era5_final_scoring_started']:
+                elif status in ['day1_scoring_started', 'era5_final_scoring_started', 'era5_final_scoring_partial']:
                     logger.info(f"  - Recovering run {run_id}: resetting stuck scoring state '{status}' - likely interrupted by restart")
                     
-                    # Reset run status to allow re-processing
-                    await _update_run_status(self, run_id, "verifying_miner_forecasts")
-                    
-                    # Reset scoring jobs to queued status for retry with smart partial logic
-                    scoring_type = 'day1_qc' if status == 'day1_scoring_started' else 'era5_final'
-                    reset_job_query = """
-                    UPDATE weather_scoring_jobs 
-                    SET status = 'queued', started_at = NULL, error_message = 'Reset due to validator restart during scoring'
-                    WHERE run_id = :run_id AND score_type = :score_type AND status IN ('in_progress', 'queued')
-                    """
-                    await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": scoring_type})
-                    
-                    logger.info(f"  - Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with '{scoring_type}' job queued for smart partial retry")
-                    
-                    # Trigger immediate scoring check
-                    asyncio.create_task(self._continue_run_workflow(run_id))
+                    # For partial scoring, don't reset status - let it continue from where it left off
+                    if status == 'era5_final_scoring_partial':
+                        logger.info(f"  - Run {run_id}: Partial scoring state - will continue progressive scoring from existing progress")
+                        # Don't reset status for partial scoring - it should continue as-is
+                        # Just trigger scoring check to resume where it left off
+                        asyncio.create_task(self._continue_run_workflow(run_id))
+                    else:
+                        # For started states, reset to allow re-processing
+                        await _update_run_status(self, run_id, "verifying_miner_forecasts")
+                        
+                        # Reset scoring jobs to queued status for retry with smart partial logic
+                        scoring_type = 'day1_qc' if status == 'day1_scoring_started' else 'era5_final'
+                        reset_job_query = """
+                        UPDATE weather_scoring_jobs 
+                        SET status = 'queued', started_at = NULL, error_message = 'Reset due to validator restart during scoring'
+                        WHERE run_id = :run_id AND score_type = :score_type AND status IN ('in_progress', 'queued')
+                        """
+                        await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": scoring_type})
+                        
+                        logger.info(f"  - Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with '{scoring_type}' job queued for smart partial retry")
+                        
+                        # Trigger immediate scoring check
+                        asyncio.create_task(self._continue_run_workflow(run_id))
                     
             except Exception as recovery_error:
                 logger.error(f"  - Error recovering run {run_id}: {recovery_error}", exc_info=True)
@@ -4514,35 +4457,183 @@ sources:
             logger.error(f"[Run {run_id}] Error completing {score_type} scoring job: {e}", exc_info=True)
             return False
 
+    async def _track_progressive_scoring_completion(self, run_id: int, completed_lead_hours: List[int]) -> bool:
+        """Track completion of specific lead hours for progressive scoring."""
+        try:
+            # Update the final_scoring_attempted_time to track overall progress
+            # but don't mark as fully complete until all desired lead hours are done
+            all_configured_hours = self.config.get('final_scoring_lead_hours', [24, 48, 72, 96, 120, 144, 168, 192, 216, 240])
+            
+            # Check how many total lead hours have been scored for this run
+            scored_hours_query = """
+            SELECT DISTINCT lead_hours FROM weather_miner_scores 
+            WHERE run_id = :run_id AND score_type LIKE '%era5%' AND score_type != 'era5_final_composite_score'
+            AND lead_hours IS NOT NULL AND lead_hours >= 0
+            ORDER BY lead_hours
+            """
+            scored_results = await self.db_manager.fetch_all(scored_hours_query, {"run_id": run_id})
+            already_scored_hours = [r['lead_hours'] for r in scored_results if r['lead_hours'] is not None]
+            
+            total_scored_hours = set(already_scored_hours + completed_lead_hours)
+            completion_ratio = len(total_scored_hours) / len(all_configured_hours)
+            
+            logger.info(f"[Run {run_id}] Progressive scoring status: {len(total_scored_hours)}/{len(all_configured_hours)} lead hours completed ({completion_ratio:.2%})")
+            
+            # Update run status based on completion ratio
+            if completion_ratio >= 0.8:  # 80% completion threshold
+                new_status = "scored"
+                logger.info(f"[Run {run_id}] Progressive scoring substantially complete, marking as scored")
+            elif completion_ratio >= 0.5:  # 50% completion threshold  
+                new_status = "era5_final_scoring_partial"
+            else:
+                new_status = "era5_final_scoring_started"
+            
+            await self.db_manager.execute(
+                "UPDATE weather_forecast_runs SET status = :status, final_scoring_attempted_time = :now WHERE id = :run_id",
+                {"status": new_status, "now": datetime.now(timezone.utc), "run_id": run_id}
+            )
+            
+            return True
+        except Exception as e:
+            logger.error(f"[Run {run_id}] Error tracking progressive scoring completion: {e}", exc_info=True)
+            return False
+
+    async def _get_scoring_timeout_if_enabled(self) -> Optional[float]:
+        """Get timeout for scoring operations if enabled, otherwise return None for no timeout."""
+        if not self.config.get('scoring_timeout_enabled', False):
+            return None
+        
+        # Return safety timeout in seconds
+        timeout_hours = self.config.get('scoring_timeout_safety_hours', 2.0)
+        return timeout_hours * 3600.0
+
+    async def _wait_for_scoring_with_progress(self, event: asyncio.Event, timeout: Optional[float], run_id: int):
+        """Wait for scoring event with periodic progress logging."""
+        start_time = time.time()
+        progress_interval = self.config.get('scoring_progress_log_interval', 300)  # 5 minutes
+        last_progress_log = start_time
+        
+        while True:
+            try:
+                # Wait for either the event or the progress interval
+                wait_time = min(progress_interval, timeout - (time.time() - start_time)) if timeout else progress_interval
+                
+                if wait_time <= 0 and timeout:
+                    # Timeout reached
+                    raise asyncio.TimeoutError()
+                
+                await asyncio.wait_for(event.wait(), timeout=wait_time)
+                # Event was set - scoring completed
+                return
+                
+            except asyncio.TimeoutError:
+                current_time = time.time()
+                elapsed = current_time - start_time
+                
+                # Check if this is a progress log timeout or actual timeout
+                if timeout and elapsed >= timeout:
+                    # Actual timeout reached
+                    raise asyncio.TimeoutError()
+                
+                # Progress log timeout - log progress and continue waiting
+                if current_time - last_progress_log >= progress_interval:
+                    logger.info(f"TEST MODE: Still waiting for Day-1 scoring of run {run_id} - elapsed: {elapsed/60:.1f} minutes")
+                    last_progress_log = current_time
+
     async def _recover_incomplete_scoring_jobs(self):
         """Recover scoring jobs that were interrupted by restarts."""
         try:
             # Find jobs that were in progress when restart happened
+            # Exclude runs that have already completed their scoring to avoid race conditions
             query = """
-            SELECT run_id, score_type, started_at
-            FROM weather_scoring_jobs 
-            WHERE status = 'in_progress'
-            AND started_at > (CURRENT_TIMESTAMP - INTERVAL '24 hours')
-            ORDER BY started_at ASC
+            SELECT wj.run_id, wj.score_type, wj.started_at
+            FROM weather_scoring_jobs wj
+            JOIN weather_forecast_runs wfr ON wj.run_id = wfr.id
+            WHERE wj.status = 'in_progress'
+            AND wj.started_at > (CURRENT_TIMESTAMP - INTERVAL '24 hours')
+            AND NOT (
+                (wj.score_type = 'day1_qc' AND wfr.status IN ('day1_scoring_complete', 'completed', 'scored')) OR
+                (wj.score_type = 'era5_final' AND wfr.status IN ('completed', 'scored')) OR
+                (wj.score_type = 'day1_qc' AND wfr.status LIKE 'era5_%')  -- Don't re-trigger Day-1 if already in ERA5 phases
+            )
+            ORDER BY wj.started_at ASC
             """
             incomplete_jobs = await self.db_manager.fetch_all(query)
             
-            if not incomplete_jobs:
-                logger.info("No incomplete scoring jobs found to recover")
+            # Additional filtering to prevent Day-1 jobs from being re-triggered for runs with existing Day-1 scores
+            filtered_jobs = []
+            for job in incomplete_jobs:
+                if job['score_type'] == 'day1_qc':
+                    # Check if this run already has Day-1 scores
+                    existing_scores = await self.db_manager.fetch_one(
+                        "SELECT COUNT(*) as count FROM weather_miner_scores WHERE run_id = :run_id AND score_type = 'day1_qc_score'",
+                        {"run_id": job['run_id']}
+                    )
+                    
+                    if existing_scores and existing_scores['count'] > 0:
+                        logger.info(f"Run {job['run_id']}: Skipping Day-1 job recovery - already has {existing_scores['count']} Day-1 scores")
+                        # Mark the job as completed to clear the in_progress status
+                        await self.db_manager.execute(
+                            "UPDATE weather_scoring_jobs SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE run_id = :run_id AND score_type = 'day1_qc'",
+                            {"run_id": job['run_id']}
+                        )
+                        continue
+                
+                filtered_jobs.append(job)
+            
+            incomplete_jobs = filtered_jobs
+            
+            # Also find runs that are in partial scoring states but might have stalled
+            stalled_partial_query = """
+            SELECT id as run_id, status, final_scoring_attempted_time
+            FROM weather_forecast_runs 
+            WHERE status IN ('era5_final_scoring_partial', 'era5_final_scoring_started')
+            AND (
+                final_scoring_attempted_time IS NULL 
+                OR final_scoring_attempted_time < (CURRENT_TIMESTAMP - INTERVAL '2 hours')
+            )
+            ORDER BY final_scoring_attempted_time ASC NULLS FIRST
+            LIMIT 10
+            """
+            stalled_runs = await self.db_manager.fetch_all(stalled_partial_query)
+            
+            total_recoveries = len(incomplete_jobs) + len(stalled_runs)
+            if total_recoveries == 0:
+                logger.info("No incomplete scoring jobs or stalled runs found to recover")
                 return
             
-            logger.info(f"Found {len(incomplete_jobs)} incomplete scoring job(s) to recover:")
+            logger.info(f"Found {len(incomplete_jobs)} incomplete scoring job(s) and {len(stalled_runs)} stalled partial run(s) to recover:")
             
+            # Recover incomplete scoring jobs
             for job in incomplete_jobs:
                 run_id = job['run_id']
                 score_type = job['score_type']
                 started_at = job['started_at']
                 
-                logger.info(f"  - Run {run_id}: {score_type} scoring (started: {started_at})")
+                logger.info(f"  - Run {run_id}: {score_type} scoring job (started: {started_at}) - resetting and retrying")
                 
                 # Reset to queued status and re-trigger
                 await self._reset_scoring_job(run_id, score_type)
                 await self._trigger_scoring_job(run_id, score_type)
+            
+            # Recover stalled partial runs
+            for run in stalled_runs:
+                run_id = run['run_id']
+                status = run['status']
+                last_attempt = run['final_scoring_attempted_time']
+                
+                logger.info(f"  - Run {run_id}: stalled in '{status}' (last attempt: {last_attempt}) - resuming progressive scoring")
+                
+                # Create a new era5_final scoring job to resume progressive scoring
+                if await self._create_scoring_job(run_id, 'era5_final'):
+                    # Update the attempted time to mark it as actively being retried
+                    await self.db_manager.execute(
+                        "UPDATE weather_forecast_runs SET final_scoring_attempted_time = :now WHERE id = :run_id",
+                        {"now": datetime.now(timezone.utc), "run_id": run_id}
+                    )
+                    logger.info(f"  - Run {run_id}: created new era5_final scoring job for progressive resume")
+                else:
+                    logger.warning(f"  - Run {run_id}: failed to create scoring job for recovery")
                 
         except Exception as e:
             logger.error(f"Error recovering incomplete scoring jobs: {e}", exc_info=True)

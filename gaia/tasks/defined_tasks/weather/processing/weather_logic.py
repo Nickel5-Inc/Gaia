@@ -512,6 +512,7 @@ async def find_job_by_alternative_methods(task_instance: 'WeatherTask', job_id: 
     """
     Attempts to find a job using alternative methods when the exact job ID is not found.
     This is critical for handling database synchronization scenarios where job IDs might not match.
+    Used by both miners and validators for database resilience.
     
     Args:
         task_instance: WeatherTask instance
@@ -521,9 +522,6 @@ async def find_job_by_alternative_methods(task_instance: 'WeatherTask', job_id: 
     Returns:
         Job details if found, None otherwise
     """
-    if task_instance.node_type != 'miner':
-        logger.error("find_job_by_alternative_methods called on non-miner node.")
-        return None
         
     try:
         # Extract timestamp from deterministic job ID if possible
@@ -870,6 +868,17 @@ async def calculate_era5_miner_score(
                 logger.info(f"[FinalScore info] Using selection_label_miner: {selection_label_miner} (type: {type(selection_label_miner)}) for miner_forecast_ds")
                 logger.info(f"[FinalScore info] Using selection_label_era5: {selection_label_era5} (type: {type(selection_label_era5)}) for era5_truth_ds")
 
+                # Remove duplicate time indices before selection to prevent reindexing errors
+                if len(miner_forecast_ds.time) > len(np.unique(miner_forecast_ds.time.values)):
+                    logger.debug(f"[FinalScore] Removing duplicate time indices from miner forecast data")
+                    _, unique_indices = np.unique(miner_forecast_ds.time.values, return_index=True)
+                    miner_forecast_ds = miner_forecast_ds.isel(time=sorted(unique_indices))
+                
+                if len(era5_truth_ds.time) > len(np.unique(era5_truth_ds.time.values)):
+                    logger.debug(f"[FinalScore] Removing duplicate time indices from ERA5 data")
+                    _, unique_indices = np.unique(era5_truth_ds.time.values, return_index=True)
+                    era5_truth_ds = era5_truth_ds.isel(time=sorted(unique_indices))
+
                 miner_forecast_lead_slice = miner_forecast_ds.sel(time=selection_label_miner, method="nearest")
                 era5_truth_lead_slice = era5_truth_ds.sel(time=selection_label_era5, method="nearest")
 
@@ -917,6 +926,12 @@ async def calculate_era5_miner_score(
             gfs_op_lead_slice = None
             if gfs_operational_fcst_ds is not None:
                 try:
+                    # Remove duplicate time indices from GFS operational data if needed
+                    if len(gfs_operational_fcst_ds.time) > len(np.unique(gfs_operational_fcst_ds.time.values)):
+                        logger.debug(f"[FinalScore] Removing duplicate time indices from GFS operational data")
+                        _, unique_indices = np.unique(gfs_operational_fcst_ds.time.values, return_index=True)
+                        gfs_operational_fcst_ds = gfs_operational_fcst_ds.isel(time=sorted(unique_indices))
+                    
                     selection_label_gfs_op = valid_time_dt
                     if np.issubdtype(gfs_operational_fcst_ds.time.dtype, np.integer):
                         selection_label_gfs_op = int(valid_time_dt.timestamp() * 1_000_000_000)
@@ -946,8 +961,55 @@ async def calculate_era5_miner_score(
                 try:
                     logger.info(f"[FinalScore] Miner {miner_hotkey}: Scoring {var_key} at {valid_time_dt} (Lead: {lead_hours}h)")
                     
-                    miner_var_da_unaligned = miner_forecast_lead_slice[var_name]
-                    truth_var_da_unaligned = era5_truth_lead_slice[var_name]
+                    # Check available variables and handle variable name mapping
+                    logger.debug(f"[FinalScore] Available miner variables: {list(miner_forecast_lead_slice.data_vars)}")
+                    logger.debug(f"[FinalScore] Available ERA5 variables: {list(era5_truth_lead_slice.data_vars)}")
+                    
+                    # Handle variable name mapping for ERA5 datasets
+                    era5_var_name = var_name
+                    miner_var_name = var_name
+                    
+                    # Define variable name mappings between config names and dataset names
+                    era5_var_mappings = {
+                        '2t': ['2t', 't2m', 'temperature_2m'],  # 2-meter temperature alternatives (surface level)
+                        'msl': ['msl', 'mean_sea_level_pressure', 'sp'],  # mean sea level pressure alternatives
+                        'z': ['z', 'geopotential'],  # geopotential alternatives
+                        't': ['t', 'temperature']  # temperature alternatives (pressure level)
+                    }
+                    
+                    miner_var_mappings = {
+                        '2t': ['2t', 't', 'temperature_2m', 'temperature'],
+                        'msl': ['msl', 'mean_sea_level_pressure', 'sp'],
+                        'z': ['z', 'geopotential'],
+                        't': ['t', 'temperature']
+                    }
+                    
+                    # Find appropriate variable name in ERA5 dataset
+                    if var_name in era5_var_mappings:
+                        for alt_name in era5_var_mappings[var_name]:
+                            if alt_name in era5_truth_lead_slice.data_vars:
+                                era5_var_name = alt_name
+                                if era5_var_name != var_name:
+                                    logger.info(f"[FinalScore] ERA5: Using variable '{alt_name}' for config variable '{var_name}'")
+                                break
+                        else:
+                            logger.error(f"[FinalScore] No suitable ERA5 variable found for '{var_name}'. Available: {list(era5_truth_lead_slice.data_vars)}")
+                            raise KeyError(f"Variable {var_name} not available in ERA5 dataset")
+                    
+                    # Find appropriate variable name in miner dataset  
+                    if var_name in miner_var_mappings:
+                        for alt_name in miner_var_mappings[var_name]:
+                            if alt_name in miner_forecast_lead_slice.data_vars:
+                                miner_var_name = alt_name
+                                if miner_var_name != var_name:
+                                    logger.info(f"[FinalScore] Miner: Using variable '{alt_name}' for config variable '{var_name}'")
+                                break
+                        else:
+                            logger.error(f"[FinalScore] No suitable miner variable found for '{var_name}'. Available: {list(miner_forecast_lead_slice.data_vars)}")
+                            raise KeyError(f"Variable {var_name} not available in miner dataset")
+                    
+                    miner_var_da_unaligned = miner_forecast_lead_slice[miner_var_name]
+                    truth_var_da_unaligned = era5_truth_lead_slice[era5_var_name]
                     
                     # Add detailed diagnostics for potential unit mismatches
                     logger.info(f"[FinalScore] RAW DATA DIAGNOSTICS for {var_key} at {valid_time_dt}:")
@@ -1085,7 +1147,20 @@ async def calculate_era5_miner_score(
                     lat_weights = None
                     if 'lat' in truth_var_da_final.dims:
                         one_d_lat_weights = await asyncio.to_thread(_calculate_latitude_weights, truth_var_da_final['lat'])
-                        _, lat_weights = await asyncio.to_thread(xr.broadcast, truth_var_da_final, one_d_lat_weights)
+                        
+                        # Handle dimension compatibility for surface vs pressure level variables
+                        if var_level is None:  # Surface variable (2t, msl, etc.)
+                            # Create weights with only lat/lon dimensions to match surface data
+                            lat_weights = one_d_lat_weights.expand_dims({'lon': truth_var_da_final['lon']})
+                            logger.debug(f"[FinalScore] Created surface-level lat_weights with dims: {lat_weights.dims}")
+                        else:  # Pressure level variable (z500, t850, etc.)
+                            # For pressure level variables, use full broadcasting
+                            try:
+                                _, lat_weights = await asyncio.to_thread(xr.broadcast, truth_var_da_final, one_d_lat_weights)
+                                logger.debug(f"[FinalScore] Created pressure-level lat_weights with dims: {lat_weights.dims}")
+                            except Exception as broadcast_err:
+                                logger.warning(f"[FinalScore] Failed to broadcast weights for pressure level, using lat/lon only: {broadcast_err}")
+                                lat_weights = one_d_lat_weights.expand_dims({'lon': truth_var_da_final['lon']})
 
                     current_metrics = {}
                     bias_corrected_forecast_da = await calculate_bias_corrected_forecast(miner_var_da_aligned, truth_var_da_final)
@@ -1105,14 +1180,53 @@ async def calculate_era5_miner_score(
                         res = xs.mse(*args, **kwargs)
                         if hasattr(res, 'compute'):
                             res = res.compute()
-                        return float(res.item())
+                        
+                        # Handle cases where result is not a scalar
+                        if hasattr(res, 'size') and res.size > 1:
+                            # If result has multiple values, take the mean
+                            logger.warning(f"[FinalScore] MSE result has {res.size} elements, taking mean")
+                            res = res.mean()
+                        
+                        if hasattr(res, 'item'):
+                            return float(res.item())
+                        else:
+                            return float(res)
 
+                    # Ensure weights dimensions match data dimensions before MSE calculation
+                    mse_weights = lat_weights
+                    if lat_weights is not None:
+                        # Check for dimension compatibility
+                        data_dims = set(truth_var_da_final.dims)
+                        weight_dims = set(lat_weights.dims)
+                        
+                        if weight_dims != data_dims:
+                            logger.info(f"[FinalScore] Adjusting weights dimensions. Data dims: {data_dims}, Weight dims: {weight_dims}")
+                            # Create weights that match the data dimensions exactly
+                            if var_level is None:  # Surface variable - only lat/lon
+                                mse_weights = one_d_lat_weights.expand_dims({'lon': truth_var_da_final['lon']})
+                            else:  # Pressure level variable - ensure weights match data structure
+                                try:
+                                    _, mse_weights = await asyncio.to_thread(xr.broadcast, truth_var_da_final, one_d_lat_weights)
+                                except Exception as broadcast_err:
+                                    logger.warning(f"[FinalScore] Failed to broadcast weights, using simple lat/lon weights: {broadcast_err}")
+                                    mse_weights = one_d_lat_weights.expand_dims({'lon': truth_var_da_final['lon']})
+                    
+                    # Calculate MSE with proper dimension handling
+                    # For proper scalar reduction, include all spatial dimensions
+                    all_spatial_dims = [d for d in truth_var_da_final.dims if d in ('lat', 'lon', 'latitude', 'longitude')]
+                    mse_dims = all_spatial_dims if all_spatial_dims else None  # None means reduce over all dimensions
+                    
+                    logger.debug(f"[FinalScore] MSE calculation - Data dims: {truth_var_da_final.dims}, MSE dims: {mse_dims}")
+                    logger.debug(f"[FinalScore] Data shapes - Miner: {miner_var_da_aligned.shape}, Truth: {truth_var_da_final.shape}")
+                    if mse_weights is not None:
+                        logger.debug(f"[FinalScore] Weights shape: {mse_weights.shape}, dims: {mse_weights.dims}")
+                    
                     raw_mse_val = await asyncio.to_thread(
                         calculate_raw_mse_scalar_threaded,
                         miner_var_da_aligned, 
                         truth_var_da_final, 
-                        dim=[d for d in truth_var_da_final.dims if d in ('lat', 'lon')], 
-                        weights=lat_weights, 
+                        dim=mse_dims, 
+                        weights=mse_weights, 
                         skipna=True
                     )
                     current_metrics["mse"] = raw_mse_val
@@ -1121,7 +1235,7 @@ async def calculate_era5_miner_score(
                     rmse_metric_row = {**db_metric_row_base, "metrics": current_metrics.copy(), "score_type": f"era5_rmse_{var_key}_{int(lead_hours)}h", "score": current_metrics["rmse"]}
                     all_metrics_for_db.append(rmse_metric_row)
 
-                    acc_val = await calculate_acc(miner_var_da_aligned, truth_var_da_final, climatology_da_aligned, lat_weights)
+                    acc_val = await calculate_acc(miner_var_da_aligned, truth_var_da_final, climatology_da_aligned, mse_weights)
                     current_metrics["acc"] = acc_val
                     acc_metric_row = {**db_metric_row_base, "metrics": current_metrics.copy(), "score_type": f"era5_acc_{var_key}_{int(lead_hours)}h", "score": acc_val}
                     all_metrics_for_db.append(acc_metric_row)
@@ -1158,7 +1272,7 @@ async def calculate_era5_miner_score(
                                 
                                 # skill score
                                 skill_score_val = await calculate_mse_skill_score(
-                                    forecast_bc_da, truth_var_da_final, gfs_var_da_aligned, lat_weights
+                                    forecast_bc_da, truth_var_da_final, gfs_var_da_aligned, mse_weights
                                 )
                                 
                                 if np.isfinite(skill_score_val):
@@ -1186,7 +1300,7 @@ async def calculate_era5_miner_score(
                             
                             # skill score vs climatology
                             skill_score_val = await calculate_mse_skill_score(
-                                forecast_bc_da, truth_var_da_final, climatology_da_aligned, lat_weights
+                                forecast_bc_da, truth_var_da_final, climatology_da_aligned, mse_weights
                             )
                             
                             if np.isfinite(skill_score_val):
@@ -1375,19 +1489,31 @@ async def _calculate_and_store_aggregated_era5_score(
                 logger.warning(f"[AggFinalScore] No valid ACC for {var_key} at lead {lead_h}h for UID {miner_uid}. ACC item will be 0.")
             acc_component_scores.append(normalized_acc_item)
 
-    avg_skill_error_score = sum(skill_error_component_scores) / len(skill_error_component_scores) if skill_error_component_scores else 0.0
-    avg_acc_score = sum(acc_component_scores) / len(acc_component_scores) if acc_component_scores else 0.0
+    # PROGRESSIVE SCORING FIX: Use total expected components as denominator (zeros for missing lead times)
+    # This ensures scores can only improve over time, not degrade as longer lead times are added
+    total_expected_lead_hours = task_instance.config.get('final_scoring_lead_hours', [24, 48, 72, 96, 120, 144, 168, 192, 216, 240])
+    total_expected_components_per_type = len(total_expected_lead_hours) * len(vars_levels_scored)
+    
+    # Calculate progressive averages with zeros as placeholders for missing components
+    avg_skill_error_score = sum(skill_error_component_scores) / total_expected_components_per_type if total_expected_components_per_type > 0 else 0.0
+    avg_acc_score = sum(acc_component_scores) / total_expected_components_per_type if total_expected_components_per_type > 0 else 0.0
 
     final_score_val = (0.5 * avg_skill_error_score) + (0.5 * avg_acc_score)
     
-    logger.info(f"[AggFinalScore] UID {miner_uid}, Run {run_id}: AvgNormSkill/Error={avg_skill_error_score:.4f} (from {len(skill_error_component_scores)} items), AvgNormACC={avg_acc_score:.4f} (from {len(acc_component_scores)} items) => Final Composite Score: {final_score_val:.4f}")
+    # Log progressive scoring details
+    logger.info(f"[AggFinalScore] UID {miner_uid}, Run {run_id}: PROGRESSIVE SCORING - Available: {len(skill_error_component_scores)}/{total_expected_components_per_type} skill/error, {len(acc_component_scores)}/{total_expected_components_per_type} ACC components")
+    logger.info(f"[AggFinalScore] UID {miner_uid}, Run {run_id}: ProgressiveSkill/Error={avg_skill_error_score:.4f}, ProgressiveACC={avg_acc_score:.4f} => Composite Score: {final_score_val:.4f}")
 
     agg_score_type = "era5_final_composite_score" 
     metrics_for_agg_score = {
         "avg_normalized_skill_error_component": avg_skill_error_score,
         "avg_normalized_acc_component": avg_acc_score,
-        "num_skill_error_components_aggregated": len(skill_error_component_scores),
-        "num_acc_components_aggregated": len(acc_component_scores)
+        "num_skill_error_components_available": len(skill_error_component_scores),
+        "num_acc_components_available": len(acc_component_scores),
+        "total_expected_components_per_type": total_expected_components_per_type,
+        "completion_ratio_skill_error": len(skill_error_component_scores) / total_expected_components_per_type if total_expected_components_per_type > 0 else 0.0,
+        "completion_ratio_acc": len(acc_component_scores) / total_expected_components_per_type if total_expected_components_per_type > 0 else 0.0,
+        "progressive_scoring_method": "zeros_for_missing_lead_times"
     }
 
     calc_time = datetime.now(timezone.utc)

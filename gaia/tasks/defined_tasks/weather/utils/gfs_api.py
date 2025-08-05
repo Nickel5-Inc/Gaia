@@ -60,14 +60,16 @@ async def fetch_gfs_data(run_time: datetime, lead_hours: List[int], output_dir: 
             import xarray as xr
             
             # Force re-registration of netcdf4 backend in this thread
-            if hasattr(xr.backends, 'NetCDF4BackendEntrypoint'):
-                try:
-                    # Manually register the netcdf4 backend in this thread context
-                    backend = xr.backends.NetCDF4BackendEntrypoint()
-                    xr.backends.backends.BACKENDS['netcdf4'] = backend
-                    logger.debug("Successfully re-registered netcdf4 backend in thread context")
-                except Exception as backend_reg_err:
-                    logger.warning(f"Could not manually register netcdf4 backend: {backend_reg_err}")
+            try:
+                # In modern xarray versions, backends are automatically registered
+                # Just verify that netcdf4 is available
+                available_engines = list(xr.backends.list_engines())
+                if 'netcdf4' in available_engines:
+                    logger.debug("netcdf4 backend is available in thread context")
+                else:
+                    logger.warning("netcdf4 backend not found in available engines")
+            except Exception as backend_check_err:
+                logger.warning(f"Could not check netcdf4 backend availability: {backend_check_err}")
             
             logger.debug(f"Thread context - Available engines: {list(xr.backends.list_engines())}")
         except ImportError as netcdf_err:
@@ -439,24 +441,31 @@ async def fetch_gfs_analysis_data(
                 if ds_cached is None:
                     raise Exception("Failed to load with any netCDF engine")
             
-            target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
-            if all(t_np_ns in ds_cached.time.values for t_np_ns in target_times_np_ns):
-                logger.info("GFS Analysis cache hit is valid.")
-                
-                if progress_callback:
-                    file_size = cache_file_to_use.stat().st_size if cache_file_to_use.exists() else 0
-                    await progress_callback({
-                        "operation": "gfs_download",
-                        "stage": "completed",
-                        "progress": 1.0,
-                        "message": f"Successfully loaded from cache ({file_size} bytes)",
-                        "bytes_downloaded": file_size,
-                        "bytes_total": file_size
-                    })
-                
-                return ds_cached
+            # Validate cache contains time coordinate and requested times
+            if 'time' in ds_cached.coords:
+                target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
+                if all(t_np_ns in ds_cached.time.values for t_np_ns in target_times_np_ns):
+                    logger.info("GFS Analysis cache hit is valid.")
+                    
+                    if progress_callback:
+                        file_size = cache_file_to_use.stat().st_size if cache_file_to_use.exists() else 0
+                        await progress_callback({
+                            "operation": "gfs_download",
+                            "stage": "completed",
+                            "progress": 1.0,
+                            "message": f"Successfully loaded from cache ({file_size} bytes)",
+                            "bytes_downloaded": file_size,
+                            "bytes_total": file_size
+                        })
+                    
+                    return ds_cached
+                else:
+                    logger.warning("Cached GFS analysis file missing requested times. Re-fetching.")
+                    if hasattr(ds_cached, 'close'):
+                        ds_cached.close()
+                    cache_file_to_use.unlink()
             else:
-                logger.warning("Cached GFS analysis file missing requested times. Re-fetching.")
+                logger.warning("Cached GFS analysis file missing 'time' coordinate. Re-fetching.")
                 if hasattr(ds_cached, 'close'):
                     ds_cached.close()
                 cache_file_to_use.unlink()
@@ -483,14 +492,16 @@ async def fetch_gfs_analysis_data(
             import xarray as xr
             
             # Force re-registration of netcdf4 backend in this thread
-            if hasattr(xr.backends, 'NetCDF4BackendEntrypoint'):
-                try:
-                    # Manually register the netcdf4 backend in this thread context
-                    backend = xr.backends.NetCDF4BackendEntrypoint()
-                    xr.backends.backends.BACKENDS['netcdf4'] = backend
-                    logger.debug("Successfully re-registered netcdf4 backend in thread context")
-                except Exception as backend_reg_err:
-                    logger.warning(f"Could not manually register netcdf4 backend: {backend_reg_err}")
+            try:
+                # In modern xarray versions, backends are automatically registered
+                # Just verify that netcdf4 is available
+                available_engines = list(xr.backends.list_engines())
+                if 'netcdf4' in available_engines:
+                    logger.debug("netcdf4 backend is available in thread context")
+                else:
+                    logger.warning("netcdf4 backend not found in available engines")
+            except Exception as backend_check_err:
+                logger.warning(f"Could not check netcdf4 backend availability: {backend_check_err}")
             
             logger.debug(f"Thread context - Available engines: {list(xr.backends.list_engines())}")
         except ImportError as netcdf_err:
