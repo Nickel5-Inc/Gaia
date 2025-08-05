@@ -4,7 +4,7 @@ model:
   # --- Aurora Model Configuration --- 
   # For Hugging Face Hub model:
   # model_repo: "microsoft/aurora"
-  checkpoint: "aurora-0.25-pretrained.ckpt"
+  checkpoint: "fine_tuned_e19.ckpt"
   
   # OR For a local model (ensure files are copied into the Docker image, e.g., to /app/local_models/my_aurora_model):
   model_repo: "/app/models/aurora_local" # Path to the directory containing the checkpoint and other model files

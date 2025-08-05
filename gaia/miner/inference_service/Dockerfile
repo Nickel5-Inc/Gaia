@@ -18,20 +18,18 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 RUN pip install --no-cache-dir --user huggingface-hub boto3 botocore
 
 # Download Aurora model in builder stage for better layer caching
-ARG AURORA_MODEL_REPO="microsoft/aurora"
-ARG AURORA_CHECKPOINT_NAME="aurora-0.25-pretrained.ckpt"
+ARG AURORA_MODEL_REPO="Nickel5HF/aurora_gfs_finetuned"
+ARG AURORA_CHECKPOINT_NAME="fine_tuned_e19.ckpt"
 
-RUN mkdir -p /app/models/aurora_local && \
-    echo "Downloading model ${AURORA_MODEL_REPO} checkpoint ${AURORA_CHECKPOINT_NAME}" && \
-    python -c "import os; os.environ['HF_HUB_CACHE']='/tmp/hf_cache'; \
-from huggingface_hub import snapshot_download; \
-snapshot_download(repo_id='${AURORA_MODEL_REPO}', \
-                  local_dir='/app/models/aurora_local', \
-                  allow_patterns=['${AURORA_CHECKPOINT_NAME}', 'config.json', '*.pickle'])" && \
-    rm -rf /tmp/hf_cache && \
-    echo "Model download complete" && \
-    ls -la /app/models/aurora_local
+# Manually download repo files above into ./models/aurora_local
+# THIS NEEDS TO BE DONE BEFORE CONTAINER IS BUILT
 
+# Copy manually downloaded files into Docker container
+RUN mkdir -p /app/models/aurora_local
+COPY ./models/aurora_local /app/models/aurora_local
+
+# TODO: CLEAN THIS UP SO WE DON'T COPY FILES LIKE 3 TIMES
+RUN echo "Successfully loaded fine-tuned model"
 # Runtime stage - minimal dependencies only
 FROM python:3.10-slim
 
