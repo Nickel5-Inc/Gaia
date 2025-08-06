@@ -87,8 +87,10 @@ async def evaluate_miner_forecast_day1(
             if not is_registered:
                 logger.warning(f"[Day1Score] Miner {miner_hotkey} failed token request and is not in current metagraph - likely deregistered. Cleaning up all records for this miner.")
                 # Import the cleanup function
-                from .processing.weather_logic import _cleanup_miner_records
+                from .processing.weather_logic import _cleanup_miner_records, _check_run_completion
                 await _cleanup_miner_records(task_instance, miner_hotkey, miner_response_db_record.get('run_id'))
+                # Check if this was the last miner in the run
+                await _check_run_completion(task_instance, miner_response_db_record.get('run_id'))
                 day1_results["error_message"] = "Miner not in current metagraph (likely deregistered)"
                 day1_results["overall_day1_score"] = 0.0
                 day1_results["qc_passed_all_vars_leads"] = False
@@ -96,8 +98,10 @@ async def evaluate_miner_forecast_day1(
             else:
                 logger.error(f"[Day1Score] Miner {miner_hotkey} failed token request but is still registered in metagraph. This may indicate a miner-side issue or network problem.")
                 # Import the cleanup function
-                from .processing.weather_logic import _cleanup_offline_miner_from_run
+                from .processing.weather_logic import _cleanup_offline_miner_from_run, _check_run_completion
                 await _cleanup_offline_miner_from_run(task_instance, miner_hotkey, miner_response_db_record.get('run_id'))
+                # Check if this was the last miner in the run
+                await _check_run_completion(task_instance, miner_response_db_record.get('run_id'))
                 day1_results["error_message"] = "Miner offline during scoring"
                 day1_results["overall_day1_score"] = 0.0
                 day1_results["qc_passed_all_vars_leads"] = False
@@ -125,7 +129,22 @@ async def evaluate_miner_forecast_day1(
         )
 
         if miner_forecast_ds is None:
-            raise ConnectionError(f"Failed to open verified Zarr dataset for miner {miner_hotkey}")
+            logger.error(f"[Day1Score] Failed to open verified Zarr dataset for miner {miner_hotkey} - manifest verification failed")
+            # Import the cleanup function
+            from .processing.weather_logic import _check_run_completion
+            # Mark this miner as failed but don't crash the entire batch
+            await task_instance.db_manager.execute(
+                """UPDATE weather_miner_responses 
+                   SET status = 'verification_failed', error_message = 'Manifest verification failed during day1 scoring'
+                   WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey""",
+                {"run_id": run_id, "miner_hotkey": miner_hotkey}
+            )
+            # Check if this was the last miner in the run
+            await _check_run_completion(task_instance, run_id)
+            day1_results["error_message"] = "Manifest verification failed"
+            day1_results["overall_day1_score"] = 0.0
+            day1_results["qc_passed_all_vars_leads"] = False
+            return day1_results  # Return graceful failure rather than exception
 
         hardcoded_valid_times: Optional[List[datetime]] = day1_scoring_config.get("hardcoded_valid_times_for_eval")
         if hardcoded_valid_times:

@@ -1691,9 +1691,14 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     for resp_rec in miners_to_poll:
                         polling_tasks.append(_poll_single_miner(resp_rec))
                     
-                    poll_results = await asyncio.gather(*polling_tasks)
+                    poll_results = await asyncio.gather(*polling_tasks, return_exceptions=True)
 
-                    for resp_id, status_data in poll_results:
+                    for i, result in enumerate(poll_results):
+                        if isinstance(result, Exception):
+                            # Extract resp_id from the task if possible
+                            logger.error(f"[Run {run_id}] Polling task failed with exception: {result}")
+                            continue
+                        resp_id, status_data = result
                         miner_hash_results[resp_id] = status_data
                     logger.info(f"[Run {run_id}] Collected input status from {len(miner_hash_results)}/{len(miners_to_poll)} miners.")
 
@@ -1815,8 +1820,15 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         
                         # Execute all update tasks after the loop completes
                         if update_tasks:
-                             await asyncio.gather(*update_tasks)
-                             logger.info(f"[Run {run_id}] Updated DB for {len(update_tasks)} miner responses after hash check.")
+                             results = await asyncio.gather(*update_tasks, return_exceptions=True)
+                             failed_updates = sum(1 for r in results if isinstance(r, Exception))
+                             if failed_updates > 0:
+                                 logger.error(f"[Run {run_id}] {failed_updates}/{len(update_tasks)} DB updates failed")
+                                 for i, r in enumerate(results):
+                                     if isinstance(r, Exception):
+                                         logger.error(f"[Run {run_id}] Update {i} failed: {r}")
+                             else:
+                                 logger.info(f"[Run {run_id}] Updated DB for {len(update_tasks)} miner responses after hash check.")
                      
                     if miners_to_trigger:
                         logger.info(f"[Run {run_id}] Triggering inference for {len(miners_to_trigger)} miners with matching input hashes.")
@@ -1859,11 +1871,15 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         for resp_id, miner_hk, miner_job_id in miners_to_trigger:
                             trigger_tasks.append(_trigger_single_miner(resp_id, miner_hk, miner_job_id))
                         
-                        trigger_results = await asyncio.gather(*trigger_tasks)
+                        trigger_results = await asyncio.gather(*trigger_tasks, return_exceptions=True)
 
                         final_update_tasks = []
                         triggered_count = 0
-                        for i, (resp_id, success) in enumerate(trigger_results):
+                        for i, result in enumerate(trigger_results):
+                            if isinstance(result, Exception):
+                                logger.error(f"[Run {run_id}] Trigger task {i} failed with exception: {result}")
+                                continue
+                            resp_id, success = result
                             if success:
                                 triggered_count += 1
                                 final_update_tasks.append(self.db_manager.execute(
@@ -1875,7 +1891,10 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 await asyncio.sleep(0)
                         
                         if final_update_tasks:
-                             await asyncio.gather(*final_update_tasks)
+                             results = await asyncio.gather(*final_update_tasks, return_exceptions=True)
+                        failed_updates = sum(1 for r in results if isinstance(r, Exception))
+                        if failed_updates > 0:
+                            logger.error(f"[Run {run_id}] {failed_updates} final DB updates failed")
                         logger.info(f"[Run {run_id}] Completed inference trigger process. Successfully triggered {triggered_count}/{len(miners_to_trigger)} miners.")
                         if triggered_count > 0:
                             await _update_run_status(self, run_id, "awaiting_inference_results")
@@ -2024,8 +2043,14 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                      verification_tasks.append(verify_miner_response(self, run_record, response))
                      
                 if verification_tasks:
-                     await asyncio.gather(*verification_tasks)
-                     logger.info(f"[Run {run_id}] Completed verification attempts for {len(verification_tasks)} responses.")
+                     results = await asyncio.gather(*verification_tasks, return_exceptions=True)
+                     failed_verifications = sum(1 for r in results if isinstance(r, Exception))
+                     if failed_verifications > 0:
+                         logger.error(f"[Run {run_id}] {failed_verifications}/{len(verification_tasks)} verification tasks failed")
+                         for i, r in enumerate(results):
+                             if isinstance(r, Exception):
+                                 logger.error(f"[Run {run_id}] Verification {i} failed: {r}")
+                     logger.info(f"[Run {run_id}] Completed verification attempts for {len(verification_tasks)} responses ({len(verification_tasks) - failed_verifications} successful).")
             else:
                 # For runs already in verifying_miner_forecasts, skip verification and go straight to scoring check
                 num_attempted_verification = 0
@@ -2365,24 +2390,34 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 return {"status": "error", "message": "Failed to preprocess input data"}
             logger.info(f"[Job {job_id}] Preprocessing completed in {time.time() - preprocessing_start_time:.2f} seconds.")
 
-            logger.info(f"[Job {job_id}] Creating initial job record in database.")
-            insert_query = """
-                INSERT INTO weather_miner_jobs (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_input_metadata, status, processing_start_time)
-                VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_meta, :status, :proc_start)
+            # Check if job already exists (multiple validators can generate same job ID)
+            existing_job_check = """
+                SELECT id, status FROM weather_miner_jobs 
+                WHERE id = :job_id
             """
-            if gfs_init_time.tzinfo is None:
-                 gfs_init_time = gfs_init_time.replace(tzinfo=timezone.utc)
+            existing_job = await self.db_manager.fetch_one(existing_job_check, {"job_id": job_id})
+            
+            if existing_job:
+                logger.info(f"[Job {job_id}] Job already exists with status '{existing_job['status']}'. Skipping duplicate creation (likely from another validator).")
+            else:
+                logger.info(f"[Job {job_id}] Creating initial job record in database.")
+                insert_query = """
+                    INSERT INTO weather_miner_jobs (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_input_metadata, status, processing_start_time)
+                    VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_meta, :status, :proc_start)
+                """
+                if gfs_init_time.tzinfo is None:
+                     gfs_init_time = gfs_init_time.replace(tzinfo=timezone.utc)
 
-            await self.db_manager.execute(insert_query, {
-                "id": job_id,
-                "req_time": datetime.now(timezone.utc),
-                "val_hk": validator_hotkey,
-                "gfs_init": gfs_init_time,
-                "gfs_meta": dumps(payload_data, default=str),
-                "status": "received",
-                "proc_start": datetime.now(timezone.utc)
-            })
-            logger.info(f"[Job {job_id}] Initial job record created.")
+                await self.db_manager.execute(insert_query, {
+                    "id": job_id,
+                    "req_time": datetime.now(timezone.utc),
+                    "val_hk": validator_hotkey,
+                    "gfs_init": gfs_init_time,
+                    "gfs_meta": dumps(payload_data, default=str),
+                    "status": "received",
+                    "proc_start": datetime.now(timezone.utc)
+                })
+                logger.info(f"[Job {job_id}] Initial job record created.")
 
             logger.info(f"[Job {job_id}] Launching background inference task...")
 
@@ -2687,24 +2722,32 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     # Reuse existing input data and hash
                     logger.info(f"[Miner Job {job_id}] Found existing input data from job {existing_input_job['id']}. Reusing GFS data and hash.")
                     
-                    insert_query = """
-                        INSERT INTO weather_miner_jobs
-                        (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_t_minus_6_time_utc, 
-                         input_data_hash, input_batch_pickle_path, status)
-                        VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_t_minus_6, :hash, :pickle_path, :status)
+                    # Check if job already exists before inserting
+                    job_exists_check = """
+                        SELECT id FROM weather_miner_jobs WHERE id = :job_id
                     """
-                    await self.db_manager.execute(insert_query, {
-                        "id": job_id,
-                        "req_time": datetime.now(timezone.utc),
-                        "val_hk": validator_hotkey,
-                        "gfs_init": t0_run_time,
-                        "gfs_t_minus_6": t_minus_6_run_time,
-                        "hash": existing_input_job['input_data_hash'],
-                        "pickle_path": existing_input_job['input_batch_pickle_path'],
-                        "status": "input_hashed_awaiting_validation"
-                    })
+                    job_exists = await self.db_manager.fetch_one(job_exists_check, {"job_id": job_id})
                     
-                    logger.info(f"[Miner Job {job_id}] Created new job record reusing input data and hash from job {existing_input_job['id']}.")
+                    if not job_exists:
+                        insert_query = """
+                            INSERT INTO weather_miner_jobs
+                            (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_t_minus_6_time_utc, 
+                             input_data_hash, input_batch_pickle_path, status)
+                            VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_t_minus_6, :hash, :pickle_path, :status)
+                        """
+                        await self.db_manager.execute(insert_query, {
+                            "id": job_id,
+                            "req_time": datetime.now(timezone.utc),
+                            "val_hk": validator_hotkey,
+                            "gfs_init": t0_run_time,
+                            "gfs_t_minus_6": t_minus_6_run_time,
+                            "hash": existing_input_job['input_data_hash'],
+                            "pickle_path": existing_input_job['input_batch_pickle_path'],
+                            "status": "input_hashed_awaiting_validation"
+                        })
+                        logger.info(f"[Miner Job {job_id}] Created new job record reusing input data and hash from job {existing_input_job['id']}.")
+                    else:
+                        logger.info(f"[Miner Job {job_id}] Job already exists, skipping creation (likely from another validator).")
                     return self._validate_and_format_response({
                         "status": WeatherTaskStatus.FETCH_ACCEPTED.value, 
                         "job_id": job_id, 
@@ -2715,20 +2758,29 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 # No existing input data found, need to fetch and hash
                 logger.info(f"[Miner Job {job_id}] No existing input data found. Creating new job for GFS fetch and hash computation.")
 
-                insert_query = """
-                    INSERT INTO weather_miner_jobs
-                    (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_t_minus_6_time_utc, status)
-                    VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_t_minus_6, :status)
+                # Check if job already exists before inserting
+                job_exists_check = """
+                    SELECT id FROM weather_miner_jobs WHERE id = :job_id
                 """
-                await self.db_manager.execute(insert_query, {
-                    "id": job_id,
-                    "req_time": datetime.now(timezone.utc),
-                    "val_hk": validator_hotkey,
-                    "gfs_init": t0_run_time,
-                    "gfs_t_minus_6": t_minus_6_run_time,
-                    "status": "fetch_queued"
-                })
-                logger.info(f"[Miner Job {job_id}] DB record created. Launching background fetch/hash task.")
+                job_exists = await self.db_manager.fetch_one(job_exists_check, {"job_id": job_id})
+                
+                if not job_exists:
+                    insert_query = """
+                        INSERT INTO weather_miner_jobs
+                        (id, validator_request_time, validator_hotkey, gfs_init_time_utc, gfs_t_minus_6_time_utc, status)
+                        VALUES (:id, :req_time, :val_hk, :gfs_init, :gfs_t_minus_6, :status)
+                    """
+                    await self.db_manager.execute(insert_query, {
+                        "id": job_id,
+                        "req_time": datetime.now(timezone.utc),
+                        "val_hk": validator_hotkey,
+                        "gfs_init": t0_run_time,
+                        "gfs_t_minus_6": t_minus_6_run_time,
+                        "status": "fetch_queued"
+                    })
+                    logger.info(f"[Miner Job {job_id}] DB record created. Launching background fetch/hash task.")
+                else:
+                    logger.info(f"[Miner Job {job_id}] Job already exists, skipping creation (likely from another validator).")
 
                 asyncio.create_task(fetch_and_hash_gfs_task(
                     task_instance=self,

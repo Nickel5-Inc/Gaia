@@ -1385,10 +1385,17 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 
                 if db_update_tasks:
                     try:
-                        await asyncio.gather(*db_update_tasks)
-                        logger.info(f"[Day1ScoringWorker] Run {run_id}: Stored Day-1 QC scores for {len(db_update_tasks)} responses.")
+                        results = await asyncio.gather(*db_update_tasks, return_exceptions=True)
+                        failed_updates = sum(1 for r in results if isinstance(r, Exception))
+                        if failed_updates > 0:
+                            logger.error(f"[Day1ScoringWorker] Run {run_id}: {failed_updates}/{len(db_update_tasks)} DB updates failed")
+                            for i, r in enumerate(results):
+                                if isinstance(r, Exception):
+                                    logger.error(f"[Day1ScoringWorker] Run {run_id}: DB update {i} failed: {r}")
+                        else:
+                            logger.info(f"[Day1ScoringWorker] Run {run_id}: Stored Day-1 QC scores for {len(db_update_tasks)} responses.")
                     except Exception as db_store_err:
-                        logger.error(f"[Day1ScoringWorker] Run {run_id}: Error storing Day-1 QC scores to DB: {db_store_err}", exc_info=True)
+                        logger.error(f"[Day1ScoringWorker] Run {run_id}: Unexpected error in DB updates: {db_store_err}", exc_info=True)
 
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: Successfully processed Day-1 QC for {successful_scores}/{len(responses)} miner responses.")
                 
@@ -1554,11 +1561,14 @@ async def finalize_scores_worker(self):
                     logger.info("[FinalizeWorker] TEST MODE: Ignoring ERA5 delay, checking recent runs for progressive final scoring")
                     # Add time constraint even in test mode to prevent scanning too much historical data
                     test_cutoff = now_utc - timedelta(days=30)  # Only look at runs from last 30 days
+                    # Test mode: check recent runs, but still exclude truly completed/failed runs
                     candidate_runs_query = """
                     SELECT id, gfs_init_time_utc
                     FROM weather_forecast_runs
                     WHERE gfs_init_time_utc > :test_cutoff
-                    AND status IN ('day1_scoring_complete', 'ensemble_created', 'completed', 'all_forecasts_failed_verification', 'stalled_no_valid_forecasts', 'initial_scoring_failed', 'final_scoring_failed', 'scored', 'era5_final_scoring_started', 'era5_final_scoring_partial')
+                    AND status IN ('day1_scoring_complete', 'ensemble_created', 'initial_scoring_failed', 
+                                 'final_scoring_failed', 'scored', 'era5_final_scoring_started', 
+                                 'era5_final_scoring_partial')
                     ORDER BY gfs_init_time_utc DESC
                     LIMIT 20 
                     """
@@ -1570,10 +1580,14 @@ async def finalize_scores_worker(self):
                     earliest_cutoff = now_utc - timedelta(days=ERA5_DELAY_DAYS) - timedelta(hours=min_lead_hour) - timedelta(hours=ERA5_BUFFER_HOURS)
                     retry_cutoff_time = now_utc - timedelta(hours=6)
                     
+                    # Only pick up runs that are in intermediate states needing ERA5 scoring
+                    # Exclude: completed, all_miners_failed, stale_abandoned
                     candidate_runs_query = """
                     SELECT id, gfs_init_time_utc
                     FROM weather_forecast_runs
-                    WHERE status IN ('processing_ensemble', 'completed', 'initial_scoring_failed', 'ensemble_failed', 'final_scoring_failed', 'scored', 'day1_scoring_complete', 'era5_final_scoring_started', 'era5_final_scoring_partial') 
+                    WHERE status IN ('processing_ensemble', 'initial_scoring_failed', 'ensemble_failed', 
+                                   'final_scoring_failed', 'scored', 'day1_scoring_complete', 
+                                   'era5_final_scoring_started', 'era5_final_scoring_partial') 
                     AND gfs_init_time_utc < :earliest_cutoff 
                     ORDER BY gfs_init_time_utc ASC
                     LIMIT 50
@@ -1743,16 +1757,16 @@ async def finalize_scores_worker(self):
                         processed_run_ids.add(run_id)
                         continue
 
-                    logger.info(f"[FinalizeWorker] Run {run_id}: Fetching ERA5 analysis for {len(target_dates_to_fetch)} dates (skipped {len(skipped_dates)} in backoff).")
+                    logger.info(f"[FinalizeWorker] Run {run_id}: Loading ERA5 data (from cache if available) for {len(target_dates_to_fetch)} dates (skipped {len(skipped_dates)} in backoff).")
                     era5_cache = Path(self.config.get('era5_cache_dir', './era5_cache'))
                     
                     # Use progressive ERA5 fetch for better data transfer efficiency
                     use_progressive_fetch = self.config.get('progressive_era5_fetch', True)
                     if use_progressive_fetch:
-                        logger.debug(f"[FinalizeWorker] Run {run_id}: Using progressive ERA5 fetch for {len(target_dates_to_fetch)} time points")
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Using progressive ERA5 fetch (with caching) for {len(target_dates_to_fetch)} time points")
                         era5_ds_for_run = await fetch_era5_data_progressive(target_times=target_dates_to_fetch, cache_dir=era5_cache)
                     else:
-                        logger.debug(f"[FinalizeWorker] Run {run_id}: Using standard ERA5 fetch")
+                        logger.info(f"[FinalizeWorker] Run {run_id}: Using standard ERA5 fetch (with caching)")
                         era5_ds_for_run = await fetch_era5_data(target_times=target_dates_to_fetch, cache_dir=era5_cache)
 
                     if era5_ds_for_run is None:
@@ -1953,8 +1967,15 @@ async def finalize_scores_worker(self):
                             
                             logger.info(f"[FinalizeWorker] Run {run_id}: Processing ERA5 batch {batch_start//batch_size + 1}/{(len(scoring_execution_tasks) + batch_size - 1)//batch_size} ({len(batch_tasks)} miners)")
                             
-                            batch_results = await asyncio.gather(*batch_tasks)
-                            miner_scoring_results.extend(batch_results)
+                            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                            # Filter out exceptions and log them
+                            for i, result in enumerate(batch_results):
+                                if isinstance(result, Exception):
+                                    miner_hotkey = batch_tasks[i].cr_frame.f_locals.get('resp_rec', {}).get('miner_hotkey', 'unknown')
+                                    logger.error(f"[FinalizeWorker] Run {run_id}: Miner {miner_hotkey} scoring failed with exception: {result}")
+                                    miner_scoring_results.append(False)  # Mark as failed
+                                else:
+                                    miner_scoring_results.append(result)
                             
                             # Memory cleanup between ERA5 batches (but not on the last batch)
                             if batch_end < len(scoring_execution_tasks):
@@ -2234,6 +2255,12 @@ async def finalize_scores_worker(self):
                     if failed_total > 0:
                         logger.info(f"[FinalizeWorker] Run {run_id}: Note - Failed miners may include deregistered miners (check individual miner logs for 'not in current metagraph' messages)")
                     
+                    # Check if this run should be marked as completed (all miners processed)
+                    from .weather_logic import _check_run_completion
+                    should_complete = await _check_run_completion(self, run_id)
+                    if should_complete:
+                        logger.info(f"[FinalizeWorker] Run {run_id}: All miners processed, run marked as completed")
+                    
                     if successful_final_scores_count > 0: 
                         # Track progressive scoring completion instead of simple status update
                         await self._track_progressive_scoring_completion(run_id, ready_lead_hours_for_run)
@@ -2249,12 +2276,6 @@ async def finalize_scores_worker(self):
                          # Mark scoring job as completed but with limited success
                          await self._complete_scoring_job(run_id, 'era5_final', success=True, error_message="No miners successfully scored")
                     processed_run_ids.add(run_id)
-                    
-                    # Check if this run should be marked as completed
-                    from .weather_logic import _check_run_completion
-                    should_complete = await _check_run_completion(self, run_id)
-                    if should_complete:
-                        logger.info(f"[FinalizeWorker] Run {run_id}: All miners processed, checking for run completion")
                     
                     # Final cleanup for any remaining dataset references (defensive)
                     logger.debug(f"[FinalizeWorker] Run {run_id}: Final cleanup - ensuring all datasets are closed")

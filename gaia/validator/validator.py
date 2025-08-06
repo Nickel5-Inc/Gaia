@@ -2519,8 +2519,9 @@ class GaiaValidator:
 
     async def cleanup_stale_history_on_startup(self):
         """
-        Compares historical prediction table hotkeys against the current metagraph
+        Compares weather score table hotkeys against the current metagraph
         and cleans up data for UIDs where hotkeys have changed or the UID is gone.
+        Weather-only validator - focuses only on weather task cleanup.
         Runs once on validator startup.
         """
         logger.info("Starting cleanup of stale miner history based on current metagraph...")
@@ -2550,30 +2551,33 @@ class GaiaValidator:
             current_nodes_info = {node.node_id: node for node in active_nodes_list}
             logger.info(f"Built current_nodes_info with {len(current_nodes_info)} active UIDs for stale history check.")
 
-            # 2. Fetch Historical Data (Distinct uid, miner_hotkey pairs)
-            geo_history_query = "SELECT DISTINCT miner_uid, miner_hotkey FROM geomagnetic_history WHERE miner_hotkey IS NOT NULL;"
-            soil_history_query = "SELECT DISTINCT miner_uid, miner_hotkey FROM soil_moisture_history WHERE miner_hotkey IS NOT NULL;"
+            # 2. Fetch Historical Data from weather-related tables only
+            # Weather task uses score_table for historical data, so we'll get historical pairs from there
+            weather_history_query = """
+            SELECT DISTINCT 
+                CAST(uid_index AS INTEGER) as miner_uid,
+                (SELECT hotkey FROM node_table WHERE uid = CAST(uid_index AS INTEGER) LIMIT 1) as miner_hotkey
+            FROM score_table 
+            WHERE task_name = 'weather' AND uid_index IS NOT NULL
+            """
             
             all_historical_pairs = set()
             try:
-                geo_results = await self.database_manager.fetch_all(geo_history_query)
-                all_historical_pairs.update((row['miner_uid'], row['miner_hotkey']) for row in geo_results)
-                logger.info(f"Found {len(geo_results)} distinct (miner_uid, hotkey) pairs in geomagnetic_history.")
+                weather_results = await self.database_manager.fetch_all(weather_history_query)
+                all_historical_pairs.update(
+                    (row['miner_uid'], row['miner_hotkey']) 
+                    for row in weather_results 
+                    if row['miner_hotkey'] is not None
+                )
+                logger.info(f"Found {len(weather_results)} distinct (miner_uid, hotkey) pairs in weather score history.")
             except Exception as e:
-                logger.warning(f"Could not query geomagnetic_history (may not exist yet): {e}")
-
-            try:
-                soil_results = await self.database_manager.fetch_all(soil_history_query)
-                all_historical_pairs.update((row['miner_uid'], row['miner_hotkey']) for row in soil_results)
-                logger.info(f"Found {len(soil_results)} distinct (miner_uid, hotkey) pairs in soil_moisture_history.")
-            except Exception as e:
-                logger.warning(f"Could not query soil_moisture_history (may not exist yet): {e}")
+                logger.warning(f"Could not query weather score history: {e}")
 
             if not all_historical_pairs:
-                logger.info("No historical data found to check. Skipping stale history cleanup.")
+                logger.info("No weather historical data found to check. Skipping stale history cleanup.")
                 return
 
-            logger.info(f"Found {len(all_historical_pairs)} total distinct historical (miner_uid, hotkey) pairs to check.")
+            logger.info(f"Found {len(all_historical_pairs)} total distinct weather historical (miner_uid, hotkey) pairs to check.")
 
             # 3. Identify Mismatches
             uids_to_cleanup = defaultdict(set)  # uid -> {stale_historical_hotkey1, stale_historical_hotkey2, ...}
@@ -2614,16 +2618,16 @@ class GaiaValidator:
             logger.info(f"Identified {len(uids_to_cleanup)} UIDs with stale history/scores.")
 
             # 4. Perform Cleanup
-            # Get relevant task names for score zeroing
+            # Get relevant task names for score zeroing (weather only)
             distinct_task_names_rows = await self.database_manager.fetch_all("SELECT DISTINCT task_name FROM score_table")
             all_task_names_in_scores = [row['task_name'] for row in distinct_task_names_rows if row['task_name']]
             tasks_for_score_cleanup = [
                 name for name in all_task_names_in_scores 
-                if name == 'geomagnetic' or name.startswith('soil_moisture')
+                if name == 'weather'
             ]
             if not tasks_for_score_cleanup:
-                 logger.warning("No relevant task names (geomagnetic, soil_moisture*) found in score_table for cleanup.")
-                 # Proceed with history deletion and node_table update anyway
+                 logger.warning("No weather task found in score_table for cleanup.")
+                 # Proceed with node_table update anyway
 
             async with self.miner_table_lock: # Use lock to coordinate with deregistration loop
                 for uid, stale_hotkeys in uids_to_cleanup.items():
@@ -2639,32 +2643,29 @@ class GaiaValidator:
                         max_ts: Optional[datetime] = None
                         timestamps_found = False
                         
-                        # Query both history tables using 'scored_at'
-                        history_tables_and_ts_cols = {
-                            "geomagnetic_history": "scored_at", # Use scored_at
-                            "soil_moisture_history": "scored_at" # Use scored_at
-                        }
+                        # For weather task, use score_table timestamps since weather doesn't have separate history tables
+                        # Use created_at from score_table as the timestamp reference
+                        score_table_ts_query = """
+                            SELECT MIN(created_at) as min_ts, MAX(created_at) as max_ts 
+                            FROM score_table 
+                            WHERE task_name = 'weather' AND uid_index = :uid_str
+                        """
                         
                         all_min_ts = []
                         all_max_ts = []
                         
-                        for table, ts_col in history_tables_and_ts_cols.items():
-                            try:
-                                ts_query = f"""
-                                    SELECT MIN({ts_col}) as min_ts, MAX({ts_col}) as max_ts 
-                                    FROM {table} 
-                                    WHERE miner_uid = :uid_str AND miner_hotkey = :stale_hk
-                                """
-                                result = await self.database_manager.fetch_one(ts_query, {"uid_str": str(uid), "stale_hk": stale_hk})
+                        # Query timestamps from score_table for weather task
+                        try:
+                            result = await self.database_manager.fetch_one(score_table_ts_query, {"uid_str": str(uid)})
+                            
+                            if result and result['min_ts'] is not None and result['max_ts'] is not None:
+                                all_min_ts.append(result['min_ts'])
+                                all_max_ts.append(result['max_ts'])
+                                timestamps_found = True
+                                logger.info(f"  Found time range in score_table for weather task UID {uid}: {result['min_ts']} -> {result['max_ts']}")
                                 
-                                if result and result['min_ts'] is not None and result['max_ts'] is not None:
-                                    all_min_ts.append(result['min_ts'])
-                                    all_max_ts.append(result['max_ts'])
-                                    timestamps_found = True
-                                    logger.info(f"  Found time range in {table} for ({uid}, {stale_hk}): {result['min_ts']} -> {result['max_ts']}")
-                                    
-                            except Exception as e_ts:
-                                logger.warning(f"Could not query timestamps from {table} for miner_uid {uid}, Hotkey {stale_hk}: {e_ts}")
+                        except Exception as e_ts:
+                            logger.warning(f"Could not query timestamps from score_table for miner_uid {uid}: {e_ts}")
                         
                         # Determine overall min/max across tables
                         if all_min_ts:
@@ -2673,9 +2674,8 @@ class GaiaValidator:
                              max_ts = max(all_max_ts)
 
                         # 4.2 Delete historical predictions associated with this specific stale hotkey
-                        logger.info(f"  Deleting history entries for ({uid}, {stale_hk})")
-                        # Geomagnetic and soil moisture history deletion skipped (tasks disabled)
-                        logger.debug(f"  History cleanup for disabled tasks skipped for miner_uid {uid}, hotkey {stale_hk}")
+                        logger.info(f"  Processing weather score cleanup for UID {uid} with stale hotkey {stale_hk}")
+                        # Weather task doesn't have separate history tables - scores are managed in score_table
                         
                         # 4.3 Zero out scores in score_table *only for the determined time window*
                         if tasks_for_score_cleanup and timestamps_found and min_ts and max_ts:
@@ -3415,18 +3415,15 @@ class GaiaValidator:
                                 except Exception as e_perf_del:
                                     logger.warning(f"  Could not clear miner_performance_stats for UID {uid_to_process}: {e_perf_del}")
 
-                                # 3. Zero out ALL scores for the UID in score_table
-                                distinct_task_names_rows = await self.database_manager.fetch_all("SELECT DISTINCT task_name FROM score_table")
-                                all_task_names_in_scores = [row['task_name'] for row in distinct_task_names_rows if row['task_name']]
-                                if all_task_names_in_scores:
-                                    logger.info(f"  Zeroing all scores in score_table for UID {uid_to_process} across tasks: {all_task_names_in_scores}")
-                                    await self.database_manager.remove_miner_from_score_tables(
-                                        uids=[uid_to_process],
-                                        task_names=all_task_names_in_scores,
-                                        filter_start_time=None, filter_end_time=None # Affect all history
-                                    )
-                                else:
-                                    logger.info(f"  No task names found in score_table to zero-out for UID {uid_to_process}.")
+                                # 3. Zero out scores for the UID in score_table (only weather task active)
+                                # Only process weather task - old tasks (geomagnetic, soil_moisture) are disabled
+                                active_task_names = ['weather']
+                                logger.info(f"  Zeroing scores in score_table for UID {uid_to_process} for weather task")
+                                await self.database_manager.remove_miner_from_score_tables(
+                                    uids=[uid_to_process],
+                                    task_names=active_task_names,
+                                    filter_start_time=None, filter_end_time=None # Affect all history
+                                )
 
                                 # 4. Update node_table with NEW info
                                 logger.info(f"  Updating node_table info for UID {uid_to_process} with new hotkey {new_chain_node_data.hotkey}.")

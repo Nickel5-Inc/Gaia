@@ -4,7 +4,7 @@ import xarray as xr
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import hashlib
 import tempfile
 import traceback
@@ -128,7 +128,7 @@ async def fetch_era5_data(
                 if 'time' in ds_combined.coords:
                     target_times_np_ns = [np.datetime64(t.replace(tzinfo=None), 'ns') for t in target_times]
                     if all(t_np_ns in ds_combined.time.values for t_np_ns in target_times_np_ns):
-                        logger.info("Cache hit is valid.")
+                        logger.info(f"✓ Cache hit for ERA5 data - loaded from {potential_cache_file.name}")
                         
                         # CRITICAL FIX: Force data loading for cached datasets too
                         # This prevents lazy-loading issues when cache files might be moved/deleted
@@ -498,7 +498,7 @@ import asyncio
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Tuple, Dict, Set
 from copy import deepcopy
 
 logger = logging.getLogger(__name__)
@@ -558,18 +558,28 @@ async def fetch_era5_data_progressive(
     daily_datasets = []
     failed_dates = []
     successful_times = []
+    cache_hits = 0
+    downloads = 0
     
     for date_key, times_for_date in daily_groups.items():
         logger.debug(f"Processing date {date_key} with {len(times_for_date)} time points")
         
-        daily_ds = await _fetch_single_day_era5(date_key, times_for_date, cache_dir)
+        daily_ds, was_cache_hit = await _fetch_single_day_era5(date_key, times_for_date, cache_dir)
         if daily_ds is not None:
             daily_datasets.append(daily_ds)
             successful_times.extend(times_for_date)
+            if was_cache_hit:
+                cache_hits += 1
+            else:
+                downloads += 1
             logger.debug(f"✅ Successfully fetched ERA5 data for date {date_key}")
         else:
             failed_dates.append(date_key)
             logger.warning(f"❌ Failed to fetch ERA5 data for date {date_key} - data may not be available yet")
+    
+    # Log cache summary
+    if cache_hits > 0 or downloads > 0:
+        logger.info(f"📊 ERA5 fetch summary: {cache_hits} from cache, {downloads} downloaded from API, {len(failed_dates)} failed")
     
     if failed_dates:
         logger.warning(f"ERA5 fetch partial failure: {len(failed_dates)} dates failed ({failed_dates}), {len(daily_datasets)} succeeded")
@@ -636,10 +646,13 @@ async def _fetch_single_day_era5(
     date_str: str,
     times_for_date: List[datetime], 
     cache_dir: Path
-) -> Optional[xr.Dataset]:
+) -> Tuple[Optional[xr.Dataset], bool]:
     """
     Fetch ERA5 data for a single day with per-day caching.
     This enables efficient progressive scoring with minimal redundant downloads.
+    
+    Returns:
+        Tuple of (dataset, was_cache_hit) where was_cache_hit is True if loaded from cache
     """
     # Create cache filename based on date and times
     times_str = "_".join([t.strftime("%H%M") for t in times_for_date])
@@ -659,8 +672,8 @@ async def _fetch_single_day_era5(
                     # Force data loading to prevent lazy-loading issues
                     for var_name in ds.data_vars:
                         _ = ds[var_name].values
-                    logger.debug(f"Cache hit for {date_str}")
-                    return ds
+                    logger.info(f"✓ Cache hit for ERA5 data on {date_str} - loaded from {cache_file.name}")
+                    return ds, True  # Return dataset and cache hit flag
                 else:
                     logger.warning(f"Cache miss: {date_str} cache doesn't contain all requested times")
                     ds.close()
@@ -675,7 +688,7 @@ async def _fetch_single_day_era5(
                 cache_file.unlink()
     
     # Fetch data from CDS API for this specific day
-    logger.info(f"Fetching ERA5 data for {date_str} from CDS API")
+    logger.info(f"⬇ Downloading ERA5 data for {date_str} from CDS API (not in cache)")
     
     times = sorted(list(set(t.strftime("%H:%M") for t in times_for_date)))
     
@@ -888,7 +901,7 @@ async def _fetch_single_day_era5(
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(None, _sync_fetch_single_day)
-        return result
+        return result, False  # Return dataset and false for cache hit (was downloaded)
     except Exception as e:
         logger.error(f"Error fetching ERA5 data for {date_str}: {e}")
-        return None 
+        return None, False 
