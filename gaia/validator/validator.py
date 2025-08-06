@@ -3707,21 +3707,37 @@ class GaiaValidator:
             weights_final = getattr(_cm, _b64.b64decode(_fn_enc).decode())(weights_final, validator_nodes_by_uid_list, logger)
             
             non_zero_mask = weights_final != 0.0
-            if not np.any(non_zero_mask): logger.warning("No non-zero weights to normalize!"); return None
+            if not np.any(non_zero_mask): 
+                logger.warning("No non-zero weights to normalize! Setting fallback weights: 100% to UID 252, 0% to all others.")
+                fallback_weights = np.zeros(256)
+                fallback_weights[252] = 1.0  # Set 100% weight to UID 252
+                return fallback_weights.tolist(), {}
             
             nz_weights = weights_final[non_zero_mask]
             max_w_val = np.max(nz_weights)
-            if max_w_val == 0: logger.warning("Max weight is 0, cannot normalize."); return None
+            if max_w_val == 0: 
+                logger.warning("Max weight is 0, cannot normalize. Setting fallback weights: 100% to UID 252, 0% to all others.")
+                fallback_weights = np.zeros(256)
+                fallback_weights[252] = 1.0  # Set 100% weight to UID 252
+                return fallback_weights.tolist(), {}
             
             norm_weights = np.copy(weights_final); norm_weights[non_zero_mask] /= max_w_val
             positives = norm_weights[norm_weights > 0]
-            if not positives.any(): logger.warning("No positive weights after initial normalization!"); return None
+            if not positives.any(): 
+                logger.warning("No positive weights after initial normalization! Setting fallback weights: 100% to UID 252, 0% to all others.")
+                fallback_weights = np.zeros(256)
+                fallback_weights[252] = 1.0  # Set 100% weight to UID 252
+                return fallback_weights.tolist(), {}
             
             M = np.percentile(positives, 80); logger.info(f"Using 80th percentile ({M:.8f}) as curve midpoint")
             b,Q,v,k,a,slope = 70,8,0.3,0.98,0.0,0.01
             transformed_w = np.zeros_like(weights_final)
             nz_indices = np.where(weights_final > 0.0)[0]
-            if not nz_indices.any(): logger.warning("No positive weight indices for transformation!"); return None
+            if not nz_indices.any(): 
+                logger.warning("No positive weight indices for transformation! Setting fallback weights: 100% to UID 252, 0% to all others.")
+                fallback_weights = np.zeros(256)
+                fallback_weights[252] = 1.0  # Set 100% weight to UID 252
+                return fallback_weights.tolist(), {}
 
             for idx in nz_indices:
                 sig_p = a+(k-a)/np.power(1+Q*np.exp(-b*(norm_weights[idx]-M)),1/v)
@@ -3750,8 +3766,10 @@ class GaiaValidator:
                 final_weights_list = transformed_w.tolist()
                 logger.info("Final normalized weights calculated.")
             else: 
-                logger.warning("Sum of weights is zero, cannot normalize! Returning None.")
-                final_weights_list = None
+                logger.warning("Sum of weights is zero, cannot normalize! Setting fallback weights: 100% to UID 252, 0% to all others.")
+                fallback_weights = np.zeros(256)
+                fallback_weights[252] = 1.0  # Set 100% weight to UID 252
+                final_weights_list = fallback_weights.tolist()
             
             # === NEW: Update pathway tracking with final submitted weights ===
             if final_weights_list:
@@ -3954,9 +3972,10 @@ class GaiaValidator:
                         self.performance_calculator._current_pathway_data.update(pathway_tracking)
                         logger.debug("Pathway tracking data stored in performance calculator")
                 elif weight_result is None:
-                    # Expected when no scores exist - not an error for weather-only subnet
-                    final_weights_list = None
-                    logger.info("No weather scores available - validator will use zero weights until scoring begins")
+                    # Expected when no scores exist - set fallback weights: 100% to UID 252, 0% to all others
+                    logger.info("No weather scores available - setting fallback weights: 100% to UID 252, 0% to all others")
+                    final_weights_list = [0.0] * 256
+                    final_weights_list[252] = 1.0
                 else:
                     # Unexpected return format
                     final_weights_list = weight_result

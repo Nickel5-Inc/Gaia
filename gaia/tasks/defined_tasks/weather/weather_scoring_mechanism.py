@@ -85,14 +85,23 @@ async def evaluate_miner_forecast_day1(
             # Check if miner is still registered before treating this as a critical error
             is_registered = await _is_miner_registered(task_instance, miner_hotkey)
             if not is_registered:
-                logger.warning(f"[Day1Score] Miner {miner_hotkey} failed token request and is not in current metagraph - likely deregistered. Skipping day1 scoring for this miner.")
+                logger.warning(f"[Day1Score] Miner {miner_hotkey} failed token request and is not in current metagraph - likely deregistered. Cleaning up all records for this miner.")
+                # Import the cleanup function
+                from .processing.weather_logic import _cleanup_miner_records
+                await _cleanup_miner_records(task_instance, miner_hotkey, miner_response_db_record.get('run_id'))
                 day1_results["error_message"] = "Miner not in current metagraph (likely deregistered)"
                 day1_results["overall_day1_score"] = 0.0
                 day1_results["qc_passed_all_vars_leads"] = False
                 return day1_results  # Return graceful failure rather than exception
             else:
                 logger.error(f"[Day1Score] Miner {miner_hotkey} failed token request but is still registered in metagraph. This may indicate a miner-side issue or network problem.")
-                raise ValueError(f"Failed to get fresh access token/URL/manifest_hash for {miner_hotkey} job {job_id}")
+                # Import the cleanup function
+                from .processing.weather_logic import _cleanup_offline_miner_from_run
+                await _cleanup_offline_miner_from_run(task_instance, miner_hotkey, miner_response_db_record.get('run_id'))
+                day1_results["error_message"] = "Miner offline during scoring"
+                day1_results["overall_day1_score"] = 0.0
+                day1_results["qc_passed_all_vars_leads"] = False
+                return day1_results  # Return graceful failure rather than exception
 
         access_token, zarr_store_url, claimed_manifest_content_hash = token_data_tuple
         

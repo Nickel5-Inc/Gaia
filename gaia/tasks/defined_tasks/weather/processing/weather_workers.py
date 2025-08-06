@@ -1403,6 +1403,12 @@ async def initial_scoring_worker(task_instance: 'WeatherTask'):
                 await task_instance._complete_scoring_job(run_id, 'day1_qc', success=True)
                 logger.info(f"[Day1ScoringWorker] Run {run_id}: Marked as day1_scoring_complete.")
                 
+                # Check if this run should be marked as completed (all miners processed)
+                from .weather_logic import _check_run_completion
+                should_complete = await _check_run_completion(task_instance, run_id)
+                if should_complete:
+                    logger.info(f"[Day1ScoringWorker] Run {run_id}: All miners processed, run completion check complete")
+                
                 task_instance.initial_scoring_queue.task_done()
 
                 if task_instance.test_mode and run_id == task_instance.last_test_mode_run_id:
@@ -2243,6 +2249,12 @@ async def finalize_scores_worker(self):
                          # Mark scoring job as completed but with limited success
                          await self._complete_scoring_job(run_id, 'era5_final', success=True, error_message="No miners successfully scored")
                     processed_run_ids.add(run_id)
+                    
+                    # Check if this run should be marked as completed
+                    from .weather_logic import _check_run_completion
+                    should_complete = await _check_run_completion(self, run_id)
+                    if should_complete:
+                        logger.info(f"[FinalizeWorker] Run {run_id}: All miners processed, checking for run completion")
                     
                     # Final cleanup for any remaining dataset references (defensive)
                     logger.debug(f"[FinalizeWorker] Run {run_id}: Final cleanup - ensuring all datasets are closed")

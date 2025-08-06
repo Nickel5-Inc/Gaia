@@ -3721,24 +3721,29 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         # Also check for runs that might be ready for scoring
         cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=self.config.get('verification_wait_minutes', 30))
         
-        # Get up to 10 runs to check, in case some have been processed already
+        # Get up to 20 runs to check, prioritizing runs that haven't completed day1 scoring
         # Include both normal recoverable states and failure states that might be recoverable
-        # ORDER BY DESC to prioritize most recent runs first
         all_recoverable_states = recoverable_states + potentially_recoverable_failure_states
-        recovery_query = """
-        SELECT id, gfs_init_time_utc, status, run_initiation_time
+        
+        # First, prioritize runs that haven't completed day1 scoring
+        day1_priority_query = """
+        SELECT id, gfs_init_time_utc, status, run_initiation_time, 
+               CASE WHEN status IN ('verifying_miner_forecasts', 'day1_scoring_started', 'initial_scoring_failed') THEN 1 ELSE 2 END as priority
         FROM weather_forecast_runs 
         WHERE status IN ({}) OR (status = 'awaiting_inference_results' AND run_initiation_time < :cutoff_time)
-        ORDER BY run_initiation_time DESC
-        LIMIT 10
+        ORDER BY priority ASC, run_initiation_time DESC
+        LIMIT 20
         """.format(','.join(f"'{state}'" for state in all_recoverable_states))
+        
+        recovery_query = day1_priority_query
         
         incomplete_runs = await self.db_manager.fetch_all(recovery_query, {"cutoff_time": cutoff_time})
         
-        # Debug: Log what we found
-        logger.debug(f"Recovery query found {len(incomplete_runs)} incomplete runs")
+        # Debug: Log what we found with priority information
+        logger.debug(f"Recovery query found {len(incomplete_runs)} incomplete runs (prioritized by day1 scoring)")
         for run in incomplete_runs:
-            logger.debug(f"  - Run {run['id']}: status='{run['status']}', age={(datetime.now(timezone.utc) - run['run_initiation_time']).total_seconds() / 3600:.1f}h")
+            priority_str = "HIGH" if run.get('priority', 2) == 1 else "NORMAL"
+            logger.debug(f"  - Run {run['id']}: status='{run['status']}', priority={priority_str}, age={(datetime.now(timezone.utc) - run['run_initiation_time']).total_seconds() / 3600:.1f}h")
         
         if not incomplete_runs:
             # Check if there are any runs in unexpected states

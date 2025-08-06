@@ -122,10 +122,18 @@ class FiberWeightSetter:
         active_nodes = (weights_tensor > 0).sum().item()
 
         if active_nodes == 0:
-            logger.warning("No active nodes found")
-            # Return zero weights tensor instead of None to maintain consistent return type
-            zero_weights = torch.zeros(len(node_ids), dtype=torch.float32)
-            return zero_weights, node_ids
+            logger.warning("No active nodes found - setting fallback weights: 100% to UID 252, 0% to all others")
+            # Set fallback weights with 100% to UID 252
+            fallback_weights = torch.zeros(len(node_ids), dtype=torch.float32)
+            if 252 < len(node_ids):
+                # Find the position of UID 252 in the node_ids list
+                try:
+                    uid_252_index = node_ids.index(252)
+                    fallback_weights[uid_252_index] = 1.0
+                    logger.info(f"Set 100% weight to UID 252 at index {uid_252_index}")
+                except ValueError:
+                    logger.warning("UID 252 not found in node_ids, using zero weights")
+            return fallback_weights, node_ids
 
         logger.info(f"Raw computed weights before normalization: {weights}")
 

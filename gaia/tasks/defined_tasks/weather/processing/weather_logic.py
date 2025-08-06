@@ -37,6 +37,132 @@ from ..weather_scoring.scoring import VARIABLE_WEIGHTS
 
 logger = get_logger(__name__)
 
+async def _cleanup_miner_records(task_instance: 'WeatherTask', miner_hotkey: str, run_id: int) -> bool:
+    """
+    Remove all records for a deregistered miner from the current run.
+    
+    Args:
+        task_instance: WeatherTask instance
+        miner_hotkey: The miner's hotkey to clean up
+        run_id: The run ID to clean up from
+        
+    Returns:
+        bool: True if cleanup was successful, False otherwise
+    """
+    try:
+        logger.info(f"[MinerCleanup] Starting cleanup for deregistered miner {miner_hotkey} in run {run_id}")
+        
+        # Delete miner scores
+        await task_instance.db_manager.execute(
+            "DELETE FROM weather_miner_scores WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey",
+            {"run_id": run_id, "miner_hotkey": miner_hotkey}
+        )
+        
+        # Delete miner responses
+        await task_instance.db_manager.execute(
+            "DELETE FROM weather_miner_responses WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey",
+            {"run_id": run_id, "miner_hotkey": miner_hotkey}
+        )
+        
+        logger.info(f"[MinerCleanup] Successfully cleaned up records for deregistered miner {miner_hotkey} in run {run_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"[MinerCleanup] Error cleaning up miner {miner_hotkey} records: {e}", exc_info=True)
+        return False
+
+async def _cleanup_offline_miner_from_run(task_instance: 'WeatherTask', miner_hotkey: str, run_id: int) -> bool:
+    """
+    Remove a miner's participation from the current run (but keep historical data).
+    This is for miners that are still registered but offline/unavailable.
+    
+    Args:
+        task_instance: WeatherTask instance
+        miner_hotkey: The miner's hotkey to remove from current run
+        run_id: The run ID to remove miner from
+        
+    Returns:
+        bool: True if removal was successful, False otherwise
+    """
+    try:
+        logger.info(f"[OfflineMinerCleanup] Removing offline miner {miner_hotkey} from run {run_id}")
+        
+        # Mark responses as failed rather than deleting them
+        await task_instance.db_manager.execute(
+            """UPDATE weather_miner_responses 
+               SET status = 'miner_offline', error_message = 'Miner offline during scoring' 
+               WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey""",
+            {"run_id": run_id, "miner_hotkey": miner_hotkey}
+        )
+        
+        # Delete any pending scores for this run
+        await task_instance.db_manager.execute(
+            "DELETE FROM weather_miner_scores WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey",
+            {"run_id": run_id, "miner_hotkey": miner_hotkey}
+        )
+        
+        logger.info(f"[OfflineMinerCleanup] Successfully removed offline miner {miner_hotkey} from run {run_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"[OfflineMinerCleanup] Error removing offline miner {miner_hotkey} from run: {e}", exc_info=True)
+        return False
+
+async def _check_run_completion(task_instance: 'WeatherTask', run_id: int) -> bool:
+    """
+    Check if a run should be marked as completed based on miner participation.
+    
+    Args:
+        task_instance: WeatherTask instance
+        run_id: The run ID to check
+        
+    Returns:
+        bool: True if run should be completed, False if it should continue
+    """
+    try:
+        # Check total miners in run
+        total_miners_query = """
+        SELECT COUNT(*) as total_count FROM weather_miner_responses 
+        WHERE run_id = :run_id
+        """
+        total_result = await task_instance.db_manager.fetch_one(total_miners_query, {"run_id": run_id})
+        total_miners = total_result['total_count'] if total_result else 0
+        
+        # Check miners with scores (successful)
+        scored_miners_query = """
+        SELECT COUNT(DISTINCT miner_hotkey) as scored_count 
+        FROM weather_miner_scores 
+        WHERE run_id = :run_id
+        """
+        scored_result = await task_instance.db_manager.fetch_one(scored_miners_query, {"run_id": run_id})
+        scored_miners = scored_result['scored_count'] if scored_result else 0
+        
+        # Check miners that failed/offline
+        failed_miners_query = """
+        SELECT COUNT(*) as failed_count FROM weather_miner_responses 
+        WHERE run_id = :run_id AND status IN ('miner_offline', 'verification_failed', 'error')
+        """
+        failed_result = await task_instance.db_manager.fetch_one(failed_miners_query, {"run_id": run_id})
+        failed_miners = failed_result['failed_count'] if failed_result else 0
+        
+        logger.info(f"[RunCompletion] Run {run_id}: Total miners: {total_miners}, Scored: {scored_miners}, Failed: {failed_miners}")
+        
+        # If all miners have either scored or failed, the run is complete
+        if total_miners > 0 and (scored_miners + failed_miners) >= total_miners:
+            if scored_miners == 0:
+                logger.warning(f"[RunCompletion] Run {run_id}: All miners failed - marking run as completed with no scores")
+                await _update_run_status(task_instance, run_id, "completed", "All miners failed or went offline")
+                return True
+            else:
+                logger.info(f"[RunCompletion] Run {run_id}: All miners processed ({scored_miners} scored, {failed_miners} failed)")
+                return True
+                
+        return False
+        
+    except Exception as e:
+        logger.error(f"[RunCompletion] Error checking run completion for run {run_id}: {e}", exc_info=True)
+        return False
+
 async def _is_miner_registered(task_instance, miner_hotkey: str) -> bool:
     """
     Check if a miner is still registered in the current metagraph.
@@ -778,11 +904,14 @@ async def calculate_era5_miner_score(
             # Check if miner is still registered before treating this as a critical error
             is_registered = await _is_miner_registered(task_instance, miner_hotkey)
             if not is_registered:
-                logger.warning(f"[FinalScore] Miner {miner_hotkey} failed token request and is not in current metagraph - likely deregistered. Skipping final scoring for this miner.")
+                logger.warning(f"[FinalScore] Miner {miner_hotkey} failed token request and is not in current metagraph - likely deregistered. Cleaning up all records for this miner.")
+                await _cleanup_miner_records(task_instance, miner_hotkey, run_id)
                 return False  # Skip this miner gracefully rather than causing worker failure
             else:
                 logger.error(f"[FinalScore] Miner {miner_hotkey} failed token request but is still registered in metagraph. This may indicate a miner-side issue or network problem.")
-                raise ValueError(f"Failed to get fresh access token for {miner_hotkey} job {job_id}. Cannot ensure Zarr URL is current.")
+                # Remove this miner from current run but don't delete their historical data
+                await _cleanup_offline_miner_from_run(task_instance, miner_hotkey, run_id)
+                return False  # Skip this miner gracefully
         
         access_token, current_zarr_store_url, _ = token_data_tuple
         
