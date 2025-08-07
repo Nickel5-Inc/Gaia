@@ -622,7 +622,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
     ) -> None:
         """
         Partially remove specified miners from 'score_table' rows for given task types,
-        preserving data for all other miners. Sets the departing miners' array values to 0.0.
+        preserving data for all other miners. Sets the departing miners' score columns to 0.0.
         Filters by a time window if filter_start_time and filter_end_time are provided.
 
         Args:
@@ -644,97 +644,48 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         total_rows_updated = 0
         for task_name in task_names:
             try:
-                # 1) Select score rows, potentially filtered by time
-                query_base = """
-                    SELECT task_id, score
-                    FROM score_table
-                    WHERE task_name = :task_name
-                """
-                params = {"task_name": task_name}
-
-                time_conditions = []
-                if filter_start_time:
-                    time_conditions.append("task_id::float >= :start_timestamp")
-                    params["start_timestamp"] = filter_start_time.timestamp()
-                if filter_end_time:
-                    time_conditions.append("task_id::float <= :end_timestamp")
-                    params["end_timestamp"] = filter_end_time.timestamp()
-
-                if time_conditions:
-                    query = query_base + " AND " + " AND ".join(time_conditions)
-                else:
-                    query = query_base # No time filter
-
-                rows = await self.fetch_all(query, params)
-
-                if not rows:
-                    logger.info(f"No '{task_name}' score rows found to update for the given criteria.")
-                    continue
-
-                logger.info(f"Found {len(rows)} {task_name} score rows to process.")
-                rows_updated = 0
-                scores_updated = 0
-
-                for row in rows:
-                    try:
-                        # 2) Parse the score array JSON (or however it's stored)
-                        all_scores = row["score"]
-                        if not isinstance(all_scores, list):
-                            logger.warning(f"Score field is not a list for score_row with task_id {row['task_id']}")
-                            continue
-
-                        changed = False
-                        changes_in_row = 0
-                        for uid in uids:
-                            if 0 <= uid < len(all_scores):
-                                current_score = all_scores[uid]
-                                # Check if current score is NOT 0.0 or NaN (represented as string or float)
-                                is_nan_or_zero = (isinstance(current_score, str) or 
-                                                 (isinstance(current_score, float) and (math.isnan(current_score) or current_score == 0.0)))
-                                logger.debug(f"Score for UID {uid} in row {row['task_id']}: {current_score} (is_nan_or_zero: {is_nan_or_zero})")
-                                if not is_nan_or_zero:
-                                    all_scores[uid] = 0.0 # Set to 0.0 instead of NaN
-                                    changed = True
-                                    changes_in_row += 1
-
-                        if changed:
-                            # 3) Update the score array in place using task_id
-                            update_sql = """
-                                UPDATE score_table
-                                SET score = :score
-                                WHERE task_name = :task_name
-                                  AND task_id = :task_id
-                            """
-                            await self.execute(
-                                update_sql,
-                                {
-                                    "score": all_scores,
-                                    "task_name": task_name,
-                                    "task_id": row["task_id"]
-                                },
-                            )
-                            rows_updated += 1
-                            scores_updated += changes_in_row
-                            logger.debug(
-                                f"Updated {changes_in_row} scores in {task_name} row with task_id {row['task_id']}"
-                            )
-
-                    except Exception as e:
-                        logger.error(
-                            f"Error zeroing out miner scores in '{task_name}' score row with task_id {row['task_id']}: {e}"
-                        )
-                        logger.error(traceback.format_exc())
-
-                total_rows_updated += rows_updated
-                logger.info(
-                    f"Task {task_name}: Zeroed out {scores_updated} scores across {rows_updated} rows"
-                )
+                # Build UPDATE query with individual column updates
+                for uid in uids:
+                    if 0 <= uid < 256:
+                        column_name = f"uid_{uid}_score"
+                        
+                        # Build base query
+                        update_sql = f"""
+                            UPDATE score_table
+                            SET {column_name} = 0.0
+                            WHERE task_name = :task_name
+                              AND {column_name} IS NOT NULL
+                              AND {column_name} != 0.0
+                        """
+                        
+                        params = {"task_name": task_name}
+                        
+                        # Add time filters if provided
+                        time_conditions = []
+                        if filter_start_time:
+                            time_conditions.append("task_id::float >= :start_timestamp")
+                            params["start_timestamp"] = filter_start_time.timestamp()
+                        if filter_end_time:
+                            time_conditions.append("task_id::float <= :end_timestamp")
+                            params["end_timestamp"] = filter_end_time.timestamp()
+                        
+                        if time_conditions:
+                            update_sql += " AND " + " AND ".join(time_conditions)
+                        
+                        # Execute update
+                        result = await self.execute(update_sql, params)
+                        
+                        if hasattr(result, 'rowcount') and result.rowcount > 0:
+                            total_rows_updated += result.rowcount
+                            logger.debug(f"Zeroed out {result.rowcount} scores for UID {uid} in task {task_name}")
+                
+                logger.info(f"Task {task_name}: Completed score zeroing for UIDs {uids}")
 
             except Exception as e:
                 logger.error(f"Error in remove_miner_from_score_tables for task '{task_name}': {e}")
                 logger.error(traceback.format_exc())
 
-        logger.info(f"Score zeroing complete. Total rows updated: {total_rows_updated}")
+        logger.info(f"Score zeroing complete. Total updates: {total_rows_updated}")
 
     @track_operation('write')
     async def store_baseline_prediction(self, 

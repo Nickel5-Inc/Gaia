@@ -1139,32 +1139,38 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 final_scores_list[uid] = score
         
 
-        score_row_data = {
-            "task_name": task_name_prefix,
-            "task_id": str(run_id),
-            "score": final_scores_list,
-            "status": f"{task_name_prefix}_scores_compiled",
-            "gfs_init_time_for_table": gfs_init_time
-        }
-
-        query = """
+        # Build individual column names and values for the new schema
+        column_names = ['task_name', 'task_id', 'status', 'created_at']
+        column_values = [':task_name', ':task_id', ':status', ':timestamp']
+        
+        # Add individual UID score columns
+        for uid in range(256):
+            column_names.append(f'uid_{uid}_score')
+            column_values.append(f':uid_{uid}_score')
+        
+        # Build INSERT query with individual columns
+        query = f"""
         INSERT INTO score_table 
-        (task_name, task_id, score, status, created_at)
-        VALUES (:task_name, :task_id, :score, :status, :timestamp)
+        ({', '.join(column_names)})
+        VALUES ({', '.join(column_values)})
         ON CONFLICT (task_name, task_id)
         DO UPDATE SET
-            score = EXCLUDED.score,
             status = EXCLUDED.status,
-            created_at = EXCLUDED.created_at
+            created_at = EXCLUDED.created_at,
+            {', '.join([f'uid_{uid}_score = EXCLUDED.uid_{uid}_score' for uid in range(256)])}
         """
         
+        # Build parameters dictionary with individual scores
         db_params = {
-            "task_name": score_row_data["task_name"],
-            "task_id": score_row_data["task_id"],
-            "score": score_row_data["score"],  # Pass list directly, not JSON string
-            "status": score_row_data["status"],
-            "timestamp": score_row_data["gfs_init_time_for_table"]
+            "task_name": task_name_prefix,
+            "task_id": str(run_id),
+            "status": f"{task_name_prefix}_scores_compiled",
+            "timestamp": gfs_init_time
         }
+        
+        # Add individual UID scores
+        for uid in range(256):
+            db_params[f'uid_{uid}_score'] = final_scores_list[uid] if uid < len(final_scores_list) else 0.0
         
         await self.db_manager.execute(query, db_params)
         logger.info(f"[BuildScoreRow] Stored/updated score row for task '{task_name_prefix}' with task_id '{run_id}'")
@@ -1194,16 +1200,34 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             if target_timestep:
                 timesteps_to_check = [target_timestep]
             else:
-                # Check last 24 hours of timesteps
-                cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+                # Check ALL runs that have weather_miner_scores but might be missing score_table entries
+                # This is more comprehensive than just checking last 24 hours
                 timestep_query = """
-                SELECT DISTINCT gfs_init_time_utc, id as run_id
-                FROM weather_forecast_runs 
-                WHERE gfs_init_time_utc >= :cutoff_time
-                AND status IN ('day1_scoring_complete', 'scored', 'final_scoring_complete')
-                ORDER BY gfs_init_time_utc DESC
+                WITH scored_runs AS (
+                    SELECT DISTINCT wms.run_id, wfr.gfs_init_time_utc
+                    FROM weather_miner_scores wms
+                    JOIN weather_forecast_runs wfr ON wfr.id = wms.run_id
+                    WHERE wms.score_type IN ('day1_qc_score', 'era5_final_composite_score')
+                ),
+                score_table_runs AS (
+                    SELECT DISTINCT 
+                        CASE 
+                            WHEN task_id LIKE 'initial_weather_scores_%' THEN CAST(SUBSTRING(task_id FROM 'initial_weather_scores_(.*)') AS INTEGER)
+                            WHEN task_id LIKE 'final_weather_scores_%' THEN CAST(SUBSTRING(task_id FROM 'final_weather_scores_(.*)') AS INTEGER)
+                            ELSE NULL
+                        END as run_id
+                    FROM score_table 
+                    WHERE task_name = 'weather' 
+                    AND task_id NOT IN ('initial_weather_scores', 'final_weather_scores')
+                )
+                SELECT sr.gfs_init_time_utc, sr.run_id
+                FROM scored_runs sr
+                LEFT JOIN score_table_runs str ON sr.run_id = str.run_id
+                WHERE str.run_id IS NULL
+                ORDER BY sr.run_id DESC
+                LIMIT 50
                 """
-                timestep_records = await self.db_manager.fetch_all(timestep_query, {"cutoff_time": cutoff_time})
+                timestep_records = await self.db_manager.fetch_all(timestep_query)
                 timesteps_to_check = [(rec['gfs_init_time_utc'], rec['run_id']) for rec in timestep_records]
             
             result["checked_timesteps"] = len(timesteps_to_check)
@@ -3761,7 +3785,9 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             'sending_fetch_requests', 'awaiting_input_hashes', 'verifying_input_hashes', 
             'triggering_inference', 'awaiting_inference_results', 'verifying_miner_forecasts',
             # INCLUDE SCORING STATES - can get stuck due to restarts during scoring
-            'day1_scoring_started', 'era5_final_scoring_started', 'era5_final_scoring_partial'
+            'day1_scoring_started', 'era5_final_scoring_started', 'era5_final_scoring_partial',
+            # AGGRESSIVELY RETRY FAILED DAY1 SCORING
+            'day1_scoring_failed', 'initial_scoring_queued', 'initial_scoring_failed'
         ]
         
         # Also include failure states that might be recoverable with full workflow
@@ -3940,6 +3966,50 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 
                 # Trigger immediate scoring check
                 await self._continue_run_workflow(run_id)
+                
+            elif status in ['day1_scoring_failed', 'initial_scoring_failed', 'initial_scoring_queued']:
+                logger.info(f"Recovering run {run_id}: Retrying failed/stuck Day-1 scoring (status: '{status}')")
+                
+                # Check if we have any verified responses to score
+                verified_check = await self.db_manager.fetch_one(
+                    """SELECT COUNT(*) as count FROM weather_miner_responses 
+                       WHERE run_id = :run_id AND verification_passed = TRUE""",
+                    {"run_id": run_id}
+                )
+                verified_count = verified_check['count'] if verified_check else 0
+                
+                if verified_count > 0:
+                    # Check if we already have some day1 scores (partial completion)
+                    existing_scores = await self.db_manager.fetch_one(
+                        "SELECT COUNT(*) as count FROM weather_miner_scores WHERE run_id = :run_id AND score_type = 'day1_qc_score'",
+                        {"run_id": run_id}
+                    )
+                    existing_count = existing_scores['count'] if existing_scores else 0
+                    
+                    logger.info(f"Run {run_id}: Found {verified_count} verified responses, {existing_count} already scored")
+                    
+                    # Reset to trigger re-scoring
+                    await _update_run_status(self, run_id, "verifying_miner_forecasts")
+                    
+                    # Ensure scoring job exists and is queued
+                    await self.db_manager.execute(
+                        """INSERT INTO weather_scoring_jobs (run_id, score_type, status, created_at)
+                           VALUES (:run_id, 'day1_qc', 'queued', NOW())
+                           ON CONFLICT (run_id, score_type) 
+                           DO UPDATE SET status = 'queued', started_at = NULL, error_message = 'Retry after failure'""",
+                        {"run_id": run_id}
+                    )
+                    
+                    # Trigger scoring and ensure score_table entry is created
+                    await self._continue_run_workflow(run_id)
+                    
+                    # Also explicitly check for missing score_table entry
+                    logger.info(f"Run {run_id}: Checking for missing score_table entry...")
+                    await self.update_combined_weather_scores(run_id_trigger=run_id, force_phase="initial")
+                    
+                else:
+                    logger.warning(f"Run {run_id}: No verified responses available, cannot retry scoring")
+                    await _update_run_status(self, run_id, "no_verified_responses_for_scoring")
                 
             elif status == 'era5_final_scoring_started':
                 logger.info(f"Recovering run {run_id}: resetting stuck ERA5 scoring state '{status}' - likely interrupted by restart")

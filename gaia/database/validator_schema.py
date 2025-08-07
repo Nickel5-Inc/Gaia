@@ -25,16 +25,31 @@ node_table = sa.Table('node_table', validator_metadata,
 )
 sa.Index('idx_node_hotkey_on_node_table', node_table.c.hotkey) # For faster lookups by hotkey
 
-score_table = sa.Table('score_table', validator_metadata,
-    sa.Column('task_name', sa.VARCHAR(255), nullable=True, comment="Name of the task being scored"), # Added length
+# Build score_table with individual UID columns for better query performance
+score_columns = [
+    sa.Column('task_name', sa.VARCHAR(255), nullable=True, comment="Name of the task being scored"),
     sa.Column('task_id', sa.Text, nullable=True, comment="Unique ID for the specific task instance"),
-    sa.Column('score', postgresql.ARRAY(sa.Float), nullable=True, comment="Array of scores, typically per UID"),
-    sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False, comment="Timestamp of score creation"),
-    sa.Column('status', sa.VARCHAR(50), server_default=sa.text("'pending'"), nullable=True, comment="Status of the scoring process"),
+]
+
+# Add individual score columns for each UID (0-255)
+for uid in range(256):
+    score_columns.append(
+        sa.Column(f'uid_{uid}_score', sa.Float, nullable=True, 
+                  comment=f"Score for UID {uid}")
+    )
+
+score_columns.extend([
+    sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), 
+              server_default=sa.func.current_timestamp(), nullable=False, 
+              comment="Timestamp of score creation"),
+    sa.Column('status', sa.VARCHAR(50), server_default=sa.text("'pending'"), 
+              nullable=True, comment="Status of the scoring process"),
+])
+
+score_table = sa.Table('score_table', validator_metadata,
+    *score_columns,
     sa.UniqueConstraint('task_name', 'task_id', name='uq_score_table_task_name_task_id'),
-    # Indexes will be defined in Alembic migration if not implicitly created by PK/FK, or for specific performance needs.
-    # Example: sa.Index('idx_score_created_at', 'created_at') # Can be added here too
-    comment="Table to store scores for various tasks."
+    comment="Table to store scores for various tasks with individual UID columns for efficient querying."
 )
 sa.Index('idx_score_created_at_on_score_table', score_table.c.created_at) # Explicit index definition
 sa.Index('idx_score_task_name_created_at_desc_on_score_table', score_table.c.task_name, score_table.c.created_at.desc())
@@ -78,7 +93,7 @@ sa.Index('idx_smr_status', soil_moisture_regions_table.c.status)
 soil_moisture_predictions_table = sa.Table('soil_moisture_predictions', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True), # SERIAL PRIMARY KEY
     sa.Column('region_id', sa.Integer, sa.ForeignKey('soil_moisture_regions.id', ondelete='SET NULL'), nullable=True),
-    sa.Column('miner_uid', sa.Text, nullable=False),
+    sa.Column('miner_uid', sa.Integer, sa.ForeignKey('node_table.uid', ondelete='CASCADE'), nullable=False),
     sa.Column('miner_hotkey', sa.Text, nullable=False),
     sa.Column('target_time', postgresql.TIMESTAMP(timezone=True), nullable=False),
     sa.Column('surface_sm', postgresql.ARRAY(sa.Float, dimensions=2), nullable=True), # Corrected for FLOAT[][]
@@ -104,7 +119,7 @@ sa.Index('idx_smp_status', soil_moisture_predictions_table.c.status)
 soil_moisture_history_table = sa.Table('soil_moisture_history', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True), # SERIAL PRIMARY KEY
     sa.Column('region_id', sa.Integer, sa.ForeignKey('soil_moisture_regions.id', ondelete='CASCADE'), nullable=False),
-    sa.Column('miner_uid', sa.Text, nullable=False),
+    sa.Column('miner_uid', sa.Integer, sa.ForeignKey('node_table.uid', ondelete='CASCADE'), nullable=False),
     sa.Column('miner_hotkey', sa.Text, nullable=False),
     sa.Column('target_time', postgresql.TIMESTAMP(timezone=True), nullable=False),
     sa.Column('surface_sm_pred', postgresql.ARRAY(sa.Float, dimensions=2), nullable=True), # Corrected for FLOAT[][]
@@ -147,7 +162,7 @@ sa.Index('idx_wfr_status_init_time', weather_forecast_runs_table.c.status, weath
 weather_miner_responses_table = sa.Table('weather_miner_responses', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True), # SERIAL PRIMARY KEY
     sa.Column('run_id', sa.Integer, sa.ForeignKey('weather_forecast_runs.id', ondelete='CASCADE'), nullable=False),
-    sa.Column('miner_uid', sa.Integer, nullable=False),
+    sa.Column('miner_uid', sa.Integer, sa.ForeignKey('node_table.uid', ondelete='CASCADE'), nullable=False),
     sa.Column('miner_hotkey', sa.VARCHAR(255), nullable=False),
     sa.Column('response_time', postgresql.TIMESTAMP(timezone=True), nullable=False),
     sa.Column('job_id', sa.VARCHAR(100), nullable=True),
@@ -183,7 +198,7 @@ weather_miner_scores_table = sa.Table('weather_miner_scores', validator_metadata
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True), # SERIAL PRIMARY KEY
     sa.Column('response_id', sa.Integer, sa.ForeignKey('weather_miner_responses.id', ondelete='CASCADE'), nullable=False),
     sa.Column('run_id', sa.Integer, sa.ForeignKey('weather_forecast_runs.id', ondelete='CASCADE'), nullable=False),
-    sa.Column('miner_uid', sa.Integer, nullable=False),
+    sa.Column('miner_uid', sa.Integer, sa.ForeignKey('node_table.uid', ondelete='CASCADE'), nullable=False),
     sa.Column('miner_hotkey', sa.VARCHAR(255), nullable=False),
     sa.Column('score_type', sa.VARCHAR(50), nullable=False),
     sa.Column('calculation_time', postgresql.TIMESTAMP(timezone=True), nullable=False),
@@ -266,7 +281,7 @@ sa.Index('idx_whw_score_type', weather_historical_weights_table.c.score_type)
 # --- Geomagnetic Tables ---
 geomagnetic_predictions_table = sa.Table('geomagnetic_predictions', validator_metadata,
     sa.Column('id', sa.Text, primary_key=True, nullable=False), # TEXT UNIQUE NOT NULL -> PK
-    sa.Column('miner_uid', sa.Text, nullable=False),
+    sa.Column('miner_uid', sa.Integer, sa.ForeignKey('node_table.uid', ondelete='CASCADE'), nullable=False),
     sa.Column('miner_hotkey', sa.Text, nullable=False),
     sa.Column('predicted_value', sa.Float, nullable=False),
     sa.Column('query_time', postgresql.TIMESTAMP(timezone=True), server_default=sa.func.current_timestamp(), nullable=False),
@@ -290,7 +305,7 @@ sa.Index('idx_gp_pending_tasks', geomagnetic_predictions_table.c.query_time.desc
 
 geomagnetic_history_table = sa.Table('geomagnetic_history', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True), # SERIAL PRIMARY KEY
-    sa.Column('miner_uid', sa.Text, nullable=False),
+    sa.Column('miner_uid', sa.Integer, sa.ForeignKey('node_table.uid', ondelete='CASCADE'), nullable=False),
     sa.Column('miner_hotkey', sa.Text, nullable=False),
     sa.Column('query_time', postgresql.TIMESTAMP(timezone=True), nullable=False),
     sa.Column('predicted_value', sa.Float, nullable=False),
@@ -305,7 +320,7 @@ sa.Index('idx_gh_miner_hotkey_scored_at', geomagnetic_history_table.c.miner_hotk
 # --- Miner Performance Statistics Table ---
 miner_performance_stats_table = sa.Table('miner_performance_stats', validator_metadata,
     sa.Column('id', sa.Integer, primary_key=True, autoincrement=True),
-    sa.Column('miner_uid', sa.Text, nullable=False, comment="Miner's UID"),
+    sa.Column('miner_uid', sa.Integer, sa.ForeignKey('node_table.uid', ondelete='CASCADE'), nullable=False, comment="Miner's UID"),
     sa.Column('miner_hotkey', sa.Text, nullable=False, comment="Miner's hotkey"),
     
     # Time period for this statistics snapshot

@@ -41,7 +41,19 @@ class AlembicCorruptionRepair:
             '3704fd24c76d',  # add_indexes_for_performance
             '9184456655c8',  # add_retry_columns_to_predictions_tables
             'a1b2c3d4e5f6',  # add_unique_constraint_soil_moisture_history
+            'd14c8157766a',  # optimize_baseline_predictions_indexes
+            'dc4f1a1ad6db',  # optimize_geomagnetic_predictions_performance
+            '7819e940673d',  # add_weather_scoring_jobs_table_for_restart_resilience
+            '911b2e3e140e',  # add_retry_columns_to_weather_miner_responses
+            '7cc0a0cb963c',  # add_miner_performance_stats_table
+            '8d832ba6c04d',  # enhance_miner_performance_stats_with_weight_tracking
+            'score_table_refactor',  # Score table refactor and add foreign keys
         ]
+        
+        # Known corrupted/stale revision that should be replaced
+        self.known_bad_revisions = {
+            'e95a106a8531': '8d832ba6c04d',  # This stale revision should be replaced with the latest valid one
+        }
     
     def _construct_db_url_from_env(self) -> str:
         """Construct database URL from environment variables."""
@@ -105,12 +117,18 @@ class AlembicCorruptionRepair:
                     logger.info("✅ Alembic version is valid - no corruption detected")
                     return True
                 
-                # Corruption detected!
-                logger.error(f"❌ CORRUPTION DETECTED: Invalid migration ID '{current_version}'")
-                logger.info("🔧 Attempting automatic repair...")
-                
-                # Determine correct version based on database state
-                target_version = self._determine_correct_version(conn)
+                # Check if it's a known bad revision that we can auto-fix
+                if current_version in self.known_bad_revisions:
+                    logger.warning(f"⚠️ Known stale/bad revision detected: '{current_version}'")
+                    target_version = self.known_bad_revisions[current_version]
+                    logger.info(f"🔧 Will replace with correct revision: '{target_version}'")
+                else:
+                    # Unknown corruption detected!
+                    logger.error(f"❌ CORRUPTION DETECTED: Invalid migration ID '{current_version}'")
+                    logger.info("🔧 Attempting automatic repair...")
+                    
+                    # Determine correct version based on database state
+                    target_version = self._determine_correct_version(conn)
                 
                 if not target_version:
                     logger.error("❌ Could not determine correct migration version")
@@ -151,6 +169,54 @@ class AlembicCorruptionRepair:
             The correct migration ID, or None if it cannot be determined
         """
         try:
+            # Check from newest to oldest migrations to find the latest applied one
+            
+            # Check for miner_performance_stats weight columns (latest migration)
+            weight_column_check = conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'miner_performance_stats' 
+                    AND column_name = 'weight_submission_block'
+                )
+            """))
+            if weight_column_check.scalar():
+                logger.info("✅ miner_performance_stats weight columns detected - setting version to 8d832ba6c04d")
+                return '8d832ba6c04d'
+            
+            # Check for miner_performance_stats table
+            mps_table_check = conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'miner_performance_stats'
+                )
+            """))
+            if mps_table_check.scalar():
+                logger.info("✅ miner_performance_stats table detected - setting version to 7cc0a0cb963c")
+                return '7cc0a0cb963c'
+            
+            # Check for weather_scoring_jobs table
+            wsj_table_check = conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'weather_scoring_jobs'
+                )
+            """))
+            if wsj_table_check.scalar():
+                logger.info("✅ weather_scoring_jobs table detected - setting version to 7819e940673d")
+                return '7819e940673d'
+            
+            # Check for geomagnetic_predictions optimization indexes
+            geo_index_check = conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_indexes 
+                    WHERE tablename = 'geomagnetic_predictions' 
+                    AND indexname = 'idx_geo_pred_request_time_run'
+                )
+            """))
+            if geo_index_check.scalar():
+                logger.info("✅ geomagnetic_predictions optimization indexes detected - setting version to dc4f1a1ad6db")
+                return 'dc4f1a1ad6db'
+            
             # Check if the soil_moisture_history unique constraint exists
             constraint_check = conn.execute(text("""
                 SELECT EXISTS (
@@ -161,9 +227,7 @@ class AlembicCorruptionRepair:
                     AND constraint_type = 'UNIQUE'
                 )
             """))
-            constraint_exists = constraint_check.scalar()
-            
-            if constraint_exists:
+            if constraint_check.scalar():
                 logger.info("✅ Unique constraint detected - setting version to a1b2c3d4e5f6")
                 return 'a1b2c3d4e5f6'
             
@@ -177,17 +241,15 @@ class AlembicCorruptionRepair:
             
             if table_check.scalar():
                 logger.info("✅ soil_moisture_history table exists but no constraint - setting version to 9184456655c8")
-                # Need to add the constraint since the code expects it
-                self._add_missing_constraint(conn)
-                return 'a1b2c3d4e5f6'  # After adding constraint
+                return '9184456655c8'
             else:
                 logger.info("⚠️ soil_moisture_history table missing - using initial migration")
                 return 'f75e4f7343a1'
                 
         except Exception as e:
             logger.error(f"Error determining correct version: {e}")
-            # Default to a safe version
-            return '9184456655c8'
+            # Default to the latest stable version before our new migration
+            return '8d832ba6c04d'
     
     def _add_missing_constraint(self, conn) -> bool:
         """Add the missing unique constraint if needed."""

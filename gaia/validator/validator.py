@@ -3415,7 +3415,35 @@ class GaiaValidator:
                                 except Exception as e_perf_del:
                                     logger.warning(f"  Could not clear miner_performance_stats for UID {uid_to_process}: {e_perf_del}")
 
-                                # 3. Zero out scores for the UID in score_table (only weather task active)
+                                # 3. Clean up weather-specific tables for this UID
+                                # CRITICAL: Must clean weather_miner_scores and weather_miner_responses
+                                # to prevent old scores from being used for the new miner
+                                logger.info(f"  Cleaning weather-specific tables for UID {uid_to_process}")
+                                try:
+                                    # Delete from weather_miner_scores by UID
+                                    await self.database_manager.execute(
+                                        "DELETE FROM weather_miner_scores WHERE miner_uid = :uid",
+                                        {"uid": uid_to_process}
+                                    )
+                                    logger.info(f"  Deleted weather_miner_scores for UID {uid_to_process}")
+                                    
+                                    # Delete from weather_miner_responses by UID
+                                    await self.database_manager.execute(
+                                        "DELETE FROM weather_miner_responses WHERE miner_uid = :uid",
+                                        {"uid": uid_to_process}
+                                    )
+                                    logger.info(f"  Deleted weather_miner_responses for UID {uid_to_process}")
+                                    
+                                    # Delete from weather_historical_weights by old hotkey
+                                    await self.database_manager.execute(
+                                        "DELETE FROM weather_historical_weights WHERE miner_hotkey = :hotkey",
+                                        {"hotkey": original_hotkey}
+                                    )
+                                    logger.info(f"  Deleted weather_historical_weights for old hotkey {original_hotkey}")
+                                except Exception as weather_cleanup_err:
+                                    logger.error(f"  Error cleaning weather tables for UID {uid_to_process}: {weather_cleanup_err}")
+                                
+                                # 4. Zero out scores for the UID in score_table (only weather task active)
                                 # Only process weather task - old tasks (geomagnetic, soil_moisture) are disabled
                                 active_task_names = ['weather']
                                 logger.info(f"  Zeroing scores in score_table for UID {uid_to_process} for weather task")
@@ -3425,7 +3453,7 @@ class GaiaValidator:
                                     filter_start_time=None, filter_end_time=None # Affect all history
                                 )
 
-                                # 4. Update node_table with NEW info
+                                # 5. Update node_table with NEW info
                                 logger.info(f"  Updating node_table info for UID {uid_to_process} with new hotkey {new_chain_node_data.hotkey}.")
                                 await self.database_manager.update_miner_info(
                                     index=uid_to_process, hotkey=new_chain_node_data.hotkey, coldkey=new_chain_node_data.coldkey,
@@ -3648,6 +3676,17 @@ class GaiaValidator:
                     weights_final[idx] = 0.0
                     continue
                 
+                # CRITICAL: Check if miner has valid IP address
+                # Miners without IPs cannot communicate and should not receive weights
+                node_info = validator_nodes_by_uid_list[idx] if validator_nodes_by_uid_list else None
+                if node_info:
+                    ip = node_info.get('ip')
+                    # Check for invalid IPs: None, '0', 0, or empty string
+                    if not ip or str(ip) == '0' or str(ip) == '':
+                        logger.warning(f"UID {idx} has no valid IP ({ip}) - setting weight to 0")
+                        weights_final[idx] = 0.0
+                        continue
+                
                 # With weather-only, we use the weather score directly (no multi-task pathways needed)
                 # Apply full weight (1.0) to weather since it's the only task
                 if 'weather' in task_percentiles:
@@ -3817,8 +3856,13 @@ class GaiaValidator:
             # Modified weather query to handle run-specific naming and prioritize final over initial scores
             # Note: weather scores use GFS init time as created_at, not evaluation time
             # Day1 QC scores (20% weight) arrive quickly, ERA5 final scores (80% weight) arrive ~10 days later
-            weather_query = """
-            SELECT score, created_at, task_id
+            # Build query with individual UID columns
+            score_columns = ', '.join([f'uid_{i}_score' for i in range(256)])
+            weather_query = f"""
+            SELECT 
+                ARRAY[{score_columns}] as score,
+                created_at, 
+                task_id
             FROM score_table 
             WHERE task_name = 'weather' AND created_at >= :weather_start_time 
             AND (
