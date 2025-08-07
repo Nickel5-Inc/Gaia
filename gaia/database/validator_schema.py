@@ -450,6 +450,17 @@ sa.Index('idx_mps_weight_submission_block', miner_performance_stats_table.c.weig
 sa.Index('idx_mps_pathway_performance', miner_performance_stats_table.c.scoring_pathway, miner_performance_stats_table.c.submitted_weight.desc(), miner_performance_stats_table.c.period_type)
 sa.Index('idx_mps_chain_integration', miner_performance_stats_table.c.weight_submission_block, miner_performance_stats_table.c.consensus_block, postgresql_where=miner_performance_stats_table.c.weight_submission_block.isnot(None))
 
+# --- Perturbation Seed Table (Anti-Weight-Copying Mechanism) ---
+# REDESIGNED: Now stores multiple seeds with activation times for safe synchronization
+perturb_seed_table = sa.Table(
+    'perturb_seed',
+    validator_metadata,
+    sa.Column('activation_hour', postgresql.TIMESTAMP(timezone=True), primary_key=True, nullable=False),
+    sa.Column('seed_hex', sa.String(64), nullable=False),  # 32-byte hex = 64 chars
+    sa.Column('generated_at', postgresql.TIMESTAMP(timezone=True), nullable=False, server_default=sa.func.now()),
+    extend_existing=True
+)
+
 # Placeholder for trigger function/trigger definitions if we move them here or handle in Alembic only
 # For now, the check_node_table_size function and its trigger are defined in the first migration directly.
 # If we make this validator_schema.py the *absolute* source, we might represent them here too,

@@ -432,6 +432,10 @@ class GaiaValidator:
         self.performance_calculator = None  # Will be initialized when database is ready
         self.last_performance_calculation = 0  # Track last calculation time
         
+        # Initialize weight perturbation manager for anti-weight-copying defense
+        self.perturbation_manager = None  # Will be initialized when database is ready
+        self.last_seed_rotation_check = 0  # Track last seed rotation check
+        
         self.weights = [0.0] * 256
         self.last_set_weights_block = 0
         
@@ -2789,6 +2793,30 @@ class GaiaValidator:
                     logger.error(f"Failed to initialize performance calculator: {e}")
                     # Continue without performance calculator - it's not critical
                 
+                # Initialize weight perturbation manager for anti-weight-copying defense
+                try:
+                    from gaia.validator.weight_perturbation import WeightPerturbationManager, ENABLE_PERTURBATION, P_MOVE
+                    
+                    validator_hotkey = None
+                    if hasattr(self, 'config') and self.config and hasattr(self.config.wallet, 'hotkey'):
+                        validator_hotkey = self.config.wallet.hotkey.ss58_address
+                    
+                    self.perturbation_manager = WeightPerturbationManager(self.database_manager, validator_hotkey)
+                    await self.perturbation_manager.initialize_seed_table()
+                    
+                    # Simple, clear logging
+                    if ENABLE_PERTURBATION:
+                        logger.info(f"Weight perturbation ENABLED - P={P_MOVE} (anti-weight-copying active)")
+                        if self.perturbation_manager.is_primary:
+                            logger.info("This is the PRIMARY validator - will generate seeds at :10 each hour")
+                        else:
+                            logger.info("Using seeds from primary validator")
+                    else:
+                        logger.info("Weight perturbation DISABLED")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to initialize weight perturbation: {e}")
+                
                 # Initialize DB Sync Components - AFTER DB init
                 await self._initialize_db_sync_components()
 
@@ -3015,6 +3043,20 @@ class GaiaValidator:
             try:
                 await self.update_task_status('scoring', 'active')
                 
+                # Check for seed generation (primary validator only, every minute)
+                # Seeds are generated at :10 for activation at :00 next hour
+                if self.perturbation_manager:
+                    current_time = time.time()
+                    if current_time - self.last_seed_rotation_check > 60:  # Check every minute
+                        try:
+                            generated = await self.perturbation_manager.rotate_seed_if_needed()
+                            if generated:
+                                logger.info("Future perturbation seed generated (primary validator)")
+                                logger.info("Seed will be synced at :39 and activate at :00 next hour")
+                            self.last_seed_rotation_check = current_time
+                        except Exception as e:
+                            logger.error(f"Error checking seed generation: {e}")
+                
                 async def scoring_cycle():
                     try:
                         validator_uid = self.validator_uid
@@ -3088,6 +3130,18 @@ class GaiaValidator:
                                 )
                                 
                                 if normalized_weights:
+                                    # Apply weight perturbation for anti-weight-copying defense
+                                    if self.perturbation_manager:
+                                        try:
+                                            import numpy as np
+                                            weights_array = np.array(normalized_weights)
+                                            perturbed_weights = await self.perturbation_manager.get_perturbed_weights(weights_array)
+                                            normalized_weights = perturbed_weights.tolist()
+                                            logger.info("Applied weight perturbation for anti-weight-copying defense")
+                                        except Exception as e:
+                                            logger.error(f"Failed to apply weight perturbation: {e}")
+                                            # Continue with unperturbed weights
+                                    
                                     # Set weights with timeout
                                     success = await asyncio.wait_for(
                                         weight_setter.set_weights(normalized_weights),

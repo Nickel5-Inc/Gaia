@@ -48,6 +48,7 @@ class AlembicCorruptionRepair:
             '7cc0a0cb963c',  # add_miner_performance_stats_table
             '8d832ba6c04d',  # enhance_miner_performance_stats_with_weight_tracking
             'score_table_refactor',  # Score table refactor and add foreign keys
+            '5fda479e51b2',  # add_perturb_seed_table
         ]
         
         # Known corrupted/stale revision that should be replaced
