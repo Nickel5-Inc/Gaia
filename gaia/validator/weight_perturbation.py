@@ -310,8 +310,12 @@ class WeightPerturbationManager:
         n = base_weights.size
         
         # Identify tail miners (bottom k%)
+        # Use tiny deterministic jitter to break ties among equal weights (e.g., many zeros)
+        # This yields a random-looking but deterministic spread across UIDs
         tail_size = max(1, int(n * TAIL_FR))
-        sorted_indices = np.argsort(base_weights)
+        jitter = rng.random(n) * 1e-12
+        jittered_weights = base_weights + jitter
+        sorted_indices = np.argsort(jittered_weights)
         tail_indices = sorted_indices[:tail_size]
         
         # Create perturbation vector

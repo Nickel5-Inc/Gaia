@@ -919,7 +919,7 @@ class MinerPerformanceCalculator:
             logger.error(f"Error cleaning up deregistered miners: {e}")
             return 0
     
-    async def cleanup_specific_miner(self, miner_uid: str, miner_hotkey: str = None) -> bool:
+    async def cleanup_specific_miner(self, miner_uid: int, miner_hotkey: str = None) -> bool:
         """
         Remove performance statistics for a specific miner.
         
@@ -933,7 +933,7 @@ class MinerPerformanceCalculator:
         try:
             # Execute queries without creating new transaction (caller manages transactions)
             # Build delete conditions
-            conditions = [miner_performance_stats_table.c.miner_uid == miner_uid]
+            conditions = [miner_performance_stats_table.c.miner_uid == int(miner_uid)]
             
             if miner_hotkey:
                 conditions.append(miner_performance_stats_table.c.miner_hotkey == miner_hotkey)

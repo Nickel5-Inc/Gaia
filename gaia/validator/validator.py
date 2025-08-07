@@ -3454,7 +3454,7 @@ class GaiaValidator:
                                     if hasattr(self, 'performance_calculator') and self.performance_calculator:
                                         # Use the performance calculator's cleanup method
                                         cleanup_success = await self.performance_calculator.cleanup_specific_miner(
-                                            str(uid_to_process), original_hotkey
+                                            int(uid_to_process), original_hotkey
                                         )
                                         if cleanup_success:
                                             logger.info(f"  Deleted performance stats for UID {uid_to_process} and old hotkey {original_hotkey} due to hotkey change.")
@@ -3464,7 +3464,7 @@ class GaiaValidator:
                                         if perf_stats_exists and perf_stats_exists['exists']:
                                             await self.database_manager.execute(
                                                 "DELETE FROM miner_performance_stats WHERE miner_uid = :uid OR miner_hotkey = :hotkey", 
-                                                {"uid": str(uid_to_process), "hotkey": original_hotkey}
+                                                {"uid": int(uid_to_process), "hotkey": original_hotkey}
                                             )
                                             logger.info(f"  Deleted performance stats for UID {uid_to_process} and old hotkey {original_hotkey} due to hotkey change.")
                                 except Exception as e_perf_del:
