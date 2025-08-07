@@ -1446,12 +1446,14 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                             processed_runs_this_session.clear()
                         else:
                             if stale_run_processed == "stale_processed":
-                                logger.info("Stale run was processed - continuing recovery loop to process next incomplete run")
+                                logger.info("Stale run was processed - will check for more incomplete runs in 30 seconds")
                             else:
-                                logger.info("Run recovery attempted - continuing to process remaining incomplete runs")
-                            last_recovery_time = 0  # Reset to trigger immediate next recovery check
+                                logger.info("Run recovery attempted - will check for more incomplete runs in 30 seconds")
+                            # Don't reset to 0 - that causes continuous recovery loops that interrupt active scoring
+                            # Instead, use a shorter interval for when we're actively recovering runs
+                            last_recovery_time = current_time - (recovery_interval - 30)  # Check again in 30 seconds
                             await asyncio.sleep(0.1)  # Yield CPU time to other async tasks
-                            continue  # Go back to top of loop to immediately check for next incomplete run
+                            continue  # Go back to top of loop
                     elif stale_run_processed == "no_more_runs":
                         logger.info("No more incomplete runs to process - proceeding to normal scheduling")
                         processed_runs_this_session.clear()  # Reset for next session
@@ -2110,6 +2112,16 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
     async def update_combined_weather_scores(self, run_id_trigger: Optional[int] = None, force_phase: Optional[str] = None):
         logger.info(f"[CombinedWeatherScore] Updating combined weather scores (triggered by run {run_id_trigger if run_id_trigger else 'periodic/manual call'}).")
+
+        # If triggered by a specific run, check if that run actually has completed scoring
+        if run_id_trigger:
+            run_check = await self.db_manager.fetch_one(
+                """SELECT status FROM weather_forecast_runs WHERE id = :run_id""",
+                {"run_id": run_id_trigger}
+            )
+            if run_check and run_check['status'] in ['day1_scoring_started', 'initial_scoring_queued', 'verifying_miner_forecasts']:
+                logger.warning(f"[CombinedWeatherScore] Run {run_id_trigger} is still in scoring phase (status: {run_check['status']}), skipping score update to avoid using stale data")
+                return
 
         latest_day1_scores_array = np.full(256, 0.0)
         latest_era5_composite_scores_array = np.full(256, 0.0)
@@ -3949,23 +3961,42 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 await self._continue_run_workflow(run_id)
                 
             elif status == 'day1_scoring_started':
-                logger.info(f"Recovering run {run_id}: resetting stuck Day-1 scoring state '{status}' - likely interrupted by restart")
+                # Check how long the run has been in this status before considering it stuck
+                # Scoring can take several minutes, especially with many miners
+                scoring_job_check = await self.db_manager.fetch_one(
+                    """SELECT started_at, status FROM weather_scoring_jobs 
+                       WHERE run_id = :run_id AND score_type = 'day1_qc'""",
+                    {"run_id": run_id}
+                )
                 
-                # Reset run status to allow re-processing
-                await _update_run_status(self, run_id, "verifying_miner_forecasts")
+                should_recover = True
+                if scoring_job_check and scoring_job_check['started_at']:
+                    time_in_scoring = (datetime.now(timezone.utc) - scoring_job_check['started_at']).total_seconds()
+                    # Allow at least 10 minutes for scoring to complete
+                    if time_in_scoring < 600:  # 10 minutes
+                        logger.debug(f"Run {run_id}: Still in active Day-1 scoring (elapsed: {time_in_scoring:.0f}s), skipping recovery")
+                        should_recover = False
+                    else:
+                        logger.warning(f"Run {run_id}: Day-1 scoring stuck for {time_in_scoring:.0f}s, triggering recovery")
                 
-                # Reset Day-1 scoring job to queued status for retry with smart partial logic
-                reset_job_query = """
-                UPDATE weather_scoring_jobs 
-                SET status = 'queued', started_at = NULL, error_message = 'Reset due to validator restart during scoring'
-                WHERE run_id = :run_id AND score_type = 'day1_qc' AND status IN ('in_progress', 'queued')
-                """
-                await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": 'day1_qc'})
-                
-                logger.info(f"Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with 'day1_qc' job queued for smart partial retry")
-                
-                # Trigger immediate scoring check
-                await self._continue_run_workflow(run_id)
+                if should_recover:
+                    logger.info(f"Recovering run {run_id}: resetting stuck Day-1 scoring state '{status}' after timeout")
+                    
+                    # Reset run status to allow re-processing
+                    await _update_run_status(self, run_id, "verifying_miner_forecasts")
+                    
+                    # Reset Day-1 scoring job to queued status for retry with smart partial logic
+                    reset_job_query = """
+                    UPDATE weather_scoring_jobs 
+                    SET status = 'queued', started_at = NULL, error_message = 'Reset due to scoring timeout'
+                    WHERE run_id = :run_id AND score_type = 'day1_qc' AND status IN ('in_progress', 'queued')
+                    """
+                    await self.db_manager.execute(reset_job_query, {"run_id": run_id, "score_type": 'day1_qc'})
+                    
+                    logger.info(f"Run {run_id}: Reset from '{status}' to 'verifying_miner_forecasts' with 'day1_qc' job queued for smart partial retry")
+                    
+                    # Trigger immediate scoring check
+                    await self._continue_run_workflow(run_id)
                 
             elif status in ['day1_scoring_failed', 'initial_scoring_failed', 'initial_scoring_queued']:
                 logger.info(f"Recovering run {run_id}: Retrying failed/stuck Day-1 scoring (status: '{status}')")
@@ -4000,12 +4031,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         {"run_id": run_id}
                     )
                     
-                    # Trigger scoring and ensure score_table entry is created
+                    # Trigger scoring workflow
                     await self._continue_run_workflow(run_id)
                     
-                    # Also explicitly check for missing score_table entry
-                    logger.info(f"Run {run_id}: Checking for missing score_table entry...")
-                    await self.update_combined_weather_scores(run_id_trigger=run_id, force_phase="initial")
+                    # Don't call update_combined_weather_scores here - scoring hasn't completed yet
+                    # The scoring workers will call it when they complete
                     
                 else:
                     logger.warning(f"Run {run_id}: No verified responses available, cannot retry scoring")

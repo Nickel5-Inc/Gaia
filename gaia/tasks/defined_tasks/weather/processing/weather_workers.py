@@ -1562,12 +1562,13 @@ async def finalize_scores_worker(self):
                     # Add time constraint even in test mode to prevent scanning too much historical data
                     test_cutoff = now_utc - timedelta(days=30)  # Only look at runs from last 30 days
                     # Test mode: check recent runs, but still exclude truly completed/failed runs
+                    # Exclude 'scored' status as it indicates completion
                     candidate_runs_query = """
                     SELECT id, gfs_init_time_utc
                     FROM weather_forecast_runs
                     WHERE gfs_init_time_utc > :test_cutoff
                     AND status IN ('day1_scoring_complete', 'ensemble_created', 'initial_scoring_failed', 
-                                 'final_scoring_failed', 'scored', 'era5_final_scoring_started', 
+                                 'final_scoring_failed', 'era5_final_scoring_started', 
                                  'era5_final_scoring_partial')
                     ORDER BY gfs_init_time_utc DESC
                     LIMIT 20 
@@ -1581,12 +1582,12 @@ async def finalize_scores_worker(self):
                     retry_cutoff_time = now_utc - timedelta(hours=6)
                     
                     # Only pick up runs that are in intermediate states needing ERA5 scoring
-                    # Exclude: completed, all_miners_failed, stale_abandoned
+                    # Exclude: scored (completed), all_miners_failed, stale_abandoned
                     candidate_runs_query = """
                     SELECT id, gfs_init_time_utc
                     FROM weather_forecast_runs
                     WHERE status IN ('processing_ensemble', 'initial_scoring_failed', 'ensemble_failed', 
-                                   'final_scoring_failed', 'scored', 'day1_scoring_complete', 
+                                   'final_scoring_failed', 'day1_scoring_complete', 
                                    'era5_final_scoring_started', 'era5_final_scoring_partial') 
                     AND gfs_init_time_utc < :earliest_cutoff 
                     ORDER BY gfs_init_time_utc ASC
