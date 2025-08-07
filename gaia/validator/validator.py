@@ -2552,13 +2552,14 @@ class GaiaValidator:
             logger.info(f"Built current_nodes_info with {len(current_nodes_info)} active UIDs for stale history check.")
 
             # 2. Fetch Historical Data from weather-related tables only
-            # Weather task uses score_table for historical data, so we'll get historical pairs from there
+            # For now, just get all UIDs that have scores in weather_miner_scores
+            # This is simpler and avoids the complexity of the new schema
             weather_history_query = """
             SELECT DISTINCT 
-                CAST(uid_index AS INTEGER) as miner_uid,
-                (SELECT hotkey FROM node_table WHERE uid = CAST(uid_index AS INTEGER) LIMIT 1) as miner_hotkey
-            FROM score_table 
-            WHERE task_name = 'weather' AND uid_index IS NOT NULL
+                miner_uid,
+                miner_hotkey
+            FROM weather_miner_scores
+            WHERE miner_hotkey IS NOT NULL
             """
             
             all_historical_pairs = set()
@@ -2643,29 +2644,29 @@ class GaiaValidator:
                         max_ts: Optional[datetime] = None
                         timestamps_found = False
                         
-                        # For weather task, use score_table timestamps since weather doesn't have separate history tables
-                        # Use created_at from score_table as the timestamp reference
+                        # For weather task, use weather_miner_scores timestamps
+                        # This is more accurate than score_table which is aggregated
                         score_table_ts_query = """
-                            SELECT MIN(created_at) as min_ts, MAX(created_at) as max_ts 
-                            FROM score_table 
-                            WHERE task_name = 'weather' AND uid_index = :uid_str
+                            SELECT MIN(calculation_time) as min_ts, MAX(calculation_time) as max_ts 
+                            FROM weather_miner_scores 
+                            WHERE miner_uid = :uid AND miner_hotkey = :hotkey
                         """
                         
                         all_min_ts = []
                         all_max_ts = []
                         
-                        # Query timestamps from score_table for weather task
+                        # Query timestamps from weather_miner_scores for this UID/hotkey pair
                         try:
-                            result = await self.database_manager.fetch_one(score_table_ts_query, {"uid_str": str(uid)})
+                            result = await self.database_manager.fetch_one(score_table_ts_query, {"uid": uid, "hotkey": stale_hk})
                             
                             if result and result['min_ts'] is not None and result['max_ts'] is not None:
                                 all_min_ts.append(result['min_ts'])
                                 all_max_ts.append(result['max_ts'])
                                 timestamps_found = True
-                                logger.info(f"  Found time range in score_table for weather task UID {uid}: {result['min_ts']} -> {result['max_ts']}")
+                                logger.info(f"  Found time range in weather_miner_scores for UID {uid}, hotkey {stale_hk}: {result['min_ts']} -> {result['max_ts']}")
                                 
                         except Exception as e_ts:
-                            logger.warning(f"Could not query timestamps from score_table for miner_uid {uid}: {e_ts}")
+                            logger.warning(f"Could not query timestamps from weather_miner_scores for miner_uid {uid}, hotkey {stale_hk}: {e_ts}")
                         
                         # Determine overall min/max across tables
                         if all_min_ts:
