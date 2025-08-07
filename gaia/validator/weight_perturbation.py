@@ -28,6 +28,7 @@ logger = get_logger(__name__)
 # These defaults are carefully chosen for optimal anti-weight-copying defense
 P_MOVE = float(os.getenv("PERTURB_P", "0.07"))  # 7% mass moved (results in v-trust ~0.58 for copiers)
 TAIL_FR = float(os.getenv("PERTURB_TAIL_FR", "0.50"))  # Bottom 50% of miners get boost
+UNIFORM_PORTION = float(os.getenv("PERTURB_UNIFORM", "0.70"))  # 70% uniform, 30% random distribution
 
 # Feature is ENABLED by default - validators must explicitly disable if needed
 # This ensures network-wide adoption without configuration
@@ -276,13 +277,16 @@ class WeightPerturbationManager:
     
     def perturb_weights(self, base_weights: np.ndarray, seed: bytes) -> np.ndarray:
         """
-        Apply ranking-safe perturbation to weight vector.
+        Apply ranking-safe perturbation to weight vector using burn key strategy.
         
         This function:
-        1. Identifies the bottom-k% miners by weight
-        2. Redistributes p% of total mass uniformly to them
-        3. Scales down all weights proportionally
+        1. Scales down all weights by (1 - P_MOVE)
+        2. Sends 30-100% of P_MOVE mass to burn key (UID 252)
+           - Exact percentage is deterministically random per hour
+           - Prevents rewarding inactive miners
+        3. Distributes remaining mass to bottom-k% miners with variation
         4. Preserves ranking of top performers
+        5. Creates unpredictable weights that foil copying attempts
         
         Args:
             base_weights: Original normalized weight vector (sum = 1)
@@ -312,10 +316,44 @@ class WeightPerturbationManager:
         
         # Create perturbation vector
         delta = np.zeros_like(base_weights)
-        if tail_size > 0:
-            # Uniform boost to tail miners
-            delta_per_miner = P_MOVE / tail_size
-            delta[tail_indices] = delta_per_miner
+        
+        # BURN KEY STRATEGY:
+        # Send most perturbation mass to burn key (UID 252) with unpredictable amount
+        # This avoids rewarding low performers while maintaining anti-copying defense
+        BURN_UID = 252
+        
+        if n > BURN_UID:  # Ensure burn UID exists
+            # Determine burn fraction: 30-100% of P_MOVE goes to burn, rest to tail
+            # Use deterministic random based on seed for high variance
+            burn_fraction = 0.3 + (rng.random() * 0.7)  # 30% to 100%
+            tail_fraction = 1.0 - burn_fraction
+            
+            # Mass to burn key
+            burn_mass = P_MOVE * burn_fraction
+            delta[BURN_UID] = burn_mass
+            
+            # Remaining mass distributed to tail miners (excluding burn key)
+            if tail_size > 0 and tail_fraction > 0:  # Only distribute if there's mass left
+                # Exclude burn key from tail if it's already there
+                tail_indices_filtered = [idx for idx in tail_indices if idx != BURN_UID]
+                
+                if len(tail_indices_filtered) > 0:
+                    # Small random variations for tail miners to avoid identical weights
+                    tail_mass = P_MOVE * tail_fraction
+                    
+                    # Generate deterministic random weights for tail
+                    tail_weights = rng.exponential(scale=1.0, size=len(tail_indices_filtered))
+                    tail_weights = tail_weights / tail_weights.sum()  # Normalize
+                    tail_weights *= tail_mass  # Scale to tail portion
+                    
+                    for i, idx in enumerate(tail_indices_filtered):
+                        delta[idx] = tail_weights[i]
+        else:
+            # Fallback if burn UID doesn't exist (shouldn't happen)
+            logger.warning(f"Burn UID {BURN_UID} not available, using standard perturbation")
+            if tail_size > 0:
+                delta_per_miner = P_MOVE / tail_size
+                delta[tail_indices] = delta_per_miner
         
         # Apply perturbation: scale down original weights and add boost
         w_prime = (1 - P_MOVE) * base_weights + delta
@@ -382,7 +420,11 @@ class WeightPerturbationManager:
             
             # Calculate and log statistics
             l1_distance = np.abs(perturbed - base_weights).sum()
-            logger.info(f"Applied weight perturbation: L1_distance={l1_distance:.4f}, P={P_MOVE}")
+            unique_weights = len(np.unique(np.round(perturbed, 10)))
+            burn_weight = perturbed[252] if len(perturbed) > 252 else 0
+            
+            logger.info(f"Applied weight perturbation: L1_distance={l1_distance:.4f}, P={P_MOVE}, "
+                       f"burn_UID252={burn_weight:.5f}, unique_weights={unique_weights}/{len(perturbed)}")
             
             return perturbed
             
