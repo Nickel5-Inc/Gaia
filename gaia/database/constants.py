@@ -12,8 +12,8 @@ MAX_RETRIES = 3
 DEFAULT_BATCH_SIZE = 1000
 
 # Status constants
-STATUS_PENDING = 'pending'
-STATUS_PROCESSING = 'processing'
-STATUS_COMPLETED = 'completed'
-STATUS_ERROR = 'error'
-STATUS_TIMEOUT = 'timeout' 
+STATUS_PENDING = "pending"
+STATUS_PROCESSING = "processing"
+STATUS_COMPLETED = "completed"
+STATUS_ERROR = "error"
+STATUS_TIMEOUT = "timeout"

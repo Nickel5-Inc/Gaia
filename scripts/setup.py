@@ -61,7 +61,10 @@ def setup_postgresql(default_user="postgres", default_password="postgres"):
         postgres_password = os.getenv("DB_PASSWORD", default_password)
 
         conn = psycopg2.connect(
-            dbname="postgres", user=postgres_user, password=postgres_password, host="localhost"
+            dbname="postgres",
+            user=postgres_user,
+            password=postgres_password,
+            host="localhost",
         )
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cur = conn.cursor()
@@ -139,8 +142,9 @@ def main():
     print("\nNext steps:")
     print("1. Activate virtual environment:")
     print("   source ../.gaia/bin/activate")
-    print("2. Configure your .env file with any additional environment variables (Miner OR Validator)")
-
+    print(
+        "2. Configure your .env file with any additional environment variables (Miner OR Validator)"
+    )
 
 
 if __name__ == "__main__":

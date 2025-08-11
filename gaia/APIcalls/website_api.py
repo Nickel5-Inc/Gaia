@@ -10,7 +10,9 @@ logger = get_logger(__name__)
 
 
 class GaiaCommunicator:
-    def __init__(self, endpoint: str = "/Validator/Info", client: httpx.AsyncClient = None):
+    def __init__(
+        self, endpoint: str = "/Validator/Info", client: httpx.AsyncClient = None
+    ):
         """
         Initialize the communicator with Gaia API base URL and endpoint.
 
@@ -20,7 +22,7 @@ class GaiaCommunicator:
         """
         api_base = "https://dev-gaia-api.azurewebsites.net"
         self.endpoint = f"{api_base}{endpoint}"
-        
+
         # Configure client with optimized settings for concurrent requests
         if client:
             self.client = client
@@ -32,16 +34,16 @@ class GaiaCommunicator:
                 limits=httpx.Limits(
                     max_keepalive_connections=20,
                     max_connections=30,
-                    keepalive_expiry=30.0
+                    keepalive_expiry=30.0,
                 ),
                 headers={
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'GaiaValidator/1.0'
-                }
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "GaiaValidator/1.0",
+                },
             )
             self._should_close_client = True
-            
+
         # Concurrency control
         self._request_semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
         self._retry_delays = [1, 2, 4, 8, 16]  # Exponential backoff delays
@@ -69,36 +71,44 @@ class GaiaCommunicator:
         # Validate numeric values in predictions
         data = self._validate_predictions(data)
         if not data:
-            logger.error(f"| {current_thread} | ❗ No valid predictions after validation")
+            logger.error(
+                f"| {current_thread} | ❗ No valid predictions after validation"
+            )
             return
 
         async with self._request_semaphore:  # Control concurrent requests
             for attempt, delay in enumerate(self._retry_delays):
                 try:
                     response = await self.client.post(self.endpoint, json=data)
-                    
+
                     if response.is_success:
-                        logger.info(f"| {current_thread} | ✅ Data sent to Gaia successfully")
+                        logger.info(
+                            f"| {current_thread} | ✅ Data sent to Gaia successfully"
+                        )
                         return
-                    
+
                     if response.status_code == 429:  # Rate limit
                         if attempt < len(self._retry_delays) - 1:
-                            logger.warning(f"| {current_thread} | Rate limit hit, retrying in {delay}s...")
+                            logger.warning(
+                                f"| {current_thread} | Rate limit hit, retrying in {delay}s..."
+                            )
                             await asyncio.sleep(delay)
                             continue
-                    
+
                     # Log error details
                     try:
                         error_details = response.json()
                     except ValueError:
                         error_details = response.text
-                    
-                    logger.warning(f"| {current_thread} | ❗ HTTP error {response.status_code}: {error_details}")
+
+                    logger.warning(
+                        f"| {current_thread} | ❗ HTTP error {response.status_code}: {error_details}"
+                    )
                     if attempt < len(self._retry_delays) - 1:
                         await asyncio.sleep(delay)
                         continue
                     break
-                    
+
                 except httpx.RequestError as e:
                     logger.warning(f"| {current_thread} | ❗ Request error: {str(e)}")
                     if attempt < len(self._retry_delays) - 1:
@@ -124,8 +134,11 @@ class GaiaCommunicator:
 
     def _validate_payload(self, data: Dict[str, Any]) -> bool:
         """Validate the payload structure."""
-        required_fields = ["minerHotKey", "minerColdKey"]  # Geomagnetic and soil moisture predictions removed (tasks disabled)
-        
+        required_fields = [
+            "minerHotKey",
+            "minerColdKey",
+        ]  # Geomagnetic and soil moisture predictions removed (tasks disabled)
+
         # Check required fields
         for field in required_fields:
             if field not in data:
@@ -133,8 +146,8 @@ class GaiaCommunicator:
                 return False
 
         # Validate prediction arrays
-            # Geomagnetic predictions validation removed (task disabled)
-            # Soil moisture predictions validation removed (task disabled)
+        # Geomagnetic predictions validation removed (task disabled)
+        # Soil moisture predictions validation removed (task disabled)
 
         return True
 
@@ -153,7 +166,7 @@ if __name__ == "__main__":
                 "geomagneticPredictedValue": 45.6,
                 "geomagneticGroundTruthValue": 42.0,
                 "geomagneticScore": 3.6,
-                "scoreGenerationDate": "2024-12-18T14:45:30Z"
+                "scoreGenerationDate": "2024-12-18T14:45:30Z",
             }
         ],
         "soilMoisturePredictions": [
@@ -174,10 +187,9 @@ if __name__ == "__main__":
                 "soilRootzoneStructureScore": 0.92,
                 "soilPredictionInput": "input.tif",
                 "soilPredictionOutput": "output.tif",
-                "scoreGenerationDate": "2024-12-18T14:45:30Z"
+                "scoreGenerationDate": "2024-12-18T14:45:30Z",
             }
-        ]
+        ],
     }
 
     communicator.send_data(example_payload)
-

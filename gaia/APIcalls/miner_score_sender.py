@@ -10,6 +10,7 @@ from gaia.APIcalls.website_api import GaiaCommunicator
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from typing import Dict, Optional
 
+
 def prepare_prediction_field(data_list):
     """
     Convert a list of values into a comma-separated string.
@@ -22,7 +23,9 @@ def prepare_prediction_field(data_list):
     """
     return ",".join(map(str, data_list)) if data_list else ""
 
+
 logger = get_logger(__name__)
+
 
 class MinerScoreSender:
     def __init__(self, database_manager, api_client=None):
@@ -43,7 +46,10 @@ class MinerScoreSender:
         """
         query = "SELECT uid, hotkey, coldkey FROM node_table WHERE hotkey IS NOT NULL"
         results = await self.db_manager.fetch_all(query)
-        return [{"uid": row["uid"], "hotkey": row["hotkey"], "coldkey": row["coldkey"]} for row in results]
+        return [
+            {"uid": row["uid"], "hotkey": row["hotkey"], "coldkey": row["coldkey"]}
+            for row in results
+        ]
 
     # Geomagnetic processing removed (task disabled)
 
@@ -72,7 +78,9 @@ class MinerScoreSender:
                 )
                 logger.warning("| MinerScoreSender | Re-created closed API client")
 
-            async with GaiaCommunicator("/Predictions", client=self.api_client) as gaia_communicator:
+            async with GaiaCommunicator(
+                "/Predictions", client=self.api_client
+            ) as gaia_communicator:
                 active_miners = await self.fetch_active_miners()
                 if not active_miners:
                     logger.warning("| MinerScoreSender | No active miners found.")
@@ -84,7 +92,9 @@ class MinerScoreSender:
                 async def process_miner_with_semaphore(miner):
                     async with miner_processing_semaphore:
                         try:
-                            logger.debug(f"Processing miner {miner['hotkey']} under semaphore")
+                            logger.debug(
+                                f"Processing miner {miner['hotkey']} under semaphore"
+                            )
                             # Only fetch weather data (other tasks disabled)
                             geo_history = []  # Geomagnetic disabled
                             soil_history = []  # Soil moisture disabled
@@ -93,69 +103,100 @@ class MinerScoreSender:
                                 "minerHotKey": miner["hotkey"],
                                 "minerColdKey": miner["coldkey"],
                                 "geomagneticPredictions": [],  # Geomagnetic task disabled
-                                "soilMoisturePredictions": []  # Soil moisture task disabled
+                                "soilMoisturePredictions": [],  # Soil moisture task disabled
                             }
                         except Exception as e:
-                            logger.error(f"Error processing miner {miner['hotkey']} under semaphore: {str(e)}\n{traceback.format_exc()}")
+                            logger.error(
+                                f"Error processing miner {miner['hotkey']} under semaphore: {str(e)}\n{traceback.format_exc()}"
+                            )
                             return None
 
                 # Process miners in smaller batches to reduce memory usage
                 batch_size = 50  # Process 50 miners at a time
                 successful_sends = 0
                 failed_sends = 0
-                
-                logger.info(f"Starting to process data for {len(active_miners)} active miners in batches of {batch_size}.")
-                
+
+                logger.info(
+                    f"Starting to process data for {len(active_miners)} active miners in batches of {batch_size}."
+                )
+
                 for batch_start in range(0, len(active_miners), batch_size):
                     batch_end = min(batch_start + batch_size, len(active_miners))
                     batch_miners = active_miners[batch_start:batch_end]
-                    
-                    logger.info(f"Processing miner batch {batch_start//batch_size + 1}: miners {batch_start+1}-{batch_end}")
-                    
+
+                    logger.info(
+                        f"Processing miner batch {batch_start//batch_size + 1}: miners {batch_start+1}-{batch_end}"
+                    )
+
                     # Process this batch
-                    batch_tasks = [process_miner_with_semaphore(miner) for miner in batch_miners]
-                    batch_payloads = await asyncio.gather(*batch_tasks, return_exceptions=True)
-                    
-                    valid_batch_payloads = [p for p in batch_payloads if p is not None and not isinstance(p, Exception)]
-                    logger.info(f"Batch {batch_start//batch_size + 1}: Successfully processed {len(valid_batch_payloads)} miners.")
-                    
+                    batch_tasks = [
+                        process_miner_with_semaphore(miner) for miner in batch_miners
+                    ]
+                    batch_payloads = await asyncio.gather(
+                        *batch_tasks, return_exceptions=True
+                    )
+
+                    valid_batch_payloads = [
+                        p
+                        for p in batch_payloads
+                        if p is not None and not isinstance(p, Exception)
+                    ]
+                    logger.info(
+                        f"Batch {batch_start//batch_size + 1}: Successfully processed {len(valid_batch_payloads)} miners."
+                    )
+
                     # Send batch data immediately and clean up
                     for i, payload in enumerate(valid_batch_payloads):
                         try:
-                            logger.debug(f"Sending data for miner {payload['minerHotKey']} ({i+1}/{len(valid_batch_payloads)})")
+                            logger.debug(
+                                f"Sending data for miner {payload['minerHotKey']} ({i+1}/{len(valid_batch_payloads)})"
+                            )
                             await asyncio.wait_for(
                                 gaia_communicator.send_data(data=payload),
-                                timeout=30 # Timeout for individual API call
+                                timeout=30,  # Timeout for individual API call
                             )
-                            logger.debug(f"Successfully sent data for miner {payload['minerHotKey']}")
+                            logger.debug(
+                                f"Successfully sent data for miner {payload['minerHotKey']}"
+                            )
                             successful_sends += 1
                         except asyncio.TimeoutError:
-                            logger.error(f"Timeout sending API data for miner {payload['minerHotKey']}")
+                            logger.error(
+                                f"Timeout sending API data for miner {payload['minerHotKey']}"
+                            )
                             failed_sends += 1
                         except Exception as e:
-                            logger.error(f"Error sending API data for miner {payload['minerHotKey']}: {str(e)}\n{traceback.format_exc()}")
+                            logger.error(
+                                f"Error sending API data for miner {payload['minerHotKey']}: {str(e)}\n{traceback.format_exc()}"
+                            )
                             failed_sends += 1
                         finally:
-                            await asyncio.sleep(0.2) # Add a small delay to avoid rate limiting
-                    
+                            await asyncio.sleep(
+                                0.2
+                            )  # Add a small delay to avoid rate limiting
+
                     # IMMEDIATE cleanup of batch data
                     try:
                         del batch_tasks
-                        del batch_payloads  
+                        del batch_payloads
                         del valid_batch_payloads
                         # Force GC every few batches for large miner sets
                         if (batch_start // batch_size + 1) % 3 == 0:
                             import gc
+
                             collected = gc.collect()
-                            logger.debug(f"Batch cleanup: GC collected {collected} objects")
+                            logger.debug(
+                                f"Batch cleanup: GC collected {collected} objects"
+                            )
                     except Exception as cleanup_err:
                         logger.debug(f"Error during batch cleanup: {cleanup_err}")
-                    
+
                     # Brief pause between batches
                     if batch_end < len(active_miners):
                         await asyncio.sleep(1.0)
-                
-                logger.info(f"Completed sending data to Gaia API. Successful: {successful_sends}, Failed: {failed_sends}")
+
+                logger.info(
+                    f"Completed sending data to Gaia API. Successful: {successful_sends}, Failed: {failed_sends}"
+                )
 
         except Exception as e:
             logger.error(f"Error in send_to_gaia: {str(e)}\n{traceback.format_exc()}")
@@ -163,17 +204,25 @@ class MinerScoreSender:
 
     async def run_async(self):
         # Add 1-hour startup delay to prevent immediate execution on validator startup
-        logger.info("| MinerScoreSender | Delaying initial execution by 1 hour to avoid startup rush...")
+        logger.info(
+            "| MinerScoreSender | Delaying initial execution by 1 hour to avoid startup rush..."
+        )
         await asyncio.sleep(3600)  # 1 hour delay
-        
+
         while True:
             try:
-                logger.info("| MinerScoreSender | Starting hourly process to send scores to Gaia API...")
+                logger.info(
+                    "| MinerScoreSender | Starting hourly process to send scores to Gaia API..."
+                )
                 await asyncio.wait_for(self.send_to_gaia(), timeout=2700)
-                logger.info("| MinerScoreSender | Completed sending scores. Sleeping for 1 hour...")
+                logger.info(
+                    "| MinerScoreSender | Completed sending scores. Sleeping for 1 hour..."
+                )
                 await asyncio.sleep(3600)
             except asyncio.TimeoutError:
-                logger.error("| MinerScoreSender | Process timed out after 45 minutes, restarting...")
+                logger.error(
+                    "| MinerScoreSender | Process timed out after 45 minutes, restarting..."
+                )
                 await asyncio.sleep(30)
             except Exception as e:
                 logger.error(f"| MinerScoreSender | ❗ Error in run_async: {e}")
@@ -184,7 +233,7 @@ class MinerScoreSender:
             if self.api_client and not self._external_api_client:
                 await self.api_client.aclose()
                 logger.info("Closed MinerScoreSender API client")
-            if self.db_manager and not getattr(self, '_external_db_manager', False):
+            if self.db_manager and not getattr(self, "_external_db_manager", False):
                 await self.db_manager.close_all_connections()
                 logger.info("Closed MinerScoreSender database connections")
         except Exception as e:
