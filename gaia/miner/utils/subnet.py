@@ -126,7 +126,7 @@ BLACKLISTED_HOTKEYS: Set[str] = set(
 )
 
 # Option 2: Load from file
-BLACKLIST_FILE_PATH = os.getenv("BLACKLIST_FILE_PATH", "/root/Gaia/blacklisted_hotkeys.json")
+BLACKLIST_FILE_PATH = os.getenv("BLACKLIST_FILE_PATH", "/root/Gaia-miner/blacklisted_hotkeys.json")
 if os.path.exists(BLACKLIST_FILE_PATH):
     try:
         with open(BLACKLIST_FILE_PATH, "r") as f:
@@ -293,9 +293,9 @@ class BlacklistChecker:
         elif hasattr(request.state, 'sender_hotkey'):  
             sender_hotkey = request.state.sender_hotkey
             
-        # Check headers
+        # Check headers - validator hotkey should be stored in validator-hotkey header
         if not sender_hotkey:
-            for header_name in ['sender-hotkey', 'hotkey', 'x-hotkey']:
+            for header_name in ['validator-hotkey', 'sender-hotkey', 'hotkey']:
                 if header_name in request.headers:
                     sender_hotkey = request.headers.get(header_name)
                     break
