@@ -715,475 +715,420 @@ sa.Index(
     geomagnetic_history_table.c.scored_at.desc(),
 )
 
-# --- Miner Performance Statistics Table ---
-miner_performance_stats_table = sa.Table(
-    "miner_performance_stats",
+# --- Weather Forecast Statistics Tables ---
+# These tables are designed for comprehensive tracking and analysis of miner performance
+# in weather forecasting tasks, with a focus on efficient querying and web server integration
+
+weather_forecast_stats_table = sa.Table(
+    "weather_forecast_stats",
     validator_metadata,
-    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+    sa.Column(
+        "id", sa.Integer, primary_key=True, autoincrement=True
+    ),  # SERIAL PRIMARY KEY
     sa.Column(
         "miner_uid",
         sa.Integer,
         sa.ForeignKey("node_table.uid", ondelete="CASCADE"),
         nullable=False,
-        comment="Miner's UID",
+        comment="Miner's UID (0-255)",
     ),
-    sa.Column("miner_hotkey", sa.Text, nullable=False, comment="Miner's hotkey"),
-    # Time period for this statistics snapshot
+    sa.Column("miner_hotkey", sa.VARCHAR(255), nullable=False, comment="Miner's hotkey"),
     sa.Column(
-        "period_start",
+        "miner_rank",
+        sa.Integer,
+        nullable=True,
+        comment="Miner's rank for this forecast run",
+    ),
+    sa.Column(
+        "forecast_run_id",
+        sa.VARCHAR(100),
+        nullable=False,
+        comment="Deterministic run ID shared across validators",
+    ),
+    sa.Column(
+        "run_id",
+        sa.Integer,
+        sa.ForeignKey("weather_forecast_runs.id", ondelete="CASCADE"),
+        nullable=True,
+        comment="Link to weather_forecast_runs table",
+    ),
+    sa.Column(
+        "forecast_init_time",
         postgresql.TIMESTAMP(timezone=True),
         nullable=False,
-        comment="Start of the performance period",
+        comment="GFS initialization time for the forecast",
     ),
     sa.Column(
-        "period_end",
-        postgresql.TIMESTAMP(timezone=True),
+        "forecast_status",
+        sa.VARCHAR(50),
         nullable=False,
-        comment="End of the performance period",
+        comment="Current stage: pending, input_received, day1_scored, era5_scoring, completed, failed",
     ),
     sa.Column(
-        "period_type",
-        sa.VARCHAR(20),
-        nullable=False,
-        comment="Type of period: daily, weekly, monthly, all_time",
-    ),
-    # Overall performance metrics
-    sa.Column(
-        "total_tasks_attempted",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-        comment="Total tasks attempted across all types",
-    ),
-    sa.Column(
-        "total_tasks_completed",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-        comment="Total tasks successfully completed",
-    ),
-    sa.Column(
-        "total_tasks_scored",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-        comment="Total tasks that received scores",
-    ),
-    sa.Column(
-        "overall_success_rate",
-        sa.Float,
-        nullable=True,
-        comment="Completion rate (completed/attempted)",
-    ),
-    sa.Column(
-        "overall_avg_score",
-        sa.Float,
-        nullable=True,
-        comment="Weighted average score across all task types",
-    ),
-    sa.Column(
-        "overall_rank",
-        sa.Integer,
-        nullable=True,
-        comment="Overall rank among all miners for this period",
-    ),
-    # Weather-specific metrics
-    sa.Column(
-        "weather_tasks_attempted",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-    ),
-    sa.Column(
-        "weather_tasks_completed",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-    ),
-    sa.Column(
-        "weather_tasks_scored", sa.Integer, server_default=sa.text("0"), nullable=False
-    ),
-    sa.Column(
-        "weather_avg_score",
-        sa.Float,
-        nullable=True,
-        comment="Average weather forecast score",
-    ),
-    sa.Column("weather_success_rate", sa.Float, nullable=True),
-    sa.Column(
-        "weather_rank", sa.Integer, nullable=True, comment="Rank in weather forecasting"
-    ),
-    sa.Column(
-        "weather_best_score",
-        sa.Float,
-        nullable=True,
-        comment="Best weather score in period",
-    ),
-    sa.Column(
-        "weather_latest_score",
-        sa.Float,
-        nullable=True,
-        comment="Most recent weather score",
-    ),
-    # Soil moisture-specific metrics
-    sa.Column(
-        "soil_moisture_tasks_attempted",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-    ),
-    sa.Column(
-        "soil_moisture_tasks_completed",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-    ),
-    sa.Column(
-        "soil_moisture_tasks_scored",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-    ),
-    sa.Column(
-        "soil_moisture_avg_score",
-        sa.Float,
-        nullable=True,
-        comment="Average combined soil moisture score",
-    ),
-    sa.Column("soil_moisture_success_rate", sa.Float, nullable=True),
-    sa.Column("soil_moisture_rank", sa.Integer, nullable=True),
-    sa.Column(
-        "soil_moisture_surface_rmse_avg",
-        sa.Float,
-        nullable=True,
-        comment="Average surface RMSE",
-    ),
-    sa.Column(
-        "soil_moisture_rootzone_rmse_avg",
-        sa.Float,
-        nullable=True,
-        comment="Average rootzone RMSE",
-    ),
-    sa.Column("soil_moisture_best_score", sa.Float, nullable=True),
-    sa.Column("soil_moisture_latest_score", sa.Float, nullable=True),
-    # Geomagnetic-specific metrics
-    sa.Column(
-        "geomagnetic_tasks_attempted",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-    ),
-    sa.Column(
-        "geomagnetic_tasks_completed",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-    ),
-    sa.Column(
-        "geomagnetic_tasks_scored",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-    ),
-    sa.Column(
-        "geomagnetic_avg_score",
-        sa.Float,
-        nullable=True,
-        comment="Average geomagnetic prediction score",
-    ),
-    sa.Column("geomagnetic_success_rate", sa.Float, nullable=True),
-    sa.Column("geomagnetic_rank", sa.Integer, nullable=True),
-    sa.Column("geomagnetic_best_score", sa.Float, nullable=True),
-    sa.Column("geomagnetic_latest_score", sa.Float, nullable=True),
-    sa.Column(
-        "geomagnetic_avg_error",
-        sa.Float,
-        nullable=True,
-        comment="Average prediction error magnitude",
-    ),
-    # === NEW WEIGHT CALCULATION PIPELINE COLUMNS ===
-    sa.Column(
-        "submitted_weight",
-        sa.Float,
-        nullable=True,
-        comment="Final weight submitted to chain by this validator",
-    ),
-    sa.Column(
-        "raw_calculated_weight",
-        sa.Float,
-        nullable=True,
-        comment="Pre-normalization weight from scoring algorithm",
-    ),
-    sa.Column(
-        "excellence_weight",
-        sa.Float,
-        nullable=True,
-        comment="Weight from excellence pathway calculation",
-    ),
-    sa.Column(
-        "diversity_weight",
-        sa.Float,
-        nullable=True,
-        comment="Weight from diversity pathway calculation",
-    ),
-    sa.Column(
-        "scoring_pathway",
-        sa.VARCHAR(20),
-        nullable=True,
-        comment="Which pathway was selected: excellence, diversity, or none",
-    ),
-    sa.Column(
-        "pathway_details",
+        "forecast_error_msg",
         postgresql.JSONB,
         nullable=True,
-        comment="Detailed breakdown of pathway calculation",
+        comment="Detailed error information with sensitive data redacted",
     ),
-    # === NEW CHAIN CONSENSUS INTEGRATION COLUMNS ===
+    # Individual scoring columns
     sa.Column(
-        "incentive",
+        "forecast_score_initial",
         sa.Float,
         nullable=True,
-        comment="Final incentive value from chain consensus",
+        comment="Day 1 GFS comparison score",
+    ),
+    # ERA5 scores for each timestep (every 24 hours up to 240 hours)
+    sa.Column(
+        "era5_score_24h",
+        sa.Float,
+        nullable=True,
+        comment="ERA5 score at 24 hour lead time",
     ),
     sa.Column(
-        "consensus_rank",
+        "era5_score_48h",
+        sa.Float,
+        nullable=True,
+        comment="ERA5 score at 48 hour lead time",
+    ),
+    sa.Column(
+        "era5_score_72h",
+        sa.Float,
+        nullable=True,
+        comment="ERA5 score at 72 hour lead time",
+    ),
+    sa.Column(
+        "era5_score_96h",
+        sa.Float,
+        nullable=True,
+        comment="ERA5 score at 96 hour lead time",
+    ),
+    sa.Column(
+        "era5_score_120h",
+        sa.Float,
+        nullable=True,
+        comment="ERA5 score at 120 hour lead time",
+    ),
+    sa.Column(
+        "era5_score_144h",
+        sa.Float,
+        nullable=True,
+        comment="ERA5 score at 144 hour lead time",
+    ),
+    sa.Column(
+        "era5_score_168h",
+        sa.Float,
+        nullable=True,
+        comment="ERA5 score at 168 hour lead time",
+    ),
+    sa.Column(
+        "era5_score_192h",
+        sa.Float,
+        nullable=True,
+        comment="ERA5 score at 192 hour lead time",
+    ),
+    sa.Column(
+        "era5_score_216h",
+        sa.Float,
+        nullable=True,
+        comment="ERA5 score at 216 hour lead time",
+    ),
+    sa.Column(
+        "era5_score_240h",
+        sa.Float,
+        nullable=True,
+        comment="ERA5 score at 240 hour lead time",
+    ),
+    # Aggregate metrics
+    sa.Column(
+        "era5_combined_score",
+        sa.Float,
+        nullable=True,
+        comment="Average across all ERA5 timesteps (including 0s for incomplete)",
+    ),
+    sa.Column(
+        "era5_completeness",
+        sa.Float,
+        nullable=True,
+        comment="Fraction of ERA5 timesteps completed (0-1)",
+    ),
+    # Additional metadata
+    sa.Column(
+        "forecast_type",
+        sa.VARCHAR(50),
+        server_default=sa.text("'10day'"),
+        nullable=False,
+        comment="Type of forecast: 10day, hindcast, cyclone_path, etc.",
+    ),
+    sa.Column(
+        "forecast_inference_time",
         sa.Integer,
         nullable=True,
-        comment="Miner rank based on final incentive values",
+        comment="Time taken for inference in seconds",
     ),
     sa.Column(
-        "weight_submission_block",
-        sa.BigInteger,
+        "forecast_input_sources",
+        postgresql.JSONB,
         nullable=True,
-        comment="Block number when weights were submitted",
+        comment="Input data sources used for the forecast",
     ),
     sa.Column(
-        "consensus_block",
-        sa.BigInteger,
+        "hosting_status",
+        sa.VARCHAR(50),
         nullable=True,
-        comment="Block number when consensus was calculated",
-    ),
-    # === NEW TASK WEIGHT CONTRIBUTIONS COLUMNS ===
-    sa.Column(
-        "weather_weight_contribution",
-        sa.Float,
-        nullable=True,
-        comment="Contribution of weather task to final weight",
+        comment="Status of hosting: accessible, inaccessible, timeout, error",
     ),
     sa.Column(
-        "geomagnetic_weight_contribution",
-        sa.Float,
+        "hosting_latency_ms",
+        sa.Integer,
         nullable=True,
-        comment="Contribution of geomagnetic task to final weight",
-    ),
-    sa.Column(
-        "soil_weight_contribution",
-        sa.Float,
-        nullable=True,
-        comment="Contribution of soil moisture task to final weight",
-    ),
-    sa.Column(
-        "multi_task_bonus",
-        sa.Float,
-        nullable=True,
-        comment="Bonus for performing multiple tasks well",
-    ),
-    # === NEW PERFORMANCE ANALYSIS COLUMNS ===
-    sa.Column(
-        "percentile_rank_weather",
-        sa.Float,
-        nullable=True,
-        comment="Percentile rank in weather forecasting (0-100)",
-    ),
-    sa.Column(
-        "percentile_rank_geomagnetic",
-        sa.Float,
-        nullable=True,
-        comment="Percentile rank in geomagnetic predictions (0-100)",
-    ),
-    sa.Column(
-        "percentile_rank_soil",
-        sa.Float,
-        nullable=True,
-        comment="Percentile rank in soil moisture predictions (0-100)",
-    ),
-    sa.Column(
-        "excellence_qualified_tasks",
-        postgresql.ARRAY(sa.Text),
-        nullable=True,
-        comment="Array of tasks where miner qualified for excellence pathway",
+        comment="Latency in milliseconds for accessing hosted files",
     ),
     sa.Column(
         "validator_hotkey",
         sa.Text,
         nullable=True,
-        comment="Which validator calculated these stats",
-    ),
-    # Performance trends and metadata
-    sa.Column(
-        "performance_trend",
-        sa.VARCHAR(20),
-        nullable=True,
-        comment="improving, declining, stable, insufficient_data",
+        comment="Validator that generated these stats",
     ),
     sa.Column(
-        "trend_confidence",
-        sa.Float,
-        nullable=True,
-        comment="Confidence in trend assessment (0-1)",
-    ),
-    sa.Column(
-        "last_active_time",
-        postgresql.TIMESTAMP(timezone=True),
-        nullable=True,
-        comment="Last time miner submitted a task",
-    ),
-    sa.Column(
-        "consecutive_failures",
-        sa.Integer,
-        server_default=sa.text("0"),
-        nullable=False,
-        comment="Number of consecutive failed tasks",
-    ),
-    sa.Column(
-        "uptime_percentage",
-        sa.Float,
-        nullable=True,
-        comment="Percentage of time miner was responsive",
-    ),
-    # Detailed metrics storage
-    sa.Column(
-        "detailed_metrics",
-        postgresql.JSONB,
-        nullable=True,
-        comment="Additional detailed metrics and breakdowns",
-    ),
-    sa.Column(
-        "score_distribution",
-        postgresql.JSONB,
-        nullable=True,
-        comment="Score percentiles and distribution stats",
-    ),
-    # Metadata
-    sa.Column(
-        "calculated_at",
+        "created_at",
         postgresql.TIMESTAMP(timezone=True),
         server_default=sa.func.current_timestamp(),
         nullable=False,
+        comment="When this record was created",
     ),
     sa.Column(
         "updated_at",
         postgresql.TIMESTAMP(timezone=True),
         server_default=sa.func.current_timestamp(),
         nullable=False,
+        comment="When this record was last updated",
     ),
-    # Ensure one record per miner per period
     sa.UniqueConstraint(
+        "miner_uid", "forecast_run_id", name="uq_wfs_miner_forecast"
+    ),
+    comment="Comprehensive weather forecast statistics for each miner per forecast run",
+)
+
+# Indexes for efficient querying
+sa.Index("idx_wfs_miner_uid", weather_forecast_stats_table.c.miner_uid)
+sa.Index("idx_wfs_miner_hotkey", weather_forecast_stats_table.c.miner_hotkey)
+sa.Index("idx_wfs_forecast_run_id", weather_forecast_stats_table.c.forecast_run_id)
+sa.Index("idx_wfs_run_id", weather_forecast_stats_table.c.run_id)
+sa.Index("idx_wfs_forecast_init_time", weather_forecast_stats_table.c.forecast_init_time.desc())
+sa.Index("idx_wfs_forecast_status", weather_forecast_stats_table.c.forecast_status)
+sa.Index("idx_wfs_miner_rank", weather_forecast_stats_table.c.miner_rank)
+sa.Index("idx_wfs_era5_combined_score", weather_forecast_stats_table.c.era5_combined_score.desc())
+sa.Index("idx_wfs_created_at", weather_forecast_stats_table.c.created_at.desc())
+sa.Index(
+    "idx_wfs_forecast_type_init_time",
+    weather_forecast_stats_table.c.forecast_type,
+    weather_forecast_stats_table.c.forecast_init_time.desc(),
+)
+
+# Aggregated miner statistics table
+miner_stats_table = sa.Table(
+    "miner_stats",
+    validator_metadata,
+    sa.Column(
         "miner_uid",
-        "period_start",
-        "period_end",
-        "period_type",
-        name="uq_mps_miner_period",
+        sa.Integer,
+        sa.ForeignKey("node_table.uid", ondelete="CASCADE"),
+        primary_key=True,
+        nullable=False,
+        comment="Miner's UID (0-255)",
     ),
-    # Data integrity constraints
-    sa.CheckConstraint(
-        "scoring_pathway IN ('excellence', 'diversity', 'none') OR scoring_pathway IS NULL",
-        name="chk_scoring_pathway",
+    sa.Column("miner_hotkey", sa.VARCHAR(255), nullable=False, comment="Miner's hotkey"),
+    sa.Column(
+        "miner_rank",
+        sa.Integer,
+        nullable=True,
+        comment="Current overall rank among all miners",
     ),
-    sa.CheckConstraint(
-        "(percentile_rank_weather IS NULL OR (percentile_rank_weather >= 0 AND percentile_rank_weather <= 100)) AND "
-        "(percentile_rank_geomagnetic IS NULL OR (percentile_rank_geomagnetic >= 0 AND percentile_rank_geomagnetic <= 100)) AND "
-        "(percentile_rank_soil IS NULL OR (percentile_rank_soil >= 0 AND percentile_rank_soil <= 100))",
-        name="chk_percentile_ranges",
+    # Forecast performance metrics
+    sa.Column(
+        "avg_forecast_score",
+        sa.Float,
+        nullable=True,
+        comment="Average score across all forecasts",
     ),
-    comment="Comprehensive miner performance statistics aggregated across all task types for visualization and analysis.",
+    sa.Column(
+        "successful_forecasts",
+        sa.Integer,
+        server_default=sa.text("0"),
+        nullable=False,
+        comment="Number of successfully completed forecasts",
+    ),
+    sa.Column(
+        "failed_forecasts",
+        sa.Integer,
+        server_default=sa.text("0"),
+        nullable=False,
+        comment="Number of failed forecasts",
+    ),
+    sa.Column(
+        "forecast_success_ratio",
+        sa.Float,
+        nullable=True,
+        comment="Ratio of successful to total forecasts (0-1)",
+    ),
+    # Hosting reliability metrics
+    sa.Column(
+        "hosting_successes",
+        sa.Integer,
+        server_default=sa.text("0"),
+        nullable=False,
+        comment="Number of successful kerchunk file retrievals",
+    ),
+    sa.Column(
+        "hosting_failures",
+        sa.Integer,
+        server_default=sa.text("0"),
+        nullable=False,
+        comment="Number of failed kerchunk file retrievals",
+    ),
+    sa.Column(
+        "host_reliability_ratio",
+        sa.Float,
+        nullable=True,
+        comment="Ratio of successful hosting attempts (0-1)",
+    ),
+    sa.Column(
+        "avg_hosting_latency_ms",
+        sa.Float,
+        nullable=True,
+        comment="Average latency for accessing hosted files in milliseconds",
+    ),
+    # Performance breakdowns
+    sa.Column(
+        "avg_day1_score",
+        sa.Float,
+        nullable=True,
+        comment="Average day 1 GFS comparison score",
+    ),
+    sa.Column(
+        "avg_era5_score",
+        sa.Float,
+        nullable=True,
+        comment="Average ERA5 comparison score across all timesteps",
+    ),
+    sa.Column(
+        "avg_era5_completeness",
+        sa.Float,
+        nullable=True,
+        comment="Average completeness of ERA5 scoring (0-1)",
+    ),
+    sa.Column(
+        "best_forecast_score",
+        sa.Float,
+        nullable=True,
+        comment="Best single forecast score achieved",
+    ),
+    sa.Column(
+        "worst_forecast_score",
+        sa.Float,
+        nullable=True,
+        comment="Worst single forecast score",
+    ),
+    sa.Column(
+        "score_std_dev",
+        sa.Float,
+        nullable=True,
+        comment="Standard deviation of forecast scores",
+    ),
+    # Temporal patterns
+    sa.Column(
+        "last_successful_forecast",
+        postgresql.TIMESTAMP(timezone=True),
+        nullable=True,
+        comment="Timestamp of last successful forecast",
+    ),
+    sa.Column(
+        "last_failed_forecast",
+        postgresql.TIMESTAMP(timezone=True),
+        nullable=True,
+        comment="Timestamp of last failed forecast",
+    ),
+    sa.Column(
+        "consecutive_successes",
+        sa.Integer,
+        server_default=sa.text("0"),
+        nullable=False,
+        comment="Current streak of successful forecasts",
+    ),
+    sa.Column(
+        "consecutive_failures",
+        sa.Integer,
+        server_default=sa.text("0"),
+        nullable=False,
+        comment="Current streak of failed forecasts",
+    ),
+    sa.Column(
+        "total_inference_time",
+        sa.BigInteger,
+        server_default=sa.text("0"),
+        nullable=False,
+        comment="Total inference time across all forecasts in seconds",
+    ),
+    sa.Column(
+        "avg_inference_time",
+        sa.Float,
+        nullable=True,
+        comment="Average inference time per forecast in seconds",
+    ),
+    # Error tracking
+    sa.Column(
+        "common_errors",
+        postgresql.JSONB,
+        nullable=True,
+        comment="Most common error types and their frequencies",
+    ),
+    sa.Column(
+        "error_rate_by_type",
+        postgresql.JSONB,
+        nullable=True,
+        comment="Error rates broken down by forecast type",
+    ),
+    # Metadata
+    sa.Column(
+        "first_seen",
+        postgresql.TIMESTAMP(timezone=True),
+        nullable=True,
+        comment="When this miner was first seen",
+    ),
+    sa.Column(
+        "last_active",
+        postgresql.TIMESTAMP(timezone=True),
+        nullable=True,
+        comment="Last time this miner was active",
+    ),
+    sa.Column(
+        "validator_hotkey",
+        sa.Text,
+        nullable=True,
+        comment="Validator that generated these stats",
+    ),
+    sa.Column(
+        "updated_at",
+        postgresql.TIMESTAMP(timezone=True),
+        server_default=sa.func.current_timestamp(),
+        nullable=False,
+        comment="When these stats were last updated",
+    ),
+    comment="Aggregated statistics for each miner across all weather forecasting tasks",
 )
 
-# Indexes for the miner performance stats table
-sa.Index("idx_mps_miner_uid", miner_performance_stats_table.c.miner_uid)
-sa.Index("idx_mps_miner_hotkey", miner_performance_stats_table.c.miner_hotkey)
+# Indexes for the miner stats table
+sa.Index("idx_ms_miner_hotkey", miner_stats_table.c.miner_hotkey)
+sa.Index("idx_ms_miner_rank", miner_stats_table.c.miner_rank)
+sa.Index("idx_ms_avg_forecast_score", miner_stats_table.c.avg_forecast_score.desc())
+sa.Index("idx_ms_forecast_success_ratio", miner_stats_table.c.forecast_success_ratio.desc())
+sa.Index("idx_ms_host_reliability_ratio", miner_stats_table.c.host_reliability_ratio.desc())
+sa.Index("idx_ms_last_active", miner_stats_table.c.last_active.desc())
+sa.Index("idx_ms_consecutive_failures", miner_stats_table.c.consecutive_failures)
 sa.Index(
-    "idx_mps_period_type_start",
-    miner_performance_stats_table.c.period_type,
-    miner_performance_stats_table.c.period_start.desc(),
-)
-sa.Index(
-    "idx_mps_overall_rank",
-    miner_performance_stats_table.c.overall_rank,
-    miner_performance_stats_table.c.period_type,
-)
-sa.Index(
-    "idx_mps_overall_score",
-    miner_performance_stats_table.c.overall_avg_score.desc(),
-    miner_performance_stats_table.c.period_type,
-)
-sa.Index("idx_mps_last_active", miner_performance_stats_table.c.last_active_time.desc())
-sa.Index("idx_mps_calculated_at", miner_performance_stats_table.c.calculated_at.desc())
-sa.Index(
-    "idx_mps_weather_rank",
-    miner_performance_stats_table.c.weather_rank,
-    miner_performance_stats_table.c.period_type,
-)
-sa.Index(
-    "idx_mps_soil_rank",
-    miner_performance_stats_table.c.soil_moisture_rank,
-    miner_performance_stats_table.c.period_type,
-)
-sa.Index(
-    "idx_mps_geomagnetic_rank",
-    miner_performance_stats_table.c.geomagnetic_rank,
-    miner_performance_stats_table.c.period_type,
-)
-
-# === NEW INDEXES FOR WEIGHT TRACKING AND CHAIN INTEGRATION ===
-sa.Index(
-    "idx_mps_submitted_weight",
-    miner_performance_stats_table.c.submitted_weight.desc(),
-    postgresql_where=miner_performance_stats_table.c.submitted_weight.isnot(None),
-)
-sa.Index(
-    "idx_mps_scoring_pathway",
-    miner_performance_stats_table.c.scoring_pathway,
-    miner_performance_stats_table.c.period_type,
-)
-sa.Index(
-    "idx_mps_incentive",
-    miner_performance_stats_table.c.incentive.desc(),
-    postgresql_where=miner_performance_stats_table.c.incentive.isnot(None),
-)
-sa.Index(
-    "idx_mps_consensus_rank",
-    miner_performance_stats_table.c.consensus_rank,
-    miner_performance_stats_table.c.period_type,
-    postgresql_where=miner_performance_stats_table.c.consensus_rank.isnot(None),
-)
-sa.Index(
-    "idx_mps_validator_hotkey",
-    miner_performance_stats_table.c.validator_hotkey,
-    miner_performance_stats_table.c.period_start.desc(),
-)
-sa.Index(
-    "idx_mps_weight_submission_block",
-    miner_performance_stats_table.c.weight_submission_block.desc(),
-    postgresql_where=miner_performance_stats_table.c.weight_submission_block.isnot(
-        None
-    ),
-)
-
-# === COMPOSITE INDEXES FOR COMMON QUERY PATTERNS ===
-sa.Index(
-    "idx_mps_pathway_performance",
-    miner_performance_stats_table.c.scoring_pathway,
-    miner_performance_stats_table.c.submitted_weight.desc(),
-    miner_performance_stats_table.c.period_type,
-)
-sa.Index(
-    "idx_mps_chain_integration",
-    miner_performance_stats_table.c.weight_submission_block,
-    miner_performance_stats_table.c.consensus_block,
-    postgresql_where=miner_performance_stats_table.c.weight_submission_block.isnot(
-        None
-    ),
+    "idx_ms_active_miners",
+    miner_stats_table.c.last_active.desc(),
+    postgresql_where=miner_stats_table.c.last_active.isnot(None),
 )
 
 # --- Perturbation Seed Table (Anti-Weight-Copying Mechanism) ---

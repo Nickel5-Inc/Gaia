@@ -162,10 +162,11 @@ from substrateinterface import SubstrateInterface
 # Geomagnetic and soil moisture tasks disabled
 from gaia.APIcalls.miner_score_sender import MinerScoreSender
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.tasks.base.miner_performance_calculator import (
-    MinerPerformanceCalculator,
-    calculate_daily_stats,
-)
+# Removed MinerPerformanceCalculator - replaced with new stats tables
+# from gaia.tasks.base.miner_performance_calculator import (
+#     MinerPerformanceCalculator,
+#     calculate_daily_stats,
+# )
 from argparse import ArgumentParser
 import pandas as pd
 import json
@@ -525,7 +526,7 @@ class GaiaValidator:
         )
 
         # Initialize performance calculator for tracking miner statistics
-        self.performance_calculator = None  # Will be initialized when database is ready
+        # self.performance_calculator = None  # Removed - replaced with new stats tables
         self.last_performance_calculation = 0  # Track last calculation time
 
         # Initialize weight perturbation manager for anti-weight-copying defense
@@ -3513,30 +3514,33 @@ class GaiaValidator:
                 logger.info("Database tables initialized.")
 
                 # Initialize performance calculator with database manager
+                # Performance calculator initialization removed - replaced with new stats tables
                 try:
-                    self.performance_calculator = MinerPerformanceCalculator(
-                        self.database_manager
-                    )
-                    # Set validator context for pathway tracking
-                    if (
-                        hasattr(self, "config")
-                        and self.config
-                        and hasattr(self.config.wallet, "hotkey")
-                    ):
-                        validator_hotkey = self.config.wallet.hotkey.ss58_address
-                        self.performance_calculator.set_validator_context(
-                            validator_hotkey
-                        )
-                        logger.info(
-                            f"Performance calculator initialized with validator context: {validator_hotkey[:8]}..."
-                        )
-                    else:
-                        logger.info(
-                            "Performance calculator initialized (no validator hotkey available)"
-                        )
+                    pass
+                    # self.performance_calculator = MinerPerformanceCalculator(
+                    #     self.database_manager
+                    # )
+                    # # Set validator context for pathway tracking
+                    # if (
+                    #     hasattr(self, "config")
+                    #     and self.config
+                    #     and hasattr(self.config.wallet, "hotkey")
+                    # ):
+                    #     validator_hotkey = self.config.wallet.hotkey.ss58_address
+                    #     self.performance_calculator.set_validator_context(
+                    #         validator_hotkey
+                    #     )
+                    #     logger.info(
+                    #         f"Performance calculator initialized with validator context: {validator_hotkey[:8]}..."
+                    #     )
+                    # else:
+                    #     logger.info(
+                    #         "Performance calculator initialized (no validator hotkey available)"
+                    #     )
                 except Exception as e:
-                    logger.error(f"Failed to initialize performance calculator: {e}")
+                    # logger.error(f"Failed to initialize performance calculator: {e}")
                     # Continue without performance calculator - it's not critical
+                    pass
 
                 # Initialize weight perturbation manager for anti-weight-copying defense
                 try:

@@ -19,11 +19,14 @@ import os
 from pathlib import Path
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set, List
 import glob
 import urllib.parse
 import base64
 import asyncio
+import json
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 
 # High-performance JSON operations for miner routes
 try:
@@ -114,6 +117,243 @@ if not MINER_JWT_SECRET_KEY:
 security = HTTPBearer()
 
 # DataModel class removed (was used only for geomagnetic task)
+
+# ============== HOTKEY BLACKLIST CONFIGURATION ==============
+# Option 1: Load from environment variable (comma-separated)
+BLACKLISTED_HOTKEYS_ENV = os.getenv("BLACKLISTED_HOTKEYS", "")
+BLACKLISTED_HOTKEYS: Set[str] = set(
+    hotkey.strip() for hotkey in BLACKLISTED_HOTKEYS_ENV.split(",") if hotkey.strip()
+)
+
+# Option 2: Load from file
+BLACKLIST_FILE_PATH = os.getenv("BLACKLIST_FILE_PATH", "/root/Gaia/blacklisted_hotkeys.json")
+if os.path.exists(BLACKLIST_FILE_PATH):
+    try:
+        with open(BLACKLIST_FILE_PATH, "r") as f:
+            file_blacklist = json.load(f)
+            if isinstance(file_blacklist, list):
+                BLACKLISTED_HOTKEYS.update(file_blacklist)
+            logger.info(f"Loaded {len(file_blacklist)} hotkeys from blacklist file")
+    except Exception as e:
+        logger.error(f"Failed to load blacklist file: {e}")
+
+logger.info(f"Total blacklisted hotkeys: {len(BLACKLISTED_HOTKEYS)}")
+
+# ============== APPROACH 1: MIDDLEWARE CLASS ==============
+class HotkeyBlacklistMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware that checks if the requesting hotkey is blacklisted.
+    This runs for ALL endpoints automatically.
+    """
+    
+    def __init__(self, app: ASGIApp, miner_instance, blacklist: Set[str] = None):
+        super().__init__(app)
+        self.miner_instance = miner_instance
+        self.blacklist = blacklist or BLACKLISTED_HOTKEYS
+        self.logger = get_logger(__name__)
+    
+    async def dispatch(self, request: Request, call_next):
+        """Process each request to check for blacklisted hotkeys."""
+        # Skip middleware for non-API endpoints (like file serving)
+        if request.url.path.startswith("/forecasts/"):
+            return await call_next(request)
+        
+        # Try to extract hotkey from request
+        sender_hotkey = await self._extract_hotkey(request)
+        
+        if sender_hotkey and sender_hotkey in self.blacklist:
+            self.logger.warning(
+                f"Blocked request from blacklisted hotkey: {sender_hotkey[:12]}... "
+                f"Endpoint: {request.url.path}"
+            )
+            raise HTTPException(
+                status_code=403, 
+                detail="Access denied: Your hotkey has been blacklisted"
+            )
+        
+        response = await call_next(request)
+        return response
+    
+    async def _extract_hotkey(self, request: Request) -> Optional[str]:
+        """
+        Extract hotkey from the request. This is tricky because Fiber encrypts the payload.
+        The hotkey is typically added by verify_request after decryption.
+        """
+        # Since the payload is encrypted, we can't easily extract the hotkey here
+        # This would require reimplementing parts of Fiber's verification
+        # For now, return None - use Approach 2 or 3 instead
+        return None
+
+# ============== APPROACH 2: CUSTOM DEPENDENCY ==============
+async def check_hotkey_blacklist(
+    request: Request,
+    decrypted_payload: Any = None
+) -> None:
+    """
+    Dependency that checks if the sender's hotkey is blacklisted.
+    This should be used AFTER decrypt_general_payload in the dependency chain.
+    """
+    # Try to get hotkey from the decrypted payload
+    sender_hotkey = None
+    
+    if hasattr(decrypted_payload, 'sender_hotkey'):
+        sender_hotkey = decrypted_payload.sender_hotkey
+    elif isinstance(decrypted_payload, dict):
+        sender_hotkey = decrypted_payload.get('sender_hotkey')
+    elif hasattr(decrypted_payload, 'data'):
+        if isinstance(decrypted_payload.data, dict):
+            sender_hotkey = decrypted_payload.data.get('sender_hotkey')
+    
+    if sender_hotkey and sender_hotkey in BLACKLISTED_HOTKEYS:
+        logger.warning(
+            f"Blocked request from blacklisted hotkey: {sender_hotkey[:12]}... "
+            f"Endpoint: {request.url.path}"
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Your hotkey has been blacklisted"
+        )
+
+# ============== APPROACH 3: ENHANCED BLACKLIST DEPENDENCY ==============
+async def enhanced_verify_request_with_blacklist(request: Request) -> dict:
+    """
+    Enhanced version of Fiber's verify_request that also checks blacklist.
+    This dependency should be used alongside or instead of verify_request.
+    """
+    # First, run Fiber's standard verification
+    # This validates the signature and extracts the sender's hotkey
+    from fiber.encrypted.miner.dependencies import verify_request as fiber_verify
+    
+    try:
+        # Run the standard Fiber verification
+        verification_result = await fiber_verify(request)
+        
+        # Extract sender hotkey from the verification result
+        # Fiber typically adds this to the request headers after verification
+        sender_hotkey = None
+        
+        # Check various places where Fiber might store the hotkey
+        if hasattr(request.state, 'hotkey'):
+            sender_hotkey = request.state.hotkey
+        elif hasattr(request.state, 'sender_hotkey'):
+            sender_hotkey = request.state.sender_hotkey
+        elif 'sender-hotkey' in request.headers:
+            sender_hotkey = request.headers.get('sender-hotkey')
+        elif 'hotkey' in request.headers:
+            sender_hotkey = request.headers.get('hotkey')
+        
+        # If we found a hotkey, check blacklist
+        if sender_hotkey and sender_hotkey in BLACKLISTED_HOTKEYS:
+            logger.warning(
+                f"Blocked request from blacklisted hotkey: {sender_hotkey[:12]}... "
+                f"Endpoint: {request.url.path}"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: Your hotkey has been blacklisted"
+            )
+        
+        return verification_result
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (including our blacklist rejection)
+        raise
+    except Exception as e:
+        logger.error(f"Error in enhanced verification: {e}")
+        raise HTTPException(status_code=500, detail="Verification failed")
+
+# ============== APPROACH 4: CUSTOM BLACKLIST DEPENDENCY ==============
+class BlacklistChecker:
+    """
+    A dependency class that can be configured and injected into routes.
+    This allows for more flexibility in how blacklisting is handled.
+    """
+    
+    def __init__(self, blacklist: Set[str] = None):
+        self.blacklist = blacklist or BLACKLISTED_HOTKEYS
+        self.logger = get_logger(__name__)
+    
+    async def __call__(
+        self, 
+        request: Request,
+        # These dependencies run first
+        _verify = Depends(verify_request),
+        _blacklist_check = Depends(blacklist_low_stake)
+    ) -> None:
+        """
+        Check if the sender is in our custom blacklist.
+        This runs AFTER Fiber's standard checks.
+        """
+        # Try to get the hotkey from various sources
+        sender_hotkey = None
+        
+        # Check request state (where Fiber might store it)
+        if hasattr(request.state, 'hotkey'):
+            sender_hotkey = request.state.hotkey
+        elif hasattr(request.state, 'sender_hotkey'):  
+            sender_hotkey = request.state.sender_hotkey
+            
+        # Check headers
+        if not sender_hotkey:
+            for header_name in ['sender-hotkey', 'hotkey', 'x-hotkey']:
+                if header_name in request.headers:
+                    sender_hotkey = request.headers.get(header_name)
+                    break
+        
+        if sender_hotkey and sender_hotkey in self.blacklist:
+            self.logger.warning(
+                f"Blocked request from blacklisted hotkey: {sender_hotkey[:12]}... "
+                f"Endpoint: {request.url.path}"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: Your hotkey has been blacklisted"
+            )
+
+# Create a reusable instance
+hotkey_blacklist_checker = BlacklistChecker()
+
+# ============== UTILITY FUNCTIONS ==============
+async def update_blacklist(hotkeys: List[str], action: str = "add") -> Dict[str, Any]:
+    """
+    Dynamically update the blacklist at runtime.
+    
+    Args:
+        hotkeys: List of hotkeys to add or remove
+        action: "add" to add hotkeys, "remove" to remove them
+    
+    Returns:
+        Status dictionary with the updated blacklist size
+    """
+    global BLACKLISTED_HOTKEYS
+    
+    if action == "add":
+        before_size = len(BLACKLISTED_HOTKEYS)
+        BLACKLISTED_HOTKEYS.update(hotkeys)
+        after_size = len(BLACKLISTED_HOTKEYS)
+        logger.info(f"Added {after_size - before_size} hotkeys to blacklist")
+    elif action == "remove":
+        before_size = len(BLACKLISTED_HOTKEYS)
+        BLACKLISTED_HOTKEYS.difference_update(hotkeys)
+        after_size = len(BLACKLISTED_HOTKEYS)
+        logger.info(f"Removed {before_size - after_size} hotkeys from blacklist")
+    else:
+        raise ValueError(f"Invalid action: {action}")
+    
+    # Optionally save to file
+    if BLACKLIST_FILE_PATH:
+        try:
+            with open(BLACKLIST_FILE_PATH, "w") as f:
+                json.dump(list(BLACKLISTED_HOTKEYS), f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save blacklist file: {e}")
+    
+    return {
+        "status": "success",
+        "action": action,
+        "total_blacklisted": after_size,
+        "hotkeys_affected": len(hotkeys)
+    }
 
 
 # Geomagnetic and soil moisture request classes removed
@@ -805,7 +1045,11 @@ def factory_router(miner_instance) -> APIRouter:
             "/weather-forecast-request",
             weather_forecast_require,
             tags=["Weather"],
-            dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+            dependencies=[
+                Depends(blacklist_low_stake), 
+                Depends(verify_request),
+                Depends(hotkey_blacklist_checker)  # Add custom blacklist check
+            ],
             methods=["POST"],
             response_class=JSONResponse,
         )
@@ -814,7 +1058,11 @@ def factory_router(miner_instance) -> APIRouter:
             "/weather-kerchunk-request",
             weather_kerchunk_require,
             tags=["Weather"],
-            dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+            dependencies=[
+                Depends(blacklist_low_stake), 
+                Depends(verify_request),
+                Depends(hotkey_blacklist_checker)  # Add custom blacklist check
+            ],
             methods=["POST"],
             response_class=JSONResponse,
         )
@@ -822,7 +1070,11 @@ def factory_router(miner_instance) -> APIRouter:
             "/weather-initiate-fetch",
             weather_initiate_fetch_require,
             tags=["Weather"],
-            dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+            dependencies=[
+                Depends(blacklist_low_stake), 
+                Depends(verify_request),
+                Depends(hotkey_blacklist_checker)  # Add custom blacklist check
+            ],
             methods=["POST"],
             response_class=JSONResponse,
         )
@@ -830,7 +1082,11 @@ def factory_router(miner_instance) -> APIRouter:
             "/weather-get-input-status",
             weather_get_input_status_require,
             tags=["Weather"],
-            dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+            dependencies=[
+                Depends(blacklist_low_stake), 
+                Depends(verify_request),
+                Depends(hotkey_blacklist_checker)  # Add custom blacklist check
+            ],
             methods=["POST"],
             response_class=JSONResponse,
         )
@@ -838,7 +1094,11 @@ def factory_router(miner_instance) -> APIRouter:
             "/weather-start-inference",
             weather_start_inference_require,
             tags=["Weather"],
-            dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+            dependencies=[
+                Depends(blacklist_low_stake), 
+                Depends(verify_request),
+                Depends(hotkey_blacklist_checker)  # Add custom blacklist check
+            ],
             methods=["POST"],
             response_class=JSONResponse,
         )
