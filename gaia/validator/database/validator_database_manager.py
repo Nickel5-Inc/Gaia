@@ -715,8 +715,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         Args:
             uids (List[int]): List of miner UIDs to be zeroed out.
             task_names (List[str]): List of task names to apply the removal.
-            filter_start_time (Optional[datetime]): If provided, only process rows where task_id >= this time.
-            filter_end_time (Optional[datetime]): If provided, only process rows where task_id <= this time.
+            filter_start_time (Optional[datetime]): If provided, only process rows where created_at >= this time.
+            filter_end_time (Optional[datetime]): If provided, only process rows where created_at <= this time.
         """
         if not uids:
             return
@@ -747,14 +747,14 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
 
                         params = {"task_name": task_name}
 
-                        # Add time filters if provided
+                        # Add time filters if provided (use created_at timestamp column)
                         time_conditions = []
                         if filter_start_time:
-                            time_conditions.append("task_id::float >= :start_timestamp")
-                            params["start_timestamp"] = filter_start_time.timestamp()
+                            time_conditions.append("created_at >= :start_time")
+                            params["start_time"] = filter_start_time
                         if filter_end_time:
-                            time_conditions.append("task_id::float <= :end_timestamp")
-                            params["end_timestamp"] = filter_end_time.timestamp()
+                            time_conditions.append("created_at <= :end_time")
+                            params["end_time"] = filter_end_time
 
                         if time_conditions:
                             update_sql += " AND " + " AND ".join(time_conditions)
