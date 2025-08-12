@@ -74,7 +74,7 @@ class AsyncProcessingConfig:
             dask.config.set({"array.chunk-size": "128MB"})
             # Optimize for memory usage
             dask.config.set({"array.slicing.split_large_chunks": True})
-            logger.info("🚀 Dask configured for async weather processing")
+            logger.debug("Dask configured for async weather processing")
         else:
             logger.warning("⚠️ Dask not available - falling back to asyncio.to_thread")
 
@@ -616,19 +616,10 @@ async def process_coordinate_transformation_async(
 
 
 def log_async_processing_summary():
-    """Log a summary of async processing capabilities."""
-    logger.info("🎯 Weather Task Async Processing Summary:")
-    logger.info(f"   Dask Available: {'✅' if DASK_AVAILABLE else '❌'}")
+    """Compact summary of async processing setup."""
     if DASK_AVAILABLE:
-        logger.info(f"   Scheduler: {dask.config.get('scheduler', 'default')}")
-        logger.info(f"   Chunk Size: {dask.config.get('array.chunk-size', 'default')}")
-    logger.info("   Processing Methods:")
-    logger.info("     - ERA5 Variable Processing: async/dask interpolation")
-    logger.info("     - Climatology Interpolation: xarray-based with dask chunking")
-    logger.info("     - Statistical Metrics: vectorized dask arrays")
-    logger.info("     - Coordinate Transformation: xarray optimized methods")
-    logger.info("   Benefits over multiprocessing:")
-    logger.info("     - Simpler debugging and error handling")
-    logger.info("     - Better memory management with dask")
-    logger.info("     - No process overhead or serialization costs")
-    logger.info("     - Seamless integration with xarray/dask ecosystem")
+        logger.info(
+            f"Async processing: Dask enabled (scheduler={dask.config.get('scheduler','default')}, chunk={dask.config.get('array.chunk-size','default')})"
+        )
+    else:
+        logger.info("Async processing: Dask not available; using asyncio.to_thread")

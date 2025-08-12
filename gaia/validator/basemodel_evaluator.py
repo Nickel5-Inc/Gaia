@@ -39,8 +39,8 @@ class BaseModelEvaluator:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Geomagnetic and soil moisture models disabled
-        logger.info(
-            f"BaseModelEvaluator initialized for weather task only. Using device: {self.device}"
+        logger.debug(
+            f"BaseModelEvaluator ready (device={self.device}, weather-only)"
         )
 
     # Geomagnetic and soil moisture helper methods removed
@@ -49,9 +49,7 @@ class BaseModelEvaluator:
         """Initialize baseline models (only weather task enabled)."""
         try:
             # Only weather task is active - no baseline models needed for weather currently
-            logger.info(
-                "Baseline model initialization complete (geomagnetic and soil moisture disabled)"
-            )
+            logger.debug("Baseline model initialization skipped (weather-only)")
             return True
         except Exception as e:
             logger.error(f"Failed to initialize baseline models: {e}")

@@ -1,6 +1,8 @@
 import gc
 import logging
 import sys
+import math
+import multiprocessing as mp
 from datetime import datetime, timezone, timedelta
 import os
 import time
@@ -158,15 +160,12 @@ from fiber.encrypted.validator import client as vali_client, handshake
 from fiber.chain.metagraph import Metagraph
 from fiber.chain.interface import get_substrate
 from substrateinterface import SubstrateInterface
-
-# Geomagnetic and soil moisture tasks disabled
 from gaia.APIcalls.miner_score_sender import MinerScoreSender
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-# Removed MinerPerformanceCalculator - replaced with new stats tables
-# from gaia.tasks.base.miner_performance_calculator import (
-#     MinerPerformanceCalculator,
-#     calculate_daily_stats,
-# )
+try:
+    mp.set_start_method("spawn", force=True)
+except Exception:
+    pass
 from argparse import ArgumentParser
 import pandas as pd
 import json
@@ -191,6 +190,9 @@ from gaia.validator.utils.substrate_manager import (
     force_substrate_cleanup,
 )
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+from gaia.tasks.defined_tasks.weather.pipeline.workers import process_one
+from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
+from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import compute_subnet_stats
 from gaia.utils import consensus_metrics
 import importlib as _il
 import base64 as _b64
@@ -311,6 +313,14 @@ async def perform_handshake_with_retry(
 
     # If we get here, all attempts failed
     raise last_exception or Exception("Handshake failed after all retry attempts")
+
+
+def _weather_worker_entrypoint() -> None:
+    # Child process entrypoint for per-miner worker
+    import asyncio
+    from gaia.tasks.defined_tasks.weather.pipeline.worker_main import main as worker_main
+
+    asyncio.run(worker_main())
 
 
 class GaiaValidator:
@@ -510,6 +520,10 @@ class GaiaValidator:
             self._clear_pycache_files()
 
         self.args = args
+        # Initialize early to avoid attribute errors during partial startup
+        self._cleanup_done = False
+        self.validator_uid = None
+
         self.metagraph = None
         self.config = None
         self.database_manager = ValidatorDatabaseManager()
@@ -524,10 +538,6 @@ class GaiaValidator:
             node_type="validator",
             test_mode=args.test,
         )
-
-        # Initialize performance calculator for tracking miner statistics
-        # self.performance_calculator = None  # Removed - replaced with new stats tables
-        self.last_performance_calculation = 0  # Track last calculation time
 
         # Initialize weight perturbation manager for anti-weight-copying defense
         self.perturbation_manager = None  # Will be initialized when database is ready
@@ -545,6 +555,15 @@ class GaiaValidator:
         self.current_block = 0
         self.nodes = {}
         self.memray_tracker: Optional[memray.Tracker] = None  # For programmatic memray
+
+        # Feature-flagged per-miner worker loop (defaults off)
+        # Enable per-miner execution via multi-process workers by default
+        self._per_miner_exec_enabled = True
+        self._per_miner_task: Optional[asyncio.Task] = None  # legacy in-process loop (unused now)
+
+        # Weather worker pool management (multi-process)
+        self._weather_worker_processes: list[mp.Process] = []
+        self._weather_worker_num: int = self._compute_weather_worker_procs()
 
         # Initialize HTTP clients first
         # Client for miner communication with SSL verification disabled
@@ -590,6 +609,7 @@ class GaiaValidator:
 
         self.last_successful_weight_set = time.time()
         self.last_successful_dereg_check = time.time()
+
         self.last_successful_db_check = time.time()
         self.last_metagraph_sync = time.time()
 
@@ -689,7 +709,7 @@ class GaiaValidator:
             db_manager=self.database_manager,
             test_mode=self.args.test if hasattr(self.args, "test") else False,
         )
-        logger.info("BaseModelEvaluator initialized")
+        logger.debug("BaseModelEvaluator initialized")
 
         # DB Sync components
         self.auto_sync_manager = None  # Streamlined sync system using pgBackRest + R2
@@ -747,6 +767,17 @@ class GaiaValidator:
         print("[STARTUP DEBUG] Initializing substrate manager")
 
         print("[STARTUP DEBUG] GaiaValidator.__init__ completed")
+
+    def _compute_weather_worker_procs(self) -> int:
+        try:
+            cores = os.cpu_count() or 2
+        except Exception:
+            cores = 2
+        # Use up to 80% of cores, rounded down, with at least 1 core reserved for main/system
+        pct_target = max(0, math.floor(0.8 * cores))
+        reserve_cap = max(0, cores - 1)
+        procs = min(pct_target, reserve_cap)
+        return max(1, procs)
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -2966,6 +2997,22 @@ class GaiaValidator:
             # MEMORY LEAK FIX: Clean up background tasks first
             await self._cleanup_background_tasks()
 
+            # Stop weather worker processes
+            if getattr(self, "_weather_worker_processes", None):
+                logger.info("Stopping weather worker processes...")
+                for p in self._weather_worker_processes:
+                    try:
+                        if p.is_alive():
+                            p.terminate()
+                    except Exception:
+                        pass
+                for p in self._weather_worker_processes:
+                    try:
+                        p.join(timeout=2)
+                    except Exception:
+                        pass
+                self._weather_worker_processes.clear()
+
             # First clean up database resources
             if hasattr(self, "database_manager"):
                 await self.database_manager.execute(
@@ -3448,31 +3495,6 @@ class GaiaValidator:
     async def main(self):
         """Main execution loop for the validator."""
 
-        memray_active = False
-        memray_output_file_path = "validator_memray_output.bin"
-
-        if os.getenv("ENABLE_MEMRAY_TRACKING", "false").lower() == "true":
-            try:
-                # memray is already imported at the top
-                logger.info(
-                    f"Programmatic Memray tracking enabled. Output will be saved to: {memray_output_file_path}"
-                )
-                self.memray_tracker = memray.Tracker(
-                    destination=memray.FileDestination(
-                        path=memray_output_file_path, overwrite=True
-                    ),
-                    native_traces=True,
-                )
-                memray_active = True
-            except (
-                ImportError
-            ):  # Should not happen if import is at top, but good for safety
-                logger.warning(
-                    "Memray library seemed to be missing despite top-level import. Programmatic Memray tracking is disabled."
-                )
-            except Exception as e:
-                logger.error(f"Failed to initialize Memray tracker: {e}")
-                self.memray_tracker = None  # Ensure it's None if init fails
 
         async def run_validator_logic():
             # Suppress gcsfs/aiohttp cleanup warnings that can block PM2 restart
@@ -3509,38 +3531,51 @@ class GaiaValidator:
 
                 logger.info("Metagraph initialized.")
 
-                logger.info("Initializing database connection...")
-                await self.database_manager.initialize_database()
-                logger.info("Database tables initialized.")
+                # Start per-miner worker PROCESS POOL if enabled
+                if self._per_miner_exec_enabled and not self._weather_worker_processes:
+                    procs = self._weather_worker_num
+                    logger.info(f"Starting weather worker pool with {procs} processes (80% of cores, floored)")
+                    for i in range(procs):
+                        name = f"weather-w{i+1}/{procs}"
+                        p = mp.Process(name=name, target=_weather_worker_entrypoint, daemon=True)
+                        p.start()
+                        self._weather_worker_processes.append(p)
 
-                # Initialize performance calculator with database manager
-                # Performance calculator initialization removed - replaced with new stats tables
-                try:
-                    pass
-                    # self.performance_calculator = MinerPerformanceCalculator(
-                    #     self.database_manager
-                    # )
-                    # # Set validator context for pathway tracking
-                    # if (
-                    #     hasattr(self, "config")
-                    #     and self.config
-                    #     and hasattr(self.config.wallet, "hotkey")
-                    # ):
-                    #     validator_hotkey = self.config.wallet.hotkey.ss58_address
-                    #     self.performance_calculator.set_validator_context(
-                    #         validator_hotkey
-                    #     )
-                    #     logger.info(
-                    #         f"Performance calculator initialized with validator context: {validator_hotkey[:8]}..."
-                    #     )
-                    # else:
-                    #     logger.info(
-                    #         "Performance calculator initialized (no validator hotkey available)"
-                    #     )
-                except Exception as e:
-                    # logger.error(f"Failed to initialize performance calculator: {e}")
-                    # Continue without performance calculator - it's not critical
-                    pass
+                    # Start periodic stats aggregation loop alongside worker pool
+                    logger.info("Initializing database connection for main process...")
+                    await self.database_manager.initialize_database()
+                    logger.info("Database tables initialized (main process).")
+                    async def _stats_aggregation_loop():
+                        interval_sec = 600  # active by default, run every 10 minutes
+                        manager = WeatherStatsManager(
+                            self.database_manager,
+                            validator_hotkey=(
+                                getattr(getattr(self.validator_wallet, "hotkey", None), "ss58_address", None)
+                                if hasattr(self, "validator_wallet") and self.validator_wallet is not None
+                                else "unknown_validator"
+                            ),
+                        )
+                        while True:
+                            try:
+                                await manager.aggregate_miner_stats()
+                                try:
+                                    await manager.get_overall_miner_ranks()
+                                except Exception:
+                                    pass
+                                try:
+                                    net = await compute_subnet_stats(self.database_manager)
+                                    logger.info(
+                                        f"[stats] subnet snapshot: active_miners={net.get('active_miners')}, avg_forecast_score={net.get('avg_forecast_score')}, avg_host_reliability_ratio={net.get('avg_host_reliability_ratio')}"
+                                    )
+                                except Exception:
+                                    pass
+                            except Exception as agg_err:
+                                logger.debug(f"Stats aggregation error: {agg_err}")
+                            await asyncio.sleep(interval_sec)
+
+                    if getattr(self, "_stats_agg_task", None) is None:
+                        self._stats_agg_task = asyncio.create_task(_stats_aggregation_loop(), name="stats_aggregation_loop")
+
 
                 # Initialize weight perturbation manager for anti-weight-copying defense
                 try:
@@ -3621,13 +3656,7 @@ class GaiaValidator:
                 await self.start_watchdog()
                 logger.info("Watchdog started.")
 
-                if not memray_active:  # Start tracemalloc only if memray is not active
-                    logger.info("Starting tracemalloc for memory analysis...")
-                    tracemalloc.start(25)  # Start tracemalloc, 25 frames for traceback
-
-                logger.info("Initializing baseline models...")
-                await self.basemodel_evaluator.initialize_models()
-                logger.info("Baseline models initialization complete")
+        
 
                 # Start auto-updater as independent task (not in main loop to avoid self-cancellation)
                 logger.info("Starting independent auto-updater task...")
@@ -3647,21 +3676,9 @@ class GaiaValidator:
                     # lambda: self.database_monitor(),
                     # Periodic substrate cleanup removed - using isolated substrate interface instead  # Added substrate cleanup task
                     lambda: self.aggressive_memory_cleanup(),  # Added aggressive memory cleanup task
-                    # lambda: self.plot_database_metrics_periodically() # Added plotting task
+  
                 ]
-                # Using process-isolated substrate manager - ABC tracking no longer needed
-                # Process isolation prevents ABC object accumulation completely
-                logger.info(
-                    "🛡️  Using process-isolated substrate manager - ABC memory leaks prevented by process isolation"
-                )
-
-                if (
-                    not memray_active
-                ):  # Add tracemalloc snapshot taker only if memray is not active
-                    tasks_lambdas.append(lambda: self.memory_snapshot_taker())
-                # ABC monitor disabled - causes 28s freeze doing isinstance(obj, ABC) on all objects
-                # tasks_lambdas.append(lambda: self.abc_object_monitor())
-
+            
                 # Add DB Sync tasks conditionally
                 if self.auto_sync_manager:
                     logger.info(
@@ -3868,17 +3885,7 @@ class GaiaValidator:
                 if not self._cleanup_done:
                     await self._initiate_shutdown()
 
-        if memray_active and self.memray_tracker:
-            with self.memray_tracker:  # This starts the tracking
-                logger.info("Memray tracker is active and wrapping validator logic.")
-                await run_validator_logic()
-            logger.info(
-                f"Memray tracking finished. Output file '{memray_output_file_path}' should be written."
-            )
-        else:
-            logger.info(
-                "Memray tracking is not active. Running validator logic directly."
-            )
+        
             await run_validator_logic()
 
     async def main_scoring(self):
@@ -4031,8 +4038,7 @@ class GaiaValidator:
                                         # Invalidate shared block cache after weight setting
                                         self._shared_block_cache["block_number"] = None
 
-                                        # Calculate performance statistics after successful weight setting
-                                        await self._calculate_performance_statistics()
+                                        
 
                                         # MEMORY LEAK FIX: Aggressive substrate cleanup after successful weight setting
                                         try:
@@ -4443,44 +4449,6 @@ class GaiaValidator:
                                             f"  Could not clear {table_name} for old hotkey {original_hotkey}: {e_hist_del}"
                                         )
 
-                                # 2.1. Delete from miner performance stats tables by UID and hotkey
-                                try:
-                                    if (
-                                        hasattr(self, "performance_calculator")
-                                        and self.performance_calculator
-                                    ):
-                                        # Use the performance calculator's cleanup method
-                                        cleanup_success = await self.performance_calculator.cleanup_specific_miner(
-                                            int(uid_to_process), original_hotkey
-                                        )
-                                        if cleanup_success:
-                                            logger.info(
-                                                f"  Deleted performance stats for UID {uid_to_process} and old hotkey {original_hotkey} due to hotkey change."
-                                            )
-                                    else:
-                                        # Fallback to direct database query if calculator not available
-                                        perf_stats_exists = await self.database_manager.fetch_one(
-                                            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'miner_performance_stats')"
-                                        )
-                                        if (
-                                            perf_stats_exists
-                                            and perf_stats_exists["exists"]
-                                        ):
-                                            await self.database_manager.execute(
-                                                "DELETE FROM miner_performance_stats WHERE miner_uid = :uid OR miner_hotkey = :hotkey",
-                                                {
-                                                    "uid": int(uid_to_process),
-                                                    "hotkey": original_hotkey,
-                                                },
-                                            )
-                                            logger.info(
-                                                f"  Deleted performance stats for UID {uid_to_process} and old hotkey {original_hotkey} due to hotkey change."
-                                            )
-                                except Exception as e_perf_del:
-                                    logger.warning(
-                                        f"  Could not clear miner_performance_stats for UID {uid_to_process}: {e_perf_del}"
-                                    )
-
                                 # 3. Clean up weather-specific tables for this UID
                                 # CRITICAL: Must clean weather_miner_scores and weather_miner_responses
                                 # to prevent old scores from being used for the new miner
@@ -4568,24 +4536,6 @@ class GaiaValidator:
                                     f"Error processing hotkey change for UID {uid_to_process}: {str(e)}",
                                     exc_info=True,
                                 )
-
-                    # --- Step 2.5: Bulk cleanup of performance stats for any remaining deregistered miners ---
-                    if (
-                        hasattr(self, "performance_calculator")
-                        and self.performance_calculator
-                    ):
-                        try:
-                            cleaned_count = (
-                                await self.performance_calculator.cleanup_deregistered_miners()
-                            )
-                            if cleaned_count > 0:
-                                logger.info(
-                                    f"🧹 Bulk cleanup removed performance data for {cleaned_count} deregistered miners"
-                                )
-                        except Exception as perf_cleanup_err:
-                            logger.warning(
-                                f"Error during bulk performance stats cleanup: {perf_cleanup_err}"
-                            )
 
                     # --- Step 3: Update info for existing miners where hotkey didn't change ---
                     if uids_to_update_info:
@@ -4711,8 +4661,7 @@ class GaiaValidator:
                                     f"Added {successful_adds} new miners to the database (fallback)"
                                 )
 
-                    # === NEW: Chain Integration - Update performance stats with consensus data ===
-                    await self._integrate_chain_consensus_data(chain_nodes_info)
+                
 
                     logger.info("Miner state synchronization cycle completed.")
 
@@ -5251,19 +5200,7 @@ class GaiaValidator:
                         f"Processing {total_records} total database records for weight calculation"
                     )
 
-                    # Trigger performance statistics calculation after gathering all task scores
-                    # This ensures performance stats are updated when new scores are available
-                    try:
-                        logger.info(
-                            "🔄 Triggering performance statistics calculation after score gathering..."
-                        )
-                        await self._calculate_performance_statistics(
-                            force_calculation=False
-                        )
-                    except Exception as perf_err:
-                        logger.error(
-                            f"Error calculating performance statistics: {perf_err}"
-                        )
+                
 
                     # Force garbage collection before the heavy sync calculation
                     collected = gc.collect()
@@ -5296,19 +5233,6 @@ class GaiaValidator:
                         f"Weather-only scoring: captured pathway tracking for {len(pathway_tracking)} miners"
                     )
 
-                    # Store pathway tracking in performance calculator for later integration
-                    if self.performance_calculator and pathway_tracking:
-                        # Store current pathway tracking data in the calculator
-                        if not hasattr(
-                            self.performance_calculator, "_current_pathway_data"
-                        ):
-                            self.performance_calculator._current_pathway_data = {}
-                        self.performance_calculator._current_pathway_data.update(
-                            pathway_tracking
-                        )
-                        logger.debug(
-                            "Pathway tracking data stored in performance calculator"
-                        )
                 elif weight_result is None:
                     # Expected when no scores exist - set fallback weights: 100% to UID 252, 0% to all others
                     logger.info(
@@ -5465,163 +5389,8 @@ class GaiaValidator:
 
         logger.info("DB Sync initialization completed (not active).")
 
-    async def _calculate_performance_statistics(self, force_calculation: bool = False):
-        """Calculate and store miner performance statistics periodically."""
-        try:
-            # Only calculate if performance calculator is initialized and enough time has passed
-            if not self.performance_calculator:
-                logger.debug(
-                    "Performance calculator not initialized, skipping statistics calculation"
-                )
-                return
 
-            current_time = time.time()
-            # Calculate daily stats once every 30 minutes (1800 seconds) - more frequent for better responsiveness
-            if (
-                not force_calculation
-                and current_time - self.last_performance_calculation < 1800
-            ):
-                logger.debug(
-                    f"Skipping performance calculation - only {current_time - self.last_performance_calculation:.0f}s since last calculation"
-                )
-                return
-
-            logger.info("🔄 Calculating miner performance statistics...")
-
-            # Calculate daily statistics for today
-            today = datetime.now(timezone.utc).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-
-            # Use daily stats calculation function with database manager
-            daily_performances = await calculate_daily_stats(
-                self.database_manager, today
-            )
-
-            if daily_performances:
-                logger.info(
-                    f"✅ Calculated performance stats for {len(daily_performances)} miners"
-                )
-
-                # Log summary of top performers
-                top_performers = [
-                    p for p in daily_performances if p.overall_avg_score is not None
-                ][:5]
-                if top_performers:
-                    logger.info("🏆 Top performers today:")
-                    for i, perf in enumerate(top_performers):
-                        logger.info(
-                            f"  {i+1}. {perf.miner_hotkey[:12]}... - Score: {perf.overall_avg_score:.3f}, Tasks: {perf.total_attempted}"
-                        )
-            else:
-                logger.info("No miner performance data available for today")
-
-            # Clean up performance data for deregistered miners
-            try:
-                cleaned_count = (
-                    await self.performance_calculator.cleanup_deregistered_miners()
-                )
-                if cleaned_count > 0:
-                    logger.info(
-                        f"🧹 Cleaned up performance data for {cleaned_count} deregistered miners"
-                    )
-            except Exception as cleanup_err:
-                logger.error(f"Error during deregistered miner cleanup: {cleanup_err}")
-
-            # Update last calculation time
-            self.last_performance_calculation = current_time
-
-        except Exception as e:
-            logger.error(f"Error calculating performance statistics: {e}")
-            logger.error(traceback.format_exc())
-
-    async def _integrate_chain_consensus_data(self, chain_nodes_info: Dict[int, Any]):
-        """
-        Integrate chain consensus data (incentive values, block info) into performance statistics.
-        This method captures the final chain consensus results and stores them for analysis.
-        """
-        try:
-            if not self.performance_calculator:
-                logger.debug(
-                    "Performance calculator not available for chain integration"
-                )
-                return
-
-            # Get current block information using the existing cached method
-            current_block = None
-            try:
-                current_block = self._get_current_block_cached()
-            except Exception as block_err:
-                logger.debug(f"Could not get current block number: {block_err}")
-                # Fallback to current_block attribute if cache method fails
-                if hasattr(self, "current_block"):
-                    current_block = self.current_block
-
-            # Prepare consensus data for miners with incentive values
-            consensus_updates = {}
-            valid_miners = 0
-
-            for uid, chain_node in chain_nodes_info.items():
-                try:
-                    if (
-                        hasattr(chain_node, "incentive")
-                        and chain_node.incentive is not None
-                        and float(chain_node.incentive) > 0
-                    ):
-
-                        consensus_updates[uid] = {
-                            "incentive": float(chain_node.incentive),
-                            "consensus_block": current_block,
-                            "validator_hotkey": (
-                                self.validator_hotkey
-                                if hasattr(self, "validator_hotkey")
-                                else None
-                            ),
-                        }
-                        valid_miners += 1
-
-                except Exception as miner_err:
-                    logger.debug(
-                        f"Error processing consensus data for UID {uid}: {miner_err}"
-                    )
-                    continue
-
-            if consensus_updates:
-                # Store consensus data in performance calculator for integration
-                if not hasattr(self.performance_calculator, "_current_consensus_data"):
-                    self.performance_calculator._current_consensus_data = {}
-                self.performance_calculator._current_consensus_data.update(
-                    consensus_updates
-                )
-
-                logger.info(
-                    f"📊 Captured chain consensus data for {valid_miners} miners (block: {current_block})"
-                )
-
-                # Calculate consensus ranks based on incentive values
-                incentive_values = [
-                    (uid, data["incentive"]) for uid, data in consensus_updates.items()
-                ]
-                incentive_values.sort(
-                    key=lambda x: x[1], reverse=True
-                )  # Sort by incentive descending
-
-                # Add consensus ranks
-                for rank, (uid, incentive) in enumerate(incentive_values, 1):
-                    consensus_updates[uid]["consensus_rank"] = rank
-
-                logger.debug(
-                    f"Chain consensus integration: Top 5 miners by incentive: "
-                    f"{[(uid, f'{inc:.4f}') for uid, inc in incentive_values[:5]]}"
-                )
-            else:
-                logger.debug(
-                    "No miners with valid incentive values found for consensus integration"
-                )
-
-        except Exception as e:
-            logger.warning(f"Error during chain consensus integration: {e}")
-            # Don't let this break the main loop
+ 
 
     async def database_monitor(self):
         """Periodically query and log database statistics from a consistent snapshot."""

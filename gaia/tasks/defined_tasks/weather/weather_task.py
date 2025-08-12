@@ -628,7 +628,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         # Initialize hardening system
         try:
             self.__init_hardening__()
-            logger.info("Weather task hardening system initialized successfully")
+            logger.debug("Weather task hardening system initialized")
         except Exception as hardening_error:
             logger.warning(f"Could not initialize hardening system: {hardening_error}")
             logger.info(
@@ -1908,72 +1908,9 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 # Perform gradual, non-blocking recovery every 5 minutes
                 current_time = time.time()
                 if current_time - last_recovery_time > recovery_interval:
-                    logger.debug("Performing periodic recovery check...")
-                    stale_run_processed = False
-                    try:
-                        # One-time backfill of scoring jobs from existing data (only runs if table is empty)
-                        await self._backfill_scoring_jobs_from_existing_data()
-                        # Sequential recovery - process one run at a time
-                        stale_run_processed = (
-                            await self._check_and_recover_incomplete_runs_sequential(
-                                processed_runs_this_session, max_attempts_per_run
-                            )
-                        )
-                        # Enhanced recovery with state consistency checks (includes original recovery)
-                        await self.enhanced_recovery_check()
-                        # Check for missing weather score rows
-                        missing_scores_result = (
-                            await self.check_and_build_missing_weather_scores()
-                        )
-                        if missing_scores_result["score_rows_created"] > 0:
-                            logger.info(
-                                f"Recovery: Built {missing_scores_result['score_rows_created']} missing weather score rows"
-                            )
-                        last_recovery_time = current_time
-                    except Exception as recovery_err:
-                        logger.warning(
-                            f"Error during periodic recovery: {recovery_err}"
-                        )
-
-                    # If any run was processed, continue recovery loop to work through backlog
-                    if stale_run_processed in ["stale_processed", "run_processed"]:
-                        # Check if we've hit the session limit
-                        total_attempts = sum(processed_runs_this_session.values())
-                        if total_attempts >= max_runs_per_session:
-                            logger.info(
-                                f"Made {total_attempts} recovery attempts this session, reaching limit - proceeding to normal scheduling"
-                            )
-                            processed_runs_this_session.clear()
-                        else:
-                            if stale_run_processed == "stale_processed":
-                                logger.info(
-                                    "Stale run was processed - will check for more incomplete runs in 30 seconds"
-                                )
-                            else:
-                                logger.info(
-                                    "Run recovery attempted - will check for more incomplete runs in 30 seconds"
-                                )
-                            # Don't reset to 0 - that causes continuous recovery loops that interrupt active scoring
-                            # Instead, use a shorter interval for when we're actively recovering runs
-                            last_recovery_time = current_time - (
-                                recovery_interval - 30
-                            )  # Check again in 30 seconds
-                            await asyncio.sleep(
-                                0.1
-                            )  # Yield CPU time to other async tasks
-                            continue  # Go back to top of loop
-                    elif stale_run_processed == "no_more_runs":
-                        logger.info(
-                            "No more incomplete runs to process - proceeding to normal scheduling"
-                        )
-                        processed_runs_this_session.clear()  # Reset for next session
-                    else:
-                        # No runs processed this cycle or unexpected return value, add a small sleep
-                        if stale_run_processed is not False:
-                            logger.debug(
-                                f"Unexpected recovery return value: {stale_run_processed}"
-                            )
-                        await asyncio.sleep(0.1)
+                    # New pipeline handles recovery via weather_forecast_steps + scheduler.
+                    # Periodic heavy recovery tasks from legacy system are disabled.
+                    last_recovery_time = current_time
 
                 now_utc = datetime.now(timezone.utc)
 
@@ -2059,8 +1996,55 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         existing_run = None  # Will create new run below
                     else:
                         logger.info(
-                            f"[Run {run_id}] Reusing existing active run. Continuing with validator_score to check progress."
+                            f"[Run {run_id}] Reusing existing active run. Ensuring seed rows exist, then continuing with validator_score."
                         )
+                        try:
+                            # Backfill seed rows if fewer than expected present
+                            cnt_row = await self.db_manager.fetch_one(
+                                "SELECT COUNT(1) AS cnt FROM weather_forecast_stats WHERE run_id = :rid",
+                                {"rid": run_id},
+                            )
+                            total = (cnt_row and cnt_row.get("cnt")) or 0
+                            if total < 255:
+                                from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import (
+                                    seed_forecast_run,
+                                )
+                                # Determine validator hotkey if available
+                                try:
+                                    vhk = (
+                                        getattr(
+                                            getattr(self.validator, "validator_wallet", None),
+                                            "hotkey",
+                                            None,
+                                        ).ss58_address
+                                        if hasattr(self, "validator") and self.validator is not None
+                                        else "unknown_validator"
+                                    )
+                                except Exception:
+                                    vhk = "unknown_validator"
+                                seeded = await seed_forecast_run(
+                                    self.db_manager, run_id, validator_hotkey=vhk
+                                )
+                                logger.info(
+                                    f"[Run {run_id}] Seed backfill completed (rows now: {total} + upserts)."
+                                )
+                                # Warm GFS caches at seed stage
+                                try:
+                                    from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import (
+                                        ensure_gfs_reference_available,
+                                    )
+                                    await ensure_gfs_reference_available(
+                                        self.db_manager, self, run_id=run_id
+                                    )
+                                except Exception as warm_err:
+                                    logger.warning(
+                                        f"[Run {run_id}] GFS warmup failed (will retry via substep logic): {warm_err}"
+                                    )
+                        except Exception as seed_err:
+                            logger.warning(
+                                f"[Run {run_id}] Seed backfill check failed: {seed_err}"
+                            )
+
                         await self.validator_score()
 
                         if self.test_mode:
@@ -2097,6 +2081,45 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                             logger.info(
                                 f"[Run {run_id}] Created NEW weather_forecast_runs record with ID: {run_id}"
                             )
+                            # Seed per-miner stats and step timelines (idempotent)
+                            try:
+                                from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import (
+                                    seed_forecast_run,
+                                )
+                                try:
+                                    vhk = (
+                                        getattr(
+                                            getattr(self.validator, "validator_wallet", None),
+                                            "hotkey",
+                                            None,
+                                        ).ss58_address
+                                        if hasattr(self, "validator") and self.validator is not None
+                                        else "unknown_validator"
+                                    )
+                                except Exception:
+                                    vhk = "unknown_validator"
+                                seeded = await seed_forecast_run(
+                                    self.db_manager, run_id, validator_hotkey=vhk
+                                )
+                                logger.info(
+                                    f"[Run {run_id}] Seeded per-miner stats/steps for {seeded} miners."
+                                )
+                                # Warm GFS caches at seed stage
+                                try:
+                                    from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import (
+                                        ensure_gfs_reference_available,
+                                    )
+                                    await ensure_gfs_reference_available(
+                                        self.db_manager, self, run_id=run_id
+                                    )
+                                except Exception as warm_err:
+                                    logger.warning(
+                                        f"[Run {run_id}] GFS warmup failed (will retry via substep logic): {warm_err}"
+                                    )
+                            except Exception as seed_err:
+                                logger.warning(
+                                    f"[Run {run_id}] Seeding per-miner rows failed: {seed_err}"
+                                )
                         else:
                             logger.error(
                                 "Failed to retrieve run_id using fetch_one after insert."
@@ -4568,12 +4591,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         num_cleanup_workers=1,
     ):
         if self.node_type == "validator":
-            await self.start_initial_scoring_workers(
-                num_workers=num_initial_scoring_workers
-            )
-            await self.start_final_scoring_workers(
-                num_workers=num_final_scoring_workers
-            )
+            # Always skip legacy batch workers; per-miner pipeline is active by default
+            logger.info("[WeatherTask] Per-miner pipeline active; skipping legacy batch workers")
             await self.start_cleanup_workers(num_workers=num_cleanup_workers)
         elif self.node_type == "miner":
             if self.config.get("r2_cleanup_enabled", False):
@@ -5322,7 +5341,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         Sequential version of run recovery that processes one run at a time to avoid system overload.
         Designed for periodic execution without blocking normal operations.
         """
-        logger.debug("Checking for incomplete runs (sequential recovery)...")
+        logger.debug("_check_and_recover_incomplete_runs_sequential disabled in new pipeline")
+        return "disabled"
 
         if processed_runs_this_session is None:
             processed_runs_this_session = {}

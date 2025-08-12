@@ -274,144 +274,142 @@ class WeatherStatsManager:
     
     async def aggregate_miner_stats(self, miner_uid: Optional[int] = None) -> bool:
         """
-        Aggregate statistics for miners from weather_forecast_stats into miner_stats.
-        
-        Args:
-            miner_uid: Optional specific miner to update, otherwise update all
-            
-        Returns:
-            True if successful, False otherwise
+        Vectorized aggregation from weather_forecast_stats into miner_stats using SQL.
         """
         try:
-            # Build the aggregation query
-            base_query = sa.select(
-                weather_forecast_stats_table.c.miner_uid,
-                weather_forecast_stats_table.c.miner_hotkey,
-                sa.func.count().label("total_forecasts"),
-                sa.func.count(
-                    sa.case(
-                        (weather_forecast_stats_table.c.forecast_status == "completed", 1)
-                    )
-                ).label("successful_forecasts"),
-                sa.func.count(
-                    sa.case(
-                        (weather_forecast_stats_table.c.forecast_status == "failed", 1)
-                    )
-                ).label("failed_forecasts"),
-                sa.func.avg(weather_forecast_stats_table.c.era5_combined_score).label("avg_forecast_score"),
-                sa.func.avg(weather_forecast_stats_table.c.forecast_score_initial).label("avg_day1_score"),
-                sa.func.avg(weather_forecast_stats_table.c.era5_completeness).label("avg_era5_completeness"),
-                sa.func.max(weather_forecast_stats_table.c.era5_combined_score).label("best_forecast_score"),
-                sa.func.min(weather_forecast_stats_table.c.era5_combined_score).label("worst_forecast_score"),
-                sa.func.stddev(weather_forecast_stats_table.c.era5_combined_score).label("score_std_dev"),
-                sa.func.count(
-                    sa.case(
-                        (weather_forecast_stats_table.c.hosting_status == "accessible", 1)
-                    )
-                ).label("hosting_successes"),
-                sa.func.count(
-                    sa.case(
-                        (weather_forecast_stats_table.c.hosting_status.in_(["inaccessible", "timeout", "error"]), 1)
-                    )
-                ).label("hosting_failures"),
-                sa.func.avg(weather_forecast_stats_table.c.hosting_latency_ms).label("avg_hosting_latency_ms"),
-                sa.func.max(weather_forecast_stats_table.c.created_at).label("last_active")
-            ).group_by(
-                weather_forecast_stats_table.c.miner_uid,
-                weather_forecast_stats_table.c.miner_hotkey
-            )
-            
+            # Derive aggregates in one shot
+            where_clause = "WHERE 1=1"
+            params = {}
             if miner_uid is not None:
-                base_query = base_query.where(weather_forecast_stats_table.c.miner_uid == miner_uid)
-            
-            results = await self.db.fetch_all(base_query)
-            
-            for row in results:
-                # Calculate derived metrics
-                total = row["total_forecasts"]
-                successful = row["successful_forecasts"] or 0
-                failed = row["failed_forecasts"] or 0
-                hosting_successes = row["hosting_successes"] or 0
-                hosting_failures = row["hosting_failures"] or 0
-                
-                stats_data = {
-                    "miner_uid": row["miner_uid"],
-                    "miner_hotkey": row["miner_hotkey"],
-                    "successful_forecasts": successful,
-                    "failed_forecasts": failed,
-                    "forecast_success_ratio": successful / total if total > 0 else 0,
-                    "avg_forecast_score": row["avg_forecast_score"],
-                    "avg_day1_score": row["avg_day1_score"],
-                    "avg_era5_completeness": row["avg_era5_completeness"],
-                    "best_forecast_score": row["best_forecast_score"],
-                    "worst_forecast_score": row["worst_forecast_score"],
-                    "score_std_dev": row["score_std_dev"],
-                    "hosting_successes": hosting_successes,
-                    "hosting_failures": hosting_failures,
-                    "host_reliability_ratio": hosting_successes / (hosting_successes + hosting_failures) 
-                        if (hosting_successes + hosting_failures) > 0 else 0,
-                    "avg_hosting_latency_ms": row["avg_hosting_latency_ms"],
-                    "last_active": row["last_active"],
-                    "validator_hotkey": self.validator_hotkey,
-                    "updated_at": datetime.now(timezone.utc)
-                }
-                
-                # Get additional temporal data
-                temporal_query = sa.select(
-                    sa.func.max(
-                        sa.case(
-                            (weather_forecast_stats_table.c.forecast_status == "completed", 
-                             weather_forecast_stats_table.c.updated_at)
-                        )
-                    ).label("last_successful_forecast"),
-                    sa.func.max(
-                        sa.case(
-                            (weather_forecast_stats_table.c.forecast_status == "failed", 
-                             weather_forecast_stats_table.c.updated_at)
-                        )
-                    ).label("last_failed_forecast"),
-                    sa.func.min(weather_forecast_stats_table.c.created_at).label("first_seen")
-                ).where(
-                    weather_forecast_stats_table.c.miner_uid == row["miner_uid"]
+                where_clause = "WHERE wfs.miner_uid = :uid"
+                params["uid"] = miner_uid
+
+            # Compute per-row average ERA5 across fixed columns and completeness, then aggregate per miner
+            sql = sa.text(
+                f"""
+                INSERT INTO miner_stats (
+                    miner_uid, miner_hotkey, miner_rank,
+                    avg_forecast_score, successful_forecasts, failed_forecasts, forecast_success_ratio,
+                    hosting_successes, hosting_failures, host_reliability_ratio, avg_hosting_latency_ms,
+                    avg_day1_score, avg_era5_score, avg_era5_completeness, best_forecast_score, worst_forecast_score, score_std_dev,
+                    last_successful_forecast, last_failed_forecast, first_seen, last_active,
+                    validator_hotkey, updated_at
                 )
-                
-                temporal_data = await self.db.fetch_one(temporal_query)
-                if temporal_data:
-                    stats_data.update({
-                        "last_successful_forecast": temporal_data["last_successful_forecast"],
-                        "last_failed_forecast": temporal_data["last_failed_forecast"],
-                        "first_seen": temporal_data["first_seen"]
-                    })
-                
-                # Calculate ERA5 average score across all timesteps
-                era5_cols = [f"era5_score_{h}h" for h in range(24, 241, 24)]
-                era5_query = sa.select(
-                    *[sa.func.avg(getattr(weather_forecast_stats_table.c, col)).label(col) 
-                      for col in era5_cols if hasattr(weather_forecast_stats_table.c, col)]
-                ).where(
-                    weather_forecast_stats_table.c.miner_uid == row["miner_uid"]
-                )
-                
-                era5_data = await self.db.fetch_one(era5_query)
-                if era5_data:
-                    era5_scores = [v for v in era5_data.values() if v is not None]
-                    if era5_scores:
-                        stats_data["avg_era5_score"] = sum(era5_scores) / len(era5_scores)
-                
-                # Upsert to miner_stats table
-                stmt = insert(miner_stats_table).values(**stats_data)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["miner_uid"],
-                    set_={k: v for k, v in stats_data.items() if k != "miner_uid"}
-                )
-                
-                await self.db.execute(stmt)
-            
-            logger.info(f"Aggregated stats for {len(results)} miners")
+                SELECT
+                    wfs.miner_uid,
+                    wfs.miner_hotkey,
+                    MAX(wfs.miner_rank) AS miner_rank,
+                    AVG(wfs.era5_combined_score) AS avg_forecast_score,
+                    SUM(CASE WHEN wfs.forecast_status = 'completed' THEN 1 ELSE 0 END) AS successful_forecasts,
+                    SUM(CASE WHEN wfs.forecast_status = 'failed' THEN 1 ELSE 0 END) AS failed_forecasts,
+                    CASE WHEN COUNT(*) > 0 THEN SUM(CASE WHEN wfs.forecast_status = 'completed' THEN 1 ELSE 0 END)::float / COUNT(*) ELSE 0 END AS forecast_success_ratio,
+                    SUM(CASE WHEN wfs.hosting_status = 'accessible' THEN 1 ELSE 0 END) AS hosting_successes,
+                    SUM(CASE WHEN wfs.hosting_status IN ('inaccessible','timeout','error') THEN 1 ELSE 0 END) AS hosting_failures,
+                    CASE WHEN SUM(CASE WHEN wfs.hosting_status IS NOT NULL THEN 1 ELSE 0 END) > 0
+                         THEN SUM(CASE WHEN wfs.hosting_status = 'accessible' THEN 1 ELSE 0 END)::float / NULLIF(SUM(CASE WHEN wfs.hosting_status IS NOT NULL THEN 1 ELSE 0 END),0)
+                         ELSE 0 END AS host_reliability_ratio,
+                    AVG(wfs.hosting_latency_ms) AS avg_hosting_latency_ms,
+                    AVG(wfs.forecast_score_initial) AS avg_day1_score,
+                    AVG((COALESCE(wfs.era5_score_24h,0)+COALESCE(wfs.era5_score_48h,0)+COALESCE(wfs.era5_score_72h,0)+COALESCE(wfs.era5_score_96h,0)+COALESCE(wfs.era5_score_120h,0)+COALESCE(wfs.era5_score_144h,0)+COALESCE(wfs.era5_score_168h,0)+COALESCE(wfs.era5_score_192h,0)+COALESCE(wfs.era5_score_216h,0)+COALESCE(wfs.era5_score_240h,0))/10.0) AS avg_era5_score,
+                    AVG((CASE WHEN wfs.era5_score_24h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_48h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_72h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_96h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_120h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_144h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_168h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_192h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_216h IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN wfs.era5_score_240h IS NOT NULL THEN 1 ELSE 0 END)/10.0) AS avg_era5_completeness,
+                    MAX(wfs.era5_combined_score) AS best_forecast_score,
+                    MIN(wfs.era5_combined_score) AS worst_forecast_score,
+                    STDDEV(wfs.era5_combined_score) AS score_std_dev,
+                    MAX(CASE WHEN wfs.forecast_status = 'completed' THEN wfs.updated_at ELSE NULL END) AS last_successful_forecast,
+                    MAX(CASE WHEN wfs.forecast_status = 'failed' THEN wfs.updated_at ELSE NULL END) AS last_failed_forecast,
+                    MIN(wfs.created_at) AS first_seen,
+                    MAX(wfs.created_at) AS last_active,
+                    :vhk AS validator_hotkey,
+                    NOW() AT TIME ZONE 'UTC' AS updated_at
+                FROM weather_forecast_stats wfs
+                {where_clause}
+                GROUP BY wfs.miner_uid, wfs.miner_hotkey
+                ON CONFLICT (miner_uid) DO UPDATE SET
+                    miner_hotkey = EXCLUDED.miner_hotkey,
+                    miner_rank = EXCLUDED.miner_rank,
+                    avg_forecast_score = EXCLUDED.avg_forecast_score,
+                    successful_forecasts = EXCLUDED.successful_forecasts,
+                    failed_forecasts = EXCLUDED.failed_forecasts,
+                    forecast_success_ratio = EXCLUDED.forecast_success_ratio,
+                    hosting_successes = EXCLUDED.hosting_successes,
+                    hosting_failures = EXCLUDED.hosting_failures,
+                    host_reliability_ratio = EXCLUDED.host_reliability_ratio,
+                    avg_hosting_latency_ms = EXCLUDED.avg_hosting_latency_ms,
+                    avg_day1_score = EXCLUDED.avg_day1_score,
+                    avg_era5_score = EXCLUDED.avg_era5_score,
+                    avg_era5_completeness = EXCLUDED.avg_era5_completeness,
+                    best_forecast_score = EXCLUDED.best_forecast_score,
+                    worst_forecast_score = EXCLUDED.worst_forecast_score,
+                    score_std_dev = EXCLUDED.score_std_dev,
+                    last_successful_forecast = EXCLUDED.last_successful_forecast,
+                    last_failed_forecast = EXCLUDED.last_failed_forecast,
+                    first_seen = EXCLUDED.first_seen,
+                    last_active = EXCLUDED.last_active,
+                    validator_hotkey = EXCLUDED.validator_hotkey,
+                    updated_at = EXCLUDED.updated_at
+                """.replace("{where_clause}", where_clause)
+            )
+
+            params["vhk"] = self.validator_hotkey
+            await self.db.execute(sql, params)
+            logger.info("Aggregated miner_stats via SQL")
             return True
-            
         except Exception as e:
-            logger.error(f"Error aggregating miner stats: {e}")
+            logger.error(f"Error aggregating miner stats (SQL): {e}")
+            return False
+
+    async def recompute_era5_rollups_for_run(self, run_id: int) -> bool:
+        """Recompute era5_combined_score and era5_completeness from fixed columns for a run."""
+        try:
+            sql = sa.text(
+                """
+                UPDATE weather_forecast_stats SET
+                  era5_combined_score = (
+                    COALESCE(era5_score_24h,0)+COALESCE(era5_score_48h,0)+COALESCE(era5_score_72h,0)+COALESCE(era5_score_96h,0)+
+                    COALESCE(era5_score_120h,0)+COALESCE(era5_score_144h,0)+COALESCE(era5_score_168h,0)+COALESCE(era5_score_192h,0)+
+                    COALESCE(era5_score_216h,0)+COALESCE(era5_score_240h,0)
+                  )/10.0,
+                  era5_completeness = (
+                    (CASE WHEN era5_score_24h IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN era5_score_48h IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN era5_score_72h IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN era5_score_96h IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN era5_score_120h IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN era5_score_144h IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN era5_score_168h IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN era5_score_192h IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN era5_score_216h IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN era5_score_240h IS NOT NULL THEN 1 ELSE 0 END)
+                  )/10.0
+                WHERE run_id = :rid
+                """
+            )
+            await self.db.execute(sql, {"rid": run_id})
+            return True
+        except Exception as e:
+            logger.error(f"Error recomputing ERA5 rollups for run {run_id}: {e}")
+            return False
+
+    async def update_miner_ranks_for_run(self, run_id: int) -> bool:
+        """Update miner_rank for a run using dense_rank over era5_combined_score."""
+        try:
+            sql = sa.text(
+                """
+                WITH ranked AS (
+                  SELECT id, DENSE_RANK() OVER (ORDER BY era5_combined_score DESC NULLS LAST) AS rnk
+                  FROM weather_forecast_stats
+                  WHERE run_id = :rid
+                )
+                UPDATE weather_forecast_stats w
+                SET miner_rank = ranked.rnk
+                FROM ranked
+                WHERE w.id = ranked.id
+                """
+            )
+            await self.db.execute(sql, {"rid": run_id})
+            return True
+        except Exception as e:
+            logger.error(f"Error updating miner ranks for run {run_id}: {e}")
             return False
     
     async def update_consecutive_streaks(self, miner_uid: int) -> None:

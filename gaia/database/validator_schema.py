@@ -1131,6 +1131,45 @@ sa.Index(
     postgresql_where=miner_stats_table.c.last_active.isnot(None),
 )
 
+# Per-miner, per-run step/sub-step event log with retry and error tracking
+weather_forecast_steps_table = sa.Table(
+    "weather_forecast_steps",
+    validator_metadata,
+    sa.Column("id", sa.BigInteger, primary_key=True, autoincrement=True),
+    sa.Column(
+        "run_id",
+        sa.Integer,
+        sa.ForeignKey("weather_forecast_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "miner_uid",
+        sa.Integer,
+        sa.ForeignKey("node_table.uid", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("miner_hotkey", sa.VARCHAR(255), nullable=False),
+    sa.Column("step_name", sa.VARCHAR(32), nullable=False),
+    sa.Column("substep", sa.VARCHAR(64), nullable=True),
+    sa.Column("lead_hours", sa.Integer, nullable=True),
+    sa.Column("status", sa.VARCHAR(32), nullable=False),
+    sa.Column("started_at", postgresql.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column("completed_at", postgresql.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column("retry_count", sa.Integer, server_default=sa.text("0"), nullable=False),
+    sa.Column("next_retry_time", postgresql.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column("latency_ms", sa.Integer, nullable=True),
+    sa.Column("error_json", postgresql.JSONB, nullable=True),
+    sa.Column("context", postgresql.JSONB, nullable=True),
+    sa.UniqueConstraint(
+        "run_id", "miner_uid", "step_name", "substep", "lead_hours",
+        name="uq_wfsteps_run_miner_step_sub_lead",
+    ),
+    comment="Event log of step/sub-step progress, retries, and errors per miner per run",
+)
+sa.Index("idx_wfsteps_run_miner", weather_forecast_steps_table.c.run_id, weather_forecast_steps_table.c.miner_uid)
+sa.Index("idx_wfsteps_step_status", weather_forecast_steps_table.c.step_name, weather_forecast_steps_table.c.status)
+sa.Index("idx_wfsteps_next_retry", weather_forecast_steps_table.c.next_retry_time)
+
 # --- Perturbation Seed Table (Anti-Weight-Copying Mechanism) ---
 # REDESIGNED: Now stores multiple seeds with activation times for safe synchronization
 perturb_seed_table = sa.Table(
