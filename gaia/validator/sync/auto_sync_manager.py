@@ -59,6 +59,8 @@ class AutoSyncManager:
                       - Both use the same test_mode parameter, no override occurs
         """
         self.test_mode = test_mode
+        # Advisory lock used to pause app DB operations during maintenance/backups
+        self.DB_PAUSE_LOCK_KEY = 746227728439
 
         # Get current system user
         import getpass
@@ -89,6 +91,73 @@ class AutoSyncManager:
                 "backup_buffer_minutes": 5,  # Wait 5 minutes after backup time
                 "sync_minute": None,  # No specific minute in test mode
             }
+
+    async def _acquire_pause_lock(self) -> None:
+        """Acquire an exclusive advisory lock to pause app DB operations."""
+        # Prefer direct DB execution to avoid shell/psql dependency
+        try:
+            from gaia.validator.database.validator_database_manager import (
+                ValidatorDatabaseManager,
+            )
+
+            db = ValidatorDatabaseManager()
+            await db.ensure_engine_initialized()
+            await db.execute(
+                "SELECT pg_advisory_lock(:key);", {"key": self.DB_PAUSE_LOCK_KEY}
+            )
+            logger.info("Acquired DB pause lock (exclusive advisory lock)")
+            return
+        except Exception as e:
+            logger.warning(
+                f"DB-based pause lock acquire failed ({e}); attempting psql fallback"
+            )
+
+        # Fallback to invoking psql if direct DB path fails
+        try:
+            cmd = [
+                "sudo",
+                "-u",
+                "postgres",
+                "psql",
+                "-Atqc",
+                f"SELECT pg_advisory_lock({self.DB_PAUSE_LOCK_KEY});",
+            ]
+            await self._run_command_async(cmd, "Acquire DB pause lock")
+            logger.info("Acquired DB pause lock via psql fallback")
+        except Exception as e:
+            logger.warning(f"Could not acquire DB pause lock via psql: {e}")
+
+    async def _release_pause_lock(self) -> None:
+        """Release the exclusive advisory lock."""
+        # Prefer direct DB execution
+        try:
+            from gaia.validator.database.validator_database_manager import (
+                ValidatorDatabaseManager,
+            )
+
+            db = ValidatorDatabaseManager()
+            await db.ensure_engine_initialized()
+            await db.execute(
+                "SELECT pg_advisory_unlock(:key);", {"key": self.DB_PAUSE_LOCK_KEY}
+            )
+            logger.info("Released DB pause lock")
+        except Exception as e:
+            logger.warning(
+                f"DB-based pause lock release failed ({e}); attempting psql fallback"
+            )
+            try:
+                cmd = [
+                    "sudo",
+                    "-u",
+                    "postgres",
+                    "psql",
+                    "-Atqc",
+                    f"SELECT pg_advisory_unlock({self.DB_PAUSE_LOCK_KEY});",
+                ]
+                await self._run_command_async(cmd, "Release DB pause lock")
+                logger.info("Released DB pause lock via psql fallback")
+            except Exception as e2:
+                logger.warning(f"Could not release DB pause lock via psql: {e2}")
         else:
             self.backup_schedule = {
                 "full_backup_time": "08:30",  # Daily at 8:30 AM UTC
@@ -1212,6 +1281,11 @@ class AutoSyncManager:
 
     async def _restart_postgresql_service(self, service_name: str) -> bool:
         """Restart PostgreSQL service using appropriate method with robust service detection."""
+        # Acquire exclusive advisory lock to pause app DB usage during restart
+        try:
+            await self._acquire_pause_lock()
+        except Exception:
+            pass
         try:
             logger.info("🔄 Restarting PostgreSQL service...")
 
@@ -1293,6 +1367,12 @@ class AutoSyncManager:
         except Exception as e:
             logger.error(f"Error restarting PostgreSQL: {e}")
             return False
+        finally:
+            # Release advisory lock after restart completes
+            try:
+                await self._release_pause_lock()
+            except Exception:
+                pass
 
     async def _verify_postgresql_configuration(self, postgres_user: str) -> bool:
         """Verify PostgreSQL configuration is correct."""

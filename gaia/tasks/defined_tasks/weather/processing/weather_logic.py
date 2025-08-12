@@ -709,14 +709,17 @@ async def _request_fresh_token(
         f"[VerifyLogic] Requesting fresh token/manifest_hash for job {job_id} from miner {miner_hotkey[:12]}..."
     )
     forecast_request_payload = {"nonce": str(uuid.uuid4()), "data": {"job_id": job_id}}
+    from gaia.validator.miner.miner_query import query_single_miner
     endpoint_to_call = "/weather-kerchunk-request"
     try:
-        all_responses = await task_instance.validator.query_miners(
-            payload=forecast_request_payload,
+        response_dict = await query_single_miner(
+            task_instance,
+            miner_hotkey,
             endpoint=endpoint_to_call,
-            hotkeys=[miner_hotkey],
+            payload=forecast_request_payload,
         )
-        response_dict = all_responses.get(miner_hotkey)
+
+        # If no response, bail
         if not response_dict:
             logger.warning(
                 f"[VerifyLogic] No response received from miner {miner_hotkey[:12]} for job {job_id}"

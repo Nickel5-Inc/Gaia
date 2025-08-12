@@ -3015,24 +3015,7 @@ class GaiaValidator:
 
             # First clean up database resources
             if hasattr(self, "database_manager"):
-                await self.database_manager.execute(
-                    """
-                    UPDATE geomagnetic_predictions 
-                    SET status = 'pending'
-                    WHERE status = 'processing'
-                    """
-                )
-                logger.info("Reset in-progress prediction statuses")
-
-                await self.database_manager.execute(
-                    """
-                    DELETE FROM score_table 
-                    WHERE task_name = 'geomagnetic' 
-                    AND status = 'processing'
-                    """
-                )
-                logger.info("Cleaned up incomplete scoring operations")
-
+                # Weather-only: no legacy geomagnetic cleanups
                 # Close database connections
                 await self.database_manager.close_all_connections()
                 logger.info("Closed database connections")
@@ -3531,50 +3514,35 @@ class GaiaValidator:
 
                 logger.info("Metagraph initialized.")
 
-                # Start per-miner worker PROCESS POOL if enabled
-                if self._per_miner_exec_enabled and not self._weather_worker_processes:
-                    procs = self._weather_worker_num
-                    logger.info(f"Starting weather worker pool with {procs} processes (80% of cores, floored)")
-                    for i in range(procs):
-                        name = f"weather-w{i+1}/{procs}"
-                        p = mp.Process(name=name, target=_weather_worker_entrypoint, daemon=True)
-                        p.start()
-                        self._weather_worker_processes.append(p)
+                # Ensure database is fully ready before starting worker pool
+                async def _wait_for_database_ready(min_ok: int = 3, max_wait_sec: int = 180) -> None:
+                    ok_count = 0
+                    start = time.time()
+                    backoff = 1.0
+                    while ok_count < min_ok:
+                        if time.time() - start > max_wait_sec:
+                            break
+                        try:
+                            await self.database_manager.initialize_database()
+                            # lightweight ping
+                            await self.database_manager.fetch_one("SELECT 1")
+                            ok_count += 1
+                            await asyncio.sleep(0.5)
+                            backoff = 1.0
+                        except Exception as e:
+                            ok_count = 0
+                            msg = str(e)
+                            if any(s in msg for s in ["shutting down", "starting up", "CannotConnectNow"]):
+                                await asyncio.sleep(backoff)
+                                backoff = min(backoff * 1.5, 5.0)
+                                continue
+                            # Other errors: brief wait and retry
+                            await asyncio.sleep(1.0)
 
-                    # Start periodic stats aggregation loop alongside worker pool
-                    logger.info("Initializing database connection for main process...")
-                    await self.database_manager.initialize_database()
-                    logger.info("Database tables initialized (main process).")
-                    async def _stats_aggregation_loop():
-                        interval_sec = 600  # active by default, run every 10 minutes
-                        manager = WeatherStatsManager(
-                            self.database_manager,
-                            validator_hotkey=(
-                                getattr(getattr(self.validator_wallet, "hotkey", None), "ss58_address", None)
-                                if hasattr(self, "validator_wallet") and self.validator_wallet is not None
-                                else "unknown_validator"
-                            ),
-                        )
-                        while True:
-                            try:
-                                await manager.aggregate_miner_stats()
-                                try:
-                                    await manager.get_overall_miner_ranks()
-                                except Exception:
-                                    pass
-                                try:
-                                    net = await compute_subnet_stats(self.database_manager)
-                                    logger.info(
-                                        f"[stats] subnet snapshot: active_miners={net.get('active_miners')}, avg_forecast_score={net.get('avg_forecast_score')}, avg_host_reliability_ratio={net.get('avg_host_reliability_ratio')}"
-                                    )
-                                except Exception:
-                                    pass
-                            except Exception as agg_err:
-                                logger.debug(f"Stats aggregation error: {agg_err}")
-                            await asyncio.sleep(interval_sec)
+                logger.info("Waiting for database to be ready before starting workers...")
+                await _wait_for_database_ready()
 
-                    if getattr(self, "_stats_agg_task", None) is None:
-                        self._stats_agg_task = asyncio.create_task(_stats_aggregation_loop(), name="stats_aggregation_loop")
+                # Defer starting worker pool until after AutoSyncManager setup below
 
 
                 # Initialize weight perturbation manager for anti-weight-copying defense
@@ -3617,9 +3585,6 @@ class GaiaValidator:
 
                 # Initialize DB Sync Components - AFTER DB init
                 await self._initialize_db_sync_components()
-
-                # logger.warning(" CHECKING FOR DATABASE WIPE TRIGGER ")
-                await handle_db_wipe(self.database_manager)
 
                 # Perform startup history cleanup AFTER db init and wipe check
                 await self.cleanup_stale_history_on_startup()
@@ -3698,6 +3663,47 @@ class GaiaValidator:
                             logger.info(
                                 "✅ AutoSyncManager setup and scheduling completed successfully!"
                             )
+                            # Start per-miner worker PROCESS POOL only AFTER AutoSyncManager setup
+                            if self._per_miner_exec_enabled and not self._weather_worker_processes:
+                                procs = self._weather_worker_num
+                                logger.info(f"Starting weather worker pool with {procs} processes (80% of cores, floored)")
+                                for i in range(procs):
+                                    name = f"weather-w{i+1}/{procs}"
+                                    p = mp.Process(name=name, target=_weather_worker_entrypoint, daemon=True)
+                                    p.start()
+                                    self._weather_worker_processes.append(p)
+
+                                # Start periodic stats aggregation loop alongside worker pool
+                                async def _stats_aggregation_loop():
+                                    interval_sec = 600  # active by default, run every 10 minutes
+                                    manager = WeatherStatsManager(
+                                        self.database_manager,
+                                        validator_hotkey=(
+                                            getattr(getattr(self.validator_wallet, "hotkey", None), "ss58_address", None)
+                                            if hasattr(self, "validator_wallet") and self.validator_wallet is not None
+                                            else "unknown_validator"
+                                        ),
+                                    )
+                                    while True:
+                                        try:
+                                            await manager.aggregate_miner_stats()
+                                            try:
+                                                await manager.get_overall_miner_ranks()
+                                            except Exception:
+                                                pass
+                                            try:
+                                                net = await compute_subnet_stats(self.database_manager)
+                                                logger.info(
+                                                    f"[stats] subnet snapshot: active_miners={net.get('active_miners')}, avg_forecast_score={net.get('avg_forecast_score')}, avg_host_reliability_ratio={net.get('avg_host_reliability_ratio')}"
+                                                )
+                                            except Exception:
+                                                pass
+                                        except Exception as agg_err:
+                                            logger.debug(f"Stats aggregation error: {agg_err}")
+                                        await asyncio.sleep(interval_sec)
+
+                                if getattr(self, "_stats_agg_task", None) is None:
+                                    self._stats_agg_task = asyncio.create_task(_stats_aggregation_loop(), name="stats_aggregation_loop")
                         else:
                             logger.warning(
                                 "⚠️ AutoSyncManager setup failed - attempting fallback scheduling for basic monitoring..."
@@ -3886,7 +3892,7 @@ class GaiaValidator:
                     await self._initiate_shutdown()
 
         
-            await run_validator_logic()
+        await run_validator_logic()
 
     async def main_scoring(self):
         """Run scoring every subnet tempo blocks."""
@@ -5099,11 +5105,11 @@ class GaiaValidator:
                 self._log_memory_usage("calc_weights_before_db_fetch")
 
                 # Debug weather query parameters
-                logger.info(
-                    f"Weather query debug - current time: {now}, lookback time: {weather_lookback}, days back: {(now - weather_lookback).days}"
-                )
-                logger.info(f"Weather query: {weather_query}")
-                logger.info(f"Weather params: {weather_params}")
+                # logger.info(
+                #     f"Weather query debug - current time: {now}, lookback time: {weather_lookback}, days back: {(now - weather_lookback).days}"
+                # )
+                # logger.info(f"Weather query: {weather_query}")
+                # logger.info(f"Weather params: {weather_params}")
 
                 weather_results, validator_nodes_list = await asyncio.gather(
                     self.database_manager.fetch_all(weather_query, weather_params),
@@ -5904,72 +5910,7 @@ class GaiaValidator:
                 logger.debug(f"Error monitoring client health: {e}")
                 await asyncio.sleep(300)
 
-    async def memory_snapshot_taker(self):
-        """Periodically takes memory snapshots and logs differences."""
-        # Register this task for global memory cleanup coordination
-        try:
-            from gaia.utils.global_memory_manager import register_thread_cleanup
-
-            def cleanup_snapshot_caches():
-                # Clear any caches that accumulate during memory snapshot processing
-                import gc
-
-                collected = gc.collect()
-                logger.debug(
-                    f"[MemorySnapshotTaker] Performed cleanup, collected {collected} objects"
-                )
-
-            register_thread_cleanup("memory_snapshot_taker", cleanup_snapshot_caches)
-            logger.debug("[MemorySnapshotTaker] Registered for global memory cleanup")
-        except Exception as e:
-            logger.debug(f"[MemorySnapshotTaker] Failed to register cleanup: {e}")
-
-        logger.info("Starting memory snapshot taker task...")
-
-        snapshot_interval_seconds = 300  # 5 minutes
-        logger.info(
-            f"Memory snapshots will be taken every {snapshot_interval_seconds} seconds."
-        )
-
-        while not self._shutdown_event.is_set():
-            try:
-                await asyncio.sleep(snapshot_interval_seconds)
-                if self._shutdown_event.is_set():
-                    break
-
-                logger.info("--- Taking Tracemalloc Snapshot ---")
-                current_snapshot = tracemalloc.take_snapshot()
-
-                logger.info("Top 10 current memory allocations (by line number):")
-                for stat in current_snapshot.statistics("lineno")[:10]:
-                    logger.info(f"  {stat}")
-                    # Uncomment for full traceback of top allocations if needed
-                    # logger.info(f"    Traceback for allocation at {stat.traceback[0]}:")
-                    # for line in stat.traceback.format():
-                    #    logger.info(f"      {line}")
-
-                if self.tracemalloc_snapshot1:
-                    logger.info("Comparing to previous snapshot...")
-                    top_stats = current_snapshot.compare_to(
-                        self.tracemalloc_snapshot1, "lineno"
-                    )
-                    logger.info("Top 10 memory differences since last snapshot:")
-                    for stat in top_stats[:10]:
-                        logger.info(f"  {stat}")
-                        # Uncomment for full traceback of significant differences
-                        # logger.info(f"    Traceback for diff at {stat.traceback[0]}:")
-                        # for line in stat.traceback.format():
-                        #    logger.info(f"      {line}")
-
-                self.tracemalloc_snapshot1 = current_snapshot
-                logger.info("--- Tracemalloc Snapshot Processed ---")
-
-            except asyncio.CancelledError:
-                logger.info("Memory snapshot taker task cancelled.")
-                break
-            except Exception as e:
-                logger.error(f"Error in memory_snapshot_taker: {e}", exc_info=True)
-                await asyncio.sleep(60)  # Wait a bit before retrying if an error occurs
+    
 
     async def periodic_substrate_cleanup(self):
         """Placeholder - substrate cleanup no longer needed with isolated substrate interface."""
@@ -6525,103 +6466,7 @@ class GaiaValidator:
             logger.debug(f"Error in comprehensive memory cleanup: {e}")
             return 0
 
-    async def abc_object_monitor(self):
-        """Monitor and cleanup ABC (Abstract Base Class) object accumulation."""
-        # Register this monitor for global memory cleanup coordination
-        try:
-            from gaia.utils.global_memory_manager import register_thread_cleanup
-
-            def cleanup_abc_caches():
-                # Clear any caches that accumulate during ABC monitoring
-                import gc
-
-                collected = gc.collect()
-                logger.debug(
-                    f"[ABCObjectMonitor] Performed cleanup, collected {collected} objects"
-                )
-
-            register_thread_cleanup("abc_object_monitor", cleanup_abc_caches)
-            logger.debug("[ABCObjectMonitor] Registered for global memory cleanup")
-        except Exception as e:
-            logger.debug(f"[ABCObjectMonitor] Failed to register cleanup: {e}")
-
-        import weakref
-        import gc
-        from abc import ABC
-
-        last_abc_count = 0
-
-        while True:
-            try:
-                await asyncio.sleep(180)  # Check every 3 minutes
-
-                # Get detailed ABC statistics if tracker is available
-                try:
-                    from gaia.utils.abc_debugger import get_abc_stats, print_abc_report
-
-                    abc_stats = get_abc_stats()
-                    current_abc_count = abc_stats["total_in_memory"]
-
-                    # Enhanced logging with detailed tracking
-                    if current_abc_count > 10000:
-                        logger.warning(
-                            f"High ABC object count: {current_abc_count} objects"
-                        )
-                        # Print detailed report for troubleshooting
-                        if current_abc_count > 20000:
-                            logger.warning("Printing detailed ABC object analysis:")
-                            print_abc_report()
-
-                except ImportError:
-                    # Fallback to basic counting if debugger not available
-                    current_abc_objects = []
-                    for obj in gc.get_objects():
-                        if isinstance(obj, ABC):
-                            current_abc_objects.append(obj)
-                    current_abc_count = len(current_abc_objects)
-
-                abc_growth = current_abc_count - last_abc_count
-
-                if current_abc_count > 10000:  # High ABC object count
-                    logger.warning(
-                        f"High ABC object count: {current_abc_count} objects "
-                        f"(growth: +{abc_growth} since last check)"
-                    )
-
-                    # Lightweight substrate cleanup instead of aggressive ABC cleanup
-                    if current_abc_count > 50000:  # Critical threshold
-                        logger.error(
-                            f"CRITICAL ABC object accumulation: {current_abc_count} objects"
-                        )
-
-                        # Use lightweight substrate cleanup instead of expensive GC passes
-                        try:
-                            from gaia.utils.abc_debugger import (
-                                lightweight_substrate_cleanup,
-                            )
-
-                            cleanup_count = lightweight_substrate_cleanup()
-                            logger.info(
-                                f"Lightweight substrate cleanup removed {cleanup_count} cache objects"
-                            )
-                        except ImportError:
-                            # Fallback to single GC pass
-                            collected = gc.collect()
-                            logger.info(f"Fallback GC collected {collected} objects")
-
-                last_abc_count = current_abc_count
-
-                if current_abc_count > 1000:  # Log if significant
-                    logger.debug(
-                        f"ABC object monitor: {current_abc_count} ABC objects tracked"
-                    )
-
-            except asyncio.CancelledError:
-                logger.info("ABC object monitor task cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error in ABC object monitor: {e}")
-                await asyncio.sleep(60)
+   
 
 
 if __name__ == "__main__":
@@ -6836,7 +6681,11 @@ if __name__ == "__main__":
         print("[STARTUP DEBUG] Entering finally block")
         if hasattr(validator, "_cleanup_done") and not validator._cleanup_done:
             try:
-                loop = asyncio.get_event_loop()
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                 if loop.is_closed():
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)

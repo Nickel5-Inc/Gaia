@@ -21,13 +21,17 @@ async def _load_inputs(db, task: WeatherTask, *, run_id: int, miner_uid: int, mi
         fetch_gfs_analysis_data,
         fetch_gfs_data,
     )
-    gfs_analysis_ds = await fetch_gfs_analysis_data(
-        [gfs_init], cache_dir=task.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache")
-    )
+    from pathlib import Path
+    cache_dir = Path(task.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache"))
+    gfs_analysis_ds = await fetch_gfs_analysis_data([gfs_init], cache_dir=cache_dir)
     if not gfs_analysis_ds:
         raise RuntimeError("fetch_gfs_analysis_data returned None")
+    # day1 uses initial scoring leads
+    leads = task.config.get("initial_scoring_lead_hours", [6, 12])
     gfs_ref_ds = await fetch_gfs_data(
-        gfs_init, cache_dir=task.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache")
+        run_time=gfs_init,
+        lead_hours=leads,
+        output_dir=str(cache_dir),
     )
     if not gfs_ref_ds:
         raise RuntimeError("fetch_gfs_data returned None")
@@ -80,12 +84,12 @@ async def run(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> 
     if not run:
         return False
 
-    gfs_init = get_effective_gfs_init(task, run["gfs_init_time_utc"])
-
     # Minimal WeatherTask for helpers/config
     task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
     if validator is not None:
         setattr(task, "validator", validator)
+
+    gfs_init = get_effective_gfs_init(task, run["gfs_init_time_utc"])
 
     # Fetch inputs (decorated sub-step with retries)
     try:

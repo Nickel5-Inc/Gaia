@@ -13,6 +13,7 @@ from gaia.database.validator_schema import (
     weather_forecast_steps_table,
 )
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
+from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask  # type: ignore
 from .substep import substep
 from .util_time import get_effective_gfs_init
 
@@ -42,7 +43,6 @@ async def seed_forecast_run(
 
     # Compute forecast_run_id once, using effective gfs_init for test mode
     # (Target time remains for run identity; gfs_init shifting is only for data alignment)
-    from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask  # type: ignore
     task_like = type("_T", (), {"test_mode": False, "config": {}})()
     eff_gfs_init = get_effective_gfs_init(task_like, gfs_init)
     forecast_run_id = WeatherStatsManager.generate_forecast_run_id(eff_gfs_init, target_time)
@@ -82,10 +82,10 @@ async def seed_forecast_run(
                 weather_forecast_stats_table.c.forecast_run_id,
             ],
             set_={
-                "run_id": sa.excluded.run_id,
-                "forecast_init_time": sa.excluded.forecast_init_time,
-                "forecast_status": sa.excluded.forecast_status,
-                "validator_hotkey": sa.excluded.validator_hotkey,
+                "run_id": stmt.excluded.run_id,
+                "forecast_init_time": stmt.excluded.forecast_init_time,
+                "forecast_status": stmt.excluded.forecast_status,
+                "validator_hotkey": stmt.excluded.validator_hotkey,
             },
         )
         await db.execute(stmt)
@@ -120,7 +120,7 @@ async def seed_forecast_run(
 
 
 @substep("seed", "download_gfs", should_retry=True, retry_delay_seconds=300, max_retries=6, retry_backoff="exponential")
-async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task: WeatherTask, *, run_id: int, miner_uid: int = 0, miner_hotkey: str = "coordinator"):
+async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task, *, run_id: int, miner_uid: int = 0, miner_hotkey: str = "coordinator"):
     """Ensure GFS reference for this run is fetched or cached.
 
     Uses the same logic as day1 load_inputs but at run level, and persists locally.
@@ -130,22 +130,33 @@ async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task: Wea
     )
     if not run:
         raise RuntimeError("run not found")
-    gfs_init = get_effective_gfs_init(task, run["gfs_init_time_utc"]) if hasattr(task, "test_mode") else run["gfs_init_time_utc"]
+    # Build a minimal WeatherTask-like object with test_mode inherited
+    # so that get_effective_gfs_init applies the configured hindcast shift once.
+    class _TaskShim:
+        def __init__(self, base):
+            self.test_mode = getattr(base, "test_mode", False)
+            self.config = getattr(base, "config", {})
+
+    gfs_init = get_effective_gfs_init(_TaskShim(task), run["gfs_init_time_utc"]) if hasattr(task, "test_mode") else run["gfs_init_time_utc"]
     from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
         fetch_gfs_analysis_data,
         fetch_gfs_data,
     )
     # Day1 leads minimal to warm cache
     leads = task.config.get("initial_scoring_lead_hours", [6, 12]) if hasattr(task, "config") else [6, 12]
-    gfs_analysis_ds = await fetch_gfs_analysis_data(
-        [gfs_init], cache_dir=task.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache") if hasattr(task, "config") else "./gfs_analysis_cache"
+    from pathlib import Path
+    cache_dir = Path(
+        task.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache")
+        if hasattr(task, "config")
+        else "./gfs_analysis_cache"
     )
+    gfs_analysis_ds = await fetch_gfs_analysis_data([gfs_init], cache_dir=cache_dir)
     if not gfs_analysis_ds:
         raise RuntimeError("fetch_gfs_analysis_data returned None")
     _ = await fetch_gfs_data(
-        gfs_init,
+        run_time=gfs_init,
         lead_hours=leads,
-        output_dir=task.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache") if hasattr(task, "config") else "./gfs_analysis_cache",
+        output_dir=str(cache_dir),
     )
     return True
 

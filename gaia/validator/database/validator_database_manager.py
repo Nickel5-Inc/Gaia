@@ -77,9 +77,20 @@ def track_operation(operation_type: str):
             op_id = random.randint(10000, 99999)
 
             overall_start_time = time.perf_counter()
-            logger.info(
-                f"[DBTrack {op_id}] ENTERING {operation_type} op: {func.__name__}, Query: {query_text_for_log}"
-            )
+            # Reduce verbosity for advisory lock noise
+            _lower_noise = False
+            _q = (query_text_for_log or "").lower()
+            if "pg_advisory" in _q:
+                _lower_noise = True
+
+            if _lower_noise:
+                logger.debug(
+                    f"[DBTrack {op_id}] ENTERING {operation_type} op: {func.__name__}, Query: {query_text_for_log}"
+                )
+            else:
+                logger.info(
+                    f"[DBTrack {op_id}] ENTERING {operation_type} op: {func.__name__}, Query: {query_text_for_log}"
+                )
 
             db_call_start_time = 0.0
             db_call_duration = 0.0
@@ -101,18 +112,29 @@ def track_operation(operation_type: str):
                             "timestamp": time.time(),
                         }
                     )
-                    logger.warning(
-                        f"[DBTrack {op_id}] Long-running DB call for {operation_type} op: {func.__name__} detected: {db_call_duration:.4f}s. Query: {query_text_for_log}"
-                    )
+                    if _lower_noise:
+                        logger.debug(
+                            f"[DBTrack {op_id}] Long-running DB call for {operation_type} op: {func.__name__} detected: {db_call_duration:.4f}s. Query: {query_text_for_log}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[DBTrack {op_id}] Long-running DB call for {operation_type} op: {func.__name__} detected: {db_call_duration:.4f}s. Query: {query_text_for_log}"
+                        )
                 else:
                     pass
 
             except Exception as e:
                 db_call_duration = time.perf_counter() - db_call_start_time
-                logger.error(
-                    f"[DBTrack {op_id}] ERROR in {operation_type} op: {func.__name__} after {db_call_duration:.4f}s in DB call. Query: {query_text_for_log}. Error: {str(e)}",
-                    exc_info=True,
-                )
+                if _lower_noise:
+                    logger.debug(
+                        f"[DBTrack {op_id}] ERROR in {operation_type} op: {func.__name__} after {db_call_duration:.4f}s in DB call. Query: {query_text_for_log}. Error: {str(e)}",
+                        exc_info=True,
+                    )
+                else:
+                    logger.error(
+                        f"[DBTrack {op_id}] ERROR in {operation_type} op: {func.__name__} after {db_call_duration:.4f}s in DB call. Query: {query_text_for_log}. Error: {str(e)}",
+                        exc_info=True,
+                    )
                 raise
             finally:
                 overall_duration = time.perf_counter() - overall_start_time
@@ -120,9 +142,14 @@ def track_operation(operation_type: str):
                     abs(overall_duration - db_call_duration) > 0.1
                     or db_call_duration > self.VALIDATOR_QUERY_TIMEOUT / 4
                 ):
-                    logger.info(
-                        f"[DBTrack {op_id}] EXITING {operation_type} op: {func.__name__}. DB call: {db_call_duration:.4f}s, Total in wrapper: {overall_duration:.4f}s. Query: {query_text_for_log}"
-                    )
+                    if _lower_noise:
+                        logger.debug(
+                            f"[DBTrack {op_id}] EXITING {operation_type} op: {func.__name__}. DB call: {db_call_duration:.4f}s, Total in wrapper: {overall_duration:.4f}s. Query: {query_text_for_log}"
+                        )
+                    else:
+                        logger.info(
+                            f"[DBTrack {op_id}] EXITING {operation_type} op: {func.__name__}. DB call: {db_call_duration:.4f}s, Total in wrapper: {overall_duration:.4f}s. Query: {query_text_for_log}"
+                        )
 
             return result
 
@@ -180,6 +207,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             cls._instance.VALIDATOR_QUERY_TIMEOUT = 60  # 1 minute
             cls._instance.VALIDATOR_TRANSACTION_TIMEOUT = 300  # 5 minutes
 
+            # Advisory lock key used to signal cluster-wide maintenance/pause.
+            # Convention: exclusive lock held by maintenance; workers probe with shared try-lock.
+            cls._instance.DB_PAUSE_LOCK_KEY = 746227728439  # arbitrary bigint, stable
+
         return cls._instance
 
     def __init__(
@@ -219,6 +250,69 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             self.node_table = node_table
             self.system_running_event = system_running_event
             self._initialized = True
+
+    async def _ping_ready(self) -> bool:
+        """Return True if the database responds to a simple SELECT 1."""
+        try:
+            await self.fetch_one("SELECT 1")
+            return True
+        except Exception as e:
+            msg = str(e)
+            # Expected transient states during restarts/backups
+            transient = (
+                "shutting down" in msg
+                or "starting up" in msg
+                or "CannotConnectNow" in msg
+            )
+            if transient:
+                return False
+            # For other errors, re-raise so callers can see them
+            raise
+
+    async def _is_paused_by_lock(self) -> bool:
+        """Return True if an exclusive advisory lock is held elsewhere (maintenance)."""
+        try:
+            row = await self.fetch_one(
+                "SELECT pg_try_advisory_lock_shared(:key) AS ok",
+                {"key": self.DB_PAUSE_LOCK_KEY},
+            )
+            ok = bool(row and (row.get("ok") in (True, 1, "t")))
+            if ok:
+                # Release immediately; we only probe state
+                await self.execute(
+                    "SELECT pg_advisory_unlock_shared(:key)",
+                    {"key": self.DB_PAUSE_LOCK_KEY},
+                )
+                return False
+            return True
+        except Exception:
+            # If DB is not reachable, treat as unavailable rather than paused
+            return False
+
+    async def wait_until_available(self, max_wait_seconds: int = 180) -> None:
+        """Block until DB is reachable and not under maintenance (advisory lock).
+
+        This is cooperative: if a maintenance process holds an exclusive
+        advisory lock on DB_PAUSE_LOCK_KEY, workers will wait here.
+        """
+        start = time.time()
+        backoff = 0.5
+        while True:
+            try:
+                paused = await self._is_paused_by_lock()
+                ready = await self._ping_ready()
+            except Exception:
+                paused = False
+                ready = False
+
+            if ready and not paused:
+                return
+
+            if time.time() - start > max_wait_seconds:
+                return  # give up silently; caller may retry later
+
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.5, 5.0)
 
     async def get_operation_stats(self) -> Dict[str, Any]:
         """Get current operation statistics."""

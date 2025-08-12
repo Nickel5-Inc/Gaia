@@ -7,7 +7,7 @@ import multiprocessing as mp
 from typing import Optional
 import logging
 
-from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager, DatabaseError
 from gaia.tasks.defined_tasks.weather.pipeline.workers import process_one
 
 
@@ -29,33 +29,52 @@ async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0) -> 
             await asyncio.sleep(1.0)
 
 
+async def _install_worker_prefix_filters(tag: str) -> None:
+    import logging
+
+    class _WorkerTagFilter(logging.Filter):
+        def __init__(self, tag: str) -> None:
+            super().__init__()
+            self._tag = tag
+
+        def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+            try:
+                if getattr(record, "_worker_tagged", False):
+                    return True
+                record.msg = f"{self._tag} {record.msg}"
+                setattr(record, "_worker_tagged", True)
+            except Exception:
+                pass
+            return True
+
+    root_logger = logging.getLogger()
+    f = _WorkerTagFilter(tag)
+    root_logger.addFilter(f)
+    # Also attach to common app loggers
+    for name in ("gaia", "fiber", "database_manager", "validator_database_manager"):
+        logging.getLogger(name).addFilter(_WorkerTagFilter(tag))
+
+
 async def main() -> None:
     db = ValidatorDatabaseManager()
-    await db.initialize_database()
+    tag = _prefix()
+    await _install_worker_prefix_filters(tag)
+    # Retry DB init while Postgres is restarting or paused for maintenance
+    max_tries = int(os.getenv("WEATHER_WORKER_DB_INIT_RETRIES", "30"))
+    backoff = 1.0
+    for attempt in range(1, max_tries + 1):
+        try:
+            await db.initialize_database()
+            break
+        except Exception as e:
+            msg = str(e)
+            if "shutting down" in msg or "CannotConnectNow" in msg or "Failed to initialize database engine" in msg:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 1.5, 10.0)
+                continue
+            raise
     try:
         idle = float(os.getenv("WEATHER_WORKER_IDLE_SLEEP", "5"))
-        # Install a logging filter to prefix messages with worker name
-        class _WorkerTagFilter(logging.Filter):
-            def __init__(self, tag: str) -> None:
-                super().__init__()
-                self._tag = tag
-
-            def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
-                try:
-                    if getattr(record, "_worker_tagged", False):
-                        return True
-                    record.msg = f"{self._tag} {record.msg}"
-                    setattr(record, "_worker_tagged", True)
-                except Exception:
-                    pass
-                return True
-
-        tag = _prefix()
-        root_logger = logging.getLogger()
-        root_logger.addFilter(_WorkerTagFilter(tag))
-        for h in root_logger.handlers:
-            h.addFilter(_WorkerTagFilter(tag))
-
         print(f"{tag} started (idle_sleep={idle}s)")
         await worker_loop(db, idle_sleep=idle)
     finally:

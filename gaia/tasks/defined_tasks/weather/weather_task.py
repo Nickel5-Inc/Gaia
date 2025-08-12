@@ -1944,13 +1944,17 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 )
 
                 if self.test_mode:
-                    logger.info(
-                        f"Test mode enabled. Adjusting GFS init time by -8 days from {now_utc.strftime('%Y-%m-%d %H:%M')} UTC."
+                    # Centralize hindcast shift configuration via util_time.get_effective_gfs_init
+                    # Default shift is -7 days; configurable via config fields test_hindcast_days/hours.
+                    from gaia.tasks.defined_tasks.weather.pipeline.steps.util_time import (
+                        get_effective_gfs_init,
                     )
-                    now_utc -= timedelta(days=8)
-                    logger.info(
-                        f"Adjusted GFS init time for test mode: {now_utc.strftime('%Y-%m-%d %H:%M')} UTC."
-                    )
+                    shifted = get_effective_gfs_init(self, now_utc)
+                    if shifted != now_utc:
+                        logger.info(
+                            f"Test mode enabled. Hindcast shift applied: {now_utc.strftime('%Y-%m-%d %H:%M')} -> {shifted.strftime('%Y-%m-%d %H:%M')} UTC"
+                        )
+                        now_utc = shifted
 
                 gfs_t0_run_time = now_utc.replace(
                     hour=0, minute=0, second=0, microsecond=0
@@ -2306,61 +2310,21 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                             f"[Run {run_id}] Polling miner {miner_hk[:8]} (Job: {miner_job_id}) for input status using query_miners."
                         )
 
-                        node = validator.metagraph.nodes.get(miner_hk)
-                        if not node:
-                            logger.warning(
-                                f"[Run {run_id}] Miner {miner_hk[:8]} not found in metagraph. Cannot poll."
-                            )
-                            return resp_id, {
-                                "status": "validator_poll_error",
-                                "message": f"Miner {miner_hk[:8]} not found in metagraph",
-                            }
-                        elif not node.ip:
-                            logger.warning(
-                                f"[Run {run_id}] Miner {miner_hk[:8]} missing IP address in metagraph. Cannot poll."
-                            )
-                            return resp_id, {
-                                "status": "validator_poll_error",
-                                "message": f"Miner {miner_hk[:8]} missing IP address in metagraph",
-                            }
-                        elif not node.port:
-                            logger.warning(
-                                f"[Run {run_id}] Miner {miner_hk[:8]} missing port in metagraph. Cannot poll."
-                            )
-                            return resp_id, {
-                                "status": "validator_poll_error",
-                                "message": f"Miner {miner_hk[:8]} missing port in metagraph",
-                            }
-
                         try:
-                            status_payload_data = WeatherGetInputStatusData(
-                                job_id=miner_job_id
-                            )
-                            status_payload = {
-                                "nonce": str(uuid.uuid4()),
-                                "data": status_payload_data.model_dump(),
-                            }
-                            endpoint = "/weather-get-input-status"
+                            from gaia.validator.miner.miner_query import get_input_status
 
-                            all_responses = await validator.query_miners(
-                                payload=status_payload,
-                                endpoint=endpoint,
-                                hotkeys=[miner_hk],
+                            status_response = await get_input_status(
+                                self, miner_hk, job_id=miner_job_id
                             )
-
-                            status_response = all_responses.get(miner_hk)
 
                             if status_response:
                                 parsed_response = status_response
-                                if (
-                                    isinstance(status_response, dict)
-                                    and "text" in status_response
-                                ):
+                                if isinstance(status_response, dict) and "text" in status_response:
                                     try:
                                         parsed_response = loads(status_response["text"])
                                     except (Exception, TypeError) as json_err:
                                         logger.warning(
-                                            f"[Run {run_id}] Failed to parse JSON response from miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {json_err}. Raw response: {status_response.get('text', '')[:200]}"
+                                            f"[Run {run_id}] Failed to parse JSON response from miner {miner_hk[:8]}: {json_err}. Raw response: {status_response.get('text', '')[:200]}"
                                         )
                                         parsed_response = {
                                             "status": "parse_error",
@@ -2373,37 +2337,30 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 return resp_id, parsed_response
                             else:
                                 logger.warning(
-                                    f"[Run {run_id}] No response received from miner {miner_hk[:8]} (IP: {node.ip}:{node.port}) via query_miners endpoint {endpoint}."
+                                    f"[Run {run_id}] No response received from miner {miner_hk[:8]} via get_input_status."
                                 )
                                 return resp_id, {
                                     "status": "validator_poll_failed",
-                                    "message": f"No response from miner {miner_hk[:8]} at {node.ip}:{node.port} on {endpoint}",
+                                "message": f"No response from miner {miner_hk[:8]} on /weather-get-input-status",
                                 }
 
                         except asyncio.TimeoutError as timeout_err:
-                            logger.error(
-                                f"[Run {run_id}] Timeout polling miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {timeout_err}"
-                            )
+                            logger.error(f"[Run {run_id}] Timeout polling miner {miner_hk[:8]}: {timeout_err}")
                             return resp_id, {
                                 "status": "validator_poll_error",
-                                "message": f"Timeout polling miner {miner_hk[:8]} at {node.ip}:{node.port}: {str(timeout_err)}",
+                                "message": f"Timeout polling miner {miner_hk[:8]}: {str(timeout_err)}",
                             }
                         except ConnectionError as conn_err:
-                            logger.error(
-                                f"[Run {run_id}] Connection error polling miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {conn_err}"
-                            )
+                            logger.error(f"[Run {run_id}] Connection error polling miner {miner_hk[:8]}: {conn_err}")
                             return resp_id, {
                                 "status": "validator_poll_error",
-                                "message": f"Connection error to miner {miner_hk[:8]} at {node.ip}:{node.port}: {str(conn_err)}",
+                                "message": f"Connection error to miner {miner_hk[:8]}: {str(conn_err)}",
                             }
                         except Exception as poll_err:
-                            logger.error(
-                                f"[Run {run_id}] Error polling miner {miner_hk[:8]} (IP: {node.ip}:{node.port}): {poll_err}",
-                                exc_info=True,
-                            )
+                            logger.error(f"[Run {run_id}] Error polling miner {miner_hk[:8]}: {poll_err}", exc_info=True)
                             return resp_id, {
                                 "status": "validator_poll_error",
-                                "message": f"Error polling miner {miner_hk[:8]} at {node.ip}:{node.port}: {type(poll_err).__name__}: {str(poll_err)}",
+                                "message": f"Error polling miner {miner_hk[:8]}: {type(poll_err).__name__}: {str(poll_err)}",
                             }
 
                     for resp_rec in miners_to_poll:
@@ -2955,56 +2912,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
             # Handle verification logic for both awaiting_inference_results and verifying_miner_forecasts
             if current_run_status == "awaiting_inference_results":
-                # Standard verification flow for inference_triggered responses
-                responses_query = """
-                SELECT mr.id, mr.miner_hotkey, mr.status, mr.job_id
-                FROM weather_miner_responses mr
-                WHERE mr.run_id = :run_id
-                  AND (
-                      mr.status = 'inference_triggered' OR
-                      (mr.status = 'retry_scheduled' AND mr.next_retry_time IS NOT NULL AND mr.next_retry_time <= :now)
-                  )
-                """
-                query_params = {"run_id": run_id, "now": datetime.now(timezone.utc)}
-                miner_responses = await self.db_manager.fetch_all(
-                    responses_query, query_params
+                # Defer per-miner verification entirely to worker pool
+                logger.info(
+                    f"[Run {run_id}] Deferring verification to worker pool; scheduler will claim per-miner verify items."
                 )
-
-                num_attempted_verification = len(miner_responses)
-                if not miner_responses:
-                    logger.info(
-                        f"[Run {run_id}] No miner responses found with status 'inference_triggered'."
-                    )
-                else:
-                    logger.info(
-                        f"[Run {run_id}] Found {num_attempted_verification} 'inference_triggered' responses to verify."
-                    )
-
-                verification_tasks = []
-                for response in miner_responses:
-                    verification_tasks.append(
-                        verify_miner_response(self, run_record, response)
-                    )
-
-                if verification_tasks:
-                    results = await asyncio.gather(
-                        *verification_tasks, return_exceptions=True
-                    )
-                    failed_verifications = sum(
-                        1 for r in results if isinstance(r, Exception)
-                    )
-                    if failed_verifications > 0:
-                        logger.error(
-                            f"[Run {run_id}] {failed_verifications}/{len(verification_tasks)} verification tasks failed"
-                        )
-                        for i, r in enumerate(results):
-                            if isinstance(r, Exception):
-                                logger.error(
-                                    f"[Run {run_id}] Verification {i} failed: {r}"
-                                )
-                    logger.info(
-                        f"[Run {run_id}] Completed verification attempts for {len(verification_tasks)} responses ({len(verification_tasks) - failed_verifications} successful)."
-                    )
+                num_attempted_verification = 0
             else:
                 # For runs already in verifying_miner_forecasts, skip verification and go straight to scoring check
                 num_attempted_verification = 0
