@@ -34,107 +34,17 @@ class MinerWorkScheduler:
     def __init__(self, db: ValidatorDatabaseManager):
         self.db = db
 
-    async def next_to_verify(self, limit: int = 50) -> List[WorkItem]:
-        now = datetime.now(timezone.utc)
-        # Match current flow: acceptance inserts 'fetch_initiated'; post-trigger 'inference_triggered'.
-        # Also allow 'retry_scheduled' when next_retry_time elapsed.
-        query = sa.text(
-            """
-            SELECT id as response_id, run_id, miner_uid, miner_hotkey
-            FROM weather_miner_responses
-            WHERE (
-                status IN ('fetch_initiated', 'inference_triggered')
-                OR (status = 'retry_scheduled' AND (next_retry_time IS NULL OR next_retry_time <= :now))
-            )
-            ORDER BY last_polled_time NULLS FIRST, response_time DESC
-            LIMIT :limit
-            """
-        )
-        rows = await self.db.fetch_all(query, {"now": now, "limit": limit})
-        items = [
-            WorkItem(
-                run_id=r["run_id"],
-                miner_uid=r["miner_uid"],
-                miner_hotkey=r["miner_hotkey"],
-                response_id=r["response_id"],
-                step="verify",
-                meta={},
-            )
-            for r in rows
-        ]
-        logging.info(f"[Scheduler] next_to_verify -> {len(items)} candidates")
-        return items
+    # Verification phase removed; selection now begins directly at day1
 
-    async def claim_to_verify(self) -> Optional[WorkItem]:
-        """Atomically claim a single verify candidate by updating last_polled_time.
-        Uses SKIP LOCKED via CTE to prevent double-claim across workers.
-        """
-        now = datetime.now(timezone.utc)
-        # Prefer step-based retry scheduling; fallback to legacy response status
-        step_row = await self.db.fetch_one(
-            sa.text(
-                """
-                SELECT s.run_id, s.miner_uid, s.miner_hotkey
-                FROM weather_forecast_steps s
-                WHERE s.step_name = 'verify' AND s.status = 'retry_scheduled' AND (s.next_retry_time IS NULL OR s.next_retry_time <= :now)
-                ORDER BY s.next_retry_time NULLS FIRST
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-                """
-            ),
-            {"now": now},
-        )
-        if step_row:
-            return WorkItem(
-                run_id=step_row["run_id"],
-                miner_uid=step_row["miner_uid"],
-                miner_hotkey=step_row["miner_hotkey"],
-                response_id=None,
-                step="verify",
-                meta={"claimed_via": "steps"},
-            )
-        # legacy fallback
-        query = sa.text(
-            """
-            WITH cte AS (
-                SELECT id, run_id, miner_uid, miner_hotkey
-                FROM weather_miner_responses
-                WHERE (
-                    status IN ('fetch_initiated', 'inference_triggered')
-                    OR (status = 'retry_scheduled' AND (next_retry_time IS NULL OR next_retry_time <= :now))
-                )
-                ORDER BY last_polled_time NULLS FIRST, response_time DESC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            UPDATE weather_miner_responses r
-            SET last_polled_time = :now
-            FROM cte
-            WHERE r.id = cte.id
-            RETURNING r.id as response_id, r.run_id, r.miner_uid, r.miner_hotkey
-            """
-        )
-        row = await self.db.fetch_one(query, {"now": now})
-        if not row:
-            return None
-        return WorkItem(
-            run_id=row["run_id"],
-            miner_uid=row["miner_uid"],
-            miner_hotkey=row["miner_hotkey"],
-            response_id=row["response_id"],
-            step="verify",
-            meta={},
-        )
+    # Verification phase removed; no claim_to_verify
 
     async def next_day1(self, limit: int = 50) -> List[WorkItem]:
-        # Verified but no day1 overall score yet
-        # After verification, responses use verification_passed=TRUE and status='verified_manifest_store_opened'.
+        # Day1 candidates: inference accepted/underway/submitted, but not day1-scored overall
         query = sa.text(
             """
             SELECT r.id as response_id, r.run_id, r.miner_uid, r.miner_hotkey
             FROM weather_miner_responses r
-            WHERE r.verification_passed = TRUE
-              AND r.status = 'verified_manifest_store_opened'
+            WHERE r.status IN ('inference_triggered','awaiting_forecast_submission','forecast_submitted')
               AND NOT EXISTS (
                 SELECT 1 FROM weather_miner_scores s
                 WHERE s.run_id = r.run_id AND s.miner_uid = r.miner_uid
@@ -189,8 +99,7 @@ class MinerWorkScheduler:
             WITH cte AS (
                 SELECT r.id as response_id, r.run_id, r.miner_uid, r.miner_hotkey
                 FROM weather_miner_responses r
-                WHERE r.verification_passed = TRUE
-                  AND r.status = 'verified_manifest_store_opened'
+                WHERE r.status IN ('inference_triggered','awaiting_forecast_submission','forecast_submitted')
                   AND NOT EXISTS (
                     SELECT 1 FROM weather_miner_scores s
                     WHERE s.run_id = r.run_id AND s.miner_uid = r.miner_uid
@@ -226,8 +135,7 @@ class MinerWorkScheduler:
             """
             SELECT r.id as response_id, r.run_id, r.miner_uid, r.miner_hotkey
             FROM weather_miner_responses r
-            WHERE (r.verification_passed = TRUE AND r.status = 'verified_manifest_store_opened')
-               OR r.status = 'day1_scored'
+            WHERE r.status = 'day1_scored'
             ORDER BY r.response_time DESC
             LIMIT :limit
             """
@@ -277,8 +185,7 @@ class MinerWorkScheduler:
             WITH cte AS (
                 SELECT r.id as response_id, r.run_id, r.miner_uid, r.miner_hotkey
                 FROM weather_miner_responses r
-                WHERE (r.verification_passed = TRUE AND r.status = 'verified_manifest_store_opened')
-                   OR r.status = 'day1_scored'
+                WHERE r.status = 'day1_scored'
                 ORDER BY r.response_time DESC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -303,15 +210,13 @@ class MinerWorkScheduler:
         )
 
     async def claim_next(self) -> Optional[WorkItem]:
-        """Return the next available work item by priority: verify → day1 → era5."""
+        """Return the next available work item by priority: day1 → era5."""
         # Opportunistically enqueue missing validator jobs to drive generic queue
         try:
             _ = await self.db.enqueue_weather_step_jobs(limit=200)
         except Exception:
             pass
-        item = await self.claim_to_verify()
-        if item:
-            return item
+        # verification removed
         item = await self.claim_day1()
         if item:
             return item

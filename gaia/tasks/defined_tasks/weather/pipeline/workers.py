@@ -7,7 +7,7 @@ import sqlalchemy as sa
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.defined_tasks.weather.pipeline.scheduler import MinerWorkScheduler
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
-from gaia.tasks.defined_tasks.weather.pipeline.steps import verify_step, day1_step, era5_step
+from gaia.tasks.defined_tasks.weather.pipeline.steps import day1_step, era5_step
 from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import (
     evaluate_miner_forecast_day1,
 )
@@ -18,9 +18,7 @@ from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
 )
 
 
-async def process_verify_one(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> bool:
-    """Pick one verify candidate and run verify using existing logic. Returns True if processed."""
-    return await verify_step.run(db, validator=validator)
+# verification removed
 
 
 async def process_day1_one(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> bool:
@@ -53,28 +51,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     payload = _json.loads(payload)
                 except Exception:
                     payload = {}
-            if jtype == "weather.verify":
-                # Use exact payload if provided
-                if all(k in payload for k in ("run_id", "miner_uid", "response_id")):
-                    # If miner_hotkey missing, fetch from DB
-                    miner_hotkey = payload.get("miner_hotkey")
-                    if not miner_hotkey:
-                        row = await db.fetch_one(
-                            "SELECT miner_hotkey FROM weather_miner_responses WHERE id = :rid",
-                            {"rid": payload["response_id"]},
-                        )
-                        miner_hotkey = row and row.get("miner_hotkey")
-                    ok = await verify_step.run_item(
-                        db,
-                        run_id=payload["run_id"],
-                        miner_uid=payload["miner_uid"],
-                        miner_hotkey=miner_hotkey or "",
-                        response_id=payload["response_id"],
-                        validator=validator,
-                    )
-                else:
-                    ok = await process_verify_one(db, validator=validator)
-            elif jtype == "weather.day1":
+            if jtype == "weather.day1":
                 if all(k in payload for k in ("run_id", "miner_uid", "response_id")):
                     miner_hotkey = payload.get("miner_hotkey")
                     if not miner_hotkey:
@@ -185,9 +162,55 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     job = await db.claim_validator_job(worker_name="weather-w/1", job_type_prefix="miners.")
     if job:
         try:
-            # Placeholder: implement specific miners ops later
-            await db.complete_validator_job(job["id"], result={"ok": True})
-            return True
+            # Opportunistically ensure polling jobs exist
+            try:
+                await db.enqueue_miner_poll_jobs(limit=500)
+            except Exception:
+                pass
+            j = job.get("job_type")
+            if j == "miners.poll_inference_status":
+                # Poll a miner for inference progress and reschedule until ready
+                payload = job.get("payload") or {}
+                if isinstance(payload, str):
+                    import json as _json
+                    try:
+                        payload = _json.loads(payload)
+                    except Exception:
+                        payload = {}
+                run_id = payload.get("run_id")
+                miner_uid = payload.get("miner_uid")
+                response_id = payload.get("response_id")
+                miner_hotkey = payload.get("miner_hotkey")
+                if response_id and miner_hotkey:
+                    try:
+                        from gaia.validator.miner.miner_query import get_input_status as _gis
+                        status_response = await _gis(validator or WeatherTask(db_manager=db, node_type="validator", test_mode=True), miner_hotkey, job_id=payload.get("job_id", ""))
+                        # Minimal interpretation: if not ready, reschedule
+                        ready = False
+                        if isinstance(status_response, dict):
+                            txt = status_response.get("text") or ""
+                            ready = "ready" in txt.lower() or "completed" in txt.lower()
+                        if ready:
+                            await db.complete_validator_job(job["id"], result={"ready": True})
+                            # Ensure a day1 step exists/enqueued for this miner
+                            try:
+                                await db.enqueue_weather_step_jobs(limit=200)
+                            except Exception:
+                                pass
+                            return True
+                        else:
+                            # Not ready; reschedule poll in ~8 minutes
+                            await db.fail_validator_job(job["id"], "not ready", schedule_retry_in_seconds=480)
+                            return True
+                    except Exception as e:
+                        await db.fail_validator_job(job["id"], f"poll exception: {e}", schedule_retry_in_seconds=600)
+                        return False
+                await db.fail_validator_job(job["id"], "missing payload fields")
+                return False
+            else:
+                # Unknown miners.* job
+                await db.fail_validator_job(job["id"], "unknown miners job")
+                return False
         except Exception as e:
             await db.fail_validator_job(job["id"], f"exception: {e}")
             return False
@@ -217,8 +240,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     item = await sched.claim_next()
     if not item:
         return False
-    if item.step == "verify":
-        return await process_verify_one(db, validator=validator)
+    # verification removed
     if item.step == "day1":
         return await process_day1_one(db, validator=validator)
     if item.step == "era5":

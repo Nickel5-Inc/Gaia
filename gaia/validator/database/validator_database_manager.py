@@ -1491,7 +1491,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 params["result"] = dumps(result) if JSON_PERFORMANCE_AVAILABLE else json.dumps(result)
                 query = """
                 UPDATE validator_jobs
-                SET status = 'completed', completed_at = NOW(), lease_expires_at = NULL, result = :result::jsonb
+                SET status = 'completed', completed_at = NOW(), lease_expires_at = NULL, result = :result
                 WHERE id = :job_id
                 """
             else:
@@ -1553,7 +1553,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 FROM weather_forecast_steps s
                 LEFT JOIN weather_miner_responses r
                   ON r.run_id = s.run_id AND r.miner_uid = s.miner_uid
-                WHERE s.step_name IN ('verify','day1','era5')
+                WHERE s.step_name IN ('day1','era5')
                   AND (
                         s.status = 'pending'
                         OR (s.status = 'retry_scheduled' AND (s.next_retry_time IS NULL OR s.next_retry_time <= NOW()))
@@ -1565,6 +1565,9 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             )
             inserted = 0
             for s in steps:
+                # Skip if we don't yet have a response row to operate on
+                if s.get("response_id") is None:
+                    continue
                 payload = {
                     "run_id": s["run_id"],
                     "miner_uid": s["miner_uid"],
@@ -1607,6 +1610,62 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             return inserted
         except Exception as e:
             logger.error(f"enqueue_weather_step_jobs error: {e}")
+            return 0
+
+    @track_operation("write")
+    async def enqueue_miner_poll_jobs(self, limit: int = 500) -> int:
+        """Ensure there are polling jobs for miners with inference underway but not yet submitted.
+
+        Creates generic validator_jobs with job_type 'miners.poll_inference_status'.
+        Avoids duplicates by checking existing pending/in_progress/retry_scheduled jobs for the same response_id.
+        """
+        try:
+            rows = await self.fetch_all(
+                """
+                SELECT r.id AS response_id, r.run_id, r.miner_uid, r.miner_hotkey, r.job_id
+                FROM weather_miner_responses r
+                WHERE r.status IN ('inference_triggered','awaiting_forecast_submission','fetch_initiated')
+                ORDER BY r.response_time DESC
+                LIMIT :limit
+                """,
+                {"limit": limit},
+            )
+            created = 0
+            for r in rows:
+                exists = await self.fetch_one(
+                    """
+                    SELECT 1 FROM validator_jobs
+                    WHERE job_type = 'miners.poll_inference_status'
+                      AND response_id = :rid
+                      AND status IN ('pending','in_progress','retry_scheduled')
+                    LIMIT 1
+                    """,
+                    {"rid": r["response_id"]},
+                )
+                if exists:
+                    continue
+                payload = {
+                    "run_id": r["run_id"],
+                    "miner_uid": r["miner_uid"],
+                    "miner_hotkey": r.get("miner_hotkey"),
+                    "response_id": r["response_id"],
+                    "job_id": r.get("job_id"),
+                }
+                jid = await self.enqueue_validator_job(
+                    job_type="miners.poll_inference_status",
+                    payload=payload,
+                    priority=120,
+                    scheduled_at=None,
+                    run_id=r["run_id"],
+                    miner_uid=r["miner_uid"],
+                    response_id=r["response_id"],
+                    step_id=None,
+                )
+                if jid:
+                    created += 1
+            return created
+        except Exception as e:
+            logger.error(f"enqueue_miner_poll_jobs error: {e}")
             return 0
 
     @track_operation("write")

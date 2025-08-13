@@ -90,13 +90,13 @@ async def seed_forecast_run(
         )
         await db.execute(stmt)
 
-    # Seed steps: set verify step to pending to form the per-miner timeline root
+    # Seed steps: set day1 step to pending for each miner (no separate verification phase)
     step_rows = [
         {
             "run_id": run_id,
             "miner_uid": m["miner_uid"],
             "miner_hotkey": m["miner_hotkey"],
-            "step_name": "verify",
+            "step_name": "day1",
             "substep": None,
             "lead_hours": None,
             "status": "pending",
@@ -119,6 +119,8 @@ async def seed_forecast_run(
     # Enqueue generic jobs for these steps
     try:
         await db.enqueue_weather_step_jobs(limit=1000)
+        # Also ensure polling jobs are present for responses that are starting
+        await db.enqueue_miner_poll_jobs(limit=1000)
     except Exception:
         pass
 
