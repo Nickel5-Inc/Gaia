@@ -30,10 +30,27 @@ async def _get_era5_truth(task: WeatherTask, run_id: int, gfs_init, leads: list[
     if ds is not None:
         return ds
 
+    # Single-worker guard: use advisory lock per (run_id, 'era5') to prevent duplicate heavy fetch
+    lock_key = (0x45524135 ^ int(run_id))  # prefix 'ERA5' xor run_id
+    try:
+        db = task.db_manager
+        row = await db.fetch_one("SELECT pg_try_advisory_lock(:key) AS ok", {"key": lock_key})
+        have_lock = bool(row and row.get("ok"))
+    except Exception:
+        have_lock = False
+
     target_datetimes = [gfs_init + timedelta(hours=h) for h in leads]
-    ds = await fetch_era5_data(
-        target_datetimes, cache_dir=task.config.get("era5_cache_dir", "./era5_cache")
-    )
+    ds = None
+    try:
+        ds = await fetch_era5_data(
+            target_datetimes, cache_dir=task.config.get("era5_cache_dir", "./era5_cache")
+        )
+    finally:
+        if have_lock:
+            try:
+                await task.db_manager.execute("SELECT pg_advisory_unlock(:key)", {"key": lock_key})
+            except Exception:
+                pass
     if ds is not None:
         _era5_truth_cache[key] = ds
     return ds

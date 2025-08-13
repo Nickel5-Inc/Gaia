@@ -1851,6 +1851,144 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         """
         pass
 
+    async def initiate_fetch_retry_once(self, validator) -> None:
+        """Retry initiate-fetch for newest run stuck without any responses."""
+        try:
+            row = await self.db_manager.fetch_one(
+                """
+                SELECT id, status FROM weather_forecast_runs
+                WHERE status IN ('sending_fetch_requests')
+                ORDER BY run_initiation_time DESC
+                LIMIT 1
+                """
+            )
+            if not row:
+                return
+            run_id = int(row["id"]) if row.get("id") is not None else None
+            if run_id is None:
+                return
+            cnt_row = await self.db_manager.fetch_one(
+                "SELECT COUNT(1) AS c FROM weather_miner_responses WHERE run_id = :rid",
+                {"rid": run_id},
+            )
+            have = int(cnt_row.get("c") if cnt_row else 0)
+            if have > 0:
+                return
+            gfs_run = await self.db_manager.fetch_one(
+                "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",
+                {"rid": run_id},
+            )
+            if not gfs_run:
+                return
+            gfs_t0_run_time = gfs_run["gfs_init_time_utc"]
+            gfs_t_minus_6_run_time = gfs_t0_run_time - timedelta(hours=6)
+            from gaia.validator.miner.miner_query import initiate_fetch as _init_fetch
+            hotkeys: list[str] = []
+            try:
+                if hasattr(validator, "metagraph") and validator.metagraph and getattr(validator.metagraph, "nodes", None):
+                    hotkeys = list(validator.metagraph.nodes.keys())
+            except Exception:
+                hotkeys = []
+            if not hotkeys:
+                try:
+                    rows = await self.db_manager.fetch_all(
+                        "SELECT hotkey FROM node_table WHERE hotkey IS NOT NULL ORDER BY uid"
+                    )
+                    hotkeys = [r["hotkey"] for r in rows]
+                except Exception:
+                    hotkeys = []
+            targeted = len(hotkeys)
+            logger.info(f"[Run {run_id}] Initiate-fetch retry targeting {targeted} miners")
+            responses = {}
+            for miner_hotkey in hotkeys:
+                try:
+                    res = await _init_fetch(
+                        validator,
+                        miner_hotkey,
+                        forecast_start_time=gfs_t0_run_time,
+                        previous_step_time=gfs_t_minus_6_run_time,
+                        validator_hotkey=(
+                            validator.keypair.ss58_address if validator.keypair else None
+                        ),
+                    )
+                    if res is not None:
+                        responses[miner_hotkey] = res
+                except Exception as e:
+                    logger.warning(f"[Run {run_id}] retry initiate failed for {miner_hotkey[:8]}: {e}")
+                    continue
+            accepted_count = 0
+            for miner_hotkey, response_data in responses.items():
+                try:
+                    miner_response = response_data
+                    if isinstance(response_data, dict) and "text" in response_data:
+                        try:
+                            miner_response = loads(response_data["text"])
+                        except Exception:
+                            miner_response = {"status": "parse_error"}
+                    if (
+                        isinstance(miner_response, dict)
+                        and miner_response.get("status") == WeatherTaskStatus.FETCH_ACCEPTED
+                        and miner_response.get("job_id")
+                    ):
+                        miner_uid_result = await self.db_manager.fetch_one(
+                            "SELECT uid FROM node_table WHERE hotkey = :hk",
+                            {"hk": miner_hotkey},
+                        )
+                        miner_uid = (
+                            miner_uid_result["uid"] if miner_uid_result else -1
+                        )
+                        if miner_uid != -1:
+                            await self.db_manager.execute(
+                                """
+                                INSERT INTO weather_miner_responses
+                                 (run_id, miner_uid, miner_hotkey, response_time, status, job_id)
+                                 VALUES (:run_id, :uid, :hk, :resp_time, :status, :job_id)
+                                ON CONFLICT (run_id, miner_uid) DO UPDATE SET
+                                 response_time = EXCLUDED.response_time,
+                                 status = EXCLUDED.status,
+                                 job_id = EXCLUDED.job_id
+                                """,
+                                {
+                                    "run_id": run_id,
+                                    "uid": miner_uid,
+                                    "hk": miner_hotkey,
+                                    "resp_time": datetime.now(timezone.utc),
+                                    "status": "fetch_initiated",
+                                    "job_id": miner_response.get("job_id"),
+                                },
+                            )
+                            accepted_count += 1
+                except Exception as resp_proc_err:
+                    logger.error(
+                        f"[Run {run_id}] Error processing response from {miner_hotkey}: {resp_proc_err}",
+                        exc_info=True,
+                    )
+                    continue
+            logger.info(
+                f"[Run {run_id}] Initiate-fetch retry summary: targeted={targeted}, responses={len(responses)}, accepted={accepted_count}, rejected={len(responses)-accepted_count}"
+            )
+            if accepted_count > 0:
+                await _update_run_status(self, run_id, "awaiting_inference_results")
+                try:
+                    _ = await self.db_manager.enqueue_miner_poll_jobs(limit=1000)
+                except Exception:
+                    pass
+                try:
+                    _ = await self.db_manager.enqueue_weather_step_jobs(limit=1000)
+                except Exception:
+                    pass
+        except Exception:
+            return
+
+    async def initiate_fetch_retry_loop(self, validator) -> None:
+        """Periodic retry loop to ensure initiate-fetch is sent for active runs."""
+        while True:
+            try:
+                await self.initiate_fetch_retry_once(validator)
+            except Exception:
+                pass
+            await asyncio.sleep(300)
+
     async def validator_execute(self, validator):
         """
         Orchestrates the weather forecast task for the validator:
@@ -1910,7 +2048,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 if current_time - last_recovery_time > recovery_interval:
                     # New pipeline handles recovery via weather_forecast_steps + scheduler.
                     # Periodic heavy recovery tasks from legacy system are disabled.
-                    last_recovery_time = current_time
+                        last_recovery_time = current_time
 
                 now_utc = datetime.now(timezone.utc)
 
@@ -2052,22 +2190,120 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 logger.info(
                                     f"[Run {run_id}] Seed backfill completed (rows now: {total} + upserts)."
                                 )
-                                # Warm GFS caches at seed stage
-                                try:
-                                    from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import (
-                                        ensure_gfs_reference_available,
-                                    )
-                                    await ensure_gfs_reference_available(
-                                        self.db_manager, self, run_id=run_id
-                                    )
-                                except Exception as warm_err:
-                                    logger.warning(
-                                        f"[Run {run_id}] GFS warmup failed (will retry via substep logic): {warm_err}"
-                                    )
+                                # Warm GFS caches now handled by worker via 'weather.seed' job
                         except Exception as seed_err:
                             logger.warning(
                                 f"[Run {run_id}] Seed backfill check failed: {seed_err}"
                             )
+
+                        # If we restarted before sending requests, re-send initiate-fetch when no responses exist
+                        try:
+                            resp_cnt_row = await self.db_manager.fetch_one(
+                                """
+                                SELECT COUNT(1) AS cnt
+                                FROM weather_miner_responses
+                                WHERE run_id = :rid
+                                """,
+                                {"rid": run_id},
+                            )
+                            resp_cnt = int(resp_cnt_row.get("cnt") if resp_cnt_row else 0)
+                        except Exception:
+                            resp_cnt = 0
+                        if resp_cnt == 0:
+                            logger.info(
+                                f"[Run {run_id}] No prior initiate-fetch responses recorded. Re-sending initiate fetch to miners."
+                            )
+                            from gaia.validator.miner.miner_query import initiate_fetch as _init_fetch
+                            # Prefer metagraph; fallback to node_table
+                            hotkeys: list[str] = []
+                            if hasattr(validator, "metagraph") and validator.metagraph and getattr(validator.metagraph, "nodes", None):
+                                try:
+                                    hotkeys = list(validator.metagraph.nodes.keys())
+                                except Exception:
+                                    hotkeys = []
+                            if not hotkeys:
+                                try:
+                                    rows = await self.db_manager.fetch_all(
+                                        "SELECT hotkey FROM node_table WHERE hotkey IS NOT NULL ORDER BY uid"
+                                    )
+                                    hotkeys = [r["hotkey"] for r in rows]
+                                except Exception:
+                                    hotkeys = []
+                            responses = {}
+                            for miner_hotkey in hotkeys:
+                                try:
+                                    res = await _init_fetch(
+                                        validator,
+                                        miner_hotkey,
+                                        forecast_start_time=gfs_t0_run_time,
+                                        previous_step_time=gfs_t_minus_6_run_time,
+                                        validator_hotkey=(
+                                            validator.keypair.ss58_address if validator.keypair else None
+                                        ),
+                                    )
+                                    if res is not None:
+                                        responses[miner_hotkey] = res
+                                except Exception:
+                                    continue
+                            # Record acceptances
+                            accepted_count = 0
+                            for miner_hotkey, response_data in responses.items():
+                                try:
+                                    miner_response = response_data
+                                    if isinstance(response_data, dict) and "text" in response_data:
+                                        try:
+                                            miner_response = loads(response_data["text"])
+                                        except Exception:
+                                            miner_response = {"status": "parse_error"}
+                                    if (
+                                        isinstance(miner_response, dict)
+                                        and miner_response.get("status") == WeatherTaskStatus.FETCH_ACCEPTED
+                                        and miner_response.get("job_id")
+                                    ):
+                                        miner_uid_result = await self.db_manager.fetch_one(
+                                            "SELECT uid FROM node_table WHERE hotkey = :hk",
+                                            {"hk": miner_hotkey},
+                                        )
+                                        miner_uid = (
+                                            miner_uid_result["uid"] if miner_uid_result else -1
+                                        )
+                                        if miner_uid != -1:
+                                            await self.db_manager.execute(
+                                                """
+                                                INSERT INTO weather_miner_responses
+                                                 (run_id, miner_uid, miner_hotkey, response_time, status, job_id)
+                                                 VALUES (:run_id, :uid, :hk, :resp_time, :status, :job_id)
+                                                ON CONFLICT (run_id, miner_uid) DO UPDATE SET
+                                                 response_time = EXCLUDED.response_time,
+                                                 status = EXCLUDED.status,
+                                                 job_id = EXCLUDED.job_id
+                                                """,
+                                                {
+                                                    "run_id": run_id,
+                                                    "uid": miner_uid,
+                                                    "hk": miner_hotkey,
+                                                    "resp_time": datetime.now(timezone.utc),
+                                                    "status": "fetch_initiated",
+                                                    "job_id": miner_response.get("job_id"),
+                                                },
+                                            )
+                                            accepted_count += 1
+                                except Exception as resp_proc_err:
+                                    logger.error(
+                                        f"[Run {run_id}] Error processing response from {miner_hotkey}: {resp_proc_err}",
+                                        exc_info=True,
+                                    )
+                                    continue
+                            if accepted_count > 0:
+                                await _update_run_status(self, run_id, "awaiting_inference_results")
+                                try:
+                                    _ = await self.db_manager.enqueue_miner_poll_jobs(limit=1000)
+                                except Exception:
+                                    pass
+                                try:
+                                    _ = await self.db_manager.enqueue_weather_step_jobs(limit=1000)
+                                except Exception:
+                                    pass
 
                         await self.validator_score()
 
@@ -2105,6 +2341,23 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                             logger.info(
                                 f"[Run {run_id}] Created NEW weather_forecast_runs record with ID: {run_id}"
                             )
+                            # Gate seeding on node_table availability; enqueue dereg job and wait briefly if empty
+                            try:
+                                row = await self.db_manager.fetch_one(
+                                    "SELECT COUNT(*) AS c FROM node_table WHERE hotkey IS NOT NULL"
+                                )
+                                count_nodes = int(row.get("c") if row else 0)
+                            except Exception:
+                                count_nodes = 0
+                            if count_nodes == 0:
+                                try:
+                                    await self.db_manager.enqueue_singleton_job(
+                                        job_type="miners.handle_deregistrations", payload={}, priority=160
+                                    )
+                                except Exception:
+                                    pass
+                                # brief wait for workers to populate node_table
+                                await asyncio.sleep(5)
                             # Seed per-miner stats and step timelines (idempotent)
                             try:
                                 from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import (
@@ -2128,23 +2381,10 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 logger.info(
                                     f"[Run {run_id}] Seeded per-miner stats/steps for {seeded} miners."
                                 )
-                                # Only schedule run-level seed substep if node_table has any miners
-                                if seeded > 0:
-                                    try:
-                                        from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import (
-                                            ensure_gfs_reference_available,
-                                        )
-                                        await ensure_gfs_reference_available(
-                                            self.db_manager, self, run_id=run_id
-                                        )
-                                    except Exception as warm_err:
-                                        logger.warning(
-                                            f"[Run {run_id}] GFS warmup failed (will retry via substep logic): {warm_err}"
-                                        )
                             except Exception as seed_err:
                                 logger.warning(
                                     f"[Run {run_id}] Seeding per-miner rows failed: {seed_err}"
-                                )
+                            )
                         else:
                             logger.error(
                                 "Failed to retrieve run_id using fetch_one after insert."
@@ -2190,8 +2430,31 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     )
                     # Per-miner secure queries using Fiber handshake
                     from gaia.validator.miner.miner_query import initiate_fetch as _init_fetch
+                    # Prefer metagraph; fall back to node_table if not yet synced
+                    hotkeys: list[str] = []
+                    try:
+                        if hasattr(validator, "metagraph") and validator.metagraph and getattr(validator.metagraph, "nodes", None):
+                            hotkeys = list(validator.metagraph.nodes.keys())
+                    except Exception:
+                        hotkeys = []
+                    if not hotkeys:
+                        try:
+                            rows = await self.db_manager.fetch_all(
+                                "SELECT hotkey FROM node_table WHERE hotkey IS NOT NULL ORDER BY uid"
+                            )
+                            hotkeys = [r["hotkey"] for r in rows]
+                            logger.info(
+                                f"[Run {run_id}] Metagraph not ready; using {len(hotkeys)} hotkeys from node_table for initiate-fetch"
+                            )
+                        except Exception as _e:
+                            logger.warning(
+                                f"[Run {run_id}] Could not obtain miner hotkeys from node_table: {_e}"
+                            )
+                            hotkeys = []
+                    targeted = len(hotkeys)
+                    logger.info(f"[Run {run_id}] Initiate-fetch targeting {targeted} miners")
                     responses = {}
-                    for miner_hotkey in validator.metagraph.nodes.keys():
+                    for miner_hotkey in hotkeys:
                         try:
                             res = await _init_fetch(
                                 validator,
@@ -2204,10 +2467,13 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                             )
                             if res is not None:
                                 responses[miner_hotkey] = res
-                        except Exception:
+                        except Exception as e:
+                            logger.warning(
+                                f"[Run {run_id}] initiate_fetch failed for {miner_hotkey[:8]}: {e}"
+                            )
                             continue
                     logger.info(
-                        f"[Run {run_id}] Received {len(responses)} initial responses from miners for fetch initiation."
+                        f"[Run {run_id}] Received {len(responses)} initial responses from miners for fetch initiation (targeted={targeted})"
                     )
 
                     await validator.update_task_status(
@@ -2292,7 +2558,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                             )
 
                     logger.info(
-                        f"[Run {run_id}] Completed processing initiate fetch responses. {accepted_count} miners accepted."
+                        f"[Run {run_id}] Completed initiate-fetch processing: accepted={accepted_count}, rejected={len(responses) - accepted_count}, targeted={targeted}"
                     )
                     # Simplified flow: skip input-hash verification; move directly to awaiting inference
                     await _update_run_status(self, run_id, "awaiting_inference_results")

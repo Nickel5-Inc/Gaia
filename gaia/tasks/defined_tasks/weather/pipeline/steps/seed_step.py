@@ -116,8 +116,22 @@ async def seed_forecast_run(
         )
         await db.execute(st)
 
-    # Enqueue generic jobs for these steps
+    # Enqueue generic jobs for these steps (including the run-level seed substep for workers)
     try:
+        # Ensure a run-level seed step exists so workers can claim GFS warmup
+        # Use an existing miner_uid/hotkey to satisfy FK; this is only a coordinator tag
+        first_node = await db.fetch_one(
+            "SELECT uid, hotkey FROM node_table ORDER BY uid ASC LIMIT 1"
+        )
+        if first_node and first_node.get("uid") is not None:
+            await db.execute(
+                """
+                INSERT INTO weather_forecast_steps (run_id, miner_uid, miner_hotkey, step_name, substep, lead_hours, status)
+                VALUES (:rid, :uid, :hk, 'seed', 'download_gfs', NULL, 'pending')
+                ON CONFLICT (run_id, miner_uid, step_name, substep, lead_hours) DO NOTHING
+                """,
+                {"rid": run_id, "uid": int(first_node["uid"]), "hk": first_node.get("hotkey") or "coordinator"},
+            )
         await db.enqueue_weather_step_jobs(limit=1000)
         # Also ensure polling jobs are present for responses that are starting
         await db.enqueue_miner_poll_jobs(limit=1000)
@@ -133,6 +147,16 @@ async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task, *, 
 
     Uses the same logic as day1 load_inputs but at run level, and persists locally.
     """
+    # Acquire a cluster-wide advisory lock so only one worker performs the heavy fetch per run
+    lock_key = 0x47505310 ^ int(run_id)  # deterministic small int key per run (prefix 'GPS\x10')
+    try:
+        row = await db.fetch_one("SELECT pg_try_advisory_lock(:key) AS ok", {"key": lock_key})
+        if not row or not row.get("ok"):
+            # Another worker is already doing this; skip gracefully
+            return True
+    except Exception:
+        # If lock acquisition fails, skip to avoid duplicate heavy work
+        return True
     run = await db.fetch_one(
         sa.select(weather_forecast_runs_table.c.gfs_init_time_utc).where(weather_forecast_runs_table.c.id == run_id)
     )
@@ -160,6 +184,35 @@ async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task, *, 
         lead_hours=leads,
         output_dir=str(cache_dir),
     )
+    # Ensure lock releases even on early returns
+    try:
+        await db.execute("SELECT pg_advisory_unlock(:key)", {"key": lock_key})
+    except Exception:
+        pass
     return True
 
+
+async def run_item(
+    db: ValidatorDatabaseManager,
+    *,
+    run_id: int,
+    miner_uid: int,
+    miner_hotkey: str,
+    validator: Optional[Any] = None,
+) -> bool:
+    """Process the run-level seed step (download_gfs) via generic job dispatch."""
+    task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+    if validator is not None:
+        setattr(task, "validator", validator)
+    try:
+        await ensure_gfs_reference_available(
+            db,
+            task,
+            run_id=run_id,
+            miner_uid=miner_uid,
+            miner_hotkey=miner_hotkey,
+        )
+        return True
+    except Exception:
+        return False
 

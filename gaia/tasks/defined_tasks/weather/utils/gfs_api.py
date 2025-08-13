@@ -284,9 +284,20 @@ async def fetch_gfs_data(
                             output_dir, f"gfs_raw_{date_str}_{cycle_str}z.nc"
                         )
                         logger.info(f"Saving raw fetched data to: {out_file}")
-                        ds.to_netcdf(out_file)
+                        # Enforce netCDF4 engine and ensure it is available in this context
+                        try:
+                            import netCDF4  # noqa: F401
+                        except Exception as imp_err:
+                            raise RuntimeError(f"netCDF4 import failed in save context: {imp_err}")
+                        available = list(xr.backends.list_engines())
+                        if "netcdf4" not in available:
+                            raise RuntimeError(
+                                f"netcdf4 engine not registered; available engines: {available}"
+                            )
+                        ds.to_netcdf(out_file, engine="netcdf4")
                     except Exception as save_err:
-                        logger.error(f"Failed to save raw NetCDF file: {save_err}")
+                        logger.error(f"Failed to save raw NetCDF file with netcdf4: {save_err}")
+                        raise
 
                 logger.info("Processing fetched data for Aurora requirements...")
                 processed_ds = process_opendap_dataset(ds)

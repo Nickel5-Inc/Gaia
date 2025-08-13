@@ -83,14 +83,7 @@ def track_operation(operation_type: str):
             if "pg_advisory" in _q:
                 _lower_noise = True
 
-            if _lower_noise:
-                logger.debug(
-                    f"[DBTrack {op_id}] ENTERING {operation_type} op: {func.__name__}, Query: {query_text_for_log}"
-                )
-            else:
-                logger.info(
-                    f"[DBTrack {op_id}] ENTERING {operation_type} op: {func.__name__}, Query: {query_text_for_log}"
-                )
+            # Reduce verbosity: skip ENTERING logs to keep worker logs clean
 
             db_call_start_time = 0.0
             db_call_duration = 0.0
@@ -112,44 +105,24 @@ def track_operation(operation_type: str):
                             "timestamp": time.time(),
                         }
                     )
-                    if _lower_noise:
-                        logger.debug(
-                            f"[DBTrack {op_id}] Long-running DB call for {operation_type} op: {func.__name__} detected: {db_call_duration:.4f}s. Query: {query_text_for_log}"
-                        )
-                    else:
-                        logger.warning(
-                            f"[DBTrack {op_id}] Long-running DB call for {operation_type} op: {func.__name__} detected: {db_call_duration:.4f}s. Query: {query_text_for_log}"
-                        )
+                    # Keep only a warning for long-running calls
+                    logger.warning(
+                        f"[DBTrack {op_id}] Long-running DB call for {operation_type} op: {func.__name__} detected: {db_call_duration:.4f}s. Query: {query_text_for_log}"
+                    )
                 else:
                     pass
 
             except Exception as e:
                 db_call_duration = time.perf_counter() - db_call_start_time
-                if _lower_noise:
-                    logger.debug(
-                        f"[DBTrack {op_id}] ERROR in {operation_type} op: {func.__name__} after {db_call_duration:.4f}s in DB call. Query: {query_text_for_log}. Error: {str(e)}",
-                        exc_info=True,
-                    )
-                else:
-                    logger.error(
-                        f"[DBTrack {op_id}] ERROR in {operation_type} op: {func.__name__} after {db_call_duration:.4f}s in DB call. Query: {query_text_for_log}. Error: {str(e)}",
-                        exc_info=True,
-                    )
+                # Always log errors
+                logger.error(
+                    f"[DBTrack {op_id}] ERROR in {operation_type} op: {func.__name__} after {db_call_duration:.4f}s in DB call. Query: {query_text_for_log}. Error: {str(e)}",
+                    exc_info=True,
+                )
                 raise
             finally:
                 overall_duration = time.perf_counter() - overall_start_time
-                if (
-                    abs(overall_duration - db_call_duration) > 0.1
-                    or db_call_duration > self.VALIDATOR_QUERY_TIMEOUT / 4
-                ):
-                    if _lower_noise:
-                        logger.debug(
-                            f"[DBTrack {op_id}] EXITING {operation_type} op: {func.__name__}. DB call: {db_call_duration:.4f}s, Total in wrapper: {overall_duration:.4f}s. Query: {query_text_for_log}"
-                        )
-                    else:
-                        logger.info(
-                            f"[DBTrack {op_id}] EXITING {operation_type} op: {func.__name__}. DB call: {db_call_duration:.4f}s, Total in wrapper: {overall_duration:.4f}s. Query: {query_text_for_log}"
-                        )
+                # Skip EXITING logs to reduce noise
 
             return result
 
@@ -548,17 +521,18 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 )
                 miner_row = existing_miner.fetchone()
 
+                # Coerce types to match schema (Text for ip, ip_type, protocol)
                 update_values = {
-                    "hotkey": hotkey,
-                    "coldkey": coldkey,
-                    "ip": ip,
-                    "ip_type": ip_type,
-                    "port": port,
+                    "hotkey": str(hotkey) if hotkey is not None else None,
+                    "coldkey": str(coldkey) if coldkey is not None else None,
+                    "ip": str(ip) if ip is not None else None,
+                    "ip_type": str(ip_type) if ip_type is not None else None,
+                    "port": int(port) if port is not None else None,
                     "incentive": float(incentive) if incentive is not None else None,
                     "stake": float(stake) if stake is not None else None,
                     "trust": float(trust) if trust is not None else None,
                     "vtrust": float(vtrust) if vtrust is not None else None,
-                    "protocol": protocol,
+                    "protocol": str(protocol) if protocol is not None else None,
                     "last_updated": datetime.now(timezone.utc),
                 }
 
@@ -728,6 +702,29 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                             f"No values to update for miner index {index_val}. Skipping."
                         )
                         continue
+
+                    # Coerce types to match schema
+                    if "hotkey" in insert_values and insert_values["hotkey"] is not None:
+                        insert_values["hotkey"] = str(insert_values["hotkey"])
+                    if "coldkey" in insert_values and insert_values["coldkey"] is not None:
+                        insert_values["coldkey"] = str(insert_values["coldkey"])
+                    if "ip" in insert_values and insert_values["ip"] is not None:
+                        insert_values["ip"] = str(insert_values["ip"])
+                    if "ip_type" in insert_values and insert_values["ip_type"] is not None:
+                        insert_values["ip_type"] = str(insert_values["ip_type"])  # column is TEXT
+                    if "protocol" in insert_values and insert_values["protocol"] is not None:
+                        insert_values["protocol"] = str(insert_values["protocol"])  # column is TEXT
+                    if "port" in insert_values and insert_values["port"] is not None:
+                        try:
+                            insert_values["port"] = int(insert_values["port"])
+                        except Exception:
+                            insert_values["port"] = None
+                    for num_field in ("incentive", "stake", "trust", "vtrust"):
+                        if num_field in insert_values and insert_values[num_field] is not None:
+                            try:
+                                insert_values[num_field] = float(insert_values[num_field])
+                            except Exception:
+                                insert_values[num_field] = None
 
                     # Use PostgreSQL's ON CONFLICT DO UPDATE for efficient upsert
                     # REMOVED: unnecessary existence check that was causing the timeout
@@ -1166,9 +1163,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                             if isinstance(query_str, str)
                             else str(query)[:100]
                         )
-                        logger.debug(
-                            f"Query executed successfully within session {id(new_session)} for query: {query_log}..."
-                        )
+                        # Reduce noise: avoid per-query success debug logs
                         return result
                     except asyncio.CancelledError:
                         query_log = (
@@ -1411,6 +1406,41 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             return None
 
     @track_operation("write")
+    async def enqueue_singleton_job(
+        self,
+        *,
+        job_type: str,
+        payload: Dict[str, Any],
+        priority: int = 100,
+        scheduled_at: Optional[datetime] = None,
+    ) -> Optional[int]:
+        """Enqueue a job only if there isn't already an active/pending one of the same type.
+
+        Active set: pending, in_progress, retry_scheduled.
+        """
+        try:
+            exists = await self.fetch_one(
+                """
+                SELECT 1 FROM validator_jobs
+                WHERE job_type = :jt
+                  AND status IN ('pending','in_progress','retry_scheduled')
+                LIMIT 1
+                """,
+                {"jt": job_type},
+            )
+            if exists:
+                return None
+            return await self.enqueue_validator_job(
+                job_type=job_type,
+                payload=payload,
+                priority=priority,
+                scheduled_at=scheduled_at,
+            )
+        except Exception as e:
+            logger.error(f"enqueue_singleton_job failed: {e}")
+            return None
+
+    @track_operation("write")
     async def log_validator_job(self, job_id: int, level: str, message: str) -> None:
         try:
             await self.execute(
@@ -1447,6 +1477,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
               FROM validator_jobs
               WHERE status IN ('pending','retry_scheduled')
                 AND (scheduled_at IS NULL OR scheduled_at <= NOW())
+                AND (next_retry_at IS NULL OR next_retry_at <= NOW())
                 AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
                 {where_extra}
               ORDER BY priority ASC, created_at ASC
@@ -1553,7 +1584,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 FROM weather_forecast_steps s
                 LEFT JOIN weather_miner_responses r
                   ON r.run_id = s.run_id AND r.miner_uid = s.miner_uid
-                WHERE s.step_name IN ('day1','era5')
+                WHERE s.step_name IN ('seed','day1','era5')
                   AND (
                         s.status = 'pending'
                         OR (s.status = 'retry_scheduled' AND (s.next_retry_time IS NULL OR s.next_retry_time <= NOW()))
@@ -1565,38 +1596,40 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             )
             inserted = 0
             for s in steps:
-                # Skip if we don't yet have a response row to operate on
-                if s.get("response_id") is None:
+                step_name = s.get("step_name")
+                # For per-miner steps, require response; for run-level seed, proceed without
+                if step_name in ("day1", "era5") and s.get("response_id") is None:
                     continue
                 payload = {
                     "run_id": s["run_id"],
                     "miner_uid": s["miner_uid"],
                     "response_id": s.get("response_id"),
                     "step_id": s["step_id"],
-                    "step": s["step_name"],
+                    "step": step_name,
                     "miner_hotkey": s.get("miner_hotkey"),
                 }
-                # Avoid duplicates: only enqueue if no active/pending job exists for this step
-                exists = await self.fetch_one(
+                # Atomically insert only if no active job exists for this step to avoid races across workers
+                row = await self.fetch_one(
                     """
-                    SELECT 1 FROM validator_jobs
-                    WHERE step_id = :sid AND status IN ('pending','in_progress','retry_scheduled')
-                    LIMIT 1
+                    INSERT INTO validator_jobs (job_type, priority, status, payload, scheduled_at, run_id, miner_uid, response_id, step_id)
+                    SELECT :job_type, :priority, 'pending', :payload, NULL, :run_id, :miner_uid, :response_id, :step_id
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM validator_jobs
+                        WHERE step_id = :step_id AND status IN ('pending','in_progress','retry_scheduled')
+                    )
+                    RETURNING id
                     """,
-                    {"sid": s["step_id"]},
+                    {
+                        "job_type": f"weather.{step_name}",
+                        "priority": 100,
+                        "payload": dumps(payload) if JSON_PERFORMANCE_AVAILABLE else json.dumps(payload),
+                        "run_id": s["run_id"],
+                        "miner_uid": s["miner_uid"],
+                        "response_id": s.get("response_id"),
+                        "step_id": s["step_id"],
+                    },
                 )
-                if exists:
-                    continue
-                job_id = await self.enqueue_validator_job(
-                    job_type=f"weather.{s['step_name']}",
-                    payload=payload,
-                    priority=100,
-                    scheduled_at=None,
-                    run_id=s["run_id"],
-                    miner_uid=s["miner_uid"],
-                    response_id=s.get("response_id"),
-                    step_id=s["step_id"],
-                )
+                job_id = int(row["id"]) if row else None
                 if job_id:
                     inserted += 1
                     # Link from step to job for easier joins

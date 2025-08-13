@@ -8,6 +8,7 @@ from gaia.validator.database.validator_database_manager import ValidatorDatabase
 from gaia.tasks.defined_tasks.weather.pipeline.scheduler import MinerWorkScheduler
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 from gaia.tasks.defined_tasks.weather.pipeline.steps import day1_step, era5_step
+from gaia.tasks.defined_tasks.weather.pipeline.steps import seed_step
 from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import (
     evaluate_miner_forecast_day1,
 )
@@ -16,6 +17,9 @@ from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
     fetch_gfs_analysis_data,
     fetch_gfs_data,
 )
+from gaia.validator.utils.substrate_manager import get_process_isolated_substrate
+from fiber.chain.fetch_nodes import get_nodes_for_netuid
+from gaia.validator.weights.weight_service import commit_weights_if_eligible
 
 
 # verification removed
@@ -43,9 +47,24 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     except Exception:
         pass
     # Prefer generic queue if available
-    job = await db.claim_validator_job(worker_name="weather-w/1", job_type_prefix="weather.")
+    # Use the actual worker process name as claimed_by to avoid all showing weather-w/1
+    try:
+        import multiprocessing as _mp
+        _pname = _mp.current_process().name if _mp.current_process() else "weather-w/1"
+    except Exception:
+        _pname = "weather-w/1"
+    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="weather.")
     if job:
         try:
+            # Log concise claim
+            try:
+                import logging as _logging, multiprocessing as _mp
+                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
+                _logging.getLogger(__name__).info(
+                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
+                )
+            except Exception:
+                pass
             jtype = job.get("job_type")
             payload = job.get("payload") or {}
             if isinstance(payload, str):
@@ -55,7 +74,28 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     payload = _json.loads(payload)
                 except Exception:
                     payload = {}
-            if jtype == "weather.day1":
+            if jtype == "weather.seed":
+                # Run-level seed job (download_gfs), payload has run_id and a coordinator miner tag
+                rid = payload.get("run_id")
+                uid = payload.get("miner_uid") or payload.get("uid")
+                hk = payload.get("miner_hotkey") or payload.get("hk") or "coordinator"
+                if rid is not None and uid is not None:
+                    ok = await seed_step.run_item(
+                        db,
+                        run_id=int(rid),
+                        miner_uid=int(uid),
+                        miner_hotkey=str(hk),
+                        validator=validator,
+                    )
+                else:
+                    ok = False
+                # Regardless of success, complete the job (seed step is idempotent and guarded by advisory lock)
+                if ok:
+                    await db.complete_validator_job(job["id"], result={"ok": True})
+                else:
+                    await db.fail_validator_job(job["id"], "seed step returned False", schedule_retry_in_seconds=300)
+                return ok
+            elif jtype == "weather.day1":
                 if all(k in payload for k in ("run_id", "miner_uid", "response_id")):
                     miner_hotkey = payload.get("miner_hotkey")
                     if not miner_hotkey:
@@ -129,9 +169,17 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             return False
 
     # Try non-weather utility queues next: stats → metagraph → miners → era5 → ops
-    job = await db.claim_validator_job(worker_name="weather-w/1", job_type_prefix="stats.")
+    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="stats.")
     if job:
         try:
+            try:
+                import logging as _logging, multiprocessing as _mp
+                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
+                _logging.getLogger(__name__).info(
+                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
+                )
+            except Exception:
+                pass
             j = job.get("job_type")
             if j == "stats.aggregate":
                 from gaia.tasks.defined_tasks.weather.pipeline.steps.aggregate_step import run_miner_aggregation
@@ -153,9 +201,17 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             await db.fail_validator_job(job["id"], f"exception: {e}")
             return False
 
-    job = await db.claim_validator_job(worker_name="weather-w/1", job_type_prefix="metagraph.")
+    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="metagraph.")
     if job:
         try:
+            try:
+                import logging as _logging, multiprocessing as _mp
+                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
+                _logging.getLogger(__name__).info(
+                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')}"
+                )
+            except Exception:
+                pass
             # Placeholder: actual metagraph sync handled elsewhere; mark completed
             await db.complete_validator_job(job["id"], result={"ok": True})
             return True
@@ -163,12 +219,20 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             await db.fail_validator_job(job["id"], f"exception: {e}")
             return False
 
-    job = await db.claim_validator_job(worker_name="weather-w/1", job_type_prefix="miners.")
+    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="miners.")
     if job:
         try:
             # Opportunistically ensure polling jobs exist
             try:
                 await db.enqueue_miner_poll_jobs(limit=500)
+            except Exception:
+                pass
+            try:
+                import logging as _logging, multiprocessing as _mp
+                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
+                _logging.getLogger(__name__).info(
+                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
+                )
             except Exception:
                 pass
             j = job.get("job_type")
@@ -220,6 +284,69 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                         return False
                 await db.fail_validator_job(job["id"], "missing payload fields")
                 return False
+            elif j == "miners.handle_deregistrations":
+                # Fetch current nodes from chain and upsert into node_table
+                try:
+                    import os as _os
+                    netuid = int(_os.getenv("NETUID", "237"))
+                    substrate = get_process_isolated_substrate(
+                        subtensor_network=_os.getenv("SUBTENSOR_NETWORK", "test"),
+                        chain_endpoint=_os.getenv("SUBTENSOR_ADDRESS", "") or "",
+                    )
+                    nodes = get_nodes_for_netuid(substrate=substrate, netuid=netuid)
+                    miners_data = []
+                    for n in nodes or []:
+                        try:
+                            index_val = int(getattr(n, "node_id", None) or getattr(n, "uid", 0))
+                            # Compare briefly against current DB snapshot; only enqueue changes
+                            existing = await db.fetch_one(
+                                "SELECT hotkey, coldkey, ip, ip_type, port, incentive, stake, trust, vtrust, protocol FROM node_table WHERE uid = :u",
+                                {"u": index_val},
+                            )
+                            row = {
+                                "index": index_val,
+                                "hotkey": getattr(n, "hotkey", None),
+                                "coldkey": getattr(n, "coldkey", None),
+                                "ip": getattr(n, "ip", None),
+                                "ip_type": getattr(n, "ip_type", None),
+                                "port": getattr(n, "port", None),
+                                "incentive": getattr(n, "incentive", None),
+                                "stake": getattr(n, "stake", None),
+                                "trust": getattr(n, "trust", None),
+                                "vtrust": getattr(n, "validator_trust", None),
+                                "protocol": getattr(n, "protocol", None),
+                            }
+                            if not existing or any(
+                                (existing.get(k) != row.get(k)) for k in [
+                                    "hotkey","coldkey","ip","ip_type","port","incentive","stake","trust","vtrust","protocol"
+                                ]
+                            ):
+                                miners_data.append(row)
+                        except Exception:
+                            continue
+                    if miners_data:
+                        await db.batch_update_miners(miners_data)
+                    await db.complete_validator_job(job["id"], result={"updated": len(miners_data)})
+                    return True
+                except Exception as e:
+                    await db.fail_validator_job(job["id"], f"dereg exception: {e}", schedule_retry_in_seconds=300)
+                    return False
+            elif j == "weights.set":
+                # Offloaded weight setting (singleton). Uses validator instance passed from parent if provided.
+                try:
+                    ok = False
+                    if validator is not None:
+                        ok = await commit_weights_if_eligible(validator)
+                    if ok:
+                        await db.complete_validator_job(job["id"], result={"ok": True})
+                        return True
+                    else:
+                        # Not eligible yet; back off 2 minutes
+                        await db.fail_validator_job(job["id"], "not eligible", schedule_retry_in_seconds=120)
+                        return True
+                except Exception as e:
+                    await db.fail_validator_job(job["id"], f"weights exception: {e}", schedule_retry_in_seconds=180)
+                    return False
             else:
                 # Unknown miners.* job
                 await db.fail_validator_job(job["id"], "unknown miners job")
@@ -228,9 +355,17 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             await db.fail_validator_job(job["id"], f"exception: {e}")
             return False
 
-    job = await db.claim_validator_job(worker_name="weather-w/1", job_type_prefix="era5.")
+    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="era5.")
     if job:
         try:
+            try:
+                import logging as _logging, multiprocessing as _mp
+                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
+                _logging.getLogger(__name__).info(
+                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')}"
+                )
+            except Exception:
+                pass
             # Placeholder: era5 token refresh, etc.
             await db.complete_validator_job(job["id"], result={"ok": True})
             return True
@@ -238,9 +373,17 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             await db.fail_validator_job(job["id"], f"exception: {e}")
             return False
 
-    job = await db.claim_validator_job(worker_name="weather-w/1", job_type_prefix="ops.")
+    job = await db.claim_validator_job(worker_name=_pname, job_type_prefix="ops.")
     if job:
         try:
+            try:
+                import logging as _logging, multiprocessing as _mp
+                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
+                _logging.getLogger(__name__).info(
+                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')}"
+                )
+            except Exception:
+                pass
             # Placeholder ops (status snapshot, db monitor, plots)
             await db.complete_validator_job(job["id"], result={"ok": True})
             return True

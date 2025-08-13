@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import os
 import signal
 import multiprocessing as mp
@@ -16,11 +17,59 @@ def _prefix() -> str:
     return f"[{pname}]"
 
 
-async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0) -> None:
+def _get_rss_mb() -> float:
+    """Return current process RSS in MB (fallbacks avoid external deps)."""
+    try:
+        import psutil  # type: ignore
+
+        return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+    except Exception:
+        try:
+            # Linux: read VmRSS from /proc/self/status
+            with open("/proc/self/status", "r") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            # value in kB
+                            return float(parts[1]) / 1024.0
+        except Exception:
+            pass
+        try:
+            # Fallback to ru_maxrss (max, not current, but better than nothing)
+            import resource  # type: ignore
+
+            rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # On Linux ru_maxrss is in kilobytes
+            return float(rss_kb) / 1024.0
+        except Exception:
+            return -1.0
+
+
+async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0, memory_limit_mb: float = 0.0) -> None:
+    last_idle_log = 0.0
+    tag = _prefix()
     while True:
         try:
             processed = await process_one(db, validator=None)
+            # Memory guard: restart if above limit
+            if memory_limit_mb and memory_limit_mb > 0:
+                rss_mb = _get_rss_mb()
+                if rss_mb >= 0 and rss_mb > memory_limit_mb:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        f"{tag} memory threshold exceeded: rss={rss_mb:.1f}MB > limit={memory_limit_mb:.1f}MB — exiting for restart"
+                    )
+                    break
             if not processed:
+                now = time.time()
+                # Occasional idle heartbeat
+                if now - last_idle_log > 60:
+                    import logging as _logging
+                    rss_mb = _get_rss_mb()
+                    mem_str = f" | rss={rss_mb:.1f}MB" if rss_mb >= 0 else ""
+                    _logging.getLogger(__name__).info(f"{tag} idle: no jobs to claim currently{mem_str}")
+                    last_idle_log = now
                 await asyncio.sleep(idle_sleep)
         except asyncio.CancelledError:
             break
@@ -31,6 +80,7 @@ async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0) -> 
 
 async def _install_worker_prefix_filters(tag: str) -> None:
     import logging
+    import sys
 
     class _WorkerTagFilter(logging.Filter):
         def __init__(self, tag: str) -> None:
@@ -48,6 +98,14 @@ async def _install_worker_prefix_filters(tag: str) -> None:
             return True
 
     root_logger = logging.getLogger()
+    # Ensure INFO level and a stdout handler so PM2 captures worker logs
+    root_logger.setLevel(logging.INFO)
+    if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+        sh = logging.StreamHandler(stream=sys.stdout)
+        sh.setLevel(logging.INFO)
+        fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s:%(funcName)s:%(lineno)d - %(message)s")
+        sh.setFormatter(fmt)
+        root_logger.addHandler(sh)
     f = _WorkerTagFilter(tag)
     root_logger.addFilter(f)
     # Also attach to common app loggers
@@ -75,8 +133,9 @@ async def main() -> None:
             raise
     try:
         idle = float(os.getenv("WEATHER_WORKER_IDLE_SLEEP", "5"))
-        print(f"{tag} started (idle_sleep={idle}s)")
-        await worker_loop(db, idle_sleep=idle)
+        mem_limit = float(os.getenv("WEATHER_WORKER_RSS_LIMIT_MB", "3072"))
+        print(f"{tag} started (idle_sleep={idle}s, rss_limit={mem_limit}MB)")
+        await worker_loop(db, idle_sleep=idle, memory_limit_mb=mem_limit)
     finally:
         await db.close_all_connections()
 

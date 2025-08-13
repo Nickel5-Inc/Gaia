@@ -3481,7 +3481,8 @@ class GaiaValidator:
 
     async def main(self):
         """Main execution loop for the validator."""
-
+        # Mark that main has started so outer finally doesn't trigger shutdown prematurely
+        self._main_started = True
 
         async def run_validator_logic():
             # Suppress gcsfs/aiohttp cleanup warnings that can block PM2 restart
@@ -3539,9 +3540,9 @@ class GaiaValidator:
                             if any(s in msg for s in ["shutting down", "starting up", "CannotConnectNow"]):
                                 await asyncio.sleep(backoff)
                                 backoff = min(backoff * 1.5, 5.0)
-                                continue
-                            # Other errors: brief wait and retry
-                            await asyncio.sleep(1.0)
+                            else:
+                                # Other errors: brief wait and retry
+                                await asyncio.sleep(1.0)
 
                 logger.info("Waiting for database to be ready before starting workers...")
                 await _wait_for_database_ready()
@@ -3576,7 +3577,7 @@ class GaiaValidator:
                                     if not fut.done():
                                         fut.set_result(res)
                                 except Exception as e:
-                                    if not fut.done():
+                                    if fut and not fut.done():
                                         fut.set_exception(e)
                         except asyncio.CancelledError:
                             break
@@ -3665,7 +3666,7 @@ class GaiaValidator:
                 await self.start_watchdog()
                 logger.info("Watchdog started.")
 
-        
+
 
                 # Start auto-updater as independent task (not in main loop to avoid self-cancellation)
                 logger.info("Starting independent auto-updater task...")
@@ -3682,34 +3683,42 @@ class GaiaValidator:
                         try:
                             now = _dt.datetime.now(_dt.timezone.utc)
                             # Stats aggregation and subnet snapshot every 10 minutes
-                            await db.enqueue_validator_job(
+                            await db.enqueue_singleton_job(
                                 job_type="stats.aggregate",
                                 payload={"ts": now.isoformat()},
                                 priority=120,
                                 scheduled_at=now,
                             )
-                            await db.enqueue_validator_job(
+                            await db.enqueue_singleton_job(
                                 job_type="stats.subnet_snapshot",
                                 payload={"ts": now.isoformat()},
                                 priority=130,
                                 scheduled_at=now,
                             )
+                            # Weights: enqueue singleton weight setting
+                            await db.enqueue_singleton_job(
+                                job_type="weights.set",
+                                payload={"reason": "recurring"},
+                                priority=140,
+                                scheduled_at=now,
+                            )
                             # Metagraph sync and miner dereg handling every 5 minutes
-                            await db.enqueue_validator_job(
-                                job_type="metagraph.sync",
-                                payload={},
-                                priority=150,
-                                scheduled_at=now,
-                            )
-                            await db.enqueue_validator_job(
-                                job_type="miners.handle_deregistrations",
-                                payload={},
-                                priority=160,
-                                scheduled_at=now,
-                            )
+                            if now.minute % 5 == 0:
+                                await db.enqueue_singleton_job(
+                                    job_type="metagraph.sync",
+                                    payload={},
+                                    priority=150,
+                                    scheduled_at=now,
+                                )
+                                await db.enqueue_singleton_job(
+                                    job_type="miners.handle_deregistrations",
+                                    payload={},
+                                    priority=160,
+                                    scheduled_at=now,
+                                )
                             # ERA5 token refresh hourly on top of the hour
                             if now.minute == 0:
-                                await db.enqueue_validator_job(
+                                await db.enqueue_singleton_job(
                                     job_type="era5.refresh_token",
                                     payload={},
                                     priority=170,
@@ -3717,13 +3726,13 @@ class GaiaValidator:
                                 )
                             # Ops status and DB monitor every 15 minutes
                             if now.minute % 15 == 0:
-                                await db.enqueue_validator_job(
+                                await db.enqueue_singleton_job(
                                     job_type="ops.status_snapshot",
                                     payload={},
                                     priority=180,
                                     scheduled_at=now,
                                 )
-                                await db.enqueue_validator_job(
+                                await db.enqueue_singleton_job(
                                     job_type="db.monitor",
                                     payload={},
                                     priority=181,
@@ -3737,9 +3746,10 @@ class GaiaValidator:
 
                 tasks_lambdas = [  # Renamed to avoid conflict if tasks variable is used elsewhere
                     lambda: self.weather_task.validator_execute(self),
+                    lambda: self.weather_task.initiate_fetch_retry_loop(self),
                     lambda: self.status_logger(),
                     lambda: self.main_scoring(),
-                    lambda: self.handle_miner_deregistration_loop(),
+                    # Deregistration moved to workers via miners.handle_deregistrations singleton job
                     # The MinerScoreSender task will be added conditionally below
                     lambda: self.manage_earthdata_token(),
                     lambda: self.monitor_client_health(),  # Added HTTP client monitoring
@@ -3748,7 +3758,7 @@ class GaiaValidator:
                     lambda: self.aggressive_memory_cleanup(),  # Added aggressive memory cleanup task
   
                 ]
-            
+
                 # Add DB Sync tasks conditionally
                 if self.auto_sync_manager:
                     logger.info(
@@ -4000,14 +4010,7 @@ class GaiaValidator:
         await run_validator_logic()
 
     async def main_scoring(self):
-        """Run scoring every subnet tempo blocks."""
-        weight_setter = FiberWeightSetter(
-            netuid=self.netuid,
-            wallet_name=self.wallet_name,
-            hotkey_name=self.hotkey_name,
-            network=self.subtensor_network,
-            # Substrate manager removed - using fresh connections only
-        )
+        """Run scoring supervision; offloads weight setting to worker job."""
 
         while True:
             try:
@@ -4096,83 +4099,12 @@ class GaiaValidator:
                             blocks_since_update is not None
                             and blocks_since_update >= min_interval
                         ):
-                            logger.info(
-                                f"Setting weights: {blocks_since_update}/{min_interval} blocks"
+                            # Offload to worker via singleton job; worker will gate eligibility
+                            await self.database_manager.enqueue_singleton_job(
+                                job_type="weights.set", payload={"reason": "eligible"}, priority=140
                             )
-                            can_set = w.can_set_weights(
-                                self.substrate, self.netuid, validator_uid
-                            )
-
-                            if can_set:
-                                await self.update_task_status(
-                                    "scoring", "processing", "weight_setting"
-                                )
-
-                                # Calculate weights with timeout
-                                normalized_weights = await asyncio.wait_for(
-                                    self._calc_task_weights(), timeout=120
-                                )
-
-                                if normalized_weights:
-                                    # Apply weight perturbation for anti-weight-copying defense
-                                    if self.perturbation_manager:
-                                        try:
-                                            import numpy as np
-
-                                            weights_array = np.array(normalized_weights)
-                                            perturbed_weights = await self.perturbation_manager.get_perturbed_weights(
-                                                weights_array
-                                            )
-                                            normalized_weights = (
-                                                perturbed_weights.tolist()
-                                            )
-                                            logger.info(
-                                                "Applied weight perturbation for anti-weight-copying defense"
-                                            )
-                                        except Exception as e:
-                                            logger.error(
-                                                f"Failed to apply weight perturbation: {e}"
-                                            )
-                                            # Continue with unperturbed weights
-
-                                    # Set weights with timeout
-                                    success = await asyncio.wait_for(
-                                        weight_setter.set_weights(normalized_weights),
-                                        timeout=480,
-                                    )
-
-                                    if success:
-                                        await self.update_last_weights_block()
-                                        self.last_successful_weight_set = time.time()
-                                        logger.info("✅ Successfully set weights")
-
-                                        # Invalidate shared block cache after weight setting
-                                        self._shared_block_cache["block_number"] = None
-
-                                        
-
-                                        # MEMORY LEAK FIX: Aggressive substrate cleanup after successful weight setting
-                                        try:
-                                            substrate_cleanup_count = (
-                                                self._aggressive_substrate_cleanup(
-                                                    "post_weight_setting"
-                                                )
-                                            )
-                                            if substrate_cleanup_count > 0:
-                                                logger.info(
-                                                    f"Post-weight-setting cleanup: cleared {substrate_cleanup_count} substrate cache objects"
-                                                )
-                                        except Exception as substrate_cleanup_err:
-                                            logger.debug(
-                                                f"Error during post-weight-setting substrate cleanup: {substrate_cleanup_err}"
-                                            )
-
-                                        await self.update_task_status("scoring", "idle")
-
-                                        # Clean up any stale operations
-                                        await self.database_manager.cleanup_stale_operations(
-                                            "score_table"
-                                        )
+                            await self.update_task_status("scoring", "idle", "weights_enqueued")
+                            return True
                         else:
                             logger.info(
                                 f"Waiting for weight setting: {blocks_since_update}/{min_interval} blocks"
@@ -4558,7 +4490,7 @@ class GaiaValidator:
                                     except Exception as e_hist_del:
                                         logger.warning(
                                             f"  Could not clear {table_name} for old hotkey {original_hotkey}: {e_hist_del}"
-                                        )
+                                    )
 
                                 # 3. Clean up weather-specific tables for this UID
                                 # CRITICAL: Must clean weather_miner_scores and weather_miner_responses
@@ -4646,7 +4578,7 @@ class GaiaValidator:
                                 logger.error(
                                     f"Error processing hotkey change for UID {uid_to_process}: {str(e)}",
                                     exc_info=True,
-                                )
+                            )
 
                     # --- Step 3: Update info for existing miners where hotkey didn't change ---
                     if uids_to_update_info:
@@ -6784,7 +6716,7 @@ if __name__ == "__main__":
         print(f"[STARTUP DEBUG] Unhandled exception: {e}")
     finally:
         print("[STARTUP DEBUG] Entering finally block")
-        if hasattr(validator, "_cleanup_done") and not validator._cleanup_done:
+        if getattr(validator, "_main_started", False) and not getattr(validator, "_cleanup_done", False):
             try:
                 try:
                     loop = asyncio.get_event_loop()

@@ -28,6 +28,10 @@ def substep(
             run_id = kwargs.get("run_id")
             miner_uid = kwargs.get("miner_uid", 0)
             miner_hotkey = kwargs.get("miner_hotkey", "coordinator")
+            # Normalize lead_hours for uniqueness to avoid accidental duplicate rows
+            lead_hours = kwargs.get("lead_hours")
+            if lead_hours is None:
+                lead_hours = 0
             await log_start(
                 db,
                 run_id=run_id,
@@ -35,6 +39,7 @@ def substep(
                 miner_hotkey=miner_hotkey,
                 step_name=step_name,
                 substep=substep_name,
+                lead_hours=lead_hours,
             )
             try:
                 result = await func(db, task, **kwargs)
@@ -45,6 +50,7 @@ def substep(
                     miner_hotkey=miner_hotkey,
                     step_name=step_name,
                     substep=substep_name,
+                    lead_hours=lead_hours,
                 )
                 return result
             except Exception as e:
@@ -68,6 +74,7 @@ def substep(
                     miner_hotkey=miner_hotkey,
                     step_name=step_name,
                     substep=substep_name,
+                    lead_hours=lead_hours,
                     error_json={"type": f"{step_name}_{substep_name}_failed", "message": str(e)},
                     retry_count=1 if nrt else None,
                     next_retry_time=nrt,
@@ -80,6 +87,7 @@ def substep(
                         miner_hotkey=miner_hotkey,
                         step_name=step_name,
                         substep=substep_name,
+                        lead_hours=lead_hours,
                         error_json={"type": f"{step_name}_{substep_name}_failed"},
                         retry_count=1,
                         next_retry_time=nrt,

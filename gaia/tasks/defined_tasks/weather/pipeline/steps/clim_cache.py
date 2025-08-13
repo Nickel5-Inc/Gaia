@@ -116,15 +116,7 @@ async def ensure_clim_cache(
             except Exception:
                 pass
     else:
-        # Another worker is computing; wait for appearance (bounded spins)
-        for _ in range(60):
-            if data_path.exists():
-                try:
-                    with open(data_path, "rb") as f:
-                        return pickle.load(f)
-                except Exception:
-                    break
-            await task.sleep(1.0) if hasattr(task, "sleep") else None
+        # Another worker is computing; avoid busy wait by returning None and letting caller retry via step scheduler
         return None
 
 
