@@ -89,7 +89,8 @@ async def run(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> 
     if validator is not None:
         setattr(task, "validator", validator)
 
-    gfs_init = get_effective_gfs_init(task, run["gfs_init_time_utc"])
+    # Use stored gfs_init_time_utc directly; it already includes test-mode shift at run creation
+    gfs_init = run["gfs_init_time_utc"]
 
     # Fetch inputs (decorated sub-step with retries)
     try:
@@ -224,3 +225,136 @@ async def run(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> 
     return bool(result)
 
 
+async def run_item(
+    db: ValidatorDatabaseManager,
+    *,
+    run_id: int,
+    miner_uid: int,
+    miner_hotkey: str,
+    response_id: int,
+    validator: Optional[Any] = None,
+) -> bool:
+    """Process Day1 for a specific miner/run item (used by generic queue dispatcher)."""
+    run = await db.fetch_one(
+        "SELECT id, gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",
+        {"rid": run_id},
+    )
+    if not run:
+        return False
+    task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+    if validator is not None:
+        setattr(task, "validator", validator)
+    gfs_init = run["gfs_init_time_utc"]
+    resp = await db.fetch_one(
+        "SELECT id, run_id, miner_uid, miner_hotkey, job_id FROM weather_miner_responses WHERE id = :rid",
+        {"rid": response_id},
+    )
+    if not resp:
+        return False
+    # Fetch inputs
+    try:
+        gfs_analysis_ds, gfs_ref_ds, era5_clim = await _load_inputs(
+            db,
+            task,
+            run_id=run_id,
+            miner_uid=miner_uid,
+            miner_hotkey=miner_hotkey,
+            gfs_init=gfs_init,
+        )
+    except Exception:
+        return False
+    miner_record = {
+        "id": resp["id"],
+        "miner_hotkey": miner_hotkey,
+        "run_id": run_id,
+        "miner_uid": miner_uid,
+        "job_id": resp.get("job_id"),
+    }
+    day1_cfg = {
+        "variables": task.config.get("day1_variables_levels_to_score", []),
+        "pattern_correlation_threshold": task.config.get("day1_pattern_correlation_threshold", 0.3),
+        "acc_lower_bound": task.config.get("day1_acc_lower_bound", 0.6),
+        "alpha_skill": task.config.get("day1_alpha_skill", 0.6),
+        "beta_acc": task.config.get("day1_beta_acc", 0.4),
+        "clone_penalty_gamma": task.config.get("day1_clone_penalty_gamma", 1.0),
+        "clone_delta_thresholds": task.config.get("day1_clone_delta_thresholds", {}),
+    }
+    import time
+    t0 = time.perf_counter()
+    try:
+        result = await _score_day1(
+            db,
+            task,
+            run_id=run_id,
+            miner_uid=miner_uid,
+            miner_hotkey=miner_hotkey,
+            gfs_init=gfs_init,
+            miner_record=miner_record,
+            gfs_analysis_ds=gfs_analysis_ds,
+            gfs_ref_ds=gfs_ref_ds,
+            era5_clim=era5_clim,
+            day1_cfg=day1_cfg,
+        )
+    except Exception:
+        result = None
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+    try:
+        overall = None
+        if isinstance(result, dict):
+            overall = result.get("overall_day1_score") or result.get("overall_score")
+        if overall is not None:
+            stats = WeatherStatsManager(
+                db,
+                validator_hotkey=(
+                    getattr(getattr(getattr(validator, "validator_wallet", None), "hotkey", None), "ss58_address", None)
+                    if validator is not None
+                    else "unknown_validator"
+                ),
+            )
+            await stats.update_forecast_stats(
+                run_id=run_id,
+                miner_uid=miner_uid,
+                miner_hotkey=miner_hotkey,
+                status="day1_scored",
+                initial_score=float(overall),
+            )
+            await log_success(
+                db,
+                run_id=run_id,
+                miner_uid=miner_uid,
+                miner_hotkey=miner_hotkey,
+                step_name="day1",
+                substep="score",
+                latency_ms=latency_ms,
+            )
+            try:
+                await stats.aggregate_miner_stats(miner_uid=miner_uid)
+            except Exception:
+                pass
+        from gaia.tasks.defined_tasks.weather.processing.weather_logic import _check_run_completion
+        try:
+            await _check_run_completion(task, run_id)
+        except Exception:
+            pass
+        try:
+            await cleanup_clim_cache_if_done(db, task, run_id=run_id)
+        except Exception:
+            pass
+    except Exception:
+        try:
+            from gaia.tasks.defined_tasks.weather.pipeline.retry_policy import next_retry_time as _nrt
+            nrt = _nrt("day1", 1)
+            await log_failure(
+                db,
+                run_id=run_id,
+                miner_uid=miner_uid,
+                miner_hotkey=miner_hotkey,
+                step_name="day1",
+                substep="score",
+                error_json={"type": "day1_unknown", "message": "exception during scoring"},
+                retry_count=1,
+                next_retry_time=nrt,
+            )
+        except Exception:
+            pass
+    return bool(result)

@@ -177,12 +177,30 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 "status": "closed",  # 'closed', 'open', 'half-open'
             }
 
+            # Tune pool sizes per process role (main vs worker) before creating semaphores
+            try:
+                import multiprocessing as _mp
+                _pname = _mp.current_process().name if _mp.current_process() else "main"
+            except Exception:
+                _pname = "main"
+
+            # Default (main process) pool sizing
+            cls._instance.MAX_CONNECTIONS = getattr(cls, "MAX_CONNECTIONS", 50)
+            cls._instance.MAX_OVERFLOW = getattr(cls, "MAX_OVERFLOW", 15)
+
+            # Worker processes get smaller pools to avoid aggregate contention
+            if isinstance(_pname, str) and _pname.startswith("weather-w"):
+                cls._instance.MAX_CONNECTIONS = 8
+                cls._instance.MAX_OVERFLOW = 4
+
             # Connection management
             cls._instance._active_sessions = set()
             cls._instance._active_operations = 0
             cls._instance._operation_lock = asyncio.Lock()
             cls._instance._session_lock = asyncio.Lock()
-            cls._instance._pool_semaphore = asyncio.Semaphore(cls.MAX_CONNECTIONS)
+            cls._instance._pool_semaphore = asyncio.Semaphore(
+                cls._instance.MAX_CONNECTIONS
+            )
 
             # Pool health monitoring
             cls._instance._last_pool_check = 0
@@ -358,8 +376,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             # Create our main engine pointing directly to the application DB
             self._engine = create_async_engine(
                 self.db_url,
-                pool_size=self.MAX_CONNECTIONS,  # Use class attribute
-                max_overflow=10,
+                pool_size=self.MAX_CONNECTIONS,  # Tuned per process
+                max_overflow=self.MAX_OVERFLOW,
                 pool_timeout=self.DEFAULT_CONNECTION_TIMEOUT,  # Use base class attribute
                 pool_recycle=300,
                 pool_pre_ping=True,
@@ -1100,6 +1118,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
     ) -> Any:
         """Execute a SQL query with parameters."""
         try:
+            # cooperative yield to reduce event-loop contention
+            await asyncio.sleep(0)
             if self._storage_locked and any(
                 keyword in query.lower() for keyword in ["insert", "update", "delete"]
             ):
@@ -1129,6 +1149,8 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     operation_name=f"execute_new_session_query_snippet_{query_snippet}"
                 ) as new_session:
                     try:
+                        # cooperative yield before executing to let other tasks progress
+                        await asyncio.sleep(0)
                         # No longer need new_session.begin() here.
                         # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
                         if isinstance(query, str):
@@ -1348,6 +1370,244 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         except Exception as e:
             logger.error(f"Error getting database performance stats: {e}")
             return {"error": str(e)}
+
+    # --- Generic validator job queue helpers ---
+
+    @track_operation("write")
+    async def enqueue_validator_job(
+        self,
+        *,
+        job_type: str,
+        payload: Dict[str, Any],
+        priority: int = 100,
+        scheduled_at: Optional[datetime] = None,
+        run_id: Optional[int] = None,
+        miner_uid: Optional[int] = None,
+        response_id: Optional[int] = None,
+        step_id: Optional[int] = None,
+    ) -> Optional[int]:
+        try:
+            payload_json = dumps(payload) if JSON_PERFORMANCE_AVAILABLE else json.dumps(payload)
+            row = await self.fetch_one(
+                """
+                INSERT INTO validator_jobs (job_type, priority, status, payload, scheduled_at, run_id, miner_uid, response_id, step_id)
+                VALUES (:job_type, :priority, 'pending', :payload, :scheduled_at, :run_id, :miner_uid, :response_id, :step_id)
+                RETURNING id
+                """,
+                {
+                    "job_type": job_type,
+                    "priority": priority,
+                    "payload": payload_json,
+                    "scheduled_at": scheduled_at,
+                    "run_id": run_id,
+                    "miner_uid": miner_uid,
+                    "response_id": response_id,
+                    "step_id": step_id,
+                },
+            )
+            return int(row["id"]) if row else None
+        except Exception as e:
+            logger.error(f"enqueue_validator_job failed: {e}")
+            return None
+
+    @track_operation("write")
+    async def log_validator_job(self, job_id: int, level: str, message: str) -> None:
+        try:
+            await self.execute(
+                """
+                INSERT INTO validator_job_logs (job_id, level, message)
+                VALUES (:job_id, :level, :message)
+                """,
+                {"job_id": job_id, "level": level, "message": message[:10000]},
+            )
+        except Exception:
+            pass
+
+    @track_operation("write")
+    async def claim_validator_job(
+        self,
+        *,
+        worker_name: str,
+        job_type_prefix: Optional[str] = None,
+        lease_seconds: int = 600,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            where_extra = ""
+            params: Dict[str, Any] = {
+                "worker_name": worker_name,
+                "lease_interval": lease_seconds,
+            }
+            if job_type_prefix:
+                where_extra = " AND job_type LIKE :jprefix"
+                params["jprefix"] = f"{job_type_prefix}%"
+
+            query = f"""
+            WITH cte AS (
+              SELECT id
+              FROM validator_jobs
+              WHERE status IN ('pending','retry_scheduled')
+                AND (scheduled_at IS NULL OR scheduled_at <= NOW())
+                AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
+                {where_extra}
+              ORDER BY priority ASC, created_at ASC
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
+            )
+            UPDATE validator_jobs j
+            SET status = 'in_progress',
+                started_at = COALESCE(j.started_at, NOW()),
+                claimed_by = :worker_name,
+                lease_expires_at = NOW() + (:lease_interval * INTERVAL '1 second'),
+                attempts = j.attempts + 1
+            FROM cte
+            WHERE j.id = cte.id
+            RETURNING j.*
+            """
+            row = await self.fetch_one(query, params)
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"claim_validator_job error: {e}")
+            return None
+
+    @track_operation("write")
+    async def renew_validator_job_lease(self, job_id: int, extend_seconds: int = 600) -> None:
+        try:
+            await self.execute(
+                """
+                UPDATE validator_jobs
+                SET lease_expires_at = NOW() + (:extend * INTERVAL '1 second')
+                WHERE id = :job_id AND status = 'in_progress'
+                """,
+                {"extend": extend_seconds, "job_id": job_id},
+            )
+        except Exception:
+            pass
+
+    @track_operation("write")
+    async def complete_validator_job(self, job_id: int, result: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            params: Dict[str, Any] = {"job_id": job_id}
+            if result is not None:
+                params["result"] = dumps(result) if JSON_PERFORMANCE_AVAILABLE else json.dumps(result)
+                query = """
+                UPDATE validator_jobs
+                SET status = 'completed', completed_at = NOW(), lease_expires_at = NULL, result = :result::jsonb
+                WHERE id = :job_id
+                """
+            else:
+                query = """
+                UPDATE validator_jobs
+                SET status = 'completed', completed_at = NOW(), lease_expires_at = NULL
+                WHERE id = :job_id
+                """
+            await self.execute(query, params)
+        except Exception as e:
+            logger.error(f"complete_validator_job error: {e}")
+
+    @track_operation("write")
+    async def fail_validator_job(
+        self,
+        job_id: int,
+        error_message: str,
+        *,
+        schedule_retry_in_seconds: Optional[int] = None,
+    ) -> None:
+        try:
+            if schedule_retry_in_seconds is not None:
+                await self.execute(
+                    """
+                    UPDATE validator_jobs
+                    SET status = 'retry_scheduled',
+                        last_error = :err,
+                        lease_expires_at = NULL,
+                        next_retry_at = NOW() + (:delay * INTERVAL '1 second')
+                    WHERE id = :job_id
+                    """,
+                    {"job_id": job_id, "err": error_message[:10000], "delay": schedule_retry_in_seconds},
+                )
+            else:
+                await self.execute(
+                    """
+                    UPDATE validator_jobs
+                    SET status = 'failed',
+                        last_error = :err,
+                        lease_expires_at = NULL,
+                        completed_at = NOW()
+                    WHERE id = :job_id
+                    """,
+                    {"job_id": job_id, "err": error_message[:10000]},
+                )
+        except Exception as e:
+            logger.error(f"fail_validator_job error: {e}")
+
+    @track_operation("write")
+    async def enqueue_weather_step_jobs(self, limit: int = 200) -> int:
+        """Scan weather_forecast_steps for pending/retry and enqueue validator_jobs for them.
+        Returns number of jobs inserted.
+        """
+        try:
+            steps = await self.fetch_all(
+                """
+                SELECT s.id AS step_id, s.run_id, s.miner_uid, s.step_name,
+                       r.id AS response_id, r.miner_hotkey
+                FROM weather_forecast_steps s
+                LEFT JOIN weather_miner_responses r
+                  ON r.run_id = s.run_id AND r.miner_uid = s.miner_uid
+                WHERE s.step_name IN ('verify','day1','era5')
+                  AND (
+                        s.status = 'pending'
+                        OR (s.status = 'retry_scheduled' AND (s.next_retry_time IS NULL OR s.next_retry_time <= NOW()))
+                  )
+                ORDER BY s.run_id ASC, s.miner_uid ASC
+                LIMIT :limit
+                """,
+                {"limit": limit},
+            )
+            inserted = 0
+            for s in steps:
+                payload = {
+                    "run_id": s["run_id"],
+                    "miner_uid": s["miner_uid"],
+                    "response_id": s.get("response_id"),
+                    "step_id": s["step_id"],
+                    "step": s["step_name"],
+                    "miner_hotkey": s.get("miner_hotkey"),
+                }
+                # Avoid duplicates: only enqueue if no active/pending job exists for this step
+                exists = await self.fetch_one(
+                    """
+                    SELECT 1 FROM validator_jobs
+                    WHERE step_id = :sid AND status IN ('pending','in_progress','retry_scheduled')
+                    LIMIT 1
+                    """,
+                    {"sid": s["step_id"]},
+                )
+                if exists:
+                    continue
+                job_id = await self.enqueue_validator_job(
+                    job_type=f"weather.{s['step_name']}",
+                    payload=payload,
+                    priority=100,
+                    scheduled_at=None,
+                    run_id=s["run_id"],
+                    miner_uid=s["miner_uid"],
+                    response_id=s.get("response_id"),
+                    step_id=s["step_id"],
+                )
+                if job_id:
+                    inserted += 1
+                    # Link from step to job for easier joins
+                    try:
+                        await self.execute(
+                            "UPDATE weather_forecast_steps SET job_id = :jid WHERE id = :sid",
+                            {"jid": job_id, "sid": s["step_id"]},
+                        )
+                    except Exception:
+                        pass
+            return inserted
+        except Exception as e:
+            logger.error(f"enqueue_weather_step_jobs error: {e}")
+            return 0
 
     @track_operation("write")
     async def optimize_baseline_predictions_table(self) -> Dict[str, Any]:

@@ -1977,9 +1977,29 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 ORDER BY run_initiation_time DESC
                 LIMIT 1
                 """
-                existing_run = await self.db_manager.fetch_one(
-                    existing_run_query, {"gfs_init": gfs_t0_run_time}
-                )
+                # Route via validator DB accessor to avoid main-loop blocking
+                try:
+                    req_id = str(uuid.uuid4())
+                    fut = asyncio.get_event_loop().create_future()
+                    if hasattr(self, "validator") and hasattr(self.validator, "_db_results"):
+                        self.validator._db_results[req_id] = fut
+                        await self.validator._db_work_queue.put(
+                            {
+                                "id": req_id,
+                                "kind": "fetch_one",
+                                "query": existing_run_query,
+                                "params": {"gfs_init": gfs_t0_run_time},
+                            }
+                        )
+                        existing_run = await fut
+                    else:
+                        existing_run = await self.db_manager.fetch_one(
+                            existing_run_query, {"gfs_init": gfs_t0_run_time}
+                        )
+                except Exception:
+                    existing_run = await self.db_manager.fetch_one(
+                        existing_run_query, {"gfs_init": gfs_t0_run_time}
+                    )
 
                 if existing_run:
                     run_id = existing_run["id"]
@@ -2108,18 +2128,19 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 logger.info(
                                     f"[Run {run_id}] Seeded per-miner stats/steps for {seeded} miners."
                                 )
-                                # Warm GFS caches at seed stage
-                                try:
-                                    from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import (
-                                        ensure_gfs_reference_available,
-                                    )
-                                    await ensure_gfs_reference_available(
-                                        self.db_manager, self, run_id=run_id
-                                    )
-                                except Exception as warm_err:
-                                    logger.warning(
-                                        f"[Run {run_id}] GFS warmup failed (will retry via substep logic): {warm_err}"
-                                    )
+                                # Only schedule run-level seed substep if node_table has any miners
+                                if seeded > 0:
+                                    try:
+                                        from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import (
+                                            ensure_gfs_reference_available,
+                                        )
+                                        await ensure_gfs_reference_available(
+                                            self.db_manager, self, run_id=run_id
+                                        )
+                                    except Exception as warm_err:
+                                        logger.warning(
+                                            f"[Run {run_id}] GFS warmup failed (will retry via substep logic): {warm_err}"
+                                        )
                             except Exception as seed_err:
                                 logger.warning(
                                     f"[Run {run_id}] Seeding per-miner rows failed: {seed_err}"
@@ -2167,9 +2188,24 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     logger.info(
                         f"[Run {run_id}] Querying miners with weather initiate fetch request (Endpoint: /weather-initiate-fetch)... Payload size approx: {len(dumps(payload))} bytes"
                     )
-                    responses = await validator.query_miners(
-                        payload=payload, endpoint="/weather-initiate-fetch"
-                    )
+                    # Per-miner secure queries using Fiber handshake
+                    from gaia.validator.miner.miner_query import initiate_fetch as _init_fetch
+                    responses = {}
+                    for miner_hotkey in validator.metagraph.nodes.keys():
+                        try:
+                            res = await _init_fetch(
+                                validator,
+                                miner_hotkey,
+                                forecast_start_time=gfs_t0_run_time,
+                                previous_step_time=gfs_t_minus_6_run_time,
+                                validator_hotkey=(
+                                    validator.keypair.ss58_address if validator.keypair else None
+                                ),
+                            )
+                            if res is not None:
+                                responses[miner_hotkey] = res
+                        except Exception:
+                            continue
                     logger.info(
                         f"[Run {run_id}] Received {len(responses)} initial responses from miners for fetch initiation."
                     )
@@ -4634,13 +4670,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 "data": status_payload_data.model_dump(),
                             }
 
-                            responses_dict = await self.query_miners(
-                                payload=status_payload,
-                                endpoint="/weather-get-input-status",
-                                hotkeys=[miner_hk],
-                            )
-
-                            status_response = responses_dict.get(miner_hk)
+                            from gaia.validator.miner.miner_query import get_input_status as _gis
+                            status_response = await _gis(self, miner_hk, job_id=miner_job_id)
 
                             if status_response:
                                 parsed_response = status_response
@@ -6483,6 +6514,15 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
     async def _create_scoring_job(self, run_id: int, score_type: str) -> bool:
         """Create a persistent scoring job record."""
         try:
+            # Also enqueue into generic validator_jobs for unified dispatch
+            job_type = (
+                "weather.scoring.day1_qc" if score_type == "day1_qc" else "weather.scoring.era5_final"
+            )
+            payload = {"run_id": run_id, "score_type": score_type}
+            _ = await self.db_manager.enqueue_validator_job(
+                job_type=job_type, payload=payload, priority=50, run_id=run_id
+            )
+            # Keep existing table updated for compatibility
             query = """
             INSERT INTO weather_scoring_jobs 
             (run_id, score_type, status, created_at)
@@ -6498,7 +6538,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     "created_at": datetime.now(timezone.utc),
                 },
             )
-            logger.info(f"[Run {run_id}] Created {score_type} scoring job")
+            logger.info(f"[Run {run_id}] Created {score_type} scoring job (+ generic queue)")
             return True
         except Exception as e:
             logger.error(
@@ -6510,6 +6550,21 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
     async def _start_scoring_job(self, run_id: int, score_type: str) -> bool:
         """Mark a scoring job as started."""
         try:
+            # Update generic queue status if exists (best-effort)
+            try:
+                jtype = (
+                    "weather.scoring.day1_qc" if score_type == "day1_qc" else "weather.scoring.era5_final"
+                )
+                await self.db_manager.execute(
+                    """
+                    UPDATE validator_jobs
+                    SET status = 'in_progress', started_at = COALESCE(started_at, NOW())
+                    WHERE run_id = :rid AND job_type = :jtype AND status IN ('pending','retry_scheduled')
+                    """,
+                    {"rid": run_id, "jtype": jtype},
+                )
+            except Exception:
+                pass
             query = """
             UPDATE weather_scoring_jobs 
             SET status = 'in_progress', started_at = :started_at
@@ -6542,6 +6597,31 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         """Mark a scoring job as completed."""
         try:
             status = "completed" if success else "failed"
+            # Best-effort finish generic queue item if exists
+            try:
+                jtype = (
+                    "weather.scoring.day1_qc" if score_type == "day1_qc" else "weather.scoring.era5_final"
+                )
+                if success:
+                    await self.db_manager.execute(
+                        """
+                        UPDATE validator_jobs
+                        SET status = 'completed', completed_at = NOW(), lease_expires_at = NULL
+                        WHERE run_id = :rid AND job_type = :jtype
+                        """,
+                        {"rid": run_id, "jtype": jtype},
+                    )
+                else:
+                    await self.db_manager.execute(
+                        """
+                        UPDATE validator_jobs
+                        SET status = 'failed', last_error = :err, completed_at = NOW(), lease_expires_at = NULL
+                        WHERE run_id = :rid AND job_type = :jtype
+                        """,
+                        {"rid": run_id, "jtype": jtype, "err": (error_message or "")[:10000]},
+                    )
+            except Exception:
+                pass
             query = """
             UPDATE weather_scoring_jobs 
             SET status = :status, completed_at = :completed_at, error_message = :error_msg

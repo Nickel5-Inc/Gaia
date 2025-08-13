@@ -532,6 +532,10 @@ class GaiaValidator:
         self._background_tasks = set()  # Track all background tasks
         self._task_cleanup_lock = asyncio.Lock()
 
+        # Lightweight DB accessor queue and worker to offload blocking DB/chain ops
+        self._db_work_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        self._db_results: dict[str, asyncio.Future] = {}
+
         # Only initialize weather task - geomagnetic and soil moisture tasks disabled
         self.weather_task = WeatherTask(
             db_manager=self.database_manager,
@@ -3542,6 +3546,46 @@ class GaiaValidator:
                 logger.info("Waiting for database to be ready before starting workers...")
                 await _wait_for_database_ready()
 
+                # Start DB accessor task
+                async def _db_accessor_worker():
+                    sem = asyncio.Semaphore(4)  # Cap concurrent ops inside accessor
+                    while not self._shutdown_event.is_set():
+                        try:
+                            work = await self._db_work_queue.get()
+                            if work is None:
+                                break
+                            op_id = work.get("id")
+                            fut: asyncio.Future = self._db_results.pop(op_id, None)
+                            if fut is None:
+                                continue
+                            async with sem:
+                                try:
+                                    kind = work.get("kind")
+                                    if kind == "fetch_one":
+                                        res = await self.database_manager.fetch_one(work["query"], work.get("params"))
+                                    elif kind == "fetch_all":
+                                        res = await self.database_manager.fetch_all(work["query"], work.get("params"))
+                                    elif kind == "execute":
+                                        res = await self.database_manager.execute(work["query"], work.get("params"))
+                                    elif kind == "metagraph_sync":
+                                        # Offload metagraph sync here if needed
+                                        await self._sync_metagraph()
+                                        res = True
+                                    else:
+                                        res = None
+                                    if not fut.done():
+                                        fut.set_result(res)
+                                except Exception as e:
+                                    if not fut.done():
+                                        fut.set_exception(e)
+                        except asyncio.CancelledError:
+                            break
+                        except Exception:
+                            await asyncio.sleep(0.01)
+
+                if not hasattr(self, "_db_accessor_task") or self._db_accessor_task is None:
+                    self._db_accessor_task = asyncio.create_task(_db_accessor_worker(), name="db_accessor_worker")
+
                 # Defer starting worker pool until after AutoSyncManager setup below
 
 
@@ -3629,6 +3673,67 @@ class GaiaValidator:
                     self.check_for_updates(), "auto_updater"
                 )
                 logger.info("Auto-updater task started independently")
+
+                # Lightweight recurring job enqueuer
+                async def _enqueue_recurring_jobs():
+                    db = self.database_manager
+                    import datetime as _dt
+                    while not self._shutdown_event.is_set():
+                        try:
+                            now = _dt.datetime.now(_dt.timezone.utc)
+                            # Stats aggregation and subnet snapshot every 10 minutes
+                            await db.enqueue_validator_job(
+                                job_type="stats.aggregate",
+                                payload={"ts": now.isoformat()},
+                                priority=120,
+                                scheduled_at=now,
+                            )
+                            await db.enqueue_validator_job(
+                                job_type="stats.subnet_snapshot",
+                                payload={"ts": now.isoformat()},
+                                priority=130,
+                                scheduled_at=now,
+                            )
+                            # Metagraph sync and miner dereg handling every 5 minutes
+                            await db.enqueue_validator_job(
+                                job_type="metagraph.sync",
+                                payload={},
+                                priority=150,
+                                scheduled_at=now,
+                            )
+                            await db.enqueue_validator_job(
+                                job_type="miners.handle_deregistrations",
+                                payload={},
+                                priority=160,
+                                scheduled_at=now,
+                            )
+                            # ERA5 token refresh hourly on top of the hour
+                            if now.minute == 0:
+                                await db.enqueue_validator_job(
+                                    job_type="era5.refresh_token",
+                                    payload={},
+                                    priority=170,
+                                    scheduled_at=now,
+                                )
+                            # Ops status and DB monitor every 15 minutes
+                            if now.minute % 15 == 0:
+                                await db.enqueue_validator_job(
+                                    job_type="ops.status_snapshot",
+                                    payload={},
+                                    priority=180,
+                                    scheduled_at=now,
+                                )
+                                await db.enqueue_validator_job(
+                                    job_type="db.monitor",
+                                    payload={},
+                                    priority=181,
+                                    scheduled_at=now,
+                                )
+                        except Exception:
+                            pass
+                        await asyncio.sleep(60)
+
+                self.create_tracked_task(_enqueue_recurring_jobs(), "job_enqueuer")
 
                 tasks_lambdas = [  # Renamed to avoid conflict if tasks variable is used elsewhere
                     lambda: self.weather_task.validator_execute(self),

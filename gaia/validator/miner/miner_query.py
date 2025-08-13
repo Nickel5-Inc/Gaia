@@ -76,18 +76,32 @@ async def query_single_miner(
 
     if validator is not None and getattr(validator, "miner_client", None) and getattr(validator, "keypair", None):
         node = validator.metagraph.nodes.get(miner_hotkey) if getattr(validator, "metagraph", None) else None
-        if not node:
-            return None
-        base_url = f"https://{node.ip}:{node.port}"
-        return await _handshake_and_request(
-            httpx_client=validator.miner_client,
-            base_url=base_url,
-            keypair=validator.keypair,
-            miner_hotkey=miner_hotkey,
-            endpoint=endpoint,
-            payload=payload,
-            timeout=timeout,
-        )
+        base_url: Optional[str] = None
+        if node and getattr(node, "ip", None) and getattr(node, "port", None):
+            base_url = f"https://{node.ip}:{node.port}"
+        else:
+            # Fallback: lookup ip/port in DB
+            db = getattr(validator, "db_manager", None) or getattr(task_or_validator, "db_manager", None)
+            if isinstance(db, ValidatorDatabaseManager):
+                try:
+                    row = await db.fetch_one(
+                        "SELECT ip, port FROM node_table WHERE hotkey = :hk", {"hk": miner_hotkey}
+                    )
+                    if row and row.get("ip") and row.get("port"):
+                        base_url = f"https://{row.get('ip')}:{row.get('port')}"
+                except Exception:
+                    base_url = None
+        if base_url:
+            return await _handshake_and_request(
+                httpx_client=validator.miner_client,
+                base_url=base_url,
+                keypair=validator.keypair,
+                miner_hotkey=miner_hotkey,
+                endpoint=endpoint,
+                payload=payload,
+                timeout=timeout,
+            )
+        # If base_url is still None, fall through to DB path below
 
     # Fallback: direct ip/port lookup
     db = getattr(task_or_validator, "db_manager", None)

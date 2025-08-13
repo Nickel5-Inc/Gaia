@@ -304,6 +304,11 @@ class MinerWorkScheduler:
 
     async def claim_next(self) -> Optional[WorkItem]:
         """Return the next available work item by priority: verify → day1 → era5."""
+        # Opportunistically enqueue missing validator jobs to drive generic queue
+        try:
+            _ = await self.db.enqueue_weather_step_jobs(limit=200)
+        except Exception:
+            pass
         item = await self.claim_to_verify()
         if item:
             return item

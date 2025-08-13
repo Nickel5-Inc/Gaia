@@ -116,11 +116,17 @@ async def seed_forecast_run(
         )
         await db.execute(st)
 
+    # Enqueue generic jobs for these steps
+    try:
+        await db.enqueue_weather_step_jobs(limit=1000)
+    except Exception:
+        pass
+
     return len(miners)
 
 
 @substep("seed", "download_gfs", should_retry=True, retry_delay_seconds=300, max_retries=6, retry_backoff="exponential")
-async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task, *, run_id: int, miner_uid: int = 0, miner_hotkey: str = "coordinator"):
+async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task, *, run_id: int, miner_uid: int = -1, miner_hotkey: str = "coordinator"):
     """Ensure GFS reference for this run is fetched or cached.
 
     Uses the same logic as day1 load_inputs but at run level, and persists locally.
@@ -130,14 +136,8 @@ async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task, *, 
     )
     if not run:
         raise RuntimeError("run not found")
-    # Build a minimal WeatherTask-like object with test_mode inherited
-    # so that get_effective_gfs_init applies the configured hindcast shift once.
-    class _TaskShim:
-        def __init__(self, base):
-            self.test_mode = getattr(base, "test_mode", False)
-            self.config = getattr(base, "config", {})
-
-    gfs_init = get_effective_gfs_init(_TaskShim(task), run["gfs_init_time_utc"]) if hasattr(task, "test_mode") else run["gfs_init_time_utc"]
+    # Use the run's stored GFS init time directly. It is already shifted in test mode at run creation.
+    gfs_init = run["gfs_init_time_utc"]
     from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
         fetch_gfs_analysis_data,
         fetch_gfs_data,

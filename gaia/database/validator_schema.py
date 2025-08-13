@@ -1160,6 +1160,12 @@ weather_forecast_steps_table = sa.Table(
     sa.Column("latency_ms", sa.Integer, nullable=True),
     sa.Column("error_json", postgresql.JSONB, nullable=True),
     sa.Column("context", postgresql.JSONB, nullable=True),
+    sa.Column(
+        "job_id",
+        sa.BigInteger,
+        sa.ForeignKey("validator_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
     sa.UniqueConstraint(
         "run_id", "miner_uid", "step_name", "substep", "lead_hours",
         name="uq_wfsteps_run_miner_step_sub_lead",
@@ -1169,6 +1175,104 @@ weather_forecast_steps_table = sa.Table(
 sa.Index("idx_wfsteps_run_miner", weather_forecast_steps_table.c.run_id, weather_forecast_steps_table.c.miner_uid)
 sa.Index("idx_wfsteps_step_status", weather_forecast_steps_table.c.step_name, weather_forecast_steps_table.c.status)
 sa.Index("idx_wfsteps_next_retry", weather_forecast_steps_table.c.next_retry_time)
+
+# --- Generic Validator Job Queue ---
+validator_jobs_table = sa.Table(
+    "validator_jobs",
+    validator_metadata,
+    sa.Column("id", sa.BigInteger, primary_key=True, autoincrement=True),
+    sa.Column("job_type", sa.String(64), nullable=False),
+    sa.Column("priority", sa.Integer, nullable=False, server_default="100"),
+    sa.Column(
+        "status",
+        sa.String(32),
+        nullable=False,
+        server_default=sa.text("'pending'"),
+    ),
+    sa.Column(
+        "payload",
+        postgresql.JSONB,
+        nullable=False,
+        server_default=sa.text("'{}'::jsonb"),
+    ),
+    sa.Column("result", postgresql.JSONB, nullable=True),
+    sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("max_attempts", sa.Integer, nullable=False, server_default="5"),
+    sa.Column(
+        "created_at",
+        postgresql.TIMESTAMP(timezone=True),
+        server_default=sa.text("NOW()"),
+        nullable=False,
+    ),
+    sa.Column("scheduled_at", postgresql.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column("started_at", postgresql.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column("completed_at", postgresql.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column("last_error", sa.Text, nullable=True),
+    sa.Column("next_retry_at", postgresql.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column("lease_expires_at", postgresql.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column("claimed_by", sa.String(64), nullable=True),
+    # Optional domain links
+    sa.Column(
+        "run_id",
+        sa.Integer,
+        sa.ForeignKey("weather_forecast_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    sa.Column(
+        "miner_uid",
+        sa.Integer,
+        sa.ForeignKey("node_table.uid", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    sa.Column(
+        "response_id",
+        sa.Integer,
+        sa.ForeignKey("weather_miner_responses.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    sa.Column(
+        "step_id",
+        sa.BigInteger,
+        sa.ForeignKey("weather_forecast_steps.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    comment="Generic validator job queue with leases and retries.",
+)
+sa.Index("idx_vjobs_status_sched", validator_jobs_table.c.status, validator_jobs_table.c.scheduled_at)
+sa.Index("idx_vjobs_type_status", validator_jobs_table.c.job_type, validator_jobs_table.c.status)
+sa.Index("idx_vjobs_priority", validator_jobs_table.c.priority)
+sa.Index("idx_vjobs_run", validator_jobs_table.c.run_id)
+sa.Index("idx_vjobs_miner", validator_jobs_table.c.miner_uid)
+sa.Index("idx_vjobs_response", validator_jobs_table.c.response_id)
+sa.Index(
+    "uq_vjobs_run_type_scoring",
+    validator_jobs_table.c.run_id,
+    validator_jobs_table.c.job_type,
+    unique=True,
+    postgresql_where=sa.text("job_type IN ('weather.scoring.day1_qc','weather.scoring.era5_final')"),
+)
+
+validator_job_logs_table = sa.Table(
+    "validator_job_logs",
+    validator_metadata,
+    sa.Column("id", sa.BigInteger, primary_key=True, autoincrement=True),
+    sa.Column(
+        "job_id",
+        sa.BigInteger,
+        sa.ForeignKey("validator_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "created_at",
+        postgresql.TIMESTAMP(timezone=True),
+        server_default=sa.text("NOW()"),
+        nullable=False,
+    ),
+    sa.Column("level", sa.String(16), nullable=False),
+    sa.Column("message", sa.Text, nullable=False),
+    comment="Per-job log messages for auditing and debugging.",
+)
+sa.Index("idx_vjob_logs_job", validator_job_logs_table.c.job_id)
 
 # --- Perturbation Seed Table (Anti-Weight-Copying Mechanism) ---
 # REDESIGNED: Now stores multiple seeds with activation times for safe synchronization

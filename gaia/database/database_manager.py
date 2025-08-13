@@ -1101,6 +1101,8 @@ class BaseDatabaseManager(ABC):
         self, query: str, params: Optional[Dict] = None, timeout: Optional[float] = None
     ) -> Optional[Dict]:
         start_time = time.time()
+        # cooperative yield to reduce event-loop contention before acquiring a session
+        await asyncio.sleep(0)
         # Handle both string queries and SQLAlchemy objects
         query_str = str(query) if hasattr(query, "__str__") else query
         query_snippet = (
@@ -1113,6 +1115,8 @@ class BaseDatabaseManager(ABC):
             try:
                 # No longer need session.begin() here, self.session() handles it.
                 # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
+                # cooperative yield before executing the statement
+                await asyncio.sleep(0)
                 if isinstance(query, str):
                     result = await session.execute(text(query), params or {})
                 else:
@@ -1136,6 +1140,7 @@ class BaseDatabaseManager(ABC):
         self, query: str, params: Optional[Dict] = None, timeout: Optional[float] = None
     ) -> List[Dict]:
         start_time = time.time()
+        await asyncio.sleep(0)
         # Handle both string queries and SQLAlchemy objects
         query_str = str(query) if hasattr(query, "__str__") else query
         query_snippet = (
@@ -1148,6 +1153,7 @@ class BaseDatabaseManager(ABC):
             try:
                 # No longer need session.begin() here, self.session() handles it.
                 # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
+                await asyncio.sleep(0)
                 if isinstance(query, str):
                     result = await session.execute(text(query), params or {})
                 else:

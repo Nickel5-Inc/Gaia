@@ -158,3 +158,126 @@ async def run(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> 
     return True
 
 
+
+async def run_item(
+    db: ValidatorDatabaseManager,
+    *,
+    run_id: int,
+    miner_uid: int,
+    miner_hotkey: str,
+    response_id: int,
+    validator: Optional[Any] = None,
+) -> bool:
+    """Process verify for a specific miner/run item (used by generic queue dispatcher)."""
+    run_details = await db.fetch_one(
+        "SELECT id, gfs_init_time_utc, status FROM weather_forecast_runs WHERE id = :rid",
+        {"rid": run_id},
+    )
+    if not run_details:
+        return False
+    response_details = await db.fetch_one(
+        "SELECT id, miner_hotkey, job_id FROM weather_miner_responses WHERE id = :rid",
+        {"rid": response_id},
+    )
+    if not response_details:
+        return False
+    task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+    if validator is not None:
+        setattr(task, "validator", validator)
+    t0 = time.perf_counter()
+    await log_start(
+        db,
+        run_id=run_id,
+        miner_uid=miner_uid,
+        miner_hotkey=miner_hotkey,
+        step_name="verify",
+        substep="open_store",
+    )
+    await verify_miner_response(task, run_details, response_details)
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    post = await db.fetch_one(
+        """
+        SELECT verification_passed, status, error_message
+        FROM weather_miner_responses
+        WHERE id = :rid
+        """,
+        {"rid": response_id},
+    )
+    if not post:
+        return True
+    hosting_status = _derive_hosting_status(bool(post.get("verification_passed")), post.get("status"))
+    err_msg = post.get("error_message")
+    stats = WeatherStatsManager(
+        db,
+        validator_hotkey=(
+            getattr(getattr(getattr(validator, "validator_wallet", None), "hotkey", None), "ss58_address", None)
+            if validator is not None
+            else "unknown_validator"
+        ),
+    )
+    await stats.update_forecast_stats(
+        run_id=run_id,
+        miner_uid=miner_uid,
+        miner_hotkey=miner_hotkey,
+        status=post.get("status") or "verify_complete",
+        error_msg=err_msg,
+        hosting_status=hosting_status,
+        hosting_latency_ms=elapsed_ms,
+    )
+    if post.get("verification_passed"):
+        await log_success(
+            db,
+            run_id=run_id,
+            miner_uid=miner_uid,
+            miner_hotkey=miner_hotkey,
+            step_name="verify",
+            substep="open_store",
+            latency_ms=elapsed_ms,
+        )
+    else:
+        retry_row = await db.fetch_one(
+            sa.text("SELECT retry_count, next_retry_time FROM weather_miner_responses WHERE id = :rid"),
+            {"rid": response_id},
+        )
+        retry_count = retry_row and retry_row.get("retry_count")
+        next_retry_time = retry_row and retry_row.get("next_retry_time")
+        from gaia.validator.stats.weather_stats_manager import WeatherStatsManager as _WSM
+        sanitized = _WSM.sanitize_error_message(err_msg) if err_msg else None
+        if next_retry_time is None:
+            try:
+                from gaia.tasks.defined_tasks.weather.pipeline.retry_policy import next_retry_time as _nrt
+                nrt = _nrt("verify", (retry_count or 0) + 1)
+                retry_count = (retry_count or 0) + 1
+                next_retry_time = nrt
+            except Exception:
+                pass
+        await log_failure(
+            db,
+            run_id=run_id,
+            miner_uid=miner_uid,
+            miner_hotkey=miner_hotkey,
+            step_name="verify",
+            substep="open_store",
+            latency_ms=elapsed_ms,
+            error_json=sanitized,
+            retry_count=retry_count,
+            next_retry_time=next_retry_time,
+        )
+        if next_retry_time is not None:
+            await schedule_retry(
+                db,
+                run_id=run_id,
+                miner_uid=miner_uid,
+                miner_hotkey=miner_hotkey,
+                step_name="verify",
+                substep="open_store",
+                error_json=sanitized,
+                retry_count=retry_count or 1,
+                next_retry_time=next_retry_time,
+            )
+    try:
+        await stats.aggregate_miner_stats(miner_uid=miner_uid)
+    except Exception:
+        pass
+    return True
+
