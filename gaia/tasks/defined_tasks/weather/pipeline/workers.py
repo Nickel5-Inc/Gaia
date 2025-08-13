@@ -38,6 +38,10 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
         await db.enqueue_weather_step_jobs(limit=200)
     except Exception:
         pass
+    try:
+        await db.enqueue_miner_poll_jobs(limit=200)
+    except Exception:
+        pass
     # Prefer generic queue if available
     job = await db.claim_validator_job(worker_name="weather-w/1", job_type_prefix="weather.")
     if job:
@@ -191,6 +195,15 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                             txt = status_response.get("text") or ""
                             ready = "ready" in txt.lower() or "completed" in txt.lower()
                         if ready:
+                            # Mark response as submitted/ready for scoring
+                            try:
+                                if response_id:
+                                    await db.execute(
+                                        "UPDATE weather_miner_responses SET status = 'forecast_submitted', last_polled_time = NOW() WHERE id = :rid",
+                                        {"rid": response_id},
+                                    )
+                            except Exception:
+                                pass
                             await db.complete_validator_job(job["id"], result={"ready": True})
                             # Ensure a day1 step exists/enqueued for this miner
                             try:

@@ -2294,46 +2294,22 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     logger.info(
                         f"[Run {run_id}] Completed processing initiate fetch responses. {accepted_count} miners accepted."
                     )
-                    await _update_run_status(self, run_id, "awaiting_input_hashes")
-
-                    wait_minutes = self.config.get("validator_hash_wait_minutes", 10)
-                    if self.test_mode:
-                        original_wait = wait_minutes
-                        wait_minutes = 1
-                        logger.info(
-                            f"TEST MODE: Using shortened wait time of {wait_minutes} minute(s) instead of {original_wait} minutes"
-                        )
-                    logger.info(
-                        f"[Run {run_id}] Waiting for {wait_minutes} minutes for miners to fetch GFS and compute input hash..."
-                    )
-                    await validator.update_task_status(
-                        "weather", "waiting", "miner_fetch_wait"
-                    )
-                    await asyncio.sleep(wait_minutes * 60)
-                    logger.info(
-                        f"[Run {run_id}] Wait finished. Proceeding with input hash verification."
-                    )
-                    await validator.update_task_status(
-                        "weather", "processing", "verifying_hashes"
-                    )
-                    await _update_run_status(self, run_id, "verifying_input_hashes")
-
-                    responses_to_check_query = """
-                        SELECT id, miner_hotkey, job_id
-                        FROM weather_miner_responses
-                        WHERE run_id = :run_id
-                          AND (
-                              status = 'fetch_initiated' OR
-                              (status = 'retry_scheduled' AND next_retry_time IS NOT NULL AND next_retry_time <= :now)
-                          )
-                    """
-                    miners_to_poll = await self.db_manager.fetch_all(
-                        responses_to_check_query,
-                        {"run_id": run_id, "now": datetime.now(timezone.utc)},
-                    )
-                    logger.info(
-                        f"[Run {run_id}] Polling {len(miners_to_poll)} miners for input hash status."
-                    )
+                    # Simplified flow: skip input-hash verification; move directly to awaiting inference
+                    await _update_run_status(self, run_id, "awaiting_inference_results")
+                    try:
+                        # Create polling jobs for miners to report readiness
+                        _ = await self.db_manager.enqueue_miner_poll_jobs(limit=1000)
+                    except Exception:
+                        pass
+                    try:
+                        # Ensure step jobs are enqueued (day1/era5)
+                        _ = await self.db_manager.enqueue_weather_step_jobs(limit=1000)
+                    except Exception:
+                        pass
+                    # Continue to scoring orchestrator which now depends on polling readiness
+                    await self.validator_score()
+                    # Proceed to next loop iteration
+                    continue
 
                     miner_hash_results = {}
                     polling_tasks = []
@@ -3963,6 +3939,13 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         logger.info(
                             f"[Miner Job {job_id}] Job already exists, skipping creation (likely from another validator)."
                         )
+                    # Immediately start inference in background (idempotent, duplicate-safe)
+                    try:
+                        from .processing.weather_workers import run_inference_background
+                        asyncio.create_task(run_inference_background(self, job_id))
+                    except Exception as inf_err:
+                        logger.warning(f"[Miner Job {job_id}] Failed to schedule inference: {inf_err}")
+
                     return self._validate_and_format_response(
                         {
                             "status": WeatherTaskStatus.FETCH_ACCEPTED.value,
@@ -4011,6 +3994,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         f"[Miner Job {job_id}] Job already exists, skipping creation (likely from another validator)."
                     )
 
+                # Start input fetch/hash and inference concurrently (each is duplicate-safe)
                 asyncio.create_task(
                     fetch_and_hash_gfs_task(
                         task_instance=self,
@@ -4019,6 +4003,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         t_minus_6_run_time=t_minus_6_run_time,
                     )
                 )
+                try:
+                    from .processing.weather_workers import run_inference_background
+                    asyncio.create_task(run_inference_background(self, job_id))
+                except Exception as inf_err:
+                    logger.warning(f"[Miner Job {job_id}] Failed to schedule inference: {inf_err}")
 
             return self._validate_and_format_response(
                 {
@@ -4091,10 +4080,10 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         f"[Miner Job {job_id}] Job status '{result['status']}' with hash converted to '{status_to_report}' for validator compatibility"
                     )
 
+            # Simplified reporting: expose raw job status for polling
             response = {
                 "job_id": job_id,
                 "status": status_to_report,
-                "input_data_hash": result.get("input_data_hash"),
                 "message": result.get("error_message"),
             }
             logger.debug(
