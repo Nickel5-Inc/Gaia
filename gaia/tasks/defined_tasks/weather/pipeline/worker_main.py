@@ -7,9 +7,13 @@ import signal
 import multiprocessing as mp
 from typing import Optional
 import logging
+import sys
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager, DatabaseError
 from gaia.tasks.defined_tasks.weather.pipeline.workers import process_one
+
+# Configure logging at module level for consistency
+logger = logging.getLogger(__name__)
 
 
 def _prefix() -> str:
@@ -56,8 +60,7 @@ async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0, mem
             if memory_limit_mb and memory_limit_mb > 0:
                 rss_mb = _get_rss_mb()
                 if rss_mb >= 0 and rss_mb > memory_limit_mb:
-                    import logging as _logging
-                    _logging.getLogger(__name__).warning(
+                    logger.warning(
                         f"{tag} memory threshold exceeded: rss={rss_mb:.1f}MB > limit={memory_limit_mb:.1f}MB — exiting for restart"
                     )
                     break
@@ -65,10 +68,9 @@ async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0, mem
                 now = time.time()
                 # Occasional idle heartbeat
                 if now - last_idle_log > 60:
-                    import logging as _logging
                     rss_mb = _get_rss_mb()
                     mem_str = f" | rss={rss_mb:.1f}MB" if rss_mb >= 0 else ""
-                    _logging.getLogger(__name__).info(f"{tag} idle: no jobs to claim currently{mem_str}")
+                    logger.info(f"{tag} idle: no jobs to claim currently{mem_str}")
                     last_idle_log = now
                 await asyncio.sleep(idle_sleep)
         except asyncio.CancelledError:
@@ -103,7 +105,9 @@ async def _install_worker_prefix_filters(tag: str) -> None:
     if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
         sh = logging.StreamHandler(stream=sys.stdout)
         sh.setLevel(logging.INFO)
-        fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s:%(funcName)s:%(lineno)d - %(message)s")
+        # Use a distinct format for worker processes to differentiate from main loop
+        fmt = logging.Formatter("[WORKER] %(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s", 
+                               datefmt="%Y-%m-%d %H:%M:%S")
         sh.setFormatter(fmt)
         root_logger.addHandler(sh)
     f = _WorkerTagFilter(tag)
@@ -111,6 +115,14 @@ async def _install_worker_prefix_filters(tag: str) -> None:
     # Also attach to common app loggers
     for name in ("gaia", "fiber", "database_manager", "validator_database_manager"):
         logging.getLogger(name).addFilter(_WorkerTagFilter(tag))
+    
+    # Suppress duplicate logs from modules that also log in the main process
+    # These modules will still log in the main process, just not in workers
+    # This prevents double logging when both main and worker import the same modules
+    for module in ['gfs_api', 'era5_api', 'weather_task', 'async_processing', 
+                   'weather_scoring_mechanism', 'memory_management', 'hardening_integration']:
+        logger = logging.getLogger(module)
+        logger.setLevel(logging.WARNING)  # Only show warnings and errors from these modules in workers
 
 
 async def main() -> None:
@@ -134,7 +146,7 @@ async def main() -> None:
     try:
         idle = float(os.getenv("WEATHER_WORKER_IDLE_SLEEP", "5"))
         mem_limit = float(os.getenv("WEATHER_WORKER_RSS_LIMIT_MB", "3072"))
-        print(f"{tag} started (idle_sleep={idle}s, rss_limit={mem_limit}MB)")
+        logger.info(f"{tag} started (idle_sleep={idle}s, rss_limit={mem_limit}MB)")
         await worker_loop(db, idle_sleep=idle, memory_limit_mb=mem_limit)
     finally:
         await db.close_all_connections()

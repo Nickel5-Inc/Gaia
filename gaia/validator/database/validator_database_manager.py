@@ -1580,7 +1580,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             steps = await self.fetch_all(
                 """
                 SELECT s.id AS step_id, s.run_id, s.miner_uid, s.step_name,
-                       r.id AS response_id, r.miner_hotkey
+                       r.id AS response_id, r.miner_hotkey, r.status as response_status, s.substep
                 FROM weather_forecast_steps s
                 LEFT JOIN weather_miner_responses r
                   ON r.run_id = s.run_id AND r.miner_uid = s.miner_uid
@@ -1597,9 +1597,70 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             inserted = 0
             for s in steps:
                 step_name = s.get("step_name")
-                # For per-miner steps, require response; for run-level seed, proceed without
+                
+                # Special handling for seed steps - use atomic insert to prevent duplicates
+                if step_name == "seed" and s.get("substep") == "download_gfs":
+                    # Use atomic insert with WHERE NOT EXISTS for run-level seed/download_gfs
+                    payload = {
+                        "run_id": s["run_id"],
+                        "miner_uid": s["miner_uid"],
+                        "response_id": None,
+                        "step_id": s["step_id"],
+                        "step": step_name,
+                        "substep": "download_gfs",
+                        "miner_hotkey": s.get("miner_hotkey"),
+                    }
+                    # Check if a seed job already exists for this run
+                    row = await self.fetch_one(
+                        """
+                        INSERT INTO validator_jobs (job_type, priority, status, payload, scheduled_at, run_id, miner_uid, response_id, step_id)
+                        SELECT :job_type, :priority, 'pending', :payload, NULL, :run_id, :miner_uid, NULL, :step_id
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM validator_jobs
+                            WHERE job_type = 'weather.seed' 
+                            AND run_id = :run_id 
+                            AND status IN ('pending','in_progress','retry_scheduled','completed')
+                        )
+                        RETURNING id
+                        """,
+                        {
+                            "job_type": "weather.seed",
+                            "priority": 50,  # Higher priority for seed
+                            "payload": dumps(payload) if JSON_PERFORMANCE_AVAILABLE else json.dumps(payload),
+                            "run_id": s["run_id"],
+                            "miner_uid": s["miner_uid"],
+                            "step_id": s["step_id"],
+                        },
+                    )
+                    job_id = int(row["id"]) if row else None
+                    if job_id:
+                        inserted += 1
+                        # Link from step to job for easier joins
+                        try:
+                            await self.execute(
+                                "UPDATE weather_forecast_steps SET job_id = :jid WHERE id = :sid",
+                                {"jid": job_id, "sid": s["step_id"]},
+                            )
+                        except Exception:
+                            pass
+                    continue
+                
+                # For per-miner steps, require valid response
+                if step_name == "day1":
+                    # Only create day1 jobs for miners that have successfully submitted forecasts
+                    response_status = s.get("response_status")
+                    if response_status not in ("forecast_submitted", "forecast_ready", "day1_scored"):
+                        continue
+                elif step_name == "era5":
+                    # Only create era5 jobs for miners that have been day1 scored
+                    response_status = s.get("response_status")
+                    if response_status not in ("day1_scored", "era5_scored"):
+                        continue
+                    
+                # Also skip if no response_id for scoring steps
                 if step_name in ("day1", "era5") and s.get("response_id") is None:
                     continue
+                    
                 payload = {
                     "run_id": s["run_id"],
                     "miner_uid": s["miner_uid"],

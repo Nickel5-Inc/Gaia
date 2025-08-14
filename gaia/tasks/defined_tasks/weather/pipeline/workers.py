@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import multiprocessing as mp
 from typing import Optional, Dict, Any
 import sqlalchemy as sa
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+
+# Use module-level logger for consistency
+logger = logging.getLogger(__name__)
 from gaia.tasks.defined_tasks.weather.pipeline.scheduler import MinerWorkScheduler
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 from gaia.tasks.defined_tasks.weather.pipeline.steps import day1_step, era5_step
@@ -58,9 +63,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
         try:
             # Log concise claim
             try:
-                import logging as _logging, multiprocessing as _mp
-                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
-                _logging.getLogger(__name__).info(
+                _tag = mp.current_process().name if mp.current_process() else "weather-w?"
+                logger.info(
                     f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
                 )
             except Exception:
@@ -74,12 +78,97 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     payload = _json.loads(payload)
                 except Exception:
                     payload = {}
-            if jtype == "weather.seed":
-                # Run-level seed job (download_gfs), payload has run_id and a coordinator miner tag
+            if jtype == "weather.run.orchestrate":
+                # High-level run orchestration
+                from gaia.tasks.defined_tasks.weather.pipeline.orchestrator import orchestrate_run
                 rid = payload.get("run_id")
-                uid = payload.get("miner_uid") or payload.get("uid")
+                vhk = payload.get("validator_hotkey", "unknown_validator")
+                if rid:
+                    ok = await orchestrate_run(db, int(rid), vhk, validator)
+                    if ok:
+                        await db.complete_validator_job(job["id"], result={"ok": True})
+                    else:
+                        await db.fail_validator_job(job["id"], "orchestration failed", schedule_retry_in_seconds=60)
+                else:
+                    await db.fail_validator_job(job["id"], "missing run_id")
+                    ok = False
+                return ok
+            elif jtype == "weather.initiate_fetch":
+                # Create individual query jobs for all miners (runs after seed completes)
+                from gaia.tasks.defined_tasks.weather.pipeline.orchestrator import handle_initiate_fetch_job
+                rid = payload.get("run_id")
+                vhk = payload.get("validator_hotkey", "unknown_validator")
+                if rid:
+                    ok = await handle_initiate_fetch_job(db, int(rid), vhk, validator)
+                    if ok:
+                        await db.complete_validator_job(job["id"], result={"ok": True})
+                    else:
+                        await db.fail_validator_job(job["id"], "initiate-fetch failed", schedule_retry_in_seconds=120)
+                else:
+                    await db.fail_validator_job(job["id"], "missing run_id")
+                    ok = False
+                return ok
+            elif jtype == "weather.query_miner":
+                # Query individual miner to start inference
+                from gaia.tasks.defined_tasks.weather.pipeline.steps.query_miner_step import run_query_miner_job
+                rid = payload.get("run_id")
+                muid = job.get("miner_uid")
+                mhk = payload.get("miner_hotkey", "unknown")
+                vhk = payload.get("validator_hotkey", "unknown")
+                if rid and muid is not None:
+                    ok = await run_query_miner_job(db, int(rid), int(muid), mhk, vhk, validator)
+                    if ok:
+                        await db.complete_validator_job(job["id"], result={"ok": True})
+                    else:
+                        # Retry with backoff
+                        retry_count = payload.get("retry_count", 0) + 1
+                        if retry_count <= 3:
+                            backoff = [60, 300, 900][retry_count - 1]  # 1min, 5min, 15min
+                            payload["retry_count"] = retry_count
+                            await db.fail_validator_job(
+                                job["id"], 
+                                f"Query failed (attempt {retry_count}/3)", 
+                                schedule_retry_in_seconds=backoff
+                            )
+                        else:
+                            await db.fail_validator_job(job["id"], "Query failed after 3 attempts")
+                        ok = False
+                else:
+                    await db.fail_validator_job(job["id"], "missing run_id or miner_uid")
+                    ok = False
+                return ok
+            elif jtype == "weather.poll_miner":
+                # Poll miner for inference status
+                from gaia.tasks.defined_tasks.weather.pipeline.steps.poll_miner_step import run_poll_miner_job
+                rid = payload.get("run_id")
+                muid = job.get("miner_uid")
+                mhk = payload.get("miner_hotkey", "unknown")
+                resp_id = job.get("response_id") or payload.get("response_id")
+                job_id = payload.get("job_id", "unknown")
+                attempt = payload.get("attempt", 1)
+                if rid and muid is not None and resp_id:
+                    ok = await run_poll_miner_job(db, int(rid), int(muid), mhk, int(resp_id), job_id, attempt, validator)
+                    if ok:
+                        await db.complete_validator_job(job["id"], result={"ok": True})
+                    else:
+                        await db.fail_validator_job(job["id"], "Poll failed", schedule_retry_in_seconds=60)
+                        ok = False
+                else:
+                    await db.fail_validator_job(job["id"], "missing required fields")
+                    ok = False
+                return ok
+            elif jtype == "weather.seed":
+                # Run-level seed job (download_gfs), payload has run_id and a coordinator miner tag
+                logger.info(f"[weather.seed] Processing seed job {job['id']} with payload: {payload}")
+                rid = payload.get("run_id")
+                # Be careful with miner_uid=0 which is falsy but valid
+                uid = payload.get("miner_uid")
+                if uid is None:
+                    uid = payload.get("uid")
                 hk = payload.get("miner_hotkey") or payload.get("hk") or "coordinator"
+                logger.info(f"[weather.seed] Extracted: run_id={rid}, miner_uid={uid}, miner_hotkey={hk}")
                 if rid is not None and uid is not None:
+                    logger.info(f"[weather.seed] Calling seed_step.run_item for run {rid}")
                     ok = await seed_step.run_item(
                         db,
                         run_id=int(rid),
@@ -87,13 +176,23 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                         miner_hotkey=str(hk),
                         validator=validator,
                     )
+                    logger.info(f"[weather.seed] seed_step.run_item returned: {ok}")
                 else:
+                    logger.warning(f"[weather.seed] Missing required fields: run_id={rid}, miner_uid={uid}")
                     ok = False
-                # Regardless of success, complete the job (seed step is idempotent and guarded by advisory lock)
+                # Mark run as GFS ready if successful
                 if ok:
+                    await db.execute(
+                        "UPDATE weather_forecast_runs SET status = 'gfs_ready' WHERE id = :run_id",
+                        {"run_id": rid}
+                    )
                     await db.complete_validator_job(job["id"], result={"ok": True})
+                    # Trigger next phase
+                    await db.enqueue_weather_step_jobs(limit=100)
                 else:
-                    await db.fail_validator_job(job["id"], "seed step returned False", schedule_retry_in_seconds=300)
+                    # Use longer backoff for rate limit errors (15 minutes)
+                    # This gives NOAA servers time to reset rate limits
+                    await db.fail_validator_job(job["id"], "seed step returned False - likely rate limited", schedule_retry_in_seconds=900)
                 return ok
             elif jtype == "weather.day1":
                 if all(k in payload for k in ("run_id", "miner_uid", "response_id")):
@@ -173,9 +272,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     if job:
         try:
             try:
-                import logging as _logging, multiprocessing as _mp
-                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
-                _logging.getLogger(__name__).info(
+                _tag = mp.current_process().name if mp.current_process() else "weather-w?"
+                logger.info(
                     f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
                 )
             except Exception:
@@ -228,9 +326,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             except Exception:
                 pass
             try:
-                import logging as _logging, multiprocessing as _mp
-                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
-                _logging.getLogger(__name__).info(
+                _tag = mp.current_process().name if mp.current_process() else "weather-w?"
+                logger.info(
                     f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
                 )
             except Exception:

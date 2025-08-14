@@ -3004,18 +3004,36 @@ class GaiaValidator:
             # Stop weather worker processes
             if getattr(self, "_weather_worker_processes", None):
                 logger.info("Stopping weather worker processes...")
+                # First try to terminate gracefully
                 for p in self._weather_worker_processes:
                     try:
                         if p.is_alive():
                             p.terminate()
-                    except Exception:
-                        pass
+                            logger.debug(f"Sent SIGTERM to worker process {p.name} (pid={p.pid})")
+                    except Exception as e:
+                        logger.debug(f"Could not terminate process {p.name}: {e}")
+                
+                # Wait for processes to exit gracefully
                 for p in self._weather_worker_processes:
                     try:
                         p.join(timeout=2)
+                        if not p.is_alive():
+                            logger.debug(f"Worker process {p.name} exited gracefully")
                     except Exception:
                         pass
+                
+                # Force kill any remaining processes
+                for p in self._weather_worker_processes:
+                    try:
+                        if p.is_alive():
+                            logger.warning(f"Force killing worker process {p.name} (pid={p.pid})")
+                            p.kill()
+                            p.join(timeout=1)
+                    except Exception as e:
+                        logger.debug(f"Could not kill process {p.name}: {e}")
+                
                 self._weather_worker_processes.clear()
+                logger.info("Weather worker processes stopped")
 
             # First clean up database resources
             if hasattr(self, "database_manager"):
@@ -3746,7 +3764,7 @@ class GaiaValidator:
 
                 tasks_lambdas = [  # Renamed to avoid conflict if tasks variable is used elsewhere
                     lambda: self.weather_task.validator_execute(self),
-                    lambda: self.weather_task.initiate_fetch_retry_loop(self),
+                    # initiate_fetch_retry_loop removed - now handled by workers
                     lambda: self.status_logger(),
                     lambda: self.main_scoring(),
                     # Deregistration moved to workers via miners.handle_deregistrations singleton job

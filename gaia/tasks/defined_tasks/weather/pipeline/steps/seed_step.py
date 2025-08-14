@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from typing import Optional, Any, List, Dict
+import logging
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
+
+logger = logging.getLogger(__name__)
 from gaia.database.validator_schema import (
     node_table,
     weather_forecast_runs_table,
@@ -118,25 +121,39 @@ async def seed_forecast_run(
 
     # Enqueue generic jobs for these steps (including the run-level seed substep for workers)
     try:
-        # Ensure a run-level seed step exists so workers can claim GFS warmup
-        # Use an existing miner_uid/hotkey to satisfy FK; this is only a coordinator tag
-        first_node = await db.fetch_one(
-            "SELECT uid, hotkey FROM node_table ORDER BY uid ASC LIMIT 1"
+        # Check if a seed step already exists for this run
+        existing_seed = await db.fetch_one(
+            """
+            SELECT id FROM weather_forecast_steps 
+            WHERE run_id = :rid AND step_name = 'seed' AND substep = 'download_gfs'
+            LIMIT 1
+            """,
+            {"rid": run_id}
         )
-        if first_node and first_node.get("uid") is not None:
-            await db.execute(
-                """
-                INSERT INTO weather_forecast_steps (run_id, miner_uid, miner_hotkey, step_name, substep, lead_hours, status)
-                VALUES (:rid, :uid, :hk, 'seed', 'download_gfs', NULL, 'pending')
-                ON CONFLICT (run_id, miner_uid, step_name, substep, lead_hours) DO NOTHING
-                """,
-                {"rid": run_id, "uid": int(first_node["uid"]), "hk": first_node.get("hotkey") or "coordinator"},
+        
+        if not existing_seed:
+            # Only create if it doesn't exist
+            first_node = await db.fetch_one(
+                "SELECT uid, hotkey FROM node_table ORDER BY uid ASC LIMIT 1"
             )
+            if first_node and first_node.get("uid") is not None:
+                await db.execute(
+                    """
+                    INSERT INTO weather_forecast_steps (run_id, miner_uid, miner_hotkey, step_name, substep, lead_hours, status)
+                    VALUES (:rid, :uid, :hk, 'seed', 'download_gfs', NULL, 'pending')
+                    ON CONFLICT (run_id, miner_uid, step_name, substep, lead_hours) DO NOTHING
+                    """,
+                    {"rid": run_id, "uid": int(first_node["uid"]), "hk": first_node.get("hotkey") or "coordinator"},
+                )
+                logger.info(f"Created seed step for run {run_id}")
+        else:
+            logger.debug(f"Seed step already exists for run {run_id}")
+            
         await db.enqueue_weather_step_jobs(limit=1000)
         # Also ensure polling jobs are present for responses that are starting
         await db.enqueue_miner_poll_jobs(limit=1000)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Error in seed job creation: {e}")
 
     return len(miners)
 
@@ -168,27 +185,52 @@ async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task, *, 
         fetch_gfs_analysis_data,
         fetch_gfs_data,
     )
-    # Day1 leads minimal to warm cache
-    leads = task.config.get("initial_scoring_lead_hours", [6, 12]) if hasattr(task, "config") else [6, 12]
+    from datetime import timedelta
     from pathlib import Path
+    
     cache_dir = Path(
         task.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache")
         if hasattr(task, "config")
         else "./gfs_analysis_cache"
     )
-    gfs_analysis_ds = await fetch_gfs_analysis_data([gfs_init], cache_dir=cache_dir)
-    if not gfs_analysis_ds:
-        raise RuntimeError("fetch_gfs_analysis_data returned None")
-    _ = await fetch_gfs_data(
+    
+    # Fetch all required GFS data upfront to minimize API calls
+    logger.info(f"[Run {run_id}] Fetching all required GFS data for input and scoring")
+    
+    # 1. Fetch T=0h analysis (current state)
+    gfs_analysis_t0 = await fetch_gfs_analysis_data([gfs_init], cache_dir=cache_dir)
+    if not gfs_analysis_t0:
+        raise RuntimeError("fetch_gfs_analysis_data for T=0h returned None")
+    
+    # 2. Fetch T=-6h analysis (previous state for input generation)
+    gfs_t_minus_6 = gfs_init - timedelta(hours=6)
+    gfs_analysis_t_minus_6 = await fetch_gfs_analysis_data([gfs_t_minus_6], cache_dir=cache_dir)
+    if not gfs_analysis_t_minus_6:
+        logger.warning(f"[Run {run_id}] Could not fetch T=-6h analysis, input generation may fail")
+    
+    # 3. Fetch forecast data for Day1 scoring (T+6h, T+12h)
+    leads = task.config.get("initial_scoring_lead_hours", [6, 12]) if hasattr(task, "config") else [6, 12]
+    gfs_forecast_result = await fetch_gfs_data(
         run_time=gfs_init,
         lead_hours=leads,
         output_dir=str(cache_dir),
     )
+    
+    # We consider the seed successful if we at least have T=0h and forecast data
+    # T=-6h is nice to have but not critical for the pipeline
+    gfs_result = gfs_analysis_t0 is not None and gfs_forecast_result is not None
     # Ensure lock releases even on early returns
     try:
         await db.execute("SELECT pg_advisory_unlock(:key)", {"key": lock_key})
     except Exception:
         pass
+    
+    # Check if GFS fetch was successful
+    if not gfs_result:
+        logger.error(f"[Run {run_id}] GFS fetch failed - missing critical data")
+        return False
+    
+    logger.info(f"[Run {run_id}] Successfully fetched all GFS data (T=-6h, T=0h, T+6h, T+12h)")
     return True
 
 
@@ -201,18 +243,32 @@ async def run_item(
     validator: Optional[Any] = None,
 ) -> bool:
     """Process the run-level seed step (download_gfs) via generic job dispatch."""
-    task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
-    if validator is not None:
-        setattr(task, "validator", validator)
+    logger.info(f"[Run {run_id}] Starting seed step with miner_uid={miner_uid}")
     try:
-        await ensure_gfs_reference_available(
+        task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
+        if validator is not None:
+            setattr(task, "validator", validator)
+        logger.info(f"[Run {run_id}] WeatherTask created, config keys: {list(task.config.keys()) if hasattr(task, 'config') else 'NO CONFIG'}")
+    except Exception as e:
+        logger.error(f"[Run {run_id}] Failed to create WeatherTask: {e}", exc_info=True)
+        return False
+    
+    try:
+        logger.info(f"[Run {run_id}] Calling ensure_gfs_reference_available")
+        result = await ensure_gfs_reference_available(
             db,
             task,
             run_id=run_id,
             miner_uid=miner_uid,
             miner_hotkey=miner_hotkey,
         )
-        return True
-    except Exception:
+        if result:
+            logger.info(f"[Run {run_id}] Seed step completed successfully")
+            return True
+        else:
+            logger.error(f"[Run {run_id}] Seed step failed - ensure_gfs_reference_available returned False")
+            return False
+    except Exception as e:
+        logger.error(f"[Run {run_id}] Seed step failed: {e}", exc_info=True)
         return False
 
