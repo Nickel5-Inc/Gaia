@@ -3904,6 +3904,34 @@ async def cleanup_worker(task_instance: "WeatherTask"):
         raise
 
 
+async def fetch_and_run_inference_task(
+    task_instance: "WeatherTask",
+    job_id: str,
+    t0_run_time: datetime,
+    t_minus_6_run_time: datetime,
+):
+    """
+    NEW COMBINED TASK: Fetches GFS data and immediately runs inference.
+    No input verification step - validator trusts miner to use correct GFS data.
+    """
+    logger.info(
+        f"[Combined Task Job {job_id}] Starting GFS fetch and inference for T0={t0_run_time}, T-6={t_minus_6_run_time}"
+    )
+    
+    # First fetch and hash the GFS data
+    await fetch_and_hash_gfs_task(task_instance, job_id, t0_run_time, t_minus_6_run_time)
+    
+    # Check if fetch was successful
+    query = "SELECT status, input_data_hash FROM weather_miner_jobs WHERE id = :job_id"
+    result = await task_instance.db_manager.fetch_one(query, {"job_id": job_id})
+    
+    if result and result.get("input_data_hash"):
+        logger.info(f"[Combined Task Job {job_id}] GFS fetch successful, starting inference immediately")
+        # Now run inference
+        await run_inference_background(task_instance, job_id)
+    else:
+        logger.error(f"[Combined Task Job {job_id}] GFS fetch failed, cannot start inference")
+
 async def fetch_and_hash_gfs_task(
     task_instance: "WeatherTask",
     job_id: str,

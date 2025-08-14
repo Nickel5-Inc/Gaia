@@ -21,6 +21,105 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger(__name__)
 
+# Cache duration for symmetric keys (24 hours by default)
+SYMMETRIC_KEY_CACHE_HOURS = 24
+
+async def _get_cached_symmetric_key(db, miner_uid: int) -> Optional[Dict[str, Any]]:
+    """
+    Get cached symmetric key for a miner if it exists and hasn't expired.
+    
+    Returns:
+        Dict with 'key' (base64 encoded), 'uuid', and 'age_minutes' if found, None otherwise
+    """
+    from datetime import datetime, timezone, timedelta
+    
+    try:
+        query = """
+            SELECT fiber_symmetric_key, fiber_symmetric_key_uuid, fiber_key_cached_at
+            FROM node_table
+            WHERE uid = :uid
+            AND fiber_symmetric_key IS NOT NULL
+            AND fiber_key_expires_at > NOW()
+        """
+        result = await db.fetch_one(query, {"uid": miner_uid})
+        
+        if result and result["fiber_symmetric_key"]:
+            age = datetime.now(timezone.utc) - result["fiber_key_cached_at"]
+            return {
+                "key": result["fiber_symmetric_key"],
+                "uuid": result["fiber_symmetric_key_uuid"],
+                "age_minutes": age.total_seconds() / 60
+            }
+    except Exception as e:
+        logger.warning(f"Error checking cached symmetric key: {e}")
+    
+    return None
+
+async def _cache_symmetric_key(db, miner_uid: int, symmetric_key: bytes, symmetric_key_uuid: str):
+    """
+    Cache a symmetric key for future use.
+    """
+    from datetime import datetime, timezone, timedelta
+    import base64
+    
+    try:
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(hours=SYMMETRIC_KEY_CACHE_HOURS)
+        key_b64 = base64.b64encode(symmetric_key).decode()
+        
+        query = """
+            UPDATE node_table
+            SET fiber_symmetric_key = :key,
+                fiber_symmetric_key_uuid = :uuid,
+                fiber_key_cached_at = :cached_at,
+                fiber_key_expires_at = :expires_at
+            WHERE uid = :uid
+        """
+        await db.execute(query, {
+            "uid": miner_uid,
+            "key": key_b64,
+            "uuid": symmetric_key_uuid,
+            "cached_at": now,
+            "expires_at": expires_at
+        })
+    except Exception as e:
+        logger.warning(f"Error caching symmetric key: {e}")
+
+async def _invalidate_cached_key(db, miner_uid: int):
+    """
+    Invalidate a cached symmetric key (e.g., after a failed request).
+    """
+    try:
+        query = """
+            UPDATE node_table
+            SET fiber_symmetric_key = NULL,
+                fiber_symmetric_key_uuid = NULL,
+                fiber_key_cached_at = NULL,
+                fiber_key_expires_at = NULL
+            WHERE uid = :uid
+        """
+        await db.execute(query, {"uid": miner_uid})
+        logger.info(f"Invalidated cached key for miner UID {miner_uid}")
+    except Exception as e:
+        logger.warning(f"Error invalidating cached key: {e}")
+
+async def _get_miner_info(db, miner_hotkey: str) -> Optional[Dict[str, Any]]:
+    """
+    Get miner information from node_table.
+    """
+    try:
+        query = """
+            SELECT uid, ip, port
+            FROM node_table
+            WHERE hotkey = :hotkey
+        """
+        result = await db.fetch_one(query, {"hotkey": miner_hotkey})
+        if result:
+            return dict(result)
+    except Exception as e:
+        logger.error(f"Error fetching miner info: {e}")
+    return None
+
 
 async def query_single_miner(
     validator: Any,
@@ -81,6 +180,16 @@ async def query_single_miner(
         logger.error("No validator keypair available")
         return None
     
+    # Check for cached symmetric key first
+    cached_key_data = await _get_cached_symmetric_key(db, miner_uid)
+    symmetric_key = None
+    symmetric_key_uuid = None
+    
+    if cached_key_data:
+        logger.info(f"✅ Using cached symmetric key for {miner_hotkey[:8]} (cached {cached_key_data['age_minutes']:.1f} min ago)")
+        symmetric_key = base64.b64decode(cached_key_data['key'])
+        symmetric_key_uuid = cached_key_data['uuid']
+    
     # Single attempt - retries are handled by the job system
     try:
         # Create HTTP client for this request
@@ -89,6 +198,10 @@ async def query_single_miner(
             verify=False  # Disable SSL verification for self-signed certs
         ) as client:
             try:
+                if not symmetric_key:
+                    # Need to perform handshake
+                    logger.info(f"🔑 No cached key, performing new handshake with {miner_hotkey[:8]}")
+                    
                     # Step 1: Get public encryption key from miner
                     logger.debug(f"🔑 Getting public key from {miner_hotkey[:8]}")
                     public_key_encryption_key = await handshake.get_public_encryption_key(
@@ -116,6 +229,10 @@ async def query_single_miner(
                     
                     if not success:
                         raise Exception("Handshake failed: server returned unsuccessful status")
+                    
+                    # Cache the symmetric key for future use
+                    await _cache_symmetric_key(db, miner_uid, symmetric_key, symmetric_key_uuid)
+                    logger.info(f"💾 Cached symmetric key for {miner_hotkey[:8]} for future requests")
                     
                     symmetric_key_str = base64.b64encode(symmetric_key).decode()
                     fernet = Fernet(symmetric_key_str)
@@ -198,17 +315,7 @@ async def query_single_miner(
         }
 
 
-async def _get_miner_info(db_manager, miner_hotkey: str) -> Optional[dict]:
-    """Get miner info from node_table."""
-    result = await db_manager.fetch_one(
-        """
-        SELECT uid, ip, port 
-        FROM node_table 
-        WHERE hotkey = :hotkey
-        """,
-        {"hotkey": miner_hotkey}
-    )
-    return dict(result) if result else None
+
 
 
 async def query_miner_for_weather(

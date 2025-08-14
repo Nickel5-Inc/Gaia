@@ -45,6 +45,31 @@ node_table = sa.Table(
         nullable=False,  # Typically, last_updated should not be null
         comment="Timestamp of the last update for this node's record",
     ),
+    # Fiber handshake caching columns
+    sa.Column(
+        "fiber_symmetric_key",
+        sa.Text,
+        nullable=True,
+        comment="Cached Fiber symmetric key for encrypted communication",
+    ),
+    sa.Column(
+        "fiber_symmetric_key_uuid",
+        sa.Text,
+        nullable=True,
+        comment="UUID for the cached symmetric key",
+    ),
+    sa.Column(
+        "fiber_key_cached_at",
+        sa.DateTime(timezone=True),
+        nullable=True,
+        comment="When the symmetric key was cached",
+    ),
+    sa.Column(
+        "fiber_key_expires_at",
+        sa.DateTime(timezone=True),
+        nullable=True,
+        comment="When the cached symmetric key expires",
+    ),
     sa.CheckConstraint("uid >= 0 AND uid < 256", name="node_table_uid_check"),
     comment="Table storing information about registered nodes (miners/validators).",
 )

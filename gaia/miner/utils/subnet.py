@@ -908,16 +908,99 @@ def factory_router(miner_instance) -> APIRouter:
                 status_code=500, content={"error": f"Internal server error: {str(e)}"}
             )
 
+    async def weather_poll_job_status(
+        decrypted_payload: WeatherGetInputStatusRequest = Depends(
+            partial(decrypt_general_payload, WeatherGetInputStatusRequest)
+        ),
+    ):
+        """
+        NEW SIMPLIFIED ENDPOINT: Validator polls for job status (GFS fetch + inference).
+        Returns current status without input hash verification.
+        """
+        logger.info("Entered /weather-poll-job-status handler.")
+        try:
+            if (
+                not hasattr(miner_instance, "weather_task")
+                or miner_instance.weather_task is None
+            ):
+                logger.error(
+                    "Miner not configured for weather task (weather_task missing or None)."
+                )
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "Miner not configured for weather task"},
+                )
+
+            job_id = decrypted_payload.data.job_id
+            if not job_id:
+                return JSONResponse(
+                    status_code=400, content={"error": "Missing job_id in request"}
+                )
+
+            # Query job status from database
+            query = """
+                SELECT status, error_message, runpod_job_id, target_netcdf_path
+                FROM weather_miner_jobs 
+                WHERE id = :job_id
+            """
+            result = await miner_instance.weather_task.db_manager.fetch_one(
+                query, {"job_id": job_id}
+            )
+
+            if not result:
+                return JSONResponse(
+                    content={
+                        "status": WeatherTaskStatus.NOT_FOUND.value,
+                        "job_id": job_id,
+                        "message": "Job not found",
+                    }
+                )
+
+            # Map internal status to external status for validator
+            internal_status = result["status"]
+            if internal_status in ["fetch_queued", "fetching_gfs", "hashing_input"]:
+                external_status = WeatherTaskStatus.FETCH_PROCESSING.value
+            elif internal_status in ["input_hashed_awaiting_validation", "in_progress"]:
+                external_status = WeatherTaskStatus.INFERENCE_RUNNING.value
+            elif internal_status == "completed":
+                external_status = WeatherTaskStatus.FETCH_COMPLETED.value
+            elif internal_status in ["failed", "error", "fetch_error"]:
+                external_status = WeatherTaskStatus.FETCH_ERROR.value
+            else:
+                external_status = internal_status
+
+            response = {
+                "status": external_status,
+                "job_id": job_id,
+                "message": result.get("error_message", ""),
+            }
+
+            # Include output path if inference is complete
+            if internal_status == "completed" and result.get("target_netcdf_path"):
+                response["output_ready"] = True
+                
+            logger.info(f"Job {job_id} status: {external_status}")
+            return JSONResponse(content=response)
+
+        except Exception as e:
+            logger.error(
+                f"Error in /weather-poll-job-status handler: {e}", exc_info=True
+            )
+            return JSONResponse(
+                status_code=500, content={"error": f"Internal server error: {str(e)}"}
+            )
+
     async def weather_get_input_status_require(
         decrypted_payload: WeatherGetInputStatusRequest = Depends(
             partial(decrypt_general_payload, WeatherGetInputStatusRequest)
         ),
     ):
         """
-        Handles Step 3: Validator polls for the status of the GFS fetch/hash process.
+        LEGACY: Handles Step 3: Validator polls for the status of the GFS fetch/hash process.
         Miner returns the job status and the input hash if available.
+        DEPRECATED: Use /weather-poll-job-status instead.
         """
-        logger.info("Entered /weather-get-input-status handler.")
+        logger.info("Entered /weather-get-input-status handler (LEGACY).")
         try:
             if (
                 not hasattr(miner_instance, "weather_task")
@@ -1081,6 +1164,19 @@ def factory_router(miner_instance) -> APIRouter:
         router.add_api_route(
             "/weather-get-input-status",
             weather_get_input_status_require,
+            tags=["Weather"],
+            dependencies=[
+                Depends(blacklist_low_stake), 
+                Depends(verify_request),
+                Depends(hotkey_blacklist_checker)  # Add custom blacklist check
+            ],
+            methods=["POST"],
+            response_class=JSONResponse,
+        )
+        # NEW: Simplified polling endpoint for job status
+        router.add_api_route(
+            "/weather-poll-job-status",
+            weather_poll_job_status,
             tags=["Weather"],
             dependencies=[
                 Depends(blacklist_low_stake), 

@@ -3196,8 +3196,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
     ) -> Dict[str, Any]:
         """
         Handles the /weather-initiate-fetch request.
-        Creates a job record and launches the background task for fetching GFS and hashing.
-        If a failed job for the same timestep exists, it will be reset and retried.
+        Creates a job record and launches the background task for fetching GFS and running inference.
+        NEW: Immediately triggers inference after GFS download - no input verification step.
         """
         if self.node_type != "miner":
             logger.error("handle_initiate_fetch called on non-miner node.")
@@ -3398,12 +3398,13 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         logger.info(
                             f"[Miner Job {job_id}] Job already exists, skipping creation (likely from another validator)."
                         )
-                    # Immediately start inference in background (idempotent, duplicate-safe)
-                    try:
-                        from .processing.weather_workers import run_inference_background
-                        asyncio.create_task(run_inference_background(self, job_id))
-                    except Exception as inf_err:
-                        logger.warning(f"[Miner Job {job_id}] Failed to schedule inference: {inf_err}")
+                                    # NEW: Immediately start inference after reusing existing GFS data
+                try:
+                    from .processing.weather_workers import run_inference_background
+                    logger.info(f"[Miner Job {job_id}] Starting inference immediately with existing GFS data")
+                    asyncio.create_task(run_inference_background(self, job_id))
+                except Exception as inf_err:
+                    logger.warning(f"[Miner Job {job_id}] Failed to schedule inference: {inf_err}")
 
                     return self._validate_and_format_response(
                         {
@@ -3453,20 +3454,18 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         f"[Miner Job {job_id}] Job already exists, skipping creation (likely from another validator)."
                     )
 
-                # Start input fetch/hash and inference concurrently (each is duplicate-safe)
+                # NEW: Start combined GFS fetch and inference task
+                # This task will fetch GFS data and immediately start inference
+                from .processing.weather_workers import fetch_and_run_inference_task
                 asyncio.create_task(
-                    fetch_and_hash_gfs_task(
+                    fetch_and_run_inference_task(
                         task_instance=self,
                         job_id=job_id,
                         t0_run_time=t0_run_time,
                         t_minus_6_run_time=t_minus_6_run_time,
                     )
                 )
-                try:
-                    from .processing.weather_workers import run_inference_background
-                    asyncio.create_task(run_inference_background(self, job_id))
-                except Exception as inf_err:
-                    logger.warning(f"[Miner Job {job_id}] Failed to schedule inference: {inf_err}")
+                logger.info(f"[Miner Job {job_id}] Started combined GFS fetch and inference task")
 
             return self._validate_and_format_response(
                 {

@@ -37,8 +37,10 @@ class WeatherTaskStatus(str, Enum):
     # Initiate Fetch Response Statuses
     FETCH_ACCEPTED = "fetch_accepted"
     FETCH_REJECTED = "fetch_rejected"
+    FETCH_COMPLETED = "completed"  # GFS fetch completed, inference can start
+    FETCH_PROCESSING = "processing"  # Currently fetching GFS or running inference
 
-    # Input Status Response Statuses
+    # Legacy Input Status Response Statuses (kept for backwards compatibility)
     FETCH_QUEUED = "fetch_queued"
     FETCHING_GFS = "fetching_gfs"
     HASHING_INPUT = "hashing_input"
@@ -48,7 +50,8 @@ class WeatherTaskStatus(str, Enum):
     # Inference Response Statuses
     INFERENCE_STARTED = "inference_started"
     INFERENCE_FAILED = "inference_failed"
-
+    INFERENCE_RUNNING = "running"  # Inference is currently running
+    
     # Kerchunk/Data Response Statuses
     COMPLETED = "completed"
     PROCESSING = "processing"
