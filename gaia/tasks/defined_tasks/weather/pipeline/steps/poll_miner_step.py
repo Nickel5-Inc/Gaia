@@ -71,7 +71,7 @@ async def run_poll_miner_job(
             
         # Query miner for status using the new communication module
         try:
-            result = await poll_miner_job_status(validator, miner_hotkey, job_id)
+            result = await poll_miner_job_status(validator, miner_hotkey, job_id, db_manager=db)
             
             if not result:
                 logger.warning(f"[Run {run_id}] No status response from miner {miner_hotkey[:8]}")

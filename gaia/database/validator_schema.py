@@ -1211,6 +1211,13 @@ validator_jobs_table = sa.Table(
     sa.Column("next_retry_at", postgresql.TIMESTAMP(timezone=True), nullable=True),
     sa.Column("lease_expires_at", postgresql.TIMESTAMP(timezone=True), nullable=True),
     sa.Column("claimed_by", sa.String(64), nullable=True),
+    # Singleton support for unique job instances
+    sa.Column(
+        "singleton_key", 
+        sa.String(255), 
+        nullable=True,
+        comment="Unique key for singleton jobs (e.g., 'initiate_fetch_run_1')"
+    ),
     # Optional domain links
     sa.Column(
         "run_id",
@@ -1244,6 +1251,13 @@ sa.Index("idx_vjobs_priority", validator_jobs_table.c.priority)
 sa.Index("idx_vjobs_run", validator_jobs_table.c.run_id)
 sa.Index("idx_vjobs_miner", validator_jobs_table.c.miner_uid)
 sa.Index("idx_vjobs_response", validator_jobs_table.c.response_id)
+# Unique constraint for singleton jobs - only one active job per singleton_key
+sa.Index(
+    "uq_vjobs_singleton_active",
+    validator_jobs_table.c.singleton_key,
+    unique=True,
+    postgresql_where=sa.text("status IN ('pending', 'claimed', 'retry_scheduled')"),
+)
 sa.Index(
     "uq_vjobs_run_type_scoring",
     validator_jobs_table.c.run_id,

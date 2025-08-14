@@ -187,8 +187,14 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                         {"run_id": rid}
                     )
                     await db.complete_validator_job(job["id"], result={"ok": True})
-                    # Trigger next phase
-                    await db.enqueue_weather_step_jobs(limit=100)
+                    # Re-enqueue orchestration job to handle the next phase
+                    await db.enqueue_validator_job(
+                        job_type="weather.run.orchestrate",
+                        payload={"run_id": rid, "validator_hotkey": hk},
+                        priority=50,
+                        run_id=rid,
+                    )
+                    logger.info(f"[weather.seed] Re-enqueued orchestration job for run {rid} after successful seed")
                 else:
                     # Use longer backoff for rate limit errors (15 minutes)
                     # This gives NOAA servers time to reset rate limits

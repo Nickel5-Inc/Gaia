@@ -107,7 +107,11 @@ async def orchestrate_run(
         elif current_status == "gfs_ready":
             # GFS is ready, we can proceed with miner queries
             logger.info(f"[Run {run_id}] GFS ready, enqueueing initiate-fetch job")
-            await db.enqueue_validator_job(
+            
+            # Use singleton to avoid duplicates
+            singleton_key = f"initiate_fetch_run_{run_id}"
+            job_id = await db.enqueue_singleton_job(
+                singleton_key=singleton_key,
                 job_type="weather.initiate_fetch", 
                 payload={
                     "run_id": run_id,
@@ -116,6 +120,11 @@ async def orchestrate_run(
                 priority=80,
                 run_id=run_id,
             )
+            
+            if job_id:
+                logger.info(f"[Run {run_id}] Created initiate-fetch singleton job {job_id}")
+            else:
+                logger.debug(f"[Run {run_id}] Initiate-fetch singleton already exists")
             
         elif current_status in ("sending_fetch_requests", "awaiting_inference_results"):
             # Already in progress, just ensure polling jobs exist
@@ -159,7 +168,7 @@ async def handle_initiate_fetch_job(
             return False
             
         if run["status"] not in ("gfs_ready", "querying_miners"):
-            logger.warning(f"[Run {run_id}] Not ready for miner queries, status: {run['status']}")
+            logger.debug(f"[Run {run_id}] Not ready for miner queries, status: {run['status']}")
             
             # Check if there's a pending/scheduled seed job
             seed_job = await db.fetch_one(
@@ -189,17 +198,38 @@ async def handle_initiate_fetch_job(
                 wait_minutes = 5
                 logger.warning(f"[Run {run_id}] No active seed job found, will check again in {wait_minutes} minutes")
             
-            # Re-enqueue to try again later with appropriate backoff
-            await db.enqueue_validator_job(
-                job_type="weather.initiate_fetch",
-                payload={
-                    "run_id": run_id,
-                    "validator_hotkey": validator_hotkey,
-                },
-                priority=90,
-                scheduled_at=datetime.now(timezone.utc) + timedelta(minutes=wait_minutes),
-                run_id=run_id,
+            # Check if there's already a scheduled initiate_fetch job for this run
+            next_check = datetime.now(timezone.utc) + timedelta(minutes=wait_minutes)
+            
+            # Use atomic insert to avoid duplicates
+            result = await db.fetch_one(
+                """
+                INSERT INTO validator_jobs (job_type, priority, status, payload, scheduled_at, run_id)
+                SELECT 'weather.initiate_fetch', 90, 'pending', :payload::jsonb, :scheduled_at, :run_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM validator_jobs 
+                    WHERE run_id = :run_id 
+                    AND job_type = 'weather.initiate_fetch'
+                    AND status IN ('pending', 'retry_scheduled')
+                    AND scheduled_at > NOW()
+                )
+                RETURNING id
+                """,
+                {
+                    "payload": json.dumps({
+                        "run_id": run_id,
+                        "validator_hotkey": validator_hotkey,
+                    }),
+                    "scheduled_at": next_check,
+                    "run_id": run_id
+                }
             )
+            
+            if result:
+                logger.info(f"[Run {run_id}] Scheduled initiate_fetch to check again in {wait_minutes} minutes (job {result['id']})")
+            else:
+                logger.debug(f"[Run {run_id}] Initiate_fetch already scheduled, skipping")
+            
             return False
             
         logger.info(f"[Run {run_id}] Creating query jobs for all miners")

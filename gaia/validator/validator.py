@@ -3702,12 +3702,14 @@ class GaiaValidator:
                             now = _dt.datetime.now(_dt.timezone.utc)
                             # Stats aggregation and subnet snapshot every 10 minutes
                             await db.enqueue_singleton_job(
+                                singleton_key="stats_aggregate",
                                 job_type="stats.aggregate",
                                 payload={"ts": now.isoformat()},
                                 priority=120,
                                 scheduled_at=now,
                             )
                             await db.enqueue_singleton_job(
+                                singleton_key="stats_subnet_snapshot",
                                 job_type="stats.subnet_snapshot",
                                 payload={"ts": now.isoformat()},
                                 priority=130,
@@ -3715,6 +3717,7 @@ class GaiaValidator:
                             )
                             # Weights: enqueue singleton weight setting
                             await db.enqueue_singleton_job(
+                                singleton_key="weights_set",
                                 job_type="weights.set",
                                 payload={"reason": "recurring"},
                                 priority=140,
@@ -3723,12 +3726,14 @@ class GaiaValidator:
                             # Metagraph sync and miner dereg handling every 5 minutes
                             if now.minute % 5 == 0:
                                 await db.enqueue_singleton_job(
+                                    singleton_key="metagraph_sync",
                                     job_type="metagraph.sync",
                                     payload={},
                                     priority=150,
                                     scheduled_at=now,
                                 )
                                 await db.enqueue_singleton_job(
+                                    singleton_key="miners_handle_deregistrations",
                                     job_type="miners.handle_deregistrations",
                                     payload={},
                                     priority=160,
@@ -3737,6 +3742,7 @@ class GaiaValidator:
                             # ERA5 token refresh hourly on top of the hour
                             if now.minute == 0:
                                 await db.enqueue_singleton_job(
+                                    singleton_key="era5_refresh_token",
                                     job_type="era5.refresh_token",
                                     payload={},
                                     priority=170,
@@ -3745,12 +3751,14 @@ class GaiaValidator:
                             # Ops status and DB monitor every 15 minutes
                             if now.minute % 15 == 0:
                                 await db.enqueue_singleton_job(
+                                    singleton_key="ops_status_snapshot",
                                     job_type="ops.status_snapshot",
                                     payload={},
                                     priority=180,
                                     scheduled_at=now,
                                 )
                                 await db.enqueue_singleton_job(
+                                    singleton_key="db_monitor",
                                     job_type="db.monitor",
                                     payload={},
                                     priority=181,
@@ -4119,7 +4127,10 @@ class GaiaValidator:
                         ):
                             # Offload to worker via singleton job; worker will gate eligibility
                             await self.database_manager.enqueue_singleton_job(
-                                job_type="weights.set", payload={"reason": "eligible"}, priority=140
+                                singleton_key="weights_set",
+                                job_type="weights.set", 
+                                payload={"reason": "eligible"}, 
+                                priority=140
                             )
                             await self.update_task_status("scoring", "idle", "weights_enqueued")
                             return True

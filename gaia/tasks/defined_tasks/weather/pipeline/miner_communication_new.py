@@ -3,7 +3,6 @@ Worker-friendly miner communication utilities with proper fiber handshake.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -15,8 +14,8 @@ from typing import Optional, Dict, Any
 
 import httpx
 from fiber import Keypair
-from fiber.encrypted.validator import handshake
-from fiber.encrypted.validator import client as vali_client
+from fiber.networking import handshake
+from fiber.validator import client as vali_client
 from cryptography.fernet import Fernet
 
 logger = logging.getLogger(__name__)

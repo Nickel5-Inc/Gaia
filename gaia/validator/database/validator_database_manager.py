@@ -1409,33 +1409,43 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
     async def enqueue_singleton_job(
         self,
         *,
+        singleton_key: str,
         job_type: str,
         payload: Dict[str, Any],
         priority: int = 100,
         scheduled_at: Optional[datetime] = None,
+        run_id: Optional[int] = None,
+        miner_uid: Optional[int] = None,
     ) -> Optional[int]:
-        """Enqueue a job only if there isn't already an active/pending one of the same type.
+        """Enqueue a job only if there isn't already an active one with the same singleton_key.
 
-        Active set: pending, in_progress, retry_scheduled.
+        Active set: pending, claimed, retry_scheduled.
+        The unique constraint on singleton_key ensures only one active job per key.
         """
+        import json
         try:
-            exists = await self.fetch_one(
+            # Try to insert with the singleton_key
+            result = await self.fetch_one(
                 """
-                SELECT 1 FROM validator_jobs
-                WHERE job_type = :jt
-                  AND status IN ('pending','in_progress','retry_scheduled')
-                LIMIT 1
+                INSERT INTO validator_jobs 
+                (singleton_key, job_type, priority, status, payload, scheduled_at, run_id, miner_uid)
+                VALUES (:sk, :jt, :p, 'pending', CAST(:payload AS jsonb), :sched, :rid, :uid)
+                ON CONFLICT (singleton_key) 
+                WHERE status IN ('pending', 'claimed', 'retry_scheduled')
+                DO NOTHING
+                RETURNING id
                 """,
-                {"jt": job_type},
+                {
+                    "sk": singleton_key,
+                    "jt": job_type,
+                    "p": priority,
+                    "payload": json.dumps(payload),  # Serialize to JSON string
+                    "sched": scheduled_at,
+                    "rid": run_id,
+                    "uid": miner_uid,
+                },
             )
-            if exists:
-                return None
-            return await self.enqueue_validator_job(
-                job_type=job_type,
-                payload=payload,
-                priority=priority,
-                scheduled_at=scheduled_at,
-            )
+            return result["id"] if result else None
         except Exception as e:
             logger.error(f"enqueue_singleton_job failed: {e}")
             return None

@@ -78,6 +78,7 @@ async def run_query_miner_job(
                 forecast_start_time=gfs_init,
                 previous_step_time=gfs_t_minus_6,
                 validator_hotkey=validator_hotkey,
+                db_manager=db,  # Pass the db instance from the worker
             )
             
             if not result:

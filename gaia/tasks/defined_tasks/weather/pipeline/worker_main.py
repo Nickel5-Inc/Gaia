@@ -53,9 +53,36 @@ def _get_rss_mb() -> float:
 async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0, memory_limit_mb: float = 0.0) -> None:
     last_idle_log = 0.0
     tag = _prefix()
+    
+    # Create a WeatherTask instance for this worker
+    # This provides the necessary validator context for miner communication
+    try:
+        from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
+        from fiber.chain import chain_utils
+        import os
+        
+        # Load the validator keypair from wallet
+        wallet_name = os.getenv("WALLET_NAME", "default")
+        hotkey_name = os.getenv("HOTKEY_NAME", "default")
+        
+        try:
+            keypair = chain_utils.load_hotkey_keypair(wallet_name, hotkey_name)
+            logger.info(f"{tag} loaded keypair for wallet={wallet_name}, hotkey={hotkey_name}")
+        except Exception as e:
+            logger.warning(f"{tag} could not load keypair: {e}, will try to proceed without it")
+            keypair = None
+        
+        # Create the task with the keypair
+        task = WeatherTask(db_manager=db, node_type="validator", test_mode=True, keypair=keypair)
+        validator = task
+        logger.info(f"{tag} initialized WeatherTask for miner communication with keypair")
+    except Exception as e:
+        logger.warning(f"{tag} could not initialize WeatherTask: {e}, proceeding without validator context")
+        validator = None
+    
     while True:
         try:
-            processed = await process_one(db, validator=None)
+            processed = await process_one(db, validator=validator)
             # Memory guard: restart if above limit
             if memory_limit_mb and memory_limit_mb > 0:
                 rss_mb = _get_rss_mb()
@@ -106,7 +133,8 @@ async def _install_worker_prefix_filters(tag: str) -> None:
         sh = logging.StreamHandler(stream=sys.stdout)
         sh.setLevel(logging.INFO)
         # Use a distinct format for worker processes to differentiate from main loop
-        fmt = logging.Formatter("[WORKER] %(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s", 
+        # Include the worker tag in the format
+        fmt = logging.Formatter(f"[{tag}] %(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s", 
                                datefmt="%Y-%m-%d %H:%M:%S")
         sh.setFormatter(fmt)
         root_logger.addHandler(sh)
