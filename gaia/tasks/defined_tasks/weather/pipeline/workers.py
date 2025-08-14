@@ -111,24 +111,45 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             elif jtype == "weather.query_miner":
                 # Query individual miner to start inference
                 from gaia.tasks.defined_tasks.weather.pipeline.steps.query_miner_step import run_query_miner_job
+                from datetime import datetime, timezone, timedelta
+                
                 rid = payload.get("run_id")
                 muid = job.get("miner_uid")
                 mhk = payload.get("miner_hotkey", "unknown")
                 vhk = payload.get("validator_hotkey", "unknown")
+                retry_count = payload.get("retry_count", 0)
+                
                 if rid and muid is not None:
                     ok = await run_query_miner_job(db, int(rid), int(muid), mhk, vhk, validator)
                     if ok:
                         await db.complete_validator_job(job["id"], result={"ok": True})
                     else:
-                        # Retry with backoff
-                        retry_count = payload.get("retry_count", 0) + 1
+                        # Schedule retry with lower priority so first attempts get processed first
+                        retry_count = retry_count + 1
                         if retry_count <= 3:
                             backoff = [60, 300, 900][retry_count - 1]  # 1min, 5min, 15min
-                            payload["retry_count"] = retry_count
-                            await db.fail_validator_job(
-                                job["id"], 
-                                f"Query failed (attempt {retry_count}/3)", 
-                                schedule_retry_in_seconds=backoff
+                            # Lower priority for retries: 85, 90, 95
+                            retry_priority = 80 + (retry_count * 5)
+                            
+                            # Re-enqueue with updated retry count and lower priority
+                            await db.enqueue_validator_job(
+                                job_type="weather.query_miner",
+                                payload={
+                                    "run_id": rid,
+                                    "miner_uid": muid,
+                                    "miner_hotkey": mhk,
+                                    "validator_hotkey": vhk,
+                                    "retry_count": retry_count,
+                                },
+                                priority=retry_priority,
+                                run_id=rid,
+                                miner_uid=muid,
+                                scheduled_at=datetime.now(timezone.utc) + timedelta(seconds=backoff)
+                            )
+                            await db.complete_validator_job(job["id"], result={"retry_scheduled": True})
+                            logger.info(
+                                f"[Run {rid}] Scheduled retry {retry_count}/3 for miner {muid} "
+                                f"in {backoff}s with priority {retry_priority}"
                             )
                         else:
                             await db.fail_validator_job(job["id"], "Query failed after 3 attempts")

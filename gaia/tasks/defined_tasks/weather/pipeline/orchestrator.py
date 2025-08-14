@@ -289,6 +289,7 @@ async def handle_initiate_fetch_job(
                         "miner_uid": miner["uid"],
                         "miner_hotkey": miner["hotkey"],
                         "validator_hotkey": validator_hotkey,
+                        "retry_count": 0,  # Track retry attempts
                     },
                     priority=80,  # High priority for initial queries
                     run_id=run_id,

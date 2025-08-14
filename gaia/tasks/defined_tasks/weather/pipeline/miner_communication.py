@@ -28,7 +28,6 @@ async def query_single_miner(
     endpoint: str,
     payload: Dict[str, Any],
     timeout: float = 30.0,
-    max_retries: int = 2,
     db_manager: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -82,16 +81,14 @@ async def query_single_miner(
         logger.error("No validator keypair available")
         return None
     
-    for attempt in range(max_retries + 1):
-        try:
-            logger.debug(f"Attempt {attempt + 1}/{max_retries + 1} to {miner_hotkey[:8]}")
-            
-            # Create HTTP client for this attempt
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(timeout),
-                verify=False  # Disable SSL verification for self-signed certs
-            ) as client:
-                try:
+    # Single attempt - retries are handled by the job system
+    try:
+        # Create HTTP client for this request
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout),
+            verify=False  # Disable SSL verification for self-signed certs
+        ) as client:
+            try:
                     # Step 1: Get public encryption key from miner
                     logger.debug(f"🔑 Getting public key from {miner_hotkey[:8]}")
                     public_key_encryption_key = await handshake.get_public_encryption_key(
@@ -165,56 +162,40 @@ async def query_single_miner(
                         "response_time_ms": int(request_time * 1000),
                     }
                     
-                except httpx.ConnectError as e:
-                    logger.warning(f"Connection failed to {miner_hotkey[:8]} at {server_address}: {e}")
-                    if attempt < max_retries:
-                        await asyncio.sleep(1.0 * (attempt + 1))
-                        continue
-                    return {
-                        "success": False,
-                        "error": f"Connection failed: {e}",
-                        "miner_uid": miner_uid,
-                    }
+            except httpx.ConnectError as e:
+                logger.warning(f"Connection failed to {miner_hotkey[:8]} at {server_address}: {e}")
+                return {
+                    "success": False,
+                    "error": f"Connection failed: {e}",
+                    "miner_uid": miner_uid,
+                }
+                
+            except httpx.TimeoutException as e:
+                logger.warning(f"Timeout querying {miner_hotkey[:8]}: {e}")
+                return {
+                    "success": False,
+                    "error": f"Timeout: {e}",
+                    "miner_uid": miner_uid,
+                }
+                
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error querying {miner_hotkey[:8]}: {e}",
+                    exc_info=True
+                )
+                return {
+                    "success": False,
+                    "error": f"Unexpected error: {e}",
+                    "miner_uid": miner_uid,
+                }
                     
-                except httpx.TimeoutException as e:
-                    logger.warning(f"Timeout querying {miner_hotkey[:8]}: {e}")
-                    if attempt < max_retries:
-                        await asyncio.sleep(1.0 * (attempt + 1))
-                        continue
-                    return {
-                        "success": False,
-                        "error": f"Timeout: {e}",
-                        "miner_uid": miner_uid,
-                    }
-                    
-                except Exception as e:
-                    logger.error(
-                        f"Unexpected error querying {miner_hotkey[:8]}: {e}",
-                        exc_info=True
-                    )
-                    if attempt < max_retries:
-                        await asyncio.sleep(1.0 * (attempt + 1))
-                        continue
-                    return {
-                        "success": False,
-                        "error": f"Unexpected error: {e}",
-                        "miner_uid": miner_uid,
-                    }
-                    
-        except Exception as e:
-            logger.error(f"Failed to create HTTP client: {e}")
-            return {
-                "success": False,
-                "error": f"Client error: {e}",
-                "miner_uid": miner_uid,
-            }
-    
-    # All retries exhausted
-    return {
-        "success": False,
-        "error": "All retry attempts failed",
-        "miner_uid": miner_uid,
-    }
+    except Exception as e:
+        logger.error(f"Failed to create HTTP client: {e}")
+        return {
+            "success": False,
+            "error": f"Client error: {e}",
+            "miner_uid": miner_uid,
+        }
 
 
 async def _get_miner_info(db_manager, miner_hotkey: str) -> Optional[dict]:
@@ -243,10 +224,13 @@ async def query_miner_for_weather(
     
     This is a worker-friendly wrapper around the fiber handshake process.
     """
+    # Wrap the data in the expected format for WeatherInitiateFetchRequest
     payload = {
-        "forecast_start_time": forecast_start_time.isoformat(),
-        "previous_step_time": previous_step_time.isoformat(),
-        "validator_hotkey": validator_hotkey,
+        "data": {
+            "forecast_start_time": forecast_start_time.isoformat(),
+            "previous_step_time": previous_step_time.isoformat(),
+            "validator_hotkey": validator_hotkey,
+        }
     }
     
     logger.info(
@@ -261,7 +245,6 @@ async def query_miner_for_weather(
         endpoint="/weather-initiate-fetch",
         payload=payload,
         timeout=30.0,
-        max_retries=2,
         db_manager=db_manager,
     )
     
@@ -291,8 +274,11 @@ async def poll_miner_job_status(
     """
     Poll a miner for job status with detailed logging.
     """
+    # Wrap the data in the expected format for WeatherGetInputStatusRequest
     payload = {
-        "job_id": job_id,
+        "data": {
+            "job_id": job_id,
+        }
     }
     
     logger.info(f"Polling job status for {miner_hotkey[:8]}, job_id: {job_id}")
@@ -303,7 +289,6 @@ async def poll_miner_job_status(
         endpoint="/weather-get-input-status",
         payload=payload,
         timeout=15.0,
-        max_retries=1,
         db_manager=db_manager,
     )
     
