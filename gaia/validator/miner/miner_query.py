@@ -162,7 +162,7 @@ async def get_input_status(
 ) -> Optional[Dict[str, Any]]:
     payload = {"nonce": __import__("uuid").uuid4().hex, "data": {"job_id": job_id}}
     return await query_single_miner(
-        task_or_validator, miner_hotkey, endpoint="/weather-get-input-status", payload=payload
+        task_or_validator, miner_hotkey, endpoint="/weather-poll-job-status", payload=payload
     )
 
 

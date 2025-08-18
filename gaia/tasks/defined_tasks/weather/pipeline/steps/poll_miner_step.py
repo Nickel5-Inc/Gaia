@@ -151,20 +151,21 @@ async def run_poll_miner_job(
                     {"id": response_id}
                 )
                 
-                # Update stats with inference time
-                if validator and inference_time_seconds:
-                    stats = WeatherStatsManager(db, getattr(validator, "hotkey", "unknown"))
-                    await db.execute(
-                        """
-                        UPDATE weather_forecast_stats wfs
-                        SET forecast_inference_time = :time
-                        FROM weather_forecast_runs wfr
-                        WHERE wfs.run_id = wfr.id 
-                        AND wfr.id = :run_id 
-                        AND wfs.miner_uid = :miner_uid
-                        """,
-                        {"time": inference_time_seconds, "run_id": run_id, "miner_uid": miner_uid}
-                    )
+                # Update stats with inference time and status
+                await db.execute(
+                    """
+                    UPDATE weather_forecast_stats wfs
+                    SET forecast_inference_time = COALESCE(:time, forecast_inference_time),
+                        current_forecast_status = 'inference_complete',
+                        current_forecast_stage = 'awaiting_scoring',
+                        last_error_message = NULL
+                    FROM weather_forecast_runs wfr
+                    WHERE wfs.run_id = wfr.id 
+                    AND wfr.id = :run_id 
+                    AND wfs.miner_uid = :miner_uid
+                    """,
+                    {"time": inference_time_seconds, "run_id": run_id, "miner_uid": miner_uid}
+                )
                 
                 # Enqueue day1 scoring job
                 await db.enqueue_validator_job(
@@ -294,6 +295,21 @@ async def _reschedule_poll(
         miner_uid=miner_uid,
         response_id=response_id,
         scheduled_at=next_poll_time,
+    )
+    
+    # Update poll attempt tracking in weather_forecast_stats
+    await db.execute(
+        """
+        UPDATE weather_forecast_stats
+        SET current_forecast_status = 'polling_for_inference',
+            last_error_message = :msg
+        WHERE run_id = :run_id AND miner_uid = :miner_uid
+        """,
+        {
+            "msg": f"Polling attempt {next_attempt}/20",
+            "run_id": run_id,
+            "miner_uid": miner_uid
+        }
     )
     
     logger.info(

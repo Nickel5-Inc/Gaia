@@ -122,6 +122,21 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 if rid and muid is not None:
                     ok = await run_query_miner_job(db, int(rid), int(muid), mhk, vhk, validator)
                     if ok:
+                        # Query succeeded, reset retry tracking
+                        await db.execute(
+                            """
+                            UPDATE weather_forecast_stats
+                            SET retries_remaining = 3,
+                                current_forecast_status = 'query_successful',
+                                last_error_message = NULL,
+                                next_scheduled_retry = NULL
+                            WHERE run_id = :run_id AND miner_uid = :miner_uid
+                            """,
+                            {
+                                "run_id": rid,
+                                "miner_uid": muid
+                            }
+                        )
                         await db.complete_validator_job(job["id"], result={"ok": True})
                     else:
                         # Schedule retry with lower priority so first attempts get processed first
@@ -130,6 +145,26 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                             backoff = [60, 300, 900][retry_count - 1]  # 1min, 5min, 15min
                             # Lower priority for retries: 85, 90, 95
                             retry_priority = 80 + (retry_count * 5)
+                            
+                            # Update retries_remaining in weather_forecast_stats
+                            retries_remaining = 3 - retry_count
+                            next_retry_time = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+                            await db.execute(
+                                """
+                                UPDATE weather_forecast_stats
+                                SET retries_remaining = :retries,
+                                    next_scheduled_retry = :next_retry,
+                                    current_forecast_status = 'retrying',
+                                    last_error_message = 'Query failed, retrying...'
+                                WHERE run_id = :run_id AND miner_uid = :miner_uid
+                                """,
+                                {
+                                    "retries": retries_remaining,
+                                    "next_retry": next_retry_time,
+                                    "run_id": rid,
+                                    "miner_uid": muid
+                                }
+                            )
                             
                             # Re-enqueue with updated retry count and lower priority
                             await db.enqueue_validator_job(
@@ -144,15 +179,31 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                                 priority=retry_priority,
                                 run_id=rid,
                                 miner_uid=muid,
-                                scheduled_at=datetime.now(timezone.utc) + timedelta(seconds=backoff)
+                                scheduled_at=next_retry_time
                             )
                             await db.complete_validator_job(job["id"], result={"retry_scheduled": True})
                             logger.info(
                                 f"[Run {rid}] Scheduled retry {retry_count}/3 for miner {muid} "
-                                f"in {backoff}s with priority {retry_priority}"
+                                f"in {backoff}s with priority {retry_priority}, {retries_remaining} retries remaining"
                             )
                         else:
+                            # All retries exhausted, mark as failed
+                            await db.execute(
+                                """
+                                UPDATE weather_forecast_stats
+                                SET retries_remaining = 0,
+                                    current_forecast_status = 'failed',
+                                    last_error_message = 'Query failed after 3 attempts',
+                                    next_scheduled_retry = NULL
+                                WHERE run_id = :run_id AND miner_uid = :miner_uid
+                                """,
+                                {
+                                    "run_id": rid,
+                                    "miner_uid": muid
+                                }
+                            )
                             await db.fail_validator_job(job["id"], "Query failed after 3 attempts")
+                            logger.warning(f"[Run {rid}] Miner {muid} failed after 3 attempts, marked as failed")
                         ok = False
                 else:
                     await db.fail_validator_job(job["id"], "missing run_id or miner_uid")

@@ -1000,7 +1000,7 @@ def factory_router(miner_instance) -> APIRouter:
         Miner returns the job status and the input hash if available.
         DEPRECATED: Use /weather-poll-job-status instead.
         """
-        logger.info("Entered /weather-get-input-status handler (LEGACY).")
+        logger.info("Entered /weather-poll-job-status handler.")
         try:
             if (
                 not hasattr(miner_instance, "weather_task")
@@ -1044,7 +1044,7 @@ def factory_router(miner_instance) -> APIRouter:
             )
         except Exception as e:
             logger.error(
-                f"Error in /weather-get-input-status handler: {e}", exc_info=True
+                f"Error in /weather-poll-job-status handler: {e}", exc_info=True
             )
             return JSONResponse(
                 status_code=500, content={"error": f"Internal server error: {str(e)}"}
@@ -1162,7 +1162,7 @@ def factory_router(miner_instance) -> APIRouter:
             response_class=JSONResponse,
         )
         router.add_api_route(
-            "/weather-get-input-status",
+            "/weather-poll-job-status",
             weather_get_input_status_require,
             tags=["Weather"],
             dependencies=[

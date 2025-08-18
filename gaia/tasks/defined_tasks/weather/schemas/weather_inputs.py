@@ -210,13 +210,13 @@ class WeatherInitiateFetchRequest(BaseModel):
 
 
 class WeatherGetInputStatusData(BaseModel):
-    """Data payload for the /weather-get-input-status request"""
+    """Data payload for the /weather-poll-job-status request"""
 
     job_id: str = Field(..., description="The unique job ID returned by the miner.")
 
 
 class WeatherGetInputStatusRequest(BaseModel):
-    """Request model for /weather-get-input-status"""
+    """Request model for /weather-poll-job-status"""
 
     nonce: str | None = None
     data: WeatherGetInputStatusData

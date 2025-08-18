@@ -601,7 +601,7 @@ async def poll_miner_job_status(
     result = await query_single_miner(
         validator=validator,
         miner_hotkey=miner_hotkey,
-        endpoint="/weather-get-input-status",
+        endpoint="/weather-poll-job-status",
         payload=payload,
         timeout=15.0,
         db_manager=db_manager,

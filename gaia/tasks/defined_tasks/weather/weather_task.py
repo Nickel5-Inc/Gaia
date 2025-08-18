@@ -3491,7 +3491,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
     async def handle_get_input_status(self, job_id: str) -> Dict[str, Any]:
         """
-        Handles the /weather-get-input-status request.
+        Handles the /weather-poll-job-status request.
         Returns the current status and input hash (if computed) for the job.
         If the job is ready for inference but hasn't been triggered, it reports
         the status as 'input_hashed_awaiting_validation' to conform to the validator.
@@ -3527,16 +3527,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
             status_to_report = result["status"]
             # If hashing is done and we are waiting for the validator to trigger inference,
-            # report the specific status the validator is looking for.
-            # For completed jobs, also report as awaiting validation so validator includes us in scoring
-            if result.get("input_data_hash"):
-                if status_to_report in ["in_progress", "completed"]:
-                    status_to_report = (
-                        WeatherTaskStatus.INPUT_HASHED_AWAITING_VALIDATION.value
-                    )
-                    logger.debug(
-                        f"[Miner Job {job_id}] Job status '{result['status']}' with hash converted to '{status_to_report}' for validator compatibility"
-                    )
+            # Report the actual status without conversion
+            # The validator needs to see "completed" to know inference is done
+            logger.debug(
+                f"[Miner Job {job_id}] Job actual status: '{result['status']}', reporting as: '{status_to_report}'"
+            )
 
             # Simplified reporting: expose raw job status for polling
             response = {
@@ -4143,11 +4138,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 return resp_id, parsed_response
                             else:
                                 logger.warning(
-                                    f"[HashWorker] [Run {run_id}] No response received from miner {miner_hk[:8]} on /weather-get-input-status endpoint."
+                                    f"[HashWorker] [Run {run_id}] No response received from miner {miner_hk[:8]} on /weather-poll-job-status endpoint."
                                 )
                                 return resp_id, {
                                     "status": "validator_poll_failed",
-                                    "message": f"No response from miner {miner_hk[:8]} on /weather-get-input-status endpoint",
+                                    "message": f"No response from miner {miner_hk[:8]} on /weather-poll-job-status endpoint",
                                 }
                         except asyncio.TimeoutError as timeout_err:
                             logger.error(
@@ -5557,7 +5552,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         "nonce": str(uuid.uuid4()),
                         "data": status_payload_data.model_dump(),
                     }
-                    endpoint = "/weather-get-input-status"
+                    endpoint = "/weather-poll-job-status"
 
                     all_responses = await self.validator.query_miners(
                         payload=status_payload, endpoint=endpoint, hotkeys=[miner_hk]

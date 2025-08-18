@@ -676,7 +676,7 @@ class WeatherInitiateFetchResponse(BaseModel):
 
 
 class WeatherGetInputStatusResponse(BaseModel):
-    """Response model for /weather-get-input-status"""
+    """Response model for /weather-poll-job-status"""
 
     job_id: str = Field(..., description="The job ID.")
     status: str = Field(

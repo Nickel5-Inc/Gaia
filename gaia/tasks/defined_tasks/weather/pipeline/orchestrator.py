@@ -4,6 +4,7 @@ This module handles the high-level coordination of a forecast run.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any

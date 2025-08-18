@@ -68,7 +68,7 @@ async def main():
             
             # Build the URL the validator is trying to reach
             miner_url = f"https://{node['ip']}:{node['port']}"
-            print(f"  Target URL: {miner_url}/weather-get-input-status")
+            print(f"  Target URL: {miner_url}/weather-poll-job-status")
         else:
             print(f"\n❌ Miner not found in node_table")
             
@@ -100,7 +100,7 @@ async def main():
     print("1. Is the miner listening on the expected IP:PORT?")
     print("2. Does the job_id exist in miner's weather_miner_jobs table?")
     print("3. Are there any miner logs showing connection attempts?")
-    print("4. Is the miner's /weather-get-input-status endpoint working?")
+    print("4. Is the miner's /weather-poll-job-status endpoint working?")
     print("5. Are there any firewall/network issues?")
 
 if __name__ == "__main__":
