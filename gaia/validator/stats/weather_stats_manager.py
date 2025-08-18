@@ -113,7 +113,10 @@ class WeatherStatsManager:
         initial_score: Optional[float] = None,
         era5_scores: Optional[Dict[int, float]] = None,
         hosting_status: Optional[str] = None,
-        hosting_latency_ms: Optional[int] = None
+        hosting_latency_ms: Optional[int] = None,
+        avg_rmse: Optional[float] = None,
+        avg_acc: Optional[float] = None,
+        avg_skill_score: Optional[float] = None
     ) -> bool:
         """
         Update or insert weather forecast statistics for a miner.
@@ -193,6 +196,14 @@ class WeatherStatsManager:
                 stats_data["hosting_status"] = hosting_status
             if hosting_latency_ms is not None:
                 stats_data["hosting_latency_ms"] = hosting_latency_ms
+            
+            # Add average component metrics
+            if avg_rmse is not None:
+                stats_data["avg_rmse"] = avg_rmse
+            if avg_acc is not None:
+                stats_data["avg_acc"] = avg_acc
+            if avg_skill_score is not None:
+                stats_data["avg_skill_score"] = avg_skill_score
             
             # Upsert the record
             stmt = insert(weather_forecast_stats_table).values(**stats_data)
@@ -579,3 +590,176 @@ class WeatherStatsManager:
         except Exception as e:
             logger.error(f"Error calculating overall miner ranks: {e}")
             return {}
+    
+    async def update_pipeline_status(
+        self,
+        run_id: int,
+        miner_uid: int,
+        stage: str,
+        status: str,
+        error: Optional[str] = None,
+        retry_info: Optional[Dict] = None
+    ) -> bool:
+        """
+        Update detailed pipeline tracking columns.
+        
+        Args:
+            run_id: Weather forecast run ID
+            miner_uid: Miner's UID
+            stage: Current pipeline stage
+            status: Status within the stage
+            error: Error message if any
+            retry_info: Dictionary with retries_remaining and next_retry_time
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Get forecast run details to generate forecast_run_id
+            run_data = await self.db.fetch_one(
+                sa.select(
+                    weather_forecast_runs_table.c.gfs_init_time_utc,
+                    weather_forecast_runs_table.c.target_forecast_time_utc
+                ).where(weather_forecast_runs_table.c.id == run_id)
+            )
+            
+            if not run_data:
+                logger.error(f"Forecast run {run_id} not found")
+                return False
+            
+            forecast_run_id = self.generate_forecast_run_id(
+                run_data["gfs_init_time_utc"],
+                run_data["target_forecast_time_utc"]
+            )
+            
+            update_data = {
+                "current_forecast_stage": stage,
+                "current_forecast_status": status,
+                "updated_at": datetime.now(timezone.utc)
+            }
+            
+            if error:
+                update_data["last_error_message"] = error[:500]  # Limit error message length
+            
+            if retry_info:
+                update_data["retries_remaining"] = retry_info.get("retries_remaining")
+                update_data["next_scheduled_retry"] = retry_info.get("next_retry_time")
+            
+            stmt = sa.update(weather_forecast_stats_table).where(
+                sa.and_(
+                    weather_forecast_stats_table.c.miner_uid == miner_uid,
+                    weather_forecast_stats_table.c.forecast_run_id == forecast_run_id
+                )
+            ).values(**update_data)
+            
+            await self.db.execute(stmt)
+            logger.debug(f"Updated pipeline status for miner {miner_uid}: {stage}/{status}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating pipeline status: {e}")
+            return False
+    
+    async def record_component_scores(
+        self,
+        run_id: int,
+        response_id: int,
+        miner_uid: int,
+        miner_hotkey: str,
+        score_type: str,
+        lead_hours: int,
+        valid_time: datetime,
+        variable_scores: Dict[str, Dict]
+    ) -> bool:
+        """
+        Batch insert component scores for a scoring operation.
+        
+        Args:
+            run_id: Weather forecast run ID
+            response_id: Miner response ID
+            miner_uid: Miner's UID
+            miner_hotkey: Miner's hotkey
+            score_type: Type of scoring ('day1' or 'era5')
+            lead_hours: Forecast lead time in hours
+            valid_time: Valid time for the forecast
+            variable_scores: Dictionary of variable -> metrics
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            from gaia.database.validator_schema import weather_forecast_component_scores_table
+            
+            rows = []
+            for variable, metrics in variable_scores.items():
+                row = {
+                    "run_id": run_id,
+                    "response_id": response_id,
+                    "miner_uid": miner_uid,
+                    "miner_hotkey": miner_hotkey,
+                    "score_type": score_type,
+                    "lead_hours": lead_hours,
+                    "valid_time_utc": valid_time,
+                    "variable_name": variable,
+                    "pressure_level": metrics.get("pressure_level"),
+                    "rmse": metrics.get("rmse"),
+                    "mse": metrics.get("mse"),
+                    "acc": metrics.get("acc"),
+                    "skill_score": metrics.get("skill_score"),
+                    "skill_score_gfs": metrics.get("skill_score_gfs"),
+                    "skill_score_climatology": metrics.get("skill_score_climatology"),
+                    "bias": metrics.get("bias"),
+                    "mae": metrics.get("mae"),
+                    "climatology_check_passed": metrics.get("climatology_check_passed"),
+                    "pattern_correlation": metrics.get("pattern_correlation"),
+                    "pattern_correlation_passed": metrics.get("pattern_correlation_passed"),
+                    "clone_penalty": metrics.get("clone_penalty", 0),
+                    "quality_penalty": metrics.get("quality_penalty", 0),
+                    "weighted_score": metrics.get("weighted_score"),
+                    "variable_weight": metrics.get("weight"),
+                    "calculated_at": datetime.now(timezone.utc),
+                    "calculation_duration_ms": metrics.get("calculation_duration_ms")
+                }
+                rows.append(row)
+            
+            if rows:
+                # Use on_conflict_do_update for idempotency
+                for row in rows:
+                    stmt = insert(weather_forecast_component_scores_table).values(**row)
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=[
+                            "response_id", "score_type", "lead_hours", 
+                            "variable_name", "pressure_level"
+                        ],
+                        set_={
+                            k: v for k, v in row.items()
+                            if k not in ["response_id", "score_type", "lead_hours", 
+                                        "variable_name", "pressure_level"]
+                        }
+                    )
+                    await self.db.execute(stmt)
+                
+                logger.debug(f"Recorded {len(rows)} component scores for miner {miner_uid}")
+            
+            # Calculate and update averages in forecast stats
+            if rows:
+                avg_rmse = sum(r["rmse"] for r in rows if r["rmse"] is not None) / len([r for r in rows if r["rmse"] is not None]) if any(r["rmse"] is not None for r in rows) else None
+                avg_acc = sum(r["acc"] for r in rows if r["acc"] is not None) / len([r for r in rows if r["acc"] is not None]) if any(r["acc"] is not None for r in rows) else None
+                avg_skill = sum(r["skill_score"] for r in rows if r["skill_score"] is not None) / len([r for r in rows if r["skill_score"] is not None]) if any(r["skill_score"] is not None for r in rows) else None
+                
+                # Update forecast stats with averages
+                await self.update_forecast_stats(
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                    miner_hotkey=miner_hotkey,
+                    status=f"{score_type}_scored" if score_type == "day1" else "era5_scoring",
+                    avg_rmse=avg_rmse,
+                    avg_acc=avg_acc,
+                    avg_skill_score=avg_skill
+                )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error recording component scores: {e}")
+            return False

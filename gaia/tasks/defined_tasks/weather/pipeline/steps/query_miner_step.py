@@ -11,6 +11,8 @@ from typing import Optional, Dict, Any
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import query_miner_for_weather
 from gaia.tasks.defined_tasks.weather.schemas.weather_outputs import WeatherTaskStatus
+from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
+from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_failure, log_success
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,24 @@ async def run_query_miner_job(
                     status="failed",
                     error_message="No response from miner"
                 )
+                # Update pipeline status
+                stats = WeatherStatsManager(db, validator_hotkey)
+                await stats.update_pipeline_status(
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                    stage="inference_requested",
+                    status="failed",
+                    error="No response from miner"
+                )
+                await log_failure(
+                    db,
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                    miner_hotkey=miner_hotkey,
+                    step_name="query",
+                    substep="initiate_fetch",
+                    error_json={"error": "No response from miner"}
+                )
                 return True  # Don't retry connection failures
             
             # Check if request was successful
@@ -106,6 +126,26 @@ async def run_query_miner_job(
                     db, run_id, miner_uid, miner_hotkey,
                     status="failed",
                     error_message=f"{error_msg} (HTTP {status_code})" if status_code else error_msg
+                )
+                
+                # Update pipeline status
+                stats = WeatherStatsManager(db, validator_hotkey)
+                await stats.update_pipeline_status(
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                    stage="inference_requested",
+                    status="error",
+                    error=f"{error_msg} (HTTP {status_code})" if status_code else error_msg
+                )
+                await log_failure(
+                    db,
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                    miner_hotkey=miner_hotkey,
+                    step_name="query",
+                    substep="initiate_fetch",
+                    error_json={"error": error_msg, "status_code": status_code},
+                    latency_ms=int(result.get("response_time", 0) * 1000) if result else None
                 )
                 
                 # Retry on network errors (no status code means connection failed)
@@ -144,6 +184,24 @@ async def run_query_miner_job(
                     WHERE id = :id
                     """,
                     {"id": response_id}
+                )
+                
+                # Update pipeline status to show inference started
+                stats = WeatherStatsManager(db, validator_hotkey)
+                await stats.update_pipeline_status(
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                    stage="inference_running",
+                    status="in_progress"
+                )
+                await log_success(
+                    db,
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                    miner_hotkey=miner_hotkey,
+                    step_name="query",
+                    substep="initiate_fetch",
+                    latency_ms=int(result.get("response_time", 0) * 1000)
                 )
                 
                 # Enqueue polling job to check when inference is complete
