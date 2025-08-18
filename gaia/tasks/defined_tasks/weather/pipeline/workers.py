@@ -207,6 +207,53 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                         "UPDATE weather_forecast_runs SET status = 'gfs_ready' WHERE id = :run_id",
                         {"run_id": rid}
                     )
+                    
+                    # Update forecast metadata for all miners
+                    import json
+                    from datetime import timedelta
+                    
+                    # Get GFS init time from the run
+                    run_info = await db.fetch_one(
+                        "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :run_id",
+                        {"run_id": rid}
+                    )
+                    if run_info and run_info["gfs_init_time_utc"]:
+                        gfs_init = run_info["gfs_init_time_utc"]
+                        forecast_type = "10day"  # Could be from config
+                        initial_scoring_lead_hours = [6, 12]  # From config
+                        
+                        input_sources = {
+                            "gfs": {
+                                "init_time": gfs_init.isoformat(),
+                                "cycle": gfs_init.strftime("%Hz"),
+                                "leads": initial_scoring_lead_hours,
+                                "analysis_times": [
+                                    (gfs_init + timedelta(hours=0)).isoformat(),
+                                    (gfs_init + timedelta(hours=-6)).isoformat()
+                                ]
+                            },
+                            "era5_climatology": {
+                                "version": "v1",
+                                "years_used": 30
+                            }
+                        }
+                        
+                        await db.execute(
+                            """
+                            UPDATE weather_forecast_stats wfs
+                            SET forecast_type = :forecast_type,
+                                forecast_input_sources = :input_sources,
+                                updated_at = NOW()
+                            FROM weather_forecast_runs wfr
+                            WHERE wfs.run_id = wfr.id
+                            AND wfr.id = :run_id
+                            """,
+                            {
+                                "run_id": rid,
+                                "forecast_type": forecast_type,
+                                "input_sources": json.dumps(input_sources)
+                            }
+                        )
                     await db.complete_validator_job(job["id"], result={"ok": True})
                     # Re-enqueue orchestration job to handle the next phase
                     await db.enqueue_validator_job(

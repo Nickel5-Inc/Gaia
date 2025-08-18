@@ -363,11 +363,88 @@ async def query_miner_for_weather(
             f"\n  Status: {data.get('status')}"
             f"\n  Response time: {result.get('response_time', 0):.2f}s"
         )
+        
+        # Track hosting success metrics
+        if db_manager:
+            try:
+                latency_ms = int(result.get('response_time', 0) * 1000)
+                await db_manager.execute(
+                    """
+                    UPDATE miner_stats 
+                    SET hosting_successes = COALESCE(hosting_successes, 0) + 1,
+                        host_reliability_ratio = CASE 
+                            WHEN (COALESCE(hosting_successes, 0) + COALESCE(hosting_failures, 0) + 1) > 0 
+                            THEN (COALESCE(hosting_successes, 0) + 1)::float / (COALESCE(hosting_successes, 0) + COALESCE(hosting_failures, 0) + 1)
+                            ELSE 1.0 
+                        END,
+                        avg_hosting_latency_ms = CASE
+                            WHEN avg_hosting_latency_ms IS NULL THEN :latency
+                            ELSE (avg_hosting_latency_ms * COALESCE(hosting_successes, 0) + :latency) / (COALESCE(hosting_successes, 0) + 1)
+                        END,
+                        last_active = NOW(),
+                        consecutive_successes = COALESCE(consecutive_successes, 0) + 1,
+                        consecutive_failures = 0
+                    WHERE miner_uid = (SELECT uid FROM node_table WHERE hotkey = :hotkey LIMIT 1)
+                    """,
+                    {
+                        "hotkey": miner_hotkey,
+                        "latency": latency_ms
+                    }
+                )
+            except Exception as stats_error:
+                logger.debug(f"Failed to update hosting success metrics: {stats_error}")
     else:
         error = result.get("error", "Unknown error") if result else "No response"
         logger.warning(
             f"✗ Weather fetch failed for {miner_hotkey[:8]}: {error}"
         )
+        
+        # Track hosting failure metrics
+        if db_manager:
+            try:
+                error_type = error.split(":")[0] if ":" in error else error[:50]
+                # Use simpler approach to avoid parameter syntax issues
+                await db_manager.execute(
+                    """
+                    UPDATE miner_stats 
+                    SET hosting_failures = COALESCE(hosting_failures, 0) + 1,
+                        host_reliability_ratio = CASE 
+                            WHEN (COALESCE(hosting_successes, 0) + COALESCE(hosting_failures, 0) + 1) > 0 
+                            THEN COALESCE(hosting_successes, 0)::float / (COALESCE(hosting_successes, 0) + COALESCE(hosting_failures, 0) + 1)
+                            ELSE 0 
+                        END,
+                        last_active = NOW(),
+                        consecutive_failures = COALESCE(consecutive_failures, 0) + 1,
+                        consecutive_successes = 0
+                    WHERE miner_uid = (SELECT uid FROM node_table WHERE hotkey = :hotkey LIMIT 1)
+                    """,
+                    {
+                        "hotkey": miner_hotkey
+                    }
+                )
+                # Update error tracking separately to avoid complex JSONB parameter issues
+                await db_manager.execute(
+                    """
+                    UPDATE miner_stats 
+                    SET common_errors = 
+                        CASE 
+                            WHEN common_errors IS NULL THEN 
+                                jsonb_build_object(:error_type, 1)
+                            WHEN common_errors ? :error_type THEN 
+                                jsonb_set(common_errors, ARRAY[:error_type], 
+                                    to_jsonb(COALESCE((common_errors->>:error_type)::int, 0) + 1))
+                            ELSE 
+                                common_errors || jsonb_build_object(:error_type, 1)
+                        END
+                    WHERE miner_uid = (SELECT uid FROM node_table WHERE hotkey = :hotkey LIMIT 1)
+                    """,
+                    {
+                        "hotkey": miner_hotkey,
+                        "error_type": error_type
+                    }
+                )
+            except Exception as stats_error:
+                logger.debug(f"Failed to update hosting failure metrics: {stats_error}")
     
     return result
 

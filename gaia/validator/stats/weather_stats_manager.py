@@ -304,6 +304,7 @@ class WeatherStatsManager:
                     hosting_successes, hosting_failures, host_reliability_ratio, avg_hosting_latency_ms,
                     avg_day1_score, avg_era5_score, avg_era5_completeness, best_forecast_score, worst_forecast_score, score_std_dev,
                     last_successful_forecast, last_failed_forecast, first_seen, last_active,
+                    total_inference_time, avg_inference_time, error_rate_by_type,
                     validator_hotkey, updated_at
                 )
                 SELECT
@@ -330,6 +331,18 @@ class WeatherStatsManager:
                     MAX(CASE WHEN wfs.forecast_status = 'failed' THEN wfs.updated_at ELSE NULL END) AS last_failed_forecast,
                     MIN(wfs.created_at) AS first_seen,
                     MAX(wfs.created_at) AS last_active,
+                    COALESCE(SUM(wfs.forecast_inference_time), 0) AS total_inference_time,
+                    CASE WHEN SUM(CASE WHEN wfs.forecast_inference_time IS NOT NULL THEN 1 ELSE 0 END) > 0 
+                         THEN AVG(wfs.forecast_inference_time) 
+                         ELSE NULL END AS avg_inference_time,
+                    CASE WHEN SUM(CASE WHEN wfs.forecast_status = 'failed' THEN 1 ELSE 0 END) > 0
+                         THEN jsonb_build_object(
+                             'network_error', SUM(CASE WHEN wfs.last_error_message LIKE '%network%' OR wfs.last_error_message LIKE '%timeout%' THEN 1 ELSE 0 END)::float / NULLIF(SUM(CASE WHEN wfs.forecast_status = 'failed' THEN 1 ELSE 0 END), 0),
+                             'verification_error', SUM(CASE WHEN wfs.last_error_message LIKE '%verification%' OR wfs.last_error_message LIKE '%manifest%' THEN 1 ELSE 0 END)::float / NULLIF(SUM(CASE WHEN wfs.forecast_status = 'failed' THEN 1 ELSE 0 END), 0),
+                             'inference_error', SUM(CASE WHEN wfs.last_error_message LIKE '%inference%' OR wfs.last_error_message LIKE '%processing%' THEN 1 ELSE 0 END)::float / NULLIF(SUM(CASE WHEN wfs.forecast_status = 'failed' THEN 1 ELSE 0 END), 0),
+                             'other_error', SUM(CASE WHEN wfs.last_error_message NOT LIKE '%network%' AND wfs.last_error_message NOT LIKE '%timeout%' AND wfs.last_error_message NOT LIKE '%verification%' AND wfs.last_error_message NOT LIKE '%manifest%' AND wfs.last_error_message NOT LIKE '%inference%' AND wfs.last_error_message NOT LIKE '%processing%' THEN 1 ELSE 0 END)::float / NULLIF(SUM(CASE WHEN wfs.forecast_status = 'failed' THEN 1 ELSE 0 END), 0)
+                         )
+                         ELSE NULL END AS error_rate_by_type,
                     :vhk AS validator_hotkey,
                     NOW() AT TIME ZONE 'UTC' AS updated_at
                 FROM weather_forecast_stats wfs
@@ -356,6 +369,9 @@ class WeatherStatsManager:
                     last_failed_forecast = EXCLUDED.last_failed_forecast,
                     first_seen = EXCLUDED.first_seen,
                     last_active = EXCLUDED.last_active,
+                    total_inference_time = EXCLUDED.total_inference_time,
+                    avg_inference_time = EXCLUDED.avg_inference_time,
+                    error_rate_by_type = EXCLUDED.error_rate_by_type,
                     validator_hotkey = EXCLUDED.validator_hotkey,
                     updated_at = EXCLUDED.updated_at
                 """.replace("{where_clause}", where_clause)

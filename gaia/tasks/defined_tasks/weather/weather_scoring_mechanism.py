@@ -177,9 +177,18 @@ async def evaluate_miner_forecast_day1(
             # Mark this miner as failed but don't crash the entire batch
             await task_instance.db_manager.execute(
                 """UPDATE weather_miner_responses 
-                   SET status = 'verification_failed', error_message = 'Manifest verification failed during day1 scoring'
+                   SET status = 'verification_failed', 
+                       error_message = 'Manifest verification failed during day1 scoring',
+                       kerchunk_json_url = :url,
+                       verification_hash_claimed = :hash,
+                       verification_passed = false
                    WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey""",
-                {"run_id": run_id, "miner_hotkey": miner_hotkey},
+                {
+                    "run_id": run_id, 
+                    "miner_hotkey": miner_hotkey,
+                    "url": zarr_store_url,
+                    "hash": claimed_manifest_content_hash
+                },
             )
             # Check if this was the last miner in the run
             await _check_run_completion(task_instance, run_id)
@@ -187,6 +196,21 @@ async def evaluate_miner_forecast_day1(
             day1_results["overall_day1_score"] = 0.0
             day1_results["qc_passed_all_vars_leads"] = False
             return day1_results  # Return graceful failure rather than exception
+        else:
+            # Verification succeeded - update tracking
+            await task_instance.db_manager.execute(
+                """UPDATE weather_miner_responses 
+                   SET kerchunk_json_url = :url,
+                       verification_hash_claimed = :hash,
+                       verification_passed = true
+                   WHERE run_id = :run_id AND miner_hotkey = :miner_hotkey""",
+                {
+                    "run_id": run_id, 
+                    "miner_hotkey": miner_hotkey,
+                    "url": zarr_store_url,
+                    "hash": claimed_manifest_content_hash
+                },
+            )
 
         hardcoded_valid_times: Optional[List[datetime]] = day1_scoring_config.get(
             "hardcoded_valid_times_for_eval"

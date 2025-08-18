@@ -125,6 +125,23 @@ async def run_poll_miner_job(
                 # Inference complete, update status and enqueue scoring
                 logger.info(f"[Run {run_id}] Miner {miner_hotkey[:8]} inference complete")
                 
+                # Calculate inference time if we have the start time
+                inference_time_seconds = None
+                try:
+                    start_time_result = await db.fetch_one(
+                        """
+                        SELECT inference_started_at 
+                        FROM weather_miner_responses 
+                        WHERE id = :id
+                        """,
+                        {"id": response_id}
+                    )
+                    if start_time_result and start_time_result["inference_started_at"]:
+                        inference_duration = datetime.now(timezone.utc) - start_time_result["inference_started_at"]
+                        inference_time_seconds = int(inference_duration.total_seconds())
+                except Exception as e:
+                    logger.debug(f"Could not calculate inference time: {e}")
+                
                 await db.execute(
                     """
                     UPDATE weather_miner_responses
@@ -133,6 +150,21 @@ async def run_poll_miner_job(
                     """,
                     {"id": response_id}
                 )
+                
+                # Update stats with inference time
+                if validator and inference_time_seconds:
+                    stats = WeatherStatsManager(db, getattr(validator, "hotkey", "unknown"))
+                    await db.execute(
+                        """
+                        UPDATE weather_forecast_stats wfs
+                        SET forecast_inference_time = :time
+                        FROM weather_forecast_runs wfr
+                        WHERE wfs.run_id = wfr.id 
+                        AND wfr.id = :run_id 
+                        AND wfs.miner_uid = :miner_uid
+                        """,
+                        {"time": inference_time_seconds, "run_id": run_id, "miner_uid": miner_uid}
+                    )
                 
                 # Enqueue day1 scoring job
                 await db.enqueue_validator_job(

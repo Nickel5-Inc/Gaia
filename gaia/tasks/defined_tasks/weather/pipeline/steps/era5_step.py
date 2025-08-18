@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any, Dict, Tuple
 
@@ -17,6 +18,8 @@ from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data
 from .step_logger import log_start, log_success, log_failure, schedule_retry
 from .substep import substep
 from .util_time import get_effective_gfs_init
+
+logger = logging.getLogger(__name__)
 
 
 # Lightweight in-process cache for ERA5 truth per (run_id, leads)
@@ -250,6 +253,120 @@ async def run(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> 
             pass
         return False
     latency_ms = int((time.perf_counter() - t0) * 1000)
+    
+    # Extract and store ERA5 component scores
+    if ok:
+        try:
+            # Get detailed scores for component storage
+            component_rows = await db.fetch_all(
+                sa.text(
+                    """
+                    SELECT 
+                        score_type, lead_hours, variable_level, score, metrics,
+                        calculation_time, valid_time_utc
+                    FROM weather_miner_scores
+                    WHERE run_id = :rid AND miner_uid = :uid 
+                    AND lead_hours IN :leads
+                    AND (score_type LIKE 'era5_rmse_%' OR score_type LIKE 'era5_acc_%' OR score_type LIKE 'era5_skill_%')
+                    """
+                ),
+                {"rid": item.run_id, "uid": item.miner_uid, "leads": tuple(ready_leads)},
+            )
+            
+            # Parse and organize component scores
+            if component_rows:
+                from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
+                stats = WeatherStatsManager(
+                    db,
+                    validator_hotkey=(
+                        getattr(getattr(getattr(validator, "validator_wallet", None), "hotkey", None), "ss58_address", None)
+                        if validator is not None
+                        else "unknown_validator"
+                    ),
+                )
+                
+                # Group scores by lead_hours
+                lead_hour_groups = {}
+                for row in component_rows:
+                    lead_h = row.get("lead_hours")
+                    if lead_h not in lead_hour_groups:
+                        lead_hour_groups[lead_h] = []
+                    lead_hour_groups[lead_h].append(row)
+                
+                # Process each lead hour group
+                for lead_hours, scores in lead_hour_groups.items():
+                    if not scores:
+                        continue
+                        
+                    # Extract variable scores
+                    variable_scores = {}
+                    valid_time = None
+                    
+                    for score_row in scores:
+                        score_type = score_row.get("score_type", "")
+                        var_level = score_row.get("variable_level", "")
+                        score_val = score_row.get("score")
+                        metrics = score_row.get("metrics", {}) if score_row.get("metrics") else {}
+                        valid_time = score_row.get("valid_time_utc")
+                        
+                        # Parse variable name from score_type (e.g., "era5_rmse_t850_24h" -> "t", level=850)
+                        import re
+                        # Extract variable info from score_type
+                        type_parts = score_type.split("_")
+                        if len(type_parts) >= 3:
+                            var_info = type_parts[2]  # e.g., "t850"
+                            # Extract variable name and level
+                            match = re.match(r'([a-z]+)(\d+)?', var_info)
+                            if match:
+                                var_name = match.group(1)
+                                pressure_level = int(match.group(2)) if match.group(2) else None
+                            else:
+                                var_name = var_info
+                                pressure_level = None
+                                
+                            if var_name not in variable_scores:
+                                variable_scores[var_name] = {
+                                    "pressure_level": pressure_level,
+                                    "weight": 1.0,  # Equal weight for now
+                                }
+                            
+                            # Add the appropriate metric
+                            if "rmse" in score_type:
+                                variable_scores[var_name]["rmse"] = score_val
+                            elif "acc" in score_type:
+                                variable_scores[var_name]["acc"] = score_val
+                            elif "skill" in score_type:
+                                variable_scores[var_name]["skill_score"] = score_val
+                            
+                            # Add metrics if available
+                            if isinstance(metrics, dict):
+                                if "mse" in metrics:
+                                    variable_scores[var_name]["mse"] = metrics.get("mse")
+                                if "bias" in metrics:
+                                    variable_scores[var_name]["bias"] = metrics.get("bias")
+                                if "mae" in metrics:
+                                    variable_scores[var_name]["mae"] = metrics.get("mae")
+                    
+                    # Record component scores if we have valid data
+                    if variable_scores and valid_time:
+                        # Normalize weights
+                        total_vars = len(variable_scores)
+                        for var_data in variable_scores.values():
+                            var_data["weight"] = 1.0 / total_vars if total_vars > 0 else 1.0
+                            var_data["calculation_duration_ms"] = latency_ms // len(lead_hour_groups) if len(lead_hour_groups) > 0 else latency_ms
+                        
+                        await stats.record_component_scores(
+                            run_id=item.run_id,
+                            response_id=item.response_id,
+                            miner_uid=item.miner_uid,
+                            miner_hotkey=item.miner_hotkey,
+                            score_type="era5",
+                            lead_hours=int(lead_hours),
+                            valid_time=valid_time,
+                            variable_scores=variable_scores
+                        )
+        except Exception as e:
+            logger.error(f"Failed to extract ERA5 component scores: {e}")
 
     # After scoring, aggregate ERA5 scores for this miner/run and upsert stats
     try:

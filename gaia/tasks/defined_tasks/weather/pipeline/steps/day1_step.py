@@ -171,6 +171,54 @@ async def run(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> 
                     else "unknown_validator"
                 ),
             )
+            
+            # Extract and store component scores
+            lead_time_scores = result.get("lead_time_scores", {})
+            if lead_time_scores:
+                from datetime import timedelta
+                for lead_hours, variables in lead_time_scores.items():
+                    if variables:
+                        # Convert lead_hours to valid_time
+                        valid_time = gfs_init + timedelta(hours=int(lead_hours))
+                        
+                        # Prepare variable scores for component score recording
+                        variable_scores = {}
+                        for var_key, var_data in variables.items():
+                            if isinstance(var_data, dict):
+                                # Extract pressure level if present in var_key (e.g., "t_850")
+                                parts = var_key.split('_')
+                                var_name = parts[0]
+                                pressure_level = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                                
+                                variable_scores[var_name] = {
+                                    "pressure_level": pressure_level,
+                                    "skill_score": var_data.get("skill_score"),
+                                    "acc": var_data.get("acc_score"),
+                                    "rmse": var_data.get("rmse"),  # May not be present, will be None
+                                    "bias": var_data.get("bias"),  # May not be present
+                                    "mae": var_data.get("mae"),  # May not be present
+                                    "pattern_correlation": var_data.get("pattern_correlation"),
+                                    "pattern_correlation_passed": var_data.get("pattern_correlation_passed"),
+                                    "climatology_check_passed": var_data.get("climatology_check_passed"),
+                                    "clone_penalty": var_data.get("clone_penalty_applied", 0),
+                                    "weight": 1.0 / len(variables),  # Equal weight for now
+                                    "calculation_duration_ms": latency_ms // len(lead_time_scores),  # Estimate
+                                }
+                        
+                        # Record component scores
+                        if variable_scores:
+                            await stats.record_component_scores(
+                                run_id=item.run_id,
+                                response_id=item.response_id,
+                                miner_uid=item.miner_uid,
+                                miner_hotkey=item.miner_hotkey,
+                                score_type="day1",
+                                lead_hours=int(lead_hours),
+                                valid_time=valid_time,
+                                variable_scores=variable_scores
+                            )
+            
+            # Update forecast stats with overall score
             await stats.update_forecast_stats(
                 run_id=item.run_id,
                 miner_uid=item.miner_uid,
