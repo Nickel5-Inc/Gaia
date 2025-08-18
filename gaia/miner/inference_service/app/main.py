@@ -1390,7 +1390,10 @@ async def initialize_app_for_runpod():
                     r2_config = Config(
                         signature_version="s3v4",
                         max_pool_connections=200,  # Increased from 50 to prevent connection pool exhaustion
-                        retries={"max_attempts": 5, "mode": "adaptive"},
+                        retries={
+                            "max_attempts": 5,
+                            "mode": "adaptive"
+                        },
                         tcp_keepalive=True,
                         region_name="auto",
                         connect_timeout=10,
