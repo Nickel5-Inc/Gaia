@@ -166,12 +166,23 @@ async def query_single_miner(
         return None
         
     # Use HTTPS for fiber handshake
+    # Convert IP from integer format to dotted decimal if needed
+    if isinstance(miner_ip, int) or (isinstance(miner_ip, str) and miner_ip.isdigit()):
+        import socket
+        import struct
+        try:
+            ip_int = int(miner_ip)
+            miner_ip = socket.inet_ntoa(struct.pack("!I", ip_int))
+        except (ValueError, struct.error, OSError) as e:
+            logger.warning(f"Failed to convert IP {miner_ip} to address: {e}")
+    
     server_address = f"https://{miner_ip}:{miner_port}"
     
     logger.info(
         f"Starting fiber handshake with miner {miner_hotkey[:8]} (UID {miner_uid}) at {server_address}"
         f"\n  Endpoint: {endpoint}"
         f"\n  Payload keys: {list(payload.keys())}"
+        f"\n  Timeout: {timeout}s"
     )
     
     # Get validator keypair
@@ -203,29 +214,50 @@ async def query_single_miner(
                     logger.info(f"🔑 No cached key, performing new handshake with {miner_hotkey[:8]}")
                     
                     # Step 1: Get public encryption key from miner
-                    logger.debug(f"🔑 Getting public key from {miner_hotkey[:8]}")
-                    public_key_encryption_key = await handshake.get_public_encryption_key(
-                        client,
-                        server_address,
-                        timeout=int(timeout),
-                    )
+                    logger.info(f"🔑 Step 1: Getting public key from {miner_hotkey[:8]} at {server_address}/handshake")
+                    handshake_start = time.time()
+                    
+                    try:
+                        public_key_encryption_key = await handshake.get_public_encryption_key(
+                            client,
+                            server_address,
+                            timeout=int(timeout),
+                        )
+                        handshake_time = time.time() - handshake_start
+                        logger.info(f"✅ Step 1 complete: Got public key from {miner_hotkey[:8]} in {handshake_time:.2f}s")
+                    except Exception as e:
+                        handshake_time = time.time() - handshake_start
+                        logger.error(f"❌ Step 1 failed: Public key request to {miner_hotkey[:8]} failed after {handshake_time:.2f}s: {e}")
+                        raise
                     
                     # Step 2: Generate symmetric key
                     symmetric_key: bytes = os.urandom(32)
                     symmetric_key_uuid = os.urandom(32).hex()
                     
                     # Step 3: Send symmetric key to server
-                    logger.debug(f"🔐 Sending symmetric key to {miner_hotkey[:8]}")
-                    success = await handshake.send_symmetric_key_to_server(
-                        client,
-                        server_address,
-                        validator_keypair,
-                        public_key_encryption_key,
-                        symmetric_key,
-                        symmetric_key_uuid,
-                        miner_hotkey,
-                        timeout=int(timeout),
-                    )
+                    logger.info(f"🔐 Step 2: Sending symmetric key to {miner_hotkey[:8]} at {server_address}/handshake")
+                    key_send_start = time.time()
+                    
+                    try:
+                        success = await handshake.send_symmetric_key_to_server(
+                            client,
+                            server_address,
+                            validator_keypair,
+                            public_key_encryption_key,
+                            symmetric_key,
+                            symmetric_key_uuid,
+                            miner_hotkey,
+                            timeout=int(timeout),
+                        )
+                        key_send_time = time.time() - key_send_start
+                        if success:
+                            logger.info(f"✅ Step 2 complete: Sent symmetric key to {miner_hotkey[:8]} in {key_send_time:.2f}s")
+                        else:
+                            logger.error(f"❌ Step 2 failed: Symmetric key rejected by {miner_hotkey[:8]} after {key_send_time:.2f}s")
+                    except Exception as e:
+                        key_send_time = time.time() - key_send_start
+                        logger.error(f"❌ Step 2 failed: Symmetric key send to {miner_hotkey[:8]} failed after {key_send_time:.2f}s: {e}")
+                        raise
                     
                     if not success:
                         raise Exception("Handshake failed: server returned unsuccessful status")
@@ -237,24 +269,44 @@ async def query_single_miner(
                     symmetric_key_str = base64.b64encode(symmetric_key).decode()
                     fernet = Fernet(symmetric_key_str)
                     
-                    logger.debug(f"✅ Handshake complete with {miner_hotkey[:8]}, making request")
+                    logger.info(f"🚀 Step 3: Making encrypted request to {miner_hotkey[:8]} at {server_address}{endpoint}")
                     
                     # Step 4: Make the actual request with encryption
                     request_start = time.time()
                     
-                    response = await vali_client.make_non_streamed_post(
-                        httpx_client=client,
-                        server_address=server_address,
-                        fernet=fernet,
-                        keypair=validator_keypair,
-                        symmetric_key_uuid=symmetric_key_uuid,
-                        validator_ss58_address=validator_keypair.ss58_address,
-                        miner_ss58_address=miner_hotkey,
-                        payload=payload,
-                        endpoint=endpoint,
-                    )
-                    
-                    request_time = time.time() - request_start
+                    try:
+                        response = await vali_client.make_non_streamed_post(
+                            httpx_client=client,
+                            server_address=server_address,
+                            fernet=fernet,
+                            keypair=validator_keypair,
+                            symmetric_key_uuid=symmetric_key_uuid,
+                            validator_ss58_address=validator_keypair.ss58_address,
+                            miner_ss58_address=miner_hotkey,
+                            payload=payload,
+                            endpoint=endpoint,
+                        )
+                        request_time = time.time() - request_start
+                        logger.info(f"📡 HTTP response received from {miner_hotkey[:8]} in {request_time:.2f}s")
+                        
+                        # Log response details
+                        if response:
+                            if hasattr(response, 'status_code'):
+                                logger.info(f"📊 Response status: {response.status_code}")
+                            if hasattr(response, 'headers'):
+                                content_type = response.headers.get('content-type', 'unknown')
+                                content_length = response.headers.get('content-length', 'unknown')
+                                logger.info(f"📋 Response headers: Content-Type={content_type}, Content-Length={content_length}")
+                            if hasattr(response, 'content'):
+                                content_preview = response.content[:200] if len(response.content) > 200 else response.content
+                                logger.info(f"📄 Response content preview: {content_preview}")
+                        else:
+                            logger.warning(f"⚠️ No response object received from {miner_hotkey[:8]}")
+                            
+                    except Exception as e:
+                        request_time = time.time() - request_start
+                        logger.error(f"❌ Step 3 failed: Encrypted request to {miner_hotkey[:8]} failed after {request_time:.2f}s: {e}")
+                        raise
                     
                     # Parse response
                     if response and hasattr(response, 'content'):
@@ -278,9 +330,85 @@ async def query_single_miner(
                         "response_time": request_time,
                         "response_time_ms": int(request_time * 1000),
                     }
+                
+                else:
+                    # We have a cached key, use it directly
+                    logger.info(f"🔐 Using cached key to make encrypted request to {miner_hotkey[:8]}")
+                    
+                    symmetric_key_str = base64.b64encode(symmetric_key).decode()
+                    fernet = Fernet(symmetric_key_str)
+                    
+                    # Make the actual request with encryption
+                    request_start = time.time()
+                    
+                    try:
+                        response = await vali_client.make_non_streamed_post(
+                            httpx_client=client,
+                            server_address=server_address,
+                            fernet=fernet,
+                            keypair=validator_keypair,
+                            symmetric_key_uuid=symmetric_key_uuid,
+                            validator_ss58_address=validator_keypair.ss58_address,
+                            miner_ss58_address=miner_hotkey,
+                            payload=payload,
+                            endpoint=endpoint,
+                        )
+                        request_time = time.time() - request_start
+                        logger.info(f"📡 HTTP response received from {miner_hotkey[:8]} in {request_time:.2f}s (using cached key)")
+                        
+                        # Log response details
+                        if response:
+                            if hasattr(response, 'status_code'):
+                                logger.info(f"📊 Response status: {response.status_code}")
+                            if hasattr(response, 'headers'):
+                                content_type = response.headers.get('content-type', 'unknown')
+                                content_length = response.headers.get('content-length', 'unknown')
+                                logger.info(f"📋 Response headers: Content-Type={content_type}, Content-Length={content_length}")
+                            if hasattr(response, 'content'):
+                                content_preview = response.content[:200] if len(response.content) > 200 else response.content
+                                logger.info(f"📄 Response content preview: {content_preview}")
+                        else:
+                            logger.warning(f"⚠️ No response object received from {miner_hotkey[:8]}")
+                            
+                    except Exception as e:
+                        request_time = time.time() - request_start
+                        logger.error(f"❌ Encrypted request (cached key) to {miner_hotkey[:8]} failed after {request_time:.2f}s: {e}")
+                        
+                        # If the cached key fails, invalidate it so next attempt does fresh handshake
+                        await _invalidate_cached_key(db, miner_uid)
+                        logger.warning(f"🗑️ Invalidated cached key for {miner_hotkey[:8]} due to request failure")
+                        raise
+                    
+                    # Parse response
+                    if response and hasattr(response, 'content'):
+                        try:
+                            data = json.loads(response.content)
+                        except json.JSONDecodeError:
+                            data = {"raw": response.content.decode('utf-8', errors='ignore')}
+                    else:
+                        data = {}
+                    
+                    logger.info(
+                        f"✅ Success from {miner_hotkey[:8]} (UID {miner_uid}) using cached key"
+                        f"\n  Time: {request_time:.2f}s"
+                        f"\n  Response keys: {list(data.keys()) if isinstance(data, dict) else 'non-dict'}"
+                    )
+                    
+                    return {
+                        "success": True,
+                        "data": data,
+                        "miner_uid": miner_uid,
+                        "response_time": request_time,
+                        "response_time_ms": int(request_time * 1000),
+                    }
                     
             except httpx.ConnectError as e:
-                logger.warning(f"Connection failed to {miner_hotkey[:8]} at {server_address}: {e}")
+                logger.error(
+                    f"🔌 Connection failed to {miner_hotkey[:8]} (UID {miner_uid})"
+                    f"\n  Target: {server_address}"
+                    f"\n  Error: {e}"
+                    f"\n  Error type: {type(e).__name__}"
+                )
                 return {
                     "success": False,
                     "error": f"Connection failed: {e}",
@@ -288,7 +416,13 @@ async def query_single_miner(
                 }
                 
             except httpx.TimeoutException as e:
-                logger.warning(f"Timeout querying {miner_hotkey[:8]}: {e}")
+                logger.error(
+                    f"⏰ Timeout querying {miner_hotkey[:8]} (UID {miner_uid})"
+                    f"\n  Target: {server_address}"
+                    f"\n  Timeout: {timeout}s"
+                    f"\n  Error: {e}"
+                    f"\n  Error type: {type(e).__name__}"
+                )
                 return {
                     "success": False,
                     "error": f"Timeout: {e}",
@@ -423,8 +557,9 @@ async def query_miner_for_weather(
                     }
                 )
                 # Update error tracking separately to avoid complex JSONB parameter issues
-                await db_manager.execute(
-                    """
+                # Use text() with bound parameters to handle JSONB operations
+                from sqlalchemy import text
+                query_with_params = text("""
                     UPDATE miner_stats 
                     SET common_errors = 
                         CASE 
@@ -437,12 +572,8 @@ async def query_miner_for_weather(
                                 common_errors || jsonb_build_object(:error_type, 1)
                         END
                     WHERE miner_uid = (SELECT uid FROM node_table WHERE hotkey = :hotkey LIMIT 1)
-                    """,
-                    {
-                        "hotkey": miner_hotkey,
-                        "error_type": error_type
-                    }
-                )
+                    """).bindparam(error_type=error_type, hotkey=miner_hotkey)
+                await db_manager.execute(query_with_params)
             except Exception as stats_error:
                 logger.debug(f"Failed to update hosting failure metrics: {stats_error}")
     

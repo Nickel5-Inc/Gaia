@@ -3545,7 +3545,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 "message": result.get("error_message"),
             }
             logger.debug(
-                f"[Miner Job {job_id}] Reporting status: {response['status']}, Hash available: {response['input_data_hash'] is not None}"
+                f"[Miner Job {job_id}] Reporting status: {response['status']}"
             )
             return self._validate_and_format_response(response, ["job_id", "status"])
 
