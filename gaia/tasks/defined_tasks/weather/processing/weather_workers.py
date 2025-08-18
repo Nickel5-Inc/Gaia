@@ -662,14 +662,26 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
 
                 elif inference_type_for_call == "http_service":
                     logger.info(
-                        f"[InferenceTask Job {job_id}] (Inside Semaphore) HTTP inference will use prepared_batch (type: {type(prepared_batch)}). Calling _run_inference_via_http_service..."
+                        f"[InferenceTask Job {job_id}] (Inside Semaphore) HTTP service inference starting. Calling _run_inference_via_http_service..."
                     )
-                    output_steps_datasets = await task_instance._run_inference_via_http_service(  # Assign to output_steps_datasets
-                        job_id=job_id, initial_batch=prepared_batch
+                    # HTTP service handles inference asynchronously via RunPod
+                    # It returns bool (success/failure) not datasets
+                    http_success = await task_instance._run_inference_via_http_service(
+                        job_id=job_id
                     )
-                    logger.info(
-                        f"[InferenceTask Job {job_id}] (Inside Semaphore) HTTP inference call completed. Result steps: {len(output_steps_datasets if output_steps_datasets else [])}."
-                    )
+                    if http_success:
+                        logger.info(
+                            f"[InferenceTask Job {job_id}] (Inside Semaphore) HTTP inference job submitted successfully. RunPod will handle processing."
+                        )
+                        # For HTTP service, we don't get immediate results
+                        # The results will be handled by the RunPod polling worker
+                        # Return early to avoid the post-processing steps
+                        return
+                    else:
+                        logger.error(
+                            f"[InferenceTask Job {job_id}] (Inside Semaphore) HTTP inference submission failed."
+                        )
+                        output_steps_datasets = None
 
                 else:
                     logger.error(

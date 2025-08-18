@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import os
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import uuid
@@ -1297,6 +1298,109 @@ async def get_run_gfs_init_time(
     return None
 
 
+async def _batch_insert_component_scores(
+    db_manager,
+    component_scores: List[Dict],
+    batch_size: int = 50  # Typically ~90 records max per miner (9 vars × 10 lead times)
+) -> bool:
+    """
+    Optimized batch insert of component scores into weather_forecast_component_scores table.
+    Uses COPY-like performance with executemany and ON CONFLICT DO UPDATE for upserts.
+    """
+    if not component_scores:
+        return True
+        
+    try:
+        # Prepare the insert query with ON CONFLICT for upserts
+        insert_query = """
+            INSERT INTO weather_forecast_component_scores (
+                run_id, response_id, miner_uid, miner_hotkey,
+                score_type, lead_hours, valid_time_utc,
+                variable_name, pressure_level,
+                rmse, mse, acc, skill_score, skill_score_gfs, skill_score_climatology,
+                bias, mae,
+                climatology_check_passed, pattern_correlation, pattern_correlation_passed,
+                clone_penalty, quality_penalty,
+                weighted_score, variable_weight,
+                calculation_duration_ms
+            ) VALUES (
+                :run_id, :response_id, :miner_uid, :miner_hotkey,
+                :score_type, :lead_hours, :valid_time_utc,
+                :variable_name, :pressure_level,
+                :rmse, :mse, :acc, :skill_score, :skill_score_gfs, :skill_score_climatology,
+                :bias, :mae,
+                :climatology_check_passed, :pattern_correlation, :pattern_correlation_passed,
+                :clone_penalty, :quality_penalty,
+                :weighted_score, :variable_weight,
+                :calculation_duration_ms
+            )
+            ON CONFLICT (response_id, score_type, lead_hours, variable_name, pressure_level)
+            DO UPDATE SET
+                rmse = EXCLUDED.rmse,
+                mse = EXCLUDED.mse,
+                acc = EXCLUDED.acc,
+                skill_score = EXCLUDED.skill_score,
+                skill_score_gfs = EXCLUDED.skill_score_gfs,
+                skill_score_climatology = EXCLUDED.skill_score_climatology,
+                bias = EXCLUDED.bias,
+                mae = EXCLUDED.mae,
+                climatology_check_passed = EXCLUDED.climatology_check_passed,
+                pattern_correlation = EXCLUDED.pattern_correlation,
+                pattern_correlation_passed = EXCLUDED.pattern_correlation_passed,
+                clone_penalty = EXCLUDED.clone_penalty,
+                quality_penalty = EXCLUDED.quality_penalty,
+                weighted_score = EXCLUDED.weighted_score,
+                variable_weight = EXCLUDED.variable_weight,
+                calculation_duration_ms = EXCLUDED.calculation_duration_ms,
+                calculated_at = CURRENT_TIMESTAMP
+        """
+        
+        # Process in batches for optimal performance
+        for i in range(0, len(component_scores), batch_size):
+            batch = component_scores[i:i + batch_size]
+            
+            # Ensure all required fields have defaults
+            processed_batch = []
+            for score in batch:
+                processed_score = {
+                    'run_id': score.get('run_id'),
+                    'response_id': score.get('response_id'),
+                    'miner_uid': score.get('miner_uid'),
+                    'miner_hotkey': score.get('miner_hotkey'),
+                    'score_type': score.get('score_type'),
+                    'lead_hours': score.get('lead_hours'),
+                    'valid_time_utc': score.get('valid_time_utc'),
+                    'variable_name': score.get('variable_name'),
+                    'pressure_level': score.get('pressure_level'),
+                    'rmse': score.get('rmse'),
+                    'mse': score.get('mse'),
+                    'acc': score.get('acc'),
+                    'skill_score': score.get('skill_score'),
+                    'skill_score_gfs': score.get('skill_score_gfs'),
+                    'skill_score_climatology': score.get('skill_score_climatology'),
+                    'bias': score.get('bias'),
+                    'mae': score.get('mae'),
+                    'climatology_check_passed': score.get('climatology_check_passed'),
+                    'pattern_correlation': score.get('pattern_correlation'),
+                    'pattern_correlation_passed': score.get('pattern_correlation_passed'),
+                    'clone_penalty': score.get('clone_penalty', 0.0),
+                    'quality_penalty': score.get('quality_penalty', 0.0),
+                    'weighted_score': score.get('weighted_score'),
+                    'variable_weight': score.get('variable_weight'),
+                    'calculation_duration_ms': score.get('calculation_duration_ms'),
+                }
+                processed_batch.append(processed_score)
+            
+            # Execute batch insert
+            await db_manager.execute_many(insert_query, processed_batch)
+            
+        logger.info(f"Successfully inserted {len(component_scores)} component scores in batches of {batch_size}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to batch insert component scores: {e}", exc_info=True)
+        return False
+
 async def calculate_era5_miner_score(
     task_instance: "WeatherTask",
     miner_response_rec: Dict,
@@ -1343,6 +1447,7 @@ async def calculate_era5_miner_score(
 
     miner_forecast_ds: Optional[xr.Dataset] = None
     all_metrics_for_db = []
+    all_component_scores = []  # NEW: Collect component scores for batch insert
 
     try:
         stored_response_details_query = "SELECT kerchunk_json_url, verification_hash_claimed FROM weather_miner_responses WHERE id = :response_id"
@@ -2157,6 +2262,22 @@ async def calculate_era5_miner_score(
                         "score": current_metrics["rmse"],
                     }
                     all_metrics_for_db.append(rmse_metric_row)
+                    
+                    # NEW: Start collecting component score for this variable/lead
+                    component_score = {
+                        'run_id': run_id,
+                        'response_id': response_id,
+                        'miner_uid': miner_uid,
+                        'miner_hotkey': miner_hotkey,
+                        'score_type': 'era5',
+                        'lead_hours': int(lead_hours),
+                        'valid_time_utc': valid_time_dt,
+                        'variable_name': var_name,
+                        'pressure_level': var_level,
+                        'rmse': current_metrics["rmse"],
+                        'mse': raw_mse_val,
+                        'calculation_duration_ms': int((time.time() - db_metric_row_base.get('calculation_time', time.time())) * 1000),
+                    }
 
                     acc_val = await calculate_acc(
                         miner_var_da_aligned,
@@ -2172,6 +2293,9 @@ async def calculate_era5_miner_score(
                         "score": acc_val,
                     }
                     all_metrics_for_db.append(acc_metric_row)
+                    
+                    # Add ACC to component score
+                    component_score['acc'] = acc_val
 
                     skill_score_val = None
 
@@ -2241,6 +2365,9 @@ async def calculate_era5_miner_score(
                                         "score": skill_score_val,
                                     }
                                     all_metrics_for_db.append(skill_metric_row)
+                                    
+                                    # Add GFS skill score to component score
+                                    component_score['skill_score_gfs'] = skill_score_val
                                 else:
                                     logger.warning(
                                         f"[FinalScore] UID {miner_uid} - Calculated skill score is non-finite for {var_key} L{lead_hours}h"
@@ -2287,6 +2414,9 @@ async def calculate_era5_miner_score(
                                     "score": skill_score_val,
                                 }
                                 all_metrics_for_db.append(skill_metric_row)
+                                
+                                # Add climatology skill score to component score
+                                component_score['skill_score_climatology'] = skill_score_val
                             else:
                                 logger.warning(
                                     f"[FinalScore] UID {miner_uid} - Calculated climatology skill score is non-finite for {var_key} L{lead_hours}h"
@@ -2312,6 +2442,16 @@ async def calculate_era5_miner_score(
                     logger.info(
                         f"[FinalScore] Miner {miner_hotkey} V:{var_key} L:{int(lead_hours)}h RMSE:{current_metrics.get('rmse', np.nan):.2f} ACC:{current_metrics.get('acc', np.nan):.3f} SKILL:{skill_score_log_str}"
                     )
+                    
+                    # Finalize and append component score
+                    if skill_score_val is not None:
+                        component_score['skill_score'] = skill_score_val
+                    
+                    # Add variable weight from VARIABLE_WEIGHTS
+                    from ..weather_scoring.scoring import VARIABLE_WEIGHTS
+                    component_score['variable_weight'] = VARIABLE_WEIGHTS.get(var_name, 0.0)
+                    
+                    all_component_scores.append(component_score)
 
                 except KeyError as ke:
                     logger.error(
@@ -2420,6 +2560,20 @@ async def calculate_era5_miner_score(
         logger.info(
             f"[FinalScore] Miner {miner_hotkey}: Stored/Updated {successful_inserts}/{len(all_metrics_for_db)} ERA5 metric records to DB."
         )
+        
+        # NEW: Batch insert component scores for full transparency
+        if all_component_scores:
+            logger.info(f"[FinalScore] Inserting {len(all_component_scores)} component scores for {miner_hotkey}")
+            component_insert_success = await _batch_insert_component_scores(
+                task_instance.db_manager,
+                all_component_scores,
+                batch_size=100
+            )
+            if not component_insert_success:
+                logger.warning(f"[FinalScore] Failed to insert some component scores for {miner_hotkey}")
+            else:
+                logger.info(f"[FinalScore] Successfully inserted all component scores for {miner_hotkey}")
+        
         return True
     else:
         logger.error(
