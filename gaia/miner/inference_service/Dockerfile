@@ -39,8 +39,8 @@ WORKDIR /app
 
 # Install only runtime system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libnetcdf19 \
-    libhdf5-103 \
+    libnetcdf-dev \
+    libhdf5-dev \
     curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -50,7 +50,7 @@ COPY --from=builder /root/.local /root/.local
 COPY --from=builder /app/models /app/models
 
 # Set PYTHONPATH and PATH
-ENV PYTHONPATH="/app:${PYTHONPATH}"
+ENV PYTHONPATH="/app${PYTHONPATH:+:${PYTHONPATH}}"
 ENV PATH="/root/.local/bin:${PATH}"
 
 # Copy the rest of the application code
