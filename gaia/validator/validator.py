@@ -55,10 +55,10 @@ try:
         sys.path.insert(0, root_dir)
     # Enable PyTorch CUDA memory allocation configuration
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    import runtime_weight_tracer
+    
 
     print("🔍 [MAIN] Weight tracing available - enabling...")
-    runtime_weight_tracer.enable_weight_tracing()
+    
     print("✅ [MAIN] Weight tracing enabled successfully")
 except Exception as e:
     print(f"⚠️ [MAIN] Weight tracing not available: {e}")
@@ -946,21 +946,32 @@ class GaiaValidator:
             )
             logger.info(f"Using netuid: {self.netuid}")
 
+            # Handle dot notation arguments properly
+            cli_chain_endpoint = getattr(self.args, 'subtensor.chain_endpoint', None)
+            env_chain_endpoint = os.getenv("SUBTENSOR_ADDRESS", "wss://test.finney.opentensor.ai:443/")
             self.subtensor_chain_endpoint = (
-                self.args.subtensor.chain_endpoint
-                if hasattr(self.args, "subtensor")
-                and hasattr(self.args.subtensor, "chain_endpoint")
-                else os.getenv(
-                    "SUBTENSOR_ADDRESS", "wss://test.finney.opentensor.ai:443/"
-                )
+                cli_chain_endpoint
+                if cli_chain_endpoint is not None
+                else env_chain_endpoint
             )
 
+            # Handle dot notation arguments properly
+            cli_network = getattr(self.args, 'subtensor.network', None)
+            env_network = os.getenv("SUBTENSOR_NETWORK", "test")
             self.subtensor_network = (
-                self.args.subtensor.network
-                if hasattr(self.args, "subtensor")
-                and hasattr(self.args.subtensor, "network")
-                else os.getenv("SUBTENSOR_NETWORK", "test")
+                cli_network
+                if cli_network is not None
+                else env_network
             )
+            
+            # CRITICAL: Log the actual values being used for debugging
+            logger.info(f"🔗 Subtensor Configuration:")
+            logger.info(f"   CLI chain_endpoint: {cli_chain_endpoint}")
+            logger.info(f"   ENV SUBTENSOR_ADDRESS: {env_chain_endpoint}")
+            logger.info(f"   Final chain_endpoint: {self.subtensor_chain_endpoint}")
+            logger.info(f"   CLI network: {cli_network}")
+            logger.info(f"   ENV SUBTENSOR_NETWORK: {env_network}")
+            logger.info(f"   Final network: {self.subtensor_network}")
 
             self.wallet_name = (
                 self.args.wallet

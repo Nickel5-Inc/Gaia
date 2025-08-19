@@ -200,6 +200,9 @@ class WeatherInitiateFetchData(BaseModel):
     validator_hotkey: Optional[str] = Field(
         None, description="Validator hotkey for deterministic job ID generation."
     )
+    expected_miner_hotkey: Optional[str] = Field(
+        None, description="Expected miner hotkey for verification to prevent crossover."
+    )
 
 
 class WeatherInitiateFetchRequest(BaseModel):

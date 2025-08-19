@@ -3240,6 +3240,13 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             expected_miner_hotkey = getattr(request_data, 'expected_miner_hotkey', None)
             actual_miner_hotkey = self.keypair.ss58_address if self.keypair else "unknown_miner"
             
+            # DEBUG: Log what we received for debugging
+            logger.info(
+                f"[Miner] Hotkey verification check: "
+                f"expected={expected_miner_hotkey[:8] + '...' + expected_miner_hotkey[-8:] if expected_miner_hotkey else 'None'}, "
+                f"actual={actual_miner_hotkey[:8]}...{actual_miner_hotkey[-8:]}"
+            )
+            
             if expected_miner_hotkey and expected_miner_hotkey != actual_miner_hotkey:
                 logger.error(
                     f"[Miner] Hotkey verification FAILED! Request intended for {expected_miner_hotkey[:8]}...{expected_miner_hotkey[-8:]} "

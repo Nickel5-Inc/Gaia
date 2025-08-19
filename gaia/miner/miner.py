@@ -147,24 +147,16 @@ class Miner:
             else int(os.getenv("PUBLIC_PORT", 33333))
         )
         # Load chain endpoint from args or env (CLI > ENV > Default)
-        # Check if args.subtensor and args.subtensor.chain_endpoint exist and were provided via CLI
-        cli_chain_endpoint = None
-        if hasattr(args, "subtensor") and hasattr(args.subtensor, "chain_endpoint"):
-            cli_chain_endpoint = (
-                args.subtensor.chain_endpoint
-            )  # Will be None if not provided via CLI (due to default=None)
-
+        # Handle dot notation arguments properly
+        cli_chain_endpoint = getattr(args, 'subtensor.chain_endpoint', None)
         self.subtensor_chain_endpoint = (
             cli_chain_endpoint
             if cli_chain_endpoint is not None
             else os.getenv("SUBTENSOR_ADDRESS", "wss://test.finney.opentensor.ai:443/")
         )
 
-        # Load chain network from args or env (CLI > ENV > Default)
-        cli_network = None
-        if hasattr(args, "subtensor") and hasattr(args.subtensor, "network"):
-            cli_network = args.subtensor.network  # Will be None if not provided via CLI
-
+        # Handle dot notation arguments properly
+        cli_network = getattr(args, 'subtensor.network', None)
         self.subtensor_network = (
             cli_network
             if cli_network is not None
