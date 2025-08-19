@@ -195,30 +195,30 @@ async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task, *, 
     )
     
     # Fetch all required GFS data upfront to minimize API calls
-    logger.info(f"[Run {run_id}] Fetching all required GFS data for input and scoring")
+    logger.info(f"[Run {run_id}] Fetching GFS data for Day1 scoring")
     
-    # 1. Fetch T=0h analysis (current state)
-    gfs_analysis_t0 = await fetch_gfs_analysis_data([gfs_init], cache_dir=cache_dir)
-    if not gfs_analysis_t0:
-        raise RuntimeError("fetch_gfs_analysis_data for T=0h returned None")
-    
-    # 2. Fetch T=-6h analysis (previous state for input generation)
-    gfs_t_minus_6 = gfs_init - timedelta(hours=6)
-    gfs_analysis_t_minus_6 = await fetch_gfs_analysis_data([gfs_t_minus_6], cache_dir=cache_dir)
-    if not gfs_analysis_t_minus_6:
-        logger.warning(f"[Run {run_id}] Could not fetch T=-6h analysis, input generation may fail")
-    
-    # 3. Fetch forecast data for Day1 scoring (T+6h, T+12h)
+    # Get lead hours for scoring
     leads = task.config.get("initial_scoring_lead_hours", [6, 12]) if hasattr(task, "config") else [6, 12]
+    
+    # For Day1 scoring, we need:
+    # 1. GFS analysis at T+6h, T+12h as ground truth
+    # 2. GFS forecast at T+6h, T+12h for reference comparison
+    analysis_times = [gfs_init + timedelta(hours=h) for h in leads]
+    
+    logger.info(f"[Run {run_id}] Fetching GFS analysis for times: {analysis_times}")
+    gfs_analysis_result = await fetch_gfs_analysis_data(analysis_times, cache_dir=cache_dir)
+    if not gfs_analysis_result:
+        logger.warning(f"[Run {run_id}] Could not fetch GFS analysis data for scoring times")
+    
+    # Fetch GFS forecast data
     gfs_forecast_result = await fetch_gfs_data(
         run_time=gfs_init,
         lead_hours=leads,
         output_dir=str(cache_dir),
     )
     
-    # We consider the seed successful if we at least have T=0h and forecast data
-    # T=-6h is nice to have but not critical for the pipeline
-    gfs_result = gfs_analysis_t0 is not None and gfs_forecast_result is not None
+    # We consider the seed successful if we have both analysis and forecast data
+    gfs_result = gfs_analysis_result is not None and gfs_forecast_result is not None
     # Ensure lock releases even on early returns
     try:
         await db.execute("SELECT pg_advisory_unlock(:key)", {"key": lock_key})
@@ -230,7 +230,7 @@ async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task, *, 
         logger.error(f"[Run {run_id}] GFS fetch failed - missing critical data")
         return False
     
-    logger.info(f"[Run {run_id}] Successfully fetched all GFS data (T=-6h, T=0h, T+6h, T+12h)")
+    logger.info(f"[Run {run_id}] Successfully fetched GFS analysis and forecast data at {len(leads)} lead times: {leads}")
     return True
 
 

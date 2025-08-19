@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional, Any
+
+logger = logging.getLogger(__name__)
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.defined_tasks.weather.pipeline.scheduler import MinerWorkScheduler
@@ -22,12 +25,19 @@ async def _load_inputs(db, task: WeatherTask, *, run_id: int, miner_uid: int, mi
         fetch_gfs_data,
     )
     from pathlib import Path
+    from datetime import timedelta
     cache_dir = Path(task.config.get("gfs_analysis_cache_dir", "./gfs_analysis_cache"))
-    gfs_analysis_ds = await fetch_gfs_analysis_data([gfs_init], cache_dir=cache_dir)
-    if not gfs_analysis_ds:
-        raise RuntimeError("fetch_gfs_analysis_data returned None")
+    
     # day1 uses initial scoring leads
     leads = task.config.get("initial_scoring_lead_hours", [6, 12])
+    
+    # Fetch GFS analysis data at evaluation times as ground truth
+    analysis_times = [gfs_init + timedelta(hours=h) for h in leads]
+    gfs_analysis_ds = await fetch_gfs_analysis_data(analysis_times, cache_dir=cache_dir)
+    if not gfs_analysis_ds:
+        raise RuntimeError("fetch_gfs_analysis_data returned None")
+    
+    # Fetch GFS forecast data for reference comparison
     gfs_ref_ds = await fetch_gfs_data(
         run_time=gfs_init,
         lead_hours=leads,
@@ -35,26 +45,28 @@ async def _load_inputs(db, task: WeatherTask, *, run_id: int, miner_uid: int, mi
     )
     if not gfs_ref_ds:
         raise RuntimeError("fetch_gfs_data returned None")
+    
     era5_clim = await task._get_or_load_era5_climatology()
     if not era5_clim:
         raise RuntimeError("ERA5 climatology not available")
+    
     return gfs_analysis_ds, gfs_ref_ds, era5_clim
 
 
 @substep("day1", "score", should_retry=True, retry_delay_seconds=900, max_retries=3, retry_backoff="linear")
-async def _score_day1(db, task: WeatherTask, *, run_id: int, miner_uid: int, miner_hotkey: str, gfs_init, miner_record: dict, gfs_analysis_ds, gfs_ref_ds, era5_clim, day1_cfg: dict):
+async def _score_day1(db, task: WeatherTask, *, run_id: int, miner_uid: int, miner_hotkey: str, gfs_init, miner_record: dict, gfs_analysis_ds, gfs_ref_ds, era5_clim, day1_cfg: dict, precomputed_cache=None):
     from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import (
         evaluate_miner_forecast_day1,
     )
     return await evaluate_miner_forecast_day1(
         task_instance=task,
         miner_response_db_record=miner_record,
-        gfs_analysis_ds_for_run=gfs_analysis_ds,
+        gfs_analysis_data_for_run=gfs_analysis_ds,
         gfs_reference_forecast_for_run=gfs_ref_ds,
         era5_climatology=era5_clim,
         day1_scoring_config=day1_cfg,
         run_gfs_init_time=gfs_init,
-        precomputed_climatology_cache=None,
+        precomputed_climatology_cache=precomputed_cache,
     )
 from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
     fetch_gfs_analysis_data,
@@ -102,7 +114,9 @@ async def run(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> 
             miner_hotkey=item.miner_hotkey,
             gfs_init=gfs_init,
         )
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"[Run {item.run_id}] Failed to load inputs for miner {item.miner_uid}: {e}", exc_info=True)
         return False
 
     # Build a record matching evaluate_miner_forecast_day1 signature
@@ -125,8 +139,9 @@ async def run(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> 
     }
 
     # Ensure shared climatology cache exists on disk (one per run)
+    precomputed_cache = None
     try:
-        _ = await ensure_clim_cache(
+        precomputed_cache = await ensure_clim_cache(
             db,
             task,
             run_id=item.run_id,
@@ -153,8 +168,11 @@ async def run(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> 
             gfs_ref_ds=gfs_ref_ds,
             era5_clim=era5_clim,
             day1_cfg=day1_cfg,
+            precomputed_cache=precomputed_cache,
         )
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"[Run {item.run_id}] Day1 scoring failed for miner {item.miner_uid}: {e}", exc_info=True)
         result = None
     latency_ms = int((time.perf_counter() - t0) * 1000)
 
@@ -299,6 +317,21 @@ async def run_item(
     )
     if not resp:
         return False
+    
+    # CRITICAL: Validate miner workflow isolation - prevent any crossover between miners
+    if resp["run_id"] != run_id:
+        logger.error(
+            f"[ISOLATION VIOLATION] Response {response_id} belongs to run {resp['run_id']} "
+            f"but job specifies run {run_id}. Aborting to prevent crossover."
+        )
+        return False
+    
+    if resp["miner_uid"] != miner_uid:
+        logger.error(
+            f"[ISOLATION VIOLATION] Response {response_id} belongs to miner UID {resp['miner_uid']} "
+            f"but job specifies miner UID {miner_uid}. Aborting to prevent crossover."
+        )
+        return False
     # Fetch inputs
     try:
         gfs_analysis_ds, gfs_ref_ds, era5_clim = await _load_inputs(
@@ -311,9 +344,18 @@ async def run_item(
         )
     except Exception:
         return False
+    # Use hotkey from database record to ensure manifest verification uses correct signer
+    db_miner_hotkey = resp["miner_hotkey"]
+    if miner_hotkey != db_miner_hotkey:
+        logger.warning(
+            f"[Run {run_id}] Hotkey mismatch detected for miner UID {miner_uid}: "
+            f"parameter={miner_hotkey[:8]}..., database={db_miner_hotkey[:8]}... "
+            f"Using database value for manifest verification."
+        )
+    
     miner_record = {
         "id": resp["id"],
-        "miner_hotkey": miner_hotkey,
+        "miner_hotkey": db_miner_hotkey,  # Use hotkey from database record, not parameter
         "run_id": run_id,
         "miner_uid": miner_uid,
         "job_id": resp.get("job_id"),

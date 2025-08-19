@@ -166,8 +166,10 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                                 }
                             )
                             
-                            # Re-enqueue with updated retry count and lower priority
-                            await db.enqueue_validator_job(
+                            # Re-enqueue with updated retry count and lower priority using singleton to prevent duplicates
+                            singleton_key = f"query_miner_run_{rid}_miner_{muid}"
+                            await db.enqueue_singleton_job(
+                                singleton_key=singleton_key,
                                 job_type="weather.query_miner",
                                 payload={
                                     "run_id": rid,
@@ -321,6 +323,23 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 return ok
             elif jtype == "weather.day1":
                 if all(k in payload for k in ("run_id", "miner_uid", "response_id")):
+                    # CRITICAL: Validate job parameters match database constraints for miner isolation
+                    if job.get("run_id") and job["run_id"] != payload["run_id"]:
+                        logger.error(
+                            f"[ISOLATION VIOLATION] Job {job.get('id')} run_id {job['run_id']} "
+                            f"doesn't match payload run_id {payload['run_id']}"
+                        )
+                        await db.fail_validator_job(job["id"], "Job/payload run_id mismatch - isolation violation")
+                        return False
+                    
+                    if job.get("miner_uid") and job["miner_uid"] != payload["miner_uid"]:
+                        logger.error(
+                            f"[ISOLATION VIOLATION] Job {job.get('id')} miner_uid {job['miner_uid']} "
+                            f"doesn't match payload miner_uid {payload['miner_uid']}"
+                        )
+                        await db.fail_validator_job(job["id"], "Job/payload miner_uid mismatch - isolation violation")
+                        return False
+                    
                     miner_hotkey = payload.get("miner_hotkey")
                     if not miner_hotkey:
                         row = await db.fetch_one(
@@ -338,8 +357,33 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     )
                 else:
                     ok = await process_day1_one(db, validator=validator)
+                
+                # Handle the result properly
+                if ok:
+                    await db.complete_validator_job(job["id"], result={"ok": True})
+                else:
+                    # Schedule retry with 60 second delay to prevent rate limiting
+                    await db.fail_validator_job(job["id"], "Day1 scoring failed", schedule_retry_in_seconds=60)
+                return ok
             elif jtype == "weather.era5":
                 if all(k in payload for k in ("run_id", "miner_uid", "response_id")):
+                    # CRITICAL: Validate job parameters match database constraints for miner isolation
+                    if job.get("run_id") and job["run_id"] != payload["run_id"]:
+                        logger.error(
+                            f"[ISOLATION VIOLATION] Job {job.get('id')} run_id {job['run_id']} "
+                            f"doesn't match payload run_id {payload['run_id']}"
+                        )
+                        await db.fail_validator_job(job["id"], "Job/payload run_id mismatch - isolation violation")
+                        return False
+                    
+                    if job.get("miner_uid") and job["miner_uid"] != payload["miner_uid"]:
+                        logger.error(
+                            f"[ISOLATION VIOLATION] Job {job.get('id')} miner_uid {job['miner_uid']} "
+                            f"doesn't match payload miner_uid {payload['miner_uid']}"
+                        )
+                        await db.fail_validator_job(job["id"], "Job/payload miner_uid mismatch - isolation violation")
+                        return False
+                    
                     miner_hotkey = payload.get("miner_hotkey")
                     if not miner_hotkey:
                         row = await db.fetch_one(
@@ -357,6 +401,14 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     )
                 else:
                     ok = await process_era5_one(db, validator=validator)
+                
+                # Handle the result properly
+                if ok:
+                    await db.complete_validator_job(job["id"], result={"ok": True})
+                else:
+                    # Schedule retry with 60 second delay to prevent rate limiting
+                    await db.fail_validator_job(job["id"], "ERA5 scoring failed", schedule_retry_in_seconds=60)
+                return ok
             elif jtype == "weather.scoring.day1_qc":
                 # Kick off per-miner day1 by ensuring jobs are enqueued
                 try:
@@ -473,13 +525,19 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 miner_hotkey = payload.get("miner_hotkey")
                 if response_id and miner_hotkey:
                     try:
-                        from gaia.validator.miner.miner_query import get_input_status as _gis
-                        status_response = await _gis(validator or WeatherTask(db_manager=db, node_type="validator", test_mode=True), miner_hotkey, job_id=payload.get("job_id", ""))
+                        from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import poll_miner_job_status
+                        status_response = await poll_miner_job_status(
+                            validator=validator,
+                            miner_hotkey=miner_hotkey,
+                            job_id=payload.get("job_id", ""),
+                            db_manager=db,
+                        )
                         # Minimal interpretation: if not ready, reschedule
                         ready = False
-                        if isinstance(status_response, dict):
-                            txt = status_response.get("text") or ""
-                            ready = "ready" in txt.lower() or "completed" in txt.lower()
+                        if status_response and status_response.get("success"):
+                            data = status_response.get("data", {})
+                            status = data.get("status", "")
+                            ready = status in ["ready", "completed"]
                         if ready:
                             # Mark response as submitted/ready for scoring
                             try:

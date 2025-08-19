@@ -1609,6 +1609,16 @@ async def _process_single_timestep_parallel(
         valid_time_np = np.datetime64(valid_time_dt.replace(tzinfo=None))
 
         try:
+            # Log available timesteps for debugging
+            if effective_lead_h == 6:  # Only log once to avoid spam
+                analysis_times = gfs_analysis_data_for_run.time.values[:10] if hasattr(gfs_analysis_data_for_run, 'time') else []
+                logger.info(
+                    f"[Day1Score] Available GFS analysis timesteps (first 10): {analysis_times}"
+                )
+                logger.info(
+                    f"[Day1Score] Trying to select time: {valid_time_np} for lead {effective_lead_h}h"
+                )
+            
             gfs_analysis_lead = gfs_analysis_data_for_run.sel(
                 time=valid_time_np, method="nearest"
             )
@@ -1619,20 +1629,24 @@ async def _process_single_timestep_parallel(
             selected_time_gfs_analysis = np.datetime64(
                 gfs_analysis_lead.time.data.item(), "ns"
             )
-            if abs(selected_time_gfs_analysis - valid_time_np) > np.timedelta64(1, "h"):
+            # GFS data comes in 6-hour intervals, so we should accept up to 3 hours difference
+            # This handles cases where the exact timestep might not be available
+            if abs(selected_time_gfs_analysis - valid_time_np) > np.timedelta64(3, "h"):
                 timestep_results["skip_reason"] = (
-                    f"GFS Analysis time {selected_time_gfs_analysis} too far from target {valid_time_np}"
+                    f"GFS Analysis time {selected_time_gfs_analysis} too far from target {valid_time_np} (>3h difference)"
                 )
                 return timestep_results
 
             selected_time_gfs_reference = np.datetime64(
                 gfs_reference_lead.time.data.item(), "ns"
             )
+            # GFS data comes in 6-hour intervals, so we should accept up to 3 hours difference
+            # This handles cases where the exact timestep might not be available
             if abs(selected_time_gfs_reference - valid_time_np) > np.timedelta64(
-                1, "h"
+                3, "h"
             ):
                 timestep_results["skip_reason"] = (
-                    f"GFS Reference time {selected_time_gfs_reference} too far from target {valid_time_np}"
+                    f"GFS Reference time {selected_time_gfs_reference} too far from target {valid_time_np} (>3h difference)"
                 )
                 return timestep_results
 

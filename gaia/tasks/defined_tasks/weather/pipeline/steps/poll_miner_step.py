@@ -110,20 +110,9 @@ async def run_poll_miner_job(
                 f"\n  Response time: {result.get('response_time', 0):.2f}s"
             )
             
-            # Update pipeline status with progress
-            if validator:
-                stats = WeatherStatsManager(db, getattr(validator, "hotkey", "unknown"))
-                progress_str = f"_{progress}%" if progress != "N/A" else ""
-                await stats.update_pipeline_status(
-                    run_id=run_id,
-                    miner_uid=miner_uid,
-                    stage=f"inference_running{progress_str}",
-                    status="polling"
-                )
-            
             if status_value in ["completed", WeatherTaskStatus.FETCH_COMPLETED]:
                 # Inference complete, update status and enqueue scoring
-                logger.info(f"[Run {run_id}] Miner {miner_hotkey[:8]} inference complete")
+                logger.info(f"[Run {run_id}] Miner {miner_hotkey[:8]} inference complete - stopping poll loop")
                 
                 # Calculate inference time if we have the start time
                 inference_time_seconds = None
@@ -167,26 +156,68 @@ async def run_poll_miner_job(
                     {"time": inference_time_seconds, "run_id": run_id, "miner_uid": miner_uid}
                 )
                 
-                # Enqueue day1 scoring job
-                await db.enqueue_validator_job(
-                    job_type="weather.day1",
-                    payload={
-                        "run_id": run_id,
-                        "miner_uid": miner_uid,
-                        "miner_hotkey": miner_hotkey,
-                        "response_id": response_id,
-                        "job_id": job_id,
-                    },
-                    priority=60,
-                    run_id=run_id,
-                    miner_uid=miner_uid,
-                    response_id=response_id,
+                # Check if day1 job already exists
+                existing_day1 = await db.fetch_one(
+                    """
+                    SELECT id FROM validator_jobs
+                    WHERE job_type = 'weather.day1'
+                    AND run_id = :run_id
+                    AND miner_uid = :miner_uid
+                    AND status IN ('pending', 'in_progress', 'retry_scheduled', 'completed')
+                    """,
+                    {"run_id": run_id, "miner_uid": miner_uid}
                 )
+                
+                if not existing_day1:
+                    # Enqueue day1 scoring job
+                    await db.enqueue_validator_job(
+                        job_type="weather.day1",
+                        payload={
+                            "run_id": run_id,
+                            "miner_uid": miner_uid,
+                            "miner_hotkey": miner_hotkey,
+                            "response_id": response_id,
+                            "job_id": job_id,
+                        },
+                        priority=60,
+                        run_id=run_id,
+                        miner_uid=miner_uid,
+                        response_id=response_id,
+                    )
+                else:
+                    logger.debug(f"[Run {run_id}] Day1 job already exists for miner {miner_uid}, skipping")
+                
+                # Cancel any pending poll jobs for this miner since inference is complete
+                try:
+                    await db.execute(
+                        """
+                        UPDATE validator_jobs 
+                        SET status = 'cancelled'
+                        WHERE job_type = 'weather.poll_miner'
+                        AND run_id = :run_id
+                        AND miner_uid = :miner_uid
+                        AND status IN ('pending', 'retry_scheduled')
+                        """,
+                        {"run_id": run_id, "miner_uid": miner_uid}
+                    )
+                    logger.info(f"[Run {run_id}] Cancelled any pending poll jobs for miner {miner_hotkey[:8]}")
+                except Exception as e:
+                    logger.debug(f"Could not cancel pending poll jobs: {e}")
                 
                 return True
                 
             elif status_value in ["processing", "running", "inference_running", WeatherTaskStatus.FETCH_PROCESSING]:
-                # Still running, reschedule poll
+                # Still running, update status and reschedule poll
+                if validator:
+                    stats = WeatherStatsManager(db, getattr(validator, "hotkey", "unknown"))
+                    progress_str = f"_{progress}%" if progress != "N/A" else ""
+                    await stats.update_pipeline_status(
+                        run_id=run_id,
+                        miner_uid=miner_uid,
+                        stage=f"inference_running{progress_str}",
+                        status="polling"
+                    )
+                
                 if attempt >= MAX_POLL_ATTEMPTS:
                     await _mark_failed(db, response_id, f"Polling timeout - still {status_value} after {attempt} attempts",
                                      run_id, miner_uid, miner_hotkey, validator)

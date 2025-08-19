@@ -4186,7 +4186,34 @@ pg1-user={self.config['pguser']}
         try:
             logger.info("🔧 Automatically fixing stanza mismatch...")
 
-            # Stop archiving temporarily to prevent conflicts during cleanup
+            # Check if this is a replica node
+            is_primary = self.config.get("is_primary", False)
+            
+            if not is_primary:
+                logger.info("🔄 Replica node detected - skipping stanza creation, will restore from existing backup")
+                # For replicas, just clean up local stanza files and let restore handle it
+                logger.info("🧹 Cleaning up local stanza files for replica...")
+                for old_stanza in existing_stanzas:
+                    if old_stanza != expected_stanza:
+                        logger.info(f"🗑️  Removing local stanza files: [{old_stanza}]")
+                        # Only clean up local files, don't try to delete from S3
+                        try:
+                            import shutil
+                            local_paths = [
+                                f"/var/lib/pgbackrest/archive/{old_stanza}",
+                                f"/var/lib/pgbackrest/backup/{old_stanza}",
+                            ]
+                            for path in local_paths:
+                                if os.path.exists(path):
+                                    shutil.rmtree(path)
+                                    logger.info(f"✅ Cleaned up local path: {path}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Warning cleaning up local files: {e}")
+                
+                logger.info("🔄 Replica stanza mismatch fixed - ready for restore")
+                return True
+
+            # PRIMARY NODE LOGIC - Stop archiving temporarily to prevent conflicts during cleanup
             logger.info("🛑 Temporarily disabling archive command...")
             await self._set_archive_command("off")
 
@@ -4223,7 +4250,7 @@ pg1-user={self.config['pguser']}
             # Wait a moment for cleanup
             await asyncio.sleep(2)
 
-            # Create the correct stanza
+            # Create the correct stanza (PRIMARY ONLY)
             logger.info(f"🆕 Creating correct stanza: [{expected_stanza}]")
             create_cmd = [
                 "sudo",
@@ -4255,7 +4282,7 @@ pg1-user={self.config['pguser']}
                     )
                     return False
 
-            # Re-enable archive command with correct stanza name
+            # Re-enable archive command with correct stanza name (PRIMARY ONLY)
             logger.info("🔄 Re-enabling archive command with correct stanza...")
             archive_command = f"pgbackrest --stanza={expected_stanza} archive-push %p"
             await self._set_archive_command(archive_command)

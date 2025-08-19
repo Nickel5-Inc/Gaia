@@ -5,6 +5,8 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any, Dict, Tuple
 
+logger = logging.getLogger(__name__)
+
 import sqlalchemy as sa
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
@@ -469,6 +471,21 @@ async def run_item(
         {"rid": response_id},
     )
     if not resp:
+        return False
+    
+    # CRITICAL: Validate miner workflow isolation - prevent any crossover between miners
+    if resp["run_id"] != run_id:
+        logger.error(
+            f"[ISOLATION VIOLATION] Response {response_id} belongs to run {resp['run_id']} "
+            f"but job specifies run {run_id}. Aborting to prevent crossover."
+        )
+        return False
+    
+    if resp["miner_uid"] != miner_uid:
+        logger.error(
+            f"[ISOLATION VIOLATION] Response {response_id} belongs to miner UID {resp['miner_uid']} "
+            f"but job specifies miner UID {miner_uid}. Aborting to prevent crossover."
+        )
         return False
     run = await db.fetch_one(
         "SELECT gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",

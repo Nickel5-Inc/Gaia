@@ -252,6 +252,9 @@ async def handle_initiate_fetch_job(
             """
         )
         
+        # CRITICAL: Log potential hotkey inconsistencies that cause duplicate requests
+        logger.info(f"[Run {run_id}] Retrieved {len(miners)} miners from node_table for query job creation")
+        
         if not miners:
             logger.warning(f"[Run {run_id}] No miners found to query")
             await db.execute(
@@ -266,14 +269,24 @@ async def handle_initiate_fetch_job(
         jobs_created = 0
         for miner in miners:
             try:
-                # Check if job already exists
+                # CRITICAL: Log the hotkey we're using from node_table for debugging
+                logger.info(
+                    f"[Run {run_id}] Creating query job for miner UID {miner['uid']} "
+                    f"with hotkey {miner['hotkey'][:8]}...{miner['hotkey'][-8:]} (from node_table)"
+                )
+                # Check if job already exists or recently completed successfully
                 existing = await db.fetch_one(
                     """
-                    SELECT id FROM validator_jobs
+                    SELECT id, status FROM validator_jobs
                     WHERE job_type = 'weather.query_miner'
                     AND run_id = :run_id
                     AND miner_uid = :miner_uid
-                    AND status IN ('pending', 'in_progress', 'retry_scheduled')
+                    AND (
+                        status IN ('pending', 'in_progress', 'retry_scheduled')
+                        OR (status = 'completed' AND completed_at > NOW() - INTERVAL '10 minutes')
+                    )
+                    ORDER BY created_at DESC
+                    LIMIT 1
                     """,
                     {"run_id": run_id, "miner_uid": miner["uid"]}
                 )
@@ -281,14 +294,16 @@ async def handle_initiate_fetch_job(
                 if existing:
                     logger.debug(f"[Run {run_id}] Query job already exists for miner {miner['uid']}")
                     continue
-                    
-                # Create query job
-                job_id = await db.enqueue_validator_job(
+                
+                # Create query job using singleton to prevent duplicates
+                singleton_key = f"query_miner_run_{run_id}_miner_{miner['uid']}"
+                job_id = await db.enqueue_singleton_job(
+                    singleton_key=singleton_key,
                     job_type="weather.query_miner",
                     payload={
                         "run_id": run_id,
                         "miner_uid": miner["uid"],
-                        "miner_hotkey": miner["hotkey"],
+                        "miner_hotkey": miner["hotkey"],  # Use node_table as source of truth
                         "validator_hotkey": validator_hotkey,
                         "retry_count": 0,  # Track retry attempts
                     },

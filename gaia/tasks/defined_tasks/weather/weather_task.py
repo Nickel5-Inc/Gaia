@@ -1852,7 +1852,13 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         pass
 
     async def initiate_fetch_retry_once(self, validator) -> None:
-        """Retry initiate-fetch for newest run stuck without any responses."""
+        """
+        DEPRECATED: This function is part of the old retry system and is never called.
+        Only called from initiate_fetch_retry_loop which is also never called.
+        The new job-based pipeline handles retries differently.
+        Retry initiate-fetch for newest run stuck without any responses.
+        """
+        return  # Disabled - never called
         try:
             row = await self.db_manager.fetch_one(
                 """
@@ -1882,7 +1888,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 return
             gfs_t0_run_time = gfs_run["gfs_init_time_utc"]
             gfs_t_minus_6_run_time = gfs_t0_run_time - timedelta(hours=6)
-            from gaia.validator.miner.miner_query import initiate_fetch as _init_fetch
+            from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import query_miner_for_weather
             hotkeys: list[str] = []
             try:
                 if hasattr(validator, "metagraph") and validator.metagraph and getattr(validator.metagraph, "nodes", None):
@@ -1902,7 +1908,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             responses = {}
             for miner_hotkey in hotkeys:
                 try:
-                    res = await _init_fetch(
+                    res = await query_miner_for_weather(
                         validator,
                         miner_hotkey,
                         forecast_start_time=gfs_t0_run_time,
@@ -1910,6 +1916,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                         validator_hotkey=(
                             validator.keypair.ss58_address if validator.keypair else None
                         ),
+                        db_manager=self.db_manager,
                     )
                     if res is not None:
                         responses[miner_hotkey] = res
@@ -1990,7 +1997,12 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             return
 
     async def initiate_fetch_retry_loop(self, validator) -> None:
-        """Periodic retry loop to ensure initiate-fetch is sent for active runs."""
+        """
+        DEPRECATED: This function is never called and uses the old retry system.
+        The new job-based pipeline handles retries through the worker retry mechanism.
+        Periodic retry loop to ensure initiate-fetch is sent for active runs.
+        """
+        return  # Disabled - never called
         while True:
             try:
                 await self.initiate_fetch_retry_once(validator)
@@ -3337,6 +3349,12 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
             miner_hotkey = (
                 self.keypair.ss58_address if self.keypair else "unknown_miner"
             )
+            
+            # CRITICAL: Log the actual miner hotkey being used for job creation and manifest signing
+            logger.info(
+                f"[Miner] Using hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]} "
+                f"for job creation and manifest signing (from self.keypair.ss58_address)"
+            )
             # Use the validator hotkey extracted above, or fall back to placeholder
             if not validator_hotkey:
                 validator_hotkey = "unknown_validator"
@@ -4112,26 +4130,18 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 "data": status_payload_data.model_dump(),
                             }
 
-                            from gaia.validator.miner.miner_query import get_input_status as _gis
-                            status_response = await _gis(self, miner_hk, job_id=miner_job_id)
+                            from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import poll_miner_job_status
+                            status_response = await poll_miner_job_status(
+                                validator=self.validator,
+                                miner_hotkey=miner_hk,
+                                job_id=miner_job_id,
+                                db_manager=self.db_manager,
+                            )
 
-                            if status_response:
-                                parsed_response = status_response
-                                if (
-                                    isinstance(status_response, dict)
-                                    and "text" in status_response
-                                ):
-                                    try:
-                                        parsed_response = loads(status_response["text"])
-                                    except (Exception, TypeError) as json_err:
-                                        logger.warning(
-                                            f"[HashWorker] [Run {run_id}] Failed to parse JSON response from miner {miner_hk[:8]}: {json_err}. Raw response: {status_response.get('text', '')[:200]}"
-                                        )
-                                        parsed_response = {
-                                            "status": "parse_error",
-                                            "message": f"JSON parse error from miner {miner_hk[:8]}: {type(json_err).__name__}: {str(json_err)}",
-                                        }
-
+                            if status_response and status_response.get("success"):
+                                # Extract the data from the standardized response format
+                                parsed_response = status_response.get("data", {})
+                                
                                 logger.debug(
                                     f"[Run {run_id}] Received status from {miner_hk[:8]}: {parsed_response}"
                                 )
@@ -4723,6 +4733,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         self, processed_runs_this_session=None, max_attempts_per_run=3
     ):
         """
+        DEPRECATED: This function uses the old bulk query system and is replaced by the job-based pipeline.
         Sequential version of run recovery that processes one run at a time to avoid system overload.
         Designed for periodic execution without blocking normal operations.
         """
@@ -5265,6 +5276,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
     async def _check_and_recover_incomplete_runs(self):
         """
+        DEPRECATED: This function uses the old bulk query system and is replaced by the job-based pipeline.
+        This function is never called and should be removed in the next cleanup.
         Check for incomplete runs from previous validator sessions and attempt to recover them.
         Returns True if any runs were recovered and should be processed.
         """
@@ -5425,7 +5438,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         return len(incomplete_runs) > 0
 
     async def _continue_run_workflow(self, run_id: int):
-        """Continue the workflow for a recovered run."""
+        """
+        DEPRECATED: This function uses the old bulk query system and is replaced by the job-based pipeline.
+        Only called from _check_and_recover_incomplete_runs_sequential which is disabled.
+        Continue the workflow for a recovered run.
+        """
         try:
             logger.info(f"[Run {run_id}] Continuing workflow from recovery...")
 
@@ -5463,6 +5480,8 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
     async def _execute_hash_verification_workflow(self, run_id: int):
         """
+        DEPRECATED: This function uses the old bulk query system and is replaced by the job-based pipeline.
+        Only called from _check_and_recover_incomplete_runs_sequential which is disabled.
         Execute the complete hash verification workflow for a run.
         This is extracted from the main validator_execute flow and reusable for recovery.
         """
@@ -5554,29 +5573,18 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     }
                     endpoint = "/weather-poll-job-status"
 
-                    all_responses = await self.validator.query_miners(
-                        payload=status_payload, endpoint=endpoint, hotkeys=[miner_hk]
+                    from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import poll_miner_job_status
+                    status_response = await poll_miner_job_status(
+                        validator=self.validator,
+                        miner_hotkey=miner_hk,
+                        job_id=miner_job_id,
+                        db_manager=self.db_manager,
                     )
 
-                    status_response = all_responses.get(miner_hk)
-
-                    if status_response:
-                        parsed_response = status_response
-                        if (
-                            isinstance(status_response, dict)
-                            and "text" in status_response
-                        ):
-                            try:
-                                parsed_response = loads(status_response["text"])
-                            except (Exception, TypeError) as json_err:
-                                logger.warning(
-                                    f"[Run {run_id}] Failed to parse status response text for {miner_hk[:8]}: {json_err}"
-                                )
-                                parsed_response = {
-                                    "status": "parse_error",
-                                    "message": str(json_err),
-                                }
-
+                    if status_response and status_response.get("success"):
+                        # Extract the data from the standardized response format
+                        parsed_response = status_response.get("data", {})
+                        
                         logger.debug(
                             f"[Run {run_id}] Received status from {miner_hk[:8]}: {parsed_response}"
                         )

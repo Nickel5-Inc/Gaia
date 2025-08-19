@@ -142,6 +142,10 @@ async def _cleanup_offline_miner_from_run(
         return False
 
 
+# Cache for run completion checks to avoid spamming logs
+_run_completion_cache = {}
+_run_completion_cache_ttl = 60  # seconds
+
 async def _check_run_completion(task_instance: "WeatherTask", run_id: int) -> bool:
     """
     Check if a run should be marked as completed based on miner participation.
@@ -157,6 +161,17 @@ async def _check_run_completion(task_instance: "WeatherTask", run_id: int) -> bo
     Returns:
         bool: True if run should be completed, False if it should continue
     """
+    import time
+    
+    # Check cache to avoid spamming the same check
+    cache_key = f"run_{run_id}"
+    now = time.time()
+    if cache_key in _run_completion_cache:
+        cached_time, cached_result = _run_completion_cache[cache_key]
+        if now - cached_time < _run_completion_cache_ttl:
+            # Return cached result without logging
+            return cached_result
+    
     try:
         # Check total miners in run
         total_miners_query = """
@@ -216,6 +231,7 @@ async def _check_run_completion(task_instance: "WeatherTask", run_id: int) -> bo
                     f"[RunCompletion] Run {run_id}: Has {scored_miners} successfully scored miner(s) - marking as complete"
                 )
             # Don't update status here - let the worker handle the appropriate status based on scoring type
+            _run_completion_cache[cache_key] = (now, True)
             return True
 
         # IMPORTANT: For ERA5 scoring, if all verified miners have been processed (scored or failed),
@@ -251,6 +267,7 @@ async def _check_run_completion(task_instance: "WeatherTask", run_id: int) -> bo
                     "all_miners_failed",
                     "All verified miners failed or went offline",
                 )
+                _run_completion_cache[cache_key] = (now, True)
                 return True
 
         # If all miners have either scored or failed, the run is complete
@@ -265,13 +282,16 @@ async def _check_run_completion(task_instance: "WeatherTask", run_id: int) -> bo
                     "all_miners_failed",
                     "All miners failed or went offline",
                 )
+                _run_completion_cache[cache_key] = (now, True)
                 return True
             else:
                 logger.info(
                     f"[RunCompletion] Run {run_id}: All miners processed ({scored_miners} scored, {failed_miners} failed)"
                 )
+                _run_completion_cache[cache_key] = (now, True)
                 return True
 
+        _run_completion_cache[cache_key] = (now, False)
         return False
 
     except Exception as e:
@@ -279,6 +299,7 @@ async def _check_run_completion(task_instance: "WeatherTask", run_id: int) -> bo
             f"[RunCompletion] Error checking run completion for run {run_id}: {e}",
             exc_info=True,
         )
+        # Don't cache error results
         return False
 
 
@@ -710,24 +731,26 @@ async def _request_fresh_token(
         f"[VerifyLogic] Requesting fresh token/manifest_hash for job {job_id} from miner {miner_hotkey[:12]}..."
     )
     forecast_request_payload = {"nonce": str(uuid.uuid4()), "data": {"job_id": job_id}}
-    from gaia.validator.miner.miner_query import query_single_miner
+    from gaia.tasks.defined_tasks.weather.pipeline.miner_communication import query_single_miner
     endpoint_to_call = "/weather-kerchunk-request"
     try:
         response_dict = await query_single_miner(
-            task_instance,
-            miner_hotkey,
+            validator=task_instance.validator,
+            miner_hotkey=miner_hotkey,
             endpoint=endpoint_to_call,
             payload=forecast_request_payload,
+            timeout=45.0,
+            db_manager=task_instance.db_manager,
         )
 
         # If no response, bail
-        if not response_dict:
+        if not response_dict or not response_dict.get("success"):
             logger.warning(
                 f"[VerifyLogic] No response received from miner {miner_hotkey[:12]} for job {job_id}"
             )
             return None
-        if response_dict.get("status_code") == 200:
-            miner_response_data = loads(response_dict["text"])
+        if response_dict.get("success"):
+            miner_response_data = response_dict.get("data", {})
             miner_status = miner_response_data.get("status")
 
             if miner_status == "completed":
@@ -735,8 +758,20 @@ async def _request_fresh_token(
                 zarr_store_relative_url = miner_response_data.get("zarr_store_url")
                 manifest_content_hash = miner_response_data.get("verification_hash")
                 if token and zarr_store_relative_url and manifest_content_hash:
-                    ip_val = response_dict["ip"]
-                    port_val = response_dict["port"]
+                    # Get IP and port from database
+                    db = task_instance.db_manager
+                    row = await db.fetch_one(
+                        "SELECT ip, port FROM node_table WHERE hotkey = :hk", 
+                        {"hk": miner_hotkey}
+                    )
+                    if not row or not row.get("ip") or not row.get("port"):
+                        logger.error(f"Could not find IP/port for miner {miner_hotkey[:12]}")
+                        return None
+                    
+                    ip_val = row["ip"]
+                    port_val = row["port"]
+                    
+                    # Convert integer IP to dotted decimal if needed
                     ip_str = (
                         str(ipaddress.ip_address(int(ip_val)))
                         if isinstance(ip_val, (str, int)) and str(ip_val).isdigit()
@@ -783,7 +818,7 @@ async def _request_fresh_token(
                 )
         else:
             logger.warning(
-                f"[VerifyLogic] Miner {miner_hotkey[:12]} returned HTTP {response_dict.get('status_code')} for job {job_id}"
+                f"[VerifyLogic] Miner {miner_hotkey[:12]} request failed: {response_dict.get('error', 'Unknown error')} for job {job_id}"
             )
     except Exception as e:
         logger.error(

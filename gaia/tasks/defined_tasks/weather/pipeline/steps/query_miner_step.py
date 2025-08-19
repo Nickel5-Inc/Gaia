@@ -55,22 +55,50 @@ async def run_query_miner_job(
         gfs_init = run["gfs_init_time_utc"]
         gfs_t_minus_6 = gfs_init - timedelta(hours=6)
         
-        logger.info(f"[Run {run_id}] Querying miner {miner_hotkey[:8]} (UID {miner_uid})")
+        logger.info(f"[Run {run_id}] Querying miner {miner_hotkey[:8]}...{miner_hotkey[-8:]} (UID {miner_uid})")
+        
+        # CRITICAL: Validate that node_table hotkey matches job parameter
+        # If they don't match, it indicates a serious issue in metagraph sync or job creation
+        node_check = await db.fetch_one(
+            "SELECT hotkey, last_updated FROM node_table WHERE uid = :uid",
+            {"uid": miner_uid}
+        )
+        if node_check and node_check["hotkey"] != miner_hotkey:
+            logger.error(
+                f"[METAGRAPH SYNC ISSUE] Run {run_id}, Miner UID {miner_uid}: "
+                f"node_table has {node_check['hotkey'][:8]}...{node_check['hotkey'][-8:]} "
+                f"but job parameter is {miner_hotkey[:8]}...{miner_hotkey[-8:]}. "
+                f"node_table last_updated: {node_check.get('last_updated')}. "
+                f"This indicates either stale metagraph data or incorrect job creation!"
+            )
+        elif not node_check:
+            logger.error(f"[METAGRAPH SYNC ISSUE] Miner UID {miner_uid} not found in node_table!")
         
         # Check if we already have a response for this miner
         existing = await db.fetch_one(
             """
-            SELECT id, status FROM weather_miner_responses
+            SELECT id, status, job_id, miner_hotkey FROM weather_miner_responses
             WHERE run_id = :run_id AND miner_uid = :miner_uid
             """,
             {"run_id": run_id, "miner_uid": miner_uid}
         )
         
-        if existing and existing["status"] not in ["created", "failed"]:
-            logger.info(
-                f"[Run {run_id}] Miner {miner_uid} already has response with status {existing['status']}, skipping"
-            )
-            return True
+        if existing:
+            # CRITICAL: Validate miner workflow isolation in existing responses
+            if existing.get("miner_hotkey") != miner_hotkey:
+                logger.error(
+                    f"[ISOLATION VIOLATION] Existing response for run {run_id}, miner UID {miner_uid} "
+                    f"has hotkey {existing.get('miner_hotkey', 'NULL')[:8]}... but job specifies "
+                    f"{miner_hotkey[:8]}... Potential crossover detected."
+                )
+                return False
+                
+            if existing["status"] not in ["created", "failed"]:
+                logger.info(
+                    f"[Run {run_id}] Miner {miner_uid} already has response with status {existing['status']} "
+                    f"(job_id: {existing.get('job_id', 'N/A')}), skipping duplicate query"
+                )
+                return True
             
         # Query the miner using the new communication module
         try:
@@ -84,12 +112,15 @@ async def run_query_miner_job(
             )
             
             if not result:
-                logger.warning(f"[Run {run_id}] No response from miner {miner_hotkey[:8]}")
+                logger.warning(
+                    f"[Run {run_id}] No response from miner {miner_hotkey[:8]} (UID {miner_uid}). "
+                    f"Miner may be offline or has not registered IP/port via fiber-post-ip process."
+                )
                 # Record failure
                 await _record_miner_response(
                     db, run_id, miner_uid, miner_hotkey,
                     status="failed",
-                    error_message="No response from miner"
+                    error_message="No response - miner offline or IP/port not registered"
                 )
                 # Update pipeline status
                 stats = WeatherStatsManager(db, validator_hotkey)
@@ -98,7 +129,7 @@ async def run_query_miner_job(
                     miner_uid=miner_uid,
                     stage="inference_requested",
                     status="failed",
-                    error="No response from miner"
+                    error="No response - miner offline or IP/port not registered"
                 )
                 await log_failure(
                     db,
@@ -107,7 +138,7 @@ async def run_query_miner_job(
                     miner_hotkey=miner_hotkey,
                     step_name="query",
                     substep="initiate_fetch",
-                    error_json={"error": "No response from miner"}
+                    error_json={"error": "No response - miner offline or IP/port not registered. Please ensure miner has completed fiber-post-ip process."}
                 )
                 return True  # Don't retry connection failures
             
@@ -162,6 +193,13 @@ async def run_query_miner_job(
                 and miner_response.get("status") == WeatherTaskStatus.FETCH_ACCEPTED
                 and miner_response.get("job_id")
             ):
+                # CRITICAL: Log where this miner hotkey came from for debugging
+                logger.info(
+                    f"[Run {run_id}] Recording response for miner UID {miner_uid} "
+                    f"with hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]} "
+                    f"(source: job parameter from node_table)"
+                )
+                
                 # Record acceptance with timing info
                 response_id = await _record_miner_response(
                     db, run_id, miner_uid, miner_hotkey,
@@ -169,6 +207,8 @@ async def run_query_miner_job(
                     job_id=miner_response.get("job_id"),
                     response_time_ms=int(result.get("response_time", 0) * 1000)
                 )
+                
+
                 
                 logger.info(
                     f"[Run {run_id}] ✓ Miner {miner_hotkey[:8]} accepted"

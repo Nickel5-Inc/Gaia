@@ -162,7 +162,11 @@ async def query_single_miner(
     miner_port = miner_info["port"]
     
     if not miner_ip or not miner_port:
-        logger.warning(f"Miner {miner_hotkey[:8]} (UID {miner_uid}) has no IP/port")
+        logger.warning(
+            f"Miner {miner_hotkey[:8]} (UID {miner_uid}) has no IP/port registered. "
+            f"IP={miner_ip}, Port={miner_port}. "
+            f"Please ensure the miner has completed the fiber-post-ip process as described in the README."
+        )
         return None
         
     # Use HTTPS for fiber handshake
@@ -528,7 +532,7 @@ async def query_miner_for_weather(
             except Exception as stats_error:
                 logger.debug(f"Failed to update hosting success metrics: {stats_error}")
     else:
-        error = result.get("error", "Unknown error") if result else "No response"
+        error = result.get("error", "Unknown error") if result else "No response (miner may be offline or IP/port not registered)"
         logger.warning(
             f"✗ Weather fetch failed for {miner_hotkey[:8]}: {error}"
         )
@@ -619,5 +623,38 @@ async def poll_miner_job_status(
         logger.warning(
             f"Failed to get status from {miner_hotkey[:8]}: {error}"
         )
+    
+    return result
+
+
+async def start_miner_inference(
+    validator: Any,
+    miner_hotkey: str,
+    job_id: str,
+    db_manager: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Trigger a miner to start inference with detailed logging.
+    """
+    # Wrap the data in the expected format
+    payload = {
+        "data": {
+            "job_id": job_id,
+        }
+    }
+    
+    logger.info(
+        f"Starting inference for {miner_hotkey[:8]}"
+        f"\n  Job ID: {job_id}"
+    )
+    
+    result = await query_single_miner(
+        validator=validator,
+        miner_hotkey=miner_hotkey,
+        endpoint="/weather-start-inference",
+        payload=payload,
+        timeout=45.0,
+        db_manager=db_manager,
+    )
     
     return result
