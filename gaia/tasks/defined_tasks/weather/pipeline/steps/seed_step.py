@@ -50,16 +50,15 @@ async def seed_forecast_run(
     eff_gfs_init = get_effective_gfs_init(task_like, gfs_init)
     forecast_run_id = WeatherStatsManager.generate_forecast_run_id(eff_gfs_init, target_time)
 
-    # Pull miners (UID/hotkey). Keep within 0..255 and require non-null hotkey
+    # TEMPORARY: Filter to only active test miners for cleaner debugging
+    test_miner_uids = [55, 80]  # The two currently active miners
     miners: List[Dict[str, Any]] = await db.fetch_all(
-        sa.text(
-            """
-            SELECT uid as miner_uid, hotkey as miner_hotkey
-            FROM node_table
-            WHERE uid BETWEEN 0 AND 255 AND hotkey IS NOT NULL
-            ORDER BY uid ASC
-            """
-        )
+        """
+        SELECT uid as miner_uid, hotkey as miner_hotkey
+        FROM node_table
+        WHERE uid IN (55, 80) AND hotkey IS NOT NULL
+        ORDER BY uid ASC
+        """
     )
     if not miners:
         return 0

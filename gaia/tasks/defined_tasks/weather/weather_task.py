@@ -3235,6 +3235,30 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
 
             # Extract validator hotkey from request data
             validator_hotkey = request_data.validator_hotkey
+            
+            # CRITICAL: Verify the request is intended for this miner's hotkey
+            expected_miner_hotkey = getattr(request_data, 'expected_miner_hotkey', None)
+            actual_miner_hotkey = self.keypair.ss58_address if self.keypair else "unknown_miner"
+            
+            if expected_miner_hotkey and expected_miner_hotkey != actual_miner_hotkey:
+                logger.error(
+                    f"[Miner] Hotkey verification FAILED! Request intended for {expected_miner_hotkey[:8]}...{expected_miner_hotkey[-8:]} "
+                    f"but this miner is {actual_miner_hotkey[:8]}...{actual_miner_hotkey[-8:]}. "
+                    f"Rejecting request to prevent crossover."
+                )
+                return self._validate_and_format_response(
+                    {
+                        "status": WeatherTaskStatus.FETCH_REJECTED.value,
+                        "message": f"Hotkey verification failed - request intended for different miner",
+                        "expected_hotkey": expected_miner_hotkey,
+                        "actual_hotkey": actual_miner_hotkey,
+                    },
+                    ["status", "message"],
+                )
+            elif expected_miner_hotkey:
+                logger.info(
+                    f"[Miner] Hotkey verification PASSED - request correctly intended for {actual_miner_hotkey[:8]}...{actual_miner_hotkey[-8:]}"
+                )
 
             # Find existing job for this exact time and validator
             if validator_hotkey:

@@ -67,8 +67,54 @@ async def evaluate_miner_forecast_day1(
     # Start timing for this miner's scoring
     scoring_start_time = time.time()
     logger.info(
-        f"[Day1Score] Starting for miner {miner_hotkey} (Resp: {response_id}, Run: {run_id}, Job: {job_id}, UID: {miner_uid})"
+        f"[Day1Score] Starting for miner {miner_hotkey[:8]}...{miner_hotkey[-8:]} (Resp: {response_id}, Run: {run_id}, Job: {job_id}, UID: {miner_uid})"
     )
+    
+    # CRITICAL: Validate job_id matches the expected miner hotkey format
+    if job_id and "_" in job_id:
+        # Extract miner hotkey from job_id for validation
+        try:
+            # Job ID format: d1ac184b-8c0b-4745-90d0-a00d5ed536dc
+            # Zarr URL format: weather_forecast_2025081200_miner_hk_5H1Lx7YNNp_d1ac184b.zarr
+            # The job_id should be deterministically generated from the actual miner hotkey
+            logger.info(
+                f"[Day1Score] Job {job_id} assigned to miner UID {miner_uid} with hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]}. "
+                f"Validating job ownership..."
+            )
+            
+            # CRITICAL: Check if this job_id appears in multiple miner records (data corruption)
+            job_ownership_check = await task_instance.db_manager.fetch_all(
+                """
+                SELECT miner_uid, miner_hotkey, status, response_time 
+                FROM weather_miner_responses 
+                WHERE job_id = :job_id
+                ORDER BY response_time DESC
+                """,
+                {"job_id": job_id}
+            )
+            
+            if len(job_ownership_check) > 1:
+                logger.error(
+                    f"[DATA CORRUPTION] Job {job_id} appears in {len(job_ownership_check)} different miner records:"
+                )
+                for i, record in enumerate(job_ownership_check):
+                    logger.error(
+                        f"  [{i+1}] UID {record['miner_uid']}, hotkey {record['miner_hotkey'][:8]}...{record['miner_hotkey'][-8:]}, "
+                        f"status: {record['status']}, time: {record['response_time']}"
+                    )
+                logger.error(f"[DATA CORRUPTION] This job should only belong to ONE miner!")
+            elif len(job_ownership_check) == 1:
+                owner = job_ownership_check[0]
+                if owner["miner_uid"] != miner_uid or owner["miner_hotkey"] != miner_hotkey:
+                    logger.error(
+                        f"[DATA CORRUPTION] Job {job_id} ownership mismatch: "
+                        f"Current scoring: UID {miner_uid}, hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]} "
+                        f"Database record: UID {owner['miner_uid']}, hotkey {owner['miner_hotkey'][:8]}...{owner['miner_hotkey'][-8:]}"
+                    )
+        except Exception as e:
+            logger.warning(f"[Day1Score] Could not validate job ownership: {e}")
+    else:
+        logger.warning(f"[Day1Score] Job ID {job_id} format unexpected, cannot validate ownership")
 
     day1_results = {
         "response_id": response_id,

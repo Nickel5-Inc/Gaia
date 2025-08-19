@@ -109,8 +109,10 @@ async def orchestrate_run(
             # GFS is ready, we can proceed with miner queries
             logger.info(f"[Run {run_id}] GFS ready, enqueueing initiate-fetch job")
             
-            # Use singleton to avoid duplicates
+            # Use singleton to avoid duplicates from multiple worker processes
             singleton_key = f"initiate_fetch_run_{run_id}"
+            logger.info(f"[Run {run_id}] Attempting to create initiate-fetch singleton job with key '{singleton_key}'")
+            
             job_id = await db.enqueue_singleton_job(
                 singleton_key=singleton_key,
                 job_type="weather.initiate_fetch", 
@@ -123,9 +125,9 @@ async def orchestrate_run(
             )
             
             if job_id:
-                logger.info(f"[Run {run_id}] Created initiate-fetch singleton job {job_id}")
+                logger.info(f"[Run {run_id}] ✓ Created initiate-fetch singleton job {job_id}")
             else:
-                logger.debug(f"[Run {run_id}] Initiate-fetch singleton already exists")
+                logger.info(f"[Run {run_id}] ✗ Initiate-fetch singleton already exists, skipped (multiprocessing protection worked)")
             
         elif current_status in ("sending_fetch_requests", "awaiting_inference_results"):
             # Already in progress, just ensure polling jobs exist
@@ -153,6 +155,10 @@ async def handle_initiate_fetch_job(
     Create individual query jobs for each miner.
     This runs AFTER GFS is ready and creates parallel jobs.
     """
+    # CRITICAL: Log when this function is called to track multiprocessing duplicates
+    import multiprocessing as mp
+    worker_name = mp.current_process().name if mp.current_process() else "unknown-worker"
+    logger.info(f"[Run {run_id}] handle_initiate_fetch_job called by worker {worker_name}")
     try:
         # Check that GFS is ready
         run = await db.fetch_one(
@@ -241,16 +247,36 @@ async def handle_initiate_fetch_job(
             {"run_id": run_id}
         )
         
-        # Get all miners with their UIDs
+        # TEMPORARY: Filter to only active test miners for cleaner debugging
         miners = await db.fetch_all(
             """
-            SELECT uid, hotkey 
+            SELECT uid, hotkey, ip, port
             FROM node_table 
             WHERE hotkey IS NOT NULL 
-            AND uid BETWEEN 0 AND 255
+            AND uid IN (55, 80)
             ORDER BY uid
             """
         )
+        
+        # CRITICAL: Check for duplicate IP/port assignments (same physical miner, different UIDs)
+        if len(miners) > 1:
+            ip_port_map = {}
+            for miner in miners:
+                ip_port = f"{miner.get('ip', 'N/A')}:{miner.get('port', 'N/A')}"
+                if ip_port in ip_port_map:
+                    logger.error(
+                        f"[DATABASE CORRUPTION] Multiple UIDs point to same miner instance {ip_port}:"
+                        f"\n  UID {ip_port_map[ip_port]['uid']}: hotkey {ip_port_map[ip_port]['hotkey'][:8]}...{ip_port_map[ip_port]['hotkey'][-8:]}"
+                        f"\n  UID {miner['uid']}: hotkey {miner['hotkey'][:8]}...{miner['hotkey'][-8:]}"
+                        f"\n  This explains why both miners return the same job_id!"
+                    )
+                else:
+                    ip_port_map[ip_port] = miner
+                    
+                logger.info(
+                    f"[Run {run_id}] Miner UID {miner['uid']}: {miner['hotkey'][:8]}...{miner['hotkey'][-8:]} "
+                    f"at {ip_port}"
+                )
         
         # CRITICAL: Log potential hotkey inconsistencies that cause duplicate requests
         logger.info(f"[Run {run_id}] Retrieved {len(miners)} miners from node_table for query job creation")

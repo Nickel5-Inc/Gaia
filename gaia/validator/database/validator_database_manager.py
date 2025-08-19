@@ -1424,15 +1424,17 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
         """
         import json
         try:
-            # Try to insert with the singleton_key
+            # Try to insert with the singleton_key using proper duplicate prevention
             result = await self.fetch_one(
                 """
                 INSERT INTO validator_jobs 
                 (singleton_key, job_type, priority, status, payload, scheduled_at, run_id, miner_uid)
-                VALUES (:sk, :jt, :p, 'pending', CAST(:payload AS jsonb), :sched, :rid, :uid)
-                ON CONFLICT (singleton_key) 
-                WHERE status IN ('pending', 'claimed', 'retry_scheduled')
-                DO NOTHING
+                SELECT CAST(:sk AS VARCHAR(255)), CAST(:jt AS VARCHAR(64)), :p, 'pending', CAST(:payload AS jsonb), :sched, :rid, :uid
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM validator_jobs 
+                    WHERE singleton_key = CAST(:sk AS VARCHAR(255))
+                    AND status IN ('pending', 'in_progress', 'retry_scheduled')
+                )
                 RETURNING id
                 """,
                 {
@@ -1445,7 +1447,12 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     "uid": miner_uid,
                 },
             )
-            return result["id"] if result else None
+            if result:
+                logger.info(f"Created singleton job {result['id']} with key '{singleton_key}'")
+                return result["id"]
+            else:
+                logger.debug(f"Singleton job with key '{singleton_key}' already exists, skipped")
+                return None
         except Exception as e:
             logger.error(f"enqueue_singleton_job failed: {e}")
             return None

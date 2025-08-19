@@ -484,6 +484,9 @@ async def query_miner_for_weather(
         f"\n  Previous step: {previous_step_time}"
     )
     
+    # CRITICAL: Add expected hotkey to payload for miner verification
+    payload["data"]["expected_miner_hotkey"] = miner_hotkey
+    
     result = await query_single_miner(
         validator=validator,
         miner_hotkey=miner_hotkey,

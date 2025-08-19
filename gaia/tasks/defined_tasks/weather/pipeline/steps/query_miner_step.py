@@ -111,6 +111,44 @@ async def run_query_miner_job(
                 db_manager=db,  # Pass the db instance from the worker
             )
             
+            # CRITICAL: Verify the responding miner's hotkey matches what we expected
+            if result and result.get("success") and result.get("data", {}).get("job_id"):
+                job_id = result["data"]["job_id"]
+                
+                # The job_id should be deterministically generated using the actual miner's hotkey
+                # If the responding miner has a different hotkey, the job_id pattern won't match
+                logger.info(
+                    f"[Run {run_id}] Received job_id {job_id} from miner at UID {miner_uid}, "
+                    f"expected hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]}"
+                )
+                
+                # Additional verification: check if this job_id was created by a different miner
+                # by looking at existing responses with this job_id
+                job_id_check = await db.fetch_one(
+                    """
+                    SELECT miner_uid, miner_hotkey FROM weather_miner_responses 
+                    WHERE job_id = :job_id AND miner_uid != :expected_uid
+                    LIMIT 1
+                    """,
+                    {"job_id": job_id, "expected_uid": miner_uid}
+                )
+                
+                if job_id_check:
+                    logger.error(
+                        f"[HOTKEY VERIFICATION FAILED] Miner UID {miner_uid} (hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]}) "
+                        f"returned job_id {job_id} that belongs to different miner UID {job_id_check['miner_uid']} "
+                        f"(hotkey {job_id_check['miner_hotkey'][:8]}...{job_id_check['miner_hotkey'][-8:]}). "
+                        f"This indicates same IP:port serving multiple miners - marking as failed."
+                    )
+                    
+                    # Record this as a failed response due to hotkey mismatch
+                    await _record_miner_response(
+                        db, run_id, miner_uid, miner_hotkey,
+                        status="failed",
+                        error_message=f"Hotkey verification failed - job_id {job_id} belongs to different miner"
+                    )
+                    return True  # Don't retry, this is a permanent configuration issue
+            
             if not result:
                 logger.warning(
                     f"[Run {run_id}] No response from miner {miner_hotkey[:8]} (UID {miner_uid}). "
@@ -269,18 +307,37 @@ async def run_query_miner_job(
                 status = miner_response.get("status", "unknown")
                 message = miner_response.get("message", "No message")
                 
-                logger.warning(
-                    f"[Run {run_id}] Miner {miner_hotkey[:8]} rejected or unexpected response"
-                    f"\n  Status: {status}"
-                    f"\n  Message: {message}"
-                )
-                
-                await _record_miner_response(
-                    db, run_id, miner_uid, miner_hotkey,
-                    status="failed",
-                    error_message=f"Status: {status}, Message: {message}"
-                )
-                return True  # Don't retry rejections
+                # Check if this is a hotkey verification failure
+                if status == WeatherTaskStatus.FETCH_REJECTED and "hotkey verification failed" in message.lower():
+                    expected_hk = miner_response.get("expected_hotkey", "unknown")
+                    actual_hk = miner_response.get("actual_hotkey", "unknown")
+                    logger.error(
+                        f"[Run {run_id}] HOTKEY VERIFICATION FAILED for UID {miner_uid}:"
+                        f"\n  Expected: {expected_hk[:8]}...{expected_hk[-8:] if len(expected_hk) > 8 else expected_hk}"
+                        f"\n  Actual: {actual_hk[:8]}...{actual_hk[-8:] if len(actual_hk) > 8 else actual_hk}"
+                        f"\n  This UID likely points to a stale/incorrect miner registration."
+                    )
+                    
+                    # Mark this miner UID as having stale registration
+                    await _record_miner_response(
+                        db, run_id, miner_uid, miner_hotkey,
+                        status="failed",
+                        error_message=f"Hotkey verification failed - UID {miner_uid} has stale registration"
+                    )
+                    return True  # Don't retry, this is a permanent configuration issue
+                else:
+                    logger.warning(
+                        f"[Run {run_id}] Miner {miner_hotkey[:8]} rejected or unexpected response"
+                        f"\n  Status: {status}"
+                        f"\n  Message: {message}"
+                    )
+                    
+                    await _record_miner_response(
+                        db, run_id, miner_uid, miner_hotkey,
+                        status="failed",
+                        error_message=f"Status: {status}, Message: {message}"
+                    )
+                    return True  # Don't retry rejections
                 
         except Exception as e:
             logger.error(f"[Run {run_id}] Error querying miner {miner_hotkey[:8]}: {e}")
@@ -303,6 +360,25 @@ async def _record_miner_response(
     response_time_ms: Optional[int] = None,
 ) -> int:
     """Record or update miner response in database."""
+    
+    # CRITICAL: Check for existing response with different hotkey (data corruption detection)
+    existing_check = await db.fetch_one(
+        "SELECT miner_hotkey, job_id FROM weather_miner_responses WHERE run_id = :run_id AND miner_uid = :uid",
+        {"run_id": run_id, "uid": miner_uid}
+    )
+    
+    if existing_check and existing_check["miner_hotkey"] != miner_hotkey:
+        logger.error(
+            f"[DATA CORRUPTION] Run {run_id}, UID {miner_uid}: "
+            f"Attempting to record response with hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]} "
+            f"but existing record has {existing_check['miner_hotkey'][:8]}...{existing_check['miner_hotkey'][-8:]} "
+            f"(existing job_id: {existing_check.get('job_id', 'N/A')}). "
+            f"This indicates serious miner workflow crossover!"
+        )
+        # Don't update the hotkey if it would cause corruption
+        miner_hotkey = existing_check["miner_hotkey"]
+        logger.warning(f"[DATA CORRUPTION] Using existing hotkey to prevent further corruption")
+    
     result = await db.fetch_one(
         """
         INSERT INTO weather_miner_responses
