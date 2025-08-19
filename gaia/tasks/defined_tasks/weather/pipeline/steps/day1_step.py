@@ -361,14 +361,31 @@ async def run_item(
         "job_id": resp.get("job_id"),
     }
     day1_cfg = {
-        "variables": task.config.get("day1_variables_levels_to_score", []),
+        "variables_levels_to_score": task.config.get("day1_variables_levels_to_score", []),  # Fix key name
         "pattern_correlation_threshold": task.config.get("day1_pattern_correlation_threshold", 0.3),
         "acc_lower_bound": task.config.get("day1_acc_lower_bound", 0.6),
         "alpha_skill": task.config.get("day1_alpha_skill", 0.6),
         "beta_acc": task.config.get("day1_beta_acc", 0.4),
         "clone_penalty_gamma": task.config.get("day1_clone_penalty_gamma", 1.0),
         "clone_delta_thresholds": task.config.get("day1_clone_delta_thresholds", {}),
+        "lead_times_hours": task.config.get("initial_scoring_lead_hours", [6, 12]),  # Add lead times
     }
+    
+    # CRITICAL: Debug configuration to understand why scoring fails
+    logger.info(
+        f"[Day1Step] Run {run_id}, Miner {miner_uid}: Configuration:"
+        f"\n  Variables: {len(day1_cfg['variables_levels_to_score'])} configured"
+        f"\n  Lead times: {day1_cfg['lead_times_hours']}"
+        f"\n  Pattern threshold: {day1_cfg['pattern_correlation_threshold']}"
+        f"\n  ACC lower bound: {day1_cfg['acc_lower_bound']}"
+    )
+    
+    if not day1_cfg["variables_levels_to_score"]:
+        logger.error(
+            f"[Day1Step] Run {run_id}, Miner {miner_uid}: "
+            f"No variables configured for Day1 scoring! Check day1_variables_levels_to_score in task config."
+        )
+    
     import time
     t0 = time.perf_counter()
     try:

@@ -70,13 +70,9 @@ async def evaluate_miner_forecast_day1(
         f"[Day1Score] Starting for miner {miner_hotkey[:8]}...{miner_hotkey[-8:]} (Resp: {response_id}, Run: {run_id}, Job: {job_id}, UID: {miner_uid})"
     )
     
-    # CRITICAL: Validate job_id matches the expected miner hotkey format
-    if job_id and "_" in job_id:
-        # Extract miner hotkey from job_id for validation
+    # CRITICAL: Validate job_id ownership across miner records
+    if job_id:
         try:
-            # Job ID format: d1ac184b-8c0b-4745-90d0-a00d5ed536dc
-            # Zarr URL format: weather_forecast_2025081200_miner_hk_5H1Lx7YNNp_d1ac184b.zarr
-            # The job_id should be deterministically generated from the actual miner hotkey
             logger.info(
                 f"[Day1Score] Job {job_id} assigned to miner UID {miner_uid} with hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]}. "
                 f"Validating job ownership..."
@@ -111,10 +107,12 @@ async def evaluate_miner_forecast_day1(
                         f"Current scoring: UID {miner_uid}, hotkey {miner_hotkey[:8]}...{miner_hotkey[-8:]} "
                         f"Database record: UID {owner['miner_uid']}, hotkey {owner['miner_hotkey'][:8]}...{owner['miner_hotkey'][-8:]}"
                     )
+            else:
+                logger.info(f"[Day1Score] Job {job_id} ownership validated - single record found")
         except Exception as e:
             logger.warning(f"[Day1Score] Could not validate job ownership: {e}")
     else:
-        logger.warning(f"[Day1Score] Job ID {job_id} format unexpected, cannot validate ownership")
+        logger.warning(f"[Day1Score] No job_id provided, cannot validate ownership")
 
     day1_results = {
         "response_id": response_id,
@@ -282,6 +280,28 @@ async def evaluate_miner_forecast_day1(
         variables_to_score: List[Dict] = day1_scoring_config.get(
             "variables_levels_to_score", []
         )
+        
+        # CRITICAL: Debug scoring configuration to understand why scores are 0
+        logger.info(
+            f"[Day1Score] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: Scoring configuration:"
+            f"\n  Variables to score: {len(variables_to_score)} variables"
+            f"\n  Times to evaluate: {len(times_to_evaluate)} time steps"
+            f"\n  Lead times: {day1_scoring_config.get('lead_times_hours', 'not set')}"
+        )
+        
+        if not variables_to_score:
+            logger.error(
+                f"[Day1Score] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: "
+                f"No variables configured for scoring! This will result in 0 score. "
+                f"Check day1_variables_levels_to_score configuration."
+            )
+        
+        if not times_to_evaluate:
+            logger.error(
+                f"[Day1Score] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: "
+                f"No time steps to evaluate! This will result in 0 score. "
+                f"Check lead_times_hours configuration."
+            )
 
         aggregated_skill_scores = []
         aggregated_acc_scores = []

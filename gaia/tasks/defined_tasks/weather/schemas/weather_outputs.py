@@ -670,9 +670,11 @@ class WeatherKerchunkResponseData(BaseModel):
 class WeatherInitiateFetchResponse(BaseModel):
     """Response model for /weather-initiate-fetch"""
 
-    status: str = Field(..., description="Status indicator, e.g., 'fetch_accepted'")
-    job_id: str = Field(..., description="The unique job ID assigned by the miner.")
+    status: str = Field(..., description="Status indicator, e.g., 'fetch_accepted', 'fetch_rejected'")
+    job_id: Optional[str] = Field(None, description="The unique job ID assigned by the miner (only for accepted requests).")
     message: Optional[str] = Field(None, description="Optional message.")
+    expected_hotkey: Optional[str] = Field(None, description="Expected hotkey (only for verification failures).")
+    actual_hotkey: Optional[str] = Field(None, description="Actual hotkey (only for verification failures).")
 
 
 class WeatherGetInputStatusResponse(BaseModel):
