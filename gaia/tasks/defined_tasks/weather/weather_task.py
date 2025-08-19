@@ -3247,6 +3247,9 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 f"actual={actual_miner_hotkey[:8]}...{actual_miner_hotkey[-8:]}"
             )
             
+            # DEBUG: Log the raw request data to see what fields are actually present
+            logger.info(f"[Miner] Raw request_data attributes: {[attr for attr in dir(request_data) if not attr.startswith('_')]}")
+            
             if expected_miner_hotkey and expected_miner_hotkey != actual_miner_hotkey:
                 logger.error(
                     f"[Miner] Hotkey verification FAILED! Request intended for {expected_miner_hotkey[:8]}...{expected_miner_hotkey[-8:]} "

@@ -487,6 +487,14 @@ async def query_miner_for_weather(
     # CRITICAL: Add expected hotkey to payload for miner verification
     payload["data"]["expected_miner_hotkey"] = miner_hotkey
     
+    # DEBUG: Log the complete payload being sent
+    logger.info(
+        f"[ValidatorQuery] Sending payload to {miner_hotkey[:8]}...{miner_hotkey[-8:]}:"
+        f"\n  Payload keys: {list(payload.keys())}"
+        f"\n  Data keys: {list(payload['data'].keys())}"
+        f"\n  Expected hotkey: {payload['data']['expected_miner_hotkey'][:8]}...{payload['data']['expected_miner_hotkey'][-8:]}"
+    )
+    
     result = await query_single_miner(
         validator=validator,
         miner_hotkey=miner_hotkey,
