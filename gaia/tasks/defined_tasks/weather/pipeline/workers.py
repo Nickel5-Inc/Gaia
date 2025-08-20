@@ -30,14 +30,8 @@ from gaia.validator.weights.weight_service import commit_weights_if_eligible
 # verification removed
 
 
-async def process_day1_one(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> bool:
-    """Process one day1 scoring candidate end-to-end for a single miner."""
-    return await day1_step.run(db, validator=validator)
-
-
-async def process_era5_one(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> bool:
-    """Process one ERA5 scoring candidate for a single miner and update stats incrementally."""
-    return await era5_step.run(db, validator=validator)
+# REMOVED: process_day1_one and process_era5_one functions that called unused run() methods
+# These are replaced by the run_item() pathway through the generic job queue
 
 
 async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> bool:
@@ -356,7 +350,9 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                         validator=validator,
                     )
                 else:
-                    ok = await process_day1_one(db, validator=validator)
+                    # Fallback: No specific job payload, cannot process without run_item parameters
+                    logger.warning("Day1 job without specific payload cannot be processed via fallback")
+                    ok = False
                 
                 # Handle the result properly
                 if ok:
@@ -400,7 +396,9 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                         validator=validator,
                     )
                 else:
-                    ok = await process_era5_one(db, validator=validator)
+                    # Fallback: No specific job payload, cannot process without run_item parameters
+                    logger.warning("ERA5 job without specific payload cannot be processed via fallback")
+                    ok = False
                 
                 # Handle the result properly
                 if ok:
@@ -616,7 +614,15 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 try:
                     ok = False
                     if validator is not None:
+                        logger.info(f"[WeightSetter] Attempting weight setting for job {job.get('id')}")
                         ok = await commit_weights_if_eligible(validator)
+                        if ok:
+                            logger.info(f"[WeightSetter] Weight setting successful for job {job.get('id')}")
+                        else:
+                            logger.info(f"[WeightSetter] Weight setting not eligible yet for job {job.get('id')}")
+                    else:
+                        logger.warning(f"[WeightSetter] No validator instance provided for job {job.get('id')}")
+                        
                     if ok:
                         await db.complete_validator_job(job["id"], result={"ok": True})
                         return True
@@ -676,11 +682,9 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     item = await sched.claim_next()
     if not item:
         return False
-    # verification removed
-    if item.step == "day1":
-        return await process_day1_one(db, validator=validator)
-    if item.step == "era5":
-        return await process_era5_one(db, validator=validator)
+    # REMOVED: Legacy per-miner worker code that used the old run() methods
+    # All scoring now goes through the generic job queue with run_item() methods
+    logger.warning(f"Legacy per-miner worker cannot process step '{item.step}' - use generic job queue instead")
     return False
 
 

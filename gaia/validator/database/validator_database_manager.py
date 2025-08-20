@@ -1448,10 +1448,10 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                 },
             )
             if result:
-                logger.info(f"Created singleton job {result['id']} with key '{singleton_key}'")
+                logger.debug(f"Created singleton job {result['id']} with key '{singleton_key}'")
                 return result["id"]
             else:
-                logger.debug(f"Singleton job with key '{singleton_key}' already exists, skipped")
+                # Reduce log spam - only log at debug level for skipped jobs
                 return None
         except Exception as e:
             logger.error(f"enqueue_singleton_job failed: {e}")

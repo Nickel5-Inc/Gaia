@@ -51,6 +51,8 @@ class WeatherTaskStatus(str, Enum):
     INFERENCE_STARTED = "inference_started"
     INFERENCE_FAILED = "inference_failed"
     INFERENCE_RUNNING = "running"  # Inference is currently running
+    RUNNING_INFERENCE = "running_inference"  # Alternative inference running status
+    INFERENCE_RUNNING_ALT = "inference_running"  # Alternative inference running status
     
     # Kerchunk/Data Response Statuses
     COMPLETED = "completed"

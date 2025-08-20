@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 logger = logging.getLogger(__name__)
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
-from gaia.tasks.defined_tasks.weather.pipeline.scheduler import MinerWorkScheduler
+# REMOVED: MinerWorkScheduler import - no longer needed since run() method was removed
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import (
     evaluate_miner_forecast_day1,
@@ -68,227 +69,11 @@ async def _score_day1(db, task: WeatherTask, *, run_id: int, miner_uid: int, min
         run_gfs_init_time=gfs_init,
         precomputed_climatology_cache=precomputed_cache,
     )
-from gaia.tasks.defined_tasks.weather.utils.gfs_api import (
-    fetch_gfs_analysis_data,
-    fetch_gfs_data,
-)
+# REMOVED: Duplicated GFS API imports - already imported in _load_inputs function
 
 
-async def run(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> bool:
-    """Claim and process a single Day1 scoring step for one miner, update stats."""
-    sched = MinerWorkScheduler(db)
-    item = await sched.claim_day1()
-    if not item:
-        return False
-
-    # Pull response and run details
-    resp = await db.fetch_one(
-        "SELECT id, run_id, miner_uid, miner_hotkey, job_id FROM weather_miner_responses WHERE run_id = :rid AND miner_uid = :uid",
-        {"rid": item.run_id, "uid": item.miner_uid},
-    )
-    if not resp:
-        return False
-
-    run = await db.fetch_one(
-        "SELECT id, gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",
-        {"rid": item.run_id},
-    )
-    if not run:
-        return False
-
-    # Minimal WeatherTask for helpers/config
-    task = WeatherTask(db_manager=db, node_type="validator", test_mode=True)
-    if validator is not None:
-        setattr(task, "validator", validator)
-
-    # Use stored gfs_init_time_utc directly; it already includes test-mode shift at run creation
-    gfs_init = run["gfs_init_time_utc"]
-
-    # Fetch inputs (decorated sub-step with retries)
-    try:
-        gfs_analysis_ds, gfs_ref_ds, era5_clim = await _load_inputs(
-            db,
-            task,
-            run_id=item.run_id,
-            miner_uid=item.miner_uid,
-            miner_hotkey=item.miner_hotkey,
-            gfs_init=gfs_init,
-        )
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).error(f"[Run {item.run_id}] Failed to load inputs for miner {item.miner_uid}: {e}", exc_info=True)
-        return False
-
-    # Build a record matching evaluate_miner_forecast_day1 signature
-    miner_record = {
-        "id": resp["id"],
-        "miner_hotkey": resp["miner_hotkey"],
-        "run_id": resp["run_id"],
-        "miner_uid": resp["miner_uid"],
-        "job_id": resp.get("job_id"),
-    }
-
-    day1_cfg = {
-        "variables": task.config.get("day1_variables_levels_to_score", []),
-        "pattern_correlation_threshold": task.config.get("day1_pattern_correlation_threshold", 0.3),
-        "acc_lower_bound": task.config.get("day1_acc_lower_bound", 0.6),
-        "alpha_skill": task.config.get("day1_alpha_skill", 0.6),
-        "beta_acc": task.config.get("day1_beta_acc", 0.4),
-        "clone_penalty_gamma": task.config.get("day1_clone_penalty_gamma", 1.0),
-        "clone_delta_thresholds": task.config.get("day1_clone_delta_thresholds", {}),
-    }
-
-    # Ensure shared climatology cache exists on disk (one per run)
-    precomputed_cache = None
-    try:
-        precomputed_cache = await ensure_clim_cache(
-            db,
-            task,
-            run_id=item.run_id,
-            gfs_analysis_sample_ds=gfs_analysis_ds,
-            gfs_init=gfs_init,
-            day1_cfg=day1_cfg,
-            era5_climatology_ds=era5_clim,
-        )
-    except Exception:
-        pass
-    # Score with latency measurement
-    import time
-    t0 = time.perf_counter()
-    try:
-        result = await _score_day1(
-            db,
-            task,
-            run_id=item.run_id,
-            miner_uid=item.miner_uid,
-            miner_hotkey=item.miner_hotkey,
-            gfs_init=gfs_init,
-            miner_record=miner_record,
-            gfs_analysis_ds=gfs_analysis_ds,
-            gfs_ref_ds=gfs_ref_ds,
-            era5_clim=era5_clim,
-            day1_cfg=day1_cfg,
-            precomputed_cache=precomputed_cache,
-        )
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).error(f"[Run {item.run_id}] Day1 scoring failed for miner {item.miner_uid}: {e}", exc_info=True)
-        result = None
-    latency_ms = int((time.perf_counter() - t0) * 1000)
-
-    try:
-        overall = None
-        if isinstance(result, dict):
-            overall = result.get("overall_day1_score") or result.get("overall_score")
-        if overall is not None:
-            stats = WeatherStatsManager(
-                db,
-                validator_hotkey=(
-                    getattr(getattr(getattr(validator, "validator_wallet", None), "hotkey", None), "ss58_address", None)
-                    if validator is not None
-                    else "unknown_validator"
-                ),
-            )
-            
-            # Extract and store component scores
-            lead_time_scores = result.get("lead_time_scores", {})
-            if lead_time_scores:
-                from datetime import timedelta
-                for lead_hours, variables in lead_time_scores.items():
-                    if variables:
-                        # Convert lead_hours to valid_time
-                        valid_time = gfs_init + timedelta(hours=int(lead_hours))
-                        
-                        # Prepare variable scores for component score recording
-                        variable_scores = {}
-                        for var_key, var_data in variables.items():
-                            if isinstance(var_data, dict):
-                                # Extract pressure level if present in var_key (e.g., "t_850")
-                                parts = var_key.split('_')
-                                var_name = parts[0]
-                                pressure_level = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
-                                
-                                variable_scores[var_name] = {
-                                    "pressure_level": pressure_level,
-                                    "skill_score": var_data.get("skill_score"),
-                                    "acc": var_data.get("acc_score"),
-                                    "rmse": var_data.get("rmse"),  # May not be present, will be None
-                                    "bias": var_data.get("bias"),  # May not be present
-                                    "mae": var_data.get("mae"),  # May not be present
-                                    "pattern_correlation": var_data.get("pattern_correlation"),
-                                    "pattern_correlation_passed": var_data.get("pattern_correlation_passed"),
-                                    "climatology_check_passed": var_data.get("climatology_check_passed"),
-                                    "clone_penalty": var_data.get("clone_penalty_applied", 0),
-                                    "weight": 1.0 / len(variables),  # Equal weight for now
-                                    "calculation_duration_ms": latency_ms // len(lead_time_scores),  # Estimate
-                                }
-                        
-                        # Record component scores
-                        if variable_scores:
-                            await stats.record_component_scores(
-                                run_id=item.run_id,
-                                response_id=item.response_id,
-                                miner_uid=item.miner_uid,
-                                miner_hotkey=item.miner_hotkey,
-                                score_type="day1",
-                                lead_hours=int(lead_hours),
-                                valid_time=valid_time,
-                                variable_scores=variable_scores
-                            )
-            
-            # Update forecast stats with overall score
-            await stats.update_forecast_stats(
-                run_id=item.run_id,
-                miner_uid=item.miner_uid,
-                miner_hotkey=item.miner_hotkey,
-                status="day1_scored",
-                initial_score=float(overall),
-            )
-            await log_success(
-                db,
-                run_id=item.run_id,
-                miner_uid=item.miner_uid,
-                miner_hotkey=item.miner_hotkey,
-                step_name="day1",
-                substep="score",
-                latency_ms=latency_ms,
-            )
-            # Per-step aggregation: update this miner's aggregate stats
-            try:
-                await stats.aggregate_miner_stats(miner_uid=item.miner_uid)
-            except Exception:
-                pass
-        # Run-level completion check
-        from gaia.tasks.defined_tasks.weather.processing.weather_logic import _check_run_completion
-        try:
-            await _check_run_completion(task, item.run_id)
-        except Exception:
-            pass
-        # Attempt cache cleanup if all miners done/failed for day1
-        try:
-            await cleanup_clim_cache_if_done(db, task, run_id=item.run_id)
-        except Exception:
-            pass
-    except Exception:
-        # schedule retry on failure
-        try:
-            from gaia.tasks.defined_tasks.weather.pipeline.retry_policy import next_retry_time as _nrt
-            nrt = _nrt("day1", 1)
-            await log_failure(
-                db,
-                run_id=item.run_id,
-                miner_uid=item.miner_uid,
-                miner_hotkey=item.miner_hotkey,
-                step_name="day1",
-                substep="score",
-                error_json={"type": "day1_unknown", "message": "exception during scoring"},
-                retry_count=1,
-                next_retry_time=nrt,
-            )
-        except Exception:
-            pass
-
-    return bool(result)
+# REMOVED: Unused run() method that was never called in current execution paths
+# All Day1 scoring now goes through run_item() method which is called by workers.py
 
 
 async def run_item(
@@ -418,6 +203,76 @@ async def run_item(
                     else "unknown_validator"
                 ),
             )
+            
+            # CRITICAL FIX: Record component scores and miner scores like the run() method does
+            if isinstance(result, dict) and "lead_time_scores" in result:
+                lead_time_scores = result["lead_time_scores"]
+                
+                # Record component scores for each lead time
+                for lead_hours, variables in lead_time_scores.items():
+                    if variables:
+                        # Convert lead_hours to valid_time
+                        valid_time = gfs_init + timedelta(hours=int(lead_hours))
+                        
+                        # Prepare variable scores for component score recording
+                        variable_scores = {}
+                        for var_key, var_data in variables.items():
+                            if isinstance(var_data, dict):
+                                # Extract pressure level if present in var_key (e.g., "t_850")
+                                parts = var_key.split('_')
+                                var_name = parts[0]
+                                pressure_level = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                                
+                                variable_scores[var_name] = {
+                                    "pressure_level": pressure_level,
+                                    "skill_score": var_data.get("skill_score"),
+                                    "acc": var_data.get("acc_score"),
+                                    "rmse": var_data.get("rmse"),
+                                    "bias": var_data.get("bias"),
+                                    "mae": var_data.get("mae"),
+                                    "pattern_correlation": var_data.get("pattern_correlation"),
+                                    "pattern_correlation_passed": var_data.get("pattern_correlation_passed"),
+                                    "climatology_check_passed": var_data.get("climatology_check_passed"),
+                                    "clone_penalty": var_data.get("clone_penalty_applied", 0),
+                                    "weight": 1.0 / len(variables),
+                                    "calculation_duration_ms": latency_ms // len(lead_time_scores),
+                                }
+                        
+                        # Record component scores
+                        if variable_scores:
+                            await stats.record_component_scores(
+                                run_id=run_id,
+                                response_id=response_id,
+                                miner_uid=miner_uid,
+                                miner_hotkey=miner_hotkey,
+                                score_type="day1",
+                                lead_hours=int(lead_hours),
+                                valid_time=valid_time,
+                                variable_scores=variable_scores
+                            )
+                            
+                # CRITICAL FIX: Write overall score to weather_miner_scores table
+                await db.execute(
+                    """
+                    INSERT INTO weather_miner_scores 
+                    (response_id, run_id, miner_uid, miner_hotkey, score_type, score, calculation_time, variable_level)
+                    VALUES (:response_id, :run_id, :miner_uid, :miner_hotkey, :score_type, :score, :calculation_time, :variable_level)
+                    ON CONFLICT (response_id, score_type, lead_hours, variable_level, valid_time_utc) 
+                    DO UPDATE SET score = EXCLUDED.score, calculation_time = EXCLUDED.calculation_time
+                    """,
+                    {
+                        "response_id": response_id,
+                        "run_id": run_id,
+                        "miner_uid": miner_uid,
+                        "miner_hotkey": miner_hotkey,
+                        "score_type": "day1_qc_score",
+                        "score": float(overall),
+                        "calculation_time": datetime.now(timezone.utc),
+                        "variable_level": "overall_day1"
+                    }
+                )
+                logger.info(f"[Day1Step] Recorded overall Day1 score {overall:.4f} to weather_miner_scores for miner {miner_uid}")
+            
             await stats.update_forecast_stats(
                 run_id=run_id,
                 miner_uid=miner_uid,

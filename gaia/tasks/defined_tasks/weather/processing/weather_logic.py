@@ -217,6 +217,28 @@ async def _check_run_completion(task_instance: "WeatherTask", run_id: int) -> bo
         logger.info(
             f"[RunCompletion] Run {run_id}: Total: {total_miners}, Verified: {verified_miners}, Scored: {scored_miners}, Failed: {failed_miners}"
         )
+        
+        # CRITICAL: Debug what's causing premature run completion
+        if total_miners > 0:
+            # Get detailed status breakdown
+            status_breakdown = await task_instance.db_manager.fetch_all(
+                """
+                SELECT miner_uid, miner_hotkey, status, verification_passed, job_id
+                FROM weather_miner_responses 
+                WHERE run_id = :run_id
+                ORDER BY miner_uid
+                """,
+                {"run_id": run_id}
+            )
+            
+            logger.info(f"[RunCompletion] Run {run_id}: Detailed status breakdown:")
+            for resp in status_breakdown:
+                logger.info(
+                    f"  UID {resp['miner_uid']}: status={resp['status']}, "
+                    f"verified={resp.get('verification_passed', 'NULL')}, "
+                    f"job_id={resp.get('job_id', 'NULL')}, "
+                    f"hotkey={resp['miner_hotkey'][:8]}...{resp['miner_hotkey'][-8:]}"
+                )
 
         # NEW: If at least one miner has been successfully scored, consider the run complete
         # This prevents retrying runs that have already produced valid scores
@@ -1485,6 +1507,22 @@ async def calculate_era5_miner_score(
     all_component_scores = []  # NEW: Collect component scores for batch insert
 
     try:
+        # CRITICAL: Debug ERA5 scoring configuration like we did for Day1
+        variables_to_score = final_scoring_config.get("variables_levels_to_score", [])
+        logger.info(
+            f"[FinalScore] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: ERA5 scoring configuration:"
+            f"\n  Variables to score: {len(variables_to_score)} variables"
+            f"\n  Target times: {len(target_datetimes)} time steps"
+        )
+        
+        if not variables_to_score:
+            logger.error(
+                f"[FinalScore] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: "
+                f"No variables configured for ERA5 scoring! This will result in failure. "
+                f"Check final_scoring_variables_levels or day1_variables_levels_to_score configuration."
+            )
+            return False
+        
         stored_response_details_query = "SELECT kerchunk_json_url, verification_hash_claimed FROM weather_miner_responses WHERE id = :response_id"
         stored_response_data = await task_instance.db_manager.fetch_one(
             stored_response_details_query, {"response_id": response_id}
@@ -1564,7 +1602,67 @@ async def calculate_era5_miner_score(
             )
             # Check if this was the last miner in the run
             await _check_run_completion(task_instance, run_id)
-            return False  # Skip this miner gracefully
+            return False
+
+        # CRITICAL FIX: Apply variable mapping to miner forecast data for ERA5 scoring consistency
+        logger.info(
+            f"[FinalScore] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: "
+            f"Checking miner forecast variable names for ERA5 scoring..."
+        )
+        logger.info(f"[FinalScore] Original miner variables: {list(miner_forecast_ds.data_vars)}")
+        
+        # Check if miner data needs variable mapping (has raw GFS names instead of mapped names)
+        raw_gfs_vars = ['tmp2m', 'prmslmsl', 'hgtprs', 'tmpprs', 'ugrd10m', 'vgrd10m', 'ugrdprs', 'vgrdprs', 'spfhprs']
+        has_raw_vars = any(var in miner_forecast_ds.data_vars for var in raw_gfs_vars)
+        mapped_vars = ['2t', 'msl', 'z', 't', '10u', '10v', 'u', 'v', 'q']
+        has_mapped_vars = any(var in miner_forecast_ds.data_vars for var in mapped_vars)
+        
+        if has_raw_vars and not has_mapped_vars:
+            logger.info(f"[FinalScore] Miner data has raw GFS variable names, applying manual mapping...")
+            
+            # Define the variable mapping from raw GFS names to scoring names
+            var_mapping = {
+                "tmp2m": "2t",
+                "ugrd10m": "10u", 
+                "vgrd10m": "10v",
+                "prmslmsl": "msl",
+                "tmpprs": "t",
+                "ugrdprs": "u",
+                "vgrdprs": "v", 
+                "spfhprs": "q",
+                "hgtprs": "z_height",
+            }
+            
+            try:
+                # Apply variable renaming
+                vars_to_rename = {k: v for k, v in var_mapping.items() if k in miner_forecast_ds.data_vars}
+                if vars_to_rename:
+                    logger.info(f"[FinalScore] Renaming variables: {vars_to_rename}")
+                    miner_forecast_ds = miner_forecast_ds.rename(vars_to_rename)
+                    
+                    # Convert geopotential height to geopotential if present
+                    if "z_height" in miner_forecast_ds.data_vars:
+                        logger.info(f"[FinalScore] Converting geopotential height to geopotential...")
+                        G = 9.80665  # Standard gravity
+                        z_height_var = miner_forecast_ds["z_height"]
+                        geopotential = G * z_height_var
+                        miner_forecast_ds["z"] = geopotential
+                        miner_forecast_ds["z"].attrs = {
+                            "units": "m2 s-2",
+                            "long_name": "Geopotential",
+                            "standard_name": "geopotential"
+                        }
+                        miner_forecast_ds = miner_forecast_ds.drop_vars("z_height")
+                        
+                    logger.info(f"[FinalScore] Mapped miner variables: {list(miner_forecast_ds.data_vars)}")
+                else:
+                    logger.info(f"[FinalScore] No variables found to rename")
+                    
+            except Exception as e:
+                logger.error(f"[FinalScore] Failed to apply variable mapping to miner data: {e}")
+                return False
+        else:
+            logger.info(f"[FinalScore] Miner data already has mapped variable names, no mapping needed")  # Skip this miner gracefully
 
         # Final scoring uses ERA5-based skill scores only (no GFS operational forecast)
         # GFS data is typically unavailable by the time final scoring runs due to retention limits

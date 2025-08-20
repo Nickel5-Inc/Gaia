@@ -303,6 +303,79 @@ async def evaluate_miner_forecast_day1(
                 f"Check lead_times_hours configuration."
             )
 
+        # CRITICAL FIX: Apply variable mapping to ALL datasets for consistency
+        logger.info(
+            f"[Day1Score] Miner {miner_hotkey[:8]}...{miner_hotkey[-8:]}: "
+            f"Applying variable mapping to all datasets for consistency..."
+        )
+        
+        # Define the variable mapping from raw GFS names to scoring names
+        var_mapping = {
+            "tmp2m": "2t",
+            "ugrd10m": "10u", 
+            "vgrd10m": "10v",
+            "prmslmsl": "msl",
+            "tmpprs": "t",
+            "ugrdprs": "u",
+            "vgrdprs": "v", 
+            "spfhprs": "q",
+            "hgtprs": "z_height",
+        }
+        
+        def apply_variable_mapping(dataset, dataset_name):
+            """Apply variable mapping and coordinate renaming to a dataset"""
+            logger.info(f"[Day1Score] Original {dataset_name} variables: {list(dataset.data_vars)}")
+            logger.info(f"[Day1Score] Original {dataset_name} coordinates: {list(dataset.coords.keys())}")
+            
+            # Apply variable renaming
+            vars_to_rename = {k: v for k, v in var_mapping.items() if k in dataset.data_vars}
+            if vars_to_rename:
+                logger.info(f"[Day1Score] Renaming {dataset_name} variables: {vars_to_rename}")
+                dataset = dataset.rename(vars_to_rename)
+                
+                # Convert geopotential height to geopotential if present
+                if "z_height" in dataset.data_vars:
+                    logger.info(f"[Day1Score] Converting {dataset_name} geopotential height to geopotential...")
+                    G = 9.80665  # Standard gravity
+                    z_height_var = dataset["z_height"]
+                    geopotential = G * z_height_var
+                    dataset["z"] = geopotential
+                    dataset["z"].attrs = {
+                        "units": "m2 s-2",
+                        "long_name": "Geopotential",
+                        "standard_name": "geopotential"
+                    }
+                    dataset = dataset.drop_vars("z_height")
+            
+            # CRITICAL: Apply coordinate renaming for pressure levels
+            coord_mapping = {
+                "lev": "pressure_level",
+                "latitude": "lat", 
+                "longitude": "lon"
+            }
+            
+            coords_to_rename = {k: v for k, v in coord_mapping.items() if k in dataset.coords}
+            if coords_to_rename:
+                logger.info(f"[Day1Score] Renaming {dataset_name} coordinates: {coords_to_rename}")
+                dataset = dataset.rename(coords_to_rename)
+                    
+            logger.info(f"[Day1Score] Final {dataset_name} variables: {list(dataset.data_vars)}")
+            logger.info(f"[Day1Score] Final {dataset_name} coordinates: {list(dataset.coords.keys())}")
+            
+            return dataset
+        
+        try:
+            # Apply mapping to all three datasets
+            miner_forecast_ds = apply_variable_mapping(miner_forecast_ds, "miner_forecast")
+            gfs_analysis_data_for_run = apply_variable_mapping(gfs_analysis_data_for_run, "gfs_analysis")
+            gfs_reference_forecast_for_run = apply_variable_mapping(gfs_reference_forecast_for_run, "gfs_reference")
+                
+        except Exception as e:
+            logger.error(f"[Day1Score] Failed to apply variable mapping: {e}")
+            day1_results["error_message"] = f"Variable mapping failed: {str(e)}"
+            day1_results["overall_day1_score"] = -np.inf
+            return day1_results
+
         aggregated_skill_scores = []
         aggregated_acc_scores = []
 
@@ -745,7 +818,7 @@ async def _process_single_variable_parallel(
                 if cache_key in cached_pressure_dims:
                     return cached_pressure_dims[cache_key]
 
-                for dim_name in ["pressure_level", "plev", "level"]:
+                for dim_name in ["pressure_level", "plev", "level", "lev"]:
                     if dim_name in data_array.dims:
                         cached_pressure_dims[cache_key] = dim_name
                         return dim_name

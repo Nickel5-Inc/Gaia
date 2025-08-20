@@ -3726,7 +3726,7 @@ class GaiaValidator:
                                 priority=130,
                                 scheduled_at=now,
                             )
-                            # Weights: enqueue singleton weight setting
+                            # Weights: enqueue singleton weight setting every 5 minutes
                             await db.enqueue_singleton_job(
                                 singleton_key="weights_set",
                                 job_type="weights.set",
@@ -3734,6 +3734,9 @@ class GaiaValidator:
                                 priority=140,
                                 scheduled_at=now,
                             )
+                            
+                            # Sleep for 5 minutes between enqueue attempts to reduce log spam
+                            await asyncio.sleep(300)
                             # Metagraph sync and miner dereg handling every 5 minutes
                             if now.minute % 5 == 0:
                                 await db.enqueue_singleton_job(
@@ -4047,125 +4050,32 @@ class GaiaValidator:
         await run_validator_logic()
 
     async def main_scoring(self):
-        """Run scoring supervision; offloads weight setting to worker job."""
+        """Simplified scoring supervision - weight setting handled by recurring jobs."""
+        
+        # Set initial status
+        await self.update_task_status("scoring", "active", "cron_mode")
+        logger.info("🎯 Scoring system running in cron mode - weight setting handled by recurring jobs")
 
         while True:
             try:
-                await self.update_task_status("scoring", "active")
-
                 # Check for seed generation (primary validator only, every minute)
-                # Seeds are generated at :10 for activation at :00 next hour
                 if self.perturbation_manager:
                     current_time = time.time()
-                    if (
-                        current_time - self.last_seed_rotation_check > 60
-                    ):  # Check every minute
+                    if current_time - self.last_seed_rotation_check > 60:  # Check every minute
                         try:
-                            generated = (
-                                await self.perturbation_manager.rotate_seed_if_needed()
-                            )
+                            generated = await self.perturbation_manager.rotate_seed_if_needed()
                             if generated:
-                                logger.info(
-                                    "Future perturbation seed generated (primary validator)"
-                                )
-                                logger.info(
-                                    "Seed will be synced at :39 and activate at :00 next hour"
-                                )
+                                logger.info("Future perturbation seed generated (primary validator)")
+                                logger.info("Seed will be synced at :39 and activate at :00 next hour")
                             self.last_seed_rotation_check = current_time
                         except Exception as e:
                             logger.error(f"Error checking seed generation: {e}")
 
-                async def scoring_cycle():
-                    try:
-                        validator_uid = self.validator_uid
-
-                        if validator_uid is None:
-                            try:
-                                self.validator_uid = self.substrate.query(
-                                    "SubtensorModule",
-                                    "Uids",
-                                    [self.netuid, self.keypair.ss58_address],
-                                )
-                                validator_uid = int(self.validator_uid)
-                            except Exception as e:
-                                logger.error(f"Error getting validator UID: {e}")
-                                logger.error(traceback.format_exc())
-                                await self.update_task_status("scoring", "error")
-                                return False
-
-                        validator_uid = int(validator_uid)
-
-                        # Get current block info using shared cache
-                        current_block = self._get_current_block_cached()
-
-                        # Get last update info
-                        last_updated_value = self.substrate.query(
-                            "SubtensorModule", "LastUpdate", [self.netuid]
-                        )
-
-                        if last_updated_value is not None and validator_uid < len(
-                            last_updated_value
-                        ):
-                            last_updated = int(last_updated_value[validator_uid])
-                            blocks_since_update = current_block - last_updated
-                            logger.info(
-                                f"Calculated blocks since update: {blocks_since_update} (current: {current_block}, last: {last_updated})"
-                            )
-                        else:
-                            blocks_since_update = None
-                            logger.warning("Could not determine last update value")
-
-                        # Check if we can set weights (using cached block)
-                        min_interval = w.min_interval_to_set_weights(
-                            self.substrate, self.netuid
-                        )
-                        if min_interval is not None:
-                            min_interval = int(min_interval)
-
-                        if current_block - self.last_set_weights_block < min_interval:
-                            logger.info(
-                                f"Recently set weights {current_block - self.last_set_weights_block} blocks ago"
-                            )
-                            await self.update_task_status("scoring", "idle", "waiting")
-                            # Longer sleep when waiting for weight setting interval
-                            await asyncio.sleep(120)  # Increased from 60 to 120 seconds
-                            return True
-
-                        # Only enter weight_setting state when actually setting weights
-                        if min_interval is None or (
-                            blocks_since_update is not None
-                            and blocks_since_update >= min_interval
-                        ):
-                            # Offload to worker via singleton job; worker will gate eligibility
-                            await self.database_manager.enqueue_singleton_job(
-                                singleton_key="weights_set",
-                                job_type="weights.set", 
-                                payload={"reason": "eligible"}, 
-                                priority=140
-                            )
-                            await self.update_task_status("scoring", "idle", "weights_enqueued")
-                            return True
-                        else:
-                            logger.info(
-                                f"Waiting for weight setting: {blocks_since_update}/{min_interval} blocks"
-                            )
-                            await self.update_task_status("scoring", "idle", "waiting")
-
-                        return True
-
-                    except asyncio.TimeoutError as e:
-                        logger.error(f"Timeout in scoring cycle: {str(e)}")
-                        return False
-                    except Exception as e:
-                        logger.error(f"Error in scoring cycle: {str(e)}")
-                        logger.error(traceback.format_exc())
-                        return False
-                    finally:
-                        # Sleep removed - now handled in main loop for consistent timing
-                        pass
-
-                # Run scoring cycle with overall timeout
-                await asyncio.wait_for(scoring_cycle(), timeout=900)
+                # Update status to show we're active
+                await self.update_task_status("scoring", "active", "monitoring")
+                
+                # Sleep for 2 minutes between checks (much simpler than complex timeout logic)
+                await asyncio.sleep(120)
 
             except asyncio.TimeoutError:
                 logger.error("Weight setting operation timed out - restarting cycle")

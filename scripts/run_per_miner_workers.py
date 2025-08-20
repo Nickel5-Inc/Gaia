@@ -5,8 +5,7 @@ import os
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.defined_tasks.weather.pipeline.workers import (
     process_verify_one,
-    process_day1_one,
-    process_era5_one,
+    # REMOVED: process_day1_one, process_era5_one - these functions were removed
     process_one,
 )
 
