@@ -54,9 +54,18 @@ async def _get_era5_truth(task: WeatherTask, run_id: int, gfs_init, leads: list[
     ds = None
     try:
         cache_dir_str = task.config.get("era5_cache_dir", "./era5_cache")
-        ds = await fetch_era5_data(
-            target_datetimes, cache_dir=Path(cache_dir_str)
-        )
+        
+        # Use progressive fetch for consistency with finalize worker and better caching
+        use_progressive_fetch = task.config.get("progressive_era5_fetch", True)
+        if use_progressive_fetch:
+            from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
+            ds = await fetch_era5_data_progressive(
+                target_datetimes, cache_dir=Path(cache_dir_str)
+            )
+        else:
+            ds = await fetch_era5_data(
+                target_datetimes, cache_dir=Path(cache_dir_str)
+            )
     finally:
         if have_lock:
             try:
@@ -161,19 +170,41 @@ async def run_item(
     pending_leads = [h for h in leads if h not in existing_scores]
     def needed_time_for_lead(h: int) -> datetime:
         return gfs_init + timedelta(hours=h) + timedelta(days=delay_days) + timedelta(hours=buffer_hours)
-    ready_leads = [h for h in pending_leads if now_utc >= needed_time_for_lead(h)]
+    
+    # Group leads by day for efficient daily scoring
+    from collections import defaultdict
+    leads_by_day = defaultdict(list)
+    for h in pending_leads:
+        forecast_time = gfs_init + timedelta(hours=h)
+        day_key = forecast_time.strftime("%Y-%m-%d")
+        leads_by_day[day_key].append(h)
+    
+    # Find the earliest ready day (not all leads)
+    ready_leads = []
+    earliest_ready_day = None
+    for day_key, day_leads in leads_by_day.items():
+        # Check if any lead from this day is ready
+        day_ready_leads = [h for h in day_leads if now_utc >= needed_time_for_lead(h)]
+        if day_ready_leads:
+            if earliest_ready_day is None:
+                earliest_ready_day = day_key
+                ready_leads = day_ready_leads
+                break  # Process one day at a time
+    
     if not ready_leads:
         # Calculate when the earliest lead will be ready
         next_ready_time = min(needed_time_for_lead(h) for h in pending_leads)
         hours_until_ready = (next_ready_time - now_utc).total_seconds() / 3600
-        logger.info(
-            f"[ERA5] Run {run_id} Miner {miner_uid}: ERA5 data not ready yet. "
+        logger.debug(
+            f"[ERA5] Run {run_id} Miner {miner_uid}: No ERA5 data ready yet. "
             f"Next lead ready in {hours_until_ready:.1f} hours at {next_ready_time}"
         )
         # Return a special exception to indicate data not ready (not a failure)
         raise DataNotReadyError(f"ERA5 data not ready for {hours_until_ready:.1f} hours")
-    # Load truth/climatology
-    truth = await _get_era5_truth(task, run_id, gfs_init, leads)
+    logger.info(f"[ERA5] Run {run_id} Miner {miner_uid}: Scoring day {earliest_ready_day} with {len(ready_leads)} lead times: {ready_leads}")
+    
+    # Load truth/climatology for only the ready leads (one day at a time)
+    truth = await _get_era5_truth(task, run_id, gfs_init, ready_leads)
     clim = await task._get_or_load_era5_climatology()
     if not truth or not clim:
         return False

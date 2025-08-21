@@ -1369,9 +1369,11 @@ class BaseDatabaseManager(ABC):
         async with self.session(
             operation_name=op_name
         ) as session:  # Pass operation_name
+            i = 0  # Initialize i to prevent "referenced before assignment" errors
             try:
-                # Begin transaction once for all batches
-                async with session.begin():
+                # Check if transaction is already active, if not begin one
+                if session.in_transaction():
+                    # Transaction already active, execute directly
                     for i in range(0, total_items, batch_size):
                         batch = params_list[i : i + batch_size]
                         batch_start_time = time.time()
@@ -1381,7 +1383,6 @@ class BaseDatabaseManager(ABC):
                             await session.execute(text(query), batch)
                         else:
                             await session.execute(query, batch)
-                        # Commit is handled by the outer session.begin() context manager
 
                         batch_duration = time.time() - batch_start_time
                         if batch_duration > 5:
@@ -1399,6 +1400,36 @@ class BaseDatabaseManager(ABC):
                                 f"Rate: {rate:.1f} items/s"
                             )
                             await self._monitor_resources()
+                else:
+                    # No transaction active, begin one for all batches
+                    async with session.begin():
+                        for i in range(0, total_items, batch_size):
+                            batch = params_list[i : i + batch_size]
+                            batch_start_time = time.time()
+
+                            # Handle both string queries (wrap with text()) and SQLAlchemy objects (execute directly)
+                            if isinstance(query, str):
+                                await session.execute(text(query), batch)
+                            else:
+                                await session.execute(query, batch)
+                            # Commit is handled by the outer session.begin() context manager
+
+                            batch_duration = time.time() - batch_start_time
+                            if batch_duration > 5:
+                                logger.warning(
+                                    f"Slow batch detected ({op_name}): {batch_duration:.2f}s "
+                                    f"(Items {i}-{i+len(batch)})"
+                                )
+                            if i > 0 and i % (batch_size * 10) == 0:
+                                progress = (i / total_items) * 100
+                                elapsed = time.time() - start_time
+                                rate = i / elapsed if elapsed > 0 else 0
+                                logger.info(
+                                    f"Batch progress ({op_name}): {progress:.1f}% "
+                                    f"({i}/{total_items}) "
+                                    f"Rate: {rate:.1f} items/s"
+                                )
+                                await self._monitor_resources()
 
                 total_duration = time.time() - start_time
                 logger.info(

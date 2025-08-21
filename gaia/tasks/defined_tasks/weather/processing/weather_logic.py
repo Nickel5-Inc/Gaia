@@ -742,9 +742,17 @@ async def get_ground_truth_data(
 
     era5_cache_dir = Path(task_instance.config.get("era5_cache_dir", "./era5_cache"))
     try:
-        ground_truth_ds = await fetch_era5_data(
-            target_times=target_datetimes, cache_dir=era5_cache_dir
-        )
+        # Use progressive fetch for consistency with other ERA5 fetching and better caching
+        use_progressive_fetch = task_instance.config.get("progressive_era5_fetch", True)
+        if use_progressive_fetch:
+            from gaia.tasks.defined_tasks.weather.utils.era5_api import fetch_era5_data_progressive
+            ground_truth_ds = await fetch_era5_data_progressive(
+                target_times=target_datetimes, cache_dir=era5_cache_dir
+            )
+        else:
+            ground_truth_ds = await fetch_era5_data(
+                target_times=target_datetimes, cache_dir=era5_cache_dir
+            )
         if ground_truth_ds is None:
             logger.warning("fetch_era5_data returned None. Ground truth unavailable.")
             return None
@@ -1472,6 +1480,7 @@ async def _batch_insert_component_scores(
         """
         
         # Process in batches for optimal performance
+        logger.debug(f"Processing {len(component_scores)} component scores in batches of {batch_size}")
         for i in range(0, len(component_scores), batch_size):
             batch = component_scores[i:i + batch_size]
             
@@ -1508,6 +1517,7 @@ async def _batch_insert_component_scores(
                 processed_batch.append(processed_score)
             
             # Execute batch insert
+            logger.debug(f"Executing batch insert for batch {i//batch_size + 1} with {len(processed_batch)} records")
             await db_manager.execute_many(insert_query, processed_batch)
             
         logger.info(f"Successfully inserted {len(component_scores)} component scores in batches of {batch_size}")
@@ -1973,6 +1983,7 @@ async def calculate_era5_miner_score(
                 }
 
                 try:
+                    scoring_start_time = time.time()  # Track scoring start time for duration calculation
                     logger.info(
                         f"[FinalScore] Miner {miner_hotkey}: Scoring {var_key} at {valid_time_dt} (Lead: {lead_hours}h)"
                     )
@@ -2479,7 +2490,7 @@ async def calculate_era5_miner_score(
                         'pressure_level': var_level,
                         'rmse': current_metrics["rmse"],
                         'mse': raw_mse_val,
-                        'calculation_duration_ms': int((time.time() - db_metric_row_base.get('calculation_time', time.time())) * 1000),
+                        'calculation_duration_ms': int((time.time() - scoring_start_time) * 1000),
                     }
 
                     acc_val = await calculate_acc(

@@ -313,7 +313,14 @@ class CustomLogger:
         log_file = os.getenv("LOG_FILE", "logs/gaia.log")
         if log_file:
             try:
-                os.makedirs(os.path.dirname(log_file), exist_ok=True)
+                # Ensure log directory exists
+                log_dir = os.path.dirname(log_file)
+                os.makedirs(log_dir, exist_ok=True)
+                
+                # Create initial log file if it doesn't exist
+                if not os.path.exists(log_file):
+                    Path(log_file).touch()
+                
                 logger.add(
                     log_file,
                     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} - {message}",
@@ -321,15 +328,21 @@ class CustomLogger:
                     rotation="100 MB",
                     retention="7 days",
                     compression="gz",
+                    catch=True,  # Catch exceptions during logging to prevent crashes
+                    enqueue=True,  # Use async logging to prevent blocking
                 )
             except Exception as e:
-                logger.warning(f"Failed to setup file logging: {e}")
+                # Fallback to console-only logging if file logging fails
+                pass
         
         # Intercept standard Python logging to filter fiber noise
         self._setup_standard_logging_intercept()
         
         # Also try to intercept fiber's own logging
         self._setup_fiber_logging_intercept()
+        
+        # Mark logger as configured to avoid duplicate setup
+        logger._gaia_configured = True
     
     def _setup_standard_logging_intercept(self):
         """Setup interception of standard Python logging to filter fiber noise."""

@@ -862,6 +862,8 @@ async def _fetch_single_day_era5(
     times_str = "_".join([t.strftime("%H%M") for t in times_for_date])
     cache_key = f"era5_{date_str}_{hashlib.md5(times_str.encode()).hexdigest()[:8]}"
     cache_file = cache_dir / f"{cache_key}.nc"
+    
+    logger.debug(f"ERA5 cache check for {date_str}: times={[t.strftime('%H%M') for t in times_for_date]}, key={cache_key}, file={cache_file.name}")
 
     # Check for existing cache
     if cache_file.exists():

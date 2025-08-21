@@ -409,7 +409,7 @@ def _load_config(self):
 
     # Default to 6 hours
 
-    logger.info(f"WeatherTask configuration loaded: {config}")
+    logger.debug(f"WeatherTask configuration loaded with {len(config)} settings")
     return config
 
 
