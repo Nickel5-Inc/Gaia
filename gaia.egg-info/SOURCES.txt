@@ -1,14 +1,12 @@
 LICENSE
 README.md
 pyproject.toml
-requirements.txt
 setup.cfg
 setup.py
 gaia/__init__.py
 gaia.egg-info/PKG-INFO
 gaia.egg-info/SOURCES.txt
 gaia.egg-info/dependency_links.txt
-gaia.egg-info/requires.txt
 gaia.egg-info/top_level.txt
 gaia/database/__init__.py
 gaia/database/constants.py
@@ -27,8 +25,6 @@ gaia/tasks/__init__.py
 gaia/tasks/base/__init__.py
 gaia/tasks/base/decorators.py
 gaia/tasks/base/deterministic_job_id.py
-gaia/tasks/base/miner_performance_calculator.py
-gaia/tasks/base/performance_stats_example.py
 gaia/tasks/base/task.py
 gaia/tasks/base/components/__init__.py
 gaia/tasks/base/components/inputs.py
@@ -40,7 +36,12 @@ gaia/tasks/defined_tasks/__init__.py
 gaia/validator/__init__.py
 gaia/validator/basemodel_evaluator.py
 gaia/validator/validator.py
+gaia/validator/weight_perturbation.py
 gaia/validator/database/__init__.py
 gaia/validator/database/alembic_corruption_repair.py
 gaia/validator/database/comprehensive_db_setup.py
 gaia/validator/database/validator_database_manager.py
+gaia/validator/stats/__init__.py
+gaia/validator/stats/stats_integration.py
+gaia/validator/stats/weather_stats_hooks.py
+gaia/validator/stats/weather_stats_manager.py

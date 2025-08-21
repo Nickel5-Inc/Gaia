@@ -10,7 +10,7 @@ from typing import Optional, Any, Dict, List
 from contextlib import contextmanager
 from fiber.chain.interface import get_substrate
 from substrateinterface import SubstrateInterface
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

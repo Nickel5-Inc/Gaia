@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional, Any, Dict, Tuple
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,11 @@ from .substep import substep
 from .util_time import get_effective_gfs_init
 
 logger = logging.getLogger(__name__)
+
+
+class DataNotReadyError(Exception):
+    """Exception raised when ERA5 data is not yet available for scoring."""
+    pass
 
 
 # Lightweight in-process cache for ERA5 truth per (run_id, leads)
@@ -47,8 +53,9 @@ async def _get_era5_truth(task: WeatherTask, run_id: int, gfs_init, leads: list[
     target_datetimes = [gfs_init + timedelta(hours=h) for h in leads]
     ds = None
     try:
+        cache_dir_str = task.config.get("era5_cache_dir", "./era5_cache")
         ds = await fetch_era5_data(
-            target_datetimes, cache_dir=task.config.get("era5_cache_dir", "./era5_cache")
+            target_datetimes, cache_dir=Path(cache_dir_str)
         )
     finally:
         if have_lock:
@@ -148,13 +155,23 @@ async def run_item(
     buffer_hours = int(getattr(task.config, "era5_buffer_hours", task.config.get("era5_buffer_hours", 6))) if hasattr(task, "config") else 6
     now_utc = datetime.now(timezone.utc)
     if getattr(task, "test_mode", False):
+        # In test mode, significantly reduce delays to allow immediate testing
+        delay_days = min(delay_days, 1)  # Reduce delay to 1 day max in test mode
         buffer_hours = min(buffer_hours, 1)
     pending_leads = [h for h in leads if h not in existing_scores]
     def needed_time_for_lead(h: int) -> datetime:
         return gfs_init + timedelta(hours=h) + timedelta(days=delay_days) + timedelta(hours=buffer_hours)
     ready_leads = [h for h in pending_leads if now_utc >= needed_time_for_lead(h)]
     if not ready_leads:
-        return False
+        # Calculate when the earliest lead will be ready
+        next_ready_time = min(needed_time_for_lead(h) for h in pending_leads)
+        hours_until_ready = (next_ready_time - now_utc).total_seconds() / 3600
+        logger.info(
+            f"[ERA5] Run {run_id} Miner {miner_uid}: ERA5 data not ready yet. "
+            f"Next lead ready in {hours_until_ready:.1f} hours at {next_ready_time}"
+        )
+        # Return a special exception to indicate data not ready (not a failure)
+        raise DataNotReadyError(f"ERA5 data not ready for {hours_until_ready:.1f} hours")
     # Load truth/climatology
     truth = await _get_era5_truth(task, run_id, gfs_init, leads)
     clim = await task._get_or_load_era5_climatology()
@@ -235,6 +252,19 @@ async def run_item(
             status=status,
             era5_scores=era5_scores,
         )
+        
+        # PIPELINE TIMING: Record ERA5 completion time and calculate total duration
+        if completed_now:  # Only when fully completed
+            await db.execute(
+                """
+                UPDATE weather_miner_responses 
+                SET era5_scoring_completed_at = NOW(),
+                    total_pipeline_duration_seconds = EXTRACT(EPOCH FROM (NOW() - job_accepted_at))::INTEGER
+                WHERE run_id = :run_id AND miner_uid = :miner_uid
+                """,
+                {"run_id": run_id, "miner_uid": miner_uid}
+            )
+            logger.info(f"[ERA5Step] Recorded ERA5 completion and total pipeline duration for miner {miner_uid}")
         await log_success(
             db,
             run_id=run_id,

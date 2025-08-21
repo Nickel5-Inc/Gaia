@@ -4,7 +4,7 @@ import numpy as np
 import traceback
 import asyncio
 import tempfile
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, Any, List, Tuple, Union
 import pandas as pd

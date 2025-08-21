@@ -19,7 +19,7 @@ try:
 except ImportError:
     NETCDF4_AVAILABLE = False
 
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

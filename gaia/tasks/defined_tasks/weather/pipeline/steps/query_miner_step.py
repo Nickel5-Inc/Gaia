@@ -243,7 +243,8 @@ async def run_query_miner_job(
                     db, run_id, miner_uid, miner_hotkey,
                     status="fetch_initiated",
                     job_id=miner_response.get("job_id"),
-                    response_time_ms=int(result.get("response_time", 0) * 1000)
+                    response_time_ms=int(result.get("response_time", 0) * 1000),
+                    job_accepted_at=datetime.now(timezone.utc),  # Track job acceptance time
                 )
                 
 
@@ -358,6 +359,7 @@ async def _record_miner_response(
     job_id: Optional[str] = None,
     error_message: Optional[str] = None,
     response_time_ms: Optional[int] = None,
+    job_accepted_at: Optional[datetime] = None,
 ) -> int:
     """Record or update miner response in database."""
     
@@ -382,13 +384,14 @@ async def _record_miner_response(
     result = await db.fetch_one(
         """
         INSERT INTO weather_miner_responses
-        (run_id, miner_uid, miner_hotkey, response_time, status, job_id, error_message)
-        VALUES (:run_id, :uid, :hk, :resp_time, :status, :job_id, :error)
+        (run_id, miner_uid, miner_hotkey, response_time, status, job_id, error_message, job_accepted_at)
+        VALUES (:run_id, :uid, :hk, :resp_time, :status, :job_id, :error, :job_accepted)
         ON CONFLICT (run_id, miner_uid) DO UPDATE SET
         response_time = EXCLUDED.response_time,
         status = EXCLUDED.status,
         job_id = COALESCE(EXCLUDED.job_id, weather_miner_responses.job_id),
-        error_message = EXCLUDED.error_message
+        error_message = EXCLUDED.error_message,
+        job_accepted_at = COALESCE(EXCLUDED.job_accepted_at, weather_miner_responses.job_accepted_at)
         RETURNING id
         """,
         {
@@ -399,6 +402,7 @@ async def _record_miner_response(
             "status": status,
             "job_id": job_id,
             "error": error_message,
+            "job_accepted": job_accepted_at,
         }
     )
     return result["id"] if result else 0

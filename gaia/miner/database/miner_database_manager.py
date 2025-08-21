@@ -4,7 +4,7 @@ from datetime import datetime
 from sqlalchemy import text
 import json
 from pathlib import Path
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from functools import wraps
 import time
 import os  # Ensure os is imported for getenv

@@ -36,11 +36,8 @@ from gaia.validator.weights.weight_service import commit_weights_if_eligible
 
 async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = None) -> bool:
     """Unified worker: claims the next available work, preferring generic queue, then per-miner fallback."""
-    # First ensure step jobs are enqueued into the generic queue
-    try:
-        await db.enqueue_weather_step_jobs(limit=200)
-    except Exception:
-        pass
+    # REMOVED: Bulk job enqueuing to eliminate dual pathways and race conditions
+    # Each pipeline step now creates its successor job upon completion
     try:
         await db.enqueue_miner_poll_jobs(limit=200)
     except Exception:
@@ -57,9 +54,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
         try:
             # Log concise claim
             try:
-                _tag = mp.current_process().name if mp.current_process() else "weather-w?"
                 logger.info(
-                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
+                    f"claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
                 )
             except Exception:
                 pass
@@ -387,14 +383,24 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                             {"rid": payload["response_id"]},
                         )
                         miner_hotkey = row and row.get("miner_hotkey")
-                    ok = await era5_step.run_item(
-                        db,
-                        run_id=payload["run_id"],
-                        miner_uid=payload["miner_uid"],
-                        miner_hotkey=miner_hotkey or "",
-                        response_id=payload["response_id"],
-                        validator=validator,
-                    )
+                    try:
+                        ok = await era5_step.run_item(
+                            db,
+                            run_id=payload["run_id"],
+                            miner_uid=payload["miner_uid"],
+                            miner_hotkey=miner_hotkey or "",
+                            response_id=payload["response_id"],
+                            validator=validator,
+                        )
+                    except era5_step.DataNotReadyError as e:
+                        # ERA5 data not ready yet - schedule retry with longer delay
+                        logger.info(f"ERA5 data not ready for run {payload['run_id']} miner {payload['miner_uid']}: {e}")
+                        # Schedule retry in 4 hours since ERA5 data may take time to become available
+                        await db.fail_validator_job(job["id"], f"ERA5 data not ready: {e}", schedule_retry_in_seconds=4*3600)
+                        return True  # Not a failure, just delayed
+                    except Exception as e:
+                        logger.error(f"ERA5 job failed with exception: {e}", exc_info=True)
+                        ok = False
                 else:
                     # Fallback: No specific job payload, cannot process without run_item parameters
                     logger.warning("ERA5 job without specific payload cannot be processed via fallback")
@@ -416,10 +422,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                     )
                 except Exception:
                     pass
-                try:
-                    await db.enqueue_weather_step_jobs(limit=500)
-                except Exception:
-                    pass
+                # REMOVED: Bulk job enqueuing - day1 jobs are created by poll_miner_step when inference completes
                 ok = True
             elif jtype == "weather.scoring.era5_final":
                 # Signal final scoring attempted; per-miner ERA5 steps will run via scheduler
@@ -447,9 +450,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     if job:
         try:
             try:
-                _tag = mp.current_process().name if mp.current_process() else "weather-w?"
                 logger.info(
-                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
+                    f"claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
                 )
             except Exception:
                 pass
@@ -478,10 +480,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     if job:
         try:
             try:
-                import logging as _logging, multiprocessing as _mp
-                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
-                _logging.getLogger(__name__).info(
-                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')}"
+                logger.info(
+                    f"claimed job id={job.get('id')} type={job.get('job_type')}"
                 )
             except Exception:
                 pass
@@ -501,9 +501,11 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
             except Exception:
                 pass
             try:
-                _tag = mp.current_process().name if mp.current_process() else "weather-w?"
+                job_type = job.get('job_type')
+                job_id = job.get('id')
+                
                 logger.info(
-                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
+                    f"claimed job id={job_id} type={job_type} run_id={job.get('run_id')} miner_uid={job.get('miner_uid')}"
                 )
             except Exception:
                 pass
@@ -548,10 +550,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                                 pass
                             await db.complete_validator_job(job["id"], result={"ready": True})
                             # Ensure a day1 step exists/enqueued for this miner
-                            try:
-                                await db.enqueue_weather_step_jobs(limit=200)
-                            except Exception:
-                                pass
+                            # REMOVED: Bulk job enqueuing - next steps are created by predecessor completion
                             return True
                         else:
                             # Not ready; reschedule poll in ~8 minutes
@@ -567,11 +566,14 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 try:
                     import os as _os
                     netuid = int(_os.getenv("NETUID", "237"))
+                    logger.info(f"[miners.handle_deregistrations] Starting with netuid={netuid}")
                     substrate = get_process_isolated_substrate(
                         subtensor_network=_os.getenv("SUBTENSOR_NETWORK", "test"),
                         chain_endpoint=_os.getenv("SUBTENSOR_ADDRESS", "") or "",
                     )
+                    logger.info(f"[miners.handle_deregistrations] Created substrate interface")
                     nodes = get_nodes_for_netuid(substrate=substrate, netuid=netuid)
+                    logger.info(f"[miners.handle_deregistrations] Retrieved {len(nodes or [])} nodes from chain")
                     miners_data = []
                     for n in nodes or []:
                         try:
@@ -600,39 +602,27 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                                 ]
                             ):
                                 miners_data.append(row)
-                        except Exception:
+                                logger.debug(f"[miners.handle_deregistrations] Added miner UID {index_val} to update batch")
+                        except Exception as e:
+                            logger.warning(f"[miners.handle_deregistrations] Failed to process node {index_val}: {e}")
                             continue
+                    logger.info(f"[miners.handle_deregistrations] Processed {len(miners_data)} miner updates")
                     if miners_data:
                         await db.batch_update_miners(miners_data)
+                        logger.info(f"[miners.handle_deregistrations] Successfully updated {len(miners_data)} miners in node_table")
+                    else:
+                        logger.info(f"[miners.handle_deregistrations] No miner updates needed")
                     await db.complete_validator_job(job["id"], result={"updated": len(miners_data)})
                     return True
                 except Exception as e:
                     await db.fail_validator_job(job["id"], f"dereg exception: {e}", schedule_retry_in_seconds=300)
                     return False
-            elif j == "weights.set":
-                # Offloaded weight setting (singleton). Uses validator instance passed from parent if provided.
-                try:
-                    ok = False
-                    if validator is not None:
-                        logger.info(f"[WeightSetter] Attempting weight setting for job {job.get('id')}")
-                        ok = await commit_weights_if_eligible(validator)
-                        if ok:
-                            logger.info(f"[WeightSetter] Weight setting successful for job {job.get('id')}")
-                        else:
-                            logger.info(f"[WeightSetter] Weight setting not eligible yet for job {job.get('id')}")
-                    else:
-                        logger.warning(f"[WeightSetter] No validator instance provided for job {job.get('id')}")
-                        
-                    if ok:
-                        await db.complete_validator_job(job["id"], result={"ok": True})
-                        return True
-                    else:
-                        # Not eligible yet; back off 2 minutes
-                        await db.fail_validator_job(job["id"], "not eligible", schedule_retry_in_seconds=120)
-                        return True
-                except Exception as e:
-                    await db.fail_validator_job(job["id"], f"weights exception: {e}", schedule_retry_in_seconds=180)
-                    return False
+            elif j == "miners.weights.set":
+                # Weight setting has been moved to main validator process
+                # Workers don't have substrate access needed for weight setting
+                logger.info(f"[WeightSetter] Weight setting job {job.get('id')} - redirecting to main validator process")
+                await db.fail_validator_job(job["id"], "weight setting moved to main validator process", schedule_retry_in_seconds=300)
+                return True
             else:
                 # Unknown miners.* job
                 await db.fail_validator_job(job["id"], "unknown miners job")
@@ -645,10 +635,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     if job:
         try:
             try:
-                import logging as _logging, multiprocessing as _mp
-                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
-                _logging.getLogger(__name__).info(
-                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')}"
+                logger.info(
+                    f"claimed job id={job.get('id')} type={job.get('job_type')}"
                 )
             except Exception:
                 pass
@@ -663,10 +651,8 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
     if job:
         try:
             try:
-                import logging as _logging, multiprocessing as _mp
-                _tag = _mp.current_process().name if _mp.current_process() else "weather-w?"
-                _logging.getLogger(__name__).info(
-                    f"[{_tag}] claimed job id={job.get('id')} type={job.get('job_type')}"
+                logger.info(
+                    f"claimed job id={job.get('id')} type={job.get('job_type')}"
                 )
             except Exception:
                 pass

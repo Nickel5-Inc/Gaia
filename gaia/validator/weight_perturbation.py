@@ -19,7 +19,7 @@ import hashlib
 import numpy as np
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict, Any
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 import asyncio
 
 logger = get_logger(__name__)

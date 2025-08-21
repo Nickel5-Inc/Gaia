@@ -133,7 +133,7 @@ async def orchestrate_run(
             # Already in progress, just ensure polling jobs exist
             logger.info(f"[Run {run_id}] Run already in progress, ensuring poll jobs exist")
             await db.enqueue_miner_poll_jobs(limit=1000)
-            await db.enqueue_weather_step_jobs(limit=1000)
+            # REMOVED: Bulk job enqueuing - jobs are created by predecessor steps upon completion
             
         else:
             logger.info(f"[Run {run_id}] Run in status '{current_status}', no orchestration needed")
@@ -253,7 +253,7 @@ async def handle_initiate_fetch_job(
             SELECT uid, hotkey, ip, port
             FROM node_table 
             WHERE hotkey IS NOT NULL 
-            AND uid IN (55, 80)
+            AND uid IN (55, 80, 82)
             ORDER BY uid
             """
         )

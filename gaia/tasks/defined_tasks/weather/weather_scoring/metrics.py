@@ -3,7 +3,7 @@ import xarray as xr
 import xskillscore as xs
 import asyncio
 from typing import Dict, Any, Union, Optional, Tuple, List
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

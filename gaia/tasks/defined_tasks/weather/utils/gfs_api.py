@@ -1,5 +1,5 @@
 import os
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Union, Tuple
 import numpy as np

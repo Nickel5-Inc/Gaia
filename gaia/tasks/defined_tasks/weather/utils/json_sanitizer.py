@@ -9,7 +9,7 @@ import json
 import math
 import numpy as np
 from typing import Any, Dict, List, Union
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

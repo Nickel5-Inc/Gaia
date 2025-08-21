@@ -1,7 +1,7 @@
 import threading
 from typing import Any, Dict, Optional
 import httpx
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 import numpy as np
 import asyncio
 import math

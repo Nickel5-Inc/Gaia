@@ -4,7 +4,7 @@ import base64
 import pickle
 from typing import Any, Dict, Optional
 import xarray as xr
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from ..utils.data_prep import create_aurora_batch_from_gfs
 from aurora import Batch
 import gc

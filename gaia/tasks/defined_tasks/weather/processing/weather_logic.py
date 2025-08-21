@@ -45,7 +45,7 @@ from ..weather_scoring.metrics import (
     _calculate_latitude_weights,
     perform_sanity_checks,
 )
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from ..weather_scoring.scoring import VARIABLE_WEIGHTS
 
 logger = get_logger(__name__)
@@ -193,11 +193,12 @@ async def _check_run_completion(task_instance: "WeatherTask", run_id: int) -> bo
         )
         verified_miners = verified_result["verified_count"] if verified_result else 0
 
-        # Check miners with scores (successful)
+        # Check miners with COMPLETE scoring (both day1 AND era5)
+        # Only count miners as "scored" if they have era5 scores, not just day1
         scored_miners_query = """
         SELECT COUNT(DISTINCT miner_hotkey) as scored_count 
         FROM weather_miner_scores 
-        WHERE run_id = :run_id
+        WHERE run_id = :run_id AND score_type = 'era5_rmse'
         """
         scored_result = await task_instance.db_manager.fetch_one(
             scored_miners_query, {"run_id": run_id}
@@ -240,8 +241,8 @@ async def _check_run_completion(task_instance: "WeatherTask", run_id: int) -> bo
                     f"hotkey={resp['miner_hotkey'][:8]}...{resp['miner_hotkey'][-8:]}"
                 )
 
-        # NEW: If at least one miner has been successfully scored, consider the run complete
-        # This prevents retrying runs that have already produced valid scores
+        # NEW: If at least one miner has been FULLY scored (ERA5), consider the run complete
+        # This prevents retrying runs that have already produced complete scores
         if scored_miners > 0:
             pending_miners = total_miners - scored_miners - failed_miners
             if pending_miners > 0:
@@ -256,41 +257,99 @@ async def _check_run_completion(task_instance: "WeatherTask", run_id: int) -> bo
             _run_completion_cache[cache_key] = (now, True)
             return True
 
-        # IMPORTANT: For ERA5 scoring, if all verified miners have been processed (scored or failed),
-        # the run should be considered complete even if unverified miners exist
+        # IMPORTANT: For ERA5 scoring, only mark complete when all verified miners are FULLY processed
+        # A miner is fully processed when it has BOTH completed inference AND scoring (or definitively failed)
         if verified_miners > 0:
-            # Count how many verified miners have been processed (either scored or marked as failed/offline)
-            processed_verified_query = """
+            # Count verified miners that are FULLY processed (have completed the entire pipeline)
+            # This includes: scored successfully, or failed/offline after inference completion
+            fully_processed_verified_query = """
             SELECT COUNT(DISTINCT mr.miner_hotkey) as processed_count
             FROM weather_miner_responses mr
             WHERE mr.run_id = :run_id AND mr.verification_passed = TRUE
             AND (
+                -- Definitely failed states (never completed inference)
                 mr.status IN ('miner_offline', 'verification_failed', 'error', 'failed')
+                -- OR completed inference and got scored (success path)
                 OR EXISTS (
                     SELECT 1 FROM weather_miner_scores wms 
                     WHERE wms.run_id = mr.run_id AND wms.miner_hotkey = mr.miner_hotkey
+                    AND wms.score_type = 'era5_rmse'  -- Only count as complete if ERA5 scored
                 )
+                -- OR completed inference but failed during scoring
+                OR (mr.status = 'forecast_ready' AND EXISTS (
+                    SELECT 1 FROM validator_jobs vj
+                    WHERE vj.job_type = 'weather.era5' 
+                    AND vj.run_id = mr.run_id 
+                    AND vj.miner_uid = mr.miner_uid
+                    AND vj.status = 'failed'
+                ))
             )
             """
             processed_result = await task_instance.db_manager.fetch_one(
-                processed_verified_query, {"run_id": run_id}
+                fully_processed_verified_query, {"run_id": run_id}
             )
-            processed_verified = (
+            fully_processed_verified = (
                 processed_result["processed_count"] if processed_result else 0
             )
 
-            if processed_verified >= verified_miners:
-                logger.warning(
-                    f"[RunCompletion] Run {run_id}: All {verified_miners} verified miners have been processed (no successful scores) - marking as complete"
-                )
-                await _update_run_status(
-                    task_instance,
-                    run_id,
-                    "all_miners_failed",
-                    "All verified miners failed or went offline",
-                )
+            # Also check for miners still in inference_running state
+            running_miners_query = """
+            SELECT COUNT(*) as running_count FROM weather_miner_responses 
+            WHERE run_id = :run_id AND verification_passed = TRUE
+            AND status IN ('inference_running', 'inference_pending')
+            """
+            running_result = await task_instance.db_manager.fetch_one(
+                running_miners_query, {"run_id": run_id}
+            )
+            running_miners = running_result["running_count"] if running_result else 0
+
+            # Also check for miners that completed inference but haven't been ERA5 scored yet
+            awaiting_era5_query = """
+            SELECT COUNT(DISTINCT mr.miner_hotkey) as awaiting_count
+            FROM weather_miner_responses mr
+            WHERE mr.run_id = :run_id AND mr.verification_passed = TRUE
+            AND mr.status = 'forecast_ready'
+            AND NOT EXISTS (
+                SELECT 1 FROM weather_miner_scores wms 
+                WHERE wms.run_id = mr.run_id AND wms.miner_hotkey = mr.miner_hotkey
+                AND wms.score_type = 'era5_rmse'
+            )
+            """
+            awaiting_era5_result = await task_instance.db_manager.fetch_one(
+                awaiting_era5_query, {"run_id": run_id}
+            )
+            awaiting_era5_miners = awaiting_era5_result["awaiting_count"] if awaiting_era5_result else 0
+
+            logger.info(
+                f"[RunCompletion] Run {run_id}: Verified miners - Total: {verified_miners}, "
+                f"Fully processed: {fully_processed_verified}, Still running: {running_miners}, "
+                f"Awaiting ERA5: {awaiting_era5_miners}"
+            )
+
+            # Only mark complete if ALL verified miners are fully processed AND none are still running/awaiting
+            if fully_processed_verified >= verified_miners and running_miners == 0 and awaiting_era5_miners == 0:
+                if scored_miners == 0:
+                    logger.warning(
+                        f"[RunCompletion] Run {run_id}: All {verified_miners} verified miners fully processed with no successful scores - marking as complete"
+                    )
+                    await _update_run_status(
+                        task_instance,
+                        run_id,
+                        "all_miners_failed",
+                        "All verified miners failed or went offline",
+                    )
+                else:
+                    logger.info(
+                        f"[RunCompletion] Run {run_id}: All {verified_miners} verified miners fully processed with {scored_miners} successful scores - marking as complete"
+                    )
                 _run_completion_cache[cache_key] = (now, True)
                 return True
+            else:
+                logger.info(
+                    f"[RunCompletion] Run {run_id}: Still waiting for miners to complete - not marking as complete yet"
+                )
+                _run_completion_cache[cache_key] = (now, False)
+                return False
 
         # If all miners have either scored or failed, the run is complete
         if total_miners > 0 and (scored_miners + failed_miners) >= total_miners:
@@ -1883,8 +1942,19 @@ async def calculate_era5_miner_score(
                 standard_name_for_clim = var_config.get("standard_name", var_name)
                 var_key = f"{var_name}{var_level if var_level else ''}"
 
+                # Ensure both datetimes are proper datetime objects for subtraction
+                if isinstance(gfs_init_time_of_run, (int, float)):
+                    gfs_init_dt = datetime.fromtimestamp(gfs_init_time_of_run, tz=timezone.utc)
+                else:
+                    gfs_init_dt = gfs_init_time_of_run
+                
+                # Ensure valid_time_dt is also a proper datetime object
+                if not isinstance(valid_time_dt, datetime):
+                    logger.error(f"[FinalScore] valid_time_dt is not a datetime object: {type(valid_time_dt)} = {valid_time_dt}")
+                    continue
+                    
                 lead_hours = int(
-                    (valid_time_dt - gfs_init_time_of_run).total_seconds() / 3600
+                    (valid_time_dt - gfs_init_dt).total_seconds() / 3600
                 )
 
                 db_metric_row_base = {
@@ -2602,6 +2672,14 @@ async def calculate_era5_miner_score(
                         f"[FinalScore] Miner {miner_hotkey}: Error scoring {var_key} at {valid_time_dt}: {e_var_score}",
                         exc_info=True,
                     )
+                    # Add debug info for type errors
+                    if "unsupported operand type" in str(e_var_score):
+                        logger.error(f"[FinalScore] Type error debug info:")
+                        logger.error(f"  - gfs_init_time_of_run type: {type(gfs_init_time_of_run)} = {gfs_init_time_of_run}")
+                        logger.error(f"  - valid_time_dt type: {type(valid_time_dt)} = {valid_time_dt}")
+                        logger.error(f"  - lead_hours type: {type(lead_hours)} = {lead_hours}")
+                        logger.error(f"  - var_key: {var_key}")
+                        logger.error(f"  - var_name: {var_name}, var_level: {var_level}")
                     error_metric_row = {
                         **db_metric_row_base,
                         "score_type": f"era5_error_{var_key}_{int(lead_hours)}h",

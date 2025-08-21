@@ -22,7 +22,7 @@ import httpx
 import gzip
 import psutil
 
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from aurora import Batch
 
 from ..utils.data_prep import create_aurora_batch_from_gfs

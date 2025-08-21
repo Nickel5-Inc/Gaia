@@ -5,9 +5,9 @@ from typing import Any, Dict, List, Optional, TypeVar, Callable
 from functools import wraps
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError, OperationalError
+from sqlalchemy.exc import SQLAlchemyError
 from contextlib import asynccontextmanager
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from gaia.utils.global_memory_manager import (
     create_thread_cleanup_helper,
     register_thread_cleanup,
@@ -327,18 +327,7 @@ class BaseDatabaseManager(ABC):
             await self._initialize_engine()
             self._engine_initialized = True
 
-    async def _check_circuit_breaker(self) -> bool:
-        if self._circuit_breaker["status"] == "open":
-            if (
-                time.time() - self._circuit_breaker["last_failure_time"]
-                > self.CIRCUIT_BREAKER_RECOVERY_TIME
-            ):
-                self._circuit_breaker["status"] = "half-open"
-                self._circuit_breaker["failures"] = 0
-                logger.info("Circuit breaker entering half-open state")
-            else:
-                return False
-        return True
+
 
     async def _update_circuit_breaker(self, success: bool) -> None:
         if not self.monitoring_enabled:
@@ -1221,8 +1210,6 @@ class BaseDatabaseManager(ABC):
         # Prepare the synchronous function to run in thread
         def sync_fetch_and_process():
             import asyncio
-            import time as time_sync
-            from sqlalchemy import text as text_sync
 
             # Create a new event loop for this thread
             loop = asyncio.new_event_loop()

@@ -331,9 +331,9 @@ class WeatherStatsManager:
                     MAX(CASE WHEN wfs.forecast_status = 'failed' THEN wfs.updated_at ELSE NULL END) AS last_failed_forecast,
                     MIN(wfs.created_at) AS first_seen,
                     MAX(wfs.created_at) AS last_active,
-                    COALESCE(SUM(wfs.forecast_inference_time), 0) AS total_inference_time,
-                    CASE WHEN SUM(CASE WHEN wfs.forecast_inference_time IS NOT NULL THEN 1 ELSE 0 END) > 0 
-                         THEN AVG(wfs.forecast_inference_time) 
+                    COALESCE(SUM(wfs.forecast_inference_duration_seconds), 0) AS total_inference_time,
+                    CASE WHEN SUM(CASE WHEN wfs.forecast_inference_duration_seconds IS NOT NULL THEN 1 ELSE 0 END) > 0 
+                         THEN AVG(wfs.forecast_inference_duration_seconds) 
                          ELSE NULL END AS avg_inference_time,
                     CASE WHEN SUM(CASE WHEN wfs.forecast_status = 'failed' THEN 1 ELSE 0 END) > 0
                          THEN jsonb_build_object(

@@ -34,7 +34,7 @@ import shutil
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 import time
 import re
 import aiofiles
@@ -69,7 +69,7 @@ class AutoSyncManager:
 
         # Perform system detection first
         self.system_info = self._detect_system_configuration()
-        logger.info(f"🔍 System Detection Results: {self.system_info}")
+        logger.debug(f"System detection: {self.system_info.get('os_type', 'unknown')} {self.system_info.get('os_version', '')}, PostgreSQL {self.system_info.get('postgresql_version', 'unknown')}")
 
         self.config = self._load_config()
         self.is_primary = self.config.get("is_primary", False)
@@ -486,24 +486,14 @@ class AutoSyncManager:
     def _load_config(self) -> Dict:
         """Load and validate configuration from environment."""
 
-        logger.info("🔧 Loading AutoSyncManager configuration...")
-
         # Enhanced stanza naming with network awareness - fully automatic
         network_suffix = os.getenv("SUBTENSOR_NETWORK", "").lower()
-
-        # Log only the essential configuration status
-        logger.info("📋 Essential configuration status:")
-        logger.info(f"   🌐 Network detected: {network_suffix or 'unknown'}")
-        logger.info(
-            f"   🏠 Node mode: {'PRIMARY' if os.getenv('IS_SOURCE_VALIDATOR_FOR_DB_SYNC', 'False').lower() == 'true' else 'REPLICA'}"
-        )
-        logger.info(
-            f"   ☁️  R2 storage: {'✅ Configured' if os.getenv('PGBACKREST_R2_BUCKET') else '❌ Missing'}"
-        )
+        
+        is_primary = os.getenv('IS_SOURCE_VALIDATOR_FOR_DB_SYNC', 'False').lower() == 'true'
+        logger.debug(f"Configuration: {network_suffix or 'unknown'} network, {'PRIMARY' if is_primary else 'REPLICA'} mode")
 
         try:
             pgdata_path = self._find_pgdata_path()
-            logger.info(f"   🗄️ PostgreSQL: ✅ Detected at {pgdata_path}")
         except Exception as e:
             logger.error(f"❌ Failed to find PostgreSQL data directory: {e}")
             # Don't raise immediately - let's see what other config we can gather
@@ -518,14 +508,8 @@ class AutoSyncManager:
         # Auto-detect stanza name based on network and node type
         if network_suffix and network_suffix in ["test", "finney"]:
             stanza_name = f"gaia-{network_suffix}"
-            logger.info(
-                f"🌐 Auto-detected network-aware stanza: {stanza_name} (network: {network_suffix})"
-            )
         else:
             stanza_name = "gaia"
-            logger.info(
-                f"🌐 Using default stanza: {stanza_name} (network: {network_suffix or 'unknown'})"
-            )
 
         # Override only if explicitly set (for advanced users)
         if os.getenv("PGBACKREST_STANZA_NAME"):
@@ -589,18 +573,7 @@ class AutoSyncManager:
                 logger.error(f"   - {env_var_name}")
             raise ValueError(f"Missing required R2 configuration: {missing_vars}")
 
-        logger.info("✅ Configuration loaded successfully")
-
-        # Log final auto-detected configuration
-        logger.info("🎯 Final configuration:")
-        logger.info(f"   📋 Stanza name: {config['stanza_name']} (auto-detected)")
-        logger.info(f"   🏠 Mode: {'PRIMARY' if config['is_primary'] else 'REPLICA'}")
-        logger.info(
-            f"   🔐 Authentication: {'✅ Ready' if config['postgres_password'] else '⚠️ Using default'}"
-        )
-        logger.info(
-            f"   🚀 Auto-sync on startup: {'✅ Enabled' if config['replica_startup_sync'] else '❌ Disabled'}"
-        )
+        logger.debug(f"Configuration loaded: {config['stanza_name']} ({'PRIMARY' if config['is_primary'] else 'REPLICA'})")
 
         # Add derived paths for configuration, essential for post-restore config
         pg_version = self.system_info.get("postgresql_version")
@@ -632,13 +605,9 @@ class AutoSyncManager:
         Handles existing installations, network transitions, and misconfigurations automatically.
         """
         try:
-            logger.info("🚀 Starting intelligent database sync setup...")
-            logger.info(f"Network: {self.config.get('network', 'unknown')}")
-            logger.info(f"Target stanza: {self.config['stanza_name']}")
-            logger.info(f"Mode: {'PRIMARY' if self.is_primary else 'REPLICA'}")
+            logger.info(f"🚀 Setting up database sync - {self.config['stanza_name']} ({'PRIMARY' if self.is_primary else 'REPLICA'})")
 
             # 1. Install dependencies with timeout
-            logger.info("Step 1: Installing dependencies...")
             try:
                 install_success = await asyncio.wait_for(
                     self._install_dependencies(), timeout=300
@@ -646,23 +615,19 @@ class AutoSyncManager:
                 if not install_success:
                     logger.error("❌ Dependency installation failed")
                     return False
-                logger.info("✅ Step 1 completed successfully")
             except asyncio.TimeoutError:
-                logger.error("❌ Step 1 timed out after 5 minutes")
+                logger.error("❌ Dependency installation timed out after 5 minutes")
                 return False
 
             # 2. Auto-detect and repair any existing configuration issues with timeout
-            logger.info("Step 2: Detecting and repairing existing configuration...")
             try:
                 await asyncio.wait_for(
                     self._auto_repair_configuration(), timeout=60
                 )  # 1 minute timeout
-                logger.info("✅ Step 2 completed successfully")
             except asyncio.TimeoutError:
-                logger.warning("⚠️ Step 2 timed out after 1 minute - continuing anyway")
+                logger.warning("⚠️ Configuration repair timed out - continuing anyway")
 
             # 3. Configure PostgreSQL (smart update, not just append) with timeout
-            logger.info("Step 3: Configuring PostgreSQL...")
             try:
                 config_success = await asyncio.wait_for(
                     self._configure_postgresql(), timeout=120
@@ -670,13 +635,11 @@ class AutoSyncManager:
                 if not config_success:
                     logger.error("❌ PostgreSQL configuration failed")
                     return False
-                logger.info("✅ Step 3 completed successfully")
             except asyncio.TimeoutError:
-                logger.error("❌ Step 3 timed out after 2 minutes")
+                logger.error("❌ PostgreSQL configuration timed out after 2 minutes")
                 return False
 
             # 4. Setup PostgreSQL authentication with timeout
-            logger.info("Step 4: Setting up PostgreSQL authentication...")
             try:
                 auth_success = await asyncio.wait_for(
                     self._setup_postgres_auth(), timeout=60
@@ -684,13 +647,11 @@ class AutoSyncManager:
                 if not auth_success:
                     logger.error("❌ PostgreSQL authentication setup failed")
                     return False
-                logger.info("✅ Step 4 completed successfully")
             except asyncio.TimeoutError:
-                logger.error("❌ Step 4 timed out after 1 minute")
+                logger.error("❌ PostgreSQL authentication setup timed out")
                 return False
 
             # 5. Configure pgBackRest with timeout
-            logger.info("Step 5: Configuring pgBackRest...")
             try:
                 pgbackrest_success = await asyncio.wait_for(
                     self._configure_pgbackrest(), timeout=60
@@ -698,28 +659,21 @@ class AutoSyncManager:
                 if not pgbackrest_success:
                     logger.error("❌ pgBackRest configuration failed")
                     return False
-                logger.info("✅ Step 5 completed successfully")
             except asyncio.TimeoutError:
-                logger.error("❌ Step 5 timed out after 1 minute")
+                logger.error("❌ pgBackRest configuration timed out")
                 return False
 
             # 6. Ensure archive command is correct (with retry logic) with timeout
-            logger.info("Step 6: Ensuring correct archive command...")
             try:
                 archive_success = await asyncio.wait_for(
                     self._ensure_correct_archive_command(), timeout=60
                 )  # 1 minute timeout
                 if not archive_success:
                     logger.warning("⚠️ Archive command may need manual attention")
-                else:
-                    logger.info("✅ Step 6 completed successfully")
             except asyncio.TimeoutError:
-                logger.warning(
-                    "⚠️ Step 6 timed out after 1 minute - archive command may need manual attention"
-                )
+                logger.warning("⚠️ Archive command setup timed out - may need manual attention")
 
             # 7. Handle stanza setup intelligently with timeout
-            logger.info("Step 7: Setting up backup stanza...")
             try:
                 stanza_success = await asyncio.wait_for(
                     self._intelligent_stanza_setup(), timeout=600
@@ -727,28 +681,22 @@ class AutoSyncManager:
                 if not stanza_success:
                     logger.error("❌ Stanza setup failed")
                     return False
-                logger.info("✅ Step 7 completed successfully")
             except asyncio.TimeoutError:
-                logger.error("❌ Step 7 timed out after 10 minutes")
+                logger.error("❌ Stanza setup timed out after 10 minutes")
                 return False
 
             # 8. Start application-controlled scheduling
-            logger.info("Step 8: Starting automated scheduling...")
             try:
                 # Add timeout to this step
                 await asyncio.wait_for(
                     self.start_scheduling(),
                     timeout=1800.0,  # 30 minutes, restore can take a while
                 )
-                logger.info("✅ Step 8 completed successfully")
             except asyncio.TimeoutError:
-                logger.error("❌ Step 8 timed out after 30 minutes")
+                logger.error("❌ Automated scheduling setup timed out after 30 minutes")
                 return False
 
-            logger.info("🎉 Database sync setup completed successfully!")
-            logger.info(
-                f"✅ Ready for {'backup operations' if self.is_primary else 'replica synchronization'}"
-            )
+            logger.info(f"✅ Database sync setup completed - ready for {'backup operations' if self.is_primary else 'replica synchronization'}")
             return True
 
         except Exception as e:
@@ -1020,13 +968,7 @@ class AutoSyncManager:
     async def _configure_postgresql(self) -> bool:
         """Configure PostgreSQL for pgBackRest using detected system configuration."""
         try:
-            logger.info("Configuring PostgreSQL...")
-            logger.info(
-                f"PostgreSQL version: {self.system_info.get('postgresql_version', 'unknown')}"
-            )
-            logger.info(
-                f"PostgreSQL service: {self.system_info.get('postgresql_service', 'postgresql')}"
-            )
+            logger.debug(f"Configuring PostgreSQL v{self.system_info.get('postgresql_version', 'unknown')}")
 
             # For replica nodes, we can skip most configuration since we'll be restoring from backup
             if not self.is_primary:
@@ -1048,7 +990,6 @@ class AutoSyncManager:
             await self._fix_failing_archiver()
 
             # Detect PostgreSQL configuration file location dynamically
-            logger.info("Detecting PostgreSQL configuration file location...")
             postgres_user = self.system_info.get("postgresql_user", "postgres")
 
             config_cmd = [
@@ -1082,7 +1023,7 @@ class AutoSyncManager:
                 else:
                     postgres_conf_path = stdout.decode().strip()
                     postgres_conf = Path(postgres_conf_path)
-                    logger.info(f"PostgreSQL config file: {postgres_conf}")
+                    logger.debug(f"PostgreSQL config file: {postgres_conf}")
 
             except asyncio.TimeoutError:
                 logger.warning(
@@ -1099,24 +1040,18 @@ class AutoSyncManager:
 
             # For pg_hba.conf, it's usually in the same directory as postgresql.conf
             hba_conf = postgres_conf.parent / "pg_hba.conf"
-            logger.info(f"📋 PostgreSQL HBA file: {hba_conf}")
 
             # Backup existing config
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             if postgres_conf.exists():
                 shutil.copy2(postgres_conf, f"{postgres_conf}.backup.{timestamp}")
-                logger.info(
-                    f"📋 Backed up config to: {postgres_conf}.backup.{timestamp}"
-                )
             if hba_conf.exists():
                 shutil.copy2(hba_conf, f"{hba_conf}.backup.{timestamp}")
-                logger.info(f"📋 Backed up HBA to: {hba_conf}.backup.{timestamp}")
 
             # PostgreSQL configuration with network-aware stanza
             archive_cmd = (
                 f"pgbackrest --stanza={self.config['stanza_name']} archive-push %p"
             )
-            logger.info(f"🔧 Setting archive command: {archive_cmd}")
 
             # Settings to add/update
             new_settings = {
@@ -1163,7 +1098,7 @@ class AutoSyncManager:
                         # Replace existing setting
                         updated_lines.append(f"{key} = {new_settings[key]}\n")
                         settings_added.add(key)
-                        logger.info(f"🔄 Updated existing {key} = {new_settings[key]}")
+                        logger.debug(f"Updated {key} = {new_settings[key]}")
                     else:
                         # Keep existing setting
                         updated_lines.append(line)
@@ -1181,7 +1116,7 @@ class AutoSyncManager:
             # Write updated configuration
             with open(postgres_conf, "w") as f:
                 f.writelines(updated_lines)
-            logger.info(f"✅ Updated PostgreSQL configuration file: {postgres_conf}")
+            logger.debug(f"Updated PostgreSQL configuration: {postgres_conf}")
 
             # Update pg_hba.conf for replication
             if hba_conf.exists():
@@ -6499,16 +6434,9 @@ async def get_auto_sync_manager(test_mode: bool = False) -> Optional[AutoSyncMan
                   - No override occurs - whatever is passed is used
     """
     try:
-        print("\n" + "🏗️" * 60)
-        print("🏗️ CREATING AUTO SYNC MANAGER 🏗️")
-        print(f"🏗️ TEST MODE: {'ENABLED' if test_mode else 'DISABLED'} 🏗️")
-        print("🏗️" * 60)
-
-        logger.info("🏗️ Creating AutoSyncManager instance...")
+        logger.info(f"🏗️ Creating AutoSyncManager ({'test mode' if test_mode else 'production mode'})")
         manager = AutoSyncManager(test_mode=test_mode)
-
-        print("✅ AUTO SYNC MANAGER CREATED SUCCESSFULLY ✅")
-        logger.info("✅ AutoSyncManager factory: Created successfully")
+        logger.info("✅ AutoSyncManager created successfully")
         return manager
     except ValueError as ve:
         print("❌ CONFIGURATION ERROR ❌")

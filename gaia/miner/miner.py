@@ -2,7 +2,7 @@ import os
 import sys  # Add sys import
 import traceback  # Add traceback import
 import subprocess  # For managing inference server subprocess
-import atexit  # To ensure inference server is stopped
+  # To ensure inference server is stopped
 import time  # For health check delays
 import httpx  # For health checking inference server
 from urllib.parse import urlparse  # To parse service URL
@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 import argparse
 from fiber import SubstrateInterface
 import uvicorn
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from fiber.encrypted.miner import server as fiber_server
 from fiber.encrypted.miner.core import configuration
 from fiber.encrypted.miner.middleware import configure_extra_logging_middleware

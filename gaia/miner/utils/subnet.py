@@ -1,17 +1,16 @@
 from functools import partial
-from fastapi import Depends, Request, HTTPException, Header, Path, Query
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi import Depends, Request, HTTPException, Path
+from fastapi.responses import FileResponse, Response
 from fastapi.routing import APIRouter
 from pydantic import BaseModel, Field
 from fiber.encrypted.miner.dependencies import blacklist_low_stake, verify_request
 from fiber.encrypted.miner.security.encryption import decrypt_general_payload
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 # Geomagnetic and soil moisture tasks disabled
 import numpy as np
 from datetime import datetime, timezone
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+
 import traceback
 from gaia.miner.database.miner_database_manager import MinerDatabaseManager
 from pydantic import ValidationError
@@ -21,7 +20,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 from typing import Any, Dict, Optional, Set, List
 import glob
-import urllib.parse
+
 import base64
 import asyncio
 import json
@@ -68,6 +67,7 @@ from gaia.tasks.defined_tasks.weather.schemas.weather_outputs import (
     WeatherInitiateFetchResponse,
     WeatherGetInputStatusResponse,
     WeatherStartInferenceResponse,
+    WeatherTaskStatus,
 )
 
 MAX_REQUEST_SIZE = 800 * 1024 * 1024  # 800MB

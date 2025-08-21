@@ -7,7 +7,7 @@ import fsspec
 import xarray as xr
 import psutil
 import pandas as pd
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 # Ensure blosc codec is available for zarr operations
 try:

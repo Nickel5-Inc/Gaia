@@ -1,5 +1,5 @@
 from typing import Dict, Any, Optional, List
-from pydantic import validator, root_validator
+from pydantic import validator
 from gaia.tasks.base.components.metadata import Metadata, CoreMetadata
 from gaia.tasks.base.decorators import handle_validation_error
 

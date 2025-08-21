@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, List, Callable, TypeVar
 from datetime import datetime, timedelta, timezone
 from gaia.database.database_manager import BaseDatabaseManager, DatabaseError
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 import random
 import time
 from functools import wraps
@@ -162,7 +162,7 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
             cls._instance.MAX_OVERFLOW = getattr(cls, "MAX_OVERFLOW", 15)
 
             # Worker processes get smaller pools to avoid aggregate contention
-            if isinstance(_pname, str) and _pname.startswith("weather-w"):
+            if isinstance(_pname, str) and (_pname.startswith("weather-w") or _pname.startswith("worker-")):
                 cls._instance.MAX_CONNECTIONS = 8
                 cls._instance.MAX_OVERFLOW = 4
 
@@ -1686,28 +1686,16 @@ class ValidatorDatabaseManager(BaseDatabaseManager):
                     "step": step_name,
                     "miner_hotkey": s.get("miner_hotkey"),
                 }
-                # Atomically insert only if no active job exists for this step to avoid races across workers
-                row = await self.fetch_one(
-                    """
-                    INSERT INTO validator_jobs (job_type, priority, status, payload, scheduled_at, run_id, miner_uid, response_id, step_id)
-                    SELECT :job_type, :priority, 'pending', :payload, NULL, :run_id, :miner_uid, :response_id, :step_id
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM validator_jobs
-                        WHERE step_id = :step_id AND status IN ('pending','in_progress','retry_scheduled')
-                    )
-                    RETURNING id
-                    """,
-                    {
-                        "job_type": f"weather.{step_name}",
-                        "priority": 100,
-                        "payload": dumps(payload) if JSON_PERFORMANCE_AVAILABLE else json.dumps(payload),
-                        "run_id": s["run_id"],
-                        "miner_uid": s["miner_uid"],
-                        "response_id": s.get("response_id"),
-                        "step_id": s["step_id"],
-                    },
+                # CRITICAL FIX: Use singleton jobs to prevent race condition duplicates
+                singleton_key = f"{step_name}_score_run_{s['run_id']}_miner_{s['miner_uid']}"
+                job_id = await self.enqueue_singleton_job(
+                    singleton_key=singleton_key,
+                    job_type=f"weather.{step_name}",
+                    payload=payload,
+                    priority=100,
+                    run_id=s["run_id"],
+                    miner_uid=s["miner_uid"],
                 )
-                job_id = int(row["id"]) if row else None
                 if job_id:
                     inserted += 1
                     # Link from step to job for easier joins

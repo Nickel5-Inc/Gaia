@@ -19,7 +19,7 @@ import numpy as np
 import xarray as xr
 from pathlib import Path
 
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

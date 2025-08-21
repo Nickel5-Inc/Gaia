@@ -103,10 +103,7 @@ class MinerWorkScheduler:
     async def claim_next(self) -> Optional[WorkItem]:
         """Legacy method - no longer functional since claim_day1/claim_era5 removed."""
         # Opportunistically enqueue missing validator jobs to drive generic queue
-        try:
-            _ = await self.db.enqueue_weather_step_jobs(limit=200)
-        except Exception:
-            pass
+        # REMOVED: Bulk job enqueuing - replaced by self-managing pipeline where each step creates its successor
         # REMOVED: All claim methods removed since scoring goes through generic job queue
         return None
 

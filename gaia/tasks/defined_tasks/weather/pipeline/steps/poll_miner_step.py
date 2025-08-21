@@ -134,7 +134,8 @@ async def run_poll_miner_job(
                 await db.execute(
                     """
                     UPDATE weather_miner_responses
-                    SET status = 'forecast_ready'
+                    SET status = 'forecast_ready',
+                        inference_completed_at = NOW()
                     WHERE id = :id
                     """,
                     {"id": response_id}
@@ -144,7 +145,7 @@ async def run_poll_miner_job(
                 await db.execute(
                     """
                     UPDATE weather_forecast_stats wfs
-                    SET forecast_inference_time = COALESCE(:time, forecast_inference_time),
+                    SET forecast_inference_duration_seconds = COALESCE(:time, forecast_inference_duration_seconds),
                         current_forecast_status = 'inference_complete',
                         current_forecast_stage = 'awaiting_scoring',
                         last_error_message = NULL
@@ -169,8 +170,10 @@ async def run_poll_miner_job(
                 )
                 
                 if not existing_day1:
-                    # Enqueue day1 scoring job
-                    await db.enqueue_validator_job(
+                    # CRITICAL FIX: Use singleton job to prevent race condition duplicates
+                    singleton_key = f"day1_score_run_{run_id}_miner_{miner_uid}"
+                    job_id_created = await db.enqueue_singleton_job(
+                        singleton_key=singleton_key,
                         job_type="weather.day1",
                         payload={
                             "run_id": run_id,
@@ -182,8 +185,11 @@ async def run_poll_miner_job(
                         priority=60,
                         run_id=run_id,
                         miner_uid=miner_uid,
-                        response_id=response_id,
                     )
+                    if job_id_created:
+                        logger.info(f"[Run {run_id}] ✓ Created Day1 singleton job {job_id_created} for miner {miner_uid}")
+                    else:
+                        logger.debug(f"[Run {run_id}] Day1 singleton job already exists for miner {miner_uid}, race condition prevented")
                 else:
                     logger.debug(f"[Run {run_id}] Day1 job already exists for miner {miner_uid}, skipping")
                 

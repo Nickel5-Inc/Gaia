@@ -1,6 +1,6 @@
 import asyncio
 from sqlalchemy import text
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 import pprint
 import math
 import traceback
@@ -11,17 +11,7 @@ from gaia.validator.database.validator_database_manager import ValidatorDatabase
 from typing import Dict, Optional
 
 
-def prepare_prediction_field(data_list):
-    """
-    Convert a list of values into a comma-separated string.
 
-    Args:
-        data_list (list): List of prediction values.
-
-    Returns:
-        str: Comma-separated string of values.
-    """
-    return ",".join(map(str, data_list)) if data_list else ""
 
 
 logger = get_logger(__name__)
@@ -51,17 +41,7 @@ class MinerScoreSender:
             for row in results
         ]
 
-    # Geomagnetic processing removed (task disabled)
-
-    async def fetch_geomagnetic_history(self, miner_hotkey: str) -> list:
-        """Geomagnetic task disabled - return empty list."""
-        return []
-
-    # Soil moisture processing removed (task disabled)
-
-    async def fetch_soil_moisture_history(self, miner_hotkey: str) -> list:
-        """Soil moisture task disabled - return empty list."""
-        return []
+    # Geomagnetic and soil moisture processing removed (tasks disabled)
     
     async def fetch_weather_stats(self, miner_uid: int, miner_hotkey: str) -> dict:
         """

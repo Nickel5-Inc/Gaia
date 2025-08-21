@@ -13,7 +13,7 @@ import asyncio
 from functools import partial
 import traceback
 from .gfs_api import fetch_gfs_analysis_data, GFS_SURFACE_VARS, GFS_ATMOS_VARS
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 import urllib.parse
 import requests
 import time

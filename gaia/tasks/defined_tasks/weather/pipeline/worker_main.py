@@ -67,29 +67,34 @@ async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0, mem
         
         try:
             keypair = chain_utils.load_hotkey_keypair(wallet_name, hotkey_name)
-            logger.info(f"{tag} loaded keypair for wallet={wallet_name}, hotkey={hotkey_name}")
+            logger.info(f"loaded keypair for wallet={wallet_name}, hotkey={hotkey_name}")
         except Exception as e:
-            logger.warning(f"{tag} could not load keypair: {e}, will try to proceed without it")
+            logger.warning(f"could not load keypair: {e}, will try to proceed without it")
             keypair = None
         
         # Create the task with the keypair
         task = WeatherTask(db_manager=db, node_type="validator", test_mode=True, keypair=keypair)
         validator = task
-        logger.info(f"{tag} initialized WeatherTask for miner communication with keypair")
+        logger.info("initialized WeatherTask for miner communication with keypair")
     except Exception as e:
-        logger.warning(f"{tag} could not initialize WeatherTask: {e}, proceeding without validator context")
+        logger.warning(f"could not initialize WeatherTask: {e}, proceeding without validator context")
         validator = None
     
     while True:
         try:
             processed = await process_one(db, validator=validator)
-            # Memory guard: restart if above limit
+            # Memory guard: check if we should restart after completing current job
             if memory_limit_mb and memory_limit_mb > 0:
                 rss_mb = _get_rss_mb()
                 if rss_mb >= 0 and rss_mb > memory_limit_mb:
-                    logger.warning(
-                        f"{tag} memory threshold exceeded: rss={rss_mb:.1f}MB > limit={memory_limit_mb:.1f}MB — exiting for restart"
-                    )
+                    if processed:
+                        logger.warning(
+                            f"memory threshold exceeded: rss={rss_mb:.1f}MB > limit={memory_limit_mb:.1f}MB — exiting after completing job for restart"
+                        )
+                    else:
+                        logger.warning(
+                            f"memory threshold exceeded: rss={rss_mb:.1f}MB > limit={memory_limit_mb:.1f}MB — exiting for restart"
+                        )
                     break
             if not processed:
                 now = time.time()
@@ -97,7 +102,7 @@ async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0, mem
                 if now - last_idle_log > 60:
                     rss_mb = _get_rss_mb()
                     mem_str = f" | rss={rss_mb:.1f}MB" if rss_mb >= 0 else ""
-                    logger.info(f"{tag} idle: no jobs to claim currently{mem_str}")
+                    logger.info(f"idle: no jobs to claim currently{mem_str}")
                     last_idle_log = now
                 await asyncio.sleep(idle_sleep)
         except asyncio.CancelledError:
@@ -109,40 +114,12 @@ async def worker_loop(db: ValidatorDatabaseManager, idle_sleep: float = 5.0, mem
 
 async def _install_worker_prefix_filters(tag: str) -> None:
     import logging
-    import sys
 
-    class _WorkerTagFilter(logging.Filter):
-        def __init__(self, tag: str) -> None:
-            super().__init__()
-            self._tag = tag
-
-        def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
-            try:
-                if getattr(record, "_worker_tagged", False):
-                    return True
-                record.msg = f"{self._tag} {record.msg}"
-                setattr(record, "_worker_tagged", True)
-            except Exception:
-                pass
-            return True
-
+    # Don't set up custom logging - let the global custom logger system handle it
+    # The global system will properly format worker logs as [WORKER X/Y]
+    # Setting up additional handlers here causes conflicts and double bracketing
     root_logger = logging.getLogger()
-    # Ensure INFO level and a stdout handler so PM2 captures worker logs
     root_logger.setLevel(logging.INFO)
-    if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
-        sh = logging.StreamHandler(stream=sys.stdout)
-        sh.setLevel(logging.INFO)
-        # Use a distinct format for worker processes to differentiate from main loop
-        # Include the worker tag in the format
-        fmt = logging.Formatter(f"[{tag}] %(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s", 
-                               datefmt="%Y-%m-%d %H:%M:%S")
-        sh.setFormatter(fmt)
-        root_logger.addHandler(sh)
-    f = _WorkerTagFilter(tag)
-    root_logger.addFilter(f)
-    # Also attach to common app loggers
-    for name in ("gaia", "fiber", "database_manager", "validator_database_manager"):
-        logging.getLogger(name).addFilter(_WorkerTagFilter(tag))
     
     # Suppress duplicate logs from modules that also log in the main process
     # These modules will still log in the main process, just not in workers
@@ -174,7 +151,7 @@ async def main() -> None:
     try:
         idle = float(os.getenv("WEATHER_WORKER_IDLE_SLEEP", "5"))
         mem_limit = float(os.getenv("WEATHER_WORKER_RSS_LIMIT_MB", "3072"))
-        logger.info(f"{tag} started (idle_sleep={idle}s, rss_limit={mem_limit}MB)")
+        logger.info(f"started (idle_sleep={idle}s, rss_limit={mem_limit}MB)")
         await worker_loop(db, idle_sleep=idle, memory_limit_mb=mem_limit)
     finally:
         await db.close_all_connections()

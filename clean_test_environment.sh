@@ -12,25 +12,33 @@ echo "=================================================="
 echo "1️⃣ Stopping validator..."
 pm2 stop validator 2>/dev/null || echo "   Validator not running or already stopped"
 
-# Step 2: Clear pgBackRest backups (but keep stanza)
-echo "2️⃣ Clearing pgBackRest backups..."
-echo "   Stopping pgBackRest operations..."
-sudo -u postgres pgbackrest --stanza=gaia-test stop || true
+# Step 2: Clear pgBackRest backup data (but keep stanza configuration)
+echo "2️⃣ Wiping pgBackRest backup data..."
 
-echo "   Expiring all existing backups..."
-# Get list of all backups and expire them
-BACKUPS=$(sudo -u postgres pgbackrest --stanza=gaia-test info --output=json 2>/dev/null | jq -r '.[0].backup[]?.label // empty' || echo "")
-if [ ! -z "$BACKUPS" ]; then
-    for backup in $BACKUPS; do
-        echo "   Expiring backup: $backup"
-        sudo -u postgres pgbackrest --stanza=gaia-test expire --set=$backup || true
-    done
-else
-    echo "   No backups found to expire"
-fi
+# Remove any stop files that might be blocking operations
+echo "   Removing any pgBackRest stop files..."
+sudo rm -f /var/lib/pgbackrest/stop/gaia-test.stop 2>/dev/null || true
 
+# Start pgBackRest operations to allow cleanup
 echo "   Starting pgBackRest operations..."
 sudo -u postgres pgbackrest --stanza=gaia-test start || true
+
+# Get current backup info before wiping
+echo "   Checking current backups..."
+sudo -u postgres pgbackrest --stanza=gaia-test info || echo "   No backup info available"
+
+# Wipe all backup data from the repository (keeps stanza config)
+echo "   Wiping all backup data from repository..."
+# This removes all backup files but keeps the stanza configuration
+sudo -u postgres pgbackrest --stanza=gaia-test expire --repo1-retention-full=0 || true
+
+# Alternative approach: manually clean the backup directory in S3/R2
+echo "   Cleaning backup repository files..."
+# Remove backup.info files to force clean state (they'll be recreated on next backup)
+sudo rm -f /var/lib/pgbackrest/backup/gaia-test/backup.info* 2>/dev/null || true
+sudo rm -f /var/lib/pgbackrest/archive/gaia-test/archive.info* 2>/dev/null || true
+
+echo "   pgBackRest data wipe completed (stanza config preserved)"
 
 # Step 3: Drop and recreate database
 echo "3️⃣ Recreating database..."

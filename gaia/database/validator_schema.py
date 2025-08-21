@@ -435,6 +435,37 @@ weather_miner_responses_table = sa.Table(
         nullable=True,
         comment="UTC timestamp when the miner started inference processing",
     ),
+    # Pipeline timing tracking for total completion time analysis
+    sa.Column(
+        "job_accepted_at",
+        postgresql.TIMESTAMP(timezone=True),
+        nullable=True,
+        comment="UTC timestamp when the miner accepted the job (fetch_accepted)",
+    ),
+    sa.Column(
+        "inference_completed_at",
+        postgresql.TIMESTAMP(timezone=True),
+        nullable=True,
+        comment="UTC timestamp when inference was completed and forecast submitted",
+    ),
+    sa.Column(
+        "day1_scoring_completed_at",
+        postgresql.TIMESTAMP(timezone=True),
+        nullable=True,
+        comment="UTC timestamp when Day1 scoring was completed",
+    ),
+    sa.Column(
+        "era5_scoring_completed_at",
+        postgresql.TIMESTAMP(timezone=True),
+        nullable=True,
+        comment="UTC timestamp when ERA5 scoring was completed",
+    ),
+    sa.Column(
+        "total_pipeline_duration_seconds",
+        sa.Integer,
+        nullable=True,
+        comment="Total time from job acceptance to final scoring completion in seconds",
+    ),
     sa.UniqueConstraint(
         "run_id", "miner_uid", name="uq_weather_miner_responses_run_miner"
     ),
@@ -941,7 +972,7 @@ weather_forecast_stats_table = sa.Table(
         comment="Type of forecast: 10day, hindcast, cyclone_path, etc.",
     ),
     sa.Column(
-        "forecast_inference_time",
+        "forecast_inference_duration_seconds",
         sa.Integer,
         nullable=True,
         comment="Time taken for inference in seconds",

@@ -7,7 +7,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 import json
 import glob
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 
 logger = get_logger(__name__)
 

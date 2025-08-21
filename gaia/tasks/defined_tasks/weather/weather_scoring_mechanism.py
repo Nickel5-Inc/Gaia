@@ -12,7 +12,7 @@ import xarray as xr
 import pandas as pd
 import xskillscore as xs
 
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple
 
 if TYPE_CHECKING:

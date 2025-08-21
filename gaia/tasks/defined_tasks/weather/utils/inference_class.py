@@ -1,7 +1,7 @@
 import torch
 from aurora import Aurora, Batch, rollout
 from typing import List
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 import os
 from aurora.foundry import FoundryClient, BlobStorageChannel, submit
 import traceback

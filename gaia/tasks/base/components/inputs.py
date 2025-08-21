@@ -1,4 +1,4 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 from ..decorators import handle_validation_error

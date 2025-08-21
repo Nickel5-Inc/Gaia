@@ -7,12 +7,11 @@ from pydantic import (
     Field,
     validator,
     ConfigDict,
-    root_validator,
     model_validator,
 )
 from gaia.tasks.base.components.outputs import Outputs
 from gaia.tasks.base.decorators import handle_validation_error
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from enum import Enum
 
 logger = get_logger(__name__)

@@ -14,7 +14,7 @@ from gaia.tasks.defined_tasks.weather.weather_scoring_mechanism import (
 )
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
 from .step_logger import log_start, log_success, log_failure
-from .clim_cache import ensure_clim_cache, cleanup_clim_cache_if_done
+from .clim_cache import cleanup_clim_cache_if_done
 from .substep import substep
 from .util_time import get_effective_gfs_init
 
@@ -280,6 +280,17 @@ async def run_item(
                 status="day1_scored",
                 initial_score=float(overall),
             )
+            
+            # PIPELINE TIMING: Record Day1 completion time
+            await db.execute(
+                """
+                UPDATE weather_miner_responses 
+                SET day1_scoring_completed_at = NOW()
+                WHERE run_id = :run_id AND miner_uid = :miner_uid
+                """,
+                {"run_id": run_id, "miner_uid": miner_uid}
+            )
+            logger.debug(f"[Day1Step] Recorded Day1 completion time for miner {miner_uid}")
             await log_success(
                 db,
                 run_id=run_id,
@@ -293,6 +304,30 @@ async def run_item(
                 await stats.aggregate_miner_stats(miner_uid=miner_uid)
             except Exception:
                 pass
+            
+            # SELF-MANAGING PIPELINE: Create ERA5 job upon Day1 completion
+            try:
+                era5_singleton_key = f"era5_score_run_{run_id}_miner_{miner_uid}"
+                era5_job_id = await db.enqueue_singleton_job(
+                    singleton_key=era5_singleton_key,
+                    job_type="weather.era5",
+                    payload={
+                        "run_id": run_id,
+                        "miner_uid": miner_uid,
+                        "miner_hotkey": miner_hotkey,
+                        "response_id": response_id,
+                    },
+                    priority=65,  # Slightly lower priority than Day1
+                    run_id=run_id,
+                    miner_uid=miner_uid,
+                )
+                if era5_job_id:
+                    logger.info(f"[Day1Step] ✓ Created ERA5 successor job {era5_job_id} for miner {miner_uid}")
+                else:
+                    logger.debug(f"[Day1Step] ERA5 job already exists for miner {miner_uid}")
+            except Exception as e:
+                logger.warning(f"[Day1Step] Failed to create ERA5 successor job for miner {miner_uid}: {e}")
+            
         from gaia.tasks.defined_tasks.weather.processing.weather_logic import _check_run_completion
         try:
             await _check_run_completion(task, run_id)

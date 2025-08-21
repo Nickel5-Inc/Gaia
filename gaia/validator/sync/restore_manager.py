@@ -2,7 +2,7 @@
 import asyncio
 import os
 import subprocess  # For pgBackRest commands
-from fiber.logging_utils import get_logger
+from gaia.utils.custom_logger import get_logger
 from typing import Optional
 
 logger = get_logger(__name__)
