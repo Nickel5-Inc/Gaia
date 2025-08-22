@@ -1950,7 +1950,7 @@ async def calculate_era5_miner_score(
                 var_name = var_config["name"]
                 var_level = var_config.get("level")
                 standard_name_for_clim = var_config.get("standard_name", var_name)
-                var_key = f"{var_name}{var_level if var_level else ''}"
+                var_key = f"{var_name}{var_level if var_level and var_level != 'all' else ''}"
 
                 # Ensure both datetimes are proper datetime objects for subtraction
                 if isinstance(gfs_init_time_of_run, (int, float)):

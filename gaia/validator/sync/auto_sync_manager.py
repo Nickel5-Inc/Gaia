@@ -1897,7 +1897,9 @@ pg1-user={self.config['pguser']}
                 )
                 logger.error(f"Error output: {stderr.decode()}")
                 if stdout:
-                    logger.debug(f"Backup stdout: {stdout.decode()}")
+                    # Escape angle brackets to prevent Loguru color tag parsing errors
+                    backup_output = stdout.decode().replace('<', '&lt;').replace('>', '&gt;')
+                    logger.debug(f"Backup stdout: {backup_output}")
                 return False
 
             logger.info(
@@ -1911,7 +1913,9 @@ pg1-user={self.config['pguser']}
             )
 
             if stdout:
-                logger.debug(f"Backup output: {stdout.decode()}")
+                # Escape angle brackets to prevent Loguru color tag parsing errors
+                backup_output = stdout.decode().replace('<', '&lt;').replace('>', '&gt;')
+                logger.debug(f"Backup output: {backup_output}")
 
             # Verify backup was uploaded to R2
             logger.info("🔍 Verifying initial backup upload to R2...")
@@ -2829,7 +2833,9 @@ pg1-user={self.config['pguser']}
                 )
 
                 if stdout:
-                    logger.debug(f"Backup output: {stdout.decode()}")
+                    # Escape angle brackets to prevent Loguru color tag parsing errors
+                    backup_output = stdout.decode().replace('<', '&lt;').replace('>', '&gt;')
+                    logger.debug(f"Backup output: {backup_output}")
 
                 # Verify R2 upload by checking backup info
                 logger.info("🔍 Verifying backup upload to R2...")
@@ -2868,7 +2874,9 @@ pg1-user={self.config['pguser']}
                 )
                 logger.error(f"Error output: {stderr.decode()}")
                 if stdout:
-                    logger.debug(f"Backup stdout: {stdout.decode()}")
+                    # Escape angle brackets to prevent Loguru color tag parsing errors
+                    backup_output = stdout.decode().replace('<', '&lt;').replace('>', '&gt;')
+                    logger.debug(f"Backup stdout: {backup_output}")
                 return False
 
         except Exception as e:

@@ -1161,19 +1161,7 @@ def factory_router(miner_instance) -> APIRouter:
             methods=["POST"],
             response_class=JSONResponse,
         )
-        router.add_api_route(
-            "/weather-poll-job-status",
-            weather_get_input_status_require,
-            tags=["Weather"],
-            dependencies=[
-                Depends(blacklist_low_stake), 
-                Depends(verify_request),
-                Depends(hotkey_blacklist_checker)  # Add custom blacklist check
-            ],
-            methods=["POST"],
-            response_class=JSONResponse,
-        )
-        # NEW: Simplified polling endpoint for job status
+        # Use the new simplified polling endpoint for job status
         router.add_api_route(
             "/weather-poll-job-status",
             weather_poll_job_status,

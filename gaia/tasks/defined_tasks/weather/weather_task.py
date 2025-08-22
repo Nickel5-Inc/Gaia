@@ -309,7 +309,29 @@ def _load_config(self):
         "gs://weatherbench2/datasets/era5-hourly-climatology/1990-2019_6h_1440x721.zarr",
     )
 
-    # Day-1 Scoring Specific Configurations
+    # Comprehensive Scoring Configuration - All Variables and Pressure Levels (except static vars)
+    # Surface variables (no pressure level)
+    surface_vars = [
+        {"name": "2t", "level": None, "standard_name": "2m_temperature"},
+        {"name": "10u", "level": None, "standard_name": "10m_u_component_of_wind"},
+        {"name": "10v", "level": None, "standard_name": "10m_v_component_of_wind"},
+        {"name": "msl", "level": None, "standard_name": "mean_sea_level_pressure"},
+    ]
+    
+    # Atmospheric variables (will handle all pressure levels as dimensions)
+    atmospheric_vars = [
+        {"name": "t", "level": "all", "standard_name": "temperature"},
+        {"name": "u", "level": "all", "standard_name": "u_component_of_wind"},
+        {"name": "v", "level": "all", "standard_name": "v_component_of_wind"},
+        {"name": "q", "level": "all", "standard_name": "specific_humidity"},
+        {"name": "z", "level": "all", "standard_name": "geopotential"},
+    ]
+    
+    # Combine all variables (surface + atmospheric, excluding static vars)
+    # This gives us 9 total variables instead of 69 variable/level combinations
+    default_comprehensive_vars_levels = surface_vars + atmospheric_vars
+    
+    # For backward compatibility, keep a subset for day1 if needed
     default_day1_vars_levels = [
         {"name": "z", "level": 500, "standard_name": "geopotential"},
         {"name": "t", "level": 850, "standard_name": "temperature"},
@@ -318,16 +340,33 @@ def _load_config(self):
     ]
     try:
         day1_vars_levels_json = os.getenv("WEATHER_DAY1_VARIABLES_LEVELS_JSON")
-        config["day1_variables_levels_to_score"] = (
-            loads(day1_vars_levels_json)
-            if day1_vars_levels_json
-            else default_day1_vars_levels
-        )
+        if day1_vars_levels_json:
+            config["day1_variables_levels_to_score"] = loads(day1_vars_levels_json)
+        else:
+            # Use comprehensive scoring by default, fallback to subset if needed
+            use_comprehensive = os.getenv("WEATHER_USE_COMPREHENSIVE_SCORING", "true").lower() in ["true", "1", "yes"]
+            config["day1_variables_levels_to_score"] = (
+                default_comprehensive_vars_levels if use_comprehensive else default_day1_vars_levels
+            )
     except Exception:
         logger.warning(
-            "Invalid JSON for WEATHER_DAY1_VARIABLES_LEVELS_JSON. Using default."
+            "Invalid JSON for WEATHER_DAY1_VARIABLES_LEVELS_JSON. Using default comprehensive scoring."
         )
-        config["day1_variables_levels_to_score"] = default_day1_vars_levels
+        config["day1_variables_levels_to_score"] = default_comprehensive_vars_levels
+    
+    # Also set final scoring variables to use the same comprehensive list
+    try:
+        final_vars_levels_json = os.getenv("WEATHER_FINAL_SCORING_VARIABLES_LEVELS_JSON")
+        if final_vars_levels_json:
+            config["final_scoring_variables_levels"] = loads(final_vars_levels_json)
+        else:
+            # Use comprehensive scoring for final scoring as well
+            config["final_scoring_variables_levels"] = default_comprehensive_vars_levels
+    except Exception:
+        logger.warning(
+            "Invalid JSON for WEATHER_FINAL_SCORING_VARIABLES_LEVELS_JSON. Using comprehensive scoring."
+        )
+        config["final_scoring_variables_levels"] = default_comprehensive_vars_levels
 
     default_day1_clim_bounds = {
         "2t": (180, 340),  # Kelvin

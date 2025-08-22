@@ -250,12 +250,16 @@ async def run_item(
     latency_ms = int((time.perf_counter() - t0) * 1000)
     # Aggregate/update stats
     try:
+        # Get ERA5 RMSE scores (they are stored as era5_rmse_varname_leadh format)
         rows = await db.fetch_all(
             sa.text(
                 """
-                SELECT lead_hours, score
+                SELECT lead_hours, AVG(score) as avg_score
                 FROM weather_miner_scores
-                WHERE run_id = :rid AND miner_uid = :uid AND score_type = 'era5_rmse'
+                WHERE run_id = :rid AND miner_uid = :uid AND score_type LIKE 'era5_rmse_%'
+                AND score IS NOT NULL
+                GROUP BY lead_hours
+                ORDER BY lead_hours
                 """
             ),
             {"rid": run_id, "uid": miner_uid},
@@ -263,7 +267,7 @@ async def run_item(
         era5_scores = {}
         for r in rows:
             lh = r.get("lead_hours")
-            sc = r.get("score")
+            sc = r.get("avg_score")
             if lh is not None and sc is not None:
                 era5_scores[int(lh)] = float(sc)
         completed_now = len([h for h in leads if h in era5_scores]) >= len(leads)

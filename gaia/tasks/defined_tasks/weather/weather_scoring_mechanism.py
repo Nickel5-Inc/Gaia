@@ -664,7 +664,7 @@ async def _process_single_variable_parallel(
     var_name = var_config["name"]
     var_level = var_config.get("level")
     standard_name_for_clim = var_config.get("standard_name", var_name)
-    var_key = f"{var_name}{var_level}" if var_level else var_name
+    var_key = f"{var_name}{var_level}" if var_level and var_level != "all" else var_name
 
     result = {
         "status": "processing",
@@ -847,37 +847,47 @@ async def _process_single_variable_parallel(
                 result["qc_failure_reason"] = "Missing pressure dimensions"
                 return result
 
-            miner_var_da_selected = miner_var_da_unaligned.sel(
-                {miner_pressure_dim: var_level}, method="nearest"
-            )
-            truth_var_da_selected = truth_var_da_unaligned.sel(
-                {truth_pressure_dim: var_level}, method="nearest"
-            )
-            ref_var_da_selected = ref_var_da_unaligned.sel(
-                {ref_pressure_dim: var_level}, method="nearest"
-            )
+            if var_level == "all":
+                # Keep all pressure levels for comprehensive scoring
+                miner_var_da_selected = miner_var_da_unaligned
+                truth_var_da_selected = truth_var_da_unaligned  
+                ref_var_da_selected = ref_var_da_unaligned
+                logger.info(f"Scoring {var_key} across all pressure levels")
+            else:
+                # Select specific pressure level
+                miner_var_da_selected = miner_var_da_unaligned.sel(
+                    {miner_pressure_dim: var_level}, method="nearest"
+                )
+                truth_var_da_selected = truth_var_da_unaligned.sel(
+                    {truth_pressure_dim: var_level}, method="nearest"
+                )
+                ref_var_da_selected = ref_var_da_unaligned.sel(
+                    {ref_pressure_dim: var_level}, method="nearest"
+                )
 
-            if abs(truth_var_da_selected[truth_pressure_dim].item() - var_level) > 10:
-                logger.warning(
-                    f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected[truth_pressure_dim].item()}). Skipping."
-                )
-                result["status"] = "skipped"
-                result["qc_failure_reason"] = "Truth data level too far from target"
-                return result
-            if abs(miner_var_da_selected[miner_pressure_dim].item() - var_level) > 10:
-                logger.warning(
-                    f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected[miner_pressure_dim].item()}). Skipping."
-                )
-                result["status"] = "skipped"
-                result["qc_failure_reason"] = "Miner data level too far from target"
-                return result
-            if abs(ref_var_da_selected[ref_pressure_dim].item() - var_level) > 10:
-                logger.warning(
-                    f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected[ref_pressure_dim].item()}). Skipping."
-                )
-                result["status"] = "skipped"
-                result["qc_failure_reason"] = "Reference data level too far from target"
-                return result
+            # Skip level validation for "all" case since we're using all levels
+            if var_level != "all":
+                if abs(truth_var_da_selected[truth_pressure_dim].item() - var_level) > 10:
+                    logger.warning(
+                        f"Truth data for {var_key} level {var_level} too far ({truth_var_da_selected[truth_pressure_dim].item()}). Skipping."
+                    )
+                    result["status"] = "skipped"
+                    result["qc_failure_reason"] = "Truth data level too far from target"
+                    return result
+                if abs(miner_var_da_selected[miner_pressure_dim].item() - var_level) > 10:
+                    logger.warning(
+                        f"Miner data for {var_key} level {var_level} too far ({miner_var_da_selected[miner_pressure_dim].item()}). Skipping."
+                    )
+                    result["status"] = "skipped"
+                    result["qc_failure_reason"] = "Miner data level too far from target"
+                    return result
+                if abs(ref_var_da_selected[ref_pressure_dim].item() - var_level) > 10:
+                    logger.warning(
+                        f"GFS Ref data for {var_key} level {var_level} too far ({ref_var_da_selected[ref_pressure_dim].item()}). Skipping."
+                    )
+                    result["status"] = "skipped"
+                    result["qc_failure_reason"] = "Reference data level too far from target"
+                    return result
         else:
             miner_var_da_selected = miner_var_da_unaligned
             truth_var_da_selected = truth_var_da_unaligned
@@ -1156,35 +1166,88 @@ async def _process_single_variable_parallel(
             miner_var_da_aligned, truth_var_da_final
         )
 
-        # MSE Skill Score
-        skill_score = await calculate_mse_skill_score(
-            forecast_bc_da,
-            truth_var_da_final,
-            ref_var_da_aligned,
-            broadcasted_weights_final,
-        )
+        # Check if this is a pressure-level variable for detailed scoring
+        if var_level == "all" and "pressure_level" in miner_var_da_aligned.dims:
+            # Per-pressure-level scoring for atmospheric variables
+            logger.info(f"Calculating detailed per-pressure-level metrics for {var_name}")
+            
+            from ..weather_scoring.metrics import (
+                calculate_mse_skill_score_by_pressure_level,
+                calculate_acc_by_pressure_level,
+                calculate_rmse_by_pressure_level
+            )
+            
+            # Single vectorized calculations that preserve pressure level dimension
+            skill_scores_by_level = await calculate_mse_skill_score_by_pressure_level(
+                forecast_bc_da, truth_var_da_final, ref_var_da_aligned, broadcasted_weights_final
+            )
+            acc_scores_by_level = await calculate_acc_by_pressure_level(
+                miner_var_da_aligned, truth_var_da_final, clim_var_da_aligned, broadcasted_weights_final
+            )
+            rmse_scores_by_level = await calculate_rmse_by_pressure_level(
+                miner_var_da_aligned, truth_var_da_final, broadcasted_weights_final
+            )
+            
+            # Apply clone penalty to skill scores and calculate averages for backward compatibility
+            avg_skill_score = 0.0
+            avg_acc_score = 0.0
+            avg_rmse_score = 0.0
+            valid_levels = 0
+            
+            for level in skill_scores_by_level.keys():
+                if level in acc_scores_by_level and level in rmse_scores_by_level:
+                    # Apply clone penalty per level
+                    skill_scores_by_level[level] -= clone_penalty
+                    avg_skill_score += skill_scores_by_level[level]
+                    avg_acc_score += acc_scores_by_level[level]
+                    avg_rmse_score += rmse_scores_by_level[level]
+                    valid_levels += 1
+            
+            # Store averages for backward compatibility
+            result["skill_score"] = avg_skill_score / valid_levels if valid_levels > 0 else -np.inf
+            result["acc_score"] = avg_acc_score / valid_levels if valid_levels > 0 else -np.inf
+            result["rmse"] = avg_rmse_score / valid_levels if valid_levels > 0 else np.inf
+            
+            # Store detailed pressure-level results for component scoring
+            result["pressure_level_scores"] = {
+                "skill": skill_scores_by_level,
+                "acc": acc_scores_by_level,
+                "rmse": rmse_scores_by_level
+            }
+            
+            logger.info(f"Extracted detailed metrics for {valid_levels} pressure levels")
+            
+        else:
+            # Traditional single-level scoring for surface variables or specific pressure levels
+            skill_score = await calculate_mse_skill_score(
+                forecast_bc_da,
+                truth_var_da_final,
+                ref_var_da_aligned,
+                broadcasted_weights_final,
+            )
+            
+            # clone penalty
+            skill_score_after_penalty = skill_score - clone_penalty
+            result["skill_score"] = skill_score_after_penalty
 
-        # clone penalty
-        skill_score_after_penalty = skill_score - clone_penalty
-        result["skill_score"] = skill_score_after_penalty
-
-        # ACC
-        acc_score = await calculate_acc(
-            miner_var_da_aligned,
-            truth_var_da_final,
-            clim_var_da_aligned,
-            broadcasted_weights_final,
-        )
-        result["acc_score"] = acc_score
+            # ACC
+            acc_score = await calculate_acc(
+                miner_var_da_aligned,
+                truth_var_da_final,
+                clim_var_da_aligned,
+                broadcasted_weights_final,
+            )
+            result["acc_score"] = acc_score
 
         # ACC Lower Bound Check
+        current_acc_score = result.get("acc_score", -np.inf)
         if (
             effective_lead_h == 12
-            and np.isfinite(acc_score)
-            and acc_score < day1_scoring_config.get("acc_lower_bound_d1", 0.6)
+            and np.isfinite(current_acc_score)
+            and current_acc_score < day1_scoring_config.get("acc_lower_bound_d1", 0.6)
         ):
             logger.warning(
-                f"[Day1Score] Miner {miner_hotkey}: ACC for {var_key} at valid time {valid_time_dt} (Eff. Lead 12h) ({acc_score:.3f}) is below threshold."
+                f"[Day1Score] Miner {miner_hotkey}: ACC for {var_key} at valid time {valid_time_dt} (Eff. Lead 12h) ({current_acc_score:.3f}) is below threshold."
             )
 
         # Mark as successful
@@ -1356,7 +1419,7 @@ async def precompute_climatology_cache(
             var_name = var_config["name"]
             var_level = var_config.get("level")
             standard_name_for_clim = var_config.get("standard_name", var_name)
-            var_key = f"{var_name}{var_level}" if var_level else var_name
+            var_key = f"{var_name}{var_level}" if var_level and var_level != "all" else var_name
 
             cache_key = f"{var_name}_{var_level}_{valid_time_dt.isoformat()}"
 
@@ -1891,7 +1954,7 @@ async def _process_single_timestep_parallel(
         for var_config in variables_to_score:
             var_name = var_config["name"]
             var_level = var_config.get("level")
-            var_key = f"{var_name}{var_level}" if var_level else var_name
+            var_key = f"{var_name}{var_level}" if var_level and var_level != "all" else var_name
 
             # Initialize result structure for this variable
             timestep_results["variables"][var_key] = {

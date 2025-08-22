@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import numpy as np
+import os
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
@@ -17,6 +19,37 @@ from .step_logger import log_start, log_success, log_failure
 from .clim_cache import cleanup_clim_cache_if_done
 from .substep import substep
 from .util_time import get_effective_gfs_init
+from ...weather_scoring.scoring import VARIABLE_WEIGHTS
+
+
+async def _score_variable_batch(
+    task: WeatherTask,
+    miner_record: dict,
+    gfs_analysis_ds,
+    gfs_ref_ds,
+    era5_clim,
+    day1_cfg: dict,
+    gfs_init,
+    variable_batch: list,
+    precomputed_cache=None
+):
+    """
+    Score a batch of variables for a miner to manage memory usage.
+    """
+    # Create a modified config with only the variables in this batch
+    batch_config = day1_cfg.copy()
+    batch_config["variables_levels_to_score"] = variable_batch
+    
+    return await evaluate_miner_forecast_day1(
+        task_instance=task,
+        miner_response_db_record=miner_record,
+        gfs_analysis_data_for_run=gfs_analysis_ds,
+        gfs_reference_forecast_for_run=gfs_ref_ds,
+        era5_climatology=era5_clim,
+        day1_scoring_config=batch_config,
+        run_gfs_init_time=gfs_init,
+        precomputed_climatology_cache=precomputed_cache,
+    )
 
 
 @substep("day1", "load_inputs", should_retry=True, retry_delay_seconds=600, max_retries=5, retry_backoff="exponential")
@@ -85,7 +118,10 @@ async def run_item(
     response_id: int,
     validator: Optional[Any] = None,
 ) -> bool:
-    """Process Day1 for a specific miner/run item (used by generic queue dispatcher)."""
+    """
+    Main day1 scoring orchestrator - now creates individual variable-level jobs
+    instead of scoring all variables at once.
+    """
     run = await db.fetch_one(
         "SELECT id, gfs_init_time_utc FROM weather_forecast_runs WHERE id = :rid",
         {"rid": run_id},
@@ -171,23 +207,72 @@ async def run_item(
             f"No variables configured for Day1 scoring! Check day1_variables_levels_to_score in task config."
         )
     
+    # Process variables individually to manage memory usage
+    all_variables = day1_cfg["variables_levels_to_score"]
+    
+    logger.info(f"[Day1Step] Run {run_id} Miner {miner_uid}: Processing {len(all_variables)} variables individually")
+    
     import time
     t0 = time.perf_counter()
+    
+    # Process each variable separately
+    all_results = {}
+    overall_score = 0.0
+    total_variables_scored = 0
+    
     try:
-        result = await _score_day1(
-            db,
-            task,
-            run_id=run_id,
-            miner_uid=miner_uid,
-            miner_hotkey=miner_hotkey,
-            gfs_init=gfs_init,
-            miner_record=miner_record,
-            gfs_analysis_ds=gfs_analysis_ds,
-            gfs_ref_ds=gfs_ref_ds,
-            era5_clim=era5_clim,
-            day1_cfg=day1_cfg,
-        )
-    except Exception:
+        for var_idx, variable_config in enumerate(all_variables):
+            var_name = variable_config["name"]
+            var_level = variable_config.get("level")
+            
+            logger.info(f"[Day1Step] Run {run_id} Miner {miner_uid}: Processing variable {var_idx+1}/{len(all_variables)}: {var_name} (level: {var_level})")
+            
+            # Create single-variable batch for this variable
+            single_var_batch = [variable_config]
+            
+            batch_result = await _score_variable_batch(
+                task=task,
+                miner_record=miner_record,
+                gfs_analysis_ds=gfs_analysis_ds,
+                gfs_ref_ds=gfs_ref_ds,
+                era5_clim=era5_clim,
+                day1_cfg=day1_cfg,
+                gfs_init=gfs_init,
+                variable_batch=single_var_batch,
+                precomputed_cache=None  # Will be handled per variable
+            )
+            
+            if batch_result and isinstance(batch_result, dict):
+                # Merge variable results
+                if "lead_time_scores" in batch_result:
+                    if "lead_time_scores" not in all_results:
+                        all_results["lead_time_scores"] = {}
+                    
+                    for lead_time, variables in batch_result["lead_time_scores"].items():
+                        if lead_time not in all_results["lead_time_scores"]:
+                            all_results["lead_time_scores"][lead_time] = {}
+                        all_results["lead_time_scores"][lead_time].update(variables)
+                
+                # Accumulate overall score
+                if "overall_day1_score" in batch_result and batch_result["overall_day1_score"] > -np.inf:
+                    overall_score += batch_result["overall_day1_score"]
+                    total_variables_scored += 1
+                    
+            # Memory cleanup between variables
+            import gc
+            gc.collect()
+        
+        # Calculate final overall score
+        if total_variables_scored > 0:
+            overall_score = overall_score / total_variables_scored
+            all_results["overall_day1_score"] = overall_score
+        else:
+            all_results = None
+            
+        result = all_results
+        
+    except Exception as e:
+        logger.error(f"[Day1Step] Error in variable processing: {e}", exc_info=True)
         result = None
     latency_ms = int((time.perf_counter() - t0) * 1000)
     try:
@@ -214,42 +299,94 @@ async def run_item(
                         # Convert lead_hours to valid_time
                         valid_time = gfs_init + timedelta(hours=int(lead_hours))
                         
-                        # Prepare variable scores for component score recording
-                        variable_scores = {}
+                        # Prepare component scores with detailed pressure-level breakdown
+                        component_scores_to_insert = []
                         for var_key, var_data in variables.items():
                             if isinstance(var_data, dict):
-                                # Extract pressure level if present in var_key (e.g., "t_850")
-                                parts = var_key.split('_')
-                                var_name = parts[0]
-                                pressure_level = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                                # Parse variable name from var_key
+                                var_name = var_key
                                 
-                                variable_scores[var_name] = {
-                                    "pressure_level": pressure_level,
-                                    "skill_score": var_data.get("skill_score"),
-                                    "acc": var_data.get("acc_score"),
-                                    "rmse": var_data.get("rmse"),
-                                    "bias": var_data.get("bias"),
-                                    "mae": var_data.get("mae"),
-                                    "pattern_correlation": var_data.get("pattern_correlation"),
-                                    "pattern_correlation_passed": var_data.get("pattern_correlation_passed"),
-                                    "climatology_check_passed": var_data.get("climatology_check_passed"),
-                                    "clone_penalty": var_data.get("clone_penalty_applied", 0),
-                                    "weight": 1.0 / len(variables),
-                                    "calculation_duration_ms": latency_ms // len(lead_time_scores),
-                                }
+                                # Check if this variable has detailed pressure-level scores
+                                pressure_level_scores = var_data.get("pressure_level_scores", {})
+                                
+                                if pressure_level_scores:
+                                    # Create component scores for each pressure level
+                                    skill_scores = pressure_level_scores.get("skill", {})
+                                    acc_scores = pressure_level_scores.get("acc", {})
+                                    rmse_scores = pressure_level_scores.get("rmse", {})
+                                    
+                                    # Get all pressure levels that have scores
+                                    all_levels = set(skill_scores.keys()) | set(acc_scores.keys()) | set(rmse_scores.keys())
+                                    
+                                    for pressure_level in all_levels:
+                                        component_score = {
+                                            "run_id": run_id,
+                                            "response_id": response_id,
+                                            "miner_uid": miner_uid,
+                                            "miner_hotkey": miner_hotkey,
+                                            "score_type": "day1",
+                                            "lead_hours": int(lead_hours),
+                                            "valid_time_utc": valid_time,
+                                            "variable_name": var_name,
+                                            "pressure_level": pressure_level,
+                                            "skill_score": skill_scores.get(pressure_level),
+                                            "acc": acc_scores.get(pressure_level),
+                                            "rmse": rmse_scores.get(pressure_level),
+                                            "bias": var_data.get("bias"),
+                                            "mae": var_data.get("mae"),
+                                            "pattern_correlation": var_data.get("pattern_correlation"),
+                                            "pattern_correlation_passed": var_data.get("pattern_correlation_passed"),
+                                            "climatology_check_passed": var_data.get("climatology_check_passed"),
+                                            "clone_penalty": var_data.get("clone_penalty_applied", 0),
+                                            "variable_weight": VARIABLE_WEIGHTS.get(var_name, 0.0),
+                                            "calculation_duration_ms": latency_ms // len(lead_time_scores),
+                                        }
+                                        component_scores_to_insert.append(component_score)
+                                else:
+                                    # Traditional single-score approach for surface variables
+                                    # Parse pressure level if present in var_key
+                                    pressure_level = None
+                                    if var_key[-4:].isdigit() and len(var_key) > 4:
+                                        pressure_level = int(var_key[-4:])
+                                        var_name = var_key[:-4]
+                                    elif var_key[-3:].isdigit() and len(var_key) > 3:
+                                        pressure_level = int(var_key[-3:])
+                                        var_name = var_key[:-3]
+                                    
+                                    component_score = {
+                                        "run_id": run_id,
+                                        "response_id": response_id,
+                                        "miner_uid": miner_uid,
+                                        "miner_hotkey": miner_hotkey,
+                                        "score_type": "day1",
+                                        "lead_hours": int(lead_hours),
+                                        "valid_time_utc": valid_time,
+                                        "variable_name": var_name,
+                                        "pressure_level": pressure_level,
+                                        "skill_score": var_data.get("skill_score"),
+                                        "acc": var_data.get("acc_score"),
+                                        "rmse": var_data.get("rmse"),
+                                        "bias": var_data.get("bias"),
+                                        "mae": var_data.get("mae"),
+                                        "pattern_correlation": var_data.get("pattern_correlation"),
+                                        "pattern_correlation_passed": var_data.get("pattern_correlation_passed"),
+                                        "climatology_check_passed": var_data.get("climatology_check_passed"),
+                                        "clone_penalty": var_data.get("clone_penalty_applied", 0),
+                                        "variable_weight": VARIABLE_WEIGHTS.get(var_name, 0.0),
+                                        "calculation_duration_ms": latency_ms // len(lead_time_scores),
+                                    }
+                                    component_scores_to_insert.append(component_score)
                         
-                        # Record component scores
-                        if variable_scores:
-                            await stats.record_component_scores(
-                                run_id=run_id,
-                                response_id=response_id,
-                                miner_uid=miner_uid,
-                                miner_hotkey=miner_hotkey,
-                                score_type="day1",
-                                lead_hours=int(lead_hours),
-                                valid_time=valid_time,
-                                variable_scores=variable_scores
+                        # Record detailed component scores directly using batch insert
+                        if component_scores_to_insert:
+                            from gaia.tasks.defined_tasks.weather.processing.weather_logic import _batch_insert_component_scores
+                            success = await _batch_insert_component_scores(
+                                db, component_scores_to_insert, batch_size=50
                             )
+                            if success:
+                                logger.info(f"[Day1Step] Inserted {len(component_scores_to_insert)} detailed component scores for lead {lead_hours}h")
+                            else:
+                                logger.warning(f"[Day1Step] Failed to insert some component scores for lead {lead_hours}h")
                             
                 # CRITICAL FIX: Write overall score to weather_miner_scores table
                 await db.execute(

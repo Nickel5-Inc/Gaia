@@ -14,6 +14,21 @@ evaluating weather forecasts, including RMSE, MAE, bias, correlation,
 """
 
 
+def _compute_metric_to_array(metric_func, *args, **kwargs):
+    """
+    Helper function to compute metrics and preserve array structure.
+    Handles both numpy arrays and dask arrays properly.
+    This function is synchronous and designed to be called via asyncio.to_thread().
+    """
+    result = metric_func(*args, **kwargs)
+
+    # Force computation if it's a dask array
+    if hasattr(result, "compute"):
+        result = result.compute()
+
+    return result
+
+
 def _compute_metric_to_scalar_array(metric_func, *args, **kwargs):
     """
     Helper function to compute metrics and convert to scalar using sync processing.
@@ -97,6 +112,81 @@ async def calculate_bias_corrected_forecast(
     except Exception as e:
         logger.error(f"Error in calculate_bias_corrected_forecast: {e}", exc_info=True)
         return forecast_da
+
+
+async def calculate_mse_skill_score_by_pressure_level(
+    forecast_bc_da: xr.DataArray,
+    truth_da: xr.DataArray,
+    reference_da: xr.DataArray,
+    lat_weights: xr.DataArray,
+) -> Dict[int, float]:
+    """
+    Calculate MSE skill score for each pressure level from vectorized calculations.
+    Returns a dict mapping pressure_level -> skill_score.
+    """
+    try:
+        spatial_dims = [
+            d for d in forecast_bc_da.dims
+            if d.lower() in ("latitude", "longitude", "lat", "lon")
+        ]
+        if not spatial_dims:
+            logger.error("No spatial dimensions (lat/lon) found for MSE skill score.")
+            return {}
+
+        # Single vectorized MSE calculations (preserve pressure_level dimension)
+        mse_forecast_result = await asyncio.to_thread(
+            _compute_metric_to_array,  # Use array-preserving helper
+            xs.mse,
+            forecast_bc_da,
+            truth_da,
+            dim=spatial_dims,  # Only reduce lat/lon
+            weights=lat_weights,
+            skipna=True,
+        )
+        
+        mse_reference_result = await asyncio.to_thread(
+            _compute_metric_to_array,  # Use array-preserving helper
+            xs.mse,
+            reference_da,
+            truth_da,
+            dim=spatial_dims,  # Only reduce lat/lon
+            weights=lat_weights,
+            skipna=True,
+        )
+
+        # Extract per-pressure-level skill scores
+        per_level_scores = {}
+        if "pressure_level" in mse_forecast_result.dims:
+            # Atmospheric variable - extract each pressure level
+            for level in mse_forecast_result.coords["pressure_level"]:
+                level_val = int(level.item())
+                
+                mse_forecast_val = float(mse_forecast_result.sel(pressure_level=level).item())
+                mse_reference_val = float(mse_reference_result.sel(pressure_level=level).item())
+                
+                if mse_reference_val == 0:
+                    skill_score = 1.0 if mse_forecast_val == 0 else -np.inf
+                else:
+                    skill_score = 1 - (mse_forecast_val / mse_reference_val)
+                
+                per_level_scores[level_val] = skill_score
+        else:
+            # Surface variable - single score
+            mse_forecast_val = float(mse_forecast_result.item())
+            mse_reference_val = float(mse_reference_result.item())
+            
+            if mse_reference_val == 0:
+                skill_score = 1.0 if mse_forecast_val == 0 else -np.inf
+            else:
+                skill_score = 1 - (mse_forecast_val / mse_reference_val)
+            
+            per_level_scores[None] = skill_score
+        
+        return per_level_scores
+
+    except Exception as e:
+        logger.error(f"Error calculating MSE skill score by pressure level: {e}")
+        return {}
 
 
 async def calculate_mse_skill_score(
@@ -197,6 +287,59 @@ async def calculate_mse_skill_score(
     except Exception as e:
         logger.error(f"Error calculating MSE skill score: {e}")
         return -np.inf
+
+
+async def calculate_acc_by_pressure_level(
+    forecast_da: xr.DataArray,
+    truth_da: xr.DataArray,
+    climatology_da: xr.DataArray,
+    lat_weights: xr.DataArray,
+) -> Dict[int, float]:
+    """
+    Calculate ACC for each pressure level from a single vectorized calculation.
+    Returns a dict mapping pressure_level -> acc_score.
+    """
+    try:
+        spatial_dims = [
+            d for d in forecast_da.dims
+            if d.lower() in ("latitude", "longitude", "lat", "lon")
+        ]
+        if not spatial_dims:
+            logger.error("No spatial dimensions (lat/lon) found for ACC.")
+            return {}
+
+        # Calculate anomalies once
+        forecast_anom = forecast_da - climatology_da
+        truth_anom = truth_da - climatology_da
+
+        # Single vectorized ACC calculation across all pressure levels
+        acc_result = await asyncio.to_thread(
+            _compute_metric_to_array,  # Use array-preserving helper
+            xs.pearson_r,
+            forecast_anom,
+            truth_anom,
+            dim=spatial_dims,  # Only reduce lat/lon, preserve pressure_level
+            weights=lat_weights,
+            skipna=True,
+        )
+
+        # Extract per-pressure-level scores
+        per_level_scores = {}
+        if "pressure_level" in acc_result.dims:
+            # Atmospheric variable - extract each pressure level
+            for level in acc_result.coords["pressure_level"]:
+                level_val = int(level.item())
+                score_val = float(acc_result.sel(pressure_level=level).item())
+                per_level_scores[level_val] = score_val
+        else:
+            # Surface variable - single score
+            per_level_scores[None] = float(acc_result.item())
+        
+        return per_level_scores
+
+    except Exception as e:
+        logger.error(f"Error calculating ACC by pressure level: {e}")
+        return {}
 
 
 async def calculate_acc(
@@ -406,6 +549,52 @@ async def perform_sanity_checks(
 
     logger.info(f"Sanity check results for {variable_name}: {results}")
     return results
+
+
+async def calculate_rmse_by_pressure_level(
+    forecast_da: xr.DataArray, truth_da: xr.DataArray, lat_weights: xr.DataArray
+) -> Dict[int, float]:
+    """
+    Calculate RMSE for each pressure level from a single vectorized calculation.
+    Returns a dict mapping pressure_level -> rmse_score.
+    """
+    try:
+        spatial_dims = [
+            d for d in forecast_da.dims 
+            if d.lower() in ("latitude", "longitude", "lat", "lon")
+        ]
+        if not spatial_dims:
+            logger.error("No spatial dimensions (lat/lon) found for RMSE.")
+            return {}
+
+        # Single vectorized calculation across all pressure levels
+        rmse_result = await asyncio.to_thread(
+            _compute_metric_to_array,  # Use array-preserving helper
+            xs.rmse,
+            forecast_da,
+            truth_da,
+            dim=spatial_dims,  # Only reduce lat/lon, preserve pressure_level
+            weights=lat_weights,
+            skipna=True,
+        )
+
+        # Extract per-pressure-level scores
+        per_level_scores = {}
+        if "pressure_level" in rmse_result.dims:
+            # Atmospheric variable - extract each pressure level
+            for level in rmse_result.coords["pressure_level"]:
+                level_val = int(level.item())
+                score_val = float(rmse_result.sel(pressure_level=level).item())
+                per_level_scores[level_val] = score_val
+        else:
+            # Surface variable - single score
+            per_level_scores[None] = float(rmse_result.item())
+        
+        return per_level_scores
+
+    except Exception as e:
+        logger.error(f"Error calculating RMSE by pressure level: {e}")
+        return {}
 
 
 async def calculate_rmse(
