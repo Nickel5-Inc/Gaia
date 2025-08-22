@@ -876,9 +876,9 @@ class Miner:
                     if current_time - req_time < 60
                 ]
 
-                # Check rate limit (max 100 requests per minute per IP)
+                # Check rate limit (increased for comprehensive scoring)
                 max_requests_per_minute = int(
-                    os.getenv("MINER_RATE_LIMIT_PER_MINUTE", "100")
+                    os.getenv("MINER_RATE_LIMIT_PER_MINUTE", "500")  # Increased from 100 to 500 for comprehensive scoring
                 )
                 if len(request_counts[client_ip]) >= max_requests_per_minute:
                     self.logger.warning(

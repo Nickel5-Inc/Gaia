@@ -682,16 +682,17 @@ class GaiaValidator:
             "VALIDATOR_PM2_RESTART_ENABLED", "true"
         ).lower() in ["true", "1", "yes"]
 
-        # REALISTIC MEMORY THRESHOLDS - Appropriate for 32GB systems running weather scoring
+        # WORKER-OPTIMIZED MEMORY THRESHOLDS - For 48GB systems with 9 workers @ 3GB each
+        # Available for main process: 48GB - (9×3GB workers) - 3GB system = 18GB max
         self.memory_warning_threshold_mb = int(
-            os.getenv("VALIDATOR_MEMORY_WARNING_THRESHOLD_MB", "20000")
-        )  # 20GB (62% of 32GB) - informational only
+            os.getenv("VALIDATOR_MEMORY_WARNING_THRESHOLD_MB", "10000")
+        )  # 10GB (56% of 18GB available) - informational only
         self.memory_emergency_threshold_mb = int(
-            os.getenv("VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB", "25000")
-        )  # 25GB (78% of 32GB) - light GC, close monitoring
+            os.getenv("VALIDATOR_MEMORY_EMERGENCY_THRESHOLD_MB", "13000")
+        )  # 13GB (72% of 18GB available) - aggressive cleanup
         self.memory_critical_threshold_mb = int(
-            os.getenv("VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB", "29000")
-        )  # 29GB (90% of 32GB) - restart to avoid OOM
+            os.getenv("VALIDATOR_MEMORY_CRITICAL_THRESHOLD_MB", "15000")
+        )  # 15GB (83% of 18GB available) - restart to avoid worker interference
 
         # Memory monitoring state
         self.last_memory_log_time = 0
@@ -3828,7 +3829,7 @@ class GaiaValidator:
                                             from gaia.validator.weights.weight_service import commit_weights_if_eligible
                                             weight_success = await commit_weights_if_eligible(self)
                                             if weight_success:
-                                                logger.info("[WeightScheduler] ✅ Weight setting completed successfully")
+                                                logger.success("[WeightScheduler] ✅ Weight setting completed successfully")
                                             else:
                                                 logger.info("[WeightScheduler] ⏳ Weight setting not eligible yet")
                                         else:
@@ -3844,7 +3845,7 @@ class GaiaValidator:
                                             from gaia.validator.weights.weight_service import commit_weights_if_eligible
                                             weight_success = await commit_weights_if_eligible(self)
                                             if weight_success:
-                                                logger.info("[WeightScheduler] ✅ Weight setting completed successfully (fallback)")
+                                                logger.success("[WeightScheduler] ✅ Weight setting completed successfully (fallback)")
                                             else:
                                                 logger.info("[WeightScheduler] ⏳ Weight setting not eligible yet (fallback)")
                                 else:
@@ -6069,19 +6070,19 @@ class GaiaValidator:
                     process = psutil.Process()
                     memory_before = process.memory_info().rss / (1024 * 1024)
 
-                    # PERFORMANCE-FIRST: Only clear caches when memory pressure requires it
+                    # WORKER-OPTIMIZED: Only clear caches when memory pressure requires it
                     cleanup_level = "none"
                     if (
-                        memory_before > 25000
-                    ):  # > 25GB (78% of 32GB) - Emergency cleanup
+                        memory_before > 13000
+                    ):  # > 13GB (72% of 18GB available) - Emergency cleanup
                         cleanup_level = "aggressive"
                     elif (
-                        memory_before > 22000
-                    ):  # > 22GB (69% of 32GB) - Moderate cleanup
+                        memory_before > 11000
+                    ):  # > 11GB (61% of 18GB available) - Moderate cleanup
                         cleanup_level = "moderate"
-                    elif memory_before > 18000:  # > 18GB (56% of 32GB) - Light cleanup
+                    elif memory_before > 9000:  # > 9GB (50% of 18GB available) - Light cleanup
                         cleanup_level = "light"
-                    # Below 18GB: NO cache clearing - preserve performance for optimal operation
+                    # Below 9GB: NO cache clearing - preserve performance for optimal operation
 
                     # Only perform cleanup when memory pressure actually requires it
                     collected = 0
@@ -6224,10 +6225,10 @@ class GaiaValidator:
 
                     # Emergency action if memory is still very high after cleanup
                     if (
-                        memory_after > 25000
-                    ):  # > 25GB after cleanup (emergency threshold)
+                        memory_after > 13000
+                    ):  # > 13GB after cleanup (emergency threshold for worker architecture)
                         logger.error(
-                            f"🚨 CRITICAL: Memory still very high after cleanup: {memory_after:.1f}MB"
+                            f"🚨 CRITICAL: Memory still very high after cleanup: {memory_after:.1f}MB - worker interference risk"
                         )
                         # Could trigger more drastic measures here if needed
 

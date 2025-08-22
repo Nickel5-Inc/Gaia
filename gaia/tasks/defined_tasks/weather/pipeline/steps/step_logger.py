@@ -8,6 +8,9 @@ from sqlalchemy.dialects.postgresql import insert
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.database.validator_schema import weather_forecast_steps_table
+from gaia.utils.custom_logger import get_logger
+
+logger = get_logger(__name__)
 
 
 async def _upsert(
@@ -74,6 +77,11 @@ async def log_start(
     lead_hours: Optional[int] = None,
     context: Optional[Dict[str, Any]] = None,
 ) -> None:
+    # Console logging for operational visibility
+    substep_str = f".{substep}" if substep else ""
+    lead_str = f" (L{lead_hours}h)" if lead_hours else ""
+    logger.info(f"🚀 [Run {run_id}] Miner {miner_uid}: Starting {step_name}{substep_str}{lead_str}")
+    
     await _upsert(
         db,
         run_id=run_id,
@@ -100,6 +108,12 @@ async def log_success(
     latency_ms: Optional[int] = None,
     context: Optional[Dict[str, Any]] = None,
 ) -> None:
+    # Console logging for operational visibility
+    substep_str = f".{substep}" if substep else ""
+    lead_str = f" (L{lead_hours}h)" if lead_hours else ""
+    latency_str = f" in {latency_ms}ms" if latency_ms else ""
+    logger.success(f"✅ [Run {run_id}] Miner {miner_uid}: Completed {step_name}{substep_str}{lead_str}{latency_str}")
+    
     await _upsert(
         db,
         run_id=run_id,
@@ -130,6 +144,15 @@ async def log_failure(
     next_retry_time: Optional[datetime] = None,
     context: Optional[Dict[str, Any]] = None,
 ) -> None:
+    # Console logging for operational visibility
+    substep_str = f".{substep}" if substep else ""
+    lead_str = f" (L{lead_hours}h)" if lead_hours else ""
+    latency_str = f" after {latency_ms}ms" if latency_ms else ""
+    error_str = f": {error_json.get('message', 'Unknown error')}" if error_json else ""
+    retry_str = f" (retry {retry_count})" if retry_count else ""
+    
+    logger.error(f"❌ [Run {run_id}] Miner {miner_uid}: Failed {step_name}{substep_str}{lead_str}{latency_str}{error_str}{retry_str}")
+    
     await _upsert(
         db,
         run_id=run_id,
@@ -161,6 +184,14 @@ async def schedule_retry(
     retry_count: int,
     next_retry_time,
 ) -> None:
+    # Console logging for operational visibility
+    substep_str = f".{substep}" if substep else ""
+    lead_str = f" (L{lead_hours}h)" if lead_hours else ""
+    retry_time_str = f" at {next_retry_time.strftime('%H:%M:%S')}" if next_retry_time else ""
+    error_str = f": {error_json.get('message', 'Unknown error')}" if error_json else ""
+    
+    logger.warning(f"🔄 [Run {run_id}] Miner {miner_uid}: Retrying {step_name}{substep_str}{lead_str} (attempt {retry_count}){retry_time_str}{error_str}")
+    
     await _upsert(
         db,
         run_id=run_id,

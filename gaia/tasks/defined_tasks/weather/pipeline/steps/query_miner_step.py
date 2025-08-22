@@ -14,7 +14,8 @@ from gaia.tasks.defined_tasks.weather.schemas.weather_outputs import WeatherTask
 from gaia.validator.stats.weather_stats_manager import WeatherStatsManager
 from gaia.tasks.defined_tasks.weather.pipeline.steps.step_logger import log_failure, log_success
 
-logger = logging.getLogger(__name__)
+from gaia.utils.custom_logger import get_logger
+logger = get_logger(__name__)
 
 
 async def run_query_miner_job(

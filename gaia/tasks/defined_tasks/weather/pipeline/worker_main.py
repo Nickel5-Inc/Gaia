@@ -11,9 +11,10 @@ import sys
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager, DatabaseError
 from gaia.tasks.defined_tasks.weather.pipeline.workers import process_one
+from gaia.utils.custom_logger import get_logger
 
-# Configure logging at module level for consistency
-logger = logging.getLogger(__name__)
+# Use custom logger for consistency with other modules
+logger = get_logger(__name__)
 
 
 def _prefix() -> str:

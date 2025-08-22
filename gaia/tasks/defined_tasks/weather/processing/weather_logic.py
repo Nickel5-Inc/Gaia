@@ -757,7 +757,7 @@ async def get_ground_truth_data(
             logger.warning("fetch_era5_data returned None. Ground truth unavailable.")
             return None
         else:
-            logger.info("Successfully fetched/loaded ERA5 ground truth data.")
+            logger.success("✅ Successfully fetched/loaded ERA5 ground truth data.")
             return ground_truth_ds
     except Exception as e:
         logger.error(f"Error occurred during get_ground_truth_data: {e}", exc_info=True)
@@ -1520,7 +1520,7 @@ async def _batch_insert_component_scores(
             logger.debug(f"Executing batch insert for batch {i//batch_size + 1} with {len(processed_batch)} records")
             await db_manager.execute_many(insert_query, processed_batch)
             
-        logger.info(f"Successfully inserted {len(component_scores)} component scores in batches of {batch_size}")
+        logger.success(f"✅ Successfully inserted {len(component_scores)} component scores in batches of {batch_size}")
         return True
         
     except Exception as e:
@@ -1726,9 +1726,22 @@ async def calculate_era5_miner_score(
                     logger.info(f"[FinalScore] Mapped miner variables: {list(miner_forecast_ds.data_vars)}")
                 else:
                     logger.info(f"[FinalScore] No variables found to rename")
+                
+                # CRITICAL: Apply coordinate renaming for pressure levels (same as Day1 scoring)
+                coord_mapping = {
+                    "lev": "pressure_level",
+                    "plev": "pressure_level", 
+                    "latitude": "lat", 
+                    "longitude": "lon"
+                }
+                
+                coords_to_rename = {k: v for k, v in coord_mapping.items() if k in miner_forecast_ds.coords}
+                if coords_to_rename:
+                    logger.info(f"[FinalScore] Renaming miner coordinates: {coords_to_rename}")
+                    miner_forecast_ds = miner_forecast_ds.rename(coords_to_rename)
                     
             except Exception as e:
-                logger.error(f"[FinalScore] Failed to apply variable mapping to miner data: {e}")
+                logger.error(f"[FinalScore] Failed to apply variable/coordinate mapping to miner data: {e}")
                 return False
         else:
             logger.info(f"[FinalScore] Miner data already has mapped variable names, no mapping needed")  # Skip this miner gracefully
@@ -1951,6 +1964,8 @@ async def calculate_era5_miner_score(
                 var_level = var_config.get("level")
                 standard_name_for_clim = var_config.get("standard_name", var_name)
                 var_key = f"{var_name}{var_level if var_level and var_level != 'all' else ''}"
+                
+                logger.debug(f"[FinalScore] Processing variable {var_key} at time {valid_time_dt}")
 
                 # Ensure both datetimes are proper datetime objects for subtraction
                 if isinstance(gfs_init_time_of_run, (int, float)):
@@ -2007,6 +2022,16 @@ async def calculate_era5_miner_score(
                             "t2m",
                             "temperature_2m",
                         ],  # 2-meter temperature alternatives (surface level)
+                        "10u": [
+                            "10u",
+                            "u10",
+                            "10m_u_component_of_wind",
+                        ],  # 10m U wind alternatives
+                        "10v": [
+                            "10v", 
+                            "v10",
+                            "10m_v_component_of_wind",
+                        ],  # 10m V wind alternatives
                         "msl": [
                             "msl",
                             "mean_sea_level_pressure",
@@ -2017,13 +2042,21 @@ async def calculate_era5_miner_score(
                             "t",
                             "temperature",
                         ],  # temperature alternatives (pressure level)
+                        "u": ["u", "u_component_of_wind"],  # U wind alternatives
+                        "v": ["v", "v_component_of_wind"],  # V wind alternatives
+                        "q": ["q", "specific_humidity"],  # Specific humidity alternatives
                     }
 
                     miner_var_mappings = {
                         "2t": ["2t", "t", "temperature_2m", "temperature"],
+                        "10u": ["10u", "u10", "10m_u_component_of_wind"],
+                        "10v": ["10v", "v10", "10m_v_component_of_wind"],
                         "msl": ["msl", "mean_sea_level_pressure", "sp"],
                         "z": ["z", "geopotential"],
                         "t": ["t", "temperature"],
+                        "u": ["u", "u_component_of_wind"],
+                        "v": ["v", "v_component_of_wind"], 
+                        "q": ["q", "specific_humidity"],
                     }
 
                     # Find appropriate variable name in ERA5 dataset
@@ -2182,7 +2215,7 @@ async def calculate_era5_miner_score(
                         method="nearest",
                     )
 
-                    if var_level:
+                    if var_level and var_level != "all":
                         # Handle different pressure level dimension names robustly
                         def _select_pressure_level(data_array, target_level):
                             """Select pressure level handling multiple possible dimension names."""
@@ -2334,6 +2367,26 @@ async def calculate_era5_miner_score(
                     logger.info(
                         f"[FinalScore info Metric Input] climatology_da_aligned -> Shape: {climatology_da_aligned.shape}, Dims: {climatology_da_aligned.dims}, Coords: {list(climatology_da_aligned.coords.keys())}"
                     )
+                    
+                    # CRITICAL: Ensure consistent dimension ordering for pressure level variables
+                    if var_level and "pressure_level" in miner_var_da_aligned.dims and "pressure_level" in truth_var_da_final.dims:
+                        # Standardize to (lat, lon, pressure_level) order for all arrays
+                        target_dims = ("lat", "lon", "pressure_level")
+                        
+                        # Transpose miner data to match truth data dimension order
+                        if miner_var_da_aligned.dims != target_dims:
+                            logger.debug(f"[FinalScore] Transposing miner data from {miner_var_da_aligned.dims} to {target_dims}")
+                            miner_var_da_aligned = miner_var_da_aligned.transpose(*target_dims)
+                        
+                        # Transpose truth data if needed
+                        if truth_var_da_final.dims != target_dims:
+                            logger.debug(f"[FinalScore] Transposing truth data from {truth_var_da_final.dims} to {target_dims}")
+                            truth_var_da_final = truth_var_da_final.transpose(*target_dims)
+                        
+                        # Transpose climatology data if needed
+                        if "pressure_level" in climatology_da_aligned.dims and climatology_da_aligned.dims != target_dims:
+                            logger.debug(f"[FinalScore] Transposing climatology data from {climatology_da_aligned.dims} to {target_dims}")
+                            climatology_da_aligned = climatology_da_aligned.transpose(*target_dims)
 
                     lat_weights = None
                     if "lat" in truth_var_da_final.dims:
@@ -2351,17 +2404,27 @@ async def calculate_era5_miner_score(
                                 f"[FinalScore] Created surface-level lat_weights with dims: {lat_weights.dims}"
                             )
                         else:  # Pressure level variable (z500, t850, etc.)
-                            # For pressure level variables, use full broadcasting
+                            # CRITICAL: For pressure level variables, create spatial-only weights to avoid 
+                            # dimension mismatch with xskillscore (same fix as Day1 scoring)
                             try:
-                                _, lat_weights = await asyncio.to_thread(
-                                    xr.broadcast, truth_var_da_final, one_d_lat_weights
-                                )
-                                logger.debug(
-                                    f"[FinalScore] Created pressure-level lat_weights with dims: {lat_weights.dims}"
-                                )
+                                # Create a spatial-only template by selecting first pressure level
+                                pressure_dims = [dim for dim in truth_var_da_final.dims if dim in ["pressure_level", "lev", "plev", "level"]]
+                                if pressure_dims:
+                                    spatial_truth = truth_var_da_final.isel({pressure_dims[0]: 0})
+                                    _, lat_weights = await asyncio.to_thread(
+                                        xr.broadcast, spatial_truth, one_d_lat_weights
+                                    )
+                                    logger.debug(
+                                        f"[FinalScore] Created spatial-only lat_weights for pressure-level variable {var_key}: {lat_weights.dims}"
+                                    )
+                                else:
+                                    # Fallback if no pressure dimension found
+                                    lat_weights = one_d_lat_weights.expand_dims(
+                                        {"lon": truth_var_da_final["lon"]}
+                                    )
                             except Exception as broadcast_err:
                                 logger.warning(
-                                    f"[FinalScore] Failed to broadcast weights for pressure level, using lat/lon only: {broadcast_err}"
+                                    f"[FinalScore] Failed to create spatial weights for pressure level, using lat/lon only: {broadcast_err}"
                                 )
                                 lat_weights = one_d_lat_weights.expand_dims(
                                     {"lon": truth_var_da_final["lon"]}
@@ -2388,22 +2451,41 @@ async def calculate_era5_miner_score(
                     current_metrics["bias"] = mean_bias_val
 
                     def calculate_raw_mse_scalar_threaded(*args, **kwargs):
-                        res = xs.mse(*args, **kwargs)
-                        if hasattr(res, "compute"):
-                            res = res.compute()
+                        try:
+                            res = xs.mse(*args, **kwargs)
+                            if hasattr(res, "compute"):
+                                res = res.compute()
 
-                        # Handle cases where result is not a scalar
-                        if hasattr(res, "size") and res.size > 1:
-                            # If result has multiple values, take the mean
-                            logger.warning(
-                                f"[FinalScore] MSE result has {res.size} elements, taking mean"
+                            # Handle cases where result is not a scalar
+                            if hasattr(res, "size") and res.size > 1:
+                                logger.warning(
+                                    f"[FinalScore] MSE result has {res.size} elements (dims: {getattr(res, 'dims', 'unknown')}), "
+                                    f"shape: {getattr(res, 'shape', 'unknown')} - taking mean to get scalar"
+                                )
+                                if hasattr(res, "mean"):
+                                    res = res.mean()
+                                else:
+                                    import numpy as np
+                                    res = np.mean(res)
+
+                            # Safe scalar conversion
+                            if hasattr(res, "item"):
+                                return float(res.item())
+                            else:
+                                return float(res)
+                                
+                        except Exception as mse_err:
+                            import traceback
+                            tb_str = traceback.format_exc()
+                            logger.error(
+                                f"[FinalScore] ERA5 MSE calculation failed for {var_key}:\n"
+                                f"Args shapes: {[getattr(arg, 'shape', 'no shape') for arg in args if hasattr(arg, 'shape')]}\n"
+                                f"Args dims: {[getattr(arg, 'dims', 'no dims') for arg in args if hasattr(arg, 'dims')]}\n"
+                                f"Kwargs: {list(kwargs.keys())}\n"
+                                f"Error: {mse_err}\n"
+                                f"Full traceback:\n{tb_str}"
                             )
-                            res = res.mean()
-
-                        if hasattr(res, "item"):
-                            return float(res.item())
-                        else:
-                            return float(res)
+                            raise
 
                     # Ensure weights dimensions match data dimensions before MSE calculation
                     mse_weights = lat_weights
@@ -2436,15 +2518,13 @@ async def calculate_era5_miner_score(
                                         {"lon": truth_var_da_final["lon"]}
                                     )
 
-                    # Calculate MSE with proper dimension handling
-                    # For proper scalar reduction, include all spatial dimensions
-                    all_spatial_dims = [
-                        d
-                        for d in truth_var_da_final.dims
-                        if d in ("lat", "lon", "latitude", "longitude")
+                    # CRITICAL: Include all non-time dimensions for proper scalar reduction
+                    # This ensures pressure_level dimension is also reduced to get a scalar
+                    all_reduction_dims = [
+                        d for d in truth_var_da_final.dims if d not in ("time",)
                     ]
                     mse_dims = (
-                        all_spatial_dims if all_spatial_dims else None
+                        all_reduction_dims if all_reduction_dims else None
                     )  # None means reduce over all dimensions
 
                     logger.debug(
@@ -2679,22 +2759,48 @@ async def calculate_era5_miner_score(
                     }
                     all_metrics_for_db.append(error_metric_row)
                 except Exception as e_var_score:
+                    import traceback
+                    tb_str = traceback.format_exc()
+                    error_msg = str(e_var_score)
+                    
                     logger.error(
-                        f"[FinalScore] Miner {miner_hotkey}: Error scoring {var_key} at {valid_time_dt}: {e_var_score}",
+                        f"[FinalScore] Miner {miner_hotkey}: Error scoring {var_key} at {valid_time_dt}:\n"
+                        f"Error: {error_msg}\n"
+                        f"Variable config: {var_config}\n"
+                        f"Data shapes - Miner: {getattr(miner_forecast_lead_slice, 'shape', 'unknown')}, "
+                        f"Truth: {getattr(era5_truth_lead_slice, 'shape', 'unknown')}\n"
+                        f"Lead hours: {lead_hours}\n"
+                        f"Full traceback:\n{tb_str}",
                         exc_info=True,
                     )
+                    
                     # Add debug info for type errors
-                    if "unsupported operand type" in str(e_var_score):
+                    if "unsupported operand type" in error_msg:
                         logger.error(f"[FinalScore] Type error debug info:")
                         logger.error(f"  - gfs_init_time_of_run type: {type(gfs_init_time_of_run)} = {gfs_init_time_of_run}")
                         logger.error(f"  - valid_time_dt type: {type(valid_time_dt)} = {valid_time_dt}")
                         logger.error(f"  - lead_hours type: {type(lead_hours)} = {lead_hours}")
                         logger.error(f"  - var_key: {var_key}")
                         logger.error(f"  - var_name: {var_name}, var_level: {var_level}")
+                    
+                    # Check for coordinate/dimension errors and fail fast
+                    if any(coord_err in error_msg.lower() for coord_err in ['lat', 'lon', 'pressure_level', 'coordinate', 'dimension', 'keyerror']):
+                        logger.error(
+                            f"[FinalScore] Miner {miner_hotkey}: CRITICAL coordinate/dimension error for {var_key} - "
+                            f"this indicates a fundamental data structure issue"
+                        )
+                        return False  # Fail the entire ERA5 scoring for this miner
+                    
                     error_metric_row = {
                         **db_metric_row_base,
                         "score_type": f"era5_error_{var_key}_{int(lead_hours)}h",
-                        "error_message": str(e_var_score),
+                        "error_message": error_msg,
+                        "debug_info": {
+                            "var_config": var_config,
+                            "miner_shape": getattr(miner_forecast_lead_slice, 'shape', None),
+                            "truth_shape": getattr(era5_truth_lead_slice, 'shape', None),
+                            "traceback": tb_str
+                        }
                     }
                     all_metrics_for_db.append(error_metric_row)
     finally:
@@ -2794,7 +2900,7 @@ async def calculate_era5_miner_score(
             if not component_insert_success:
                 logger.warning(f"[FinalScore] Failed to insert some component scores for {miner_hotkey}")
             else:
-                logger.info(f"[FinalScore] Successfully inserted all component scores for {miner_hotkey}")
+                logger.success(f"[FinalScore] ✅ Successfully inserted all component scores for {miner_hotkey}")
         
         return True
     else:

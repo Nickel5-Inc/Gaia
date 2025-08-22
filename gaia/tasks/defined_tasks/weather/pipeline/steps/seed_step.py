@@ -8,7 +8,8 @@ from sqlalchemy.dialects.postgresql import insert
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 
-logger = logging.getLogger(__name__)
+from gaia.utils.custom_logger import get_logger
+logger = get_logger(__name__)
 from gaia.database.validator_schema import (
     node_table,
     weather_forecast_runs_table,
@@ -246,7 +247,7 @@ async def ensure_gfs_reference_available(db: ValidatorDatabaseManager, task, *, 
         logger.error(f"[Run {run_id}] GFS fetch failed - missing critical data")
         return False
     
-    logger.info(f"[Run {run_id}] Successfully fetched GFS analysis and forecast data at {len(leads)} lead times: {leads}")
+    logger.success(f"[Run {run_id}] ✅ Successfully fetched GFS analysis and forecast data at {len(leads)} lead times: {leads}")
     return True
 
 

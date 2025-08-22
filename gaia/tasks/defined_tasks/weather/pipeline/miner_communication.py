@@ -19,7 +19,8 @@ from fiber.encrypted.validator import handshake
 from fiber.encrypted.validator import client as vali_client
 from cryptography.fernet import Fernet
 
-logger = logging.getLogger(__name__)
+from gaia.utils.custom_logger import get_logger
+logger = get_logger(__name__)
 
 # Cache duration for symmetric keys (24 hours by default)
 SYMMETRIC_KEY_CACHE_HOURS = 24
@@ -506,8 +507,8 @@ async def query_miner_for_weather(
     
     if result and result.get("success"):
         data = result.get("data", {})
-        logger.info(
-            f"✓ Weather fetch accepted by {miner_hotkey[:8]}"
+        logger.success(
+            f"✅ Weather fetch accepted by {miner_hotkey[:8]}"
             f"\n  Job ID: {data.get('job_id')}"
             f"\n  Status: {data.get('status')}"
             f"\n  Response time: {result.get('response_time', 0):.2f}s"

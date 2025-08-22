@@ -92,7 +92,7 @@ async def fetch_era5_data(
     for potential_cache_file in cache_files_to_check:
         if potential_cache_file.exists():
             try:
-                logger.info(f"Loading cached ERA5 data from: {potential_cache_file}")
+                logger.success(f"✅ Loading cached ERA5 data from: {potential_cache_file}")
 
                 if potential_cache_file.suffix == ".pkl":
                     # Load pickle format

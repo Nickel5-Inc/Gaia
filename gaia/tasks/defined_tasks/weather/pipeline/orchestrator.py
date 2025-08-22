@@ -12,7 +12,8 @@ from typing import Optional, Dict, Any
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 from gaia.tasks.defined_tasks.weather.pipeline.steps.seed_step import seed_forecast_run
 
-logger = logging.getLogger(__name__)
+from gaia.utils.custom_logger import get_logger
+logger = get_logger(__name__)
 
 
 async def orchestrate_run(

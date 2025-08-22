@@ -8,8 +8,9 @@ import sqlalchemy as sa
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 
-# Use module-level logger for consistency
-logger = logging.getLogger(__name__)
+# Use custom logger for consistency and proper formatting
+from gaia.utils.custom_logger import get_logger
+logger = get_logger(__name__)
 from gaia.tasks.defined_tasks.weather.pipeline.scheduler import MinerWorkScheduler
 from gaia.tasks.defined_tasks.weather.weather_task import WeatherTask
 from gaia.tasks.defined_tasks.weather.pipeline.steps import day1_step, era5_step
@@ -353,9 +354,15 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 # Handle the result properly
                 if ok:
                     await db.complete_validator_job(job["id"], result={"ok": True})
+                elif ok is None:
+                    # Substep scheduled its own retry, complete job to prevent double retries
+                    await db.complete_validator_job(job["id"], result={"retry_scheduled_by_substep": True})
+                    logger.info(f"[weather.day1] Job {job['id']} completed - substep scheduled own retry")
                 else:
-                    # Schedule retry with 60 second delay to prevent rate limiting
-                    await db.fail_validator_job(job["id"], "Day1 scoring failed", schedule_retry_in_seconds=60)
+                    # Check if failure was due to rate limiting (longer retry delay)
+                    # vs other errors (shorter retry delay)
+                    retry_delay = 300  # 5 minutes for rate limit issues
+                    await db.fail_validator_job(job["id"], "Day1 scoring failed - likely rate limited", schedule_retry_in_seconds=retry_delay)
                 return ok
             elif jtype == "weather.era5":
                 if all(k in payload for k in ("run_id", "miner_uid", "response_id")):
@@ -409,6 +416,10 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 # Handle the result properly
                 if ok:
                     await db.complete_validator_job(job["id"], result={"ok": True})
+                elif ok is None:
+                    # Substep scheduled its own retry, complete job to prevent double retries
+                    await db.complete_validator_job(job["id"], result={"retry_scheduled_by_substep": True})
+                    logger.info(f"[weather.era5] Job {job['id']} completed - substep scheduled own retry")
                 else:
                     # Schedule retry with 60 second delay to prevent rate limiting
                     await db.fail_validator_job(job["id"], "ERA5 scoring failed", schedule_retry_in_seconds=60)

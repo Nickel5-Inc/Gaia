@@ -6,7 +6,8 @@ import os
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
-logger = logging.getLogger(__name__)
+from gaia.utils.custom_logger import get_logger
+logger = get_logger(__name__)
 
 from gaia.validator.database.validator_database_manager import ValidatorDatabaseManager
 # REMOVED: MinerWorkScheduler import - no longer needed since run() method was removed
@@ -215,65 +216,54 @@ async def run_item(
     import time
     t0 = time.perf_counter()
     
-    # Process each variable separately
-    all_results = {}
-    overall_score = 0.0
-    total_variables_scored = 0
+    # Load dataset once into shared readonly memory for maximum efficiency
+    logger.info(f"[Day1Step] Run {run_id} Miner {miner_uid}: Loading miner dataset into shared memory for {len(all_variables)} variables")
     
+    # Load the entire dataset once and share it across all variable processing
+    shared_miner_dataset = None
     try:
-        for var_idx, variable_config in enumerate(all_variables):
-            var_name = variable_config["name"]
-            var_level = variable_config.get("level")
-            
-            logger.info(f"[Day1Step] Run {run_id} Miner {miner_uid}: Processing variable {var_idx+1}/{len(all_variables)}: {var_name} (level: {var_level})")
-            
-            # Create single-variable batch for this variable
-            single_var_batch = [variable_config]
-            
-            batch_result = await _score_variable_batch(
-                task=task,
-                miner_record=miner_record,
-                gfs_analysis_ds=gfs_analysis_ds,
-                gfs_ref_ds=gfs_ref_ds,
-                era5_clim=era5_clim,
-                day1_cfg=day1_cfg,
-                gfs_init=gfs_init,
-                variable_batch=single_var_batch,
-                precomputed_cache=None  # Will be handled per variable
-            )
-            
-            if batch_result and isinstance(batch_result, dict):
-                # Merge variable results
-                if "lead_time_scores" in batch_result:
-                    if "lead_time_scores" not in all_results:
-                        all_results["lead_time_scores"] = {}
-                    
-                    for lead_time, variables in batch_result["lead_time_scores"].items():
-                        if lead_time not in all_results["lead_time_scores"]:
-                            all_results["lead_time_scores"][lead_time] = {}
-                        all_results["lead_time_scores"][lead_time].update(variables)
-                
-                # Accumulate overall score
-                if "overall_day1_score" in batch_result and batch_result["overall_day1_score"] > -np.inf:
-                    overall_score += batch_result["overall_day1_score"]
-                    total_variables_scored += 1
-                    
-            # Memory cleanup between variables
-            import gc
-            gc.collect()
-        
-        # Calculate final overall score
-        if total_variables_scored > 0:
-            overall_score = overall_score / total_variables_scored
-            all_results["overall_day1_score"] = overall_score
-        else:
-            all_results = None
-            
-        result = all_results
+        # Score all variables at once using shared dataset
+        result = await _score_variable_batch(
+            task=task,
+            miner_record=miner_record,
+            gfs_analysis_ds=gfs_analysis_ds,
+            gfs_ref_ds=gfs_ref_ds,
+            era5_clim=era5_clim,
+            day1_cfg=day1_cfg,
+            gfs_init=gfs_init,
+            variable_batch=all_variables,  # Process all variables with shared dataset
+            precomputed_cache=None
+        )
         
     except Exception as e:
         logger.error(f"[Day1Step] Error in variable processing: {e}", exc_info=True)
         result = None
+    finally:
+        # CRITICAL: Aggressive cleanup of shared dataset and all associated caches
+        if shared_miner_dataset is not None:
+            try:
+                # Close the dataset
+                shared_miner_dataset.close()
+                logger.debug(f"[Day1Step] Closed shared miner dataset for miner {miner_uid}")
+            except Exception:
+                pass
+        
+        # Force garbage collection to clear any lingering references
+        import gc
+        import sys
+        
+        # Clear any module-level caches that might hold dataset references
+        try:
+            # Clear xarray caches
+            if hasattr(sys.modules.get('xarray', None), '_cache'):
+                sys.modules['xarray']._cache.clear()
+        except Exception:
+            pass
+            
+        # Force aggressive garbage collection
+        collected = gc.collect()
+        logger.debug(f"[Day1Step] Aggressive cleanup collected {collected} objects for miner {miner_uid}")
+        
     latency_ms = int((time.perf_counter() - t0) * 1000)
     try:
         overall = None

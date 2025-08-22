@@ -6,7 +6,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Any, Dict, Tuple
 
-logger = logging.getLogger(__name__)
+from gaia.utils.custom_logger import get_logger
+logger = get_logger(__name__)
 
 import sqlalchemy as sa
 
@@ -22,7 +23,7 @@ from .step_logger import log_start, log_success, log_failure, schedule_retry
 from .substep import substep
 from .util_time import get_effective_gfs_init
 
-logger = logging.getLogger(__name__)
+
 
 
 class DataNotReadyError(Exception):

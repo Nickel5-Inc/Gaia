@@ -29,12 +29,14 @@ sudo -u postgres pgbackrest --stanza=gaia-test info || echo "   No backup info a
 
 # Wipe all backup data from the repository (keeps stanza config)
 echo "   Wiping all backup data from repository..."
-# This removes all backup files but keeps the stanza configuration
-sudo -u postgres pgbackrest --stanza=gaia-test expire --repo1-retention-full=0 || true
+# First get list of existing backups, then expire them individually
+sudo -u postgres pgbackrest --stanza=gaia-test info --output=json > /tmp/backup_info.json 2>/dev/null || true
 
-# Alternative approach: manually clean the backup directory in S3/R2
+# Remove all backups by setting very short retention and running expire
+sudo -u postgres pgbackrest --stanza=gaia-test expire --repo1-retention-full=1 --repo1-retention-diff=1 || true
+
+# Then remove the remaining backup by deleting the backup info files
 echo "   Cleaning backup repository files..."
-# Remove backup.info files to force clean state (they'll be recreated on next backup)
 sudo rm -f /var/lib/pgbackrest/backup/gaia-test/backup.info* 2>/dev/null || true
 sudo rm -f /var/lib/pgbackrest/archive/gaia-test/archive.info* 2>/dev/null || true
 

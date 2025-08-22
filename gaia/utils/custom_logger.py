@@ -58,7 +58,7 @@ WORKER_COLORS = [
     "\033[33m",    # Yellow - Worker 3
     "\033[35m",    # Magenta - Worker 4
     "\033[34m",    # Blue - Worker 5
-    "\033[31m",    # Red - Worker 6
+    "\033[95m",    # Light Magenta - Worker 6 (changed from red)
     "\033[37m",    # White - Worker 7
     "\033[96m",    # Light Cyan - Worker 8
     "\033[92m",    # Light Green - Worker 9
@@ -309,7 +309,7 @@ class CustomLogger:
             filter=stderr_filter,
         )
         
-        # Add file handler for persistent logging
+        # Add file handler for persistent logging with robust error handling
         log_file = os.getenv("LOG_FILE", "logs/gaia.log")
         if log_file:
             try:
@@ -317,12 +317,13 @@ class CustomLogger:
                 log_dir = os.path.dirname(log_file)
                 os.makedirs(log_dir, exist_ok=True)
                 
-                # Create initial log file if it doesn't exist
-                if not os.path.exists(log_file):
-                    Path(log_file).touch()
+                # Use time-based rotation to avoid file conflicts
+                import time
+                timestamp = int(time.time())
+                log_file_with_timestamp = f"{log_dir}/gaia_{timestamp}.log"
                 
                 logger.add(
-                    log_file,
+                    log_file_with_timestamp,
                     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} - {message}",
                     level="DEBUG",  # File logging captures more detail
                     rotation="100 MB",
@@ -330,6 +331,7 @@ class CustomLogger:
                     compression="gz",
                     catch=True,  # Catch exceptions during logging to prevent crashes
                     enqueue=True,  # Use async logging to prevent blocking
+                    serialize=False,  # Disable serialization to prevent conflicts
                 )
             except Exception as e:
                 # Fallback to console-only logging if file logging fails

@@ -18,6 +18,8 @@ import urllib.parse
 import requests
 import time
 import logging
+
+logger = get_logger(__name__)
 import os
 import psutil
 import ssl
@@ -36,6 +38,7 @@ import xxhash
 import shutil
 from substrateinterface.base import Keypair
 from cryptography.exceptions import InvalidSignature
+import numcodecs
 
 logger = get_logger(__name__)
 
@@ -1417,6 +1420,17 @@ class VerifyingChunkMapper(fsspec.mapping.FSMap):
             raise ValueError(msg)
 
     def __getitem__(self, key: str) -> bytes:
+        # CRITICAL: Debug logging to track duplicate requests
+        import multiprocessing as mp
+        import threading
+        process_name = mp.current_process().name if mp.current_process() else "unknown"
+        thread_name = threading.current_thread().name
+        
+        # Test with both logger and print to ensure we see the output
+        request_msg = f"🌐 ZARR REQUEST [{process_name}:{thread_name}] Job {self.job_id_for_logging}: Requesting chunk '{key}'"
+        logger.info(request_msg)
+        print(f"DEBUG ZARR: {request_msg}", flush=True)  # Immediate output for testing
+        
         chunk_content_bytes = super().__getitem__(key)
         expected_hash = self.trusted_manifest_files.get(key)
         if expected_hash is None:
