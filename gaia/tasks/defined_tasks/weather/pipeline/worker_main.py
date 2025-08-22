@@ -121,13 +121,16 @@ async def _install_worker_prefix_filters(tag: str) -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     
-    # Suppress duplicate logs from modules that also log in the main process
-    # These modules will still log in the main process, just not in workers
-    # This prevents double logging when both main and worker import the same modules
-    for module in ['gfs_api', 'era5_api', 'weather_task', 'async_processing', 
-                   'weather_scoring_mechanism', 'memory_management', 'hardening_integration']:
+    # Suppress duplicate logs from ONLY heavy background modules to prevent double logging
+    # Keep important worker processing logs visible for debugging
+    for module in ['gfs_api', 'era5_api', 'async_processing', 'memory_management']:
         logger = logging.getLogger(module)
         logger.setLevel(logging.WARNING)  # Only show warnings and errors from these modules in workers
+    
+    # Keep these modules at INFO level in workers for operational visibility:
+    # - weather_task: Important for job processing logs
+    # - weather_scoring_mechanism: Critical for scoring progress
+    # - hardening_integration: Important for error recovery
 
 
 async def main() -> None:

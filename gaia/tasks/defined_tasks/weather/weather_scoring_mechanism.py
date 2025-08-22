@@ -1171,7 +1171,7 @@ async def _process_single_variable_parallel(
             # Per-pressure-level scoring for atmospheric variables
             logger.info(f"Calculating detailed per-pressure-level metrics for {var_name}")
             
-            from ..weather_scoring.metrics import (
+            from .weather_scoring.metrics import (
                 calculate_mse_skill_score_by_pressure_level,
                 calculate_acc_by_pressure_level,
                 calculate_rmse_by_pressure_level
