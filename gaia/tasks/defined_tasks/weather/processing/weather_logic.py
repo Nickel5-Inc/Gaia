@@ -606,23 +606,23 @@ async def build_score_row(
                             for t in local_ground_truth_ds.time.values
                         ]
 
-                        logger.info(
-                            f"[build_score_row] Calling calculate_era5_ensemble_score..."
-                        )
-                        ensemble_score = await calculate_era5_ensemble_score(
-                            task_instance=task_instance,
-                            ensemble_details=ensemble_details,
-                            target_datetimes=target_datetimes_for_scoring,
-                            ground_truth_ds=local_ground_truth_ds,
-                        )
-                        if ensemble_score is not None:
-                            logger.info(
-                                f"[build_score_row] Received ensemble score: {ensemble_score:.4f}"
-                            )
-                        else:
-                            logger.warning(
-                                f"[build_score_row] Ensemble scoring failed or returned None."
-                            )
+                        # logger.info(
+                        #     f"[build_score_row] Calling calculate_era5_ensemble_score..."
+                        # )
+                        # ensemble_score = await calculate_era5_ensemble_score(
+                        #     task_instance=task_instance,
+                        #     ensemble_details=ensemble_details,
+                        #     target_datetimes=target_datetimes_for_scoring,
+                        #     ground_truth_ds=local_ground_truth_ds,
+                        # )
+                        # if ensemble_score is not None:
+                        #     logger.info(
+                        #         f"[build_score_row] Received ensemble score: {ensemble_score:.4f}"
+                        #     )
+                        # else:
+                        #     logger.warning(
+                        #         f"[build_score_row] Ensemble scoring failed or returned None."
+                        #     )
                     else:
                         logger.warning(
                             f"[build_score_row] Could not retrieve/receive ground truth data. Cannot score ensemble."

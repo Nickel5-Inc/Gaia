@@ -1827,19 +1827,37 @@ async def _process_single_variable_parallel_preloaded(
             try:
                 target_lat_coord = truth_var_da_final[actual_lat_dim_in_target]
                 one_d_lat_weights_target = _calculate_latitude_weights(target_lat_coord)
-                _, broadcasted_weights_final = xr.broadcast(truth_var_da_final, one_d_lat_weights_target)
+                
+                # Create a template with only the spatial dimensions that will be used in MSE
+                template_dims = {dim: truth_var_da_final.sizes[dim] for dim in spatial_dims_for_metric}
+                template_coords = {dim: truth_var_da_final.coords[dim] for dim in spatial_dims_for_metric if dim in truth_var_da_final.coords}
+                template_da = xr.DataArray(
+                    data=np.ones([template_dims[dim] for dim in spatial_dims_for_metric]),
+                    dims=spatial_dims_for_metric,
+                    coords=template_coords
+                )
+                
+                _, broadcasted_weights_final = xr.broadcast(template_da, one_d_lat_weights_target)
             except Exception as e_broadcast_weights:
                 logger.error(f"[Day1Score] Failed to create latitude weights for {var_key}: {e_broadcast_weights}")
                 broadcasted_weights_final = None
 
         # Calculate clone distance MSE
-        clone_distance_mse_val = xs.mse(
+        mse_result = xs.mse(
             miner_var_da_aligned,
             ref_var_da_aligned,
             dim=spatial_dims_for_metric,
             weights=broadcasted_weights_final,
             skipna=True,
-        ).compute().item()
+        ).compute()
+        
+        # Ensure we get a scalar value - if there are remaining dimensions, take the mean
+        if mse_result.size == 1:
+            clone_distance_mse_val = mse_result.item()
+        else:
+            # If there are still dimensions remaining, reduce them to get a scalar
+            clone_distance_mse_val = float(mse_result.mean().values)
+            
         result["clone_distance_mse"] = clone_distance_mse_val
 
         # Clone penalty calculation
@@ -1864,13 +1882,19 @@ async def _process_single_variable_parallel_preloaded(
         )
         clim_var_to_interpolate = _standardize_spatial_dims(clim_var_da_raw)
 
-        if var_level:
+        if var_level and var_level != "all":
             for dim_name in ["pressure_level", "lev", "plev", "level"]:
                 if dim_name in clim_var_to_interpolate.dims:
-                    clim_var_to_interpolate = clim_var_to_interpolate.sel(
-                        **{dim_name: var_level}, method="nearest"
-                    )
-                    break
+                    # Ensure var_level is numeric for pressure level selection
+                    try:
+                        numeric_level = float(var_level)
+                        clim_var_to_interpolate = clim_var_to_interpolate.sel(
+                            **{dim_name: numeric_level}, method="nearest"
+                        )
+                        break
+                    except (ValueError, TypeError):
+                        logger.warning(f"Could not convert var_level {var_level} to numeric for {var_key}")
+                        break
 
         clim_var_da_aligned = await asyncio.to_thread(
             lambda: clim_var_to_interpolate.interp_like(truth_var_da_final, method="linear")
@@ -1924,7 +1948,7 @@ async def _process_single_variable_parallel_preloaded(
             f"[Day1Score] Miner {miner_hotkey}: Error in parallel preloaded scoring {var_key} at {valid_time_dt}:\n"
             f"Error: {error_msg}\n"
             f"Variable config: {var_config}\n"
-            f"Full traceback:\n{tb_str}",
+            f"Full traceback:\n{tb_str}".replace("{", "{{").replace("}", "}}"),
             exc_info=True,
         )
         result["status"] = "error"

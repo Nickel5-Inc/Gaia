@@ -3208,17 +3208,18 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                     "input_poll_error",
                 ]:
                     logger.warning(
-                        f"[Miner Job {job_id}] Found existing FAILED job (status: {status}). Resetting and retrying."
+                        f"[Miner Job {job_id}] Found existing FAILED job (status: {status}). Resetting and retrying with combined workflow."
                     )
 
-                    # Reset status to 'fetch_queued' and clear any previous error message.
+                    # Reset status to 'received' and clear any previous error message.
                     await update_job_status(
-                        self, job_id, "fetch_queued", error_message=""
+                        self, job_id, "received", error_message=""
                     )
 
-                    # Relaunch the background task to fetch and hash the data.
+                    # Relaunch the combined background task (fetch + inference).
+                    from .processing.weather_workers import fetch_and_run_inference_task
                     asyncio.create_task(
-                        fetch_and_hash_gfs_task(
+                        fetch_and_run_inference_task(
                             task_instance=self,
                             job_id=job_id,
                             t0_run_time=t0_run_time,
@@ -3385,11 +3386,11 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                             "val_hk": validator_hotkey,
                             "gfs_init": t0_run_time,
                             "gfs_t_minus_6": t_minus_6_run_time,
-                            "status": "fetch_queued",
+                            "status": "received",
                         },
                     )
                     logger.info(
-                        f"[Miner Job {job_id}] DB record created. Launching background fetch/hash task."
+                        f"[Miner Job {job_id}] DB record created. Launching combined fetch and inference task."
                     )
                 else:
                     logger.info(
