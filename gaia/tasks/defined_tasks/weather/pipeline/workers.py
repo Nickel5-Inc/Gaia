@@ -428,7 +428,7 @@ async def process_one(db: ValidatorDatabaseManager, validator: Optional[Any] = N
                 # Kick off per-miner day1 by ensuring jobs are enqueued
                 try:
                     await db.execute(
-                        "UPDATE weather_forecast_runs SET status = 'day1_scoring_started' WHERE id = :rid",
+                        "UPDATE weather_forecast_runs SET status = 'scoring' WHERE id = :rid",
                         {"rid": payload.get("run_id")},
                     )
                 except Exception:

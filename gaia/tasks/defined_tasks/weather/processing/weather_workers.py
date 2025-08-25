@@ -271,7 +271,7 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
         )
 
     try:
-        await update_job_status(task_instance, job_id, "processing_input")
+        await update_job_status(task_instance, job_id, "processing")
         logger.info(f"[InferenceTask Job {job_id}] Fetching job details from DB...")
         job_db_details = await task_instance.db_manager.fetch_one(
             "SELECT gfs_init_time_utc, gfs_t_minus_6_time_utc FROM weather_miner_jobs WHERE id = :job_id",
@@ -303,7 +303,7 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
             if not http_service_url_available:
                 err_msg = "HTTP service URL not configured in WeatherTask for http_service type."
                 logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
-                await update_job_status(task_instance, job_id, "error", err_msg)
+                await update_job_status(task_instance, job_id, "failed", err_msg)
                 return
 
             logger.info(
@@ -319,7 +319,7 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
             ):
                 err_msg = f"Cannot find input_batch_pickle_path for job {job_id} for HTTP inference."
                 logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
-                await update_job_status(task_instance, job_id, "error", err_msg)
+                await update_job_status(task_instance, job_id, "failed", err_msg)
                 return
 
             input_batch_file_path = Path(
@@ -328,7 +328,7 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
             if not await asyncio.to_thread(input_batch_file_path.exists):
                 err_msg = f"Input batch pickle file {input_batch_file_path} not found for HTTP inference."
                 logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
-                await update_job_status(task_instance, job_id, "error", err_msg)
+                await update_job_status(task_instance, job_id, "failed", err_msg)
                 return
 
             try:
@@ -351,7 +351,7 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
             except Exception as e_load_batch:
                 err_msg = f"Failed to load pickled batch from {input_batch_file_path}: {e_load_batch}"
                 logger.error(f"[InferenceTask Job {job_id}] {err_msg}", exc_info=True)
-                await update_job_status(task_instance, job_id, "error", err_msg)
+                await update_job_status(task_instance, job_id, "failed", err_msg)
                 return
 
         elif current_inference_type == "local_model":
@@ -362,7 +362,7 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
                     "Local inference runner or model not ready for local_model type."
                 )
                 logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
-                await update_job_status(task_instance, job_id, "error", err_msg)
+                await update_job_status(task_instance, job_id, "failed", err_msg)
                 return
 
             # DIAGNOSTIC: Add detailed logging to compare data processing paths
@@ -382,7 +382,7 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
             if ds_t0 is None or ds_t_minus_6 is None:
                 err_msg = "Failed to fetch/load GFS data from cache for local_model."
                 logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
-                await update_job_status(task_instance, job_id, "error", err_msg)
+                await update_job_status(task_instance, job_id, "failed", err_msg)
                 return
 
             logger.info(
@@ -489,7 +489,7 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
             if prepared_batch is None:
                 err_msg = "Failed to create Aurora batch for local model from GFS data."
                 logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
-                await update_job_status(task_instance, job_id, "error", err_msg)
+                await update_job_status(task_instance, job_id, "failed", err_msg)
                 return
 
             # DIAGNOSTIC: Log batch details to compare with HTTP processing
@@ -574,14 +574,14 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
                 f"Unknown current_inference_type: '{current_inference_type}'. Aborting."
             )
             logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
-            await update_job_status(task_instance, job_id, "error", err_msg)
+            await update_job_status(task_instance, job_id, "failed", err_msg)
             return
 
         # Critical check: prepared_batch must be valid to proceed to semaphore
         if prepared_batch is None:
             err_msg = "CRITICAL: `prepared_batch` is None before entering GPU semaphore. This indicates a flaw in pre-semaphore preparation logic."
             logger.error(f"[InferenceTask Job {job_id}] {err_msg}")
-            await update_job_status(task_instance, job_id, "error", err_msg)
+            await update_job_status(task_instance, job_id, "failed", err_msg)
             # Ensure GFS datasets are closed if they were loaded for local model path that failed before semaphore
             if ds_t0:
                 ds_t0.close()
@@ -592,7 +592,7 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
             gc.collect()
             return
 
-        await update_job_status(task_instance, job_id, "running_inference")
+        await update_job_status(task_instance, job_id, "processing")
         logger.info(f"[InferenceTask Job {job_id}] Waiting for GPU semaphore...")
 
         # Check memory safety before acquiring semaphore
@@ -724,7 +724,7 @@ async def run_inference_background(task_instance: "WeatherTask", job_id: str):
             logger.info(
                 f"[InferenceTask Job {job_id}] Inference successful. Processing {len(output_steps_datasets)} steps for saving..."
             )
-            await update_job_status(task_instance, job_id, "processing_output")
+            await update_job_status(task_instance, job_id, "processing")
 
             MINER_FORECAST_DIR_BG.mkdir(parents=True, exist_ok=True)
 
@@ -3980,7 +3980,7 @@ async def fetch_and_hash_gfs_task(
             AND id != :current_job_id
             AND input_data_hash IS NOT NULL
             AND input_batch_pickle_path IS NOT NULL
-            AND status IN ('input_hashed_awaiting_validation', 'in_progress', 'completed')
+            AND status IN ('processing', 'completed')
             ORDER BY validator_request_time ASC
             LIMIT 1
         """
@@ -4020,7 +4020,7 @@ async def fetch_and_hash_gfs_task(
                         "job_id": job_id,
                         "hash": concurrent_input_job["input_data_hash"],
                         "pickle_path": concurrent_input_job["input_batch_pickle_path"],
-                        "status": "input_hashed_awaiting_validation",
+                        "status": "processing",
                         "now": datetime.now(timezone.utc),
                     },
                 )
@@ -4030,7 +4030,7 @@ async def fetch_and_hash_gfs_task(
                 )
                 return
 
-        await update_job_status(task_instance, job_id, "fetching_gfs")
+        await update_job_status(task_instance, job_id, "processing")
 
         cache_dir_str = task_instance.config.get(
             "gfs_analysis_cache_dir", "./gfs_analysis_cache"
@@ -4071,7 +4071,7 @@ async def fetch_and_hash_gfs_task(
             await update_job_status(
                 task_instance,
                 job_id,
-                "fetch_error",
+                "failed",
                 "Failed to fetch GFS data for batch preparation.",
             )
             await task_instance._emit_progress(
@@ -4199,7 +4199,7 @@ async def fetch_and_hash_gfs_task(
             )
         )
 
-        await update_job_status(task_instance, job_id, "hashing_input")
+        await update_job_status(task_instance, job_id, "processing")
         logger.info(
             f"[FetchHashTask Job {job_id}] Computing canonical input data hash..."
         )
@@ -4276,19 +4276,19 @@ async def fetch_and_hash_gfs_task(
                     "job_id": job_id,
                     "hash": canonical_input_hash,
                     "pickle_path": input_batch_pickle_file_path_str,  # Store the path
-                    "status": "input_hashed_awaiting_validation",
+                    "status": "processing",
                     "now": datetime.now(timezone.utc),
                 },
             )
             logger.info(
-                f"[FetchHashTask Job {job_id}] Status updated to input_hashed_awaiting_validation with hash and batch path."
+                f"[FetchHashTask Job {job_id}] Status updated to processing with hash and batch path."
             )
         else:
             logger.error(
                 f"[FetchHashTask Job {job_id}] compute_input_data_hash failed (returned None). Updating status to fetch_error."
             )
             await update_job_status(
-                task_instance, job_id, "fetch_error", "Failed to compute input hash."
+                task_instance, job_id, "failed", "Failed to compute input hash."
             )
 
     except Exception as e:
@@ -4311,7 +4311,7 @@ async def fetch_and_hash_gfs_task(
                 )
 
         try:
-            await update_job_status(task_instance, job_id, "error", error_message)
+            await update_job_status(task_instance, job_id, "failed", error_message)
         except Exception as db_err:
             logger.error(
                 f"[FetchHashTask Job {job_id}] Failed to update status to error after exception: {db_err}"
@@ -5004,19 +5004,9 @@ async def weather_job_status_logger(task_instance: "WeatherTask"):
 
                 if status == "completed":
                     validator_stats[validator]["completed"] += 1
-                elif status in [
-                    "error",
-                    "failed",
-                    "fetch_error",
-                    "input_hash_mismatch",
-                ]:
+                elif status in ["failed"]:
                     validator_stats[validator]["failed"] += 1
-                elif status in [
-                    "processing",
-                    "running_inference",
-                    "processing_input",
-                    "processing_output",
-                ]:
+                elif status in ["processing"]:
                     validator_stats[validator]["running"] += 1
 
             # Build status summary
@@ -5028,17 +5018,10 @@ async def weather_job_status_logger(task_instance: "WeatherTask"):
             # Status breakdown
             status_summary = []
             priority_statuses = [
-                "running_inference",
                 "processing",
-                "processing_input",
-                "processing_output",
-                "fetch_queued",
-                "fetching_gfs",
-                "input_hashed_awaiting_validation",
-                "completed",
-                "error",
+                "completed", 
                 "failed",
-                "fetch_error",
+                "received"
             ]
 
             for status in priority_statuses:
@@ -5056,13 +5039,8 @@ async def weather_job_status_logger(task_instance: "WeatherTask"):
 
             # Active jobs details
             active_statuses = [
-                "running_inference",
                 "processing",
-                "processing_input",
-                "processing_output",
-                "fetch_queued",
-                "fetching_gfs",
-                "input_hashed_awaiting_validation",
+                "received"
             ]
             active_jobs = []
             for status in active_statuses:
@@ -5120,7 +5098,7 @@ async def weather_job_status_logger(task_instance: "WeatherTask"):
                     )
 
             # Recent failures
-            failed_statuses = ["error", "failed", "fetch_error", "input_hash_mismatch"]
+            failed_statuses = ["failed"]
             failed_jobs = []
             for status in failed_statuses:
                 if status in status_groups:

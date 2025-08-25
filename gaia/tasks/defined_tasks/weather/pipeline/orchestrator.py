@@ -58,7 +58,7 @@ async def orchestrate_run(
         logger.info(f"[Run {run_id}] Starting orchestration, current status: {current_status}")
         
         # Step 1: Ensure seed data exists (per-miner rows)
-        if current_status in ("created", "fetching_gfs"):
+        if current_status in ("created", "seeding"):
             # Check if there's already a seed job for this run
             existing_seed = await db.fetch_one(
                 """
@@ -98,7 +98,7 @@ async def orchestrate_run(
             
             # Update status to indicate we're downloading GFS
             await db.execute(
-                "UPDATE weather_forecast_runs SET status = 'fetching_gfs' WHERE id = :run_id",
+                "UPDATE weather_forecast_runs SET status = 'seeding' WHERE id = :run_id",
                 {"run_id": run_id}
             )
             
@@ -130,7 +130,7 @@ async def orchestrate_run(
             else:
                 logger.info(f"[Run {run_id}] ✗ Initiate-fetch singleton already exists, skipped (multiprocessing protection worked)")
             
-        elif current_status in ("sending_fetch_requests", "awaiting_inference_results"):
+        elif current_status in ("querying_miners", "awaiting_results"):
             # Already in progress, just ensure polling jobs exist
             logger.info(f"[Run {run_id}] Run already in progress, ensuring poll jobs exist")
             await db.enqueue_miner_poll_jobs(limit=1000)
@@ -285,7 +285,7 @@ async def handle_initiate_fetch_job(
         if not miners:
             logger.warning(f"[Run {run_id}] No miners found to query")
             await db.execute(
-                "UPDATE weather_forecast_runs SET status = 'error', error_message = 'No miners found' WHERE id = :run_id",
+                "UPDATE weather_forecast_runs SET status = 'failed', error_message = 'No miners found' WHERE id = :run_id",
                 {"run_id": run_id}
             )
             return True
@@ -351,12 +351,12 @@ async def handle_initiate_fetch_job(
         # Update run status
         if jobs_created > 0:
             await db.execute(
-                "UPDATE weather_forecast_runs SET status = 'awaiting_inference_results' WHERE id = :run_id",
+                "UPDATE weather_forecast_runs SET status = 'awaiting_results' WHERE id = :run_id",
                 {"run_id": run_id}
             )
         else:
             await db.execute(
-                "UPDATE weather_forecast_runs SET status = 'error', error_message = 'Failed to create query jobs' WHERE id = :run_id",
+                "UPDATE weather_forecast_runs SET status = 'failed', error_message = 'Failed to create query jobs' WHERE id = :run_id",
                 {"run_id": run_id}
             )
             

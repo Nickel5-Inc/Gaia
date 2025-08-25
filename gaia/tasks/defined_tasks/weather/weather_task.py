@@ -3199,14 +3199,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 status = existing_job["status"]
 
                 # If the job is in a recoverable (failed) state, reset and retry it.
-                if status in [
-                    "error",
-                    "fetch_error",
-                    "failed",
-                    "input_hash_mismatch",
-                    "input_hash_timeout",
-                    "input_poll_error",
-                ]:
+                if status in ["failed"]:
                     logger.warning(
                         f"[Miner Job {job_id}] Found existing FAILED job (status: {status}). Resetting and retrying with combined workflow."
                     )
@@ -3261,7 +3254,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 AND gfs_t_minus_6_time_utc = :gfs_t_minus_6
                 AND input_data_hash IS NOT NULL
                 AND input_batch_pickle_path IS NOT NULL
-                AND status IN ('input_hashed_awaiting_validation', 'in_progress', 'completed')
+                AND status IN ('processing', 'completed')
                 ORDER BY validator_request_time DESC
                 LIMIT 1
             """
@@ -3331,7 +3324,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 "pickle_path": existing_input_job[
                                     "input_batch_pickle_path"
                                 ],
-                                "status": "input_hashed_awaiting_validation",
+                                "status": "processing",
                             },
                         )
                         logger.info(
@@ -3437,7 +3430,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         Handles the /weather-poll-job-status request.
         Returns the current status and input hash (if computed) for the job.
         If the job is ready for inference but hasn't been triggered, it reports
-        the status as 'input_hashed_awaiting_validation' to conform to the validator.
+        the current processing status.
         """
         if self.node_type != "miner":
             logger.error("handle_get_input_status called on non-miner node.")
@@ -3568,7 +3561,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                 current_job_check_query = """
                     SELECT id, status, validator_request_time, processing_start_time FROM weather_miner_jobs 
                     WHERE id = :current_job_id 
-                    AND status IN ('in_progress', 'completed', 'processing', 'running_inference', 'processing_input', 'processing_output')
+                    AND status IN ('processing', 'completed')
                     LIMIT 1
                 """
                 current_job = await self.db_manager.fetch_one(
@@ -5090,7 +5083,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                             logger.warning(
                                 f"[Run {run_id}] Hash MISMATCH for response ID {resp_id}. Miner: {miner_hash[:10]}... Validator: {validator_input_hash[:10]}... (Miner status: {miner_status})"
                             )
-                            new_db_status = "input_hash_mismatch"
+                            new_db_status = "failed"
                             hash_match = False
                     elif miner_status == WeatherTaskStatus.FETCH_ERROR.value:
                         new_db_status = "input_fetch_error"
@@ -5152,15 +5145,15 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
                                 f"[Run {run_id}] Miner for response ID {resp_id} exhausted all 3 retries (status: {miner_status}). "
                                 f"Marking as input timeout after final retry at 15 minutes."
                             )
-                            new_db_status = "input_hash_timeout"
+                            new_db_status = "failed"
                     elif miner_status in [
                         "validator_poll_failed",
                         "validator_poll_error",
                     ]:
-                        new_db_status = "input_poll_error"
+                        new_db_status = "failed"
                         # The detailed error message is already captured in error_msg from status_data.get('message')
                     else:
-                        new_db_status = "input_fetch_error"
+                        new_db_status = "failed"
 
                     if new_db_status:
                         update_query = """

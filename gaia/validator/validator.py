@@ -620,6 +620,8 @@ class GaiaValidator:
                 "timeouts": {
                     "default": 1800,  # 30 minutes
                     "weight_setting": 300,  # 5 minutes
+                    "monitoring": 7200,  # 2 hours for idle monitoring loops
+                    "monitoring_idle": 86400,  # 24 hours for idle monitoring (essentially no timeout)
                 },
                 "resources": {
                     "memory_start": 0,
@@ -2421,6 +2423,7 @@ class GaiaValidator:
             if health["status"] == "idle":
                 continue
 
+            # Use operation-specific timeout (e.g., "monitoring" has extended timeout)
             timeout = health["timeouts"].get(
                 health.get("current_operation"), health["timeouts"]["default"]
             )
@@ -4205,7 +4208,7 @@ class GaiaValidator:
                         except Exception as e:
                             logger.error(f"Error checking seed generation: {e}")
 
-                # Update status to show we're active
+                # Update status - monitoring has extended timeout to prevent false alerts
                 await self.update_task_status("scoring", "active", "monitoring")
                 
                 # Sleep for 2 minutes between checks (much simpler than complex timeout logic)

@@ -213,7 +213,7 @@ async def run_poll_miner_job(
                 
                 return True
                 
-            elif status_value in ["processing", "running", "inference_running", WeatherTaskStatus.FETCH_PROCESSING]:
+            elif status_value in ["processing", "received"]:
                 # Still running, update status and reschedule poll
                 if validator:
                     stats = WeatherStatsManager(db, getattr(validator, "hotkey", "unknown"))
@@ -232,7 +232,7 @@ async def run_poll_miner_job(
                 else:
                     return await _reschedule_poll(db, run_id, miner_uid, miner_hotkey, response_id, job_id, attempt + 1)
                     
-            elif status_value in ["error", "failed"]:
+            elif status_value in ["failed", "error", "fetch_error", "input_hash_mismatch", "input_hash_timeout", "input_poll_error"]:
                 # Miner reported failure
                 error_msg = miner_status.get("message", "Miner reported failure")
                 await _mark_failed(db, response_id, error_msg,
