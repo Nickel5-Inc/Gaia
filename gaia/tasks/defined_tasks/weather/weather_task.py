@@ -169,10 +169,11 @@ def _load_config(self):
         config["inference_steps"] * config["forecast_step_hours"]
     )
 
-    # Scoring Parameters
+    # OPTIMIZED DAY1 SCORING: Single lead time for fast quality control
+    # Day1 scoring focuses on quick validation, not comprehensive analysis
     config["initial_scoring_lead_hours"] = parse_int_list(
-        "WEATHER_INITIAL_SCORING_LEAD_HOURS", [6, 12]
-    )  # Day 0.25, 0.5
+        "WEATHER_INITIAL_SCORING_LEAD_HOURS", [12]
+    )  # Single 12-hour lead time for efficient QC
     # Progressive daily scoring: score each day from 1-10 as ERA5 data becomes available
     config["final_scoring_lead_hours"] = parse_int_list(
         "WEATHER_FINAL_SCORING_LEAD_HOURS",
@@ -331,28 +332,33 @@ def _load_config(self):
     # This gives us 9 total variables instead of 69 variable/level combinations
     default_comprehensive_vars_levels = surface_vars + atmospheric_vars
     
-    # For backward compatibility, keep a subset for day1 if needed
+    # OPTIMIZED DAY1 SCORING: Essential surface variables for quality control
+    # Focus on variables that can quickly validate atmospheric reasonableness and detect GFS cloning
     default_day1_vars_levels = [
-        {"name": "z", "level": 500, "standard_name": "geopotential"},
-        {"name": "t", "level": 850, "standard_name": "temperature"},
-        {"name": "2t", "level": None, "standard_name": "2m_temperature"},
-        {"name": "msl", "level": None, "standard_name": "mean_sea_level_pressure"},
+        # Core surface variables - most important for immediate validation
+        {"name": "2t", "level": None, "standard_name": "2m_temperature"},      # Temperature patterns
+        {"name": "msl", "level": None, "standard_name": "mean_sea_level_pressure"},  # Pressure systems
+        {"name": "10u", "level": None, "standard_name": "10m_u_wind"},         # Wind patterns U
+        {"name": "10v", "level": None, "standard_name": "10m_v_wind"},         # Wind patterns V
+        # Single atmospheric level for vertical structure check
+        {"name": "z", "level": 500, "standard_name": "geopotential"},          # 500hPa geopotential height
     ]
     try:
         day1_vars_levels_json = os.getenv("WEATHER_DAY1_VARIABLES_LEVELS_JSON")
         if day1_vars_levels_json:
             config["day1_variables_levels_to_score"] = loads(day1_vars_levels_json)
         else:
-            # Use comprehensive scoring by default, fallback to subset if needed
-            use_comprehensive = os.getenv("WEATHER_USE_COMPREHENSIVE_SCORING", "true").lower() in ["true", "1", "yes"]
+            # Use optimized day1 scoring by default for fast quality control
+            # Set WEATHER_USE_COMPREHENSIVE_SCORING=true to enable full variable scoring (not recommended for day1)
+            use_comprehensive = os.getenv("WEATHER_USE_COMPREHENSIVE_SCORING", "false").lower() in ["true", "1", "yes"]
             config["day1_variables_levels_to_score"] = (
                 default_comprehensive_vars_levels if use_comprehensive else default_day1_vars_levels
             )
     except Exception:
         logger.warning(
-            "Invalid JSON for WEATHER_DAY1_VARIABLES_LEVELS_JSON. Using default comprehensive scoring."
+            "Invalid JSON for WEATHER_DAY1_VARIABLES_LEVELS_JSON. Using optimized day1 scoring."
         )
-        config["day1_variables_levels_to_score"] = default_comprehensive_vars_levels
+        config["day1_variables_levels_to_score"] = default_day1_vars_levels
     
     # Also set final scoring variables to use the same comprehensive list
     try:
@@ -403,11 +409,13 @@ def _load_config(self):
     config["day1_clone_penalty_gamma"] = float(
         os.getenv("WEATHER_DAY1_CLONE_PENALTY_GAMMA", "1.0")
     )
+    # OPTIMIZED DAY1 CLONE DETECTION: Thresholds for essential surface variables
     default_clone_delta_thresholds = {
-        "2t": 0.0025,  # (RMSE 0.1K)^2
-        "msl": 400,  # (RMSE 100Pa or 1hPa)^2
-        "z500": 100,  # (RMSE 100 m^2/s^2)^2 for geopotential
-        "t850": 0.04,  # (RMSE 0.5K)^2
+        "2t": 0.0025,    # (RMSE 0.05K)^2 - 2m temperature
+        "msl": 400,      # (RMSE 20Pa)^2 - mean sea level pressure  
+        "10u": 0.01,     # (RMSE 0.1 m/s)^2 - 10m U wind
+        "10v": 0.01,     # (RMSE 0.1 m/s)^2 - 10m V wind
+        "z500": 100,     # (RMSE 10 m)^2 - 500hPa geopotential height
     }
     try:
         clone_delta_json = os.getenv("WEATHER_DAY1_CLONE_DELTA_THRESHOLDS_JSON")

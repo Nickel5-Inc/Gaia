@@ -379,23 +379,85 @@ async def evaluate_miner_forecast_day1(
         aggregated_skill_scores = []
         aggregated_acc_scores = []
 
-        # OPTIMIZATION 8: PARALLEL TIME STEP PROCESSING
-        # Process all time steps simultaneously instead of sequentially for major additional speedup
-        # Expected speedup: 2x for 2 time steps (5s → 2.5s)
+        # OPTIMIZED DAY1 QUALITY CONTROL: Fast sequential processing for essential variables
+        # Day1 scoring focuses on atmospheric validity and GFS clone detection, not comprehensive analysis
+        # Using minimal variable set (5 variables) for maximum speed while maintaining quality control
 
         logger.info(
-            f"[Day1Score] Miner {miner_hotkey}: Starting PARALLEL processing of {len(times_to_evaluate)} time steps"
+            f"[Day1Score] Miner {miner_hotkey}: Starting OPTIMIZED DAY1 QC processing - {len(variables_to_score)} variables, {len(times_to_evaluate)} time steps"
         )
         parallel_timesteps_start = time.time()
 
-        # Create parallel tasks for all time steps
-        timestep_tasks = []
-        for valid_time_dt in times_to_evaluate:
+        # SEQUENTIAL PRE-LOADING: Load variables one by one to avoid overwhelming the system
+        # This prevents the massive memory spike of loading everything at once
+        logger.info(f"[Day1Score] Miner {miner_hotkey}: Using sequential pre-loading strategy...")
+        
+        try:
+            variables_needed = [var_config["name"] for var_config in variables_to_score]
+            variables_in_dataset = [var for var in variables_needed if var in miner_forecast_ds.data_vars]
+            
+            if variables_in_dataset:
+                # Convert times to proper format for selection
+                time_coords = []
+                for dt in times_to_evaluate:
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    else:
+                        dt = dt.astimezone(timezone.utc)
+                    time_coords.append(pd.Timestamp(dt))
+                
+                # Create focused subset
+                miner_subset = miner_forecast_ds[variables_in_dataset].sel(time=time_coords, method="nearest")
+                
+                # SEQUENTIAL LOADING: Load each variable separately to control memory usage
+                logger.info(f"[Day1Score] Pre-loading {len(variables_in_dataset)} variables sequentially...")
+                preload_start = time.time()
+                
+                loaded_vars = {}
+                for i, var_name in enumerate(variables_in_dataset):
+                    try:
+                        var_start = time.time()
+                        # Load this variable's data
+                        var_data = await asyncio.to_thread(lambda v=var_name: miner_subset[v].load())
+                        loaded_vars[var_name] = var_data
+                        var_time = time.time() - var_start
+                        logger.debug(f"[Day1Score] Loaded variable {var_name} in {var_time:.2f}s ({i+1}/{len(variables_in_dataset)})")
+                        
+                        # Small delay between variables to avoid overwhelming the server
+                        if i < len(variables_in_dataset) - 1:
+                            await asyncio.sleep(0.1)
+                            
+                    except Exception as var_err:
+                        logger.warning(f"[Day1Score] Failed to pre-load variable {var_name}: {var_err}")
+                        # Continue with lazy loading for this variable
+                        loaded_vars[var_name] = miner_subset[var_name]
+                
+                # Create new dataset with loaded variables
+                if loaded_vars:
+                    miner_forecast_ds = xr.Dataset(loaded_vars, attrs=miner_subset.attrs)
+                    # Copy coordinates
+                    for coord_name, coord_data in miner_subset.coords.items():
+                        if coord_name not in miner_forecast_ds.coords:
+                            miner_forecast_ds = miner_forecast_ds.assign_coords({coord_name: coord_data})
+                
+                preload_time = time.time() - preload_start
+                logger.info(f"[Day1Score] Miner {miner_hotkey}: Sequential pre-loading completed in {preload_time:.2f}s")
+                logger.info(f"[Day1Score] Loaded {len(loaded_vars)}/{len(variables_in_dataset)} variables successfully")
+            else:
+                logger.warning(f"[Day1Score] Miner {miner_hotkey}: No scoring variables found in dataset")
+                
+        except Exception as setup_err:
+            logger.warning(f"[Day1Score] Miner {miner_hotkey}: Sequential pre-loading failed: {setup_err}")
+            logger.warning("Falling back to standard lazy loading")
+
+        # Process time steps sequentially for better CPU efficiency
+        timestep_results = []
+        for i, valid_time_dt in enumerate(times_to_evaluate):
             effective_lead_h = int(
                 (valid_time_dt - run_gfs_init_time).total_seconds() / 3600
             )
 
-            # Normalize timezone for parallel processing
+            # Normalize timezone for processing
             if (
                 valid_time_dt.tzinfo is None
                 or valid_time_dt.tzinfo.utcoffset(valid_time_dt) is None
@@ -408,43 +470,33 @@ async def evaluate_miner_forecast_day1(
             time_key_for_results = effective_lead_h
             day1_results["lead_time_scores"][time_key_for_results] = {}
 
-            # Create parallel task for this time step
-            task = asyncio.create_task(
-                _process_single_timestep_parallel(
-                    valid_time_dt=valid_time_dt,
-                    effective_lead_h=effective_lead_h,
-                    variables_to_score=variables_to_score,
-                    miner_forecast_ds=miner_forecast_ds,
-                    gfs_analysis_data_for_run=gfs_analysis_data_for_run,
-                    gfs_reference_forecast_for_run=gfs_reference_forecast_for_run,
-                    era5_climatology=era5_climatology,
-                    precomputed_climatology_cache=precomputed_climatology_cache,
-                    day1_scoring_config=day1_scoring_config,
-                    run_gfs_init_time=run_gfs_init_time,
-                    miner_hotkey=miner_hotkey,
-                ),
-                name=f"timestep_{effective_lead_h}h_{miner_hotkey[:8]}",
+            logger.info(f"[Day1Score] Miner {miner_hotkey}: Processing time step {i+1}/{len(times_to_evaluate)}: +{effective_lead_h}h")
+            
+            # Process this time step sequentially
+            timestep_result = await _process_single_timestep_sequential(
+                valid_time_dt=valid_time_dt,
+                effective_lead_h=effective_lead_h,
+                variables_to_score=variables_to_score,
+                miner_forecast_ds=miner_forecast_ds,
+                gfs_analysis_data_for_run=gfs_analysis_data_for_run,
+                gfs_reference_forecast_for_run=gfs_reference_forecast_for_run,
+                era5_climatology=era5_climatology,
+                precomputed_climatology_cache=precomputed_climatology_cache,
+                day1_scoring_config=day1_scoring_config,
+                run_gfs_init_time=run_gfs_init_time,
+                miner_hotkey=miner_hotkey,
             )
-            timestep_tasks.append((effective_lead_h, task))
+            timestep_results.append(timestep_result)
 
-        # Execute all time steps in parallel and collect results
-        logger.debug(
-            f"[Day1Score] Miner {miner_hotkey}: Executing {len(timestep_tasks)} time step tasks in parallel..."
-        )
-
-        # Get just the tasks for asyncio.gather
-        tasks_only = [task for _, task in timestep_tasks]
-        timestep_results = await asyncio.gather(*tasks_only, return_exceptions=True)
-
-        parallel_timesteps_time = time.time() - parallel_timesteps_start
+        sequential_timesteps_time = time.time() - parallel_timesteps_start
         logger.info(
-            f"[Day1Score] Miner {miner_hotkey}: PARALLEL time step processing completed in {parallel_timesteps_time:.2f}s"
+            f"[Day1Score] Miner {miner_hotkey}: SEQUENTIAL time step processing completed in {sequential_timesteps_time:.2f}s"
         )
 
-        # Process results from parallel time step execution
-        for i, (effective_lead_h, _) in enumerate(timestep_tasks):
-            result = timestep_results[i]
-            time_key_for_results = effective_lead_h
+        # Process results from sequential time step execution
+        for i, result in enumerate(timestep_results):
+            # Get the effective lead hour from the result
+            time_key_for_results = result.get("effective_lead_h", i)
 
             if isinstance(result, Exception):
                 logger.error(
@@ -2404,7 +2456,7 @@ async def _async_dataset_select(dataset, time_coord, method="nearest"):
     return await asyncio.to_thread(lambda: dataset.sel(time=time_coord, method=method))
 
 
-async def _process_single_timestep_parallel(
+async def _process_single_timestep_sequential(
     valid_time_dt: datetime,
     effective_lead_h: int,
     variables_to_score: List[Dict],
@@ -2587,63 +2639,40 @@ async def _process_single_timestep_parallel(
         cached_grid_dims = None
         cached_pressure_dims = {}
 
-        # SMART CACHING: Use lazy DataArrays with optimized chunk access
-        # This avoids the massive performance hit of .load() while still preventing duplicate HTTP requests
-        logger.debug(f"[Day1Score] Creating optimized lazy variable cache for {len(variables_to_score)} variables")
+        # OPTIMIZED CACHING: Since data is pre-loaded, create simple variable references
+        # The miner forecast data has already been downloaded and cached in memory
+        logger.debug(f"[Day1Score] Creating variable references for {len(variables_to_score)} variables (data pre-loaded)")
         preloaded_variables = {}
         
         try:
-            # Create lazy references to variables (no .load() calls!)
-            # xarray will handle chunking and caching automatically
+            # Create references to pre-loaded variables
             vars_to_cache = [
                 var_config["name"] for var_config in variables_to_score
                 if var_config["name"] in miner_forecast_lead.data_vars
             ]
             
             if vars_to_cache:
-                # Pre-select variables to create optimized lazy DataArrays
-                # This creates references without downloading data
                 for var_name in vars_to_cache:
                     try:
                         preloaded_variables[var_name] = {
-                            "miner": miner_forecast_lead[var_name],  # Lazy DataArray - no .load()!
-                            "truth": gfs_analysis_lead[var_name],    # Lazy DataArray - no .load()!
-                            "ref": gfs_reference_lead[var_name],     # Lazy DataArray - no .load()!
+                            "miner": miner_forecast_lead[var_name],  # Pre-loaded DataArray
+                            "truth": gfs_analysis_lead[var_name],    # Local data
+                            "ref": gfs_reference_lead[var_name],     # Local data
                         }
-                        logger.debug(f"[Day1Score] Cached lazy reference for variable {var_name}")
+                        logger.debug(f"[Day1Score] Cached reference for pre-loaded variable {var_name}")
                     except KeyError:
                         logger.warning(f"[Day1Score] Variable {var_name} not found in datasets")
                         continue
                 
-                logger.info(f"[Day1Score] Created lazy cache for {len(preloaded_variables)}/{len(vars_to_cache)} variables")
-                
-                # OPTIONAL: Pre-warm the most critical chunks asynchronously in background
-                # This downloads small metadata chunks to speed up first access
-                if len(vars_to_cache) <= 3:  # Only for small variable sets to avoid memory issues
-                    async def _prewarm_chunks():
-                        try:
-                            # Pre-warm just the coordinate metadata (very small)
-                            for var_name in list(preloaded_variables.keys())[:2]:  # Limit to first 2 vars
-                                var_data = preloaded_variables[var_name]
-                                # Touch coordinates to cache metadata (minimal data transfer)
-                                _ = var_data["miner"].coords
-                                _ = var_data["truth"].coords  
-                                _ = var_data["ref"].coords
-                            logger.debug(f"[Day1Score] Pre-warmed coordinate metadata for faster access")
-                        except Exception as e:
-                            logger.debug(f"[Day1Score] Coordinate pre-warming failed (non-critical): {e}")
-                    
-                    # Run pre-warming in background without blocking
-                    asyncio.create_task(_prewarm_chunks())
+                logger.debug(f"[Day1Score] Created references for {len(preloaded_variables)}/{len(vars_to_cache)} pre-loaded variables")
             
         except Exception as cache_err:
-            logger.warning(f"[Day1Score] Failed to create variable cache: {cache_err}")
+            logger.warning(f"[Day1Score] Failed to create variable references: {cache_err}")
             # Fall back to direct dataset access
             preloaded_variables = {}
 
-        # Create parallel tasks for all variables in this time step
-        variable_tasks = []
-        for var_config in variables_to_score:
+        # Process variables sequentially for better CPU efficiency
+        for j, var_config in enumerate(variables_to_score):
             var_name = var_config["name"]
             var_level = var_config.get("level")
             var_key = f"{var_name}{var_level}" if var_level and var_level != "all" else var_name
@@ -2657,81 +2686,53 @@ async def _process_single_timestep_parallel(
                 "clone_penalty_applied": None,
             }
 
+            logger.debug(f"[Day1Score] Miner {miner_hotkey}: Processing variable {j+1}/{len(variables_to_score)}: {var_key}")
+
             # Use pre-loaded variables if available, otherwise pass datasets
             if var_name in preloaded_variables:
                 task_datasets = preloaded_variables[var_name]
-                task = asyncio.create_task(
-                    _process_single_variable_parallel_preloaded(
-                        var_config=var_config,
-                        miner_var_da=task_datasets["miner"],
-                        truth_var_da=task_datasets["truth"],
-                        ref_var_da=task_datasets["ref"],
-                        era5_climatology=era5_climatology,
-                        precomputed_climatology_cache=precomputed_climatology_cache,
-                        day1_scoring_config=day1_scoring_config,
-                        valid_time_dt=valid_time_dt,
-                        effective_lead_h=effective_lead_h,
-                        miner_hotkey=miner_hotkey,
-                        cached_pressure_dims=cached_pressure_dims,
-                        cached_lat_weights=cached_lat_weights,
-                        cached_grid_dims=cached_grid_dims,
-                        variables_to_score=variables_to_score,
-                    ),
-                    name=f"var_{var_key}_{effective_lead_h}h_{miner_hotkey[:8]}_preloaded",
+                result = await _process_single_variable_parallel_preloaded(
+                    var_config=var_config,
+                    miner_var_da=task_datasets["miner"],
+                    truth_var_da=task_datasets["truth"],
+                    ref_var_da=task_datasets["ref"],
+                    era5_climatology=era5_climatology,
+                    precomputed_climatology_cache=precomputed_climatology_cache,
+                    day1_scoring_config=day1_scoring_config,
+                    valid_time_dt=valid_time_dt,
+                    effective_lead_h=effective_lead_h,
+                    miner_hotkey=miner_hotkey,
+                    cached_pressure_dims=cached_pressure_dims,
+                    cached_lat_weights=cached_lat_weights,
+                    cached_grid_dims=cached_grid_dims,
+                    variables_to_score=variables_to_score,
                 )
             else:
                 # Fallback to original method
-                task = asyncio.create_task(
-                    _process_single_variable_parallel(
-                        var_config=var_config,
-                        miner_forecast_lead=miner_forecast_lead,
-                        gfs_analysis_lead=gfs_analysis_lead,
-                        gfs_reference_lead=gfs_reference_lead,
-                        era5_climatology=era5_climatology,
-                        precomputed_climatology_cache=precomputed_climatology_cache,
-                        day1_scoring_config=day1_scoring_config,
-                        valid_time_dt=valid_time_dt,
-                        effective_lead_h=effective_lead_h,
-                        miner_hotkey=miner_hotkey,
-                        cached_pressure_dims=cached_pressure_dims,
-                        cached_lat_weights=cached_lat_weights,
-                        cached_grid_dims=cached_grid_dims,
-                        variables_to_score=variables_to_score,
-                    ),
-                    name=f"var_{var_key}_{effective_lead_h}h_{miner_hotkey[:8]}",
+                result = await _process_single_variable_parallel(
+                    var_config=var_config,
+                    miner_forecast_lead=miner_forecast_lead,
+                    gfs_analysis_lead=gfs_analysis_lead,
+                    gfs_reference_lead=gfs_reference_lead,
+                    era5_climatology=era5_climatology,
+                    precomputed_climatology_cache=precomputed_climatology_cache,
+                    day1_scoring_config=day1_scoring_config,
+                    valid_time_dt=valid_time_dt,
+                    effective_lead_h=effective_lead_h,
+                    miner_hotkey=miner_hotkey,
+                    cached_pressure_dims=cached_pressure_dims,
+                    cached_lat_weights=cached_lat_weights,
+                    cached_grid_dims=cached_grid_dims,
+                    variables_to_score=variables_to_score,
                 )
-            variable_tasks.append((var_key, task))
 
-        # Execute all variables in parallel for this time step
-        logger.debug(
-            f"[Day1Score] Miner {miner_hotkey}: Executing {len(variable_tasks)} variable tasks for time step {valid_time_dt}"
-        )
-
-        # Get just the tasks for asyncio.gather
-        tasks_only = [task for _, task in variable_tasks]
-        variable_results = await asyncio.gather(*tasks_only, return_exceptions=True)
-
-        timestep_time = time.time() - timestep_start
-        logger.info(
-            f"[Day1Score] Miner {miner_hotkey}: PARALLEL time step {valid_time_dt} completed in {timestep_time:.2f}s"
-        )
-
-        # Process results from parallel variable execution
-        for i, (var_key, _) in enumerate(variable_tasks):
-            result = variable_results[i]
-
+            # Process result immediately
             if isinstance(result, Exception):
                 error_msg = str(result)
                 logger.error(
-                    f"[Day1Score] Miner {miner_hotkey}: PARALLEL task failed for {var_key} at {valid_time_dt}: {error_msg}",
+                    f"[Day1Score] Miner {miner_hotkey}: Variable processing failed for {var_key} at {valid_time_dt}: {error_msg}",
                     exc_info=result if hasattr(result, '__traceback__') else None
                 )
-                
-                # Log full traceback for debugging
-                import traceback
-                if hasattr(result, '__traceback__'):
-                    tb_str = ''.join(traceback.format_exception(type(result), result, result.__traceback__))
-                    logger.debug(f"[Day1Score] Full traceback for {var_key} failure:\n{tb_str}")
                 
                 timestep_results["variables"][var_key]["error"] = error_msg
                 timestep_results["qc_passed"] = False

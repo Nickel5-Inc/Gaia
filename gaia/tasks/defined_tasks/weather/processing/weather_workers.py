@@ -1494,21 +1494,17 @@ async def initial_scoring_worker(task_instance: "WeatherTask"):
                     )
                 )
 
+                # OPTIMIZED DAY1 SCORING: Essential surface variables for quality control
                 resolved_day1_variables_levels_to_score = task_instance.config.get(
                     "day1_variables_levels_to_score",
                     [
+                        # Core surface variables - most important for immediate validation
+                        {"name": "2t", "level": None, "standard_name": "2m_temperature"},
+                        {"name": "msl", "level": None, "standard_name": "mean_sea_level_pressure"},
+                        {"name": "10u", "level": None, "standard_name": "10m_u_wind"},
+                        {"name": "10v", "level": None, "standard_name": "10m_v_wind"},
+                        # Single atmospheric level for vertical structure check
                         {"name": "z", "level": 500, "standard_name": "geopotential"},
-                        {"name": "t", "level": 850, "standard_name": "temperature"},
-                        {
-                            "name": "2t",
-                            "level": None,
-                            "standard_name": "2m_temperature",
-                        },
-                        {
-                            "name": "msl",
-                            "level": None,
-                            "standard_name": "mean_sea_level_pressure",
-                        },
                     ],
                 )
 
