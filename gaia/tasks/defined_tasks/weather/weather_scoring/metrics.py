@@ -236,8 +236,15 @@ async def calculate_mse_skill_score(
 
                 if metrics_result and "skill" in metrics_result:
                     skill_score = metrics_result["skill"]
-                    logger.info(f"MSE Skill Score (Async): {skill_score:.4f}")
-                    return skill_score
+                    logger.info(f"MSE Skill Score (Async): {skill_score}")
+                    
+                    # DIAGNOSTIC: Check if async skill score is non-finite
+                    if not np.isfinite(skill_score):
+                        logger.warning(f"MSE Skill Score (Async): Non-finite result: {skill_score}")
+                        logger.info(f"MSE Skill Score (Async): Metrics result: {metrics_result}")
+                        # Fall through to xskillscore for better diagnostics
+                    else:
+                        return skill_score
                 else:
                     logger.warning(
                         "Async skill score calculation failed, falling back to xskillscore"
@@ -276,12 +283,27 @@ async def calculate_mse_skill_score(
         if hasattr(mse_reference_scalar, "compute"):
             mse_reference_scalar = await asyncio.to_thread(mse_reference_scalar.compute)
 
-        if mse_reference_scalar.item() == 0:
-            skill_score = 1.0 if mse_forecast_scalar.item() == 0 else -np.inf
-        else:
-            skill_score = 1 - (mse_forecast_scalar.item() / mse_reference_scalar.item())
+        # Extract scalar values with validation
+        mse_forecast_val = mse_forecast_scalar.item()
+        mse_reference_val = mse_reference_scalar.item()
+        
+        # DIAGNOSTIC: Check for NaN/inf values in MSE calculations
+        logger.info(f"MSE Skill Score Diagnostics - Forecast MSE: {mse_forecast_val}, Reference MSE: {mse_reference_val}")
+        
+        if not np.isfinite(mse_forecast_val):
+            logger.warning(f"MSE Skill Score: Forecast MSE is non-finite: {mse_forecast_val}")
+            return np.nan
+        
+        if not np.isfinite(mse_reference_val):
+            logger.warning(f"MSE Skill Score: Reference MSE is non-finite: {mse_reference_val}")
+            return np.nan
 
-        logger.info(f"MSE Skill Score (xskillscore): {skill_score:.4f}")
+        if mse_reference_val == 0:
+            skill_score = 1.0 if mse_forecast_val == 0 else -np.inf
+        else:
+            skill_score = 1 - (mse_forecast_val / mse_reference_val)
+
+        logger.info(f"MSE Skill Score (xskillscore): {skill_score}")
         return skill_score
 
     except Exception as e:

@@ -1753,6 +1753,44 @@ async def calculate_era5_miner_score(
             f"[FinalScore] Miner {miner_hotkey}: Using ERA5-climatology skill scores (GFS operational not used for final scoring)"
         )
 
+        # PRE-LOAD STRATEGY: Download all required data chunks ONCE before processing
+        # This prevents duplicate HTTP requests when processing multiple variables
+        logger.info(f"[FinalScore] Miner {miner_hotkey}: Pre-loading forecast data to prevent duplicate requests...")
+        preload_start_time = time.time()
+        
+        try:
+            variables_needed = [var_config["name"] for var_config in variables_to_score]
+            variables_in_dataset = [var for var in variables_needed if var in miner_forecast_ds.data_vars]
+            
+            if variables_in_dataset:
+                # Convert target datetimes to proper time coordinates for selection
+                time_coords = []
+                for dt in target_datetimes:
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    else:
+                        dt = dt.astimezone(timezone.utc)
+                    time_coords.append(pd.Timestamp(dt))
+                
+                # Select only the variables and times we need
+                miner_subset = miner_forecast_ds[variables_in_dataset].sel(time=time_coords, method="nearest")
+                
+                # Load all data at once to cache in memory
+                await asyncio.to_thread(lambda: miner_subset.load())
+                
+                # Replace the original dataset with the pre-loaded subset
+                miner_forecast_ds = miner_subset
+                
+                preload_time = time.time() - preload_start_time
+                logger.info(f"[FinalScore] Miner {miner_hotkey}: Pre-loaded forecast data in {preload_time:.2f}s - processing will use cached data")
+            else:
+                logger.warning(f"[FinalScore] Miner {miner_hotkey}: No scoring variables found in dataset")
+                
+        except Exception as preload_err:
+            preload_time = time.time() - preload_start_time
+            logger.warning(f"[FinalScore] Miner {miner_hotkey}: Pre-loading failed after {preload_time:.2f}s: {preload_err}")
+            logger.warning("Continuing with lazy loading (may result in duplicate requests)")
+
         if gfs_operational_fcst_ds is None:
             logger.debug(
                 f"[FinalScore] Miner {miner_hotkey}: Using ERA5-climatology-based skill scores only (no GFS operational reference in final scoring)"
@@ -2094,9 +2132,22 @@ async def calculate_era5_miner_score(
                             raise KeyError(
                                 f"Variable {var_name} not available in miner dataset"
                             )
+                    
+                    # CRITICAL FIX: Standardize dimension names across all datasets before processing
+                    def standardize_pressure_dims(data_array, target_dim_name="pressure_level"):
+                        """Standardize pressure level dimension names"""
+                        if hasattr(data_array, 'dims'):
+                            rename_map = {}
+                            for dim in data_array.dims:
+                                if dim in ['plev', 'lev', 'level'] and dim != target_dim_name:
+                                    rename_map[dim] = target_dim_name
+                            if rename_map:
+                                logger.debug(f"[FinalScore] Standardizing dimensions: {rename_map}")
+                                return data_array.rename(rename_map)
+                        return data_array
 
-                    miner_var_da_unaligned = miner_forecast_lead_slice[miner_var_name]
-                    truth_var_da_unaligned = era5_truth_lead_slice[era5_var_name]
+                    miner_var_da_unaligned = standardize_pressure_dims(miner_forecast_lead_slice[miner_var_name])
+                    truth_var_da_unaligned = standardize_pressure_dims(era5_truth_lead_slice[era5_var_name])
 
                     # Add detailed diagnostics for potential unit mismatches
                     logger.info(
@@ -2498,25 +2549,57 @@ async def calculate_era5_miner_score(
                             logger.info(
                                 f"[FinalScore] Adjusting weights dimensions. Data dims: {data_dims}, Weight dims: {weight_dims}"
                             )
-                            # Create weights that match the data dimensions exactly
-                            if var_level is None:  # Surface variable - only lat/lon
-                                mse_weights = one_d_lat_weights.expand_dims(
-                                    {"lon": truth_var_da_final["lon"]}
-                                )
-                            else:  # Pressure level variable - ensure weights match data structure
-                                try:
-                                    _, mse_weights = await asyncio.to_thread(
-                                        xr.broadcast,
-                                        truth_var_da_final,
-                                        one_d_lat_weights,
-                                    )
-                                except Exception as broadcast_err:
-                                    logger.warning(
-                                        f"[FinalScore] Failed to broadcast weights, using simple lat/lon weights: {broadcast_err}"
-                                    )
-                                    mse_weights = one_d_lat_weights.expand_dims(
-                                        {"lon": truth_var_da_final["lon"]}
-                                    )
+                            
+                            # CRITICAL FIX: Handle dimension name mismatches (plev vs pressure_level)
+                            # Standardize pressure level dimension names in weights to match data
+                            if lat_weights is not None and hasattr(lat_weights, 'dims'):
+                                weight_rename_map = {}
+                                for data_dim in truth_var_da_final.dims:
+                                    if data_dim in ['plev', 'pressure_level', 'lev', 'level']:
+                                        for weight_dim in lat_weights.dims:
+                                            if weight_dim in ['plev', 'pressure_level', 'lev', 'level'] and weight_dim != data_dim:
+                                                weight_rename_map[weight_dim] = data_dim
+                                                break
+                                
+                                if weight_rename_map:
+                                    logger.info(f"[FinalScore] Renaming weight dimensions: {weight_rename_map}")
+                                    lat_weights = lat_weights.rename(weight_rename_map)
+                            
+                            # CRITICAL FIX: Create weights that match the EXACT dimensions of the data
+                            # Check the actual dimensions of the truth data to determine weight structure
+                            truth_dims = set(truth_var_da_final.dims)
+                            logger.debug(f"[FinalScore] Truth data dimensions: {truth_dims}")
+                            
+                            # Always start with basic lat/lon weights
+                            if "lon" in truth_dims and "lat" in truth_dims:
+                                # Create 2D lat/lon weights
+                                base_weights = one_d_lat_weights.expand_dims({"lon": truth_var_da_final["lon"]})
+                                
+                                # If data has pressure levels, broadcast to include pressure dimension
+                                pressure_dims = [d for d in truth_dims if d in ['pressure_level', 'plev', 'lev', 'level']]
+                                if pressure_dims:
+                                    pressure_dim = pressure_dims[0]  # Use the first pressure dimension found
+                                    logger.debug(f"[FinalScore] Adding pressure dimension: {pressure_dim}")
+                                    try:
+                                        # Broadcast weights to match all data dimensions
+                                        _, mse_weights = await asyncio.to_thread(
+                                            xr.broadcast,
+                                            truth_var_da_final,
+                                            base_weights,
+                                        )
+                                        logger.debug(f"[FinalScore] Broadcasted weights dimensions: {mse_weights.dims}")
+                                    except Exception as broadcast_err:
+                                        logger.warning(
+                                            f"[FinalScore] Failed to broadcast weights to pressure levels: {broadcast_err}"
+                                        )
+                                        mse_weights = base_weights
+                                else:
+                                    # Surface variable - use 2D lat/lon weights
+                                    mse_weights = base_weights
+                                    logger.debug(f"[FinalScore] Using 2D lat/lon weights for surface variable")
+                            else:
+                                logger.warning(f"[FinalScore] No lat/lon dimensions found in data: {truth_dims}")
+                                mse_weights = None
 
                     # CRITICAL: Include all non-time dimensions for proper scalar reduction
                     # This ensures pressure_level dimension is also reduced to get a scalar
@@ -2533,10 +2616,44 @@ async def calculate_era5_miner_score(
                     logger.debug(
                         f"[FinalScore] Data shapes - Miner: {miner_var_da_aligned.shape}, Truth: {truth_var_da_final.shape}"
                     )
+                    logger.debug(
+                        f"[FinalScore] Data dimensions - Miner: {miner_var_da_aligned.dims}, Truth: {truth_var_da_final.dims}"
+                    )
                     if mse_weights is not None:
                         logger.debug(
                             f"[FinalScore] Weights shape: {mse_weights.shape}, dims: {mse_weights.dims}"
                         )
+                        logger.debug(
+                            f"[FinalScore] Weights coordinate sizes: {dict(mse_weights.sizes)}"
+                        )
+                        
+                        # VALIDATION: Check for dimension compatibility before MSE calculation
+                        truth_dims_set = set(truth_var_da_final.dims)
+                        weights_dims_set = set(mse_weights.dims)
+                        
+                        # Check if weights can be broadcast to truth dimensions
+                        # Weights should be a subset of truth dimensions (broadcastable)
+                        if not weights_dims_set.issubset(truth_dims_set):
+                            logger.warning(
+                                f"[FinalScore] DIMENSION MISMATCH detected before MSE calculation:"
+                                f"\n  Truth dims: {truth_dims_set}"
+                                f"\n  Weights dims: {weights_dims_set}"
+                                f"\n  Weights have extra dimensions not in truth data"
+                                f"\n  Will attempt MSE without weights to avoid error"
+                            )
+                            mse_weights = None
+                        else:
+                            # Additional check: ensure weight shapes are compatible
+                            try:
+                                # Test broadcast compatibility by attempting a dummy operation
+                                _ = truth_var_da_final * mse_weights
+                                logger.debug(f"[FinalScore] Weights broadcast compatibility confirmed")
+                            except Exception as broadcast_test_err:
+                                logger.warning(
+                                    f"[FinalScore] Weights broadcast test failed: {broadcast_test_err}"
+                                    f"\n  Will attempt MSE without weights to avoid error"
+                                )
+                                mse_weights = None  # Disable weights to prevent error
 
                     raw_mse_val = await asyncio.to_thread(
                         calculate_raw_mse_scalar_threaded,
@@ -2558,6 +2675,9 @@ async def calculate_era5_miner_score(
                     all_metrics_for_db.append(rmse_metric_row)
                     
                     # NEW: Start collecting component score for this variable/lead
+                    # CRITICAL FIX: Convert pressure_level to proper database type
+                    pressure_level_db = None if var_level == "all" or var_level is None else int(var_level)
+                    
                     component_score = {
                         'run_id': run_id,
                         'response_id': response_id,
@@ -2567,7 +2687,7 @@ async def calculate_era5_miner_score(
                         'lead_hours': int(lead_hours),
                         'valid_time_utc': valid_time_dt,
                         'variable_name': var_name,
-                        'pressure_level': var_level,
+                        'pressure_level': pressure_level_db,  # Use NULL for "all" levels
                         'rmse': current_metrics["rmse"],
                         'mse': raw_mse_val,
                         'calculation_duration_ms': int((time.time() - scoring_start_time) * 1000),

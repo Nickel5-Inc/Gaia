@@ -497,11 +497,21 @@ def compute_statistical_metrics_mp(
                 else:
                     mse_ref = float(np.mean(ref_squared_error))
 
-                if mse_ref > 0:
+                # DIAGNOSTIC: Check for NaN/inf values in skill score calculation
+                logger.debug(f"Skill Score MP Diagnostics - Forecast MSE: {mse}, Reference MSE: {mse_ref}")
+                
+                if not np.isfinite(mse):
+                    logger.warning(f"Skill Score MP: Forecast MSE is non-finite: {mse}")
+                    results["skill"] = np.nan
+                elif not np.isfinite(mse_ref):
+                    logger.warning(f"Skill Score MP: Reference MSE is non-finite: {mse_ref}")
+                    results["skill"] = np.nan
+                elif mse_ref > 0:
                     results["skill"] = float(1.0 - (mse / mse_ref))
                 else:
                     results["skill"] = 1.0 if mse == 0 else -np.inf
             else:
+                logger.warning(f"Skill Score MP: Shape mismatch - Reference: {reference.shape}, Truth: {truth.shape}")
                 results["skill"] = np.nan
 
         # ACC (requires climatology)

@@ -121,7 +121,6 @@ from .processing.weather_logic import (
 from .hardening_integration import WeatherTaskHardeningMixin
 from .processing.weather_workers import (
     initial_scoring_worker,
-    finalize_scores_worker,
     cleanup_worker,
     run_inference_background,
     fetch_and_hash_gfs_task,
@@ -338,8 +337,8 @@ def _load_config(self):
         # Core surface variables - most important for immediate validation
         {"name": "2t", "level": None, "standard_name": "2m_temperature"},      # Temperature patterns
         {"name": "msl", "level": None, "standard_name": "mean_sea_level_pressure"},  # Pressure systems
-        {"name": "10u", "level": None, "standard_name": "10m_u_wind"},         # Wind patterns U
-        {"name": "10v", "level": None, "standard_name": "10m_v_wind"},         # Wind patterns V
+        {"name": "10u", "level": None, "standard_name": "10m_u_component_of_wind"},  # Wind patterns U - FIXED
+        {"name": "10v", "level": None, "standard_name": "10m_v_component_of_wind"},  # Wind patterns V - FIXED
         # Single atmospheric level for vertical structure check
         {"name": "z", "level": 500, "standard_name": "geopotential"},          # 500hPa geopotential height
     ]
@@ -517,8 +516,6 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         self.initial_scoring_queue = asyncio.Queue()
         self.initial_scoring_worker_running = False
         self.initial_scoring_workers = []
-        self.final_scoring_worker_running = False
-        self.final_scoring_workers = []
         self.cleanup_worker_running = False
         self.cleanup_workers = []
         self.r2_cleanup_worker_running = False  # For R2 cleanup
@@ -529,16 +526,17 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         self.test_mode_run_scored_event = asyncio.Event()
         self.last_test_mode_run_id = None
 
+        # GPU INFERENCE CONCURRENCY: Controls concurrent inference operations on miners
+        # This is separate from scoring concurrency and remains relevant for GPU resource management
         self.gpu_semaphore = asyncio.Semaphore(
             self.config.get("max_concurrent_inferences", 1)
         )
 
-        era5_scoring_concurrency = int(
-            os.getenv("WEATHER_VALIDATOR_ERA5_SCORING_CONCURRENCY", "4")
-        )
-        self.era5_scoring_semaphore = asyncio.Semaphore(era5_scoring_concurrency)
+        # ERA5 SCORING: Sequential processing for CPU-intensive operations
+        # ERA5 scoring is CPU-bound (interpolation, MSE, ACC calculations) and doesn't benefit from asyncio concurrency
+        # The heavy computations already use asyncio.to_thread(), so asyncio-level parallelism adds overhead without benefit
         logger.info(
-            f"ERA5 scoring concurrency for validator set to: {era5_scoring_concurrency}"
+            "ERA5 scoring configured for sequential processing (CPU-intensive operations don't benefit from asyncio concurrency)"
         )
 
         # Configure file serving mode for miners
@@ -3858,30 +3856,7 @@ class WeatherTask(Task, WeatherTaskHardeningMixin):
         self.initial_scoring_workers = []
         logger.info("Stopped all initial scoring workers")
 
-    async def start_final_scoring_workers(self, num_workers=1):
-        """Start background workers for final ERA5-based scoring."""
-        if self.final_scoring_worker_running:
-            logger.info("Final scoring workers already running")
-            return
 
-        self.final_scoring_worker_running = True
-        for _ in range(num_workers):
-            worker = asyncio.create_task(finalize_scores_worker(self))
-            self.final_scoring_workers.append(worker)
-        logger.info(f"Started {num_workers} final scoring workers")
-
-    async def stop_final_scoring_workers(self):
-        """Stop all background final scoring workers."""
-        if not self.final_scoring_worker_running:
-            return
-
-        self.final_scoring_worker_running = False
-        logger.info("Stopping final scoring workers...")
-        for worker in self.final_scoring_workers:
-            worker.cancel()
-
-        self.final_scoring_workers = []
-        logger.info("Stopped all final scoring workers")
 
     async def start_cleanup_workers(self, num_workers=1):
         """Start background workers for cleaning up old data."""

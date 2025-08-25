@@ -180,17 +180,18 @@ async def run_item(
         day_key = forecast_time.strftime("%Y-%m-%d")
         leads_by_day[day_key].append(h)
     
-    # Find the earliest ready day (not all leads)
+    # PROGRESSIVE SCHEDULING: Find ALL ready lead times, not just one day
     ready_leads = []
-    earliest_ready_day = None
+    ready_days = []
     for day_key, day_leads in leads_by_day.items():
         # Check if any lead from this day is ready
         day_ready_leads = [h for h in day_leads if now_utc >= needed_time_for_lead(h)]
         if day_ready_leads:
-            if earliest_ready_day is None:
-                earliest_ready_day = day_key
-                ready_leads = day_ready_leads
-                break  # Process one day at a time
+            ready_leads.extend(day_ready_leads)
+            ready_days.append(day_key)
+    
+    # Sort ready leads for consistent processing order
+    ready_leads = sorted(ready_leads)
     
     if not ready_leads:
         # Calculate when the earliest lead will be ready
@@ -202,7 +203,7 @@ async def run_item(
         )
         # Return a special exception to indicate data not ready (not a failure)
         raise DataNotReadyError(f"ERA5 data not ready for {hours_until_ready:.1f} hours")
-    logger.info(f"[ERA5] Run {run_id} Miner {miner_uid}: Scoring day {earliest_ready_day} with {len(ready_leads)} lead times: {ready_leads}")
+    logger.info(f"[ERA5] Run {run_id} Miner {miner_uid}: Progressive scoring {len(ready_days)} days with {len(ready_leads)} lead times: {ready_leads}")
     
     # Load truth/climatology for only the ready leads (one day at a time)
     truth = await _get_era5_truth(task, run_id, gfs_init, ready_leads)
