@@ -249,13 +249,12 @@ async def handle_initiate_fetch_job(
             {"run_id": run_id}
         )
         
-        # TEMPORARY: Filter to only active test miners for cleaner debugging
+        # Select all active miners (no UID filtering)
         miners = await db.fetch_all(
             """
             SELECT uid, hotkey, ip, port
             FROM node_table 
             WHERE hotkey IS NOT NULL 
-            AND uid IN (55, 80, 82)
             ORDER BY uid
             """
         )

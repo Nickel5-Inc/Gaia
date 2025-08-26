@@ -51,13 +51,12 @@ async def seed_forecast_run(
     eff_gfs_init = get_effective_gfs_init(task_like, gfs_init)
     forecast_run_id = WeatherStatsManager.generate_forecast_run_id(eff_gfs_init, target_time)
 
-    # TEMPORARY: Filter to only active test miners for cleaner debugging
-    test_miner_uids = [55, 80, 82]  # The three currently active miners
+    # Select all active miners (no UID filtering)
     miners: List[Dict[str, Any]] = await db.fetch_all(
         """
         SELECT uid as miner_uid, hotkey as miner_hotkey
         FROM node_table
-        WHERE uid IN (55, 80, 82) AND hotkey IS NOT NULL
+        WHERE hotkey IS NOT NULL
         ORDER BY uid ASC
         """
     )
